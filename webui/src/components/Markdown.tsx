@@ -3,7 +3,7 @@ import { useMemo, useRef, useEffect } from 'preact/hooks';
 import { render } from 'preact';
 import { markdownToHtml } from '../lib/markdownRender';
 import { MermaidDiagram } from './MermaidDiagram';
-import { useSettings, SettingsProvider } from '../settings';
+import { useSettings } from '../settings';
 
 export { preprocessMarkdown, markdownToHtml } from '../lib/markdownRender';
 
@@ -51,7 +51,7 @@ function highlightHtml(html: string, search: string): string {
 }
 
 export function Markdown({ content, search }: { content: string; search?: string }) {
-  const { theme } = useSettings();
+  const { theme, lang, t } = useSettings();
   const isDark = (theme === 'dark') ||
     (theme === 'system' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) ||
     (typeof document !== 'undefined' && document.documentElement.dataset.theme === 'dark');
@@ -83,9 +83,7 @@ export function Markdown({ content, search }: { content: string; search?: string
       try {
         const decoded = decodeURIComponent(rawCode);
         render(
-          <SettingsProvider>
-            <MermaidDiagram code={decoded} isDark={isDark} />
-          </SettingsProvider>,
+          <MermaidDiagram code={decoded} isDark={isDark} t={t} />,
           node,
         );
         mountedElements.push(node);
@@ -101,7 +99,7 @@ export function Markdown({ content, search }: { content: string; search?: string
         } catch {}
       }
     };
-  }, [html, isDark]);
+  }, [html, isDark, lang]);
 
   function onClick(e: MouseEvent) {
     const targetEl = e.target as HTMLElement;

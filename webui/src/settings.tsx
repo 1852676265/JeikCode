@@ -12,7 +12,7 @@ export type Theme = 'light' | 'dark' | 'system';
 /** Which settings dialog to open from the sidebar settings menu. */
 export type SettingsSection = 'theme' | 'language' | 'model';
 
-type TParams = Record<string, string | number>;
+export type TParams = Record<string, string | number>;
 
 interface SettingsCtx {
   theme: Theme;
