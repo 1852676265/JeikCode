@@ -77,6 +77,7 @@ import {
   MAX_IMAGES,
   MAX_IMAGE_BYTES,
   MAX_IMAGE_MB,
+  ACCEPTED_IMAGE_INPUT_ACCEPT,
   countPending,
   fileToImageData,
   formatUserMessageWithAttachments,
@@ -7574,6 +7575,7 @@ export function Chat({
             ref={nativeFileInputRef}
             type="file"
             multiple
+            accept={ACCEPTED_IMAGE_INPUT_ACCEPT}
             style={{ display: 'none' }}
             onChange={(e) => {
               const input = e.target as HTMLInputElement;

@@ -10278,7 +10278,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/tunnel/status", get(get_tunnel_status))
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
-        .route("/live/message", post(live_api::live_message))
+        .route(
+            "/live/message",
+            post(live_api::live_message)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/user-input", post(live_api::live_user_input))
