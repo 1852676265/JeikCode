@@ -23,18 +23,6 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
-## v7.2.1-beta.12 (2026-10-11)
-
-- **[Mermaid Polish & Dynamic Internationalization] Streamline Mermaid Header Badge, Compact Icon-Only Toggle Button, and Pass Reactive Translator for Instant Multi-Language Adaptation**:
-  - **Pure 'Mermaid' Badge & Icon-Only Clean Toolbar**: Simplified the top-left diagram badge text to pure "Mermaid" across all locales, and removed the trailing "代码" / "Code" text from the view toggle button in `MermaidDiagram.tsx`. This produces a clean, symmetrical 24x24 icon-button layout that completely eliminates vertical text wrapping and capsule bar overflows on narrow mobile viewports.
-  - **Reactive Multi-Language Tooltip & Instruction Binding**: Passed the authoritative root translator `t` from `Markdown.tsx` into `MermaidDiagram` and added `lang` to the hydration `useEffect` dependency array. Switching languages in the application immediately triggers live updates across all button hover tooltips (code/diagram view, zoom in/out, reset, fullscreen, download, copy), the bottom gesture guide ("Scroll to zoom · Drag to pan · Pinch with two fingers"), and parsing fallback banners.
-
----
-
-- **[Mermaid 视觉微调与响应式全多语言联动] 精简 Mermaid 徽章标识、极简纯图标代码切换，贯通响应式翻译器实现多语言即时响应**:
-  - **纯净 'Mermaid' 徽章与极简无字代码切换按钮**: 将图表左上角徽章文本全语言统一精简为纯 "Mermaid"，并彻底去除代码/图表切换按钮上的“代码”汉字后缀；使操作栏所有按钮统一为 24x24 正方形圆角胶囊纯图标，彻底消除了移动端竖屏极窄视口下汉字折行撑裂操作栏的问题。
-  - **操作教程说明与悬停文字多语言实时联动**: 在 `Markdown.tsx` 中直接将主树权威翻译器 `t` 作为 prop 直传进 `MermaidDiagram`，并将 `lang` 纳入水合挂载的 `useEffect` 依赖数组；解决脱离 Context 无法响应全局语言切换的问题，当用户在顶栏切换语言（中/英/越）时，所有按钮悬停提示（查看图表/查看代码、放大、缩小、重置、全屏、下载、复制）、底部手势教程说明（“滚轮平滑缩放 · 拖拽平移 · 双指捏合”）及容灾横幅瞬间同步无缝更新。
-
 ## v7.2.1-beta.11 (2026-10-11)
 
 - **[Markdown Hydration & Streaming Fence Robustness] Fix Mermaid Context Hydration Crash, Prevent Mobile GPU Compositor Tiling Ghosting, and Stop Nested Code Fence Fragmentation Across Protocols**:
