@@ -2174,6 +2174,7 @@ export function Chat({
   // keeps whatever code already arrived (buffering until artifact_end used to
   // swallow the whole block).
   const artifactOpenRef = useRef(false);
+  const artifactFenceLenRef = useRef(3);
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -2286,6 +2287,7 @@ export function Chat({
       }
       loadedForRef.current = null;
       artifactOpenRef.current = false;
+      artifactFenceLenRef.current = 3;
       if (!prevWasRunning && prevId) {
         sessionWatchersRef.current.get(prevId)?.abort();
         sessionWatchersRef.current.delete(prevId);
@@ -5035,7 +5037,10 @@ export function Chat({
   function closeOpenArtifactFence() {
     if (!artifactOpenRef.current) return;
     artifactOpenRef.current = false;
-    appendToLastAssistant('\n```\n', { skipReplayDedup: true });
+    const fenceLen = artifactFenceLenRef.current || 3;
+    const marker = '`'.repeat(fenceLen);
+    appendToLastAssistant('\n' + marker + '\n', { skipReplayDedup: true });
+    artifactFenceLenRef.current = 3;
   }
 
   function addToolToLastAssistant(tool: ToolRow) {
@@ -5782,7 +5787,11 @@ export function Chat({
           break;
         }
         const lang = (event.language ?? '').trim();
-        const fence = (lang ? '```' + lang : '```') + '\n';
+        const fenceLen = typeof event.fence_len === 'number' && event.fence_len >= 3
+          ? event.fence_len
+          : 3;
+        const marker = '`'.repeat(fenceLen);
+        const fence = (lang ? marker + lang : marker) + '\n';
         // 关键防御：确保代码块开启围栏始终独立成行，杜绝与前置文本粘连导致代码块被炸开为正文
         const curMessages = messagesRef.current;
         const lastMsg = curMessages[curMessages.length - 1];
@@ -5797,6 +5806,7 @@ export function Chat({
           skipReplayDedup: true,
         });
         artifactOpenRef.current = true;
+        artifactFenceLenRef.current = fenceLen;
         break;
       }
       case 'artifact_content': {
@@ -5810,9 +5820,12 @@ export function Chat({
           break;
         }
         if (artifactOpenRef.current) {
-          appendToLastAssistant('\n```\n', { skipReplayDedup: true });
+          const fenceLen = artifactFenceLenRef.current || 3;
+          const marker = '`'.repeat(fenceLen);
+          appendToLastAssistant('\n' + marker + '\n', { skipReplayDedup: true });
         }
         artifactOpenRef.current = false;
+        artifactFenceLenRef.current = 3;
         break;
       }
       case 'session_mutation': {

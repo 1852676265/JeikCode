@@ -31,7 +31,7 @@ function getMermaid() {
       const instance = m.default || m;
       instance.initialize({
         startOnLoad: false,
-        securityLevel: 'strict',
+        securityLevel: 'loose',
         fontFamily: 'var(--app-sans-font-family, ui-sans-serif, sans-serif)',
         logLevel: 'error',
       });
@@ -81,6 +81,8 @@ export function MermaidDiagram({ code, isDark = false }: MermaidDiagramProps) {
         .then(async (mermaid) => {
           if (canceled) return;
           mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'loose',
             theme: isDark ? 'dark' : 'neutral',
             themeVariables: isDark
               ? {
