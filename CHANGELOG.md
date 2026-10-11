@@ -85,6 +85,7 @@
   - **TUI suite gated**: `ci.yml` / `portability.yml` now run `cargo test -p jeikcode-tuix --lib -- --test-threads=1` (1,700+ tests previously only exercised locally), and `retained_small_frame_single_write` pins the Unix DA1 parser query separately (adapted from PR #44).
   - **Hermetic all-features suite**: isolated-home guard lifetime fixed (an unsafe-block-bound guard dropped immediately, reading the developer's real `~/.jeikcode/mcp.json`), plugin fixtures built with `serde_json`, trusted-domain expectations gated on the live list, the glob hidden-file test serialized, the explore workspace-root test bounded + ignored; rustfmt passes folded in for files CI's check-only policy left unformatted.
   - **Coding integration convergence**: `full_assembly` asserts prompt layout by shape (60s bounded drive loop, phase-labelled panics); `permission_grants` encodes correct allow-always semantics and canonical `write` (the fixture's `../..` path is an unresolved parent traversal that is deliberately never remembered).
+  - **Portability gate**: the native-temp assertion in `special_dirs` is platform-gated — a leading `/` is POSIX pollution only on Windows; on Unix it IS the native form, so the slash/drive checks run under `cfg!(windows)` (the first real cross-platform run of this batch caught it).
   - **Process**: `AGENTS.md` now requires bilingual commit bodies (English pass, `---`, Chinese pass).
 
 ---
@@ -149,6 +150,7 @@
   - **TUI 套件门禁**: `ci.yml` / `portability.yml` 现跑 `cargo test -p jeikcode-tuix --lib -- --test-threads=1`（1700+ 单测此前只在本地被跑到）；`retained_small_frame_single_write` 单独钉住 Unix DA1 查询（改自 PR #44）。
   - **all-features 套件密闭化**: 修复 unsafe 块内即析构的 isolated-home guard（此前读开发机真实 `~/.jeikcode/mcp.json`）、插件夹具改用 `serde_json`、信任域期望按实时表 gate、glob 隐藏文件测试串行化、explore workspace-root 测试加有界护栏并 `#[ignore]`；并入 CI 只 check 未 fmt 文件的 rustfmt 收敛。
   - **coding 集成收敛**: `full_assembly` 按形状断言提示布局（60s 有界 drive、按阶段 panic）；`permission_grants` 采用正确的始终允许语义与规范 `write`（夹具的 `../..` 属设计上「每次问、不记住」的未解析父级穿越）。
+  - **Portability 门禁**: `special_dirs` 的原生 temp 断言改为按平台判定 —— 前导 `/` 只在 Windows 上属于 POSIX 污染，Unix 上它就是原生形态；斜杠/盘符检查现仅在 `cfg!(windows)` 下执行（本批提交的首次真实跨平台运行抓到了它）。
   - **流程**: `AGENTS.md` 新增双语提交正文规范（英文整段、`---`、中文整段）。
 
 ## v7.2.2-beta.0 (2026-10-11)

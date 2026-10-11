@@ -373,9 +373,12 @@ mod tests {
         // POSIX (`/tmp/`). The value handed to shells and to `$VAR` expansion must
         // still be native, or native programs mis-resolve an ARGUMENT built from it.
         let dir = temp_dir();
-        assert!(!dir.to_string_lossy().starts_with('/'), "{dir:?}");
         assert!(dir.is_dir(), "{dir:?}");
+        // "Native" is platform-relative: a leading `/` is POSIX pollution ONLY on
+        // Windows (the bug this guards); on Unix `/tmp` / `/var/folders/...` IS the
+        // native form, so the slash/drive checks run under `cfg!(windows)` only.
         if cfg!(windows) {
+            assert!(!dir.to_string_lossy().starts_with('/'), "{dir:?}");
             assert!(
                 dir.to_string_lossy().as_bytes().get(1) == Some(&b':'),
                 "must carry a drive letter: {dir:?}"
