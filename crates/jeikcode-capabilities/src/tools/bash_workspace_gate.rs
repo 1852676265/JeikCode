@@ -1070,7 +1070,7 @@ mod tests {
     fn bash_call(command: &str) -> ToolCall {
         ToolCall {
             id: "1".into(),
-            name: "bash".into(),
+            name: "run_command".into(),
             arguments: serde_json::json!({ "command": command }).to_string(),
         }
     }
@@ -1081,7 +1081,7 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
         let mut call = ToolCall {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "read".into(),
             arguments: r#"{"file_path":"a"}"#.into(),
         };
         assert_eq!(
@@ -1398,7 +1398,7 @@ mod tests {
         let tool = bash_tool();
         let mut call = ToolCall {
             id: "1".into(),
-            name: "bash".into(),
+            name: "run_command".into(),
             arguments: serde_json::json!({ "cmd": format!("rm {}", target.to_str().unwrap()) })
                 .to_string(),
         };

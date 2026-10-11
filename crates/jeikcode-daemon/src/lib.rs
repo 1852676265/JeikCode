@@ -569,7 +569,9 @@ mod env_write_guard_tests {
             for (index, line) in source.lines().enumerate() {
                 let trimmed = line.trim_start();
                 // 注释里的示例不算违规。
-                if trimmed.starts_with("//") || !(line.contains("set_var") || line.contains("remove_var")) {
+                if trimmed.starts_with("//")
+                    || !(line.contains("set_var") || line.contains("remove_var"))
+                {
                     continue;
                 }
                 if GUARDED_KEYS
@@ -647,7 +649,9 @@ mod global_events_tests {
         });
         for rx in [&mut first, &mut second] {
             let a = rx.try_recv().expect("first event reaches every subscriber");
-            let b = rx.try_recv().expect("second event reaches every subscriber");
+            let b = rx
+                .try_recv()
+                .expect("second event reaches every subscriber");
             assert!(matches!(a, GlobalWireEvent::Activity { .. }));
             assert!(matches!(b, GlobalWireEvent::ReviewAsked { .. }));
         }
@@ -664,7 +668,12 @@ mod global_events_tests {
 
         let app = with_global_events_route(Router::new());
         let response = app
-            .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .expect("/events must be mounted on the router");
         assert_eq!(response.status(), StatusCode::OK);
@@ -2074,7 +2083,8 @@ pub(crate) fn session_row_wire_in_bucket(
     project_bucket: &str,
     session_id: &str,
 ) -> Option<SessionRowWire> {
-    let manager = NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_bucket));
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_bucket));
     let meta = manager.read_meta(session_id).ok()?;
     let origin = match meta.origin {
         jeikcode_capabilities::session::SessionOrigin::Manual => "manual",
@@ -6564,7 +6574,7 @@ mod chat_event_type_tests {
         let calls: Vec<jeikcode_kernel::event::ToolBatchCall> =
             vec![jeikcode_kernel::event::ToolBatchCall {
                 id: "call-1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: "{}".into(),
                 parallel_safe: true,
             }];
@@ -6599,7 +6609,7 @@ mod chat_event_type_tests {
                 batch_id: "batch-1".into(),
                 calls: vec![jeikcode_kernel::event::ToolBatchCall {
                     id: "call-1".into(),
-                    name: "read_file".into(),
+                    name: "read".into(),
                     arguments: "{}".into(),
                     parallel_safe: true,
                 }],
@@ -15007,7 +15017,7 @@ mod channel_mode_tests {
             ChatEvent::PermissionRequest {
                 session_id: "s1".into(),
                 approval_id: "approval-c1".into(),
-                tool_name: "edit_file".into(),
+                tool_name: "edit".into(),
                 reason: "Requires approval".into(),
                 call_id: "c1".into(),
                 arguments: "{}".into(),
@@ -15208,7 +15218,7 @@ mod channel_mode_tests {
         let mut turn0_tool = Message::assistant("", Vec::new());
         turn0_tool.tool_calls = vec![jeikcode_kernel::tool::ToolCall {
             id: "call-1".into(),
-            name: "read_file".into(),
+            name: "read".into(),
             arguments: "{}".into(),
         }];
 

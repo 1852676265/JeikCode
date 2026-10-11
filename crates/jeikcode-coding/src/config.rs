@@ -185,10 +185,15 @@ pub struct CodingAgentConfig {
     pub thinking_type: Option<String>,
     /// Kimi K2.6 preserved thinking: `thinking.keep`. `None` ⇒ omit.
     pub thinking_keep: Option<String>,
-    /// Auto-compaction trigger as a fraction of the context window (real utilization
-    /// from the provider's reported prompt tokens). At/above this, the task-boundary
-    /// trigger runs [`StubCompaction`] to stub old tool results. Default `0.7` (the
-    /// normal-path threshold ported from core). Set `>= 1.0` to effectively disable.
+    /// Auto-compaction trigger as a fraction of the model's WATERMARK input budget
+    /// (`window − min(20K, the round's output budget)`; the usage side is the provider's
+    /// reported prompt tokens). At/above this, the task-boundary trigger runs
+    /// [`StubCompaction`] and — past the high-water mark — escalates to a drain+summary.
+    /// Default `0.9`. The denominator is the watermark budget, NOT the raw window and NOT
+    /// `[models.X] max_tokens`: a declared output ceiling (e.g. 384K) caps the per-call
+    /// budget but must never shrink the usable context (that conflation made a 1M-window
+    /// session warn "near the limit" at 49% while never auto-compacting). Set `>= 1.0` to
+    /// effectively disable.
     ///
     /// [`StubCompaction`]: jeikcode_capabilities::compaction::StubCompaction
     pub compact_threshold: f32,
@@ -785,7 +790,7 @@ impl CodingAgentConfig {
             thinking_budget: None,
             thinking_type: None,
             thinking_keep: None,
-            compact_threshold: 0.7,
+            compact_threshold: 0.9,
             web_search_provider: None,
             keep_interrupted_context: false,
             user_agent: None,

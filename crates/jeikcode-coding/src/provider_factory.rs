@@ -221,8 +221,12 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
     }
 }
 
+/// Default per-call output budget (the 64K tier) for a model that declares no
+/// `max_tokens`, window-clamped. Delegates to the kernel's watermark model so the value the
+/// agent loop puts on the wire and the value a configuration caller computes can never drift
+/// apart. NOTE: a capability/protocol budget ONLY — it never feeds the context/watermark math.
 pub fn default_max_tokens(context_window: u32) -> u32 {
-    (context_window / 4).clamp(8_000, 64_000)
+    jeikcode_kernel::agent::wire_output_budget(context_window, None)
 }
 
 pub fn derive_tier_config(
@@ -402,9 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn default_output_cap_matches_legacy_bounds() {
-        assert_eq!(default_max_tokens(16_000), 8_000);
-        assert_eq!(default_max_tokens(64_000), 16_000);
-        assert_eq!(default_max_tokens(200_000), 50_000);
+    fn default_output_budget_is_the_64k_tier_clamped_to_the_window() {
+        // Unset `max_tokens` ⇒ the 64K default tier; never above the model window.
+        assert_eq!(default_max_tokens(2_000_000), 64_000);
+        assert_eq!(default_max_tokens(200_000), 64_000);
+        assert_eq!(default_max_tokens(32_000), 32_000);
     }
 }

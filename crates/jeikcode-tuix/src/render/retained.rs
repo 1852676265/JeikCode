@@ -7719,7 +7719,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // - header: bold, terminal default fg. SGR Color::White
                 //   was tried for "亮白" emphasis but on iTerm2's light
                 //   preset the terminal maps it to the same shade as
-                //   the background — the entire `● Running 3 read_file
+                //   the background — the entire `● Running 3 read
                 //   calls in parallel` line went invisible (user
                 //   screenshot: child rows visible, header line blank).
                 //   Same root cause as the inline-code bright-white→
@@ -7961,7 +7961,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //     hiccups visually identical to real failures.
                 // Continuation lines (and success bodies) — default fg.
                 //
-                // Why split header vs continuation: when an edit_file
+                // Why split header vs continuation: when an edit
                 // error includes quoted code (e.g. "Partial match at
                 // lines 760-779" + actual file lines), painting the
                 // whole block red made it visually identical to a Diff
@@ -7975,7 +7975,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //     headers above.
                 //   * continuation_style — line ≥ 1 of any body and any
                 //     line of multi-line success output. Default fg so
-                //     quoted code (edit_file errors) and stderr (bash
+                //     quoted code (edit errors) and stderr (bash
                 //     failure body) stay readable.
                 //   * error_header / warn_header — line 0 of a failure
                 //     body, see B-discriminated logic below.
@@ -13895,7 +13895,7 @@ mod tests {
     /// Failure ToolResult: header line is bold red (so users still get
     /// the "this is bad" signal) but continuation lines fall back to
     /// default fg (so quoted code in error messages — common with
-    /// edit_file's "old_string not found" path — doesn't blend visually
+    /// edit's "old_string not found" path — doesn't blend visually
     /// with diff-remove blocks. See retained.rs UiLine::ToolResult arm.
     #[test]
     fn retained_tool_result_failure_header_red_body_default() {
@@ -16148,7 +16148,7 @@ mod tests {
 
         r.render(UiLine::ToolGroupRender {
             batch_id: "b1".into(),
-            header: "▸ Running 3 read_file calls in parallel".into(),
+            header: "▸ Running 3 read calls in parallel".into(),
             children: vec![
                 ToolGroupChild {
                     call_id: "c1".into(),
@@ -16176,7 +16176,7 @@ mod tests {
 
         let dump_before = vterm.dump();
         assert!(
-            dump_before.contains("Running 3 read_file"),
+            dump_before.contains("Running 3 read"),
             "header missing:\n{}",
             dump_before
         );
@@ -19568,7 +19568,7 @@ mod tests {
         );
     }
 
-    /// Bug repro: single edit_file tool call (auto-approved) must render
+    /// Bug repro: single edit tool call (auto-approved) must render
     /// exactly ONE ● EditFile row in body_lines. User report shows two
     /// when ToolCallResult arrives and both ToolCallCommit → commit_inflight_tool
     /// AND ToolResult's defense-in-depth commit_inflight_tool produce a row.
@@ -19585,7 +19585,7 @@ mod tests {
         });
         r.flush_deferred();
 
-        // Simulate ToolCallStarted -> inflight spinner for edit_file
+        // Simulate ToolCallStarted -> inflight spinner for edit
         r.render(UiLine::ToolCallInFlight {
             id: "call-edit-1".into(),
             name: "EditFile".into(),
@@ -19938,7 +19938,7 @@ mod tests {
         // side; pick a payload that lands a unique trailing marker near
         // the right edge so we can spot it later).
         let long_marker = "ENDMARKER";
-        let long_payload = format!("write_file(/long/path/to/file.md) {}", long_marker);
+        let long_payload = format!("write(/long/path/to/file.md) {}", long_marker);
         // Sanity: ensure the payload fits in a single body row so we
         // don't accidentally land the marker on a wrapped second row.
         assert!(
@@ -19970,7 +19970,7 @@ mod tests {
         // emit_body_line_inner / EL erase.)
         let short = {
             let mut row: Vec<Cell> = Vec::new();
-            push_str_cells(&mut row, "  write_file(file.md)", &CellStyle::default());
+            push_str_cells(&mut row, "  write(file.md)", &CellStyle::default());
             row
         };
         if let Some(last) = r.body_lines.last_mut() {

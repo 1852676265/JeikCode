@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// Default kernel cap on a single tool result's `content` byte length.
 ///
 /// 256 KiB (~64K tokens). Sized so a 2000-line numbered source file from
-/// `read_file` survives the backstop instead of being chopped into a crawl.
+/// `read` survives the backstop instead of being chopped into a crawl.
 /// Runaway tools (a `grep -r /`, an infinite generator) are still bounded well
 /// below a megabyte. Tools that declare `never_truncate_result()` skip this cap
 /// (and the artifact fold). `0` disables the cap (UNBOUNDED) — see
@@ -312,7 +312,7 @@ const TRUNCATION_RESUME_NUDGE: &str =
     "Output limit hit — your last response was cut off before finishing. If the task is \
      already complete, reply with a short summary and stop (no tool calls). Otherwise resume \
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
-     next section with edit_file) rather than re-emitting it all in one response.";
+     next section with edit) rather than re-emitting it all in one response.";
 
 // Provider adapters can emit these placeholder strings when no usable reasoning
 // was captured. Keep the neutral kernel cleanup list aligned with adapter output.
@@ -527,60 +527,81 @@ fn empty_exhaustion_message(
     }
 }
 
-/// The mid-turn input budget: the window minus a reservation for the completion
-/// (`max_tokens`) and a margin covering the byte-based token estimate's undercount.
-/// Used only by the pre-send compaction guard and the over-window advisory — the
-/// DISPLAYED window (`context_window()`) is unchanged, so users still see the model's
-/// full window while the guard keeps the real request (messages + completion) under
-/// the model's usable limit.
-fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
-    let output_reserve = max_tokens.unwrap_or(16_384);
-    let margin = (window / 8).clamp(16_000, 128_000);
-    let reserve = output_reserve.saturating_add(margin);
-    // If the reserve can't fit inside the window (unrealistically small windows,
-    // e.g. test fixtures), don't reserve — fall back to the raw window so the guard
-    // keeps its old `est >= window` behavior. Real model windows (>= 128K) always
-    // leave room, so this only affects tiny windows.
-    if reserve >= window {
-        window
+/// Output WATERMARK buffer — the ONLY output-derived term the pressure math reserves.
+///
+/// A small, fixed watermark (mirroring opencode's `COMPACTION_BUFFER`), capped at a quarter
+/// of the window so even tiny windows (test fixtures, misconfigurations) keep a gaugeable
+/// budget. `[models.X] max_tokens` (e.g. 384K) is a CAPABILITY DECLARATION that is passed to
+/// the provider as the protocol max budget — it NEVER enters the context/watermark math.
+/// (Reserving it verbatim once shrank a 1M-window model to a 491K input budget and warned
+/// "near the limit" at 49% — the "max_tokens folded into the context window" defect.)
+const OUTPUT_WATERMARK_BUFFER: u32 = 20_000;
+
+/// Default per-call output budget when `[models.X] max_tokens` is unset — the 64K tier the
+/// model editor offers (32K / 64K / 128K / 256K / 384K / custom).
+pub const DEFAULT_OUTPUT_BUDGET: u32 = 64_000;
+
+/// The output budget handed to the provider this round: the DECLARED value VERBATIM
+/// (`max_tokens` / `max_output_tokens` per protocol), or [`DEFAULT_OUTPUT_BUDGET`] when
+/// unset. The only adjustment is a window sanity clamp — a budget above the window is
+/// protocol-invalid on every gateway. This value never feeds the context/watermark math:
+/// the real output is whatever the model actually generates within it, and real context
+/// pressure comes from the provider's reported usage.
+pub fn wire_output_budget(window: u32, declared: Option<u32>) -> u32 {
+    let budget = declared.unwrap_or(DEFAULT_OUTPUT_BUDGET);
+    let bounded = if window > 0 {
+        budget.min(window)
     } else {
-        window - reserve
-    }
+        budget
+    };
+    bounded.max(1)
 }
 
-/// The pre-send over-window advisory. Fires when the estimate reaches `trigger_limit`
-/// (the effective input budget — window minus output reserve minus margin), so it
-/// warns BEFORE the real request crosses the model's usable limit. The user-facing
-/// text still references the full `ctx_window` — the reserve is internal.
+/// The input WATERMARK budget — the denominator of every pressure decision: the window
+/// minus [`OUTPUT_WATERMARK_BUFFER`] (no output term at all). Auto-compaction, the pre-send
+/// guard and the `CompactionView` handed to the strategy are all sized against THIS, so the
+/// declared output budget cannot influence when context pressure is acted on — real context
+/// is only ever measured by the provider-reported usage (or the byte estimate as fallback).
+fn input_watermark_budget(window: u32) -> u32 {
+    window.saturating_sub(OUTPUT_WATERMARK_BUFFER.min(window / 4))
+}
+
+/// The pre-send over-window advisory. Fires when the estimate reaches the WATERMARK budget
+/// (window − the fixed output watermark) — the same line auto-compaction acts on, so the
+/// advice and the trigger agree. The text names both terms so the arithmetic is auditable.
 fn over_window_advisory(
     est_prompt_tokens: u32,
     ctx_window: u32,
-    trigger_limit: u32,
+    watermark_limit: u32,
 ) -> Option<String> {
-    if ctx_window == 0 || (est_prompt_tokens as u64) < (trigger_limit as u64) {
+    if ctx_window == 0 || (est_prompt_tokens as u64) < (watermark_limit as u64) {
         return None;
     }
     Some(format!(
-        "请求约 {}K tokens 接近当前模型可用上限（窗口约 {}K，需为回复预留空间）：请精简输入或换用更大窗口的模型。",
+        "请求约 {}K tokens 已达上下文水位（窗口约 {}K − 水位缓冲 {}K）：请精简输入或换用更大窗口的模型。",
         est_prompt_tokens / 1000,
         ctx_window / 1000,
+        ctx_window.saturating_sub(watermark_limit) / 1000,
     ))
 }
 
-/// Auto-compaction pressure verdict: `used_tokens / ctx_window >= threshold`.
-/// Recomputed against the LIVE window (not a stored ratio) so a model switch is
+/// Auto-compaction pressure verdict: `used_tokens / input_watermark_budget >= threshold`.
+/// Recomputed against the LIVE model (not a stored ratio) so a model switch is
 /// re-evaluated each turn — switch to a smaller window ⇒ pressure rises ⇒ compact
 /// proactively; switch to a larger window ⇒ pressure drops ⇒ no needless compaction.
-/// `None` when the window is unknown (`ctx_window == 0`) — can't gauge, so don't act.
+/// The denominator is the WATERMARK budget (window − output watermark), NOT the raw window
+/// and NOT the declared output ceiling, so the trigger and the pre-send guard share one
+/// denominator line — no "warns every turn but never compacts" gap.
+/// `None` when the budget is unknown (`watermark_budget == 0`) — can't gauge, so don't act.
 fn auto_compact_trigger(
     used_tokens: u32,
-    ctx_window: u32,
+    watermark_budget: u32,
     threshold: f32,
 ) -> Option<CompactTrigger> {
-    if ctx_window == 0 {
+    if watermark_budget == 0 {
         return None;
     }
-    let utilization = used_tokens as f32 / ctx_window as f32;
+    let utilization = used_tokens as f32 / watermark_budget as f32;
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
 }
 
@@ -1299,8 +1320,13 @@ impl RunningAgent {
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
     /// `compact_threshold` is configured AND the last stored assistant turn's raw
-    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model window
-    /// are `>= threshold`. Reads `used_tokens` — NOT the stored `meta.utilization`
+    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model's
+    /// WATERMARK budget (`window − min(20K, output budget)`) are `>= threshold`
+    /// (default 0.9). The denominator is the watermark budget — NOT the raw window and
+    /// NOT the declared output ceiling — so this trigger and the pre-send guard share
+    /// one line: a `max_tokens` capability ceiling (e.g. 384K) can no longer shrink the
+    /// usable context, and there is no "warns every turn but never compacts" gap.
+    /// Reads `used_tokens` — NOT the stored `meta.utilization`
     /// ratio, which baked in whatever window was active when that turn was recorded;
     /// switching to a smaller-window model must re-evaluate (the stored ratio, e.g.
     /// 0.23 against a 1M window, stays below the threshold, so the first send would
@@ -1321,7 +1347,8 @@ impl RunningAgent {
         // stored-ratio behavior for the unknown-window case (no regression there).
         let live = self.provider.context_window();
         let window = if live > 0 { live } else { recorded_window };
-        auto_compact_trigger(used, window, thresh)
+        let budget = input_watermark_budget(window);
+        auto_compact_trigger(used, budget, thresh)
     }
 
     /// Give an in-kernel continuation the same automatic-compaction opportunity as
@@ -1350,11 +1377,15 @@ impl RunningAgent {
             .map(|meta| (meta.ctx_window, meta.used_tokens))
             .unwrap_or((0, 0));
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 {
+        let window = if live_window > 0 {
             live_window
         } else {
             recorded_window
         };
+        // Pressure math runs against the WATERMARK budget (window − the fixed watermark), NOT
+        // the raw window and NOT the declared output budget — so the strategy's keep-budget /
+        // drain marks / auto escalation use the exact denominator the trigger used.
+        let ctx_window = input_watermark_budget(window);
         let utilization = if ctx_window > 0 {
             used_tokens as f32 / ctx_window as f32
         } else {
@@ -1397,16 +1428,19 @@ impl RunningAgent {
             .and_then(|m| m.meta.as_ref())
             .map(|meta| (meta.ctx_window, meta.used_tokens))
             .unwrap_or((0, 0));
-        // Size this compaction to the CURRENT model window (fall back to the recorded
-        // one only when the live window is unknown), and recompute pressure against it.
-        // A compaction running after a model switch must use the NEW window — otherwise
-        // the keep-budget / drain math would be sized to the previous model's window.
+        // Size this compaction to the CURRENT model's WATERMARK budget (fall back to the
+        // recorded window only when the live window is unknown), and recompute pressure
+        // against it. A compaction running after a model switch must use the NEW window —
+        // otherwise the keep-budget / drain math would be sized to the previous model's
+        // window. The budget — not the raw window, and never the declared output budget —
+        // is what the strategy's pressure math is sized against.
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 {
+        let window = if live_window > 0 {
             live_window
         } else {
             recorded_window
         };
+        let ctx_window = input_watermark_budget(window);
         let utilization = if ctx_window > 0 {
             used_tokens as f32 / ctx_window as f32
         } else {
@@ -2384,7 +2418,7 @@ impl RunningAgent {
             // floor — unrecoverable, so fall through to the advisory).
             {
                 let window = self.provider.context_window();
-                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                let limit = input_watermark_budget(window);
                 let est = |msgs: &[Message]| -> u64 {
                     msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
                 };
@@ -2425,7 +2459,7 @@ impl RunningAgent {
             if !over_window_warned {
                 let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
                 let window = self.provider.context_window();
-                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                let limit = input_watermark_budget(window);
                 if let Some(advisory) = over_window_advisory(est, window, limit) {
                     over_window_warned = true;
                     self.rt.emit(AgentEvent::Warning(advisory));
@@ -2454,6 +2488,19 @@ impl RunningAgent {
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
             let mut request_options = self.chat_options.clone();
+            // OUTPUT BUDGET (capability declaration → protocol max budget): the configured
+            // `[models.X] max_tokens` rides the wire VERBATIM (32K / 64K / 128K / 256K / 384K /
+            // custom; 64K when unset), so the model may generate up to it. It deliberately
+            // does NOT feed the context/watermark math above — that math uses the window minus
+            // a fixed watermark buffer, and real pressure comes from the provider's report.
+            // `pre_request_options` runs below and may still override (documented hook seam).
+            let wire_window = self.provider.context_window();
+            if wire_window > 0 {
+                request_options.max_tokens = Some(wire_output_budget(
+                    wire_window,
+                    self.chat_options.max_tokens,
+                ));
+            }
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
             self.hooks
                 .pre_request_options(&messages, &mut request_options, &turn_ctx)
@@ -3459,7 +3506,7 @@ impl RunningAgent {
                 std::collections::HashSet::new();
             let mut seen_calls: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
-            // VISION: images a tool produced this batch (e.g. read_file on a picture),
+            // VISION: images a tool produced this batch (e.g. read on a picture),
             // collected to attach to ONE follow-up user message AFTER every tool_result
             // is in — see the injection at the loop's end for why this is deferred.
             let mut turn_images: Vec<crate::message::ImageContent> = vec![];
@@ -3937,7 +3984,7 @@ impl RunningAgent {
                 } else if batch_start.is_some() {
                     batch_ok += 1;
                 }
-                // VISION: a tool may return inline images (read_file on a picture). The
+                // VISION: a tool may return inline images (read on a picture). The
                 // tool-result message itself stays TEXT — a provider rejects images in a
                 // tool message — so harvest them here and attach to a single follow-up
                 // user message once ALL of this assistant's tool_results are pushed
@@ -4756,20 +4803,22 @@ mod over_window_advisory_tests {
     use super::over_window_advisory;
 
     #[test]
-    fn fires_at_or_over_window() {
+    fn fires_at_or_over_the_watermark() {
+        // 200K window ⇒ watermark budget = 200_000 − min(20_000, 50_000) = 180_000.
+        assert_eq!(super::input_watermark_budget(200_000), 180_000);
         assert!(
-            over_window_advisory(200_000, 200_000, 200_000).is_some(),
-            "exactly at window must warn"
+            over_window_advisory(180_000, 200_000, 180_000).is_some(),
+            "exactly at the watermark budget must warn"
         );
         assert!(
-            over_window_advisory(339_000, 200_000, 200_000).is_some(),
-            "over window must warn"
+            over_window_advisory(339_000, 200_000, 180_000).is_some(),
+            "over the watermark budget must warn"
         );
     }
 
     #[test]
-    fn silent_within_window() {
-        assert!(over_window_advisory(150_000, 200_000, 200_000).is_none());
+    fn silent_below_the_watermark() {
+        assert!(over_window_advisory(179_999, 200_000, 180_000).is_none());
     }
 
     #[test]
@@ -4779,9 +4828,13 @@ mod over_window_advisory_tests {
 
     #[test]
     fn advisory_is_actionable_and_one_line() {
-        let m = over_window_advisory(339_000, 200_000, 200_000).expect("over-window must warn");
+        let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
         assert!(!m.contains('\n'), "must be a single line: {m}");
         assert!(m.contains("窗口"), "must name the window: {m}");
+        assert!(
+            m.contains("水位缓冲"),
+            "must name the watermark buffer so the math is auditable: {m}"
+        );
         assert!(
             m.contains("精简") || m.contains("更大窗口"),
             "must give actionable advice (trim / larger window): {m}"
@@ -4793,13 +4846,24 @@ mod over_window_advisory_tests {
     }
 
     #[test]
-    fn fires_at_effective_limit_below_window() {
-        // window 1_000_000, effective limit 858_616 (16_384 output + 125_000 margin).
-        // An estimate of 900_000 is UNDER the window but OVER the effective limit —
-        // the old `est >= window` gate would stay silent; the reserve makes it warn.
-        assert!(super::over_window_advisory(900_000, 1_000_000, 858_616).is_some());
-        // Just under the effective limit → still silent.
-        assert!(super::over_window_advisory(800_000, 1_000_000, 858_616).is_none());
+    fn declared_output_budget_never_shrinks_the_trigger() {
+        // The reported defect: a declared 384K output budget on a 1M window used to reserve
+        // 384K + 125K ⇒ warning from 491K (49% utilization!). It is now a pure protocol
+        // budget; the trigger sits at the watermark budget 980K — and the very request that
+        // produced the bogus advisory (582K real / ~491K estimated) is comfortably silent.
+        let window = 1_000_000;
+        let limit = super::input_watermark_budget(window);
+        assert_eq!(limit, 980_000);
+        assert_eq!(
+            super::wire_output_budget(window, Some(384_000)),
+            384_000,
+            "the declaration rides the wire verbatim"
+        );
+        assert!(
+            over_window_advisory(582_000, window, limit).is_none(),
+            "a 582K request into a 1M window must NOT warn"
+        );
+        assert!(over_window_advisory(980_000, window, limit).is_some());
     }
 }
 
@@ -4850,25 +4914,31 @@ mod cap_tool_result_tests {
 
 #[cfg(test)]
 mod auto_compact_trigger_tests {
-    use super::{auto_compact_trigger, CompactTrigger};
+    use super::{auto_compact_trigger, input_watermark_budget, CompactTrigger};
 
-    fn fires(used: u32, window: u32, thresh: f32) -> bool {
+    /// Watermark budget for a model window — the exact denominator `should_compact` feeds
+    /// the trigger. No output term: a declared output budget never influences pressure.
+    fn budget(window: u32) -> u32 {
+        input_watermark_budget(window)
+    }
+
+    fn fires(used: u32, watermark_budget: u32, thresh: f32) -> bool {
         matches!(
-            auto_compact_trigger(used, window, thresh),
+            auto_compact_trigger(used, watermark_budget, thresh),
             Some(CompactTrigger::Auto { .. })
         )
     }
 
     #[test]
     fn switch_to_smaller_window_recomputes_and_fires() {
-        // 229K tokens sat at 23% of a 1M window (no compaction there)…
+        // 229K tokens sat at 23% of a 1M-window budget (no compaction there)…
         assert!(
-            !fires(229_000, 1_000_000, 0.7),
+            !fires(229_000, budget(1_000_000), 0.9),
             "under a 1M window: no compaction"
         );
-        // …but switching to a 64K window recomputes to 3.6× over → must compact.
+        // …but switching to a 64K window recomputes well over the threshold → must compact.
         assert!(
-            fires(229_000, 64_000, 0.7),
+            fires(229_000, budget(64_000), 0.9),
             "switch to 64K window: must compact"
         );
     }
@@ -4877,29 +4947,47 @@ mod auto_compact_trigger_tests {
     fn switch_to_larger_window_does_not_fire() {
         // Pressure drops when the window grows — no needless compaction.
         assert!(
-            !fires(60_000, 1_000_000, 0.7),
+            !fires(60_000, budget(1_000_000), 0.9),
             "60K in a 1M window: no compaction"
         );
     }
 
     #[test]
     fn threshold_boundary_and_unknown_window() {
-        assert!(fires(7_000, 10_000, 0.7), "exactly at threshold fires");
-        assert!(!fires(6_999, 10_000, 0.7), "just below threshold does not");
-        assert!(!fires(999_999, 0, 0.7), "unknown window (0) never fires");
+        assert!(fires(9_000, 10_000, 0.9), "exactly at threshold fires");
+        assert!(!fires(8_999, 10_000, 0.9), "just below threshold does not");
+        assert!(!fires(999_999, 0, 0.9), "unknown budget (0) never fires");
     }
 
     #[test]
     fn carries_the_recomputed_utilization() {
-        match auto_compact_trigger(229_000, 64_000, 0.7) {
+        match auto_compact_trigger(229_000, 64_000, 0.9) {
             Some(CompactTrigger::Auto { utilization }) => {
                 assert!(
                     (utilization - 229_000.0 / 64_000.0).abs() < 1e-4,
-                    "utilization vs CURRENT window"
+                    "utilization vs the CURRENT watermark budget"
                 );
             }
             other => panic!("expected Auto, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn declared_384k_ceiling_no_longer_compacts_a_comfortable_session() {
+        // The reported session: 1M window, `[models.X] max_tokens = 384000`, 582K real
+        // prompt tokens. OLD: the declaration was reserved (491K guard) while the
+        // window-based threshold sat at 700K ⇒ a turn that warns every round but never
+        // compacts. NEW: the declaration is a pure protocol budget, so the watermark
+        // budget is 1M − 20K = 980K and the trigger sits at 0.9 × 980K = 882K ⇒ the 582K
+        // session is comfortably below; only a genuinely full window compacts.
+        let b = budget(1_000_000);
+        assert_eq!(b, 980_000);
+        assert!(!fires(582_000, b, 0.9), "582K must not compact a 1M window");
+        assert!(!fires(881_999, b, 0.9), "just below 90%: no compaction");
+        assert!(
+            fires(882_000, b, 0.9),
+            "90% of the watermark budget: compact"
+        );
     }
 }
 
@@ -5000,7 +5088,9 @@ mod internal_continuation_compaction_tests {
 
     #[tokio::test]
     async fn hook_continuation_compacts_at_threshold_before_next_round() {
-        let (events, calls) = run_hook_continuation(700).await;
+        // The threshold is a fraction of the WATERMARK budget (window 1_000 − the fixed
+        // 250-token watermark = 750) ⇒ "at threshold" = 0.7 × 750 = 525 prompt tokens.
+        let (events, calls) = run_hook_continuation(525).await;
         assert!(
             events.iter().any(|event| matches!(
                 event,
@@ -5026,7 +5116,8 @@ mod internal_continuation_compaction_tests {
 
     #[tokio::test]
     async fn hook_continuation_below_threshold_does_not_compact() {
-        let (events, calls) = run_hook_continuation(699).await;
+        // One token below the watermark-budget threshold (0.7 × 750 = 525).
+        let (events, calls) = run_hook_continuation(524).await;
         assert!(
             !events
                 .iter()
@@ -5038,12 +5129,15 @@ mod internal_continuation_compaction_tests {
 
     #[tokio::test]
     async fn later_summary_stage_is_not_blocked_by_an_earlier_noop_stage() {
+        // Usages are chosen against the WATERMARK budget (window 1_000 − 250 = 750) so they
+        // straddle the policy's 0.78 summary gate: 540/750 = 0.72 (rewrite stage) then
+        // 600/750 = 0.80 (summary stage). Both are ≥ the 0.7 trigger.
         let provider = Arc::new(
             MockProvider::new(vec![
                 vec![
                     StreamEvent::TextDelta("moderate pressure".into()),
                     StreamEvent::Usage(TokenUsage {
-                        prompt: 700,
+                        prompt: 540,
                         completion: 1,
                         cached: 0,
                     }),
@@ -5052,7 +5146,7 @@ mod internal_continuation_compaction_tests {
                 vec![
                     StreamEvent::TextDelta("high pressure".into()),
                     StreamEvent::Usage(TokenUsage {
-                        prompt: 780,
+                        prompt: 600,
                         completion: 1,
                         cached: 0,
                     }),
@@ -5406,7 +5500,7 @@ mod partial_stream_persistence_tests {
         convo.push(Message::user("work"));
         let call = ToolCall {
             id: "call-1".into(),
-            name: "write_file".into(),
+            name: "write".into(),
             arguments: r#"{"path":"x"}"#.into(),
         };
 
@@ -5743,7 +5837,11 @@ mod steer_buffer_tests {
             "the announced identity is the stored kernel message id; got {:?}",
             prompts[0].0
         );
-        assert_eq!(steered_ids.len(), 1, "the folded steer announces its stored identity");
+        assert_eq!(
+            steered_ids.len(),
+            1,
+            "the folded steer announces its stored identity"
+        );
         assert!(
             steered_ids[0]
                 .as_deref()
@@ -5874,7 +5972,11 @@ mod steer_buffer_tests {
         }
         // The folded input now also carries the STORED identity of the message it
         // became (回传 id)；断言文本/图片不变，且身份确实是内核消息 id。
-        assert_eq!(steered_inputs.len(), 1, "one folded prompt → Steered {{ count: 1 }}");
+        assert_eq!(
+            steered_inputs.len(),
+            1,
+            "one folded prompt → Steered {{ count: 1 }}"
+        );
         assert_eq!(steered_inputs[0].text, "STEER-COUNT");
         assert!(steered_inputs[0].images.is_empty());
         assert!(
@@ -6097,40 +6199,36 @@ mod provider_message_pairing_tests {
 }
 
 #[cfg(test)]
-mod effective_input_limit_tests {
-    use super::effective_input_limit;
+mod output_budget_tests {
+    use super::{input_watermark_budget, wire_output_budget, DEFAULT_OUTPUT_BUDGET};
 
     #[test]
-    fn reserves_output_plus_margin() {
-        // deepseek-v4-flash: 1M window, 16,384 max_tokens.
-        // margin = 1_000_000/8 = 125_000; reserve = 16_384 + 125_000 = 141_384.
-        assert_eq!(effective_input_limit(1_000_000, Some(16_384)), 858_616);
-        // GLM: 200K window, 16,384 max_tokens.
-        // margin = 200_000/8 = 25_000; reserve = 16_384 + 25_000 = 41_384.
-        assert_eq!(effective_input_limit(200_000, Some(16_384)), 158_616);
+    fn declared_budget_rides_the_wire_verbatim() {
+        // The model editor's tiers: 32K / 64K / 128K / 256K / 384K / custom.
+        for tier in [32_000, 64_000, 128_000, 256_000, 384_000] {
+            assert_eq!(wire_output_budget(1_000_000, Some(tier)), tier);
+        }
+        // Unset ⇒ the 64K default tier.
+        assert_eq!(DEFAULT_OUTPUT_BUDGET, 64_000);
+        assert_eq!(wire_output_budget(1_000_000, None), 64_000);
+        // The ONLY adjustment is the window sanity clamp (a budget above the window is
+        // protocol-invalid on every gateway) — never a capability downsizing.
+        assert_eq!(wire_output_budget(16_000, Some(384_000)), 16_000);
+        // Unknown window ⇒ the declaration passes through untouched.
+        assert_eq!(wire_output_budget(0, Some(384_000)), 384_000);
     }
 
     #[test]
-    fn none_max_tokens_uses_default_16384() {
-        assert_eq!(effective_input_limit(1_000_000, None), 858_616);
-    }
-
-    #[test]
-    fn margin_clamps_floor_and_ceiling() {
-        // Small window: 64_000/8 = 8_000 → clamped UP to 16_000.
-        // reserve = 16_384 + 16_000 = 32_384; effective = 31_616.
-        assert_eq!(effective_input_limit(64_000, Some(16_384)), 31_616);
-        // Large window: 2_000_000/8 = 250_000 → clamped DOWN to 128_000.
-        // reserve = 16_384 + 128_000 = 144_384; effective = 1_855_616.
-        assert_eq!(effective_input_limit(2_000_000, Some(16_384)), 1_855_616);
-    }
-
-    #[test]
-    fn tiny_window_falls_back_to_raw_window() {
-        // reserve (~32_384) exceeds a tiny window → no reservation possible, so it
-        // falls back to the raw window (old `est >= window` behavior). Never panics.
-        assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
-        assert_eq!(effective_input_limit(100, Some(16_384)), 100);
+    fn watermark_budget_has_no_output_term() {
+        // 1M window ⇒ window − min(20K, window/4) = 980K, whatever the declared output is.
+        assert_eq!(input_watermark_budget(1_000_000), 980_000);
+        assert_eq!(input_watermark_budget(200_000), 180_000);
+        // Tiny windows (test fixtures / misconfigurations): the buffer is capped at a
+        // quarter of the window so a gaugeable budget always remains.
+        assert_eq!(input_watermark_budget(1_000), 750);
+        assert_eq!(input_watermark_budget(100), 75);
+        // Unknown window ⇒ 0 (callers treat 0 as "can't gauge").
+        assert_eq!(input_watermark_budget(0), 0);
     }
 }
 

@@ -1,4 +1,4 @@
-//! `edit_file` — replace an exact, UNIQUE text fragment in a file (or all of them
+//! `edit` — replace an exact, UNIQUE text fragment in a file (or all of them
 //! with `replace_all`). Mutates the filesystem ⇒ always `Risky`.
 //!
 //! Public schema matches mainstream agent editors: `old_string` / `new_string`,
@@ -136,13 +136,15 @@ impl Tool for EditFileTool {
                     .enumerate()
                     .filter(|(_, hunk)| {
                         hunk.is_object()
-                            && ["old_string", "old_str", "oldText", "search"].iter().all(|key| {
-                                hunk.get(key)
-                                    .and_then(|value| value.as_str())
-                                    .map(str::trim)
-                                    .unwrap_or("")
-                                    .is_empty()
-                            })
+                            && ["old_string", "old_str", "oldText", "search"]
+                                .iter()
+                                .all(|key| {
+                                    hunk.get(key)
+                                        .and_then(|value| value.as_str())
+                                        .map(str::trim)
+                                        .unwrap_or("")
+                                        .is_empty()
+                                })
                     })
                     .map(|(index, _)| index)
                     .collect();
@@ -217,7 +219,7 @@ impl Tool for EditFileTool {
                 .all(|h| h.old_string.is_empty() && h.new_string.is_empty())
         {
             return err(
-                "edit_file: provide a non-empty `edits` array with `old_string` and `new_string`."
+                "edit: provide a non-empty `edits` array with `old_string` and `new_string`."
                     .to_string(),
             );
         }
@@ -257,7 +259,7 @@ impl Tool for EditFileTool {
             Some(d) => d,
             None => {
                 return err(format!(
-                    "edit_file: cannot read {} as UTF-8 or a supported legacy text encoding \
+                    "edit: cannot read {} as UTF-8 or a supported legacy text encoding \
                      (GBK/GB18030). Convert it to UTF-8 first. The file was NOT modified.",
                     crate::pathnorm::to_display(&path)
                 ))
@@ -281,7 +283,7 @@ impl Tool for EditFileTool {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return err(e),
             Err(e) => {
-                return err(format!("edit_file: apply task failed: {e}"));
+                return err(format!("edit: apply task failed: {e}"));
             }
         };
         let HunkApplyResult {
@@ -298,7 +300,7 @@ impl Tool for EditFileTool {
                 format!(" skipped hunks: {}.", skipped.join(", "))
             };
             return ok(format!(
-                "edit_file: no replacements applied; the file was not modified.{skip_note}"
+                "edit: no replacements applied; the file was not modified.{skip_note}"
             ));
         }
         if let Err(msg) = write_encoded(&path, &buf, file_encoding).await {
@@ -363,7 +365,7 @@ fn apply_hunks_cpu(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<HunkApplyResult, String> {
     if cancel.is_cancelled() {
-        return Err("edit_file: cancelled.".into());
+        return Err("edit: cancelled.".into());
     }
     crate::tools::edit_history::record_version(path, &content);
     let mut hunks = hunks;
@@ -385,7 +387,7 @@ fn apply_hunks_cpu(
     let mut skipped: Vec<String> = Vec::new();
     for (i, h) in hunks.iter().enumerate() {
         if cancel.is_cancelled() {
-            return Err("edit_file: cancelled.".into());
+            return Err("edit: cancelled.".into());
         }
         if !h.old_string.is_empty() && h.old_string == h.new_string {
             skipped.push(format!("{} (identical old/new)", i + 1));
@@ -424,7 +426,7 @@ fn apply_hunks_cpu(
                         auto_healed_old_strings.push(rebased.actual_old_string);
                     }
                 } else if cancel.is_cancelled() {
-                    return Err("edit_file: cancelled.".into());
+                    return Err("edit: cancelled.".into());
                 } else {
                     let hunk_idx = if h.original_index > 0 {
                         h.original_index
@@ -440,7 +442,7 @@ fn apply_hunks_cpu(
                         String::new()
                     };
                     return Err(format!(
-                        "edit_file: hunk {}/{} failed. The file was NOT modified.{prior_note} {e}",
+                        "edit: hunk {}/{} failed. The file was NOT modified.{prior_note} {e}",
                         hunk_idx,
                         hunks.len()
                     ));
@@ -623,7 +625,7 @@ fn apply_hunk_with(
             diagnose,
         );
     }
-    Err("edit_file: provide a non-empty `old_string` in each edit hunk.".into())
+    Err("edit: provide a non-empty `old_string` in each edit hunk.".into())
 }
 
 /// Topologically sorts multiple edit hunks within a file:
@@ -821,7 +823,7 @@ fn locate_hunk_lines(content_lines: &[&str], old_string: &str) -> Option<(usize,
     }
 }
 
-/// If a model accidentally copies lines from `read_file` with the `LINE_NUMBER→` prefix,
+/// If a model accidentally copies lines from `read` with the `LINE_NUMBER→` prefix,
 /// this helper strips that prefix so the target snippet can match cleanly.
 fn strip_line_prefix_hints(text: &str) -> Option<String> {
     let mut stripped = String::with_capacity(text.len());
@@ -1052,14 +1054,14 @@ async fn write_encoded(
 ) -> Result<(), String> {
     let bytes = crate::tools::encoding::encode(text, encoding).ok_or_else(|| {
         format!(
-            "edit_file: cannot re-encode the edit to {}'s original encoding; the file was \
+            "edit: cannot re-encode the edit to {}'s original encoding; the file was \
              NOT modified. Convert it to UTF-8 first.",
             crate::pathnorm::to_display(path)
         )
     })?;
     tokio::fs::write(path, bytes).await.map_err(|e| {
         format!(
-            "edit_file: failed to write {}: {e}",
+            "edit: failed to write {}: {e}",
             crate::pathnorm::to_display(path)
         )
     })
@@ -1691,7 +1693,7 @@ fn try_comment_style_replace(
     ))
 }
 
-const MISMATCH_GREP_HINT: &str = "[Content Mismatch]: Target old_string could not be located in the file. Please use grep to locate the target symbol or read a narrow window with read_file.";
+const MISMATCH_GREP_HINT: &str = "[Content Mismatch]: Target old_string could not be located in the file. Please use grep to locate the target symbol or read a narrow window with `read`.";
 
 /// Line-level similarity with a hard cap so a minified / data-URL line cannot
 /// run character Levenshtein on tens of thousands of chars.
@@ -2292,7 +2294,9 @@ mod tests {
             "replace_all": true,
             "edits": [{"old_string": "dup", "new_string": "x"}]
         });
-        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        let r = EditFileTool
+            .execute(&args.to_string(), &ctx(d.path()))
+            .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("per-hunk"), "{}", r.content);
         // 拒绝必须发生在写盘之前。
@@ -2311,7 +2315,9 @@ mod tests {
             "file_path": "a.txt",
             "edits": [{"old_string": "dup", "new_string": "x", "replace_all": true}]
         });
-        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        let r = EditFileTool
+            .execute(&args.to_string(), &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
@@ -2330,7 +2336,9 @@ mod tests {
             "new_string": "x",
             "replace_all": true
         });
-        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        let r = EditFileTool
+            .execute(&args.to_string(), &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
@@ -2347,7 +2355,9 @@ mod tests {
             "file_path": "a.txt",
             "edits": [{"old_string": "dup", "new_string": "x", "replace_all": true, "occurrence": 2}]
         });
-        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        let r = EditFileTool
+            .execute(&args.to_string(), &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
@@ -2368,7 +2378,9 @@ mod tests {
                 {"new_string": "新增"}
             ]
         });
-        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        let r = EditFileTool
+            .execute(&args.to_string(), &ctx(d.path()))
+            .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("edits[1]"), "{}", r.content);
         assert_eq!(
@@ -2401,7 +2413,7 @@ mod tests {
     }
 
     // A CRLF (Windows) file edited with a multi-line `old_string` whose line break is
-    // `\n` — which is exactly what read_file shows the model, because read_file does
+    // `\n` — which is exactly what read shows the model, because read does
     // `text.lines()` and strips the `\r`. The edit must still succeed, and the file must
     // stay CRLF (no mixed line endings introduced).
     #[tokio::test]
@@ -2512,7 +2524,7 @@ mod tests {
     }
 
     // The reported "改不动只能写脚本" case: the file is TAB-indented but the model
-    // reproduced the body with SPACE indentation (read_file faithfully passes the tabs;
+    // reproduced the body with SPACE indentation (read faithfully passes the tabs;
     // the model dropped them). Exact + EOL match both fail. The whitespace-normalized
     // fuzzy fallback must match line-by-line ignoring leading whitespace, and write back
     // using the file's REAL indentation (tabs preserved).
@@ -2558,7 +2570,7 @@ mod tests {
             "fn f() {\r\n\tlet x = 1;\r\n\tlet y = 2;\r\n}\r\n",
         )
         .unwrap();
-        // Model copied LF text (read_file strips \r) with SPACE indentation.
+        // Model copied LF text (read strips \r) with SPACE indentation.
         let r = EditFileTool
             .execute(
                 r#"{"file_path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
@@ -2882,7 +2894,7 @@ mod tests {
     async fn test_stripped_arrow_prefix_succeeds() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("code.rs"), "fn foo() {\n    bar();\n}\n").unwrap();
-        // Model accidentally copied read_file output prefix "1→" and "2→"
+        // Model accidentally copied read output prefix "1→" and "2→"
         let args = serde_json::json!({
             "file_path": "code.rs",
             "edits": [
@@ -3075,7 +3087,7 @@ fn b() { 2 }
                     value["hunk"] = serde_json::json!({"old_string":"a", "new_string":"changed"});
                 }
                 let args = value.to_string();
-                let repaired = crate::tools::repair::repair_tool_args("edit_file", &args);
+                let repaired = crate::tools::repair::repair_tool_args("edit", &args);
                 assert_eq!(
                     repaired, args,
                     "original incomplete edits must not be repaired"
@@ -3121,7 +3133,7 @@ fn b() { 2 }
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join("mod.rs"),
-            "            \"todowrite\",\n            \"read_file\",\n",
+            "            \"todowrite\",\n            \"read\",\n",
         )
         .unwrap();
         let args = serde_json::json!({
@@ -3142,7 +3154,7 @@ fn b() { 2 }
         );
         assert_eq!(
             std::fs::read_to_string(d.path().join("mod.rs")).unwrap(),
-            "            \"todowrite\",\n            \"read_file\",\n"
+            "            \"todowrite\",\n            \"read\",\n"
         );
     }
 

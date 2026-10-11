@@ -346,7 +346,7 @@ pub(crate) fn split_absolute_base(pattern: &str) -> Option<(PathBuf, String)> {
     // which resolves `~` via resolve_path); expand it so `glob("~/proj/**/*.rs")`
     // isn't silently walked relative to cwd.
     let base = if crate::pathutil::expand_tilde(dir).is_some() || is_absolute_path(dir) {
-        // Same resolver as read_file: `~`, POSIX `/tmp`, MSYS `/c/Users`, Windows
+        // Same resolver as read: `~`, POSIX `/tmp`, MSYS `/c/Users`, Windows
         // drive/UNC. Dummy cwd is unused for these absolute/tilde forms.
         resolve_path(dir, Path::new("."))
     } else {
@@ -455,7 +455,7 @@ mod tests {
         }
     }
 
-    /// Same recovery clue as `grep`/`list_directory` — glob failed on the identical guessed
+    /// Same recovery clue as `grep`/`read` — glob failed on the identical guessed
     /// path in the reported session.
     #[tokio::test]
     async fn missing_base_dir_error_carries_the_nearest_existing_ancestor() {

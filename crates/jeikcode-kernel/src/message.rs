@@ -361,7 +361,7 @@ impl Message {
         }
     }
     /// A KERNEL-INJECTED `Role::User` message carrying `images` — used by the agent
-    /// loop to surface images a TOOL produced (e.g. `read_file` on a picture) to the
+    /// loop to surface images a TOOL produced (e.g. `read` on a picture) to the
     /// model, since a provider only serializes images on a user message, never a tool
     /// message. `synthetic = true` so `sacred_floor` skips it when locating the real
     /// task prompt (same rationale as [`Message::synthetic_user`]).
@@ -1241,6 +1241,12 @@ pub enum CompactTrigger {
 pub struct CompactionView<'a> {
     pub messages: &'a [Message],
     pub trigger: CompactTrigger,
+    /// The INPUT budget this pressure math is sized against — the model window minus the
+    /// fixed output watermark buffer (`window − min(20K, window/4)`), NOT the raw model
+    /// window. The declared output budget (`[models.X] max_tokens`) deliberately has NO term
+    /// here: it is a capability declaration + the protocol max budget only, so it can never
+    /// shrink the usable context. `recent_keep_budget` / drain marks / auto-escalation all
+    /// derive from it.
     pub ctx_window: u32,
     pub used_tokens: u32,
     pub utilization: f32,
@@ -1587,7 +1593,7 @@ mod tests {
         c.push(Message::user("do two things"));
         c.push(Message::assistant(
             "calling",
-            vec![call("call_1", "write_file"), call("call_2", "echo")],
+            vec![call("call_1", "write"), call("call_2", "echo")],
         ));
         let before = c.messages.clone();
         assert_eq!(c.messages.len(), 2);
@@ -1622,7 +1628,7 @@ mod tests {
         let mut c = Conversation::new();
         c.push(Message::assistant(
             "calling",
-            vec![call("same", "write_file"), call("same", "write_file")],
+            vec![call("same", "write"), call("same", "write")],
         ));
 
         c.backfill_interrupted_tool_results();
@@ -1646,15 +1652,9 @@ mod tests {
     fn cancel_preserves_completed_pairs_and_backfills_incomplete() {
         let mut c = Conversation::new();
         c.push(Message::user("read then edit"));
-        c.push(Message::assistant(
-            "read",
-            vec![call("call_1", "read_file")],
-        ));
+        c.push(Message::assistant("read", vec![call("call_1", "read")]));
         c.push(Message::tool_result("call_1", "fn main() {}", false));
-        c.push(Message::assistant(
-            "edit",
-            vec![call("call_2", "edit_file")],
-        ));
+        c.push(Message::assistant("edit", vec![call("call_2", "edit")]));
         let before = c.messages.clone();
         assert_eq!(c.messages.len(), 4);
 
@@ -1719,7 +1719,7 @@ mod tests {
             vec![
                 ToolCall {
                     id: "call_1".into(),
-                    name: "read_file".into(),
+                    name: "read".into(),
                     arguments: "{\"path\":\"/x\"}".into(),
                 },
                 ToolCall {
@@ -1776,7 +1776,7 @@ mod tests {
             "tool_calls must survive the round-trip"
         );
         assert_eq!(asst.tool_calls[0].id, "call_1");
-        assert_eq!(asst.tool_calls[0].name, "read_file");
+        assert_eq!(asst.tool_calls[0].name, "read");
         assert_eq!(asst.tool_calls[0].arguments, "{\"path\":\"/x\"}");
         assert_eq!(asst.tool_calls[1].id, "call_2");
 
@@ -2276,7 +2276,7 @@ mod tests {
         let mut c = Conversation::new();
         c.push(Message::system("sys"));
         c.push(Message::user("task"));
-        c.push(Message::assistant("call", vec![call("c1", "read_file")]));
+        c.push(Message::assistant("call", vec![call("c1", "read")]));
         c.push(Message::tool_result(
             "c1",
             "HUGE TOOL OUTPUT THAT IS LONG",

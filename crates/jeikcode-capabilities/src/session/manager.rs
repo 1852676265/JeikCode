@@ -6975,7 +6975,7 @@ mod tests {
                 "waiting on approval",
                 vec![jeikcode_kernel::tool::ToolCall {
                     id: "c1".into(),
-                    name: "write_file".into(),
+                    name: "write".into(),
                     arguments: "{}".into(),
                 }],
             ),

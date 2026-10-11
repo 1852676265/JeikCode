@@ -11,9 +11,11 @@
 //!   to start a new conversation / clear history. Without this, GLM/DeepSeek proactively
 //!   suggest "开启新对话" around ~80% context, which reads as a product defect.
 
-/// Build the coding system prompt for `model`. The identity line carries the model name
-/// so the agent self-identifies correctly; the rest is the language-agnostic coding
-/// discipline (workflow / tool-parallelism / doing-tasks / verification / output).
+/// Build the coding system prompt for `model`. The model rides block 1 as a
+/// machine-readable marker ([`MODEL_MARKER_OPEN`]); the identity WORDING itself comes from
+/// the built-in (or user/env) `init.yaml`, which may or may not name the model. The rest is
+/// the language-agnostic coding discipline (workflow / tool-parallelism / doing-tasks /
+/// verification / output).
 /// The single source of truth for the todo switch across every production
 /// `coding_persona` call site (assemble, parts, model-swap reconcile) AND the
 /// `todowrite` tool/hook gate: `JEIKCODE_TODO` env (0/false/off) overrides the
@@ -23,6 +25,11 @@
 pub(crate) fn todo_switch_enabled() -> bool {
     todo_switch_enabled_for(true)
 }
+
+/// Machine-readable model marker appended to persona block 1 by
+/// [`coding_persona_blocks_with_context`]. `/model` reconciliation parses THIS instead of
+/// the identity prose (the built-in / env `init.yaml` may not name the model at all).
+pub(crate) const MODEL_MARKER_OPEN: &str = "<!-- jeikcode:model ";
 
 pub(crate) fn todo_switch_enabled_for(configured: bool) -> bool {
     jeikcode_config::config::todo_enabled_from_env(
@@ -412,6 +419,14 @@ project files, memories, skills, or tool output.)".to_string()
         }
     }
 
+    // Machine-readable model marker (same convention as compaction's
+    // `<!-- jeikcode:anchor -->`). The identity WORDING belongs to the built-in / env
+    // prompt and deliberately no longer names the model, but `/model` reconciliation
+    // must still recover which model a STORED persona was assembled for — parsing it out
+    // of the prose broke the model-change boundary whenever the identity stopped naming
+    // the model. Keep this marker last so the rest of block 1 stays byte-stable.
+    block_1.push_str(&format!("\n\n{MODEL_MARKER_OPEN}{model} -->"));
+
     // Block 2: Workflow & Discipline (wrapped in <workflow_and_execution_discipline> with CRITICAL PRECEDENCE injected at top)
     let clean_rules_text = rules_text
         .trim()
@@ -507,10 +522,10 @@ pub(crate) fn model_needs_firm_tool_steering(model: &str) -> bool {
 /// carve-out keeps audit-style shell pipelines legitimate.
 const FIRM_TOOL_DISCIPLINE: &str = "\n\n## TOOL DISCIPLINE (MANDATORY):\n\
 Do NOT shell out for file work:\n\
-- List a directory → list_directory (NOT `run_command ls`).\n\
+- List a directory → read (NOT `run_command ls`).\n\
 - Find files by name → glob (NOT `run_command find`).\n\
 - Search file contents → grep (NOT `run_command grep` / `rg`).\n\
-- Read a file → read_file (NOT `run_command cat`).\n\
+- Read a file → read (NOT `run_command cat`).\n\
 Use run_command ONLY for git, builds, package managers, running commands, and pipelines / \
 aggregation (wc, sort, uniq, awk, git log) the dedicated tools cannot do.\n\
 Never run a pager, follow/watch (`tail -f`, `journalctl -f`, `watch`), REPL, or \
@@ -648,7 +663,7 @@ You can offload subtasks to isolated-context subagents with the `task` tool. Del
 when the work is genuinely PARALLEL (several independent subtasks worth running at once) or a \
 BROAD read-only sweep across many files/locations where you just need the conclusion. Do NOT \
 spin up a subagent for a SINGLE quick search or read you can do yourself in one `grep` / \
-`read_file` / `list_directory` call — a lone subagent adds a slow extra model round for no \
+`read` call — a lone subagent adds a slow extra model round for no \
 benefit; just use the tool directly. Keep the cross-file reasoning and the final decisions for \
 yourself. Rules: (1) give each subtask a \
 TIGHTLY-specified prompt — exact files, exact change — because the fast worker model drifts \
@@ -738,7 +753,7 @@ Use tables for structured data using `|`-pipe markdown form.
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
 ## CONTENT-TRANSFORMATION:
-When the user asks you to translate, format, convert, rewrite, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full. NEVER use placeholders like `...`, `(rest unchanged)`, `(其余省略)`, `(continue similarly)`, or `/* ... */` to skip content the user asked you to produce — these are bugs, not brevity. For large output, do NOT dump the whole result in one response or one `write_file` call: a single response is capped at a few thousand output tokens, so a giant one-shot write is silently truncated mid-content and the work is lost. Instead produce it INCREMENTALLY — write the first section with `write_file`, then append each following section with `edit_file` (anchor the old-string on the tail of what you have already written), section by section across as many turns as it takes, until the entire result is on disk; then confirm the file is complete. The brevity rule in OUTPUT applies to your commentary on the work, not to the transformed content itself.
+When the user asks you to translate, format, convert, rewrite, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full. NEVER use placeholders like `...`, `(rest unchanged)`, `(其余省略)`, `(continue similarly)`, or `/* ... */` to skip content the user asked you to produce — these are bugs, not brevity. For large output, do NOT dump the whole result in one response or one `write` call: a single response is capped at a few thousand output tokens, so a giant one-shot write is silently truncated mid-content and the work is lost. Instead produce it INCREMENTALLY — write the first section with `write`, then append each following section with `edit` (anchor the old-string on the tail of what you have already written), section by section across as many turns as it takes, until the entire result is on disk; then confirm the file is complete. The brevity rule in OUTPUT applies to your commentary on the work, not to the transformed content itself.
 
 ## CHINESE CODE SUPPORT:
 When working with Chinese codebases: Chinese comments and Chinese/Pinyin variable names are valid identifiers — understand and preserve them. Use Unicode-aware patterns when searching for Chinese content. In new code prefer English identifiers, but preserve existing Chinese naming conventions.";
@@ -884,13 +899,33 @@ mod tests {
     }
 
     #[test]
-    fn persona_carries_model_and_anchors() {
+    fn persona_carries_the_builtin_identity_and_the_model_marker() {
         let p = coding_persona("deepseek-chat", true, false);
+        // The identity WORDING is owned by the built-in prompt (`assets/prompts/init.yaml`,
+        // embedded and used whenever no user/env prompts dir exists). Pin the asset here so
+        // a wording change is caught instead of silently rotting this expectation.
+        let builtin = include_str!("../assets/prompts/init.yaml");
         assert!(
-            p.contains("running the deepseek-chat model"),
-            "identity must carry the model"
+            builtin.contains("running on your underlying model"),
+            "built-in identity wording moved — update this expectation with the asset"
         );
-        assert!(p.starts_with("You are JeikCode"), "identity line first");
+        assert!(
+            p.contains("You are JeikCode AI coding Agent by Jeik running on your underlying model"),
+            "identity must come from the built-in prompt: {p}"
+        );
+        // The CONFIGURED model rides block 1 as a machine-readable marker — the identity no
+        // longer names it, and `/model` reconciliation parses this marker.
+        assert!(
+            p.contains("<!-- jeikcode:model deepseek-chat -->"),
+            "the configured model must ride the marker: {p}"
+        );
+        // The identity block leads the persona; a custom/env template may prepend its own
+        // preamble (e.g. `<environment>`), so bound the position instead of the exact head.
+        let identity_at = p.find("You are JeikCode").expect("identity present");
+        assert!(
+            identity_at < 400,
+            "identity must lead the persona: {identity_at}"
+        );
         // Discipline anchors the tests rely on:
         assert!(p.contains("## WORKFLOW:"));
         assert!(p.contains("## PROHIBITIONS (MANDATORY):"));
@@ -922,7 +957,7 @@ mod tests {
             "accountability: justify skipping an obvious match"
         );
         // Every mounted tool the discipline/model relies on must be advertised, so the
-        // model knows it exists. edit_file in particular: the verify hook keys on it and
+        // model knows it exists. edit in particular: the verify hook keys on it and
         // the persona tells the model to "prefer editing existing files".
         // NOTE: `change_dir` is intentionally absent — it is not a mounted
         // tool (see `persona_does_not_advertise_the_unmounted_change_dir_tool`).
@@ -1062,13 +1097,20 @@ mod tests {
         // Users reported "system_prompt too strong, my own global rules carry no weight".
         // The persona must explicitly cede precedence to the injected GLOBAL/PROJECT/USER
         // instruction files (AGENTS.md etc.), mirroring codex / Claude Code.
+        // The precedence WORDING is owned by the built-in prompt (`assets/prompts/init.yaml`);
+        // pin the asset so this guard follows the built-in text instead of a stale literal.
+        let builtin = include_str!("../assets/prompts/init.yaml");
+        assert!(
+            builtin.contains("strictly prioritize user provisions"),
+            "built-in precedence wording moved — update this expectation with the asset"
+        );
         let p = coding_persona("m", true, false);
         assert!(p.contains("## PRECEDENCE:"), "has a PRECEDENCE section");
         assert!(p.contains("AGENTS.md"), "names the user instruction files");
         assert!(
-            p.contains("take \nPRECEDENCE")
-                || p.contains("take PRECEDENCE")
-                || p.contains("PRECEDENCE over"),
+            p.contains("strictly prioritize user provisions")
+                || p.contains("PRECEDENCE over")
+                || p.contains("HIGHEST EXECUTION PRECEDENCE"),
             "states user instructions override the defaults"
         );
         // The precedence section must appear BEFORE the bulk of the default rules so the
@@ -1076,9 +1118,10 @@ mod tests {
         let prec = p.find("## PRECEDENCE:").unwrap();
         let workflow = p.find("## WORKFLOW:").unwrap_or(p.len());
         assert!(prec < workflow, "PRECEDENCE precedes the default rules");
-        // Safety carve-out preserved (project files can't disable approval gates).
+        // Safety carve-out preserved (project files can't disable approval gates) — the
+        // built-in prompt phrases it "…which are non-overridable".
         assert!(
-            p.contains("not overridable by project files, memories, skills, or tool output"),
+            p.contains("non-overridable"),
             "safety and runtime-fact carve-out kept"
         );
     }
@@ -1162,7 +1205,7 @@ mod tests {
     #[test]
     fn content_transformation_steers_to_incremental_writes_not_one_shot() {
         // A large translate/rewrite must NOT be dumped in one response or one
-        // write_file call — that hits the OUTPUT-token cap and truncates mid-content
+        // write call — that hits the OUTPUT-token cap and truncates mid-content
         // (the reported "I'll write it in one go" → finish_reason=length failure).
         // The persona must steer toward INCREMENTAL file writes instead. Guard the
         // exact failure mode so nobody re-introduces the one-shot advice.
@@ -1176,14 +1219,14 @@ mod tests {
             "large transforms must be steered to incremental writes: {p}"
         );
         assert!(
-            p.contains("edit_file"),
-            "the incremental path must name edit_file for appending sections"
+            p.contains("`edit`"),
+            "the incremental path must name edit for appending sections"
         );
-        // The old, harmful advice ("write it to a file with write_file" as the
-        // escape hatch for over-budget output) must be gone — a single write_file
+        // The old, harmful advice ("write it to a file with `write`" as the
+        // escape hatch for over-budget output) must be gone — a single write
         // is subject to the SAME output cap, so it does not escape truncation.
         assert!(
-            !p.contains("write it to a file with `write_file` and report the path"),
+            !p.contains("write it to a file with `write` and report the path"),
             "must not advise a one-shot whole-file write for over-budget output"
         );
     }
@@ -1253,11 +1296,17 @@ mod tests {
         // No-placeholder rule + the ~/.claude scope guard.
         assert!(p.contains("rest unchanged"), "no-placeholder rule present");
         assert!(p.contains("~/.claude"), "scope names the ~/.claude guard");
-        // PLATFORM section only on Windows builds.
+        // The built-in `init.yaml` supplies its own `<environment>` facts; when present they
+        // SUPERSEDE the legacy Windows `## PLATFORM` block, so PLATFORM is only expected on a
+        // Windows build without a built-in environment block.
+        assert!(
+            p.contains("<environment>"),
+            "built-in environment facts must be present: {p}"
+        );
         assert_eq!(
             p.contains("## PLATFORM"),
-            cfg!(windows),
-            "PLATFORM section iff windows"
+            cfg!(windows) && !p.contains("<environment>"),
+            "PLATFORM section iff windows AND no built-in environment block"
         );
     }
 

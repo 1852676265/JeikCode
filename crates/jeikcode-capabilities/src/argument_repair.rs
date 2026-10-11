@@ -2444,13 +2444,13 @@ mod tests {
     #[test]
     fn repair_tool_args_passes_valid_json_through() {
         let input = r#"{"file_path":"/tmp/a.rs","content":"x"}"#;
-        assert_eq!(repair_tool_args("write_file", input), input);
+        assert_eq!(repair_tool_args("write", input), input);
     }
 
     #[test]
     fn repair_tool_args_fixes_fence_wrapped_json() {
         let input = "```json\n{\"file_path\":\"/tmp/a.rs\",\"content\":\"x\"}\n```";
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("should parse");
         assert_eq!(v["file_path"], "/tmp/a.rs");
     }
@@ -2459,7 +2459,7 @@ mod tests {
     fn repair_tool_args_keeps_empty_object_untouched() {
         // Empty `{}` is valid JSON — we must not paper over it by inventing fields.
         // Callers surface it as a user-visible error instead.
-        assert_eq!(repair_tool_args("write_file", "{}"), "{}");
+        assert_eq!(repair_tool_args("write", "{}"), "{}");
     }
 
     #[test]
@@ -2467,7 +2467,7 @@ mod tests {
         // Pure garbage with no extractable key=value pairs → return as-is so
         // the tool emits the real parse error (not a misleading repaired stub).
         let input = "!!!";
-        assert_eq!(repair_tool_args("write_file", input), "!!!");
+        assert_eq!(repair_tool_args("write", input), "!!!");
     }
 
     // --- Windows-path unescape regression tests ---
@@ -2544,7 +2544,7 @@ mod tests {
         // this would silently decode to "D:<TAB>est<FF>oo.py" without
         // the pre-pass. Raw bytes: `D` `:` `\` `t` `e` `s` `t` `\` `f`...
         let input = "{\"file_path\": \"D:\\test\\foo.py\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("should be valid JSON after pre-pass");
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
@@ -2562,7 +2562,7 @@ mod tests {
         // Properly escaped Windows path — pre-pass must not double again.
         // Raw bytes: `D` `:` `\` `\` `w` `o` `r` `k` `\` `\` `a` ...
         let input = r#"{"file_path": "D:\\work\\app.py"}"#;
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "D:\\work\\app.py");
     }
@@ -2572,7 +2572,7 @@ mod tests {
         // \\?\D:\... long-path prefix, fully escaped. The leading
         // \\\\?\\ region must survive pre-pass and parse correctly.
         let input = r#"{"file_path": "\\\\?\\D:\\test-wsd\\run.py"}"#;
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "\\\\?\\D:\\test-wsd\\run.py");
     }
@@ -2584,7 +2584,7 @@ mod tests {
         // (alpha-then-`:`-then-`\`) but `y` is the tail of a word, not
         // a single-letter drive. The tab MUST be decoded as a tab.
         let input = r#"{"category": "fast\ttab\nnewline"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let s = v["category"].as_str().unwrap();
         assert!(s.contains('\t'), "real \\t should remain a tab: {:?}", s);
@@ -2601,7 +2601,7 @@ mod tests {
         // not the tail of a longer word. False-positive would corrupt
         // the intended newline into the two chars `\` + `n`.
         let input = r#"{"label": "category:\nimportant"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let s = v["label"].as_str().unwrap();
         assert!(s.contains('\n'), "newline should survive: got {:?}", s);
@@ -2634,7 +2634,7 @@ mod tests {
         // round-trips, otherwise serde decodes `\n` → newline and
         // the path turns into `D:<newline>ew<formfeed>oo.py`.
         let input = "{\"file_path\": \"D:\\new\\foo.py\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let p = v["file_path"].as_str().unwrap();
         assert_eq!(
@@ -2666,7 +2666,7 @@ mod tests {
     #[test]
     fn repair_tool_args_single_letter_label_before_newline_is_not_path() {
         let input = r#"{"file_path": "/tmp/notify.py", "content": "class A:\n    pass\n"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let content = v["content"].as_str().unwrap();
         assert!(
@@ -2697,7 +2697,7 @@ mod tests {
         // paths, so the already-`\\`-escaped path is left alone and the real
         // newlines survive.
         let input = r#"{"file_path":"D:\\jeikcode\\read_excel.py","content":"import openpyxl\nimport os\nexcel_path = r'C:\\Users\\Administrator\\Desktop\\文章.xlsx'\nprint(os.path.exists(excel_path))\n"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let content = v["content"].as_str().unwrap();
         assert!(
@@ -2728,7 +2728,7 @@ mod tests {
     fn repair_tool_args_lowercase_drive_letter_recognized() {
         // Lowercase `c:\` is also a valid Windows drive prefix.
         let input = "{\"file_path\": \"c:\\users\\me\\file.txt\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "c:\\users\\me\\file.txt");
     }
@@ -2739,7 +2739,7 @@ mod tests {
         // AND single-backslash Windows path. Pre-pass fixes the path
         // first, then repair_json strips the trailing comma.
         let input = "{\"file_path\": \"D:\\test\\foo.py\",}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("should recover via repair_json");
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
@@ -2753,7 +2753,7 @@ mod tests {
         // backslash — so valid code/text isn't corrupted. (Models must escape
         // paths they embed in code, e.g. `D:\\test`.)
         let input = "{\"file_path\": \"D:\\test\\foo.py\", \"old_string\": \"x = 'C:\\nfoo'\"}";
-        let out = repair_tool_args("edit_file", input);
+        let out = repair_tool_args("edit", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         // file_path: the lone-backslash path rescued to literal backslashes.
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
@@ -2768,7 +2768,7 @@ mod tests {
         // A properly-escaped path round-trips unchanged; the pre-pass walker still
         // honours `\"` when locating the string close.
         let input = "{\"cmd\": \"run \\\"D:\\\\foo.exe\\\"\"}";
-        let out = repair_tool_args("bash", input);
+        let out = repair_tool_args("run_command", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["cmd"], "run \"D:\\foo.exe\"");
     }
@@ -2777,7 +2777,7 @@ mod tests {
     #[cfg(windows)]
     fn bash_repair_routes_unmistakable_powershell_without_outer_shell() {
         let input = r#"{"command":"Get-Process | Where-Object { $_.Name -eq 'node.exe' }"}"#;
-        let out = repair_and_route_shell_args("bash", input);
+        let out = repair_and_route_shell_args("run_command", input);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["shell"], "powershell");
         assert_eq!(
@@ -2790,24 +2790,24 @@ mod tests {
     #[cfg(windows)]
     fn bash_repair_does_not_reinterpret_generic_or_explicit_nested_shells() {
         let generic = r#"{"command":"printf '%s\\n' \"$HOME\""}"#;
-        assert_eq!(repair_and_route_shell_args("bash", generic), generic);
+        assert_eq!(repair_and_route_shell_args("run_command", generic), generic);
         let nested =
             r#"{"command":"powershell -Command \"Get-Process | Where-Object { $_.Name }\""}"#;
-        assert_eq!(repair_and_route_shell_args("bash", nested), nested);
+        assert_eq!(repair_and_route_shell_args("run_command", nested), nested);
     }
 
     #[test]
     #[cfg(windows)]
     fn bash_repair_normalizes_known_shell_aliases_and_cmd_field_only() {
         let input = r#"{"cmd":"Get-CimInstance Win32_Process","shell":"pwsh"}"#;
-        let out = repair_and_route_shell_args("bash", input);
+        let out = repair_and_route_shell_args("run_command", input);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["command"], "Get-CimInstance Win32_Process");
         assert_eq!(value["shell"], "powershell");
         assert!(value.get("cmd").is_none());
 
         let cmd = r#"{"command":"for /f %i in ('where node') do @echo %i"}"#;
-        let out = repair_and_route_shell_args("bash", cmd);
+        let out = repair_and_route_shell_args("run_command", cmd);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["shell"], "cmd");
     }
@@ -2816,7 +2816,7 @@ mod tests {
     #[cfg(windows)]
     fn bash_repair_preserves_unknown_explicit_shell_and_script_bytes() {
         let input = r#"{"command":"Invoke-StrangeThing --raw '$x'","shell":"custom-shell"}"#;
-        assert_eq!(repair_and_route_shell_args("bash", input), input);
+        assert_eq!(repair_and_route_shell_args("run_command", input), input);
     }
 
     #[test]
@@ -2927,7 +2927,7 @@ mod tests {
         // Raw bytes: `C` `:` `\` `\` `U` `s` `e` `r` `s` `\` `\` `\` `u` `5` `f` `2` `0` …
         // After JSON decode that's `C:\Users\张三\file.txt`.
         let input = r#"{"file_path": "C:\\Users\\张三\\file.txt"}"#;
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "C:\\Users\\张三\\file.txt");
         // Negative: bytes after pre-pass MUST NOT contain `\\u` —
@@ -2950,7 +2950,7 @@ mod tests {
     #[test]
     fn pre_escape_mixes_unicode_escape_with_ambiguous_letter() {
         let input = "{\"file_path\": \"D:\\test\\u0041\\foo\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         // \t → literal `\t`; A → "A"; \f → literal `\f`.
         assert_eq!(v["file_path"], "D:\\testA\\foo");
@@ -3222,11 +3222,8 @@ mod middleware_tests {
         // Common weak-model output: a trailing comma in write_file args, which
         // the kernel's `from_str` rejects outright.
         let mw = RepairToolArgsMiddleware;
-        let mut c = call(
-            "write_file",
-            r#"{"file_path":"game.html","content":"<html>",}"#,
-        );
-        mw.repair_call("write_file", &schema(), &mut c);
+        let mut c = call("write", r#"{"file_path":"game.html","content":"<html>",}"#);
+        mw.repair_call("write", &schema(), &mut c);
         let v: serde_json::Value = serde_json::from_str(&c.arguments)
             .expect("arguments should be valid JSON after repair");
         assert_eq!(v["file_path"], "game.html");
@@ -3236,8 +3233,8 @@ mod middleware_tests {
     fn passes_valid_json_through_unchanged() {
         let mw = RepairToolArgsMiddleware;
         let valid = r#"{"file_path":"a.html","content":"x"}"#;
-        let mut c = call("write_file", valid);
-        mw.repair_call("write_file", &schema(), &mut c);
+        let mut c = call("write", valid);
+        mw.repair_call("write", &schema(), &mut c);
         assert_eq!(c.arguments, valid, "valid JSON must not be altered");
     }
 
@@ -3506,7 +3503,7 @@ mod hardening_tests {
     fn trailing_comma_run_collapses_correctly() {
         // `{"k":[,,,...]}` (a botched list) used to remove one comma per pass → O(N^2).
         let input = format!("{{\"k\":[{}]}}", ",".repeat(50_000));
-        let out = repair_tool_args("write_file", &input);
+        let out = repair_tool_args("write", &input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON after repair");
         assert!(
             v["k"].as_array().map(|a| a.is_empty()).unwrap_or(false),
@@ -3526,7 +3523,7 @@ mod hardening_tests {
             s.push_str(&format!("\"k{i}\":\"v\""));
         }
         s.push('}');
-        let out = repair_tool_args("write_file", &s);
+        let out = repair_tool_args("write", &s);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON after repair");
         assert_eq!(v["k0"], "v");
         assert_eq!(v[format!("k{}", n - 1)], "v");
@@ -3537,7 +3534,7 @@ mod hardening_tests {
         // Past the MAX_REPAIR_BYTES ceiling, repair is skipped and the original is
         // returned verbatim (the tool surfaces its own parse error).
         let big = format!("{{\"content\":\"{}\",}}", "x".repeat(600_000));
-        assert_eq!(repair_tool_args("write_file", &big), big);
+        assert_eq!(repair_tool_args("write", &big), big);
     }
 
     // --- #3: edit_file extractor selection is case-insensitive (canonical name). ---
@@ -3622,7 +3619,7 @@ mod hardening_tests {
         // separator. Pre-key-scoping this doubled it to literal `\\n`, landing
         // broken code on disk.
         let input = r#"{"content":"print('C:\ndone')"}"#;
-        assert_eq!(repair_tool_args("write_file", input), input);
+        assert_eq!(repair_tool_args("write", input), input);
     }
 
     #[test]

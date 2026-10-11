@@ -681,7 +681,9 @@ impl McpRegistry {
                                         }
                                     }
                                     let mut servers = servers.write().await;
-                                    servers.insert(name.clone(), Arc::from(client));
+                                    let client: Arc<dyn McpClient> = Arc::from(client);
+                                    super::register_mcp_client(&client);
+                                    servers.insert(name.clone(), client);
                                     drop(servers);
                                     let mut timeouts = server_timeouts_ms.write().await;
                                     timeouts.insert(name.clone(), timeout_ms);
@@ -1128,7 +1130,9 @@ impl McpRegistry {
         let _discovery = self.tool_discovery_lock.lock().await;
         self.tool_cache.write().await.remove(&config.name);
         let mut servers = self.servers.write().await;
-        servers.insert(config.name.clone(), Arc::from(client));
+        let client: Arc<dyn McpClient> = Arc::from(client);
+        super::register_mcp_client(&client);
+        servers.insert(config.name.clone(), client);
         drop(servers);
         drop(_discovery);
         let mut timeouts = self.server_timeouts_ms.write().await;
@@ -1623,6 +1627,25 @@ impl McpRegistry {
     /// Cancel connection/discovery work associated with this registry.
     pub fn cancel_pending_work(&self) {
         self.cancelled.send_replace(true);
+    }
+
+    /// Synchronously kill every connected transport (best-effort, NO awaits).
+    ///
+    /// [`Self::shutdown`]'s `Drop`-context twin: the session lease's last-owner teardown
+    /// runs while the host may already be tearing its runtime down, so it cannot await.
+    /// Killing the children here closes their stdout pipes — which is what unblocks any
+    /// reader still parked on them (the reason `Runtime::drop` used to hang forever) — and
+    /// stops the npx/cmd/node tree from leaking. Best-effort: a busy lock leaves the async
+    /// idle reaper (or process exit) to finish the job.
+    pub fn kill_all_children_now(&self) {
+        self.cancel_pending_work();
+        let servers: Vec<Arc<dyn McpClient>> = match self.servers.try_write() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => return,
+        };
+        for server in servers {
+            server.kill_now();
+        }
     }
 
     /// Cancel pending work and tear down every connected transport.

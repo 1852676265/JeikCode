@@ -3624,7 +3624,7 @@ impl CodeIndex {
             // (`ReparseBudget::Unlimited`) creates a first index.
             if !matches!(budget, ReparseBudget::Unlimited) {
                 on_progress(
-                    "Code graph: no index — skipped auto-build. Use list_directory; \
+                    "Code graph: no index — skipped auto-build. Use read; \
                      leave `jeikcode init` to the user.",
                 );
                 let mut guard = match self.inner.lock() {

@@ -378,7 +378,7 @@ mod tests {
     fn edit_call(path: &str) -> ToolCall {
         ToolCall {
             id: "1".into(),
-            name: "edit_file".into(),
+            name: "edit".into(),
             arguments: format!(r#"{{"file_path":{path:?},"old_string":"x","new_string":"y"}}"#),
         }
     }
@@ -394,7 +394,7 @@ mod tests {
     fn write_call(path: &str) -> ToolCall {
         ToolCall {
             id: "1".into(),
-            name: "write_file".into(),
+            name: "write".into(),
             arguments: format!(r#"{{"file_path":{path:?},"content":"x"}}"#),
         }
     }
@@ -412,7 +412,7 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::read::ReadFileTool::default());
         let mut call = ToolCall {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "read".into(),
             arguments: r#"{"file_path":"a"}"#.into(),
         };
         assert_eq!(
@@ -857,13 +857,13 @@ mod tests {
     fn write_targets_extracts_per_tool() {
         assert_eq!(
             write_targets(
-                "edit_file",
+                "edit",
                 r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#
             ),
             vec!["a.rs".to_string()]
         );
         assert_eq!(
-            write_targets("write_file", r#"{"file_path":"b.rs","content":"x"}"#),
+            write_targets("write", r#"{"file_path":"b.rs","content":"x"}"#),
             vec!["b.rs".to_string()]
         );
         assert_eq!(
@@ -877,7 +877,20 @@ mod tests {
             write_targets("write", r#"{"path":"b.rs","content":"x"}"#),
             vec!["b.rs".to_string()]
         );
-        assert!(write_targets("edit_file", "not json").is_empty());
-        assert!(write_targets("bash", r#"{"command":"ls"}"#).is_empty());
+        // Legacy aliases must keep resolving through the same per-tool extractors so
+        // WRITE_TOOLS' legacy (`edit_file`/`write_file`) branches stay covered.
+        assert_eq!(
+            write_targets(
+                "edit_file",
+                r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#
+            ),
+            vec!["a.rs".to_string()]
+        );
+        assert_eq!(
+            write_targets("write_file", r#"{"file_path":"b.rs","content":"x"}"#),
+            vec!["b.rs".to_string()]
+        );
+        assert!(write_targets("edit", "not json").is_empty());
+        assert!(write_targets("run_command", r#"{"command":"ls"}"#).is_empty());
     }
 }

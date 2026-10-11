@@ -1050,7 +1050,7 @@ mod tests {
             "ok",
             vec![ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: r#"{"path":"a.rs"}"#.into(),
             }],
         );
@@ -1067,7 +1067,7 @@ mod tests {
             Message::tool_result("c1", r#"{"ok":true}"#, false),
         ];
         let tools = vec![ToolDef {
-            name: "read_file".into(),
+            name: "read".into(),
             description: "read".into(),
             parameters: json!({"type":"object"}),
         }];
@@ -1089,17 +1089,17 @@ mod tests {
         assert_eq!(contents[1]["parts"][1]["text"], json!("ok"));
         assert_eq!(
             contents[1]["parts"][2]["functionCall"]["name"],
-            json!("read_file")
+            json!("read")
         );
         assert_eq!(contents[1]["parts"][2]["thoughtSignature"], json!("sig-1"));
         assert_eq!(contents[2]["role"], json!("user"));
         assert_eq!(
             contents[2]["parts"][0]["functionResponse"]["name"],
-            json!("read_file")
+            json!("read")
         );
         assert_eq!(
             body["tools"][0]["functionDeclarations"][0]["name"],
-            json!("read_file")
+            json!("read")
         );
     }
 

@@ -1136,7 +1136,7 @@ fn shell_tool_description(
         () => {
             "Run a shell command and return stdout, stderr, and exit code. \
              Use for builds, tests, package management, Git operations, binaries, and process checks. \
-             Prefer dedicated tools for files: `read_file`, `grep`, `glob`, `list_directory`, `edit_file`, `write_file`. \
+             Prefer dedicated tools for files: `read` (also lists directories), `grep`, `glob`, `edit`, `write`. \
              `&&`, `||`, and `|` are supported. Use `;` only when the next command must run even if the previous failed. \
              Shell pipelines and aggregation (such as wc, sort, uniq, git log) are supported."
         };
@@ -1175,7 +1175,7 @@ fn shell_tool_description(
              `Get-ChildItem -LiteralPath '\\\\server\\share$'`. Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
-             The dedicated file tools above (read_file / grep / glob / list_directory) also \
+             The dedicated file tools above (read / grep / glob) also \
              sidestep cmd's type/find/dir and all the quoting pitfalls here."
         };
     }
@@ -5952,9 +5952,7 @@ mod tests {
         assert!(BashTool.aliases().contains(&"bash"));
         let desc = shell_tool_description(false, false, false);
         assert!(
-            desc.contains("`read_file`")
-                && desc.contains("`grep`")
-                && desc.contains("`list_directory`"),
+            desc.contains("`read`") && desc.contains("`grep`") && desc.contains("`edit`"),
             "schema must steer file work to dedicated tools: {desc}"
         );
         assert!(
@@ -6496,7 +6494,7 @@ mod tests {
         // Prefer jeikcode's native file tools over shell file ops.
         assert!(win.contains("glob"), "must steer to glob: {win}");
         assert!(win.contains("grep"), "must steer to grep: {win}");
-        assert!(win.contains("read_file"), "must steer to read_file: {win}");
+        assert!(win.contains("`read`"), "must steer to read: {win}");
         // The unix description stays lean (no Windows shell noise).
         let unix = shell_tool_description(false, false, false);
         assert!(
@@ -6530,12 +6528,16 @@ mod tests {
         // Must warn about Windows path backslashes (bash treats `\\` as escape) and steer
         // to forward-slash / POSIX form — the concrete thing that breaks `dir C:\\Windows`.
         assert!(
+        assert!(
+            !desc.contains("list_directory") && !desc.contains("read_file"),
+            "schema must not advertise purged/legacy tool names: {desc}"
+        );
             lc.contains("forward slash") || lc.contains("/c/") || lc.contains("c:/"),
             "must steer to forward-slash / POSIX paths: {d}"
         );
         // Base steering (native file tools) still present.
         assert!(
-            d.contains("read_file") && d.contains("glob"),
+            d.contains("`read`") && d.contains("glob"),
             "base steering retained: {d}"
         );
         // Must steer output-discard to /dev/null, NOT `nul`: under Git Bash `> nul`
@@ -6595,7 +6597,7 @@ mod tests {
     #[test]
     fn unix_description_steers_file_ops_to_native_tools() {
         let unix = shell_tool_description(false, false, false);
-        for tool in ["read_file", "grep", "glob", "list_directory"] {
+        for tool in ["read", "grep", "glob"] {
             assert!(
                 unix.contains(tool),
                 "unix desc must steer to {tool}: {unix}"
@@ -7174,6 +7176,10 @@ mod tests {
         assert!(!is_read_only_bash("git commit -m x"));
         assert!(!is_read_only_bash("cargo build"));
         assert!(!is_read_only_bash("cd /a && cargo check"));
+        assert!(
+            !unix.contains("read_file") && !unix.contains("list_directory"),
+            "unix desc must not advertise purged/legacy tool names: {unix}"
+        );
         assert!(!is_read_only_bash("grep x | tee f"));
         assert!(!is_read_only_bash("grep x | xargs rm"));
         // Command / process substitution (DOUBLE-quoted or bare) executes — reject.

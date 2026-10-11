@@ -1,4 +1,4 @@
-//! Sensitive-path read gating through the FULL assembly: a read_file of `~/.ssh/id_rsa`
+//! Sensitive-path read gating through the FULL assembly: a read of `~/.ssh/id_rsa`
 //! is Safe (would skip approval) but must be gated, and with no driver answering the
 //! approval it fails closed — the secret is never read.
 
@@ -46,7 +46,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: r#"{"file_path":"/home/u/.ssh/id_rsa"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
@@ -76,7 +76,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
     h.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h.task.await;
 
-    let (is_error, content) = blocked.expect("read_file must produce a (blocked) tool result");
+    let (is_error, content) = blocked.expect("read must produce a (blocked) tool result");
     assert!(is_error, "a denied sensitive read must be an error result");
     assert!(
         content.to_lowercase().contains("sensitive path"),

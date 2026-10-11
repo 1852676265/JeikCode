@@ -2354,7 +2354,7 @@ mod tests {
             "",
             vec![ToolCall {
                 id: "c1".into(),
-                name: "write_file".into(),
+                name: "write".into(),
                 // raw string: contains a single backslash before each segment.
                 arguments:
                     r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#

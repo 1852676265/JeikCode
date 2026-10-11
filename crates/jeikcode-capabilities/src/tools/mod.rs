@@ -130,13 +130,13 @@ pub fn coding_tool_names() -> &'static [&'static str] {
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
-/// given specialization should expose to the model). Vision support OFF — `read_file`
+/// given specialization should expose to the model). Vision support OFF — `read`
 /// reports images as binary (use [`register_coding_tools_with_vision`] for a VL model).
 pub fn register_coding_tools(reg: &mut ToolRegistry) {
     register_coding_tools_with_vision(reg, false);
 }
 
-/// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
+/// Like [`register_coding_tools`], but `vision` gates whether `read` hands an
 /// image file back to the model as an actual picture (a VISION model SEES it) instead
 /// of the "binary, cannot display" text. The caller decides the flag from the model
 /// using [`crate::provider::model_suggests_vision`], the same detector used by the
@@ -370,7 +370,7 @@ fn render_dir_hint(dir: &Path) -> String {
 
 /// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
 /// to `\n`, then expand to the target. Idempotent for `"\n"`. Used by the editors so a
-/// model that copied LF text from `read_file` (which strips `\r` via `str::lines()`) can
+/// model that copied LF text from `read` (which strips `\r` via `str::lines()`) can
 /// still match — and not corrupt — a CRLF file on disk.
 pub(crate) fn coerce_eol(s: &str, eol: &str) -> String {
     if eol == "\r\n" {
@@ -411,7 +411,7 @@ pub(crate) fn is_skip_dir(name: &str) -> bool {
 }
 
 /// WebUI user-upload store. Gitignored so it stays out of project VCS, but
-/// `read` / `grep` / `glob` / `list_directory` must still see it — these files
+/// `read` / `grep` / `glob` must still see it — these files
 /// are attachments the model is expected to open, not project source.
 pub const USER_UPLOAD_STORE_DIR: &str = ".jeikcode_store";
 
@@ -566,7 +566,7 @@ pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
     }
 }
 /// A successful tool result that also carries inline `images` for a VISION model to
-/// SEE (e.g. `read_file` returning a picture). The agent loop lifts these onto a
+/// SEE (e.g. `read` returning a picture). The agent loop lifts these onto a
 /// follow-up `Role::User` message — the only role a provider serializes images on.
 pub(crate) fn ok_with_images(
     content: impl Into<String>,

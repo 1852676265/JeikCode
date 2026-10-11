@@ -1691,10 +1691,19 @@ const JEIKCODE_PERSONA_PREFIX: &str =
 const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
 
 fn persona_model(text: &str) -> Option<&str> {
+    // Canonical: the machine-readable marker block 1 carries (`coding_persona_blocks_*`).
+    // The identity WORDING is owned by the built-in / env prompt and may not name the
+    // model at all — prose parsing alone silently stopped detecting `/model` switches.
+    if let Some(pos) = text.find(crate::persona::MODEL_MARKER_OPEN) {
+        let rest = &text[pos + crate::persona::MODEL_MARKER_OPEN.len()..];
+        if let Some(end) = rest.find(" -->") {
+            return Some(rest[..end].trim());
+        }
+    }
+    // Legacy snapshots / custom persona templates that still name the model in the prose.
     if let Some(rest) = text.strip_prefix(JEIKCODE_PERSONA_PREFIX) {
         return rest.split_once(" model.").map(|(model, _)| model);
     }
-    // Handle custom persona templates, e.g., "You are JeikCode, an AI coding agent by JeikCode running the {model} model."
     if let Some(pos) = text.find(" running the ") {
         let rest = &text[pos + " running the ".len()..];
         return rest.split_once(" model.").map(|(model, _)| model);
@@ -2036,7 +2045,7 @@ mod tests {
 
         assert!(snapshot.messages[0]
             .text
-            .contains("running the deepseek-v4-flash model"));
+            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
         assert_eq!(snapshot.messages[4].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
     }
@@ -2051,7 +2060,7 @@ mod tests {
         assert!(!snapshot.messages[1].text.contains("## TASK TRACKING"));
         assert!(snapshot.messages[0]
             .text
-            .contains("running the deepseek-v4-flash model"));
+            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
     }
 
     #[test]
@@ -2091,7 +2100,7 @@ mod tests {
         assert_eq!(personas, 4);
         assert!(snapshot.messages[0]
             .text
-            .contains("running the deepseek-v4-flash model"));
+            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
         assert!(snapshot.messages[0]
             .text
             .contains(MODEL_CHANGE_CONTEXT_PREFIX));
@@ -2180,7 +2189,7 @@ mod tests {
 
         assert!(snapshot.messages[0]
             .text
-            .contains("running the model-a model"));
+            .contains("<!-- jeikcode:model model-a -->"));
         assert!(!snapshot
             .messages
             .iter()
@@ -2869,7 +2878,7 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn prepare_wires_cc_external_hooks_only_when_present() {
         let home = tempfile::tempdir().unwrap(); // empty → no user-level hooks
-        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+                                                 // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
         let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         // No project hooks → nothing wired.

@@ -2548,7 +2548,7 @@ fn fold_snippet(
         let folded_count = tail_start.saturating_sub(head_end + 1);
         if folded_count > 0 {
             snippet.push(format!(
-                "...\t// ... [{folded_count} lines folded; use read_file(\"{rel_path}\", start_line={}, end_line={}) to view full body] ...",
+                "...\t// ... [{folded_count} lines folded; use read(\"{rel_path}\", start_line={}, end_line={}) to view full body] ...",
                 head_end + 1,
                 tail_start.saturating_sub(1)
             ));
@@ -2722,7 +2722,7 @@ fn render_explore_output(
             > FOLD_AFTER_LINES
         {
             next.push(format!(
-                "{n}. read_file  {rel}  offset={}  limit=100 (inspect targeted slice around symbol)",
+                "{n}. read  {rel}  offset={}  limit=100 (inspect targeted slice around symbol)",
                 first.sym.node.start_line
             ));
             n += 1;
@@ -2911,7 +2911,7 @@ fn render_explore_output(
         if evidence_chars >= EVIDENCE_BUDGET_CHARS {
             let rel = rel_disp(&e.fc.file, root);
             out.push(format!(
-                "> budget full — skipped `{}` in `{rel}`. NEXT: read_file  {rel}  offset={}",
+                "> budget full — skipped `{}` in `{rel}`. NEXT: read  {rel}  offset={}",
                 e.sym.node.name, e.sym.node.start_line
             ));
             continue;
@@ -2941,7 +2941,7 @@ fn render_explore_output(
             let already_sent = sent_list.iter().any(|(s, en)| *s <= start && end <= *en);
             if already_sent {
                 out.push(format!(
-                    "> `[Same range already returned earlier this session (dedup): {rel_path} L{start}-L{end} (`{}`) — use read_file  {rel_path}  offset={start}]`\n",
+                    "> `[Same range already returned earlier this session (dedup): {rel_path} L{start}-L{end} (`{}`) — use read  {rel_path}  offset={start}]`\n",
                     e.sym.node.name
                 ));
             } else {
@@ -2967,7 +2967,7 @@ fn render_explore_output(
         .filter(|c| !evidence_file_set.contains(c.file.as_path()))
         .collect();
     if !catalog_rest.is_empty() {
-        out.push("\n**CATALOG (not rendered — `read_file` a listed FILE; `code_explore` the PARENT DIRECTORY with the symbol as query, never the file path):**".to_string());
+        out.push("\n**CATALOG (not rendered — `read` a listed FILE; `code_explore` the PARENT DIRECTORY with the symbol as query, never the file path):**".to_string());
         for (i, c) in catalog_rest.iter().take(MAX_CATALOG_REMAINING).enumerate() {
             let rel = rel_disp(&c.file, root);
             let layer = c
@@ -3310,8 +3310,7 @@ mod tests {
         );
         assert!(out.contains("CATALOG"), "catalog section missing:\n{out}");
         assert!(
-            out.contains("PARENT DIRECTORY")
-                && !out.contains("copy path into read_file / code_explore"),
+            out.contains("PARENT DIRECTORY") && !out.contains("copy path into read / code_explore"),
             "catalog must not tell the model to pass a file path to code_explore:\n{out}"
         );
         assert!(

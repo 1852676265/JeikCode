@@ -712,7 +712,7 @@ mod tests {
             "done",
             vec![ToolCall {
                 id: "call-1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: r#"{"path":"README.md"}"#.into(),
             }],
         );
@@ -753,8 +753,8 @@ mod tests {
         let markdown = fs::read_to_string(markdown_path).unwrap();
         assert!(markdown.contains("## User"));
         assert!(markdown.contains("### Turn 2"));
-        assert!(markdown.contains("- read_file"));
-        assert!(markdown.contains("**Tool result:** `read_file` (`call-1`, ok)"));
+        assert!(markdown.contains("- read"));
+        assert!(markdown.contains("**Tool result:** `read` (`call-1`, ok)"));
         assert!(markdown.contains("tool output"));
         assert!(markdown.contains("**Error:** sample failure"));
         assert!(markdown.contains("**Stats:** 2 turns, 1 tool calls"));
