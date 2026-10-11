@@ -23,6 +23,20 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.3 (2026-10-12)
+
+- **[WebUI Live Streaming & Turn Settlement] Unblock multi-round live streaming and auto-reconcile disk at turn boundary**:
+  - **Technical Root Cause / Detail**: In turns involving tool executions, Round 1 (tool execution) stamped the assistant bubble with `last.id = "m-round-1"`. When Round 2 (final summary response text) began streaming with a new round identity (`message_id: "m-round-2"`), the anti-ghost-replay gate `mayPaintUnroutedDelta` erroneously rejected all live text deltas because `last.id` was already set. Consequently, live streaming of the final text after tool execution was completely dropped on the canvas, only appearing after manual page refresh or window blur triggered disk reconciliation.
+  - **Implementation Mechanism**: Unblocked live streaming by ensuring `mayPaintUnroutedDelta` unconditionally permits live streaming deltas (`replay === false`), guaranteeing real-time token-by-token rendering on screen during active LLM generation. Enhanced `identifiedAssistantIndex` to match both `message.id === messageId` and any part whose id starts with `${messageId}:`, enabling multi-round assistant bubbles to route subsequent events cleanly. Added `settleDiskCatchUp` with a `force` option to proactively reconcile disk state upon turn completion (`settleToIdleWatch`), user stop (`handleStop`), or premature stream closures without waiting for window blur.
+  - **Verification & Testing**: Added regression test `live streaming of multi-round turn (tools in round 1, final text in round 2) is NEVER blocked` in `sessionProjection.test.ts`. All 479 WebUI tests pass, `tsc --noEmit` is clean, and `npm run build` succeeds.
+
+---
+
+- **[WebUI 实时流式传输与回合结算] 放行多轮工具后实时流式输出，并在回合收尾时主动对账磁盘**:
+  - **技术机理 / 现象溯源**: 当回合包含工具调用时，Round 1（工具轮）为助手气泡盖上了 `last.id = "m-round-1"`。随后 Round 2（最终回复正文）带着新分配的 `message_id: "m-round-2"` 推流到达时，画布拦截守卫 `mayPaintUnroutedDelta` 因发现 `last.id` 已存在而错误地拒绝了所有实时文本增量。导致工具执行后的最终正文在推流期间完全无法在画布渲染，只响铃弹通知，正文必须等到用户手动刷新或窗口失焦触发磁盘回读后才显现。
+  - **实现防线 / 核心改动**: 彻底放行实时推流：`mayPaintUnroutedDelta` 增加 `!replay` 检查，在直播推流状态（`replay === false`）下 100% 放行，确保活动生成期间实时逐字上屏。强化轮次部件前缀索引：`identifiedAssistantIndex` 除了比对 `message.id` 外，新增按部件前缀 `${messageId}:` 匹配，打通同一气泡跨多轮次（多 round）的精准寻址。回合收尾磁盘对账：新增 `settleDiskCatchUp`（携带 `force` 选项），在终态到达、用户停止或长连接意外提前关闭等收尾时机主动补偿拉取磁盘，无需等待窗口失焦。
+  - **验证与交付**: 在 `sessionProjection.test.ts` 中新增多轮工具调用后最终正文实时推流回归测试；全量 479 项 WebUI 单元测试 100% 通过；`tsc --noEmit` 0 报错；`npm run build` 成功。
+
 ## v7.2.2-beta.2 (2026-10-12)
 
 - **[WebUI & Daemon Interaction] Robust send-now, idempotent turn replay, and todolist replay dedup**:
