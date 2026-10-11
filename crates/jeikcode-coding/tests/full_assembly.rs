@@ -65,7 +65,18 @@ async fn drive(
         .unwrap();
     let mut events = Vec::new();
     let mut requests = 0;
-    while let Some(ev) = handle.events.recv().await {
+    // Bounded wait: a turn that never completes (e.g. a parked tool / dead provider)
+    // must FAIL with context instead of hanging the suite forever — same philosophy as
+    // `shutdown()`. The label is the user text so the panic names the phase.
+    let mut turn_completed = false;
+    while !turn_completed {
+        let ev = match tokio::time::timeout(Duration::from_secs(60), handle.events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => break,
+            Err(_) => {
+                panic!("turn {text:?} did not complete within 60s (parked tool / dead provider?)")
+            }
+        };
         match &ev {
             AgentEvent::Request { id, .. } => {
                 requests += 1;
@@ -80,7 +91,8 @@ async fn drive(
             }
             AgentEvent::TurnComplete { .. } => {
                 events.push(ev);
-                break;
+                turn_completed = true;
+                continue;
             }
             _ => {}
         }
