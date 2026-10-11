@@ -524,8 +524,10 @@ impl Tool for TaskTool {
                 if is_worker { "worker" } else { "explore" },
                 idx + 1
             );
-            let prompt = t.prompt;
+            // Resolve the display description BEFORE the prompt is moved out of `t`:
+            // `resolved_description` borrows `self`, but `t.prompt` is moved on the next line.
             let desc = t.resolved_description(idx);
+            let prompt = t.prompt;
             let sem = sem.clone();
             let progress = ctx.progress.clone();
             let inherited_worker_middlewares = inherited_worker_middlewares.clone();
