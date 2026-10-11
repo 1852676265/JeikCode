@@ -140,8 +140,8 @@ jobs:
               fs::remove_dir_all(root).unwrap();
           }
           RS
-          cargo run --quiet --locked -p jeikcode-capabilities --example __catalog_timestamp_smoke
-          cargo test --locked -p jeikcode-capabilities --lib session::manager::tests::catalog_scan_merges_physical_sources_and_keeps_diagnostics -- --exact
+          cargo run --quiet --locked -p jeikcode-capabilities --features session --example __catalog_timestamp_smoke
+          cargo test --locked -p jeikcode-capabilities --features session --lib session::manager::tests::catalog_scan_merges_physical_sources_and_keeps_diagnostics -- --exact
       - name: Test capabilities integration suite
         run: cargo test -p jeikcode-capabilities --test tools_integration --test http_mock --test anthropic_mock --test ollama_mock --test compaction_cache --test session_fixture_invariants --locked
         env:
