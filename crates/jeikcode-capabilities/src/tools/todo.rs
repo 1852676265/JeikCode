@@ -227,6 +227,9 @@ fn action_kind(v: &serde_json::Value) -> Option<&'static str> {
         Some("update") => Some("update"),
         Some("delete") | Some("remove") => Some("delete"),
         Some("clear") => Some("clear"),
+        // 只读的列表动作：老形态 {\"action\":\"list\"} 仍要能被识别（TUI 详情面板靠它渲染
+        // “list all”，工具侧也不该把它当未知动作拒掉）。
+        Some("list") => Some("list"),
         Some(_) => None,
         None => infer_action_kind(v),
     }
@@ -258,7 +261,7 @@ fn infer_action_kind(v: &serde_json::Value) -> Option<&'static str> {
 fn unknown_or_uninferable_action(v: &serde_json::Value) -> String {
     if let Some(other) = explicit_action(v) {
         format!(
-            "`action` must be `add`, `insert`, `update`, `delete`/`remove`, or `clear` (got `{other}`). Example: {{\"action\": \"add\", \"content\": \"Task text\"}}."
+            "`action` must be `add`, `insert`, `update`, `delete`/`remove`, `clear`, or `list` (got `{other}`). Example: {{\"action\": \"add\", \"content\": \"Task text\"}}."
         )
     } else {
         "could not infer `action` from fields. Use {content} to add, {content,position} to insert, {id,status} or {id,content} to update, {id} to delete. `clear` always needs action=\"clear\"".to_string()
