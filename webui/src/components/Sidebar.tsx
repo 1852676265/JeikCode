@@ -14,6 +14,7 @@ import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { ConfirmDialog } from './ConfirmDialog';
 import { CwdPicker } from './CwdPicker';
 import { mergeOptimisticSession, mergeOptimisticSessions } from '../lib/sessionList';
+import { mcpAutoTrustSignature, mcpEnableNeedsTrust } from '../lib/mcpTrust';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, stripExtendedPathPrefix } from '../lib/displayPath';
 
@@ -439,7 +440,7 @@ export function Sidebar({
   const prevHiddenRef = useRef<Set<string>>(new Set());
   const [query, setQuery] = useState('');
   // Capability menu (unified MCP server + skills list): fetched lazily; the count
-  // badges show once loaded. `mcpTrust` carries only the MCP trust/blocked notice.
+  // badges show once loaded.
   const [capabilities, setCapabilities] = useState<CapabilityItem[] | null>(null);
   const [capsLoading, setCapsLoading] = useState(false);
   const [capsBusy, setCapsBusy] = useState<Set<string>>(new Set());
@@ -448,8 +449,8 @@ export function Sidebar({
   const [skillsMenuPos, setSkillsMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
-  // MCP menu: trust/blocked notice only (the rows come from `capabilities`).
-  const [mcpTrust, setMcpTrust] = useState<McpStatusInfo | null>(null);
+  // MCP menu: the rows come from `capabilities`; `/mcp/status` is consumed only to
+  // auto-confirm an untrusted project (no prompt is rendered).
   const [mcpReloading, setMcpReloading] = useState(false);
 
   // 侧栏可拖拽宽度状态与本地持久化
@@ -497,9 +498,12 @@ export function Sidebar({
   const [mcpMenuPos, setMcpMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const mcpMenuRef = useRef<HTMLDivElement | null>(null);
   const mcpBtnRef = useRef<HTMLButtonElement | null>(null);
-  // Trust flow: in-flight POST + error for the "Trust this project" button.
-  const [trusting, setTrusting] = useState(false);
-  const [trustError, setTrustError] = useState<string | null>(null);
+  // 项目信任自动确认：签名 = 当前项目 + 被拦截 server 集合。同一次拦截只尝试一次，
+  // 失败不循环重试；手动刷新（↻）与项目切换会重置签名，允许再次尝试。
+  const mcpAutoTrustSigRef = useRef<string | null>(null);
+  // 上次已拉取过能力表的项目身份（cwd|projectHash），用于项目切换后补拉一次。
+  const capProjectKeyRef = useRef('');
+
   // Per-session kebab menu: which session, and where to anchor the fixed menu.
   const [menuFor, setMenuFor] = useState<string | null>(null);
   // top XOR bottom: `top` opens the menu downward below the kebab; `bottom`
@@ -1111,17 +1115,41 @@ export function Sidebar({
   }
 
   // Fetch the unified capability list (MCP + skills) once; both menus reuse it.
-  // `mcpTrust` is refreshed alongside for the MCP trust/blocked notice.
+  // The `/mcp/status` ride-along only feeds the silent project-trust auto-confirm.
+  // The project identity of THIS fetch is recorded so a later project switch (or the
+  // arrival of `cwd`/`projectHash` after mount) can be detected as stale data.
+  function capabilityProjectKey() {
+    return `${cwd || ''}|${projectHash || ''}`;
+  }
   function refreshCapabilities() {
+    capProjectKeyRef.current = capabilityProjectKey();
     setCapsLoading(true);
     getCapabilities()
       .then(setCapabilities)
       .catch(() => setCapabilities((cur) => cur ?? []))
       .finally(() => setCapsLoading(false));
     getMcpStatus()
-      .then(setMcpTrust)
+      .then(maybeAutoTrustProjectMcp)
       .catch(() => {});
   }
+
+  // 用户偏好：项目级 MCP 的信任不做任何提示，检测到未信任就直接确认。
+  // 判定规则见 `lib/mcpTrust`（只有 daemon 明确上报「未信任」且确实存在被拦截的项目级
+  // server 才动作）；信任成功后立即刷新，让刚放行的 server 出现在面板上并开始连接。
+  // 失败保持静默，不弹提示（点 ↻ 可重试）。
+  function maybeAutoTrustProjectMcp(info: McpStatusInfo) {
+    const sig = mcpAutoTrustSignature(info, cwd || '');
+    if (sig === null || mcpAutoTrustSigRef.current === sig) return;
+    mcpAutoTrustSigRef.current = sig;
+    postLiveMcpTrust()
+      .then((result) => {
+        if (!result.ok) return;
+        mcpPollAttemptsRef.current = 0;
+        refreshCapabilities();
+      })
+      .catch(() => {});
+  }
+
   function ensureCapabilities() {
     if (capabilities !== null || capsLoading) return;
     refreshCapabilities();
@@ -1130,6 +1158,16 @@ export function Sidebar({
     ensureCapabilities();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // 能力开关与信任状态都是项目级的，而切换项目不会重挂载侧栏：当 cwd/projectHash 与
+  // 「上一次拉取所针对的项目身份」不一致时补拉一次（也覆盖挂载拉取早于 cwd 就绪的情形），
+  // 并重置自动信任签名，让新项目重新确认信任。
+  useEffect(() => {
+    if (!cwd && !projectHash) return;
+    if (capProjectKeyRef.current === capabilityProjectKey()) return;
+    mcpAutoTrustSigRef.current = null;
+    refreshCapabilities();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cwd, projectHash]);
 
   // Toggle one capability's disabled flag at a scope, then reconcile with the backend
   // so the row reflects the authoritative state. Optimistic paint keeps the switch
@@ -1160,6 +1198,17 @@ export function Sidebar({
         : cur,
     );
     try {
+      // 铁律：开关是唯一权威 —— 打开就得加载。若信任门正拦截着已启用的项目级 MCP，
+      // 先静默补上信任（不提示）再落开关，让开关一落地就是「已连接」，而不是等状态
+      // 轮询兜底。关闭路径、技能开关与信任门无关，连状态都不查。
+      if (item.kind === 'mcp' && wasDisabled) {
+        try {
+          const info = await getMcpStatus();
+          if (mcpEnableNeedsTrust(info, item.kind, true)) await postLiveMcpTrust();
+        } catch {
+          /* 静默失败：开关照落，随后的状态刷新仍会走一次自动信任兜底 */
+        }
+      }
       const res = await toggleCapability(item.kind, item.id, scope, !wasDisabled);
       if (!res.ok) setCapsError(res.error || 'toggle failed');
       // Give the runtime a beat to rebuild, then reconcile with the backend.
@@ -1229,6 +1278,8 @@ export function Sidebar({
     setMcpReloaded(false);
     setCapsLoading(true);
     try {
+      // 手动刷新也是用户的重试入口：重置签名后重新检测一次信任状态。
+      mcpAutoTrustSigRef.current = null;
       await postMcpReload();
       mcpPollAttemptsRef.current = 0;
       let list = await getCapabilities();
@@ -1239,7 +1290,7 @@ export function Sidebar({
         list = await getCapabilities();
         setCapabilities(list);
       }
-      getMcpStatus().then(setMcpTrust).catch(() => {});
+      getMcpStatus().then(maybeAutoTrustProjectMcp).catch(() => {});
       setMcpReloaded(true);
       if (mcpReloadedTimerRef.current != null) window.clearTimeout(mcpReloadedTimerRef.current);
       mcpReloadedTimerRef.current = window.setTimeout(() => setMcpReloaded(false), 2500);
@@ -1295,26 +1346,6 @@ export function Sidebar({
       window.removeEventListener('scroll', onScroll, true);
     };
   }, [mcpMenuOpen]);
-
-  async function onTrust() {
-    if (trusting) return;
-    setTrusting(true);
-    setTrustError(null);
-    try {
-      const result = await postLiveMcpTrust();
-      if (result.ok) {
-        // Refresh so the blocked notice disappears and newly-ready servers appear.
-        mcpPollAttemptsRef.current = 0;
-        refreshCapabilities();
-      } else {
-        setTrustError(result.error ?? 'Trust failed');
-      }
-    } catch (e) {
-      setTrustError(e instanceof Error ? e.message : 'Trust failed');
-    } finally {
-      setTrusting(false);
-    }
-  }
 
   function toggleMcpMenu(e: MouseEvent) {
     e.preventDefault();
@@ -1555,17 +1586,8 @@ export function Sidebar({
         {capsLoading && rows.length === 0 && (
           <div class="group-by-menu-title">{t('sidebar.mcpLoading')}</div>
         )}
-        {!capsLoading && rows.length === 0 && !(mcpTrust?.blocked?.length) && (
+        {!capsLoading && rows.length === 0 && (
           <div class="group-by-menu-title">{t('sidebar.mcpEmpty')}</div>
-        )}
-        {(mcpTrust?.blocked?.length ?? 0) > 0 && (
-          <div class="mcp-blocked-notice">
-            <span>{t('mcp.blockedUntrusted').replace('{n}', String(mcpTrust!.blocked!.length))}</span>
-            {trustError && <span class="mcp-blocked-error">{trustError}</span>}
-            <button class="btn btn-primary" disabled={trusting} onClick={onTrust}>
-              {trusting ? '…' : t('mcp.trustProject')}
-            </button>
-          </div>
         )}
         {capsError && (
           <div class="cap-error">{t('cap.toggleFailed', { error: capsError })}</div>

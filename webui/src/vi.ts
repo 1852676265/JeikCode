@@ -31,7 +31,6 @@ export const vi: Record<keyof typeof en, string> = {
   'sidebar.mcpReloading': 'Đang tải lại…',
   'sidebar.mcpReloaded': 'Đã tải lại',
   'mcp.blockedUntrusted': 'Đã chặn {n} máy chủ MCP từ dự án chưa được tin cậy.',
-  'mcp.trustProject': 'Tin cậy dự án này',
   'cap.global': 'Toàn cục',
   'cap.project': 'Dự án',
   'cap.toggleGlobal': 'Bật/tắt toàn cục',
