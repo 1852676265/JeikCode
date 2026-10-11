@@ -2,7 +2,8 @@
 //! current state is DERIVED by folding transcript `todo_write`/`todowrite`/`todo` calls
 //! ([`reduce_todos`]). Preferred shape is `actions[]` (or a single action object);
 //! `action` may be omitted when the other fields uniquely determine the op.
-//! `{"todos":[…]}` is resume/legacy full-list replace only. Non-destructive ⇒ `Safe`.
+//! `{"todos":[…]}` is resume/legacy full-list replace only. `list` is a read-only echo of
+//! the current list (legacy name kept as a first-class read; never batched). Non-destructive ⇒ `Safe`.
 
 /// Canonical name advertised to the model. `todowrite` / `todo` remain aliases so
 /// old transcripts and models still fold.
@@ -308,6 +309,14 @@ fn validate_actions_mix(arr: &[serde_json::Value]) -> Result<(), String> {
     {
         return Err(
             "todowrite: `clear` can only be batched with `add` and/or `update` (`clear` runs first)."
+                .into(),
+        );
+    }
+    // `list` is read-only: it travels alone, so a batch can never imply a mutation it did
+    // not ask for and the fold can treat it as a pure no-op.
+    if has("list") && (kinds.len() > 1 || arr.len() > 1) {
+        return Err(
+            "todowrite: `list` is read-only and must be the only action (it cannot be batched)."
                 .into(),
         );
     }
@@ -688,6 +697,8 @@ fn try_apply_one_action(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Resu
             list.clear();
             Ok(())
         }
+        // Read-only: the derived list must fold a `list` call as a pure no-op.
+        Some("list") => Ok(()),
         _ => Err(format!("todowrite: {}", unknown_or_uninferable_action(v))),
     }
 }
@@ -940,14 +951,14 @@ impl Tool for TodoTool {
             "properties": {
                 "actions": {
                     "type": "array",
-                    "description": "Array of task action objects to apply in sequence. Each item specifies an action ('add', 'insert', 'update', 'delete', 'remove', 'clear').",
+                    "description": "Array of task action objects to apply in sequence. Each item specifies an action ('add', 'insert', 'update', 'delete', 'remove', 'clear'); the read-only 'list' must be the only item.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "action": {
                                 "type": "string",
-                                "enum": ["add", "insert", "update", "delete", "clear"],
-                                "description": "Optional when fields uniquely determine the op: {content}→add, {content,position}→insert, {id,status|content}→update, {id}→delete. Required for clear. Explicit value always wins."
+                                "enum": ["add", "insert", "update", "delete", "remove", "clear", "list"],
+                                "description": "Optional when fields uniquely determine the op: {content}→add, {content,position}→insert, {id,status|content}→update, {id}→delete. Required for `clear` and for the read-only `list` (returns the current tasks). Explicit value always wins."
                             },
                             "id": {
                                 "type": "integer",
@@ -1001,6 +1012,19 @@ impl Tool for TodoTool {
         if v.get("actions").is_none() && v.get("todos").is_none() && action_kind(&v).is_some() {
             let single = v.clone();
             v = json!({ "actions": [single] });
+        }
+
+        // Read-only `list`: echo the CURRENT list and touch nothing. The name predates the
+        // `actions` contract and is kept as a first-class read (old transcripts and models still
+        // ask for it), so it answers with the numbered list instead of the mutation summary.
+        if matches!(
+            v.get("actions").and_then(|a| a.as_array()).map(Vec::as_slice),
+            Some([only]) if action_kind(only) == Some("list")
+        ) {
+            return ok(format!(
+                "Current task list:\n\n{}",
+                render_todos_numbered(&list, false)
+            ));
         }
 
         if v.get("actions").and_then(|a| a.as_array()).is_none() {
@@ -1117,6 +1141,10 @@ fn summarize_todo_action(v: &serde_json::Value) -> Result<String, String> {
             _ => Err("`delete`/`remove` needs a valid `id` (1-based task number). Example: {\"action\": \"delete\", \"id\": 1}".into()),
         },
         Some("clear") => Ok("all tasks cleared".to_string()),
+        // Reachable only through a direct call: `execute` short-circuits a lone `list` before
+        // the summary runs and batching is rejected above. Kept total so a read-only kind can
+        // never surface as "unknown action".
+        Some("list") => Ok("listed the current tasks".to_string()),
         _ => Err(unknown_or_uninferable_action(v)),
     }
 }
@@ -1469,6 +1497,54 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("task"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn list_action_echoes_the_current_tasks_without_mutating_them() {
+        let t = TodoTool::new();
+        let seeded = t
+            .execute(
+                r#"{"actions":[{"action":"add","content":"alpha"},{"action":"add","content":"beta"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!seeded.is_error, "{}", seeded.content);
+
+        // Both the bare legacy shape and the explicit `actions[]` shape answer with the list.
+        let bare = t.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(!bare.is_error, "list must not error: {}", bare.content);
+        assert!(
+            bare.content.contains("alpha") && bare.content.contains("beta"),
+            "{}",
+            bare.content
+        );
+        let explicit = t
+            .execute(r#"{"actions":[{"action":"list"}]}"#, &ctx())
+            .await;
+        assert_eq!(
+            explicit.content, bare.content,
+            "list must not mutate the list"
+        );
+
+        // The fold sees the same no-op: a `list` call never changes derived state.
+        let mut folded =
+            parse_todos(r#"{"todos":[{"content":"kept","status":"pending"}]}"#).unwrap();
+        let before = folded.clone();
+        apply_todo_action(&mut folded, r#"{"action":"list"}"#);
+        assert_eq!(folded, before);
+    }
+
+    #[tokio::test]
+    async fn list_action_rejects_being_batched_with_a_mutation() {
+        let t = TodoTool::new();
+        let r = t
+            .execute(
+                r#"{"actions":[{"action":"list"},{"action":"add","content":"x"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("read-only"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -2285,6 +2361,16 @@ mod tests {
         assert_eq!(v["actions"].as_array().unwrap().len(), 2);
         assert_eq!(v["actions"][0]["content"], "one");
         assert_eq!(v["actions"][1]["id"], 1);
+    }
+
+    #[test]
+    fn merge_todo_write_args_keeps_a_read_only_list_call_independent() {
+        // `list` must never ride inside a merged batch: the mix is illegal, so the merge
+        // declines and the kernel runs the two calls in order (list echoes, add applies).
+        let list = r#"{"action":"list"}"#;
+        let add = r#"{"action":"add","content":"one"}"#;
+        assert!(merge_todo_write_args(&[list, add]).is_none());
+        assert!(merge_todo_write_args(&[list, list]).is_none());
     }
 
     #[test]
