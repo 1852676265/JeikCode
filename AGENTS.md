@@ -22,6 +22,7 @@
 ## 3. Commit & PR Discipline
 
 - **Git Commit Standards**: Follow Conventional Commits (`feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, etc.). Provide clear commit bodies describing the final effective state and rationale. Avoid fragmented 1–3 file micro-commits, except during iterative CI fix loops; consolidate repetitive CI fix commits into a single unified commit once green.
+- **Bilingual Commit Bodies**: Commit titles stay English-only. Bodies must be written in two complete passes, in this exact order: (1) the full English version first; (2) a standalone `---` separator line; (3) the full Chinese version. Inside the Chinese section, keep code identifiers, file paths, commands, API/field names, and other technical terms in their original English form at the appropriate places — do not translate them. The co-authorship trailer remains its own final paragraph, separated by a blank line.
 - **Issue & PR Traceability**: When referencing or addressing specific PRs or issues, explicitly state in both the commit title and body what was fixed, added, or changed regarding the target and the resulting outcome.
 - **PR Scope & Quality**:
   - **Single Responsibility**: Each PR must address exactly one category of change. Never bundle unrelated edits.
