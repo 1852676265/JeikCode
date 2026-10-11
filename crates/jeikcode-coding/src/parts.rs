@@ -320,7 +320,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
-    let bash_runtime = reuse_bash_runtime.unwrap_or_else(|| Arc::new(BashRuntimeState::new()));
+    let bash_runtime =
+        reuse_bash_runtime.unwrap_or_else(jeikcode_capabilities::tools::legacy_bash_runtime_state);
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
