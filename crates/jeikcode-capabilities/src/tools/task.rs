@@ -1692,9 +1692,7 @@ mod tests {
         assert!(g
             .violation("write_file", r#"{"file_path":"Cargo.toml"}"#)
             .is_none());
-        assert!(g
-            .violation("write", r#"{"path":"Cargo.toml"}"#)
-            .is_none());
+        assert!(g.violation("write", r#"{"path":"Cargo.toml"}"#).is_none());
         // out-of-scope write → denied, message names the path + scope
         let deny = g
             .violation("edit_file", r#"{"file_path":"src/db/schema.rs"}"#)
@@ -1746,19 +1744,13 @@ mod tests {
         assert!(g
             .violation("write", r#"{"path":"../outside.rs"}"#)
             .is_some());
-        assert!(g
-            .violation("edit", r#"{"path":"../outside.rs"}"#)
-            .is_some());
+        assert!(g.violation("edit", r#"{"path":"../outside.rs"}"#).is_some());
         // ...and an absolute path outside the working dir is denied
         assert!(g
             .violation("write_file", r#"{"file_path":"/etc/passwd"}"#)
             .is_some());
-        assert!(g
-            .violation("write", r#"{"path":"/etc/passwd"}"#)
-            .is_some());
-        assert!(g
-            .violation("edit", r#"{"path":"/etc/passwd"}"#)
-            .is_some());
+        assert!(g.violation("write", r#"{"path":"/etc/passwd"}"#).is_some());
+        assert!(g.violation("edit", r#"{"path":"/etc/passwd"}"#).is_some());
         // an absolute path INSIDE the working dir is normalized + allowed
         assert!(g
             .violation("write_file", r#"{"file_path":"/workspace/in.rs"}"#)
@@ -1902,10 +1894,10 @@ mod tests {
             scope: scope.into_iter().map(String::from).collect(),
         };
         let tasks = vec![
-            mk("Worker", vec!["src/**"]),  // PascalCase ok
-            mk("WORKER", vec![]),           // UPPERCASE missing scope -> flagged
-            mk(" worker ", vec!["  "]),     // padded missing scope -> flagged
-            mk("Explore", vec![]),          // explore -> ignored
+            mk("Worker", vec!["src/**"]), // PascalCase ok
+            mk("WORKER", vec![]),         // UPPERCASE missing scope -> flagged
+            mk(" worker ", vec!["  "]),   // padded missing scope -> flagged
+            mk("Explore", vec![]),        // explore -> ignored
         ];
         assert_eq!(workers_missing_scope(&tasks), vec![2, 3]);
 

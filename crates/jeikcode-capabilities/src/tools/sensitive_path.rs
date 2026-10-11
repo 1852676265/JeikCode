@@ -686,8 +686,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn code_explore_sensitive_path_through_symlink_requires_approval() {
-        use std::os::unix::fs::symlink;
         use jeikcode_kernel::tool::{ToolContext, ToolResult};
+        use std::os::unix::fs::symlink;
 
         let ws = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -746,11 +746,7 @@ mod tests {
             Some(cwd.join("src"))
         );
         assert_eq!(
-            local_read_target(
-                "code_explore",
-                r#"{"query":"auth","path":"src/auth"}"#,
-                cwd
-            ),
+            local_read_target("code_explore", r#"{"query":"auth","path":"src/auth"}"#, cwd),
             Some(cwd.join("src/auth"))
         );
     }

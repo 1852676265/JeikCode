@@ -659,6 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn windows_backslash_and_case_insensitive_and_hidden_match() {
         let work = tempfile::tempdir().unwrap();
         let sub = work.path().join("src").join("components");
@@ -686,6 +687,32 @@ mod tests {
             .await;
         assert!(!r3.is_error, "r3 failed: {}", r3.content);
         assert!(r3.content.contains(".env.local"));
+    }
+
+    /// The SHIPPED ignore list must not hide `.env*` from search.
+    ///
+    /// Regression lock for the reported flake: the asset briefly carried `.env` / `.env.*`,
+    /// which (a) silently hid `.env.local` from `glob` / `grep` — and because an earlier
+    /// test seeds the list into `~/.jeikcode/.codegraphignore`, it failed ONLY in the full
+    /// suite while passing in isolation — and (b) made `grep` on `.env` lie.
+    #[tokio::test]
+    async fn shipped_ignore_does_not_hide_env_files_from_glob() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(
+            work.path().join(".codegraphignore"),
+            include_str!("../../assets/.codegraphignore"),
+        )
+        .unwrap();
+        std::fs::write(work.path().join(".env.local"), "SECRET=1\n").unwrap();
+        let r = GlobTool
+            .execute(r#"{"pattern":".env*"}"#, &ctx(work.path()))
+            .await;
+        assert!(!r.is_error, "failed: {}", r.content);
+        assert!(
+            r.content.contains(".env.local"),
+            "the shipped ignore list must NOT hide .env files from glob: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

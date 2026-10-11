@@ -295,7 +295,10 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         // “空 JEIKCODE_HOME = 未设置”现在等价于“本线程用默认临时 home”：重点断言
         // 不产生 bogus 的相对 `skills` 目录（历史回归：`PathBuf::from("").join("skills")`）。
-        let _home = jeikcode_config::test_util::isolated_home();
+        // 把 seam 钉在**本测试 home 的 .jeikcode 根**上：`runtime_skill_dirs` 会把
+        // `home/.jeikcode/*` 重基到 `Config::config_dir()`（也就是 seam 根本身），
+        // 所以 seam 必须等于 `home/.jeikcode`，两侧才会一致。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path().join(".jeikcode"));
         let dirs = runtime_skill_dirs(home.path(), project.path());
 
         // Empty JEIKCODE_HOME must be treated as unset — NOT redirected to a bogus

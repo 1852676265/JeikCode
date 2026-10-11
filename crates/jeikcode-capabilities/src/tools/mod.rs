@@ -525,6 +525,13 @@ pub(crate) fn for_each_project_entry(
         .git_ignore(git_ignore_active)
         .git_global(git_ignore_active)
         .git_exclude(git_ignore_active);
+    // The shipped/user ignore list is applied AS A WHOLE on purpose: its dir rules
+    // (`obj/`, `bin/Debug/`, …) and its file-level negations (`!bin/*.js`,
+    // `!src/bin/`) only work together — filtering it down to "dirs only" hides
+    // `bin/` and with it the negations that rescue `bin/cli.js` (see
+    // `shipped_ignore_keeps_source_bins_in_glob`). Consequently the list itself must
+    // never hide files an explicit search is asked for; that is why `.env*` was
+    // removed from the asset (it silently hid `.env.local` from `glob`/`grep`).
     if git_ignore_active {
         add_codegraph_ignores(&mut main);
     }

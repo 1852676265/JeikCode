@@ -46,7 +46,10 @@ impl SkillCatalogHook {
     /// Reconcile the catalog block in place. No-op when the catalog is unchanged.
     fn refresh_in_place(&self, convo: &mut Conversation) {
         {
-            let mut last = self.last_block.lock().unwrap_or_else(|error| error.into_inner());
+            let mut last = self
+                .last_block
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if last.as_ref() == Some(&self.catalog) {
                 return;
             }
