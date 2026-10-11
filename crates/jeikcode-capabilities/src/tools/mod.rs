@@ -271,6 +271,35 @@ pub(crate) async fn output_with_timeout_secs(
 /// Resolve a model-supplied path. Shared with `codeintel` via [`crate::pathutil`].
 pub(crate) use crate::pathutil::{is_absolute_path, resolve_path};
 
+/// Names every name-keyed gate must treat as a FILE MUTATION: the canonical tools first, then
+/// the aliases that still dispatch. `create_file` is a long-recognised spelling (the daemon,
+/// tuix and goal-summary layers already accept it), and the purged bulk-edit names stay listed
+/// so a hallucinated call can never skip a gate. Single source: adding an alias here covers the
+/// write-approval gate AND the worker scope gate at once.
+pub const FILE_MUTATION_TOOLS: &[&str] = &[
+    "edit",
+    "edit_file",
+    "write",
+    "write_file",
+    "create_file",
+    "search_replace",
+    "global_search_replace",
+    "parallel_edit_files",
+];
+
+/// Case-insensitive membership test over [`FILE_MUTATION_TOOLS`].
+pub fn is_file_mutation_tool(name: &str) -> bool {
+    FILE_MUTATION_TOOLS
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
+}
+
+/// The bulk-edit tools whose "target" is a search ROOT (a directory), not a single file.
+pub fn is_search_replace_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("search_replace")
+        || name.eq_ignore_ascii_case("global_search_replace")
+}
+
 /// Max entries listed in a not-found hint before it is truncated.
 const HINT_MAX_ENTRIES: usize = 40;
 

@@ -145,53 +145,54 @@ impl WorkerScopeGate {
     /// `None` = allow; `Some(reason)` = deny. Non-write tools (reads, `bash`, anything else)
     /// always return `None`.
     fn violation(&self, tool: &str, args_json: &str) -> Option<String> {
-        match tool {
-            "edit" | "edit_file" | "write" | "write_file" => {
-                let raw = match serde_json::from_str::<serde_json::Value>(args_json)
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| {
-                        v.get("path")
-                            .or_else(|| v.get("file_path"))
-                            .and_then(|x| x.as_str())
-                    })
-                {
-                    Some(p) => p.to_string(),
-                    // Fail closed: a write tool with no usable `path` or `file_path` must not slip past
-                    // the gate (defense-in-depth; the tool itself also rejects it).
-                    None => {
-                        return Some(format!(
-                            "worker {tool} call has no usable `path` or `file_path`; cannot verify it is within scope."
-                        ))
-                    }
-                };
-                match self.workspace_relative(&raw) {
+        // Name sets come from capabilities (`is_file_mutation_tool` / `is_search_replace_tool`)
+        // so a newly registered alias can never fall through to the `None` (allow) arm again —
+        // `create_file` used to escape this gate exactly that way.
+        if super::is_search_replace_tool(tool) {
+            let value = serde_json::from_str::<serde_json::Value>(args_json)
+                .unwrap_or(serde_json::Value::Null);
+            match value.get("path").and_then(|x| x.as_str()) {
+                None => Some(format!(
+                    "worker {tool} has no `path`, which would rewrite the whole tree; \
+                     restrict `path` to within the declared scope [{}].",
+                    self.display
+                )),
+                Some(dir) => match self.workspace_relative(dir) {
                     None => Some(format!(
-                        "worker edit out of scope: {raw} is outside the working directory."
+                        "worker edit out of scope: {dir} is outside the working directory."
                     )),
-                    Some(rel) if self.globs.is_match(&rel) => None,
-                    Some(rel) => Some(self.deny_out_of_scope(&rel)),
-                }
+                    Some(rel_dir) if self.dir_in_scope(&rel_dir) => None,
+                    Some(rel_dir) => Some(self.deny_out_of_scope(&rel_dir)),
+                },
             }
-            "global_search_replace" | "search_replace" => {
-                let value = serde_json::from_str::<serde_json::Value>(args_json)
-                    .unwrap_or(serde_json::Value::Null);
-                match value.get("path").and_then(|x| x.as_str()) {
-                    None => Some(format!(
-                        "worker {tool} has no `path`, which would rewrite the whole tree; \
-                         restrict `path` to within the declared scope [{}].",
-                        self.display
-                    )),
-                    Some(dir) => match self.workspace_relative(dir) {
-                        None => Some(format!(
-                            "worker edit out of scope: {dir} is outside the working directory."
-                        )),
-                        Some(rel_dir) if self.dir_in_scope(&rel_dir) => None,
-                        Some(rel_dir) => Some(self.deny_out_of_scope(&rel_dir)),
-                    },
+        } else if super::is_file_mutation_tool(tool) {
+            let raw = match serde_json::from_str::<serde_json::Value>(args_json)
+                .ok()
+                .as_ref()
+                .and_then(|v| {
+                    v.get("path")
+                        .or_else(|| v.get("file_path"))
+                        .and_then(|x| x.as_str())
+                })
+            {
+                Some(p) => p.to_string(),
+                // Fail closed: a write tool with no usable `path` or `file_path` must not slip past
+                // the gate (defense-in-depth; the tool itself also rejects it).
+                None => {
+                    return Some(format!(
+                        "worker {tool} call has no usable `path` or `file_path`; cannot verify it is within scope."
+                    ))
                 }
+            };
+            match self.workspace_relative(&raw) {
+                None => Some(format!(
+                    "worker edit out of scope: {raw} is outside the working directory."
+                )),
+                Some(rel) if self.globs.is_match(&rel) => None,
+                Some(rel) => Some(self.deny_out_of_scope(&rel)),
             }
-            _ => None,
+        } else {
+            None
         }
     }
 
