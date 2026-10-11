@@ -844,6 +844,10 @@ struct ActiveChatOperation {
     /// A submit on this channel is folded at the next round boundary; it does not
     /// cancel the in-flight model call or tool batch.
     steer_tx: Option<mpsc::UnboundedSender<live_api::ChatSteerSignal>>,
+    /// FIFO of client correlation ids for `/chat/steer` submits awaiting fold.
+    /// Drained by the projection when a `Steered` event lands, so the wire can
+    /// echo the id and let the WebUI reconcile an in-flight steer after refresh.
+    steer_client_ids: std::collections::VecDeque<Option<String>>,
 }
 
 #[derive(Default)]
@@ -968,6 +972,7 @@ impl ActiveChatRegistry {
                 admitted_user: None,
                 replay: Arc::new(std::sync::Mutex::new(Vec::new())),
                 steer_tx: None,
+                steer_client_ids: std::collections::VecDeque::new(),
             },
         );
 
@@ -1478,6 +1483,34 @@ impl ActiveChatRegistry {
         index.operations.get(operation_id)?.steer_tx.clone()
     }
 
+    /// Record a `/chat/steer` submit's client correlation id (FIFO; `None` when
+    /// the client sent none) so the turn projection can echo it on `steered`.
+    async fn record_steer_client_id(&self, alias: &str, client_input_id: Option<String>) {
+        let mut index = self.inner.write().await;
+        if let Some(operation_id) = index.aliases.get(alias).cloned() {
+            if let Some(operation) = index.operations.get_mut(&operation_id) {
+                operation.steer_client_ids.push_back(client_input_id);
+            }
+        }
+    }
+
+    /// Drain up to `count` recorded steer client ids for the operation (FIFO),
+    /// padding with `None` so the returned list always aligns 1:1 with the folded
+    /// inputs reported by the kernel.
+    async fn take_steer_client_ids(
+        &self,
+        operation_id: &str,
+        count: usize,
+    ) -> Vec<Option<String>> {
+        let mut index = self.inner.write().await;
+        let Some(operation) = index.operations.get_mut(operation_id) else {
+            return Vec::new();
+        };
+        (0..count)
+            .map(|_| operation.steer_client_ids.pop_front().unwrap_or(None))
+            .collect()
+    }
+
     /// Remove only the exact operation that finished. A late cleanup from an
     /// older generation can never erase a replacement operation's aliases.
     async fn complete(&self, operation_id: &str) -> bool {
@@ -1643,12 +1676,12 @@ fn replay_resolves_call(events: &[ChatEvent], call_id: &str) -> bool {
 /// deltas so a long stream does not allocate one Vec entry per token.
 fn push_chat_replay(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
     match (&event, buf.last_mut()) {
-        (ChatEvent::TextDelta { content }, Some(ChatEvent::TextDelta { content: prev })) => {
+        (ChatEvent::TextDelta { content, .. }, Some(ChatEvent::TextDelta { content: prev, .. })) => {
             prev.push_str(content);
         }
         (
-            ChatEvent::ReasoningDelta { content },
-            Some(ChatEvent::ReasoningDelta { content: prev }),
+            ChatEvent::ReasoningDelta { content, .. },
+            Some(ChatEvent::ReasoningDelta { content: prev, .. }),
         ) => {
             prev.push_str(content);
         }
@@ -1775,14 +1808,14 @@ fn mirror_chat_event_to_registry(session_id: &str, event: &ChatEvent) {
         .unwrap_or_else(|| PathBuf::from("."));
     let _ = reg.open_or_attach(session_id.to_string(), working_dir);
     match event {
-        ChatEvent::TextDelta { content } => {
+        ChatEvent::TextDelta { content, .. } => {
             let _ = reg.push_runtime_event(
                 &session_id.to_string(),
                 0,
                 CodingRuntimeEvent::Agent(AgentEvent::TextDelta(content.clone())),
             );
         }
-        ChatEvent::ReasoningDelta { content } => {
+        ChatEvent::ReasoningDelta { content, .. } => {
             let _ = reg.push_runtime_event(
                 &session_id.to_string(),
                 0,
@@ -5329,10 +5362,29 @@ pub enum ChatEvent {
     },
     /// LLM text delta
     #[serde(rename = "text")]
-    TextDelta { content: String },
+    TextDelta {
+        content: String,
+        /// Streaming assistant-message identity (from `AssistantMessage`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        /// Unique part id for this streamed text run: `{message_id}:{part_seq}:text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        /// Monotonic part counter within the message (bumped on kind change).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
     /// LLM reasoning/thinking content
     #[serde(rename = "reasoning")]
-    ReasoningDelta { content: String },
+    ReasoningDelta {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
     /// Tool call started
     #[serde(rename = "tool_start")]
     ToolCallStarted {
@@ -5353,6 +5405,11 @@ pub enum ChatEvent {
     Steered {
         count: usize,
         inputs: Vec<jeikcode_kernel::event::SteeredInput>,
+        /// Client-correlation ids for the folded inputs, in FIFO order (`None`
+        /// when a submit carried none). Lets the WebUI promote its optimistic
+        /// steer card/bubble to the persisted message by id across a refresh.
+        #[serde(default)]
+        client_input_ids: Vec<Option<String>>,
     },
     /// Tool call completed
     #[serde(rename = "tool_result")]
@@ -5896,7 +5953,7 @@ mod chat_event_type_tests {
         });
         assert!(matches!(
             events.as_slice(),
-            [ChatEvent::Steered { count: 1, inputs }] if inputs[0].text == "next instruction"
+            [ChatEvent::Steered { count: 1, inputs, .. }] if inputs[0].text == "next instruction"
         ));
     }
 
@@ -6203,6 +6260,9 @@ impl ArtifactDetector {
                         if fence_start > 0 {
                             events.push(ChatEvent::TextDelta {
                                 content: remaining[..fence_start].to_string(),
+                                message_id: None,
+                                part_id: None,
+                                part_seq: None,
                             });
                         }
 
@@ -6272,6 +6332,9 @@ impl ArtifactDetector {
                         // Normal text
                         events.push(ChatEvent::TextDelta {
                             content: remaining.to_string(),
+                            message_id: None,
+                            part_id: None,
+                            part_seq: None,
                         });
                         remaining = "";
                     }
@@ -6521,6 +6584,14 @@ struct ChatRuntimeProjector {
     /// nested ```` fences) as `content`. ArtifactDetector is a WebUI widget
     /// split and must not run on that path or mixed last-turn text is lost.
     keep_raw_markdown: bool,
+    /// Stable id of the assistant message currently streaming (from
+    /// `AgentEvent::AssistantMessage`). Tags text/reasoning deltas with the same
+    /// identity the persisted `Message` carries.
+    current_message_id: Option<String>,
+    /// Monotonic per-message part counter; bumped when the streaming part KIND
+    /// changes (reasoning → text → …) so each part gets a unique `part_id`.
+    part_seq: u32,
+    last_part_kind: Option<String>,
 }
 
 impl Default for ChatRuntimeProjector {
@@ -6534,6 +6605,9 @@ impl Default for ChatRuntimeProjector {
             terminal_seen: false,
             last_error: None,
             keep_raw_markdown: false,
+            current_message_id: None,
+            part_seq: 0,
+            last_part_kind: None,
         }
     }
 }
@@ -6604,7 +6678,12 @@ impl ChatRuntimeProjector {
                     outcome.summary_would_grow(),
                 );
                 if self.keep_raw_markdown {
-                    vec![ChatEvent::TextDelta { content: text }]
+                    vec![ChatEvent::TextDelta {
+                        content: text,
+                        message_id: None,
+                        part_id: None,
+                        part_seq: None,
+                    }]
                 } else {
                     self.artifacts.process(&text)
                 }
@@ -6712,18 +6791,77 @@ impl ChatRuntimeProjector {
         }
     }
 
+    /// Allocate the id set for the current streaming part `kind` (bumping
+    /// `part_seq` when the kind changes). `None` ids when no assistant-message
+    /// boundary has been seen (older driver / non-boundary text such as a
+    /// compaction advisory).
+    fn next_part_stamp(&mut self, kind: &str) -> (Option<String>, Option<String>, Option<u32>) {
+        let message_id = self.current_message_id.clone();
+        if self.last_part_kind.as_deref() != Some(kind) {
+            self.part_seq += 1;
+            self.last_part_kind = Some(kind.to_string());
+        }
+        let has_id = message_id.is_some();
+        let part_id = message_id
+            .as_ref()
+            .map(|m| format!("{m}:{}:{kind}", self.part_seq));
+        (message_id, part_id, has_id.then_some(self.part_seq))
+    }
+
     fn project_agent(&mut self, event: jeikcode_kernel::event::AgentEvent) -> Vec<ChatEvent> {
         use jeikcode_kernel::event::AgentEvent as Agent;
 
         match event {
+            Agent::AssistantMessage { message_id } => {
+                // Boundary marker: tag subsequent deltas with this identity.
+                self.current_message_id = Some(message_id);
+                self.part_seq = 0;
+                self.last_part_kind = None;
+                Vec::new()
+            }
             Agent::TextDelta(text) => {
-                if self.keep_raw_markdown {
-                    vec![ChatEvent::TextDelta { content: text }]
+                let (message_id, part_id, part_seq) = self.next_part_stamp("text");
+                let mut events = if self.keep_raw_markdown {
+                    vec![ChatEvent::TextDelta {
+                        content: text,
+                        message_id: message_id.clone(),
+                        part_id: part_id.clone(),
+                        part_seq,
+                    }]
                 } else {
                     self.artifacts.process(&text)
+                };
+                // ArtifactDetector emits TextDelta without ids — stamp them here.
+                for ev in events.iter_mut() {
+                    if let ChatEvent::TextDelta {
+                        message_id: m,
+                        part_id: p,
+                        part_seq: s,
+                        ..
+                    } = ev
+                    {
+                        if m.is_none() {
+                            *m = message_id.clone();
+                        }
+                        if p.is_none() {
+                            *p = part_id.clone();
+                        }
+                        if s.is_none() {
+                            *s = part_seq;
+                        }
+                    }
                 }
+                events
             }
-            Agent::Reasoning(content) => vec![ChatEvent::ReasoningDelta { content }],
+            Agent::Reasoning(content) => {
+                let (message_id, part_id, part_seq) = self.next_part_stamp("reasoning");
+                vec![ChatEvent::ReasoningDelta {
+                    content,
+                    message_id,
+                    part_id,
+                    part_seq,
+                }]
+            }
             Agent::ToolBatchStarted { calls, .. } => {
                 vec![ChatEvent::ToolBatchStarted { calls }]
             }
@@ -6792,7 +6930,11 @@ impl ChatRuntimeProjector {
                 if let Some(event) = self.finish() {
                     events.push(event);
                 }
-                events.push(ChatEvent::Steered { count, inputs });
+                events.push(ChatEvent::Steered {
+                    count,
+                    inputs,
+                    client_input_ids: Vec::new(),
+                });
                 events
             }
             Agent::TurnStarted
@@ -7436,7 +7578,21 @@ async fn process_chat_request(
         ..ChatRuntimeProjector::default()
     };
     while let Some(event) = runtime_event_rx.recv().await {
-        for chat_event in projector.project_runtime(event, &perm_session_key) {
+        for mut chat_event in projector.project_runtime(event, &perm_session_key) {
+            // Echo the recorded client correlation ids on a steer fold, so the
+            // WebUI can reconcile an in-flight steer (id → persisted message).
+            if let ChatEvent::Steered {
+                count,
+                client_input_ids,
+                ..
+            } = &mut chat_event
+            {
+                if client_input_ids.is_empty() {
+                    *client_input_ids = active_chats
+                        .take_steer_client_ids(&operation_id, *count)
+                        .await;
+                }
+            }
             if matches!(
                 chat_event,
                 ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
@@ -7852,6 +8008,10 @@ struct ChatSteerRequest {
     message: String,
     #[serde(default)]
     images: Vec<ImageInput>,
+    /// Client correlation id (opaque). Echoed on the `steered` wire event so the
+    /// WebUI can promote an optimistic steer to the persisted message by id.
+    #[serde(default)]
+    client_input_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8009,6 +8169,12 @@ async fn chat_steer(
             }),
         );
     };
+    // Record the client correlation id BEFORE submitting, so a fast round-boundary
+    // fold cannot emit `steered` before the id is available to echo.
+    state
+        .active_chats
+        .record_steer_client_id(&req.session_id, req.client_input_id.clone())
+        .await;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let pending = live_api::PendingChatSteer {
         text: steer_prompt::compose_steer_text(&req.message),
@@ -13612,7 +13778,7 @@ mod tests {
         assert_eq!(events.len(), 5, "{events:?}");
         assert!(matches!(
             &events[0],
-            ChatEvent::TextDelta { content } if content == "验证：\n"
+            ChatEvent::TextDelta { content, .. } if content == "验证：\n"
         ));
         assert!(matches!(
             &events[1],
@@ -13629,7 +13795,7 @@ mod tests {
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
         assert!(matches!(
             &events[4],
-            ChatEvent::TextDelta { content } if content == "完成"
+            ChatEvent::TextDelta { content, .. } if content == "完成"
         ));
     }
 
@@ -13640,7 +13806,7 @@ mod tests {
         let events = detector.process(input);
 
         assert_eq!(events.len(), 5, "Events: {events:#?}");
-        assert!(matches!(&events[0], ChatEvent::TextDelta { content } if content == "前言：\n"));
+        assert!(matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "前言：\n"));
         assert!(matches!(
             &events[1],
             ChatEvent::ArtifactStart {
@@ -13658,7 +13824,7 @@ mod tests {
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
         assert!(matches!(
             &events[4],
-            ChatEvent::TextDelta { content } if content == "#### 结论：完成"
+            ChatEvent::TextDelta { content, .. } if content == "#### 结论：完成"
         ));
     }
 
@@ -13673,7 +13839,7 @@ mod tests {
         assert!(matches!(&events[1], ChatEvent::ArtifactContent { .. }));
         assert!(matches!(&events[2], ChatEvent::ArtifactContent { .. }));
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
-        assert!(matches!(&events[4], ChatEvent::TextDelta { content } if content == "后续正文"));
+        assert!(matches!(&events[4], ChatEvent::TextDelta { content, .. } if content == "后续正文"));
     }
 
     #[test]

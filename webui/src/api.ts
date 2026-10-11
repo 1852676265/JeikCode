@@ -157,9 +157,9 @@ export async function getHealth(): Promise<HealthInfo> {
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
-  | { type: 'user'; content: string; session_id?: string; created_at?: number }
-  | { type: 'text'; content: string }
-  | { type: 'reasoning'; content: string }
+  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number }
+  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
   | { type: 'tool_output'; id?: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
@@ -1724,9 +1724,9 @@ export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; session_name?: string; project_hash: string; provider: string; mode: ApprovalMode; working_dir?: string }
   | { type: 'provider'; provider: string }
   | { type: 'mode'; mode: ApprovalMode }
-  | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }
-  | { type: 'text'; content: string }
-  | { type: 'reasoning'; content: string }
+  | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string; message_id?: string }
+  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
   | { type: 'tool_start'; id: string; name: string; arguments: string }
   | { type: 'tool_output'; id: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
