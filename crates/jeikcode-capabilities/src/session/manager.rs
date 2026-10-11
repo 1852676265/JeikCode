@@ -3569,16 +3569,22 @@ fn catalog_entry(
 ) -> Option<CatalogEntry> {
     match (sources.native, sources.legacy) {
         (Some(native), legacy) => {
-            let created_at_ms = if native.created_at > 0 && native.created_at < 100_000_000_000 {
-                native.created_at.saturating_mul(1_000)
-            } else {
-                native.created_at
+            // Historical self-heal: an earlier revision of delete/patch/truncate wrote
+            // `updated_at` in whole seconds. Repair ONLY values that fall inside the
+            // plausible Unix *seconds* window [1e9, 1e11) (~2001..5138), multiplying to
+            // milliseconds. A genuine millisecond timestamp (~1.7e12) — and synthetic
+            // placeholders such as `4_000` — sit outside that window and pass through
+            // untouched, so this stays a precise corruption repair rather than a blanket
+            // rewrite of every small value.
+            let normalize_epoch = |value: i64| -> i64 {
+                if (1_000_000_000..100_000_000_000).contains(&value) {
+                    value.saturating_mul(1_000)
+                } else {
+                    value
+                }
             };
-            let updated_at_ms = if native.updated_at > 0 && native.updated_at < 100_000_000_000 {
-                native.updated_at.saturating_mul(1_000)
-            } else {
-                native.updated_at
-            };
+            let created_at_ms = normalize_epoch(native.created_at);
+            let updated_at_ms = normalize_epoch(native.updated_at);
             Some(CatalogEntry {
                 id,
                 fork_root_id: native.fork_info.as_ref().map(|fork| fork.root_id.clone()),
@@ -5732,6 +5738,49 @@ mod tests {
         assert_eq!(scan.latest().unwrap().id, "both");
         assert_eq!(scan.search_name("LEGACY").len(), 1);
         assert_eq!(scan.search_name("LEGACY")[0].id, "legacy");
+    }
+
+    #[test]
+    fn catalog_entry_heals_second_scale_timestamps_and_preserves_millis() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+
+        // 真实毫秒时间戳（~1.7e12）必须原样保留。
+        let mut millis = SessionMeta::new("millis", "/p", 1_700_000_000_000);
+        millis.updated_at = 1_700_000_000_000;
+        mgr.write_meta(&millis).unwrap();
+
+        // 历史 BUG 误写的秒级时间戳（~1.7e9）应自愈 ×1000。
+        let mut seconds = SessionMeta::new("seconds", "/p", 1_700_000_000_000);
+        seconds.updated_at = 1_700_000_000;
+        mgr.write_meta(&seconds).unwrap();
+
+        // 非秒级的小占位值不应被误判为秒而改写。
+        let mut placeholder = SessionMeta::new("placeholder", "/p", 1_700_000_000_000);
+        placeholder.updated_at = 4_000;
+        mgr.write_meta(&placeholder).unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+        let updated = |id: &str| {
+            scan.entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("entry {id} missing"))
+                .updated_at_ms
+        };
+
+        assert_eq!(
+            updated("millis"),
+            1_700_000_000_000,
+            "毫秒时间戳必须原样保留"
+        );
+        assert_eq!(
+            updated("seconds"),
+            1_700_000_000_000,
+            "秒级时间戳应自愈为毫秒"
+        );
+        assert_eq!(updated("placeholder"), 4_000, "非秒级小值不应被改写");
     }
 
     #[test]
