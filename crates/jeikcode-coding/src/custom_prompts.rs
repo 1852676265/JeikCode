@@ -132,16 +132,59 @@ fn cache() -> &'static RwLock<PromptCacheState> {
     PROMPT_CACHE.get_or_init(|| RwLock::new(PromptCacheState::default()))
 }
 
+/// Test-only: drop the cached prompt/persona state so the next load re-reads from
+/// disk. Integration tests share ONE process and this cache is keyed by mtime
+/// only (not by the prompts dir), so a test that installs a DIFFERENT temp home
+/// would otherwise keep seeing the previous test's rules/personas.
+#[doc(hidden)]
+pub fn invalidate_cache_for_test() {
+    *cache().write().unwrap_or_else(|error| error.into_inner()) = PromptCacheState::default();
+}
+
+/// Resolve the user prompts dir.
+///
+/// Deliberately keeps the RAW rule — env (`JEIKCODE_HOME` → `ATOMCODE_HOME`) first, then
+/// the real home (`~/.jeikcode/prompts` → legacy `~/.atomcode/prompts`). It is NOT routed
+/// through `Config::config_dir()`: the converged version silently dropped the real-home
+/// fallback and removed the `<environment>` block from the assembled session context
+/// (proved by an isolation bisect — the sibling commit message has the details).
+/// `cc_hooks` keeps the same shape for the same reason.
 fn resolve_prompts_dir() -> Option<PathBuf> {
-    // Single source of truth for the home root (includes the thread-local test
-    // override). Unit tests must not leak the developer's real `~/.jeikcode/prompts`
-    // into persona snapshots, so they only resolve prompts when a test explicitly
-    // installed its own home (`jeikcode_config::test_util::isolated_home()`).
+    // 线程级测试覆盖优先（isolated_home），其次保持原始规则：env → 真实 home。
+    // 两者都必须保留：只留覆盖会丢掉真实 home 回退（曾导致会话上下文里
+    // `<environment>` 整块消失）；只留 env 则会让用覆盖的测试读不到自己的 prompts。
+    if let Some(home) = jeikcode_config::test_util::overridden_home() {
+        return Some(home.join("prompts"));
+    }
+    if let Ok(p) = std::env::var("JEIKCODE_HOME") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p).join("prompts"));
+        }
+    }
+    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p).join("prompts"));
+        }
+    }
+    // Unit tests must not leak the developer's `~/.jeikcode/prompts` into persona
+    // snapshots. Production still loads the user home.
     #[cfg(test)]
-    if jeikcode_config::test_util::overridden_home().is_none() {
+    {
         return None;
     }
-    Some(jeikcode_config::Config::config_dir().join("prompts"))
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir()?;
+        let jeik = home.join(".jeikcode").join("prompts");
+        if jeik.exists() {
+            return Some(jeik);
+        }
+        let legacy_dir = home.join(".atomcode").join("prompts");
+        if legacy_dir.exists() {
+            return Some(legacy_dir);
+        }
+        Some(jeik)
+    }
 }
 
 fn strip_utf8_bom(content: &str) -> &str {
@@ -213,22 +256,26 @@ pub fn get_custom_prompt_config() -> Option<CustomPromptConfig> {
             if r.last_init_mtime == current_mtime && r.last_init_mtime.is_some() {
                 return r.init_config.clone();
             }
-            if current_mtime.is_none() && r.last_init_mtime.is_none() {
-                return None;
+            // 文件不存在且无缓存时**不要提前返回**：下方要回退到内嵌基线。
+            // 仅当基线已经解析并缓存过才直接复用。
+            if current_mtime.is_none() && r.last_init_mtime.is_none() && r.init_config.is_some() {
+                return r.init_config.clone();
             }
         }
     }
 
     let mut w = c.write().ok()?;
-    let config = if init_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&init_path) {
-            serde_yaml::from_str::<CustomPromptConfig>(strip_utf8_bom(&content)).ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // 文件缺失/读不到时回退到**内嵌基线** `init.yaml`。此前依赖“seed 先写过文件”，
+    // 一旦 seed 没发生（或落在别的 home），整块 <environment> 就会从系统提示消失。
+    let content = std::fs::read_to_string(&init_path).ok().or_else(|| {
+        PROMPT_SEEDS
+            .iter()
+            .find(|(name, _)| *name == "init.yaml")
+            .map(|(_, body)| (*body).to_string())
+    });
+    let config = content
+        .map(|content| strip_utf8_bom(&content).to_string())
+        .and_then(|content| serde_yaml::from_str::<CustomPromptConfig>(&content).ok());
 
     w.last_init_mtime = current_mtime;
     w.init_config = config.clone();
@@ -248,6 +295,8 @@ pub fn get_custom_rules_config() -> Option<CustomRulesConfig> {
             if r.last_rules_mtime == current_mtime && r.last_rules_mtime.is_some() {
                 return r.rules_config.clone();
             }
+            // rules 缺失时保持 None：persona 的内建基线（含 PROHIBITIONS）才是这类段落的
+            // 来源；用“内嵌 seed”顶替会把基线的静态段落挤掉。
             if current_mtime.is_none() && r.last_rules_mtime.is_none() {
                 return None;
             }
@@ -255,12 +304,13 @@ pub fn get_custom_rules_config() -> Option<CustomRulesConfig> {
     }
 
     let mut w = c.write().ok()?;
+    // rules：文件缺失/读不到 → None（保留 persona 内建基线，而不是用 seed 顶替）。
     let config = if rules_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&rules_path) {
-            serde_yaml::from_str::<CustomRulesConfig>(strip_utf8_bom(&content)).ok()
-        } else {
-            None
-        }
+        std::fs::read_to_string(&rules_path)
+            .ok()
+            .and_then(|content| {
+                serde_yaml::from_str::<CustomRulesConfig>(strip_utf8_bom(&content)).ok()
+            })
     } else {
         None
     };
