@@ -110,6 +110,15 @@ pub(crate) mod proxy;
 /// Free of any feature `cfg` because `codeintel` is independent of `tools`.
 pub(crate) mod pathutil;
 
+/// ONE source for the special directories JeikCode exports to shells and the
+/// `$VAR` expansion of model-supplied paths: `tools::bash` injects
+/// `$TMPDIR`/`$TMP`/`$TEMP`/`$DESKTOP` into every shell child and
+/// `pathutil::resolve_path` expands the same names in tool paths, so the two can
+/// no longer drift (on Windows the desktop is registry-backed — see
+/// [`special_dirs::desktop_dir`]). Ungated (`dirs` is a baseline dependency); the
+/// daemon reuses it for its shortcut list.
+pub mod special_dirs;
+
 /// Structured tool-argument errors + path-not-found "Did you mean?" enrichment.
 /// Shared by `tools` and `codeintel` so model feedback is consistent.
 pub mod tool_feedback;

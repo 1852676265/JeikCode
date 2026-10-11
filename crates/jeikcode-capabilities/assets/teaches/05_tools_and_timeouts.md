@@ -20,12 +20,23 @@ long_bash_command_keyword = []  # 长任务关键词列表（如 ["build", "test
 ### 1.1 `run_command` 细微调用参数说明
 - **后台常驻服务 (`"background": true`)**：
   - 前台运行常驻服务（`npm run dev`、`uvicorn` 等）会被空闲检测拦截终止。
-  - 传入 `"background": true`（可配合选填 `"settle_secs": 3` 设置启动观察秒数，默认 3 秒）：观察期内若进程未秒退，立即返回 PID 与端口并将当前 Turn 完成，进程转入后台托管。
-  - 后续每轮对话的 `<system-reminder>` 中会自动显示 `[Active Background Tasks]` 存活状态；若后台进程崩溃，会在下一轮触发一次性 `[Background Task Alert]` 告警。
-  - 结束后台任务使用系统原生命令：`kill <pid>`（Windows 上为 `taskkill /F /PID <pid>`）。
+  - 传入 `"background": true`（可配合选填 `"settle_secs": 3` 设置启动观察秒数，默认 3 秒）：观察期内若进程未秒退，立即返回 PID 与端口并将当前 Turn 完成，进程转入后台托管。启动回报会做**就绪体检**：逐端口探测 `127.0.0.1` 是否可连接（`Port: 8899 (accepting on 127.0.0.1)` / `(not reachable on 127.0.0.1 yet)`）；当“无输出且无端口”时明确标注 readiness **UNVERIFIED**——不再把“进程还活着”当作“启动成功”。
+  - 后续每轮对话的 `<system-reminder>` 中会自动显示 `[Active Background Tasks]` 存活状态（含 `pid` 与停止命令）；若后台进程非零退出，会在下一轮触发一次性 `[Background Task Alert]` 告警。
+  - 结束后台任务：**启动消息里直接给出可用的停止命令**。Windows 会同时回报两个真实 PID——工作负载的 `WinPID`（用于 `taskkill /F /T /PID <WinPID>`）与其 Git Bash PID（用于 `kill <GitBashPID>`）；两者都是真实进程号，`kill` 只认后者。推荐 `taskkill /F /T /PID <WinPID>`（`/T` 必需，否则子进程残留），或 `kill <GitBashPID>`（杀掉工作负载后包装 shell 会自然退出）。若消息只给出 `WinPID <包装 shell>`（尚未识别到子进程），仍用 `taskkill /F /T /PID <WinPID>` 整树终止。Unix 用 `kill -TERM -<pid>`（负号 = 整个进程组）。
 - **Windows PowerShell 模式 (`"shell": "powershell"`)**：
   - `"shell": "default"`（默认）：通过 Git Bash / CMD 执行。
   - `"shell": "powershell"`：通过 64 位原生 PowerShell (UTF-16LE EncodedCommand) 执行，避免 Bash 路径转义，适合 UNC 网络共享路径（如 `\\192.168.1.10\share$`）或 PowerShell 专有命令。
+
+### 1.2 路径解析与环境变量（内置工具）
+
+- 内置工具（`read` / `grep` / `glob` / `edit` / `write` / `code_explore` 等）的路径参数与
+  `run_command` **共用同一解析器**：支持 `~`、`$VAR` / `${VAR}`（Windows 另支持 `%VAR%`），
+  以及成对引号包裹的形式（如 `"$TMPDIR/x"`）。
+- 用 `"$TMPDIR"`（含 `"$TMP"` / `"$TEMP"`）而不是写死 `/tmp`，用 `"$DESKTOP"` 而不是假设
+  `~/Desktop`：两者在 shell 内与**传给原生程序的参数**（python / node / curl）里都能直接用。
+  `"$TMPDIR_WIN"` / `"$DESKTOP_WIN"` 是同一路径的备用名字（嵌套的非 bash shell 场景）。
+- 未定义变量**原样保留**（绝不静默删除），因此写错变量名时路径会以相对形式落在工作区内并在
+  报错信息中暴露，而不是逃逸到盘根。
 
 ---
 

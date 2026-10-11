@@ -1940,6 +1940,7 @@ dependencies = [
  "url",
  "uuid",
  "windows-sys 0.61.2",
+ "winreg",
  "wiremock",
  "zeroize",
  "zstd",

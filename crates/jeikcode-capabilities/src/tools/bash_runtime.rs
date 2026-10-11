@@ -16,10 +16,32 @@ use tokio_util::sync::CancellationToken;
 /// Marker in bash output / tool result: the process is still running and the
 /// model must promote or kill it. WebUI/TUI keep the original pane inflight.
 pub const AWAIT_DECISION_MARK: &str = "[bash-await-decision]";
-/// Written to the original pane when `bash_kill_by_id` wins.
+/// Written to the original pane when the runtime's kill path wins (see `kill_by_pid`).
 pub const KILLED_BY_TOOL_MARK: &str = "[task was canceled by bash kill tool]";
 /// Written to the original pane when a keyword promote lands on a live task.
 pub const PROMOTED_MARK: &str = "[bash promoted to long job]";
+
+/// One canonical, copy-pasteable recipe for stopping a background task by the PID
+/// its `run_command` start message reports (also shown by the per-turn
+/// `[Active Background Tasks]` reminder).
+///
+/// The reported pid is the OS process id of the **wrapper shell** — a Windows
+/// process id on Windows, a process-group leader on Unix — which closes two traps:
+/// - Windows: MSYS `kill` CANNOT signal the wrapper (it runs in a foreign MSYS
+///   session — verified: `kill <wrapper msys pid>` → "No such process"), and a bare
+///   `taskkill /F /PID <pid>` ORPHANS the workload because the real process
+///   (python/node/…) is a CHILD of the wrapper — `/T` is what makes it complete.
+///   The start message therefore reports the WORKLOAD's own WinPID + MSYS pid
+///   (which `kill` CAN signal) and keeps this wrapper form as the tree-kill fallback.
+/// - Unix: the wrapper leads its own process group, so the negative-pid form stops
+///   the whole tree.
+pub fn stop_hint(pid: u32) -> String {
+    if cfg!(windows) {
+        format!("`taskkill /F /T /PID {pid}`")
+    } else {
+        format!("`kill -TERM -{pid}`")
+    }
+}
 
 pub struct LiveBash {
     pub pid: u32,

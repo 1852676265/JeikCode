@@ -672,20 +672,54 @@ impl Tool for BashTool {
                 }
             });
 
+            // Report ids a model can ACT on: the workload's WinPID (`taskkill`) plus
+            // its Git-Bash pid (`kill`) — see `render_background_pid_block` for why the
+            // wrapper shell's number alone is not enough.
+            #[cfg(target_os = "windows")]
+            let workloads = {
+                let rows = match child_pid {
+                    Some(pid) => windows_descendant_rows(pid),
+                    None => Vec::new(),
+                };
+                let leaves = workload_leaves(&rows);
+                let winpids: Vec<u32> = leaves.iter().map(|(pid, _)| *pid).collect();
+                let mut msys = msys_pids_for(&winpids).await;
+                leaves
+                    .into_iter()
+                    .map(|(pid, name)| (pid, msys.remove(&pid), name))
+                    .collect::<Vec<_>>()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let workloads: Vec<(u32, Option<u32>, String)> = Vec::new();
+
             let pid_info = match child_pid {
-                Some(pid) => format!("PID: {pid}"),
+                Some(pid) => render_background_pid_block(pid, &workloads),
                 None => "PID: unknown".to_string(),
             };
             let detected_ports = detect_listening_ports_from_output(&initial_output);
+            // Health-check every port the startup output declared: a listener that ACCEPTS
+            // on 127.0.0.1 is real evidence the service is up. "Not reachable yet" stays an
+            // observation (bind addresses vary), never a failure claim.
             let port_info = if !detected_ports.is_empty() {
-                let port_str = detected_ports
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("\nPort: {port_str}")
+                let mut parts = Vec::with_capacity(detected_ports.len());
+                for port in &detected_ports {
+                    parts.push(if port_accepts_loopback(*port).await {
+                        format!("{port} (accepting on 127.0.0.1)")
+                    } else {
+                        format!("{port} (not reachable on 127.0.0.1 yet)")
+                    });
+                }
+                format!("\nPort: {}", parts.join(", "))
             } else {
                 String::new()
+            };
+            // "Alive" is not "ready": with neither output nor a declared port there is no
+            // evidence at all, so the report says so instead of reading as a successful start.
+            let unverified_note = if initial_output.trim().is_empty() && detected_ports.is_empty() {
+                "\n[Note: no output and no listening port detected yet — the process is alive \
+                 but its readiness is UNVERIFIED; check the log path before relying on it.]"
+            } else {
+                ""
             };
             let log_info = format!("\nLog path: {bg_log_path_display}");
 
@@ -697,7 +731,7 @@ impl Tool for BashTool {
             );
 
             return annotate(ok(format!(
-                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{guidance_note}"
+                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}{unverified_note}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{guidance_note}"
             )));
         }
 
@@ -1195,9 +1229,10 @@ fn shell_tool_description(
              Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
              NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
              equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above.\n\
-             OUTPUT: discard a stream with `>/dev/null` (or `2>/dev/null`), NEVER `nul` — \
-             here `> nul` does not mean the null device; it creates a stray, undeletable \
-             `nul` file in the working directory."
+             OUTPUT: discard a stream with `>/dev/null` (or `2>/dev/null`) — no special \
+             spelling is needed.\n\
+             PATHS & FLAGS: hand paths to native Windows programs as `$TMPDIR`/`$DESKTOP` \
+             (never a hardcoded `/tmp/x` — that only works for MSYS tools)."
         };
     }
     // Tell the model interactive password prompts work — ONLY when the askpass
@@ -1387,6 +1422,199 @@ fn powershell_encoded_command(command: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(utf16_le)
 }
 
+/// All descendants of `root` as `(pid, parent, exe name)` rows (BFS over a Toolhelp
+/// snapshot, depth-bounded so a re-parenting process cannot spin this). The wrapper
+/// shell is excluded: MSYS `kill` cannot signal it (foreign session), so it is only
+/// ever reported as the `taskkill /F /T` tree-kill root.
+#[cfg(target_os = "windows")]
+fn windows_descendant_rows(root: u32) -> Vec<(u32, u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    /// Closes the snapshot handle on every exit path (including early returns).
+    struct Snapshot(HANDLE);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let snapshot = Snapshot(snapshot);
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut rows: Vec<(u32, u32, String)> = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while more {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        rows.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..len]),
+        ));
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+
+    let mut found: Vec<(u32, u32, String)> = Vec::new();
+    let mut frontier = vec![root];
+    for _ in 0..4 {
+        let mut next: Vec<u32> = Vec::new();
+        for (pid, parent, name) in &rows {
+            if frontier.contains(parent) && *pid != root && !found.iter().any(|(p, _, _)| p == pid)
+            {
+                found.push((*pid, *parent, name.clone()));
+                next.push(*pid);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    found
+}
+
+/// The workload processes worth reporting: the LEAVES among the descendants — the
+/// server/worker itself (python/node/…), not the inner shells that merely wait on it.
+/// Killing a leaf unwinds the wrapper (verified: the wrapper exits once its child
+/// dies), while killing an inner shell would orphan the real workload.
+/// Console hosts are dropped: Windows spawns `conhost.exe`/`OpenConsole.exe` as children
+/// of a console app, and they are never the user's workload.
+/// Only the Windows reporting path calls this; the unit tests cover it everywhere.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn workload_leaves(rows: &[(u32, u32, String)]) -> Vec<(u32, String)> {
+    rows.iter()
+        .filter(|(pid, _, _)| !rows.iter().any(|(_, parent, _)| parent == pid))
+        .filter(|(_, _, name)| {
+            let name = name.to_ascii_lowercase();
+            name != "conhost.exe" && name != "openconsole.exe"
+        })
+        .map(|(pid, _, name)| (*pid, name.clone()))
+        .collect()
+}
+
+/// `ps -W` rows are `PID PPID PGID WINPID TTY UID STIME COMMAND`; the WINPID → MSYS
+/// pid map is what lets the report print an id that Git Bash's `kill` can actually
+/// signal. Pure so it is unit-tested against a real capture from this platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_ps_w_ids(text: &str) -> std::collections::HashMap<u32, u32> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 || cols[0] == "PID" {
+            continue;
+        }
+        if let (Ok(pid), Ok(winpid)) = (cols[0].parse::<u32>(), cols[3].parse::<u32>()) {
+            map.insert(winpid, pid);
+        }
+    }
+    map
+}
+
+/// Resolve Git-Bash pids for `winpids` with ONE `ps -W` spawn (MSYS keeps its own pid
+/// namespace, so the mapping can only be read from inside a shell). Best-effort: any
+/// failure degrades to `WinPID`-only reporting, never to a wrong id.
+#[cfg(target_os = "windows")]
+async fn msys_pids_for(winpids: &[u32]) -> std::collections::HashMap<u32, u32> {
+    if winpids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(mut cmd) = build_command("ps -W", ShellMode::Default) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(out) = cmd.output().await else {
+        return std::collections::HashMap::new();
+    };
+    if !out.status.success() {
+        return std::collections::HashMap::new();
+    }
+    parse_ps_w_ids(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .filter(|(winpid, _)| winpids.contains(winpid))
+        .collect()
+}
+
+/// Does something ACCEPT a TCP connection on `127.0.0.1:port`? A cheap, portable readiness
+/// probe for a just-started background service: connect + immediate close (no bytes are
+/// sent, so an HTTP server logs no request). A negative result is reported as an
+/// observation, not a failure — services may bind only a specific interface.
+async fn port_accepts_loopback(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Model-facing PID block for a background task.
+///
+/// Printing ONE number without its semantics is what made the old report
+/// untrustworthy (`kill <pid>` → "No such process"; `taskkill /F /PID` → orphan).
+/// Windows therefore prints the workload's TWO real ids with the recipe for each,
+/// and falls back to the wrapper's `WinPID` + whole-tree kill when no workload child
+/// can be attributed yet. Unix prints the process-group recipe (the wrapper leads it).
+fn render_background_pid_block(
+    wrapper_winpid: u32,
+    workloads: &[(u32, Option<u32>, String)],
+) -> String {
+    if !cfg!(windows) {
+        return format!(
+            "PID: {wrapper_winpid} (process-group leader)\nStop: `kill -TERM -{wrapper_winpid}` (whole process group)"
+        );
+    }
+    if workloads.is_empty() {
+        return format!(
+            "PID: WinPID {wrapper_winpid} (wrapper shell — no child process attributed yet)\n\
+             Stop: `taskkill /F /T /PID {wrapper_winpid}` (whole process tree)"
+        );
+    }
+    const SHOWN: usize = 3;
+    let shown = &workloads[..workloads.len().min(SHOWN)];
+    let mut pid_line = String::from("PID: ");
+    for (index, (winpid, msys, name)) in shown.iter().enumerate() {
+        if index > 0 {
+            pid_line.push_str(", ");
+        }
+        match msys {
+            Some(msys) => {
+                pid_line.push_str(&format!("{msys} (Git Bash) / WinPID {winpid} ({name})"))
+            }
+            None => pid_line.push_str(&format!("WinPID {winpid} ({name})")),
+        }
+    }
+    if workloads.len() > SHOWN {
+        pid_line.push_str(&format!(" (+{} more)", workloads.len() - SHOWN));
+    }
+    let kill_ids: Vec<String> = shown
+        .iter()
+        .filter_map(|(_, msys, _)| msys.map(|m| m.to_string()))
+        .collect();
+    let stop_line = if kill_ids.is_empty() {
+        format!("Stop: `taskkill /F /T /PID {wrapper_winpid}` (whole process tree)")
+    } else {
+        format!(
+            "Stop: `kill {}` (Git Bash) or `taskkill /F /T /PID {wrapper_winpid}` (wrapper shell, whole tree)",
+            kill_ids.join(" ")
+        )
+    };
+    format!("{pid_line}\n{stop_line}")
+}
+
 /// Export shell-agnostic, OS-resolved special directories so tools and native
 /// programs invoked from the shell agree on one real path (cross-platform).
 ///
@@ -1401,23 +1629,104 @@ fn powershell_encoded_command(command: &str) -> String {
 ///   custom `TMPDIR` (e.g. sandboxes) instead of hardcoding `/tmp`.
 ///
 /// Desktop (`DESKTOP`): the real desktop via the OS Known Folder API on Windows
-/// (`dirs::desktop_dir()` → `SHGetKnownFolderPath(FOLDERID_Desktop)`), so a relocated /
+/// (`dirs::desktop_dir()` → registry-backed `SHGetKnownFolderPath(FOLDERID_Desktop)`),
+/// with `User Shell Folders\Desktop` as the direct-registry fallback, so a relocated /
 /// OneDrive-redirected desktop is honored instead of assuming `%USERPROFILE%\Desktop`.
-/// Native forward-slash form; `dirs` resolves it on Linux/macOS too. Skipped when
-/// unresolved or empty.
+/// Native forward-slash form; skipped when unresolved or empty.
+///
+/// The values come from `crate::special_dirs` — the SAME source the built-in tools'
+/// `$VAR` path expansion uses (`pathutil::resolve_path`), so a shell child and a
+/// `read`/`grep`/`glob`/`edit` call can no longer disagree about `$TMPDIR`/`$DESKTOP`.
 fn apply_shell_env(cmd: &mut tokio::process::Command) {
-    let native_tmp = std::env::temp_dir().to_string_lossy().replace('\\', "/");
-    if !native_tmp.is_empty() {
-        cmd.env("TMPDIR", &native_tmp);
-        cmd.env("TMP", &native_tmp);
-        cmd.env("TEMP", &native_tmp);
-    }
-    if let Some(desktop) = dirs::desktop_dir() {
-        let desktop = desktop.to_string_lossy().replace('\\', "/");
-        if !desktop.is_empty() {
-            cmd.env("DESKTOP", &desktop);
+    for name in ["TMPDIR", "TMP", "TEMP", "DESKTOP"] {
+        let Some(dir) = crate::special_dirs::lookup(name) else {
+            continue;
+        };
+        if let Some(value) = native_dir_env_value(&dir) {
+            cmd.env(name, value);
         }
     }
+
+    // A second, NATIVE form under names MSYS does NOT rewrite. Experimentally verified:
+    // `MSYS2_ENV_CONV_EXCL` cannot stop the name-based conversion of TMPDIR/TMP/TEMP (a
+    // native parent spawning bash always yields the `/tmp` view), while an unknown name
+    // survives verbatim (`TMPDIR_WIN=F:/temp` → `F:/temp` inside bash). Native programs
+    // that receive a PATH ARGUMENT need this form:
+    // `python --directory "$TMPDIR_WIN/app"`.
+    #[cfg(windows)]
+    for (handle, source) in [("TMPDIR_WIN", "TMPDIR"), ("DESKTOP_WIN", "DESKTOP")] {
+        let Some(dir) = crate::special_dirs::lookup(source) else {
+            continue;
+        };
+        if let Some(value) = native_dir_env_value(&dir) {
+            cmd.env(handle, value);
+        }
+    }
+
+    #[cfg(windows)]
+    apply_bash_env_rc(cmd);
+}
+
+/// Name of the rc file every bash child sources (`BASH_ENV`) and of the variable carrying
+/// the user's previous `BASH_ENV` so ours chains instead of clobbering it.
+const SHELL_ENV_RC_FILE: &str = "jeikcode-shell-env.sh";
+const USER_BASH_ENV_VAR: &str = "JEIKCODE_USER_BASH_ENV";
+
+/// MSYS rewrites `TMPDIR`/`TMP`/`TEMP` into its POSIX view when a NATIVE parent starts a
+/// bash child — by variable NAME, and `MSYS2_ENV_CONV_EXCL` cannot stop it (verified on
+/// this platform), so whatever we export in the environment arrives as `/tmp`.
+///
+/// Re-exporting the native values from INSIDE the shell is the fix: bash sources
+/// `BASH_ENV` before running `-c`, and MSYS does not touch anything the runtime evaluates.
+/// Verified end to end: after this rc runs, `"$TMPDIR"` is `F:/temp` and a native program
+/// (`powershell Test-Path $env:TMPDIR`) resolves it — so `python --directory "$TMPDIR/app"`
+/// works without the model having to know any extra variable name.
+const SHELL_ENV_RC: &str = "\
+# JeikCode shell env — sourced via BASH_ENV before every `bash -c` (see bash.rs).\n\
+if [ -n \"$JEIKCODE_USER_BASH_ENV\" ] && [ -r \"$JEIKCODE_USER_BASH_ENV\" ]; then . \"$JEIKCODE_USER_BASH_ENV\"; fi\n\
+: \"${TMPDIR_WIN:=$TMPDIR}\"\n\
+export TMPDIR=\"$TMPDIR_WIN\" TMP=\"$TMPDIR_WIN\" TEMP=\"$TMPDIR_WIN\"\n\
+if [ -n \"$DESKTOP_WIN\" ]; then export DESKTOP=\"$DESKTOP_WIN\"; fi\n\
+";
+
+/// Install the rc file and point `BASH_ENV` at it (best-effort: any failure degrades to the
+/// previous behavior — the MSYS view — with `$TMPDIR_WIN` still available as a handle).
+///
+/// The file is PID-suffixed and written exactly ONCE per process ([`Once`]): tool shells are
+/// spawned from many threads (and many shells), and a child must never source a half-written
+/// rc — one writer per file and one write per process removes that window entirely.
+/// A missing file simply leaves `BASH_ENV` unset (bash would otherwise print a load error).
+#[cfg(windows)]
+fn apply_bash_env_rc(cmd: &mut tokio::process::Command) {
+    use std::sync::Once;
+
+    static INSTALL: Once = Once::new();
+    let rc =
+        crate::special_dirs::temp_dir().join(format!("{SHELL_ENV_RC_FILE}.{}", std::process::id()));
+    INSTALL.call_once(|| {
+        let _ = std::fs::write(&rc, SHELL_ENV_RC);
+    });
+    if !rc.exists() {
+        return;
+    }
+    if let Some(existing) = std::env::var_os("BASH_ENV") {
+        if !existing.is_empty() && existing.as_os_str() != rc.as_os_str() {
+            cmd.env(USER_BASH_ENV_VAR, existing);
+        }
+    }
+    cmd.env("BASH_ENV", &rc);
+}
+
+/// Native forward-slash form of a directory for shell export, without a trailing
+/// separator: `"$TMPDIR/x"` must not read `<dir>//x`. Never trims a drive root
+/// (`C:/` keeps its slash — `C:` alone is drive-relative).
+fn native_dir_env_value(dir: &std::path::Path) -> Option<String> {
+    let native = dir.to_string_lossy().replace('\\', "/");
+    let trimmed = native
+        .strip_suffix('/')
+        .filter(|rest| !rest.ends_with(':'))
+        .unwrap_or(native.as_str());
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn build_powershell_command(command: &str) -> tokio::process::Command {
@@ -1812,6 +2121,218 @@ fn rewrite_nul_redirect(command: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// MSYS-convention ARGUMENT rewrites for the Windows Git Bash path.
+///
+/// `build_command` deliberately disables the MSYS argument conversion (the `/flags`
+/// hardening), which leaves two common spellings broken when an ARGUMENT is consumed by a
+/// native program. Both are rewritten here so neither the model nor the user has to know
+/// the difference:
+/// - `//X…` → `/X…`: the Git-Bash escape convention (`//F` used to arrive as `/F` because
+///   the runtime folded the doubled slash).
+/// - `/dev/null` → `NUL`: an MSYS tool wants `/dev/null`, but a NATIVE program resolves it
+///   as `<drive>:\dev\null` — it fails (curl exit 23) or, worse, writes a REAL file.
+///   Only NON-redirect tokens are rewritten (bash redirection handles `/dev/null` itself),
+///   and only when the segment's program classifies as native: `NUL` is a plain filename to
+///   an MSYS tool (`grep -f NUL` → "No such file or directory", verified).
+///
+/// Conservative by construction — single-quoted words, double-quoted words and
+/// heredoc/here-string commands are left ENTIRELY alone (they may be literal payload), and
+/// anything the classifier cannot place stays as written: a miss, never corruption.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rewrite_msys_arg_conventions<'a>(
+    command: &'a str,
+    git_root: Option<&std::path::Path>,
+) -> Cow<'a, str> {
+    let bytes = command.as_bytes();
+    if command.contains("<<") || !bytes.contains(&b'/') {
+        return Cow::Borrowed(command);
+    }
+
+    // Words that only ever lead to ANOTHER program — the real program is later, so a
+    // classification here would be wrong. Leaving it unclassified means "no rewrite".
+    const WRAPPERS: [&str; 7] = ["env", "command", "sudo", "time", "nohup", "nice", "xargs"];
+
+    let n = bytes.len();
+    let mut result = String::new();
+    let mut last_copied = 0usize;
+    let mut changed = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut segment_program: Option<String> = None;
+    let mut redirect_target_next = false;
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'\\' && i + 1 < n {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'\\' if i + 1 < n => i += 2,
+            b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}' | b'\n' => {
+                segment_program = None;
+                redirect_target_next = false;
+                i += 1;
+            }
+            b'<' | b'>' => {
+                let mut op_end = i + 1;
+                while op_end < n
+                    && (bytes[op_end] == b'<' || bytes[op_end] == b'>' || bytes[op_end] == b'|')
+                {
+                    op_end += 1;
+                }
+                let mut t = op_end;
+                while t < n && (bytes[t] == b' ' || bytes[t] == b'\t') {
+                    t += 1;
+                }
+                redirect_target_next = true;
+                i = t;
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
+            _ => {
+                // A bare word (quotes are handled above, so a quote immediately ends it).
+                let start = i;
+                while i < n
+                    && !matches!(
+                        bytes[i],
+                        b' ' | b'\t'
+                            | b'\r'
+                            | b'\n'
+                            | b';'
+                            | b'|'
+                            | b'&'
+                            | b'('
+                            | b')'
+                            | b'{'
+                            | b'}'
+                            | b'<'
+                            | b'>'
+                            | b'\''
+                            | b'"'
+                    )
+                {
+                    i += 1;
+                }
+                let word = &command[start..i];
+                // `2>/dev/null`: the fd digits belong to the operator, not to a program.
+                if word.bytes().all(|b| b.is_ascii_digit())
+                    && matches!(bytes.get(i), Some(b'>') | Some(b'<'))
+                {
+                    continue;
+                }
+                if redirect_target_next {
+                    redirect_target_next = false;
+                    continue;
+                }
+                let is_first_word = segment_program.is_none();
+                // Before the real program: wrapper OPTIONS (`env -i curl`) and env-style
+                // ASSIGNMENTS (`env FOO=1 curl`) are not programs themselves — skipping them
+                // keeps the classification pointed at the actual binary.
+                let skippable_prefix = is_first_word
+                    && (word.starts_with('-')
+                        || word.find('=').is_some_and(|eq| {
+                            eq > 0
+                                && word[..eq]
+                                    .chars()
+                                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        }));
+                if is_first_word && !skippable_prefix && !WRAPPERS.contains(&word) {
+                    segment_program = Some(word.to_owned());
+                }
+                let word_bytes = word.as_bytes();
+                let doubled_switch = word_bytes.len() > 2
+                    && word_bytes[0] == b'/'
+                    && word_bytes[1] == b'/'
+                    && word_bytes[2].is_ascii_alphabetic()
+                    && !word[2..].contains('/');
+                if doubled_switch {
+                    result.push_str(&command[last_copied..start]);
+                    result.push_str(&word[1..]);
+                    last_copied = i;
+                    changed = true;
+                    continue;
+                }
+                if word == "/dev/null" {
+                    let Some(program) = segment_program.as_deref() else {
+                        continue;
+                    };
+                    if program_is_native_windows(program, git_root) == Some(true) {
+                        result.push_str(&command[last_copied..start]);
+                        result.push_str("NUL");
+                        last_copied = i;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(command);
+    }
+    result.push_str(&command[last_copied..]);
+    Cow::Owned(result)
+}
+
+/// Classify a command word as a native Windows binary (`Some(true)` → `NUL` is right for
+/// it) or an MSYS tool (`Some(false)` → `/dev/null` is right). `None` = cannot tell.
+///
+/// The MSYS runtime ships its POSIX tool set under `<git_root>/usr/bin`, while the
+/// mingw64/clang64/ucrt64 trees are NATIVE builds — that split is exactly the `NUL` vs
+/// `/dev/null` split, and it is checkable from the shell's own Git root.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn program_is_native_windows(program: &str, git_root: Option<&std::path::Path>) -> Option<bool> {
+    let program = program.trim();
+    if program.is_empty() {
+        return None;
+    }
+    let lower = program.to_ascii_lowercase();
+    if lower.starts_with('/') {
+        if lower.starts_with("/usr/") || lower.starts_with("/bin/") {
+            return Some(false);
+        }
+        if lower.starts_with("/mingw") || lower.starts_with("/clang") || lower.starts_with("/ucrt")
+        {
+            return Some(true);
+        }
+        return None;
+    }
+    if program.len() > 1 && program.as_bytes()[1] == b':' {
+        return Some(true); // drive-letter path
+    }
+    if lower.contains('/') {
+        return None; // some other POSIX-ish path
+    }
+    let root = git_root?;
+    let name = if lower.ends_with(".exe") {
+        lower.clone()
+    } else {
+        format!("{lower}.exe")
+    };
+    Some(!root.join("usr").join("bin").join(name).exists())
+}
+
 /// Win32 PATH surgery for Git Bash. String-based (not `std::path::Path`) so the
 /// drive-letter layout can be unit-tested on Unix, where `\` is not a separator.
 ///
@@ -2163,6 +2684,14 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
         // is a plain filename, so `> nul` would create a stray, undeletable `nul` file in
         // the cwd (see `rewrite_nul_redirect`).
         let command = rewrite_nul_redirect(&command);
+        // Fold the Git-Bash `//X` convention and give a native program's own output argument
+        // a working discard target (`/dev/null` → `NUL`) — the run-time conversion that used
+        // to do this is deliberately disabled. See `rewrite_msys_arg_conventions`.
+        let git_root = std::path::Path::new(&bash)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf);
+        let command = rewrite_msys_arg_conventions(command.as_ref(), git_root.as_deref());
         let command = crate::process_utils::rewrite_python3_for_windows_shell(command.as_ref());
         let mut cmd = tokio::process::Command::new(&bash);
 
@@ -2343,9 +2872,63 @@ fn decode_stream_chunk(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> Option
     if emit_len == 0 {
         return None;
     }
-    let text = decode_output(&pending[..emit_len]);
+    let text = decode_mixed_span(&pending[..emit_len]);
     pending.drain(..emit_len);
     Some(text)
+}
+
+/// Decode a byte span that may MIX UTF-8 text with legacy (GBK/Big5/…) text — the shape
+/// of real Windows command output: a native tool's localized line (GBK) sitting between
+/// UTF-8 lines from bash/MSYS.
+///
+/// The span is split into maximal same-class runs at line boundaries: a UTF-8 run is
+/// emitted verbatim, and only a legacy run goes to [`decode_output`]. Decoding the whole
+/// span with ONE codepage (the previous behavior) garbled every UTF-8 line as soon as a
+/// single legacy line appeared in the same read — e.g. `echo "中文"; taskkill /F …` came
+/// back as mojibake because taskkill's localized error line pulled the whole span into
+/// the GBK decoder.
+fn decode_mixed_span(span: &[u8]) -> String {
+    // Fast path: nothing legacy in the span (the overwhelmingly common case).
+    if let Ok(text) = std::str::from_utf8(span) {
+        return text.to_owned();
+    }
+
+    let mut ranges: Vec<(bool, usize, usize)> = Vec::new();
+    let mut line_start = 0usize;
+    for (index, byte) in span.iter().enumerate() {
+        if matches!(byte, b'\n' | b'\r') {
+            let end = index + 1;
+            push_line_range(&mut ranges, span, line_start, end);
+            line_start = end;
+        }
+    }
+    if line_start < span.len() {
+        push_line_range(&mut ranges, span, line_start, span.len());
+    }
+
+    let mut out = String::with_capacity(span.len());
+    for (is_utf8, start, end) in ranges {
+        let run = &span[start..end];
+        if is_utf8 {
+            out.push_str(std::str::from_utf8(run).unwrap_or_default());
+        } else {
+            out.push_str(&decode_output(run));
+        }
+    }
+    out
+}
+
+/// Append one line's `[start, end)` to `ranges`, merging it into the previous range when
+/// the UTF-8/legacy class matches — so a multi-line legacy block is still handed to the
+/// detector as ONE unit (isolated short lines detect poorly).
+fn push_line_range(ranges: &mut Vec<(bool, usize, usize)>, span: &[u8], start: usize, end: usize) {
+    let is_utf8 = std::str::from_utf8(&span[start..end]).is_ok();
+    match ranges.last_mut() {
+        Some((last_is_utf8, _, last_end)) if *last_is_utf8 == is_utf8 && *last_end == start => {
+            *last_end = end;
+        }
+        _ => ranges.push((is_utf8, start, end)),
+    }
 }
 
 #[cfg(windows)]
@@ -2687,8 +3270,9 @@ fn format_streams(
     exit: Option<(bool, Option<i32>)>,
     incremental: bool,
 ) -> String {
-    let stdout = sanitize_terminal_output(&decode_output(stdout));
-    let stderr = sanitize_terminal_output(&decode_output(stderr));
+    // Mixed-encoding aware: a legacy (GBK) line must not drag the UTF-8 lines with it.
+    let stdout = sanitize_terminal_output(&decode_mixed_span(stdout));
+    let stderr = sanitize_terminal_output(&decode_mixed_span(stderr));
     let mut s = String::new();
     if !stdout.is_empty() {
         s.push_str(&stdout);
@@ -5151,8 +5735,8 @@ pub async fn run_shell(
         chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
     }
 
-    let stdout_str = decode_output(&stdout_buf);
-    let stderr_str = decode_output(&stderr_buf);
+    let stdout_str = decode_mixed_span(&stdout_buf);
+    let stderr_str = decode_mixed_span(&stderr_buf);
     let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
     let exit = match result {
@@ -5956,6 +6540,10 @@ mod tests {
             "schema must steer file work to dedicated tools: {desc}"
         );
         assert!(
+            !desc.contains("list_directory") && !desc.contains("read_file"),
+            "schema must not advertise purged/legacy tool names: {desc}"
+        );
+        assert!(
             !desc.contains("not available in this shell tool"),
             "must not claim file tools are unavailable: {desc}"
         );
@@ -6528,10 +7116,6 @@ mod tests {
         // Must warn about Windows path backslashes (bash treats `\\` as escape) and steer
         // to forward-slash / POSIX form — the concrete thing that breaks `dir C:\\Windows`.
         assert!(
-        assert!(
-            !desc.contains("list_directory") && !desc.contains("read_file"),
-            "schema must not advertise purged/legacy tool names: {desc}"
-        );
             lc.contains("forward slash") || lc.contains("/c/") || lc.contains("c:/"),
             "must steer to forward-slash / POSIX paths: {d}"
         );
@@ -6603,6 +7187,10 @@ mod tests {
                 "unix desc must steer to {tool}: {unix}"
             );
         }
+        assert!(
+            !unix.contains("read_file") && !unix.contains("list_directory"),
+            "unix desc must not advertise purged/legacy tool names: {unix}"
+        );
         let lc = unix.to_lowercase();
         assert!(
             lc.contains("aggregation") || lc.contains("pipeline"),
@@ -7176,10 +7764,6 @@ mod tests {
         assert!(!is_read_only_bash("git commit -m x"));
         assert!(!is_read_only_bash("cargo build"));
         assert!(!is_read_only_bash("cd /a && cargo check"));
-        assert!(
-            !unix.contains("read_file") && !unix.contains("list_directory"),
-            "unix desc must not advertise purged/legacy tool names: {unix}"
-        );
         assert!(!is_read_only_bash("grep x | tee f"));
         assert!(!is_read_only_bash("grep x | xargs rm"));
         // Command / process substitution (DOUBLE-quoted or bare) executes — reject.
@@ -7487,5 +8071,252 @@ mod tests {
         // Commands with arguments or pipes are allowed
         assert!(check_interactive_command("python3 script.py").is_none());
         assert!(check_interactive_command("echo 'select 1;' | sqlite3").is_none());
+    }
+}
+
+#[cfg(test)]
+mod background_pid_block_tests {
+    use super::*;
+
+    #[test]
+    fn ps_w_rows_map_winpid_to_msys_pid() {
+        // A REAL capture from this platform (Git Bash `ps -W`): the daemon-spawned
+        // wrapper shows uid 0 (foreign MSYS session) while a native child carries the
+        // user uid. Only the mapping matters here.
+        let sample = "\
+      PID    PPID    PGID     WINPID   TTY         UID    STIME COMMAND
+  4227900       0       0      33596  ?              0 19:03:44 C:\\Program Files\\Git\\bin\\bash.exe
+      676       1     676        416  ?         197108 19:03:43 /f/Python/Python312/python
+";
+        let map = parse_ps_w_ids(sample);
+        assert_eq!(map.get(&33596), Some(&4227900));
+        assert_eq!(map.get(&416), Some(&676));
+        assert_eq!(map.get(&999_999), None);
+    }
+
+    #[test]
+    fn workload_leaves_keep_the_process_the_command_started() {
+        // wrapper -> inner bash -> python: the LEAF is the workload (killing it unwinds
+        // the wrapper); killing the inner shell would orphan python.
+        let rows = vec![
+            (100u32, 1u32, "bash.exe".to_string()),
+            (200, 100, "python.exe".to_string()),
+        ];
+        assert_eq!(
+            workload_leaves(&rows),
+            vec![(200, "python.exe".to_string())]
+        );
+    }
+
+    #[test]
+    fn workload_leaves_keep_siblings_and_drop_parents() {
+        let rows = vec![
+            (100u32, 1u32, "node.exe".to_string()),
+            (200, 100, "esbuild.exe".to_string()),
+            (300, 100, "worker.exe".to_string()),
+        ];
+        let leaves = workload_leaves(&rows);
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|(pid, _)| *pid == 200));
+        assert!(leaves.iter().any(|(pid, _)| *pid == 300));
+    }
+
+    #[test]
+    fn workload_leaves_drop_windows_console_hosts() {
+        // Windows spawns a console host as a child of every console app; reporting it
+        // would hand the model a useless pid next to the real workload.
+        let rows = vec![
+            (100u32, 1u32, "bash.exe".to_string()),
+            (200, 100, "sleep.exe".to_string()),
+            (300, 100, "conhost.exe".to_string()),
+            (400, 100, "OpenConsole.exe".to_string()),
+        ];
+        assert_eq!(workload_leaves(&rows), vec![(200, "sleep.exe".to_string())]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_block_reports_both_ids_then_falls_back_to_the_tree_kill() {
+        // Workload with a resolved Git-Bash pid → BOTH recipes, each named.
+        let one = render_background_pid_block(33596, &[(416, Some(676), "python".into())]);
+        assert!(
+            one.contains("676 (Git Bash) / WinPID 416 (python)"),
+            "{one}"
+        );
+        assert!(one.contains("`kill 676` (Git Bash)"), "{one}");
+        assert!(one.contains("`taskkill /F /T /PID 33596`"), "{one}");
+
+        // No attributable child yet → wrapper WinPID + whole-tree kill only.
+        let none = render_background_pid_block(33596, &[]);
+        assert!(none.contains("WinPID 33596"), "{none}");
+        assert!(none.contains("`taskkill /F /T /PID 33596`"), "{none}");
+
+        // >3 workloads collapse with a count; the tree kill stays the complete recipe.
+        let many: Vec<(u32, Option<u32>, String)> = (0..5)
+            .map(|i| (400 + i, Some(700 + i), format!("w{i}")))
+            .collect();
+        let block = render_background_pid_block(33596, &many);
+        assert!(block.contains("(+2 more)"), "{block}");
+        assert!(block.contains("`taskkill /F /T /PID 33596`"), "{block}");
+
+        // A workload with no MSYS pid must NOT advertise a `kill` recipe.
+        let winpid_only = render_background_pid_block(33596, &[(416, None, "python".into())]);
+        assert!(!winpid_only.contains("`kill "), "{winpid_only}");
+        assert!(
+            winpid_only.contains("`taskkill /F /T /PID 33596`"),
+            "{winpid_only}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_block_reports_the_process_group_recipe() {
+        let block = render_background_pid_block(4242, &[]);
+        assert!(
+            block.contains("PID: 4242 (process-group leader)"),
+            "{block}"
+        );
+        assert!(block.contains("`kill -TERM -4242`"), "{block}");
+    }
+}
+
+#[cfg(test)]
+mod mixed_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn a_legacy_line_does_not_mangle_neighbouring_utf8_lines() {
+        // The reported bug: taskkill's localized (GBK) error line pulled the whole read
+        // span into the GBK decoder, so the UTF-8 lines around it came back as mojibake.
+        let (gbk, _, _) = encoding_rs::GB18030.encode("错误 err\n");
+        let mut chunk = "中文行 first\n".as_bytes().to_vec();
+        chunk.extend_from_slice(&gbk);
+        chunk.extend_from_slice("中文行 last\n".as_bytes());
+
+        let mut pending = Vec::new();
+        let out = decode_stream_chunk(&mut pending, &chunk, true).expect("mixed chunk");
+        assert!(out.contains("中文行 first"), "{out:?}");
+        assert!(out.contains("中文行 last"), "{out:?}");
+        assert!(out.contains("err"), "{out:?}");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_pending_legacy_line_still_lets_utf8_lines_through() {
+        // Streaming: a complete UTF-8 line must be emitted even while a later legacy line
+        // is still incomplete (it waits for its own newline).
+        let mut pending = Vec::new();
+        let mut chunk = "第一行\n".as_bytes().to_vec();
+        chunk.extend_from_slice(&encoding_rs::GB18030.encode("错误").0);
+        let out = decode_stream_chunk(&mut pending, &chunk, false).expect("utf8 line");
+        assert_eq!(out, "第一行\n");
+        assert!(!pending.is_empty(), "legacy tail must stay buffered");
+    }
+
+    #[test]
+    fn pure_spans_keep_the_previous_decoding() {
+        // Pure UTF-8: byte-for-byte (fast path).
+        assert_eq!(decode_mixed_span("héllo 世界\n".as_bytes()), "héllo 世界\n");
+        // Pure legacy: the whole block still reaches the detector as ONE unit, so the
+        // result is identical to the historical `decode_output` behavior.
+        let (gbk, _, _) = encoding_rs::GB18030.encode("福建省新闻正文\n第二行\n");
+        assert_eq!(decode_mixed_span(&gbk), decode_output(&gbk));
+    }
+
+    #[test]
+    fn final_formatted_output_keeps_utf8_around_a_legacy_line() {
+        // The model-visible path: `format_streams` decodes the captured buffers.
+        let (gbk, _, _) = encoding_rs::GB18030.encode("错误 err\n");
+        let mut stdout = "构建输出\n".as_bytes().to_vec();
+        stdout.extend_from_slice(&gbk);
+        let formatted = format_streams(&stdout, &[], Some((true, Some(0))), false);
+        assert!(formatted.contains("构建输出"), "{formatted:?}");
+        assert!(formatted.contains("err"), "{formatted:?}");
+    }
+}
+
+#[cfg(test)]
+mod msys_arg_rewrite_tests {
+    use super::*;
+
+    fn rewrite(cmd: &str, git_root: Option<&std::path::Path>) -> String {
+        rewrite_msys_arg_conventions(cmd, git_root).into_owned()
+    }
+
+    #[test]
+    fn double_slash_switches_fold_to_single_slash() {
+        // The Git-Bash convention: `//F` meant `/F` while the runtime folded the doubled
+        // slash. Conversion is off now, so the fold happens here.
+        assert_eq!(
+            rewrite("taskkill //F //PID 123", None),
+            "taskkill /F /PID 123"
+        );
+        assert_eq!(
+            rewrite("msbuild //NOLOGO //t:Build", None),
+            "msbuild /NOLOGO /t:Build"
+        );
+        assert_eq!(rewrite("cmd //c ver", None), "cmd /c ver");
+        // A deeper path is NOT the convention — leave `//server/share` alone.
+        assert_eq!(rewrite("cd //server/share", None), "cd //server/share");
+        // Literal payload (single quotes, heredoc bodies) is never touched.
+        assert_eq!(rewrite("echo '//F'", None), "echo '//F'");
+        assert_eq!(rewrite("cat <<EOF\n//F\nEOF", None), "cat <<EOF\n//F\nEOF");
+        // Nothing to do → borrowed, not rebuilt.
+        assert!(matches!(
+            rewrite_msys_arg_conventions("echo plain", None),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn dev_null_becomes_nul_only_for_native_programs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        std::fs::write(root.path().join("usr/bin/grep.exe"), b"").unwrap();
+        std::fs::write(root.path().join("usr/bin/head.exe"), b"").unwrap();
+        let root = root.path();
+
+        // Native program (not in the MSYS tree) → `NUL`, so `-o` really discards.
+        assert_eq!(
+            rewrite("curl -s -o /dev/null http://x", Some(root)),
+            "curl -s -o NUL http://x"
+        );
+        assert_eq!(
+            rewrite(
+                "python app.py > out.log && curl -o /dev/null http://x",
+                Some(root)
+            ),
+            "python app.py > out.log && curl -o NUL http://x"
+        );
+        // MSYS tool → POSIX spelling kept (`NUL` would be a plain filename for it).
+        assert_eq!(
+            rewrite("grep -f /dev/null x", Some(root)),
+            "grep -f /dev/null x"
+        );
+        assert_eq!(
+            rewrite("head -c 1 /dev/null", Some(root)),
+            "head -c 1 /dev/null"
+        );
+        // Redirect targets belong to bash — never rewritten.
+        assert_eq!(
+            rewrite("curl -s http://x > /dev/null", Some(root)),
+            "curl -s http://x > /dev/null"
+        );
+        // Without a Git root the program cannot be classified → leave as written (a miss,
+        // never corruption).
+        assert_eq!(
+            rewrite("curl -o /dev/null http://x", None),
+            "curl -o /dev/null http://x"
+        );
+        // A wrapper + assignment still resolves to the REAL program: `env FOO=1 curl` →
+        // native (rewrite), `env FOO=1 grep -f` → MSYS (keep).
+        assert_eq!(
+            rewrite("env FOO=1 curl -o /dev/null http://x", Some(root)),
+            "env FOO=1 curl -o NUL http://x"
+        );
+        assert_eq!(
+            rewrite("env -i grep -f /dev/null x", Some(root)),
+            "env -i grep -f /dev/null x"
+        );
     }
 }
