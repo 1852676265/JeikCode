@@ -23,6 +23,134 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.1 (2026-10-12)
+
+- **[Unified Tool-Output Compression (capabilities/kernel/config)]**:
+  - **Technical Root Cause / Detail**: Two independent mechanisms — a 64 KiB artifact fold at execution time and a 24 KiB wire prune at request time — left the 24–64 KiB band trimmed for the model with NO retrieval handle, and the terminal class had no dedicated line.
+  - **Implementation Mechanism**: One compression seam at tool return (`ArtifactMiddleware`): non-exempt results above `[tools.tool_output] max_bytes` (default 64 KiB) and terminal (`run_command` / `bash`) results above `min(max_bytes, terminal_max_bytes)` (default 24 KiB) become a uniform head 1500 + tail 2200 preview carrying the `artifact_id` handle (`fetch_output(artifact_id=...)`); the full text is spilled to the artifact store first, so the handle always resolves. `terminal_max_bytes` is configurable (config.toml + `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES`, env wins; `0` follows `max_bytes`). The kernel's `adaptive_prune_tool_output_for_llm` / `prune_messages_for_wire` are deleted; `model_history()` is verbatim.
+  - **Verification & Testing**: kernel lib 131; capabilities lib 936 (terminal split, alias, config override, uniform preview); coding artifact wiring roundtrip; config 245; workspace `check --all-targets`; `cargo fmt --check` clean.
+
+- **[Kernel: Watermark Context Budget, Canonical Tool Names & Deterministic MCP Teardown]**:
+  - **Watermark Budget**: `[models.X] max_tokens` is a capability declaration and per-protocol output budget — never context math. `effective_input_limit` is replaced by `input_watermark_budget` = window − min(20K, window/4); the wire sends the declared value verbatim; auto-compaction, the pre-send guard and `CompactionView` share one denominator; `compact_threshold` moves to 0.9 of the watermark, killing the "warns every turn but never compacts" gap (the reported 491K warning at 49% on a 1M window). The model editor offers 32K/64K/128K/256K/384K tiers + custom.
+  - **Tool-Name Retirement**: `read_file`→`read` (now also lists directories), `list_directory` dropped, `write_file`→`write`, `edit_file`→`edit`; legacy names remain dispatch aliases only. Real defects fixed with it: compaction's "never stub file reads" exemption compared the literal `read_file` (now `is_file_read_tool`), the wander meter missed `read`, goal summaries only collected legacy names, the reviewer mounted the purged `list_directory`, tuix/daemon file-class arms lacked canonical names, and model-facing prose was aligned.
+  - **MCP Child Lifecycle**: the last `SessionMcpLease` drop parked the process for an async TTL reaper that lives ON the runtime — a host that tears its runtime down (tests / one-shot CLI / embedded SDK) could never run it, leaking the npx/cmd/node tree while `Runtime::drop` waited forever on the child's still-open stdout. Added `McpClient::kill_now` / `StdioClient::kill_now`, `McpRegistry::kill_all_children_now` and a process-global weak registry; the last owner now reaps synchronously unless the host's idle reaper has proven itself.
+  - **Verification & Testing**: `cargo check --lib -p jeikcode-daemon`; kernel 131 lib + integration; capabilities 927 lib + compaction_cache/tools_integration; coding 366 lib + full_assembly (un-ignored, ~2.4s) / plan_mode / sensitive_path / tool_args_repair / system_context; review 67+1; tuix display/format 30; webui build.
+
+- **[Git-Bash/MSYS Reliability: Paths, Background PIDs & Mixed-Encoding]**:
+  - **Technical Root Cause / Detail**: Git-Bash/MSYS integration made tool paths and background tasks unreliable on Windows: POSIX-polluted `TMP`/`TEMP` reached child shells, `$VAR`/`%VAR%` handling was inconsistent, background reports carried the wrapper PID only, and a single GBK line garbled neighbouring UTF-8 lines.
+  - **Implementation Mechanism**: one `special_dirs` source for `$TMPDIR`/`$TMP`/`$TEMP`/`$DESKTOP`/`$HOME` (desktop registry-backed); tool path params accept `$VAR`/`${VAR}`/`%VAR%` plus one quote pair with undefined names kept verbatim (fail-closed); temp normalized end to end (`BASH_ENV` rc re-exports native values, `TMPDIR_WIN`/`DESKTOP_WIN` alias handles, host env sanitized at three entry points); background tasks report the workload's two real ids (`WinPID` + Git-Bash pid, leaf via Toolhelp) with the exact stop recipe; readiness probes detected ports on 127.0.0.1; `decode_mixed_span` decodes per same-class line run; `//X`→`/X` and native `/dev/null`→`NUL` normalization.
+  - **Verification & Testing**: `tools::bash` 143/143, `tools_integration` 11/11 (real background start/stop with the printed recipe), `special_dirs` 6/6, `pathutil` 12/12, `mixed_encoding` 4/4, `bash_runtime` 14/14, registry consistency 18/18, reminder 9/9, `temp_env_sanitize` 1/1.
+
+- **[Pipeline Identity & the Cross-Instance Incremental Event Bus (kernel/daemon/webui)]**:
+  - **Technical Root Cause / Detail**: Without a stable per-part identity, live streaming, refresh and session switching produced ordering errors, card resurrection and ghost answer replay.
+  - **Implementation Mechanism**: kernel `Message.id` + a new `AgentEvent::UserMessage` boundary event; `SteeredInput` carries the landed `message_id`; daemon `message_id`/`part_id`/`part_seq` on chat/live deltas; replay merging scoped by `message_id`/`part_id`; id-driven render keys and directed painting in the WebUI (`withAssistantIdentity` uniqueness guard, whitespace-delta self-healing); a process-wide broadcast bus + `GET /events` incremental channel (`session_upsert`/`session_deleted`/`activity`/`review_asked`/`review_resolved`) with a route-level SSE test.
+  - **Verification & Testing**: `cargo check --workspace --all-targets`; daemon lib tests; webui `tsc`, `node --test`, production build.
+
+- **[Single Home-Root Derivation & Thread-Local Test Home Seam]**:
+  - **Technical Root Cause / Detail**: every path layer re-implemented the home rule (env → legacy → real home); tests repointed the process-wide environment, so one test's `update_config` rewrote the file another test was asserting on (observed: a provider key resolved to "").
+  - **Implementation Mechanism**: `capabilities::paths::config_dir` delegates to `Config::resolve_config_dir`; `Config::config_dir` memoizes production resolution in a `OnceLock`; all 91 `set_var` sites on `JEIKCODE_HOME`/`ATOMCODE_HOME`/`TMPDIR`/`TMP`/`TEMP` across 22 files move to a thread-local home override (`IsolatedHome::at`); kernel `isolate_home` resolves through the POSIX-normalized resolver; a source-scanning guard fails the build for new `set_var` sites outside the two sanctioned startup points (backlog now empty).
+  - **Verification & Testing**: capabilities lib 927/927, coding lib 364/364, daemon lib 396/396 (x3), env guard green, workspace `--all-targets` clean.
+
+- **[Prompt/Persona Baseline Resolution (coding)]**:
+  - **Technical Root Cause / Detail**: an existing-but-empty prompts dir was treated as the whole persona set (silently dropping the embedded baseline — PROHIBITIONS vanished); routing resolution solely through `Config::config_dir()` dropped the real-home fallback and removed the `<environment>` block.
+  - **Implementation Mechanism**: an absent dir yields `None` while the interim `exists()` gate is reverted (a not-yet-existing dir is the normal state — persona assembly seeds it from embedded defaults); resolution order keeps the thread-local test override, then env → `~/.jeikcode/prompts` → legacy `~/.atomcode/prompts`; init prompts fall back to the embedded baseline; the prompt cache gains `invalidate_cache_for_test()`; `system_context` asserts design-independent invariants.
+  - **Verification & Testing**: `system_context` 2/2, coding suite green.
+
+- **[Tool-Name & Alias Convergence Across the Stack]**:
+  - **Edit repair (#38)**: `extract_edit_file_args` matched only the literal `edit_file`, so a modern `edit` call with unescaped quotes fell through to generic extraction; a single `is_edit_tool_name` now covers both names and all four check sites converge on it.
+  - **Daemon formatting (#40)**: artifact extraction and `format_tool_args` were hardcoded to legacy names/`file_path`; now `write|write_file|create_file|edit|edit_file`, `path` before `file_path`, `command` or `cmd`, plus modern `read`/`write`/`edit`/`run_command`/`code_explore`/`task` formatting.
+  - **Worker scope gate**: `WorkerScope::violation` matched a hardcoded list and allowed anything else, so `create_file` silently escaped a worker's declared scope; the name set now lives once (`FILE_MUTATION_TOOLS` / `is_file_mutation_tool` + `is_search_replace_tool`).
+  - **todo `list` (read-only first-class)**: the legacy `{"action":"list"}` shape half-worked (summary/apply returned an error merely carrying the list, with a self-contradictory hint); it is now a real read-only action (short-circuit, no-op fold, batch rejection, schema advertises `list` plus the long-accepted `remove`).
+  - **Edit ambiguity**: mixing `edits[]` with a top-level `replace_all` is a loud error; a missing `old_string` names the exact `edits[N]` index; occurrence-vs-replace_all precedence documented and pinned.
+  - **TUix**: legacy `list` action recognized, mid-stream `/clear` and `/new` whitelisted, `format_tool_detail("read", …)` accepts `file_path`/`path`, and the never-passable auth-gated login tests are deleted with a comment.
+  - **Verification & Testing**: focused unit regressions per area (capabilities 931, tool_format_tests 69/69, menu_tests 54/54, write_approval 18/18).
+
+- **[Security & Indexing: `code_explore` Sensitivity + Graph-Only Credential Ignores (#41)]**:
+  - **Technical Root Cause / Detail**: `SensitivePathGate` only resolved targets for `read`/`read_file`/`grep`/`glob`, so a `code_explore` on a benign symlink pointing at credentials bypassed the prompt; and the shipped `.codegraphignore` (with `.env`/`.env.*`) applied to BOTH the graph and the search walk, so an explicit glob/grep silently lost `.env.local` (green in isolation, red in the full suite).
+  - **Implementation Mechanism**: `code_explore` joins `local_tool` + `local_read_target` with symlink-intercept tests; the ignore list splits into `.codegraphignore` (noise, both scopes) and the new graph-only `.codegraphignore.graph` (`.env*`, `.ssh/`, `*.pem`, `*.key`, `id_rsa*`/`id_ed25519*`), registered in `BUNDLED_ASSETS` (+ localized description) so upgrades receive it as a default-selected New diff.
+  - **Verification & Testing**: `--all-features` suite 1644 passed / 0 failed / 1 ignored (previously never finished); default suite 928; tools::glob 24/24; an integration test locks the asset diff.
+
+- **[Grep Correctness & Windows Path Normalization]**:
+  - **Lenient braces**: rust's regex parser treats any unescaped `{` as a quantifier, so `.sidebar {` failed pattern build and silently degraded; `escape_bare_braces`/`build_regex_lenient` keep legal quantifiers and escape the rest (PCRE/GNU ERE aligned), with an `is_regex=true` guidance line on zero-hit patterns containing bare `.`/`{`/`}`.
+  - **Missing target**: a non-existent path now searches the same-named candidate, then the nearest existing ancestor directory, stating the fallback in the output header.
+  - **UNC (#39)**: `strip_verbatim` was case-sensitive on `\?\UNC\`/`\??\UNC\`, corrupting lowercase verbatim UNC paths into `unc\server\share`; all verbatim UNC forms (backslash + slash) now normalize case-insensitively to canonical UNC.
+
+- **[Subagents Gain `code_explore` (#37)]**: `child_reg` never registered codeintel tools, so explore/worker subagents calling the flagship semantic graph failed with "tool not found" and fell back to flat grep; `codeintel` now mounts into `child_reg` and `code_explore` joins both profiles, with parts.rs regressions.
+
+- **[WebUI: Mermaid Labels, Power Switches & Eye-Care Palette]**:
+  - **Mermaid**: DOMPurify's SVG namespace validation stripped HTML inside `foreignObject`, making all flowchart labels vanish; foreignObject inner HTML and outer SVG are now sanitized separately under their respective profiles and restored via placeholder tokens, preserving labels, line breaks and KaTeX while keeping strict XSS protection.
+  - **Theming**: circular IEC 5009 power-key switches (energised green micro-glow / red standby glow, press-scale micro-interactions, spinning busy glyph) and a low-glare matte-slate light palette (#f4f5f7 / #eaecee) with deepened borders, darker typography, deep forest-green success/JSON tones, a deep-amber reasoning accent, and light-mode overrides for settings surfaces.
+
+- **[CI & Suite Hygiene]**:
+  - **TUI suite gated**: `ci.yml` / `portability.yml` now run `cargo test -p jeikcode-tuix --lib -- --test-threads=1` (1,700+ tests previously only exercised locally), and `retained_small_frame_single_write` pins the Unix DA1 parser query separately (adapted from PR #44).
+  - **Hermetic all-features suite**: isolated-home guard lifetime fixed (an unsafe-block-bound guard dropped immediately, reading the developer's real `~/.jeikcode/mcp.json`), plugin fixtures built with `serde_json`, trusted-domain expectations gated on the live list, the glob hidden-file test serialized, the explore workspace-root test bounded + ignored; rustfmt passes folded in for files CI's check-only policy left unformatted.
+  - **Coding integration convergence**: `full_assembly` asserts prompt layout by shape (60s bounded drive loop, phase-labelled panics); `permission_grants` encodes correct allow-always semantics and canonical `write` (the fixture's `../..` path is an unresolved parent traversal that is deliberately never remembered).
+  - **Process**: `AGENTS.md` now requires bilingual commit bodies (English pass, `---`, Chinese pass).
+
+---
+
+- **[统一工具输出压缩（capabilities/kernel/config）]**:
+  - **技术机理 / 现象溯源**: 执行时的 64 KiB 折叠与请求时的 24 KiB wire 裁剪是两套独立机制，导致 24–64 KiB 区间被裁剪后**没有任何取回钥匙**，且终端类没有专属线。
+  - **实现防线 / 核心改动**: 压缩只保留一处——工具返回时的 `ArtifactMiddleware`：非豁免结果超过 `[tools.tool_output] max_bytes`（默认 64 KiB）、终端（`run_command` / `bash`）结果超过 `min(max_bytes, terminal_max_bytes)`（默认 24 KiB）时，统一改写为「头 1500 + 尾 2200 字节」预览并携带 `artifact_id` 钥匙（`fetch_output(artifact_id=...)`）；改写前先落盘全量文本，钥匙永远可解析。`terminal_max_bytes` 可配置（config.toml + `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES`，env 优先；`0` 表示跟随 `max_bytes`）。内核的 `adaptive_prune_tool_output_for_llm` / `prune_messages_for_wire` 整体删除，`model_history()` 不再二次改写。
+  - **验证与交付**: kernel lib 131；capabilities lib 936（终端分档、别名、配置覆盖、均匀预览）；coding artifact 接线往返；config 245；全工作区 `check --all-targets`；fmt 干净。
+
+- **[内核：水位上下文预算、权威工具名与 MCP 子进程确定性回收]**:
+  - **水位预算**: `[models.X] max_tokens` 是能力声明与各协议输出预算，绝不进入上下文计算；`effective_input_limit` 改为 `input_watermark_budget` = 窗口 − min(20K, 窗口/4)，wire 按声明值原样下发；自动压缩、发前守卫与 `CompactionView` 共用同一分母；`compact_threshold` 提到水位 0.9，消除「每轮报警但从不压缩」死区（即 1M 窗口上的 491K / 49% 误报）。模型面板提供 32K/64K/128K/256K/384K 档 + 自定义。
+  - **工具名退役**: `read_file`→`read`（兼列目录）、`list_directory` 删除、`write_file`→`write`、`edit_file`→`edit`，旧名仅作分发别名。随之修复的真实缺陷：压缩的「不打桩文件读取」豁免对 `read` 静默失效（改用 `is_file_read_tool`）、wander 漏数 `read`、goal 摘要清单恒空、review 挂载已删工具、tuix/daemon 文件类分支缺 canonical、模型可见文案全面对齐。
+  - **MCP 生命周期**: 最后一个租约 drop 只把进程「停放」给活在运行时上的异步 reaper —— 销毁运行时的宿主（测试 / 一次性 CLI / 嵌入式 SDK）永远跑不到它，npx/cmd/node 进程树泄漏且 `Runtime::drop` 永久等待子进程未关闭的 stdout。新增 `McpClient::kill_now` / `StdioClient::kill_now`、`McpRegistry::kill_all_children_now` 与进程级弱登记表；最后一个 owner 在宿主 reaper 未证明可用时同步回收。
+  - **验证与交付**: `cargo check --lib -p jeikcode-daemon`；kernel 131 lib + 集成；capabilities 927 lib + compaction_cache/tools_integration；coding 366 lib + full_assembly（解禁，~2.4s）/ plan_mode / sensitive_path / tool_args_repair / system_context；review 67+1；tuix 30；webui build。
+
+- **[Git-Bash/MSYS 可靠性：路径、后台 PID 与混合编码]**:
+  - **技术机理 / 现象溯源**: Windows 上 Git-Bash/MSYS 集成让工具路径与后台任务不可靠：被 POSIX 污染的 `TMP`/`TEMP` 进入子 shell、`$VAR`/`%VAR%` 处理不一致、后台只报包装进程 PID、一行 GBK 污染相邻 UTF-8 行。
+  - **实现防线 / 核心改动**: `special_dirs` 单一事实源（`$TMPDIR`/`$TMP`/`$TEMP`/`$DESKTOP`/`$HOME`，桌面走注册表）；工具路径参数支持 `$VAR`/`${VAR}`/`%VAR%` 与一层引号，未定义变量原样保留（fail-closed）；temp 全链路原生化（`BASH_ENV` rc 重导出、`TMPDIR_WIN`/`DESKTOP_WIN` 别名、三入口清理宿主 env）；后台任务回报工作负载两个真实 ID（`WinPID` + Git-Bash pid，Toolhelp 取叶子）与可照抄停止配方；端口在 127.0.0.1 就绪探测；`decode_mixed_span` 按同类行段解码；`//X`→`/X`、原生 `/dev/null`→`NUL` 归一。
+  - **验证与交付**: `tools::bash` 143/143、`tools_integration` 11/11（真实后台起停 + 配方照抄）、`special_dirs` 6/6、`pathutil` 12/12、`mixed_encoding` 4/4、`bash_runtime` 14/14、注册表一致性 18/18、提醒 9/9、`temp_env_sanitize` 1/1。
+
+- **[管线身份与跨实例增量事件总线（kernel/daemon/webui）]**:
+  - **技术机理 / 现象溯源**: 缺少稳定的部件身份时，流式、刷新与切会话会产生错序、卡片复活与幽灵回放。
+  - **实现防线 / 核心改动**: kernel `Message.id` + 新 `AgentEvent::UserMessage` 边界事件；`SteeredInput` 携带落盘 `message_id`；daemon 在 chat/live 增量上带 `message_id`/`part_id`/`part_seq`；回放合并按 `message_id`/`part_id` 作用域；WebUI 按 id 定向落笔与渲染键（`withAssistantIdentity` 唯一性守卫、空白增量自愈）；进程级广播 + `GET /events` 增量通道（`session_upsert`/`session_deleted`/`activity`/`review_asked`/`review_resolved`）并附路由级 SSE 测试。
+  - **验证与交付**: `cargo check --workspace --all-targets`；daemon lib 测试；webui `tsc`、`node --test`、生产构建。
+
+- **[单一 home 根推导与线程级测试 home 缝]**:
+  - **技术机理 / 现象溯源**: 各路径层各自重写 home 规则（env → legacy → 真实 home）；测试改向进程级环境变量，导致一个测试的 `update_config` 重写另一个测试正在断言的文件（实测 provider key 解析成 ""）。
+  - **实现防线 / 核心改动**: `capabilities::paths::config_dir` 委派 `Config::resolve_config_dir`；`Config::config_dir` 用 `OnceLock` memo 生产解析；22 个文件里 91 处 `set_var` 全部改为线程级 home 覆盖（`IsolatedHome::at`）；kernel `isolate_home` 走 POSIX 归一解析；源码扫描守卫对新增 `set_var` 直接判失败（历史清单已清空）。
+  - **验证与交付**: capabilities lib 927/927、coding lib 364/364、daemon lib 396/396（×3）、env 守卫绿、workspace `--all-targets` 干净。
+
+- **[提示词/persona 基线解析（coding）]**:
+  - **技术机理 / 现象溯源**: 「目录存在但为空」被当成完整 persona 集，静默丢掉内嵌基线（PROHIBITIONS 消失）；只走 `Config::config_dir()` 丢掉真实 home 回退，`<environment>` 块整体消失。
+  - **实现防线 / 核心改动**: 目录不存在返回 `None`，期间引入的 `exists()` 门回滚（目录尚不存在是正常态——组装会从内嵌默认 seed）；解析顺序保留线程级覆盖，再 env → `~/.jeikcode/prompts` → 旧 `~/.atomcode/prompts`；init 提示词回退内嵌基线；提示词缓存新增 `invalidate_cache_for_test()`；`system_context` 改断言与设计无关的不变量。
+  - **验证与交付**: `system_context` 2/2，coding 套件全绿。
+
+- **[全栈工具名与别名收敛]**:
+  - **edit 修复（#38）**: `extract_edit_file_args` 只认字面 `edit_file`，现代 `edit` 调用（含未转义引号）落到通用提取；新增单一真源 `is_edit_tool_name` 并收敛四处检查点。
+  - **daemon 格式化（#40）**: artifact 提取与 `format_tool_args` 硬编码旧名/`file_path`；现支持 `write|write_file|create_file|edit|edit_file`、`path` 优先于 `file_path`、`command` 或 `cmd`，并补齐 `read`/`write`/`edit`/`run_command`/`code_explore`/`task` 格式化。
+  - **worker 作用域门**: `WorkerScope::violation` 用硬编码名单、其余一律放行，`create_file` 可静默绕过声明作用域；名字集合收敛为 `FILE_MUTATION_TOOLS` / `is_file_mutation_tool` + `is_search_replace_tool`。
+  - **todo `list` 一等公民**: 老形态 `{"action":"list"}` 此前半支持（返回夹带清单的错误与自相矛盾提示）；现为真正只读动作（短路回显、no-op 折叠、批次拒绝、schema 广告 `list` 与早已接受的 `remove`）。
+  - **edit 歧义**: `edits[]` 与顶层 `replace_all` 混用改为响亮报错；缺 `old_string` 点名 `edits[N]`；occurrence 与 `replace_all` 优先级文档化并用回归锁定。
+  - **TUix**: 识别 legacy `list`、流式中放行 `/clear` 与 `/new`、`format_tool_detail("read", …)` 同时接受 `file_path`/`path`、删除永远无法通过的账号登录测试并注明。
+  - **验证与交付**: 各区域定向回归（capabilities 931、tool_format_tests 69/69、menu_tests 54/54、write_approval 18/18）。
+
+- **[安全与索引：`code_explore` 敏感路径 + 图谱专用凭据忽略（#41）]**:
+  - **技术机理 / 现象溯源**: `SensitivePathGate` 只为 `read`/`read_file`/`grep`/`glob` 解析目标，`code_explore` 经良性符号链接指向凭据可绕过审批；内置 `.codegraphignore`（含 `.env`/`.env.*`）同时作用于建图与搜索遍历，显式 glob/grep 会静默丢失 `.env.local`（单跑绿、全套红）。
+  - **实现防线 / 核心改动**: `code_explore` 加入 `local_tool` + `local_read_target` 并附符号链接拦截测试；忽略清单拆为 `.codegraphignore`（噪声，双作用域）与新增图谱专用 `.codegraphignore.graph`（`.env*`、`.ssh/`、`*.pem`、`*.key`、`id_rsa*`/`id_ed25519*`），注册进 `BUNDLED_ASSETS`（含本地化描述），升级用户以默认勾选的 New 差异收到。
+  - **验证与交付**: `--all-features` 全套 1644 passed / 0 failed / 1 ignored（此前跑不完）；默认套件 928；tools::glob 24/24；集成测试锁定资产差异。
+
+- **[grep 正确性与 Windows 路径归一]**:
+  - **花括号宽容**: rust regex 把任何未转义 `{` 当量词，`.sidebar {` 会让模式构建失败并静默降级；`escape_bare_braces`/`build_regex_lenient` 保留合法量词、其余转义（对齐 PCRE/GNU ERE），零命中且含裸 `.`/`{`/`}` 时追加 `is_regex=true` 引导。
+  - **目标缺失兜底**: 路径不存在时先找同名候选、再退最近已存在祖先目录，并把落空事实写进输出头部。
+  - **UNC（#39）**: `strip_verbatim` 对 `\?\UNC\`/`\??\UNC\` 大小写敏感，小写 verbatim UNC 会被毁成 `unc\server\share`；现所有 verbatim UNC 形态（反斜杠 + 斜杠）大小写不敏感归一到规范 UNC。
+
+- **[子代理获得 `code_explore`（#37）]**: `child_reg` 从不注册 codeintel 工具，explore/worker 子代理调用旗舰语义图谱时报 "tool not found"、退回扁平 grep；现 `codeintel` 挂入 `child_reg`，`code_explore` 进入两个 profile，parts.rs 附回归。
+
+- **[WebUI：Mermaid 标签、电源开关与护眼配色]**:
+  - **Mermaid**: DOMPurify 的 SVG 命名空间校验会剥掉 `foreignObject` 内的 HTML，流程图节点标签全部消失；现将 foreignObject 内层 HTML 与外层 SVG 分别按各自 profile 净化并用占位符还原，标签、换行与 KaTeX 全保留，同时维持严格 XSS 防护。
+  - **主题**: 圆形 IEC 5009 电源按键（通电绿色微光 / 红色待机辉光、按压缩放微交互、忙碌旋转）与低眩光哑光石板亮色配色（#f4f5f7 / #eaecee），加深描边与文字、成功/JSON 深森林绿、思考深琥珀色，并为设置面板补亮色覆盖。
+
+- **[CI 与测试套件治理]**:
+  - **TUI 套件门禁**: `ci.yml` / `portability.yml` 现跑 `cargo test -p jeikcode-tuix --lib -- --test-threads=1`（1700+ 单测此前只在本地被跑到）；`retained_small_frame_single_write` 单独钉住 Unix DA1 查询（改自 PR #44）。
+  - **all-features 套件密闭化**: 修复 unsafe 块内即析构的 isolated-home guard（此前读开发机真实 `~/.jeikcode/mcp.json`）、插件夹具改用 `serde_json`、信任域期望按实时表 gate、glob 隐藏文件测试串行化、explore workspace-root 测试加有界护栏并 `#[ignore]`；并入 CI 只 check 未 fmt 文件的 rustfmt 收敛。
+  - **coding 集成收敛**: `full_assembly` 按形状断言提示布局（60s 有界 drive、按阶段 panic）；`permission_grants` 采用正确的始终允许语义与规范 `write`（夹具的 `../..` 属设计上「每次问、不记住」的未解析父级穿越）。
+  - **流程**: `AGENTS.md` 新增双语提交正文规范（英文整段、`---`、中文整段）。
+
 ## v7.2.2-beta.0 (2026-10-11)
 
 - **[Subagent Dispatch, Shell-Alias Extraction & Worker Scope Gate]** (#32, #33, #34):
