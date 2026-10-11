@@ -32,6 +32,14 @@ import { createTimelineFollow } from '../lib/timelineFollow';
 
 /** First paint / page size for long transcripts. Older messages load on demand. */
 const HISTORY_PAGE = 48;
+/** 「立即发送」程序化停止标记的有效期：后端 /chat/stop 的 stop_and_wait 上限仅 2.5s。 */
+const PROGRAMMATIC_STOP_MARK_TTL_MS = 15000;
+/**
+ * 页面长时间隐藏（手机后台挂起、系统休眠）后才允许失焦重连 watch。
+ * 短暂失焦（截图工具、切窗口回来）绝不断开重连：重连会强制后端重放整轮事件
+ * （subscribe_live_with_replay），把已画完的正文/思考再落一遍。
+ */
+const WATCH_REATTACH_AFTER_HIDDEN_MS = 60000;
 import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, streamLive, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -156,6 +164,8 @@ import {
   stashSessionQueued,
   restoreSessionQueued,
 } from '../lib/queuedDraft';
+import { consumesProgrammaticStopMark, runningTurnStopAliases, type ProgrammaticStopMark } from '../lib/turnStop';
+import { loadAppliedTodoCallIds, saveAppliedTodoCallIds } from '../lib/todoAppliedIds';
 import {
   chatRecoveryPolicy,
   classifyChatDone,
@@ -230,9 +240,11 @@ import {
   identifiedAssistantIndex,
   paintAssistantReasoning,
   paintAssistantText,
+  paintCachedAssistantDelta,
   ensureWorkingAssistant,
   paintUserMessage,
   visibleToolChunk,
+  withAssistantIdentity,
 } from '../lib/sessionProjection';
 
 interface Message {
@@ -1095,6 +1107,39 @@ export function Chat({
   const queuedRef = useRef(queued);
   queuedRef.current = queued;
   const queuedBySessionRef = useRef<Map<string, QueuedMessage[]>>(loadQueuedFromStorage());
+  // 「立即发送」发起的程序化停止标记：命中后旧回合的 stopped 终态不得再把其余排队卡片回吐到输入框。
+  const programmaticStopMarkRef = useRef<ProgrammaticStopMark | null>(null);
+  /**
+   * 队列三处一致性写入的唯一出口：内存会话映射 + localStorage + 后端 `/chat/queue`。
+   * 任何队列变更都必须走这里，否则刷新/换端时后端旧副本会把已出队的卡片复活。
+   */
+  function persistSessionQueue(sid: string, next: QueuedMessage[]) {
+    if (next.length > 0) {
+      queuedBySessionRef.current.set(sid, [...next]);
+    } else {
+      queuedBySessionRef.current.delete(sid);
+    }
+    saveQueuedToStorage(queuedBySessionRef.current);
+    // 跨设备后端队列同步持久化：换别的手机打开或刷新卡片永不丢失
+    void saveChatQueue(sid, next as unknown as QueuedMessageApiItem[]);
+  }
+
+  /**
+   * 定向更新某个会话的队列：前台就是该会话时走响应式 `setQueued`，否则只改该会话缓存；
+   * 两条路都会镜像到 localStorage 与后端 `/chat/queue`，保证跨会话操作后三处依旧一致。
+   */
+  function updateQueuedForSession(
+    sid: string | null | undefined,
+    updater: (items: QueuedMessage[]) => QueuedMessage[],
+  ) {
+    if (!sid) return;
+    if (activeIdRef.current === sid) {
+      setQueued(updater);
+      return;
+    }
+    persistSessionQueue(sid, updater(queuedBySessionRef.current.get(sid) ?? []));
+  }
+
   function setQueued(
     update: QueuedMessage[] | ((current: QueuedMessage[]) => QueuedMessage[]),
   ) {
@@ -1104,16 +1149,7 @@ export function Chat({
     const next = typeof update === 'function' ? update(queuedRef.current) : update;
     queuedRef.current = next;
     const sid = activeIdRef.current;
-    if (sid) {
-      if (next.length > 0) {
-        queuedBySessionRef.current.set(sid, [...next]);
-      } else {
-        queuedBySessionRef.current.delete(sid);
-      }
-      saveQueuedToStorage(queuedBySessionRef.current);
-      // 跨设备后端队列同步持久化：换别的手机打开或刷新卡片永不丢失
-      void saveChatQueue(sid, next as unknown as QueuedMessageApiItem[]);
-    }
+    if (sid) persistSessionQueue(sid, next);
     setQueuedState(next);
   }
   const queueIdRef = useRef(0);
@@ -1333,7 +1369,29 @@ export function Chat({
   const activeTodosRef = useRef<TodoItem[] | null>(null);
   activeTodosRef.current = activeTodos;
   const activeTodosBySessionRef = useRef<Map<string, TodoItem[]>>(new Map());
-  const todoAppliedCallIdsRef = useRef(new Map<string, Set<string>>());
+  // 幂等键必须跨刷新存活：/chat/watch 会重放整轮事件，而 todowrite 的 plan/批量 add 是
+  // 整表替换（todos.ts），重复折叠会把最新清单打回旧状态。直接从 localStorage 水合恢复。
+  const todoAppliedCallIdsRef = useRef<Map<string, Set<string>>>(loadAppliedTodoCallIds());
+  function persistAppliedTodoIds() {
+    saveAppliedTodoCallIds(todoAppliedCallIdsRef.current);
+  }
+  /**
+   * 幂等键种子：只做"并入"，绝不覆盖。
+   * 种子来源（画布窗口内的 todo 调用）天然看不到窗口外的历史 plan，覆盖式种子会把
+   * 持久化下来的保护集合冲掉，重放又能把已完成清单打回旧状态。
+   */
+  function seedAppliedTodoIds(sessionId: string | null | undefined, ids: Iterable<string | null | undefined>) {
+    if (!sessionId) return;
+    const applied = appliedTodoIdsFor(sessionId);
+    let changed = false;
+    for (const id of ids) {
+      if (id && !applied.has(id)) {
+        applied.add(id);
+        changed = true;
+      }
+    }
+    if (changed) persistAppliedTodoIds();
+  }
   function applySessionStickyTodos(sessionId: string | null | undefined, items: TodoItem[] | null) {
     const sticky = items && items.length > 0 && !items.every((t) => t.status === 'completed') ? items : null;
     setActiveTodos(sticky);
@@ -1341,8 +1399,9 @@ export function Chat({
     if (!sessionId) return;
     if (sticky) activeTodosBySessionRef.current.set(sessionId, sticky);
     else {
+      // 关键防线：清单全完成时**绝不能**清空幂等键。那正是最容易被重放覆盖的时刻
+      // （旧 plan 一重折就把打钩状态打回原形并定格）。新计划自带新 callId，无需清空。
       activeTodosBySessionRef.current.delete(sessionId);
-      todoAppliedCallIdsRef.current.delete(sessionId);
     }
   }
   function adoptStickyFromMessages(
@@ -1354,7 +1413,7 @@ export function Chat({
     const surface = hydrateSession(messages, authoritativeTodos, stashed);
     applySessionStickyTodos(sessionId, surface.todos);
     if (!sessionId) return;
-    todoAppliedCallIdsRef.current.set(sessionId, new Set(surface.appliedTodoIds));
+    seedAppliedTodoIds(sessionId, surface.appliedTodoIds);
   }
   function appliedTodoIdsFor(sessionId: string | null | undefined): Set<string> {
     if (!sessionId) return new Set();
@@ -1669,7 +1728,7 @@ export function Chat({
           } else {
             activeTodosBySessionRef.current.delete(id);
           }
-          todoAppliedCallIdsRef.current.set(id, new Set(surface.appliedTodoIds));
+          seedAppliedTodoIds(id, surface.appliedTodoIds);
         } catch {
           /* return path refetches disk */
         }
@@ -1743,11 +1802,7 @@ export function Chat({
     // events already painted are skipped, and only the unpainted suffix is
     // appended. Deleting the trailing assistant here is what made a refresh
     // drop the in-flight turn and leave only the steer card.
-    todoAppliedCallIdsRef.current.set(
-      loadId,
-      new Set(todoCallIdsFromMessages(messagesRef.current)),
-    );
-
+    seedAppliedTodoIds(loadId, todoCallIdsFromMessages(messagesRef.current));
     // Backup path: explicit pending query restores approval cards even if the
     // watch stream drops the edge event (or a mid-turn race loses the snapshot).
     restorePendingInteractive(loadId, loadGeneration);
@@ -1885,7 +1940,7 @@ export function Chat({
     if (settledSticky !== undefined) {
       applySessionStickyTodos(id, settledSticky);
       if (id) {
-        todoAppliedCallIdsRef.current.set(id, new Set(todoCallIdsFromMessages(messagesRef.current)));
+        seedAppliedTodoIds(id, todoCallIdsFromMessages(messagesRef.current));
       }
     }
     return fresh.running;
@@ -2069,10 +2124,7 @@ export function Chat({
           setBusyAndClock(true);
           busyRef.current = true;
           // A remote turn preserves the reader's current follow intent.
-          todoAppliedCallIdsRef.current.set(
-            loadId,
-            new Set(todoCallIdsFromMessages(messagesRef.current)),
-          );
+          seedAppliedTodoIds(loadId, todoCallIdsFromMessages(messagesRef.current));
           // Backup: restore Build/AcceptEdits/Plan approval cards mid-turn.
           restorePendingInteractive(loadId, loadGeneration);
           // API turn 已 admit(会话已建):通知 App 刷新侧栏,让新建会话实时出现。
@@ -3024,6 +3076,9 @@ export function Chat({
     return () => window.removeEventListener('keydown', onHardReload);
   }, []);
 
+  // 页面进入隐藏（切后台/挂起）的时刻；仅用于判定失焦重进是否需要重连 watch。
+  const pageHiddenSinceRef = useRef<number | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     getApprovalMode()
@@ -3069,7 +3124,16 @@ export function Chat({
     }
 
     const refreshOnFocus = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState !== 'visible') {
+        // 记录挂起起点：手机后台/休眠场景下面向“可能需要重连 watch”的判定。
+        pageHiddenSinceRef.current = Date.now();
+        return;
+      }
+      const hiddenForLong =
+        pageHiddenSinceRef.current != null &&
+        Date.now() - pageHiddenSinceRef.current >= WATCH_REATTACH_AFTER_HIDDEN_MS;
+      pageHiddenSinceRef.current = null;
+      {
         getApprovalMode()
           .then((current) => {
             if (!cancelled) applyIncomingMode(current);
@@ -3088,7 +3152,13 @@ export function Chat({
               if (cancelled || activeIdRef.current !== sid) return;
               const isRunning = Array.isArray(activeSessions) && activeSessions.includes(sid);
               if (isRunning) {
-                // 如果本端当前没有活跃的本地发起流，无缝自动重连 watch！
+                // 关键防线：本会话的 watch 通道仍然健在时绝不再订阅一次。
+                // `startDetachedHistoryPoll` 会 abort 旧 watcher 并重新订阅，后端随即
+                // 把整轮事件 replay 回来，把已画完的正文/思考重复落到最新 agent 消息上。
+                // 只有通道真的断了，或页面长时间挂起（连接可能静默半开）才无缝重连。
+                const watcher = sessionWatchersRef.current.get(sid);
+                const watcherAlive = !!watcher && !watcher.signal.aborted;
+                if (watcherAlive && !hiddenForLong) return;
                 if (
                   abortRef.current === null &&
                   activeStreamRequestIdRef.current === null &&
@@ -3951,47 +4021,8 @@ export function Chat({
 
   // ── Sync mode removed as obsolete / redundant ──
 
-  /** Stamp the streaming assistant message + its trailing text/reasoning part with
-   *  the wire identity (message_id / part_id), so render keys and cache merges are
-   *  id-based for LIVE output too (not only after a disk reload). Pure. */
-  function withAssistantIdentity(msgs: Message[], messageId?: string, partId?: string): Message[] {
-    if (!messageId && !partId) return msgs;
-    if (msgs.length === 0) return msgs;
-    let idx = messageId
-      ? msgs.findIndex((m) => m.role === 'assistant' && m.id === messageId)
-      : -1;
-    if (idx < 0) {
-      const lastIdx = msgs.length - 1;
-      const last = msgs[lastIdx];
-      if (!last || last.role !== 'assistant') return msgs;
-      if (messageId && last.id && last.id !== messageId) return msgs;
-      idx = lastIdx;
-    }
-    // 同一 message_id 绝不能在两条消息上共存：重复 key 会让 Preact 复用错 DOM，
-    // 表现为“老回合的一部分回复渲染到新消息里”。
-    if (messageId && msgs.some((m, i) => i !== idx && m.id === messageId)) return msgs;
-    const message = msgs[idx]!;
-    let changed = false;
-    let id = message.id;
-    if (messageId && !id) {
-      id = messageId;
-      changed = true;
-    }
-    let parts = message.parts;
-    if (partId && parts.length > 0) {
-      const pi = parts.length - 1;
-      const p = parts[pi];
-      if (p && (p.kind === 'text' || p.kind === 'reasoning') && !p.id) {
-        parts = parts.slice();
-        parts[pi] = { ...p, id: partId };
-        changed = true;
-      }
-    }
-    if (!changed) return msgs;
-    const next = msgs.slice();
-    next[idx] = { ...message, id, parts };
-    return next;
-  }
+  // Identity stamping (`withAssistantIdentity`) lives in the projection module so the
+  // background-cache path (`applyEventToSessionCache`) and this live path share one contract.
 
   function appendToLastAssistant(
     content: string,
@@ -5210,7 +5241,9 @@ export function Chat({
         messagesRef.current = updated;
         return updated;
       }
-      // 历史中不存在：新工具。若末尾是 assistant 则追加，若末尾是 user（如 Steer）则安全开启新 assistant
+      // 历史中不存在：新工具。若末尾是 assistant 则追加，若末尾是 user（如 Steer）则安全开启新 assistant。
+      // 新行同样要带上管线身份（含同 id 已在别处时的唯一性守卫），否则这一轮此后
+      // 无法被重放/增量按 id 定位，只能落到“最后一条 assistant”上（串轮元凶）。
       const last = prev[prev.length - 1];
       if (last && last.role === 'assistant') {
         next = [...prev.slice(0, -1), { ...last, parts: upsertToolPart(last.parts, tool) }];
@@ -5220,6 +5253,7 @@ export function Chat({
           { role: 'assistant' as const, parts: [{ kind: 'tool' as const, tool }] },
         ];
       }
+      next = withAssistantIdentity(next, messageId);
       messagesRef.current = next;
       return next;
     });
@@ -5235,11 +5269,19 @@ export function Chat({
     const msgs = messageCacheRef.current.get(targetSid);
     if (!msgs || msgs.length === 0) return;
     if (event.type === 'text') {
-      messageCacheRef.current.set(targetSid, paintAssistantText(msgs, event.content, false, event.message_id));
+      // 后台缓存与画布共用同一套身份盖章：行上盖住 message_id，后续 watch 重放
+      // 才能回到自己那一轮，而不是被当成“新内容”追加到最新 agent 消息里。
+      messageCacheRef.current.set(targetSid, paintCachedAssistantDelta(msgs, 'text', event.content, {
+        messageId: event.message_id,
+        partId: event.part_id,
+      }));
       return;
     }
     if (event.type === 'reasoning') {
-      messageCacheRef.current.set(targetSid, paintAssistantReasoning(msgs, event.content, false, event.message_id));
+      messageCacheRef.current.set(targetSid, paintCachedAssistantDelta(msgs, 'reasoning', event.content, {
+        messageId: event.message_id,
+        partId: event.part_id,
+      }));
       return;
     }
     if (event.type === 'user') {
@@ -5264,6 +5306,8 @@ export function Chat({
           callId: event.id,
           appliedIds,
         });
+        // 后台会话的折叠同样要落盘幂等键（跨会话重放也不能把清单打回旧状态）。
+        persistAppliedTodoIds();
         if (nextTodos && nextTodos.length > 0 && nextTodos.some((t) => t.status !== 'completed')) {
           activeTodosBySessionRef.current.set(targetSid, nextTodos);
         } else {
@@ -5374,6 +5418,8 @@ export function Chat({
             ...(subtasks ? { subtasks } : {}),
           },
         });
+        // 工具行同样盖上管线身份：纯工具回合的行也要能被后续重放/增量按 id 定位。
+        next = withAssistantIdentity(next, event.message_id);
         messageCacheRef.current.set(targetSid, next);
         break;
       }
@@ -5592,6 +5638,8 @@ export function Chat({
               callId: event.id,
               appliedIds,
             });
+            // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
+            persistAppliedTodoIds();
             if (activeIdRef.current) {
               if (next && next.length > 0 && next.some((t) => t.status !== 'completed')) {
                 activeTodosBySessionRef.current.set(activeIdRef.current, next);
@@ -5713,6 +5761,8 @@ export function Chat({
                 callId: event.id,
                 appliedIds,
               });
+              // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
+              persistAppliedTodoIds();
               if (activeIdRef.current) {
                 if (next && next.length > 0 && next.some((t) => t.status !== 'completed')) {
                   activeTodosBySessionRef.current.set(activeIdRef.current, next);
@@ -5924,7 +5974,14 @@ export function Chat({
         setBusyAndClock(false);
         closeOpenArtifactFence();
         finalizePendingToolsOnCanvas();
-        restoreQueuedToComposer(); // 用户中止：排队内容回到输入框，而不是丢掉
+        if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, activeIdRef.current ?? sessionId, Date.now())) {
+          // 程序化停止（排队卡「立即发送」）：本次 stopped 是本端为换发新消息而主动触发的，
+          // 其余排队卡片与已投递的转向必须原地保留。队首卡片交给紧随其后的 drain 投递，
+          // 绝不整段回吐到输入框（那是用户主动按「停止」的语义）。
+          programmaticStopMarkRef.current = null;
+        } else {
+          restoreQueuedToComposer(); // 用户中止：排队内容回到输入框，而不是丢掉
+        }
         onPermissionResolved?.(null);
         setUserInputReq(null);
         break;
@@ -6354,6 +6411,8 @@ export function Chat({
     // ── Normal path ──
     stopDetachedHistoryPoll();
     stopIdleWatch();
+    // 新回合已进入投递：程序化停止（立即发送）的抑制标记到此为止，绝不能影响后续真实的用户停止。
+    programmaticStopMarkRef.current = null;
     const now = Date.now();
     setBusyAndClock(true, now);
     busyRef.current = true;
@@ -6720,10 +6779,9 @@ export function Chat({
       return;
     }
 
-    const next = queued.find((item) => item.kind === 'queue');
+    const next = queuedRef.current.find((item) => item.kind === 'queue');
     if (!next) return;
-    setQueued((q) => q.filter((item) => item.id !== next.id));
-    void deliver(next.text, next.images ?? [], next.approvalMode);
+    dispatchQueuedCard(next);
     // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy, queued, messages, loading, modeState.pendingMode, chatRecovery]);
@@ -6826,21 +6884,11 @@ export function Chat({
     const targetSid = sid;
     // 客户端关联键：随卡片持久化，刷新后与内核回传的 client_input_ids 对账。
     const clientInputId = q.clientInputId ?? randomUUID();
-    const updateTargetQueued = (updater: (item: QueuedMessage) => QueuedMessage) => {
-      // 1. 若当前前台仍是 targetSid，更新响应式 queued
-      if (activeIdRef.current === targetSid) {
-        setQueued((arr) => arr.map((item) => (item.id === q.id ? updater(item) : item)));
-      }
-      // 2. 无论当前前台切换到了哪个会话，都精准更新 targetSid 的 session 缓存与持久化！
-      const currentList = queuedBySessionRef.current.get(targetSid) ?? [];
-      const updatedList = currentList.map((item) => (item.id === q.id ? updater(item) : item));
-      if (updatedList.length > 0) {
-        queuedBySessionRef.current.set(targetSid, updatedList);
-      } else {
-        queuedBySessionRef.current.delete(targetSid);
-      }
-      saveQueuedToStorage(queuedBySessionRef.current);
-    };
+    const updateTargetQueued = (updater: (item: QueuedMessage) => QueuedMessage) =>
+      // 定向更新目标会话队列：前台/后台两态与 localStorage、后端 `/chat/queue` 三处同步。
+      updateQueuedForSession(targetSid, (items) =>
+        items.map((item) => (item.id === q.id ? updater(item) : item)),
+      );
 
     updateTargetQueued((item) => ({ ...item, kind: 'steering' as const, clientInputId }));
     try {
@@ -6854,47 +6902,70 @@ export function Chat({
   }
 
   /**
-   * 立即发送排队中的消息：
-   * 停止当前正在运行的回合（按停止键），并立即以该消息发起新回合（点发送键）。
+   * 停止运行中的回合：WebUI「停止」按钮与排队卡「立即发送」共用的唯一停止通道。
+   *
+   * 别名策略见 `runningTurnStopAliases`：本端回合被 /chat admit（202 已受理）之后 requestIdRef
+   * 即被清空，会话 id 才是长期有效的停止别名，只认 request id 会让停止被整体跳过。
+   * 后端 /chat/stop 经由 stop_and_wait 同步等待上一回合完全退出注册表，await 返回即代表槽位已释放，
+   * 调用方可以 0 延迟发起新的投递（绝不 409 抢跑）。
+   */
+  async function stopRunningTurn(currentSid: string | null, requestAlias: string | null): Promise<boolean> {
+    const stopPromises: Promise<boolean>[] = runningTurnStopAliases({
+      requestAlias,
+      sessionId: currentSid,
+    }).map((alias) => stopChat(alias).then((result) => result.released, () => false));
+    // 运行时（native live）回合由 /live 停止兜底，与「停止」按钮的历史行为保持一致。
+    if (currentSid && (attachedToLiveRuntime() || liveSessionIdRef.current)) {
+      stopPromises.push(postLiveStop(currentSid).then(() => true, () => false));
+    }
+    if (stopPromises.length === 0) return true; // 无停止目标：本就空闲
+    const results = await Promise.all(stopPromises);
+    return results.every(Boolean);
+  }
+
+  /**
+   * 队列卡片的唯一投递出口：出队（内存 / localStorage / 后端三处同步）后立刻作为新回合发出。
+   * 卡片随消息真正成为正文而自然销毁——drain 自动发送与「立即发送」共用此通道。
+   */
+  function dispatchQueuedCard(item: QueuedMessage) {
+    // 以 ref 为准做去重：两个投递入口可能在同一批渲染里竞争同一张卡片。
+    if (!queuedRef.current.some((entry) => entry.id === item.id)) return;
+    setQueued((current) => current.filter((entry) => entry.id !== item.id));
+    void deliver(item.text, item.images ?? [], item.approvalMode ?? modeState.confirmedMode);
+  }
+
+  /**
+   * 立即发送排队中的消息 = 触发「停止」控件 + 把该卡片投递为新回合。
+   *
+   * 卡片生命周期与「转向」完全对齐：只有真正成为正文（出队并画出用户气泡）才销毁，
+   * 期间始终留在队列里（内存 / localStorage / 后端三处一致），绝不提前移除造成闪烁或丢卡。
+   * 停止释放未获确认时不做无谓投递：卡片留在队首，旧回合终态一到即由 drain 自动补发。
    */
   async function handleSendImmediately(q: QueuedMessage) {
-    const textToSend = q.text;
-    const imagesToSend = q.images ?? [];
-    const modeToSend = q.approvalMode ?? modeState.confirmedMode;
+    const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
 
-    // 1. 从队列中移除当前项
-    setQueued((arr) => arr.filter((item) => item.id !== q.id));
-    const targetSid = sessionId ?? activeIdRef.current ?? requestIdRef.current;
-    if (targetSid) {
-      const currentList = queuedBySessionRef.current.get(targetSid) ?? [];
-      const updatedList = currentList.filter((item) => item.id !== q.id);
-      if (updatedList.length > 0) {
-        queuedBySessionRef.current.set(targetSid, updatedList);
-      } else {
-        queuedBySessionRef.current.delete(targetSid);
-      }
-      saveQueuedToStorage(queuedBySessionRef.current);
+    // 1. 该卡片跃升为队首（其余卡片保持原序）：立即发送后它就是下一条正文。
+    updateQueuedForSession(currentSid, (items) => {
+      const target = items.find((item) => item.id === q.id);
+      if (!target) return items;
+      return [target, ...items.filter((item) => item.id !== q.id)];
+    });
+
+    // 2. 打上程序化停止标记（旧回合的 stopped 终态不得把队列回吐到输入框）并停止。
+    //    会话在此刻前后持续处于占用态，故不做 busy 抖动复位，直到新回合由 deliver 接管。
+    if (currentSid) {
+      programmaticStopMarkRef.current = {
+        sessionId: currentSid,
+        expiresAt: Date.now() + PROGRAMMATIC_STOP_MARK_TTL_MS,
+      };
     }
+    const released = await stopRunningTurn(currentSid, requestIdRef.current);
+    abortRef.current?.abort();
 
-    // 2. 终止当前运行中的回合
-    try {
-      if (requestIdRef.current && (!attachedToLiveRuntime() || chatRecoveryPolicy(chatRecoveryRef.current).allowStop)) {
-        const requestAlias = requestIdRef.current;
-        await stopChat(requestAlias);
-        abortRef.current?.abort();
-      } else if (attachedToLiveRuntime()) {
-        await postLiveStop(liveSessionIdRef.current ?? sessionId ?? activeIdRef.current);
-      }
-    } catch {
-      // 容错：即使停止遇到非致命错误也尝试投递
-    } finally {
-      setBusyAndClock(false);
-      busyRef.current = false;
-      liveLifecycleRef.current = createLiveLifecycleState();
-    }
-
-    // 3. 后端 /chat/stop 经由 stop_and_wait 已经确保完全释放槽位，直接 0 延迟发起投递！
-    void deliver(textToSend, imagesToSend, modeToSend);
+    // 3. 后端已确认槽位释放（正常路径下与「秒停」同步完成）→ 立刻出队并投递。
+    if (!released) return;
+    const latest = queuedRef.current.find((item) => item.id === q.id);
+    if (latest) dispatchQueuedCard(latest);
   }
 
   async function handleSaveRewrite(sourceIndex: number, newText: string, newImages: ImageData[]) {
@@ -7264,6 +7335,8 @@ export function Chat({
   async function handleStop() {
     const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
     const requestAlias = requestIdRef.current;
+    // 用户主动停止：无论此前是否发生过程序化停止，都复位抑制标记，保证排队内容照常回吐输入框。
+    programmaticStopMarkRef.current = null;
     if (currentSid) {
       markSessionManuallyStopped(currentSid);
       sessionWatchersRef.current.get(currentSid)?.abort();
@@ -7299,19 +7372,7 @@ export function Chat({
     pushCommandNotice(t('chat.detachedStopped'));
 
     try {
-      const stopPromises: Promise<unknown>[] = [];
-      if (requestAlias) {
-        stopPromises.push(stopChat(requestAlias).catch(() => {}));
-      }
-      if (currentSid && currentSid !== requestAlias) {
-        stopPromises.push(stopChat(currentSid).catch(() => {}));
-      }
-      if (attachedToLiveRuntime() || liveSessionIdRef.current) {
-        stopPromises.push(
-          postLiveStop(liveSessionIdRef.current ?? sessionId ?? activeIdRef.current).catch(() => {}),
-        );
-      }
-      await Promise.all(stopPromises);
+      await stopRunningTurn(currentSid, requestAlias);
     } catch (error) {
       pushNoticeToLastAssistant(t('chat.cancelFailed', { error: String(error) }));
     } finally {

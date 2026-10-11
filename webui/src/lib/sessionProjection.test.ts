@@ -9,7 +9,9 @@ import {
   identifiedAssistantIndex,
   paintAssistantReasoning,
   paintAssistantText,
+  paintCachedAssistantDelta,
   paintUserMessage,
+  withAssistantIdentity,
 } from './sessionProjection.ts';
 
 const plan = [
@@ -562,4 +564,87 @@ test('a new round identity still opens its own bubble after the steer', () => {
   assert.equal(next[1], steer);
   assert.equal(next[2]?.role, 'assistant');
   assert.equal(next[2]?.parts[0]?.text, '新回合回答');
+});
+
+test('withAssistantIdentity keeps one wire id on exactly one row', () => {
+  const first = { role: 'assistant', id: 'm-1', parts: [{ kind: 'text' as const, text: '一' }] };
+  const second = { role: 'assistant', parts: [{ kind: 'text' as const, text: '二' }] };
+  const msgs = [first, second];
+
+  // 同一 message_id 不得再盖到第二条消息上（重复 key 会让 Preact 复用错 DOM，
+  // 表现为“老回合的一部分回复渲染到新消息里”）。
+  const stamped = withAssistantIdentity(msgs, 'm-1');
+  assert.equal(stamped, msgs);
+  assert.equal(msgs[1]?.id, undefined);
+});
+
+test('a replay whose identity is absent never repaints old body/reasoning into the newest bubble', () => {
+  const orig = { role: 'user', parts: [{ kind: 'text' as const, text: '重构网络层' }] };
+  // 早期后台缓存路径落笔不盖章 → 这一行没有身份
+  const roundA = {
+    role: 'assistant',
+    parts: [
+      { kind: 'text' as const, text: '旧正文' },
+      { kind: 'reasoning' as const, text: '旧思考' },
+    ],
+  };
+  const steer = { role: 'user', parts: [{ kind: 'text' as const, text: '改用 reqwest' }] };
+  const roundB = { role: 'assistant', id: 'm-B', parts: [{ kind: 'text' as const, text: '新正文' }] };
+  const canvas = [orig, roundA, steer, roundB];
+
+  // 身份 m-A 在画布上找不到，且末行已属于另一轮：
+  // 重放必须原地不动（位置唯一），绝不能把旧正文/思考追加到最新消息上。
+  assert.equal(paintAssistantText(canvas, '旧正文', true, 'm-A'), canvas);
+  assert.equal(paintAssistantReasoning(canvas, '旧思考', true, 'm-A'), canvas);
+
+  // 幂等：同一帧重放多少次，画布都一字不变。
+  let again = canvas;
+  for (let i = 0; i < 3; i += 1) {
+    again = paintAssistantReasoning(
+      paintAssistantText(again, '旧正文', true, 'm-A'),
+      '旧思考',
+      true,
+      'm-A',
+    );
+  }
+  assert.equal(again, canvas);
+});
+
+test('an unrouted delta still opens the placeholder round it belongs to', () => {
+  const previous = { role: 'assistant', id: 'm-1', parts: [{ kind: 'text' as const, text: '上一轮' }] };
+  const steer = { role: 'user', parts: [{ kind: 'text' as const, text: '继续' }] };
+  const canvas = [previous, steer, { role: 'assistant', parts: [] }];
+
+  // 本轮的占位行（未盖章）必须能接收它的首段增量——正常直播/首次落笔路径不变。
+  const painted = paintAssistantText(canvas, '新回合正文', false, 'm-2');
+  assert.equal(painted.length, 3);
+  assert.equal(painted[2]?.parts[0]?.text, '新回合正文');
+  const thought = paintAssistantReasoning(canvas, '新回合思考', false, 'm-2');
+  assert.equal(thought[2]?.parts[0]?.text, '新回合思考');
+});
+test('background cache stamps every round so a replay can never leak old body into the newest bubble', () => {
+  // 后台会话（用户正看着别的会话）的真实序列：本回合正文 → steer → 新回合正文。
+  let canvas: Array<{ role: string; id?: string; parts: Array<{ kind: string; text?: string }> }> = [
+    { role: 'user', parts: [{ kind: 'text', text: '重构网络层' }] },
+    { role: 'assistant', parts: [] },
+  ];
+  canvas = paintCachedAssistantDelta(canvas, 'text', '旧正文', { messageId: 'm-A' });
+  assert.equal(canvas[1]?.id, 'm-A', '后台缓存落笔必须盖上 message_id');
+
+  canvas = paintUserMessage(canvas as never, '改用 reqwest', 2, () => ({
+    role: 'user',
+    parts: [{ kind: 'text', text: '改用 reqwest' }],
+  } as never)) as never;
+  canvas = paintCachedAssistantDelta(canvas, 'text', '新正文', { messageId: 'm-B' });
+
+  assert.equal(canvas.length, 4, 'steer 气泡之后新回合另起一行');
+  assert.equal(canvas[1]?.id, 'm-A');
+  assert.equal(canvas[3]?.id, 'm-B');
+
+  // 失焦重进后的 watch 整轮重放：旧回合的增量必须回到自己那一行，
+  // 绝不能被当成新内容追加到最新 agent 消息里。
+  const replayed = paintAssistantText(canvas as never, '旧正文（重放补充）', true, 'm-A') as typeof canvas;
+  assert.equal(replayed.length, 4, '重放不得新增气泡');
+  assert.equal(replayed[1]?.parts[0]?.text, '旧正文（重放补充）');
+  assert.equal(replayed[3]?.parts[0]?.text, '新正文', '最新 agent 消息绝不能被旧正文污染');
 });

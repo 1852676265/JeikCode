@@ -1616,7 +1616,13 @@ impl ActiveChatRegistry {
     /// until it leaves the registry. `true` means the alias is idle (already
     /// gone, or the cancelled turn finished). `false` means the timeout fired
     /// while the previous turn was still persisting.
-    async fn stop_and_wait(&self, alias: String, timeout: Duration) -> bool {
+    ///
+    /// `timeout = None` waits for the release to be real instead of timing out.
+    /// Send-now callers need that verdict: a hard cap there misreported
+    /// "still busy" for turns that were already releasing, which pushed the
+    /// user's message back into the queue. `Some(limit)` keeps the bounded
+    /// behaviour of the session-deletion paths.
+    async fn stop_and_wait(&self, alias: String, timeout: Option<Duration>) -> bool {
         let operation_id = {
             let index = self.inner.read().await;
             let Some(operation_id) = index.aliases.get(&alias).cloned() else {
@@ -1628,7 +1634,7 @@ impl ActiveChatRegistry {
             operation_id
         };
         self.stop_alias_owned(alias).await;
-        tokio::time::timeout(timeout, async {
+        let await_release = async {
             loop {
                 let finished = {
                     let index = self.inner.read().await;
@@ -1646,9 +1652,16 @@ impl ActiveChatRegistry {
                 }
                 notified.await;
             }
-        })
-        .await
-        .is_ok()
+        };
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, await_release).await.is_ok(),
+            // Unterminated wait: the operation always leaves the registry (the
+            // chat task completes even on panic), so this resolves, not hangs.
+            None => {
+                await_release.await;
+                true
+            }
+        }
     }
 
     async fn stop_alias_owned(&self, alias: String) -> bool {
@@ -1753,7 +1766,7 @@ impl ActiveChatRegistry {
             if remaining.is_zero() {
                 return false;
             }
-            if !self.stop_and_wait(alias, remaining).await {
+            if !self.stop_and_wait(alias, Some(remaining)).await {
                 return false;
             }
         }
@@ -5363,7 +5376,7 @@ async fn patch_session_message(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let _ = state_clone
             .active_chats
-            .stop_and_wait(id.clone(), std::time::Duration::from_millis(1500))
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
             .await;
         let _ = crate::native_live::cancel_via_registry(&id);
 
@@ -5477,7 +5490,7 @@ async fn delete_session_message(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let _ = state_clone
             .active_chats
-            .stop_and_wait(id.clone(), std::time::Duration::from_millis(1500))
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
             .await;
         let _ = crate::native_live::cancel_via_registry(&id);
 
@@ -5624,7 +5637,7 @@ async fn truncate_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let _ = state_clone
             .active_chats
-            .stop_and_wait(id.clone(), std::time::Duration::from_millis(1500))
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
             .await;
         let _ = crate::native_live::cancel_via_registry(&id);
 
@@ -8383,6 +8396,10 @@ struct StopChatRequest {
 #[derive(Debug, Serialize)]
 struct StopChatResponse {
     success: bool,
+    /// Authoritative release verdict for callers that aim to start a new turn
+    /// right after stopping (WebUI send-now): the compat registry slot is free
+    /// **and** no native-runtime turn still occupies the session.
+    released: bool,
     message: String,
 }
 
@@ -8619,12 +8636,11 @@ async fn stop_chat(
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let resolved_session_id = state_clone.active_chats.session_id(&req.session_id).await;
+        // 与「停止按钮同源」的停止：无上限等待该会话的 compat 运行中操作真正离场。
+        // 正常路径下与“秒停”同步完成，固定上限反而会把正在收尾的回合误报成占用。
         let stopped_alias = state_clone
             .active_chats
-            .stop_and_wait(
-                req.session_id.clone(),
-                std::time::Duration::from_millis(2500),
-            )
+            .stop_and_wait(req.session_id.clone(), None)
             .await;
         let mut stopped_reg = crate::native_live::cancel_via_registry(&req.session_id).is_ok();
         if let Some(ref sid) = resolved_session_id {
@@ -8633,6 +8649,14 @@ async fn stop_chat(
             }
         }
         jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
+        // 调用方（WebUI「立即发送」）能否安全紧接一个新回合的权威结论：
+        // compat 槽位已确认释放，且该会话（或它绑定的 canonical id）没有任何
+        // native runtime 回合仍在占用——后者只能异步取消，不能在此处宣称已释放。
+        let released = stopped_alias
+            && !crate::native_live::live_turn_running(&req.session_id)
+            && resolved_session_id.as_deref().map_or(true, |sid| {
+                sid == req.session_id || !crate::native_live::live_turn_running(sid)
+            });
         if stopped_alias || stopped_reg {
             state_clone.telemetry.track(Event::UseCommand {
                 type_: "stop".into(),
@@ -8644,6 +8668,7 @@ async fn stop_chat(
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
                     success: true,
+                    released,
                     message: format!("Chat session {} stopped", req.session_id),
                 }),
             )
@@ -8658,6 +8683,7 @@ async fn stop_chat(
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
                     success: true,
+                    released,
                     message: format!("Chat session {} was not running", req.session_id),
                 }),
             )
@@ -13282,11 +13308,33 @@ mod tests {
         let first = registry.admit(Some("session-1"), None).await.unwrap();
         assert!(
             !registry
-                .stop_and_wait("session-1".into(), Duration::from_millis(30))
+                .stop_and_wait("session-1".into(), Some(Duration::from_millis(30)))
                 .await
         );
         assert!(first.cancellation.is_cancelled());
         registry.complete(&first.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_without_timeout_returns_only_after_the_operation_left() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        let operation_id = first.operation_id.clone();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry_bg = registry.clone();
+        let flag = released.clone();
+        let completer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            registry_bg.complete(&operation_id).await;
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        // Uncapped wait: the verdict must be the real release, never an early
+        // "still busy" that would bounce a send-now message back into the queue.
+        assert!(registry.stop_and_wait("session-1".into(), None).await);
+        completer.await.unwrap();
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        assert!(first.cancellation.is_cancelled());
     }
 
     #[tokio::test]

@@ -41,6 +41,25 @@ export interface ProjectionMessage {
 }
 
 /**
+ * 身份未命中时，是否允许把增量落到“最后一条 assistant”。
+ *
+ * 这是重放幂等的闸门：额外盖了**别的**身份的收尾行意味着这帧内容属于另一轮
+ * （典型：turn 中途插了 steer，轮次被劈成多条 assistant 行）。此时若退化成
+ * “追加到最后一条”，旧正文/思考就会被画到最新消息附近，且每次重放都再画一遍
+ * —— 画布不幂等，失焦重进多少次就脏多少（而正确的重放应当原地不动）。
+ * 本轮的占位行（未盖章）与“旧 daemon 不带身份”的帧不受影响，保持原有语义。
+ */
+export function mayPaintUnroutedDelta<T extends ProjectionMessage>(
+  messages: T[],
+  targetId?: string,
+): boolean {
+  if (!targetId) return true; // 旧 daemon：无身份可依，保持既有尾随语义
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'assistant') return true; // 新回合的新行正由本次落笔创建
+  return !last.id; // 空行（本轮占位）可落笔；已属于别的轮次则拒绝
+}
+
+/**
  * 归属消息定位：`messageId` 命中画布上的 assistant 消息时返回其下标，否则 -1。
  * 回合中途插入的 steer 气泡会把“最后一条”变成用户行；谁属于哪一轮由管线
  * 身份（message_id）决定，绝不能用“最后一条 assistant”猜。
@@ -104,6 +123,78 @@ export function hydrateSession<T>(
       messages as Parameters<typeof todoCallIdsFromMessages>[0],
     ),
   };
+}
+
+/**
+ * Stamp the streaming assistant message + its trailing text/reasoning part with
+ * the wire identity (message_id / part_id), so render keys and cache merges are
+ * id-based for LIVE output too (not only after a disk reload). Pure; returns the
+ * same array when nothing changed.
+ */
+export function withAssistantIdentity<T extends ProjectionMessage>(
+  msgs: T[],
+  messageId?: string,
+  partId?: string,
+): T[] {
+  if (!messageId && !partId) return msgs;
+  if (msgs.length === 0) return msgs;
+  let idx = messageId
+    ? msgs.findIndex((m) => m.role === 'assistant' && m.id === messageId)
+    : -1;
+  if (idx < 0) {
+    const lastIdx = msgs.length - 1;
+    const last = msgs[lastIdx];
+    if (!last || last.role !== 'assistant') return msgs;
+    if (messageId && last.id && last.id !== messageId) return msgs;
+    idx = lastIdx;
+  }
+  // 同一 message_id 绝不能在两条消息上共存：重复 key 会让 Preact 复用错 DOM，
+  // 表现为“老回合的一部分回复渲染到新消息里”。
+  if (messageId && msgs.some((m, i) => i !== idx && m.id === messageId)) return msgs;
+  const message = msgs[idx]!;
+  let changed = false;
+  let id = message.id;
+  if (messageId && !id) {
+    id = messageId;
+    changed = true;
+  }
+  let parts = message.parts;
+  if (partId && parts.length > 0) {
+    const pi = parts.length - 1;
+    const p = parts[pi];
+    if (p && (p.kind === 'text' || p.kind === 'reasoning') && !p.id) {
+      parts = parts.slice();
+      parts[pi] = { ...p, id: partId };
+      changed = true;
+    }
+  }
+  if (!changed) return msgs;
+  const next = msgs.slice();
+  next[idx] = { ...message, id, parts } as T;
+  return next;
+}
+
+/**
+ * Background-session cache delta (the user is viewing another session).
+ *
+ * Uses the SAME identity contract as the live canvas path: the row that receives
+ * the delta is stamped with the wire `message_id`. Without the stamp a later
+ * `/chat/watch` replay of that round cannot be routed back to its own bubble and
+ * the projection appends it to the newest assistant message instead — the
+ * "old body / reasoning repainted into the latest agent reply" bug after a
+ * refocus or a switch-back (a turn with a steer has more than one assistant row,
+ * so "the last assistant" is a different round).
+ */
+export function paintCachedAssistantDelta<T extends ProjectionMessage>(
+  messages: T[],
+  part: 'text' | 'reasoning',
+  content: string,
+  identity?: { messageId?: string; partId?: string },
+): T[] {
+  const painted = part === 'text'
+    ? paintAssistantText(messages, content, false, identity?.messageId)
+    : paintAssistantReasoning(messages, content, false, identity?.messageId);
+  return withAssistantIdentity(painted, identity?.messageId, identity?.partId);
 }
 
 /**
@@ -215,6 +306,8 @@ export function paintAssistantText<T extends ProjectionMessage>(
     next[target] = { ...messages[target]!, parts };
     return next;
   }
+  // 身份未命中：只有“本轮的占位行”可以接收，否则这帧属于另一轮，必须拒绝落笔。
+  if (!mayPaintUnroutedDelta(messages, targetId)) return messages;
   if (messages.length === 0) {
     if (!content) return messages;
     return [{ role: 'assistant', parts: [{ kind: 'text', text: content }] } as unknown as T];
@@ -278,6 +371,8 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
     next[target] = { ...messages[target]!, parts };
     return next;
   }
+  // 身份未命中：同 paintAssistantText，绝不能把旧回合的思考追加到最新消息上。
+  if (!mayPaintUnroutedDelta(messages, targetId)) return messages;
 
   let last = messages[messages.length - 1];
   let base = messages;

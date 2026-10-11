@@ -297,13 +297,37 @@ export async function postChatPrompt(
   }
 }
 
-export async function stopChat(requestId: string): Promise<void> {
+export interface StopChatResult {
+  success: boolean;
+  /**
+   * 权威释放结论：目标槽位已确认空闲，调用方可以紧接着投递一个新回合。
+   * 旧版 daemon 缺该字段时按 true 兼容处理（保持旧行为）。
+   */
+  released: boolean;
+}
+
+/**
+ * Stop the running turn of a session (or of a raw request alias).
+ *
+ * `released` is the daemon's verdict — not a guess: the compat registry slot is
+ * free and no native-runtime turn still occupies the session. "Send now" only
+ * delivers after `released`, which is what removes the 409-then-requeue flash.
+ */
+export async function stopChat(requestId: string): Promise<StopChatResult> {
   const resp = await apiFetch('/chat/stop', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: requestId }),
   });
   if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
+  try {
+    const body = (await resp.json()) as Partial<StopChatResult>;
+    return { success: body.success !== false, released: body.released !== false };
+  } catch {
+    // Older daemons answered without a body field set; keep the optimistic
+    // contract so a stale binary cannot wedge send-now into never delivering.
+    return { success: true, released: true };
+  }
 }
 
 /** Fold a queued follow-up into the running `/chat` turn at the next step. */
