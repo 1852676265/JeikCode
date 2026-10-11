@@ -35,10 +35,15 @@ Tailwind 4's minimums. Add new styles explicitly instead of reintroducing
 `@tailwind` or `@apply` directives.
 
 The scoped Mermaid override in `package.json` shares the WebUI's patched KaTeX
-renderer and bundled stylesheet while retaining Mermaid's current major.
-Behavioral coverage lives in `src/lib/markdownMath.test.ts`,
-`src/lib/markdownRender.test.ts`, `src/lib/mermaidMath.test.ts`, and
-`src/lib/stylesheet.test.ts`.
+renderer and bundled stylesheet while retaining Mermaid's current major. Note that
+this crosses a 0.x minor boundary (Mermaid 12.1 declares `katex ^0.16` while the
+root renderer is 0.18.x), so it is guarded by `src/lib/mermaidMath.test.ts` plus
+browser smoke rather than an exhaustive API-contract test; revisit if Mermaid
+widens its KaTeX range. `MermaidDiagram` also sanitizes Mermaid's SVG output with
+DOMPurify before injection, because `securityLevel: 'loose'` keeps HTML labels but
+does not itself sanitize markup. Behavioral coverage lives in
+`src/lib/markdownMath.test.ts`, `src/lib/markdownRender.test.ts`,
+`src/lib/mermaidMath.test.ts`, and `src/lib/stylesheet.test.ts`.
 
 ## Build for release
 
