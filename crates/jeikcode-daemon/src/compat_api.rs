@@ -984,8 +984,16 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
         .event_bus_with_replay(&admission.operation_id)
         .await
         .map(|(_, r)| r);
-    let fan_tx =
-        fanout_chat_events_for_session(client_tx, event_bus, replay, chat_req.session_id.clone());
+    let fan_tx = fanout_chat_events_for_session(
+        client_tx,
+        event_bus,
+        replay,
+        chat_req.session_id.clone(),
+        chat_req
+            .working_dir
+            .as_deref()
+            .map(std::path::PathBuf::from),
+    );
     let active_chats = state.active_chats.clone();
     let mcp_pool = state.mcp_pool.clone();
     let telemetry = state.telemetry.clone();
@@ -1270,6 +1278,7 @@ async fn collect_compat_response(
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 if !current_block.is_empty() {
                     text_blocks.push(std::mem::take(&mut current_block));
@@ -1743,6 +1752,7 @@ mod tests {
             id: "call_1".into(),
             name: "bash".into(),
             arguments: r#"{"command":"ls"}"#.into(),
+            message_id: None,
         });
         let out = p.project(ChatEvent::ToolOutputChunk {
             id: "call_1".into(),

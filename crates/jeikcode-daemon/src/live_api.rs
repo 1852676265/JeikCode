@@ -1511,6 +1511,12 @@ pub(crate) enum LiveWireEvent {
         id: String,
         name: String,
         arguments: String,
+        /// Assistant message (round) that issued this call — same identity the
+        /// `text` / `reasoning` deltas of that round carry. A mid-turn steer
+        /// bubble can be appended after a still-running round, so the WebUI
+        /// must attach late tool rows by this id, not "whatever is last".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Append-only live stdout/stderr (or other committed tool bytes). Distinct
     /// from `tool_progress`, which is latest-wins ephemeral activity.
@@ -1578,6 +1584,14 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "user_input_resolved")]
     UserInputResolved { request_id: u64 },
+    /// The STORED identity of the real user prompt this turn runs on (kernel
+    /// `UserMessage` boundary). The visible bubble is already painted by the
+    /// `user` echo — this only binds it to the transcript message id.
+    #[serde(rename = "user_identified")]
+    UserIdentified {
+        message_id: String,
+        turn_ordinal: u32,
+    },
     /// One or more live inputs were folded into the active turn. The exact
     /// payload lets browser clients acknowledge their FIFO pending-steer UI
     /// without guessing from text deltas or turn terminals.
@@ -1662,14 +1676,26 @@ impl NativeLiveWireProjector {
 
         // Boundary: remember the streaming assistant-message identity (boundary
         // marker carries no wire event of its own — return None).
-        if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(
-            Kernel::AssistantMessage { message_id },
-        )) = &event
+        if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(Kernel::AssistantMessage {
+            message_id,
+        })) = &event
         {
             self.current_message_id = Some(message_id.clone());
             self.part_seq = 0;
             self.last_part_kind = None;
             return None;
+        }
+        // Identity-only boundary for the STORED user prompt: the `user` echo
+        // already painted the bubble; this binds it to the transcript identity.
+        if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(Kernel::UserMessage {
+            message_id,
+            turn_ordinal,
+        })) = &event
+        {
+            return Some(LiveWireEvent::UserIdentified {
+                message_id: message_id.clone(),
+                turn_ordinal: *turn_ordinal,
+            });
         }
 
         Some(match event {
@@ -1742,6 +1768,7 @@ impl NativeLiveWireProjector {
                         id: call.id,
                         name: call.name,
                         arguments: call.arguments,
+                        message_id: self.current_message_id.clone(),
                     }
                 }
                 Kernel::ToolProgress { call_id, message } => {
@@ -4642,6 +4669,7 @@ mod tests {
                 inputs: vec![jeikcode_kernel::event::SteeredInput {
                     text: "use the smaller fix".into(),
                     images: Vec::new(),
+                    message_id: Some("m-steer-1".into()),
                 }],
                 client_input_ids: vec![Some("web-1".into())],
             })
@@ -4651,7 +4679,25 @@ mod tests {
         assert_eq!(json["count"], 1);
         assert_eq!(json["inputs"][0]["text"], "use the smaller fix");
         assert_eq!(json["inputs"][0]["images"], serde_json::json!([]));
+        assert_eq!(json["inputs"][0]["message_id"], "m-steer-1");
         assert_eq!(json["client_input_ids"][0], "web-1");
+    }
+
+    #[test]
+    fn native_live_projector_exposes_the_stored_user_prompt_identity() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(jeikcode_kernel::event::AgentEvent::UserMessage {
+                    message_id: "m-user-1".into(),
+                    turn_ordinal: 4,
+                }),
+            ))
+            .expect("the stored user identity must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "user_identified");
+        assert_eq!(json["message_id"], "m-user-1");
+        assert_eq!(json["turn_ordinal"], 4);
     }
 
     #[test]

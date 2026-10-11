@@ -758,6 +758,7 @@ impl CompatProjector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 self.ensure_openai_started(&mut out);
                 self.remember_tool(&id, &name);
@@ -1034,6 +1035,7 @@ impl CompatProjector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 out.extend(self.responses_tool_started(&id, &name, &arguments));
             }
@@ -1349,6 +1351,7 @@ impl CompatProjector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 self.close_open_anthropic_blocks(&mut out);
                 out.extend(self.anthropic_tool_started(&id, &name, &arguments));
@@ -1601,11 +1604,13 @@ mod tests {
             id: "call_a".into(),
             name: "read".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let b = p.project(ChatEvent::ToolCallStarted {
             id: "call_b".into(),
             name: "grep".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let out_a = p.project(ChatEvent::ToolOutputChunk {
             id: "call_a".into(),
@@ -1658,6 +1663,7 @@ mod tests {
             id: "call_task".into(),
             name: "task".into(),
             arguments: "{}".into(),
+            message_id: None,
         }));
         for (id, msg) in [
             ("explore#1", "排队中 · 搜目录"),
@@ -1711,6 +1717,7 @@ mod tests {
             name: "task".into(),
             arguments: r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore"}]}"#
                 .into(),
+            message_id: None,
         });
         let prog = p.project(ChatEvent::ToolProgress {
             id: "task_1".into(),
@@ -1729,6 +1736,7 @@ mod tests {
             id: "call_x".into(),
             name: "bash".into(),
             arguments: r#"{"command":"ls"}"#.into(),
+            message_id: None,
         });
         let joined: String = chunks.iter().map(|c| c.data.as_str()).collect();
         assert!(
@@ -1752,11 +1760,13 @@ mod tests {
             id: "toolu_1".into(),
             name: "read".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let b = p.project(ChatEvent::ToolCallStarted {
             id: "toolu_2".into(),
             name: "grep".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let joined: String = a.iter().chain(b.iter()).map(|c| c.data.as_str()).collect();
         assert!(joined.contains("toolu_1"));

@@ -1740,6 +1740,26 @@ impl RunningAgent {
             PromptKind::User => Message::user_with_images(text, images),
             PromptKind::Synthetic => Message::synthetic_user(text),
         });
+        // Identity boundary: announce the STORED user message so a client can bind
+        // its optimistic first-prompt bubble to the same id the transcript carries
+        // (id-based merges across refresh / session switch / replay). Synthetic
+        // continuations are host-driven, not user turns — never announced.
+        if kind == PromptKind::User {
+            if let Some(message_id) = convo.messages.last().and_then(|message| message.id.clone()) {
+                let turn_ordinal = convo.messages[..convo.messages.len().saturating_sub(1)]
+                    .iter()
+                    .filter(|message| {
+                        message.role == crate::message::Role::User
+                            && !message.synthetic
+                            && !message.text.trim().is_empty()
+                    })
+                    .count() as u32;
+                self.rt.emit(AgentEvent::UserMessage {
+                    message_id,
+                    turn_ordinal,
+                });
+            }
+        }
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
         // ToolContext so cooperative tools can bail. SEAM 2: derived from the
@@ -2327,9 +2347,14 @@ impl RunningAgent {
                         input.text.clone(),
                         input.images.clone(),
                     ));
+                    // Same identity the persisted steer message will carry, so the
+                    // client's pending steer card/bubble adopts it (instead of keeping
+                    // its local client id) and id-based merges converge with disk.
+                    let message_id = convo.messages.last().and_then(|message| message.id.clone());
                     inputs.push(crate::event::SteeredInput {
                         text: input.text,
                         images: input.images,
+                        message_id,
                     });
                 }
                 self.rt.emit(AgentEvent::Steered { count: n, inputs });
@@ -5650,6 +5675,88 @@ mod steer_buffer_tests {
         );
     }
 
+    /// 身份回传：落盘的用户消息身份在两个 seam 上都会被宣布——回合起始提问
+    /// （`UserMessage`）与每个被 fold 的 steer（`Steered.inputs[..].message_id`），
+    /// 让客户端把乐观气泡绑定到转录里真正存储的 id（不再依赖文本启发对齐）。
+    #[tokio::test]
+    async fn user_identity_is_announced_for_prompt_and_steer() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            1,
+            "STEER-ID",
+            deferred_tx_clone,
+        ));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut prompts: Vec<(String, u32)> = Vec::new();
+        let mut steered_ids: Vec<Option<String>> = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::UserMessage {
+                    message_id,
+                    turn_ordinal,
+                } => prompts.push((message_id, turn_ordinal)),
+                AgentEvent::Steered { inputs, .. } => {
+                    steered_ids.extend(inputs.into_iter().map(|input| input.message_id));
+                }
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            prompts.len(),
+            1,
+            "exactly one turn-start prompt is announced (synthetic/folded inputs must not re-announce)"
+        );
+        assert_eq!(prompts[0].1, 0, "the first real prompt is ordinal 0");
+        assert!(
+            prompts[0].0.starts_with("m-"),
+            "the announced identity is the stored kernel message id; got {:?}",
+            prompts[0].0
+        );
+        assert_eq!(steered_ids.len(), 1, "the folded steer announces its stored identity");
+        assert!(
+            steered_ids[0]
+                .as_deref()
+                .is_some_and(|id| id.starts_with("m-")),
+            "the steer carries the stored message id; got {steered_ids:?}"
+        );
+        assert_ne!(
+            Some(prompts[0].0.clone()),
+            steered_ids[0],
+            "prompt and steer identities must be distinct rows"
+        );
+    }
+
     /// A pure-text turn (no tool calls) where the user steers mid-stream must
     /// CONTINUE in the same turn rather than ending.
     ///
@@ -5765,13 +5872,18 @@ mod steer_buffer_tests {
                 _ => {}
             }
         }
-        assert_eq!(
-            steered_inputs,
-            vec![crate::event::SteeredInput {
-                text: "STEER-COUNT".into(),
-                images: Vec::new(),
-            }],
-            "one folded prompt → Steered {{ count: 1 }}"
+        // The folded input now also carries the STORED identity of the message it
+        // became (回传 id)；断言文本/图片不变，且身份确实是内核消息 id。
+        assert_eq!(steered_inputs.len(), 1, "one folded prompt → Steered {{ count: 1 }}");
+        assert_eq!(steered_inputs[0].text, "STEER-COUNT");
+        assert!(steered_inputs[0].images.is_empty());
+        assert!(
+            steered_inputs[0]
+                .message_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("m-")),
+            "a folded steer announces the stored message identity; got {:?}",
+            steered_inputs[0].message_id
         );
     }
 

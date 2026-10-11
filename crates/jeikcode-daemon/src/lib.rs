@@ -466,6 +466,184 @@ mod session_window_tests {
     }
 }
 
+#[cfg(test)]
+mod chat_replay_tests {
+    use super::*;
+
+    #[test]
+    fn chat_replay_coalesces_only_within_the_same_identity() {
+        let delta = |content: &str, message_id: &str, part_id: &str| ChatEvent::TextDelta {
+            content: content.into(),
+            message_id: Some(message_id.into()),
+            part_id: Some(part_id.into()),
+            part_seq: Some(1),
+        };
+        let mut buf = Vec::new();
+        push_chat_replay(&mut buf, delta("a", "m-1", "m-1:1:text"));
+        push_chat_replay(&mut buf, delta("b", "m-1", "m-1:1:text"));
+        assert_eq!(buf.len(), 1, "same identity coalesces");
+        // 身份不同绝不合并：合并后回放会把后一回合的正文画到前一回合名下。
+        push_chat_replay(&mut buf, delta("c", "m-2", "m-2:1:text"));
+        assert_eq!(buf.len(), 2, "a different round keeps its own replay entry");
+        match (&buf[0], &buf[1]) {
+            (
+                ChatEvent::TextDelta {
+                    content: first,
+                    message_id: Some(first_id),
+                    ..
+                },
+                ChatEvent::TextDelta {
+                    content: second,
+                    message_id: Some(second_id),
+                    ..
+                },
+            ) => {
+                assert_eq!(first, "ab");
+                assert_eq!(first_id, "m-1");
+                assert_eq!(second, "c");
+                assert_eq!(second_id, "m-2");
+            }
+            other => panic!("unexpected replay buffer: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod global_events_tests {
+    use super::*;
+
+    #[test]
+    fn global_bus_fans_out_to_every_subscriber() {
+        // 跨实例语义：每个实例一条订阅，投递必须广播到所有订阅者（而不是竞争消费）。
+        let mut first = global_events().subscribe();
+        let mut second = global_events().subscribe();
+        publish_global(GlobalWireEvent::Activity {
+            session_id: "s-1".into(),
+            running: true,
+            terminal: None,
+        });
+        publish_global(GlobalWireEvent::ReviewAsked {
+            session_id: "s-1".into(),
+        });
+        for rx in [&mut first, &mut second] {
+            let a = rx.try_recv().expect("first event reaches every subscriber");
+            let b = rx.try_recv().expect("second event reaches every subscriber");
+            assert!(matches!(a, GlobalWireEvent::Activity { .. }));
+            assert!(matches!(b, GlobalWireEvent::ReviewAsked { .. }));
+        }
+    }
+
+    /// 路由级 smoke：`/events` 必须先发 `sync` 对齐帧，随后把总线上的增量事件
+    /// 真正推到 SSE 客户端（走 axum 路由 + ServiceExt::oneshot，与生产挂载同一 helper）。
+    #[tokio::test]
+    async fn global_events_route_streams_sync_then_incremental_events() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use futures::StreamExt as _;
+        use tower::ServiceExt as _;
+
+        let app = with_global_events_route(Router::new());
+        let response = app
+            .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
+            .await
+            .expect("/events must be mounted on the router");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        // 首帧：sync。累积读取，不依赖分片边界。
+        let mut seen = String::new();
+        while !seen.contains("\"type\":\"sync\"") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("sync frame must arrive")
+                .expect("stream stays open")
+                .expect("frame is valid");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+
+        // 真推送：订阅建立后发布增量事件，SSE 必须送达。
+        publish_global(GlobalWireEvent::ReviewAsked {
+            session_id: "s-route".into(),
+        });
+        while !seen.contains("review_asked") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("incremental event must arrive")
+                .expect("stream stays open")
+                .expect("frame is valid");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(seen.contains("\"session_id\":\"s-route\""), "{seen}");
+    }
+
+    #[test]
+    fn global_wire_events_carry_incremental_payloads() {
+        let upsert = serde_json::to_value(GlobalWireEvent::SessionUpsert {
+            session: SessionRowWire {
+                id: "s1".into(),
+                name: "n".into(),
+                working_dir: "E:/p".into(),
+                project_hash: "0123456789abcdef".into(),
+                created_at: 1,
+                updated_at: 2,
+                message_count: 3,
+                origin: "manual".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(upsert["type"], "session_upsert");
+        assert_eq!(upsert["session"]["id"], "s1");
+        assert_eq!(upsert["session"]["project_hash"], "0123456789abcdef");
+
+        let deleted = serde_json::to_value(GlobalWireEvent::SessionDeleted {
+            session_id: "s1".into(),
+            project_hash: "0123456789abcdef".into(),
+        })
+        .unwrap();
+        assert_eq!(deleted["type"], "session_deleted");
+        assert_eq!(deleted["session_id"], "s1");
+
+        // 终态带 kind（客户端据此出右下角通知）；运行中事件不带 terminal。
+        let terminal = serde_json::to_value(GlobalWireEvent::Activity {
+            session_id: "s1".into(),
+            running: false,
+            terminal: Some("completed"),
+        })
+        .unwrap();
+        assert_eq!(terminal["type"], "activity");
+        assert_eq!(terminal["terminal"], "completed");
+        let running = serde_json::to_value(GlobalWireEvent::Activity {
+            session_id: "s1".into(),
+            running: true,
+            terminal: None,
+        })
+        .unwrap();
+        assert!(running.get("terminal").is_none());
+
+        let asked = serde_json::to_value(GlobalWireEvent::ReviewAsked {
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(asked["type"], "review_asked");
+        let resolved = serde_json::to_value(GlobalWireEvent::ReviewResolved {
+            session_id: "s1".into(),
+            approval_id: Some("a1".into()),
+            request_id: None,
+        })
+        .unwrap();
+        assert_eq!(resolved["type"], "review_resolved");
+        assert_eq!(resolved["approval_id"], "a1");
+        assert!(resolved.get("request_id").is_none());
+    }
+}
+
 const DISPLAY_FIELD_CAP: usize = 24 * 1024;
 
 /// Compact user-question row for the session outline (right-rail). Not the
@@ -989,6 +1167,15 @@ impl ActiveChatRegistry {
             }
         }
 
+        // 跨实例增量：新轮次开始 → 所有实例即时点亮该会话的活动状态。
+        if let Some(sid) = session_id.clone() {
+            publish_global(GlobalWireEvent::Activity {
+                session_id: sid,
+                running: true,
+                terminal: None,
+            });
+        }
+
         Ok(ActiveChatAdmission {
             operation_id,
             cancellation,
@@ -1497,11 +1684,7 @@ impl ActiveChatRegistry {
     /// Drain up to `count` recorded steer client ids for the operation (FIFO),
     /// padding with `None` so the returned list always aligns 1:1 with the folded
     /// inputs reported by the kernel.
-    async fn take_steer_client_ids(
-        &self,
-        operation_id: &str,
-        count: usize,
-    ) -> Vec<Option<String>> {
+    async fn take_steer_client_ids(&self, operation_id: &str, count: usize) -> Vec<Option<String>> {
         let mut index = self.inner.write().await;
         let Some(operation) = index.operations.get_mut(operation_id) else {
             return Vec::new();
@@ -1528,6 +1711,14 @@ impl ActiveChatRegistry {
             }
         }
         operation.finished.notify_waiters();
+        // 跨实例增量：操作结束 → 活动状态回落（不触发任何整表重拉）。
+        if let Some(sid) = operation.session_id.clone() {
+            publish_global(GlobalWireEvent::Activity {
+                session_id: sid,
+                running: false,
+                terminal: None,
+            });
+        }
         true
     }
 
@@ -1672,17 +1863,230 @@ fn replay_resolves_call(events: &[ChatEvent], call_id: &str) -> bool {
     })
 }
 
+/// 全局失效总线（跨实例推送）。
+///
+/// 现有推送通道都是「按会话」的：`SessionRuntimeRegistry` 每个会话一条
+/// broadcast（订阅必须带 session_id），`LiveViewHub` 只绑定一个执行会话，
+/// `/chat/watch` 同样需要指定会话。于是「实例 B」无从得知「实例 A 新建/删除了
+/// 会话、某会话弹出了审批/提问卡」——只能靠窗口聚焦重拉（历史上的 15s 轮询
+/// 兜底已被拔除）。这里补上唯一缺失的一环：一条进程级全局广播 + `/events`。
+///
+/// 只发「失效信号」（不发 payload 副本）：客户端收到后单次重拉既有接口，
+/// 保证实时性的同时让数据形状与一致性仍由单一数据源决定。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum GlobalWireEvent {
+    /// 会话行新增/更新（新建、改名、回合完成后的 updated_at/message_count）。
+    /// 客户端按 id 就地 upsert，不重拉列表。
+    #[serde(rename = "session_upsert")]
+    SessionUpsert { session: SessionRowWire },
+    /// 会话删除（含批量）：客户端就地删行并丢弃该 id 的本地缓存。
+    #[serde(rename = "session_deleted")]
+    SessionDeleted {
+        session_id: String,
+        project_hash: String,
+    },
+    /// 活动/转圈变化；`terminal` 非空时同时携带终态供右下角通知去重。
+    #[serde(rename = "activity")]
+    Activity {
+        session_id: String,
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal: Option<&'static str>,
+    },
+    /// 某会话弹出待交互卡片（审批/提问）。只带会话 id，客户端对该会话做一次
+    /// 定向 pending 拉取（单会话、小请求），避免重拉整表。
+    #[serde(rename = "review_asked")]
+    ReviewAsked { session_id: String },
+    /// 待交互卡片已解决：客户端直接就地移除卡片。
+    #[serde(rename = "review_resolved")]
+    ReviewResolved {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+    },
+}
+
+/// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
+/// 客户端按 `id` 就地 upsert。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SessionRowWire {
+    pub id: String,
+    pub name: String,
+    pub working_dir: String,
+    pub project_hash: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: u32,
+    pub origin: String,
+}
+
+/// Build the incremental session row for one stored session. `None` when the
+/// aggregate is not (yet) durable.
+pub(crate) fn session_row_wire(
+    working_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    let manager = NativeSessionManager::for_project(working_dir);
+    let meta = manager.read_meta(session_id).ok()?;
+    let origin = match meta.origin {
+        jeikcode_capabilities::session::SessionOrigin::Manual => "manual",
+        jeikcode_capabilities::session::SessionOrigin::Scheduled => "scheduled",
+        jeikcode_capabilities::session::SessionOrigin::Protocol => "protocol",
+    };
+    Some(SessionRowWire {
+        id: session_id.to_string(),
+        name: meta.name.clone(),
+        working_dir: meta.working_dir.clone(),
+        project_hash: response_project_hash(std::path::Path::new(&meta.working_dir)),
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0),
+        updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
+        message_count: meta.message_count,
+        origin: origin.to_string(),
+    })
+}
+
+/// Same row, addressed by project bucket instead of a working dir (catalog
+/// mutation helpers already hold the bucket).
+pub(crate) fn session_row_wire_in_bucket(
+    project_bucket: &str,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    let manager = NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_bucket));
+    let meta = manager.read_meta(session_id).ok()?;
+    let origin = match meta.origin {
+        jeikcode_capabilities::session::SessionOrigin::Manual => "manual",
+        jeikcode_capabilities::session::SessionOrigin::Scheduled => "scheduled",
+        jeikcode_capabilities::session::SessionOrigin::Protocol => "protocol",
+    };
+    Some(SessionRowWire {
+        id: session_id.to_string(),
+        name: meta.name.clone(),
+        working_dir: meta.working_dir.clone(),
+        project_hash: project_bucket.to_string(),
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0),
+        updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
+        message_count: meta.message_count,
+        origin: origin.to_string(),
+    })
+}
+
+/// 推送一条会话行的增量快照（读 meta 失败即静默跳过：下次事件/冷启动收敛）。
+pub(crate) fn publish_session_upsert(working_dir: &std::path::Path, session_id: &str) {
+    if let Some(session) = session_row_wire(working_dir, session_id) {
+        publish_global(GlobalWireEvent::SessionUpsert { session });
+    }
+}
+
+const GLOBAL_EVENTS_CAP: usize = 256;
+
+/// Process-wide invalidation bus shared by every connected client instance.
+pub(crate) fn global_events() -> &'static tokio::sync::broadcast::Sender<GlobalWireEvent> {
+    static BUS: std::sync::OnceLock<tokio::sync::broadcast::Sender<GlobalWireEvent>> =
+        std::sync::OnceLock::new();
+    BUS.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(GLOBAL_EVENTS_CAP);
+        tx
+    })
+}
+
+/// Broadcast an invalidation signal. No subscribers / lagged receivers are fine:
+/// the next invalidation (or a client's cold start) reconciles the state.
+pub(crate) fn publish_global(event: GlobalWireEvent) {
+    let _ = global_events().send(event);
+}
+
+/// `/events` 的挂载点。单独抽成 helper，生产路由与测试共用同一份定义：
+/// 路由一旦被从生产路由上拿掉，`global_events_route_tests` 会立即失败。
+pub(crate) fn with_global_events_route<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.route("/events", get(global_events_stream))
+}
+
+/// GET /events — cross-instance invalidation stream (SSE).
+///
+/// The first frame is `{"type":"sync"}` so a connecting client performs one
+/// cold-start alignment; afterwards only real changes are pushed.
+async fn global_events_stream() -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt as _;
+    use std::convert::Infallible;
+
+    let mut rx = global_events().subscribe();
+    let (tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let _ = tx.send(serde_json::json!({ "type": "sync" }).to_string());
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => match serde_json::to_string(&event) {
+                    Ok(json) => {
+                        if tx.send(json).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx)
+        .map(|json| Ok::<Event, Infallible>(Event::default().data(json)));
+    let mut resp = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp
+}
+
 /// Append `event` to the turn replay log, coalescing consecutive text/reasoning
 /// deltas so a long stream does not allocate one Vec entry per token.
+///
+/// Coalescing is IDENTITY-SCOPED: two deltas may merge only when they carry the
+/// same `message_id`/`part_id`. Merging across identities used to fuse a later
+/// round's tail into an earlier round's entry, so a watch/live replay repainted
+/// that text under the WRONG stored message (ghost rounds + misplaced text).
 fn push_chat_replay(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
     match (&event, buf.last_mut()) {
-        (ChatEvent::TextDelta { content, .. }, Some(ChatEvent::TextDelta { content: prev, .. })) => {
+        (
+            ChatEvent::TextDelta {
+                content,
+                message_id,
+                part_id,
+                ..
+            },
+            Some(ChatEvent::TextDelta {
+                content: prev,
+                message_id: prev_message_id,
+                part_id: prev_part_id,
+                ..
+            }),
+        ) if message_id == prev_message_id && part_id == prev_part_id => {
             prev.push_str(content);
         }
         (
-            ChatEvent::ReasoningDelta { content, .. },
-            Some(ChatEvent::ReasoningDelta { content: prev, .. }),
-        ) => {
+            ChatEvent::ReasoningDelta {
+                content,
+                message_id,
+                part_id,
+                ..
+            },
+            Some(ChatEvent::ReasoningDelta {
+                content: prev,
+                message_id: prev_message_id,
+                part_id: prev_part_id,
+                ..
+            }),
+        ) if message_id == prev_message_id && part_id == prev_part_id => {
             prev.push_str(content);
         }
         (
@@ -1708,7 +2112,7 @@ pub(crate) fn fanout_chat_events(
     bus: tokio::sync::broadcast::Sender<ChatEvent>,
     replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
-    fanout_chat_events_for_session(primary, bus, replay, None)
+    fanout_chat_events_for_session(primary, bus, replay, None, None)
 }
 
 /// Like [`fanout_chat_events`], but also mirrors stream events into the L2
@@ -1719,10 +2123,12 @@ pub(crate) fn fanout_chat_events_for_session(
     bus: tokio::sync::broadcast::Sender<ChatEvent>,
     replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
     session_id: Option<String>,
+    working_dir: Option<std::path::PathBuf>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     tokio::spawn(async move {
         let mut current_sid = session_id;
+        let mut current_wd = working_dir;
         while let Some(event) = rx.recv().await {
             match &event {
                 ChatEvent::ToolCallStarted {
@@ -1735,18 +2141,60 @@ pub(crate) fn fanout_chat_events_for_session(
                     );
                 }
                 ChatEvent::PermissionRequest {
-                    tool_name, call_id, ..
+                    session_id,
+                    tool_name,
+                    call_id,
+                    ..
                 } => {
                     tracing::warn!(
                         tool = %tool_name,
                         call_id = %call_id,
                         "chat: PERMISSION REQUEST emitted (approval round-trip)"
                     );
+                    publish_global(GlobalWireEvent::ReviewAsked {
+                        session_id: session_id.clone(),
+                    });
                 }
-                ChatEvent::UserInputRequest { .. } => {
+                ChatEvent::UserInputRequest { session_id, .. } => {
                     tracing::warn!(
                         "chat: user_input_request emitted (model asked a structured question)"
                     );
+                    publish_global(GlobalWireEvent::ReviewAsked {
+                        session_id: session_id.clone(),
+                    });
+                }
+                ChatEvent::User { session_id, .. } => {
+                    let sid = session_id.clone().or_else(|| current_sid.clone());
+                    if let Some(sid) = sid {
+                        publish_global(GlobalWireEvent::Activity {
+                            session_id: sid,
+                            running: true,
+                            terminal: None,
+                        });
+                    }
+                }
+                ChatEvent::Done {
+                    session_id,
+                    stop_reason,
+                    ..
+                } => {
+                    publish_global(GlobalWireEvent::Activity {
+                        session_id: session_id.clone(),
+                        running: false,
+                        terminal: Some(chat_done_terminal_label(stop_reason.as_deref())),
+                    });
+                    if let Some(wd) = current_wd.clone() {
+                        publish_session_upsert(&wd, session_id);
+                    }
+                }
+                ChatEvent::Stopped | ChatEvent::Error { .. } => {
+                    if let Some(sid) = current_sid.clone() {
+                        publish_global(GlobalWireEvent::Activity {
+                            session_id: sid,
+                            running: false,
+                            terminal: Some("stopped"),
+                        });
+                    }
                 }
                 ChatEvent::ToolCallResult { name, success, .. } => {
                     tracing::info!(tool = %name, success, "chat: tool result");
@@ -4133,7 +4581,13 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
 /// unexpected storage failure (`500`). Flattening everything into
 /// `io::Error::other` made that distinction impossible.
 fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
-    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)
+    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)?;
+    // 跨实例增量：删行 + 让客户端丢弃该 id 的本地缓存。
+    publish_global(GlobalWireEvent::SessionDeleted {
+        session_id: session_id.to_string(),
+        project_hash: project_hash.to_string(),
+    });
+    Ok(())
 }
 
 fn valid_project_bucket(project_bucket: &str) -> bool {
@@ -4542,7 +4996,12 @@ fn rename_session_file(
 ) -> std::io::Result<()> {
     crate::legacy_convert::rename_catalog_session_in_project(project_hash, session_id, new_name)
         .map(|_| ())
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+    // 跨实例增量：就地 upsert 该行（改名 + updated_at），不重拉列表。
+    if let Some(session) = session_row_wire_in_bucket(project_hash, session_id) {
+        publish_global(GlobalWireEvent::SessionUpsert { session });
+    }
+    Ok(())
 }
 
 /// PATCH /projects/:hash/sessions/:id/rename - Rename a session
@@ -5394,6 +5853,15 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_ordinal: Option<u32>,
     },
+    /// The STORED identity of the real user prompt this turn runs on (from the
+    /// kernel `UserMessage` boundary). Identity-only — the visible bubble is
+    /// already painted by the `user` echo; this lets a client bind that
+    /// optimistic bubble to the id the disk transcript carries.
+    #[serde(rename = "user_identified")]
+    UserIdentified {
+        message_id: String,
+        turn_ordinal: u32,
+    },
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
     ToolBatchStarted {
@@ -5430,6 +5898,12 @@ pub enum ChatEvent {
         id: String,
         name: String,
         arguments: String,
+        /// Assistant message (round) that issued this call. Lets the WebUI
+        /// attach the row to the OWNING round instead of "whatever assistant
+        /// is last" — a mid-turn steer bubble can sit after that round while
+        /// its remaining tool calls still stream in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Real-time tool output chunk (stdout). `id` is the tool call id so parallel
     /// tools can be attributed correctly on the OpenAI/Anthropic compat surface.
@@ -5988,6 +6462,7 @@ mod chat_event_type_tests {
             inputs: vec![jeikcode_kernel::event::SteeredInput {
                 text: "next instruction".into(),
                 images: Vec::new(),
+                message_id: Some("m-steer-1".into()),
             }],
         });
         assert!(matches!(
@@ -6858,6 +7333,17 @@ impl ChatRuntimeProjector {
                 self.last_part_kind = None;
                 Vec::new()
             }
+            Agent::UserMessage {
+                message_id,
+                turn_ordinal,
+            } => {
+                // Identity-only boundary: the `user` echo already painted the
+                // bubble; this binds it to the stored message id.
+                vec![ChatEvent::UserIdentified {
+                    message_id,
+                    turn_ordinal,
+                }]
+            }
             Agent::TextDelta(text) => {
                 let (message_id, part_id, part_seq) = self.next_part_stamp("text");
                 let mut events = if self.keep_raw_markdown {
@@ -7000,6 +7486,7 @@ impl ChatRuntimeProjector {
             id: call.id,
             name: call.name.clone(),
             arguments: call.arguments.clone(),
+            message_id: self.current_message_id.clone(),
         }];
 
         if !self.keep_raw_markdown
@@ -7132,6 +7619,7 @@ async fn chat_stream(
         event_bus,
         replay,
         req.session_id.clone(),
+        req.working_dir.clone(),
     );
 
     // Clone state for the spawned task
@@ -9073,8 +9561,10 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
     let global = jeikcode_capabilities::skills::controls::load_global();
     let project = jeikcode_capabilities::skills::controls::load_project(&working_dir);
     for skill in registry.user_invocable() {
-        let global_disabled = global.contains(&skill.name);
-        let project_disabled = project.contains(&skill.name);
+        let global_disabled =
+            jeikcode_capabilities::skills::controls::is_skill_disabled(&global, &skill.name);
+        let project_disabled =
+            jeikcode_capabilities::skills::controls::is_skill_disabled(&project, &skill.name);
         items.push(CapItemResponse {
             kind: "skill",
             id: skill.name.clone(),
@@ -10005,7 +10495,9 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     jeikcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     // Honor the persisted GLOBAL/PROJECT disable state — the same set the prompt
     // catalog and the sidebar capability list use, so all three agree.
-    registry.retain_enabled(&jeikcode_capabilities::skills::controls::load_disabled(&working_dir));
+    registry.retain_enabled(&jeikcode_capabilities::skills::controls::load_disabled(
+        &working_dir,
+    ));
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
         .map(|s| SkillInfo {
@@ -10774,6 +11266,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/pending", get(chat_pending))
         // Reattach to a turn started by another client (OpenAI API / another tab).
         .route("/chat/watch", get(chat_watch))
+        // 跨实例增量推送（会话行/活动/待交互卡片）——所有实例共用的唯一全局信道。
+        // 经 helper 挂载：与路由级测试共用同一份定义。
+        .merge(with_global_events_route(Router::<AppState>::new()))
         .route("/chat/permission", post(chat_permission))
         .route("/chat/user-input", post(chat_user_input))
         // OpenAI / Anthropic compatible surface (same token gate as /chat).
@@ -12642,6 +13137,16 @@ mod tests {
         .unwrap();
         assert_eq!(json["type"], "user");
         assert_eq!(json["created_at"], 42);
+
+        // 身份回传事件：与可见气泡分离的纯身份通道。
+        let identified = serde_json::to_value(ChatEvent::UserIdentified {
+            message_id: "m-user-1".into(),
+            turn_ordinal: 3,
+        })
+        .unwrap();
+        assert_eq!(identified["type"], "user_identified");
+        assert_eq!(identified["message_id"], "m-user-1");
+        assert_eq!(identified["turn_ordinal"], 3);
     }
 
     #[tokio::test]
@@ -13854,7 +14359,9 @@ mod tests {
         let events = detector.process(input);
 
         assert_eq!(events.len(), 5, "Events: {events:#?}");
-        assert!(matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "前言：\n"));
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "前言：\n")
+        );
         assert!(matches!(
             &events[1],
             ChatEvent::ArtifactStart {
@@ -13887,7 +14394,9 @@ mod tests {
         assert!(matches!(&events[1], ChatEvent::ArtifactContent { .. }));
         assert!(matches!(&events[2], ChatEvent::ArtifactContent { .. }));
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
-        assert!(matches!(&events[4], ChatEvent::TextDelta { content, .. } if content == "后续正文"));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content == "后续正文")
+        );
     }
 
     #[test]
@@ -14333,6 +14842,7 @@ mod channel_mode_tests {
                 id: "c1".into(),
                 name: "task".into(),
                 arguments: "{}".into(),
+                message_id: None,
             },
             ChatEvent::PermissionRequest {
                 session_id: "s1".into(),
@@ -14629,10 +15139,7 @@ mod channel_mode_tests {
     fn format_tool_args_supports_modern_and_legacy_tool_names() {
         // 1. read / read_file
         let read_args = r#"{"path":"src/main.rs","offset":10,"limit":50}"#;
-        assert_eq!(
-            format_tool_args("read", read_args),
-            "src/main.rs L10-60"
-        );
+        assert_eq!(format_tool_args("read", read_args), "src/main.rs L10-60");
         let read_legacy = r#"{"file_path":"crates/core/lib.rs"}"#;
         assert_eq!(
             format_tool_args("read_file", read_legacy),
@@ -14653,15 +15160,9 @@ mod channel_mode_tests {
 
         // 3. edit / edit_file
         let edit_args = r#"{"path":"crates/jeikcode-daemon/src/lib.rs"}"#;
-        assert_eq!(
-            format_tool_args("edit", edit_args),
-            ".../src/lib.rs"
-        );
+        assert_eq!(format_tool_args("edit", edit_args), ".../src/lib.rs");
         let edit_legacy = r#"{"file_path":"crates/jeikcode-daemon/src/lib.rs"}"#;
-        assert_eq!(
-            format_tool_args("edit_file", edit_legacy),
-            ".../src/lib.rs"
-        );
+        assert_eq!(format_tool_args("edit_file", edit_legacy), ".../src/lib.rs");
 
         // 4. run_command / bash with command or cmd
         let cmd_args = r#"{"command":"cargo test","summary":"run test suite"}"#;
@@ -14670,10 +15171,7 @@ mod channel_mode_tests {
             "run test suite — `cargo test`"
         );
         let cmd_alias = r#"{"cmd":"git status"}"#;
-        assert_eq!(
-            format_tool_args("run_command", cmd_alias),
-            "`git status`"
-        );
+        assert_eq!(format_tool_args("run_command", cmd_alias), "`git status`");
 
         // 5. code_explore
         let explore_args = r#"{"query":"CodeExploreTool","path":"crates/capabilities"}"#;
@@ -14684,18 +15182,21 @@ mod channel_mode_tests {
 
         // 6. task
         let task_args = r#"{"tasks":[{"description":"sub1"},{"description":"sub2"}]}"#;
-        assert_eq!(
-            format_tool_args("task", task_args),
-            "2 subtask(s)"
-        );
+        assert_eq!(format_tool_args("task", task_args), "2 subtask(s)");
     }
 
     #[test]
     fn extract_artifacts_supports_modern_write_edit_and_cmd() {
         let calls = vec![
-            ("write", r#"{"path":"chart.html","content":"<h1>Chart</h1>"}"#),
+            (
+                "write",
+                r#"{"path":"chart.html","content":"<h1>Chart</h1>"}"#,
+            ),
             ("edit", r#"{"path":"diagram.svg","content":"<svg></svg>"}"#),
-            ("create_file", r##"{"file_path":"notes.md","content":"# Notes"}"##),
+            (
+                "create_file",
+                r##"{"file_path":"notes.md","content":"# Notes"}"##,
+            ),
             ("run_command", r#"{"cmd":"echo 'Report' > report.md"}"#),
             ("bash", r#"{"command":"python script.py >> results.html"}"#),
         ];
