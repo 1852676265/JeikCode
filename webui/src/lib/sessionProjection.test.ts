@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  bindUserMessageIdentity,
   catchUpSession,
   ensureWorkingAssistant,
   foldLiveTodo,
   hydrateSession,
+  identifiedAssistantIndex,
   paintAssistantReasoning,
   paintAssistantText,
   paintUserMessage,
@@ -456,4 +458,108 @@ test('single event bus stream updates in-memory session cache correctly for back
   assert.equal(t2[1]?.parts.length, 2);
   assert.equal(t2[1]?.parts[1]?.kind, 'text');
   assert.equal(t2[1]?.parts[1]?.text, '建议使用 SIMD 加速。具体步骤如下：');
+});
+
+test('bindUserMessageIdentity binds the stored id to the optimistic bubble once', () => {
+  const local = {
+    role: 'user',
+    id: 'client-id-1',
+    parts: [{ kind: 'text' as const, text: '你好' }],
+  };
+  const messages = [local, { role: 'assistant', id: 'm-a1', parts: [] }];
+  const bound = bindUserMessageIdentity(messages, 'm-user-1');
+  assert.equal(bound[0]?.id, 'm-user-1');
+  assert.equal(bound[1], messages[1]);
+  // 幂等：同一个 id 第二次到达不改变画布。
+  assert.equal(bindUserMessageIdentity(bound, 'm-user-1'), bound);
+  // 唯一性：已在画布上的 id 绝不再贴到另一条消息上。
+  const other = [
+    { role: 'user', id: 'm-user-9', parts: [{ kind: 'text' as const, text: '别人的提问' }] },
+    { role: 'user', parts: [{ kind: 'text' as const, text: '我的提问' }] },
+  ];
+  assert.equal(bindUserMessageIdentity(other, 'm-user-9'), other);
+  // 无用户气泡 / 无 id：原样返回（同一引用，避免无谓重绘）。
+  const empty: Array<{ role: string; parts: Array<{ kind: 'text'; text: string }> }> = [];
+  assert.equal(bindUserMessageIdentity(empty, 'm-x'), empty);
+  assert.equal(bindUserMessageIdentity(other, undefined), other);
+});
+
+test('identifiedAssistantIndex resolves the owning round, never the steer bubble', () => {
+  const round = { role: 'assistant', id: 'm-1', parts: [] };
+  const steer = { role: 'user', id: 'client-1', parts: [{ kind: 'text' as const, text: '换个方向' }] };
+  const messages = [round, steer];
+  assert.equal(identifiedAssistantIndex(messages, 'm-1'), 0);
+  // A user bubble carrying its own client id is not an assistant target.
+  assert.equal(identifiedAssistantIndex(messages, 'client-1'), -1);
+  assert.equal(identifiedAssistantIndex(messages, undefined), -1);
+  assert.equal(identifiedAssistantIndex(messages, 'm-missing'), -1);
+});
+
+// 回合中途 steer 的回归防线：上一回合迟到的思考/正文/工具增量必须回到它所属的
+// assistant 消息，绝不能渲染到 steer 气泡下方（错序 + 重复的根因）。
+test('late deltas keep their owning round above a mid-turn steer bubble', () => {
+  const round = {
+    role: 'assistant',
+    id: 'm-1',
+    parts: [{ kind: 'text' as const, text: '前半段正文' }],
+  };
+  const steer = { role: 'user', parts: [{ kind: 'text' as const, text: '改个方向' }] };
+  const canvas = [round, steer];
+
+  const text = paintAssistantText(canvas, '后半段正文', false, 'm-1');
+  assert.equal(text.length, 2, 'steer 气泡之后绝不能另起一条 assistant');
+  assert.equal(text[1], steer);
+  const mergedPart = text[0]?.parts[0];
+  assert.equal(mergedPart?.kind, 'text');
+  assert.equal(mergedPart?.text, '前半段正文后半段正文');
+
+  const reasoning = paintAssistantReasoning(text, '补充思考', false, 'm-1');
+  assert.equal(reasoning.length, 2);
+  assert.equal(reasoning[1], steer);
+  assert.equal(reasoning[0]?.parts.length, 2);
+  assert.equal(reasoning[0]?.parts[0]?.text, '前半段正文后半段正文');
+  assert.equal(reasoning[0]?.parts[1]?.kind, 'reasoning');
+  assert.equal(reasoning[0]?.parts[1]?.text, '补充思考');
+
+  // 未携带身份（旧 daemon）时保持原有尾随语义，不回归。
+  const trailing = paintAssistantText(canvas, '新回合正文', false);
+  assert.equal(trailing.length, 3);
+  assert.equal(trailing[1], steer);
+  assert.equal(trailing[2]?.role, 'assistant');
+  assert.equal(trailing[2]?.parts[0]?.text, '新回合正文');
+});
+
+test('streamed markdown keeps paragraph breaks when whitespace arrives as its own delta', () => {
+  // 真实流序：正文 → "\n\n"（独立 delta）→ 下一条列表项。
+  // 空白 delta 被吞会让列表/段落粘连，就是“首帧乱排、刷新后正常”的根因。
+  let canvas = paintAssistantText([], '一、顶层开关是活的语义', true);
+  canvas = paintAssistantText(canvas, '\n\n', true);
+  canvas = paintAssistantText(canvas, '1. 对外 schema 只暴露 hunk 级', true);
+  canvas = paintAssistantText(canvas, '\n\n', true);
+  canvas = paintAssistantText(canvas, '2. 但底层也接受顶层开关', true);
+  const text = (canvas[0]?.parts ?? []).map((part) => part.text ?? '').join('');
+  assert.equal(
+    text,
+    '一、顶层开关是活的语义\n\n1. 对外 schema 只暴露 hunk 级\n\n2. 但底层也接受顶层开关',
+  );
+  // 同一段空白重复到达（重放）不得叠加空行：
+  // 画布末尾已是空白时不再追加（否则空行滚雪球）。
+  const endsWithBreak = paintAssistantText([], '段落一\n\n', true);
+  const replayed = paintAssistantText(endsWithBreak, '\n\n', true);
+  assert.equal(
+    (replayed[0]?.parts ?? []).map((part) => part.text ?? '').join(''),
+    '段落一\n\n',
+  );
+});
+
+test('a new round identity still opens its own bubble after the steer', () => {
+  const round = { role: 'assistant', id: 'm-1', parts: [{ kind: 'text' as const, text: '旧回合' }] };
+  const steer = { role: 'user', parts: [{ kind: 'text' as const, text: 'steer' }] };
+  const canvas = [round, steer];
+
+  const next = paintAssistantText(canvas, '新回合回答', false, 'm-2');
+  assert.equal(next.length, 3);
+  assert.equal(next[1], steer);
+  assert.equal(next[2]?.role, 'assistant');
+  assert.equal(next[2]?.parts[0]?.text, '新回合回答');
 });

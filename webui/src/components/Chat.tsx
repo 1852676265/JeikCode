@@ -222,9 +222,12 @@ import {
   pendingSteersToDraft,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
+import { onGlobalEvent } from '../lib/globalEvents';
 import {
+  bindUserMessageIdentity,
   foldLiveTodo,
   hydrateSession,
+  identifiedAssistantIndex,
   paintAssistantReasoning,
   paintAssistantText,
   ensureWorkingAssistant,
@@ -2169,6 +2172,20 @@ export function Chat({
       userInput: userInputReq,
     });
   }, [onLiveReview, sessionId, livePending, userInputReq]);
+  // 跨实例增量：待交互卡在别处被解决时，同步清掉本画布的待批准/待回答状态。
+  useEffect(
+    () =>
+      onGlobalEvent((event) => {
+        if (event.type !== 'review_resolved' || event.request_id == null) return;
+        setLivePending((cur) =>
+          cur && cur.request_id === event.request_id ? null : cur,
+        );
+        setUserInputReq((cur) =>
+          cur && cur.request_id === event.request_id ? null : cur,
+        );
+      }),
+    [],
+  );
   /** Project hash for the session on screen, including before App metadata arrives. */
   const viewedProjectHashRef = useRef<string | null>(activeSession?.project_hash ?? null);
   /** Last freshness signature we already parsed. Unchanged files are not read. */
@@ -3390,7 +3407,7 @@ export function Chat({
     switch (e.type) {
       case 'text': return { type: 'text', content: e.content, message_id: e.message_id, part_id: e.part_id, part_seq: e.part_seq };
       case 'reasoning': return { type: 'reasoning', content: e.content, message_id: e.message_id, part_id: e.part_id, part_seq: e.part_seq };
-      case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments };
+      case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments, message_id: e.message_id };
       case 'tool_output': return { type: 'tool_output', id: e.id, chunk: e.chunk };
       case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
@@ -3836,6 +3853,18 @@ export function Chat({
         foldSteeredInputs(e.inputs, e.client_input_ids);
         break;
       }
+
+      case 'user_identified': {
+        setMessages((prev) => {
+          const next = bindUserMessageIdentity(prev, e.message_id);
+          if (next === prev) return prev;
+          messagesRef.current = next;
+          const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
+          if (currentSid) messageCacheRef.current.set(currentSid, next);
+          return next;
+        });
+        break;
+      }
       case 'error': {
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'error',
@@ -3928,17 +3957,27 @@ export function Chat({
   function withAssistantIdentity(msgs: Message[], messageId?: string, partId?: string): Message[] {
     if (!messageId && !partId) return msgs;
     if (msgs.length === 0) return msgs;
-    const idx = msgs.length - 1;
-    const last = msgs[idx];
-    if (!last || last.role !== 'assistant') return msgs;
-    if (messageId && last.id && last.id !== messageId) return msgs;
+    let idx = messageId
+      ? msgs.findIndex((m) => m.role === 'assistant' && m.id === messageId)
+      : -1;
+    if (idx < 0) {
+      const lastIdx = msgs.length - 1;
+      const last = msgs[lastIdx];
+      if (!last || last.role !== 'assistant') return msgs;
+      if (messageId && last.id && last.id !== messageId) return msgs;
+      idx = lastIdx;
+    }
+    // 同一 message_id 绝不能在两条消息上共存：重复 key 会让 Preact 复用错 DOM，
+    // 表现为“老回合的一部分回复渲染到新消息里”。
+    if (messageId && msgs.some((m, i) => i !== idx && m.id === messageId)) return msgs;
+    const message = msgs[idx]!;
     let changed = false;
-    let id = last.id;
+    let id = message.id;
     if (messageId && !id) {
       id = messageId;
       changed = true;
     }
-    let parts = last.parts;
+    let parts = message.parts;
     if (partId && parts.length > 0) {
       const pi = parts.length - 1;
       const p = parts[pi];
@@ -3950,7 +3989,7 @@ export function Chat({
     }
     if (!changed) return msgs;
     const next = msgs.slice();
-    next[idx] = { ...last, id, parts };
+    next[idx] = { ...message, id, parts };
     return next;
   }
 
@@ -3962,7 +4001,7 @@ export function Chat({
     const replay = opts?.requireReplayDedup === true && opts?.skipReplayDedup !== true;
     setMessages((prev) => {
       const next = withAssistantIdentity(
-        paintAssistantText(prev, content, replay),
+        paintAssistantText(prev, content, replay, ids?.messageId),
         ids?.messageId,
         ids?.partId,
       );
@@ -4422,12 +4461,14 @@ export function Chat({
   }
 
   function foldSteeredInputs(
-    inputs: { text: string; images?: ImageData[] }[],
+    inputs: { text: string; images?: ImageData[]; message_id?: string }[],
     clientInputIds?: Array<string | null>,
   ) {
     const steeredInputs = (inputs ?? []).map((input) => ({
       text: stripSteerEnvelopeForDisplay(input.text || ''),
       images: input.images ?? [],
+      // 内核回传的落盘消息 id（优先于本地 client id，让 id 收敛不依赖文本启发）
+      messageId: input.message_id,
     }));
     if (steeredInputs.length === 0) return;
 
@@ -4479,9 +4520,25 @@ export function Chat({
           (m) => m.role === 'user' && m.parts?.some((p) => p.kind === 'text' && (p.text.trim() === cleanText || userTextsMatch(p.text, cleanText)))
         );
         if (alreadyPresent) {
-          next = next.map((m) =>
-            m.pendingSteerId ? { ...m, pendingSteerId: undefined } : m
-          );
+          // 乐观气泡已存在（本地发送时已画）：清 pending 标记 + 采纳落盘身份，
+          // 让后续刷新/切换/回放按 id 收敛，而非回退文本启发。
+          const storedId = s.messageId;
+          next = next.map((m) => {
+            const isMatch =
+              m.role === 'user' &&
+              m.parts?.some(
+                (p) => p.kind === 'text' && (p.text.trim() === cleanText || userTextsMatch(p.text, cleanText)),
+              );
+            if (isMatch) {
+              const patched: Message = { ...m, pendingSteerId: undefined };
+              // 唯一性守卫：同一个落盘 id 绝不贴到第二条消息上。
+              if (storedId && !next.some((other) => other.id === storedId)) {
+                patched.id = storedId;
+              }
+              return patched;
+            }
+            return m.pendingSteerId ? { ...m, pendingSteerId: undefined } : m;
+          });
           continue;
         }
 
@@ -4496,7 +4553,8 @@ export function Chat({
           ts: now,
           sourceIndex: turnIndex,
           turnNavOrdinal: turnOrdinal,
-          id: clientInputIds?.[i] ?? undefined,
+          // 内核身份优先；旧 daemon 无此字段时退回本地 client id。
+          id: s.messageId ?? clientInputIds?.[i] ?? undefined,
         });
         next.push({
           role: 'assistant',
@@ -5127,7 +5185,7 @@ export function Chat({
     artifactFenceLenRef.current = 3;
   }
 
-  function addToolToLastAssistant(tool: ToolRow) {
+  function addToolToLastAssistant(tool: ToolRow, messageId?: string) {
     setMessages((prev) => {
       if (prev.length === 0) return prev;
       let next: Message[] = prev;
@@ -5141,6 +5199,16 @@ export function Chat({
           messagesRef.current = next;
           return next;
         }
+      }
+      // 管线身份直连：带 message_id 的工具行必须回到它所属的那一轮 assistant 消息。
+      // 回合中途的 steer 气泡会把“最后一条”变成用户行；若在 steer 下方另开新消息，
+      // 上一回合迟到的工具就会渲染到 steer 之后（错序/重复的根因）。
+      const owner = identifiedAssistantIndex(prev, messageId);
+      if (owner >= 0) {
+        const updated = prev.slice();
+        updated[owner] = { ...prev[owner]!, parts: upsertToolPart(prev[owner]!.parts, tool) };
+        messagesRef.current = updated;
+        return updated;
       }
       // 历史中不存在：新工具。若末尾是 assistant 则追加，若末尾是 user（如 Steer）则安全开启新 assistant
       const last = prev[prev.length - 1];
@@ -5167,11 +5235,11 @@ export function Chat({
     const msgs = messageCacheRef.current.get(targetSid);
     if (!msgs || msgs.length === 0) return;
     if (event.type === 'text') {
-      messageCacheRef.current.set(targetSid, paintAssistantText(msgs, event.content, false));
+      messageCacheRef.current.set(targetSid, paintAssistantText(msgs, event.content, false, event.message_id));
       return;
     }
     if (event.type === 'reasoning') {
-      messageCacheRef.current.set(targetSid, paintAssistantReasoning(msgs, event.content, false));
+      messageCacheRef.current.set(targetSid, paintAssistantReasoning(msgs, event.content, false, event.message_id));
       return;
     }
     if (event.type === 'user') {
@@ -5256,6 +5324,29 @@ export function Chat({
             return;
           }
         }
+      }
+    }
+
+    // 管线身份直连：带 message_id 的新工具行直接落到它所属的那一轮（steer 气泡之后
+    // 绝不能另开一条 assistant，否则上一回合迟到的事件会被渲染到 steer 下方）。
+    if (event.type === 'tool_start' && event.message_id) {
+      const owner = identifiedAssistantIndex(next, event.message_id);
+      if (owner >= 0) {
+        const argsStr = formatArgs(event.arguments);
+        const subtasks = event.name === 'task' ? subtasksFromTaskArgs(argsStr) ?? undefined : undefined;
+        const updated = next.slice();
+        updated[owner] = {
+          ...next[owner]!,
+          parts: upsertToolPart(next[owner]!.parts, {
+            id: event.id,
+            name: event.name,
+            args: argsStr,
+            status: 'pending',
+            ...(subtasks ? { subtasks } : {}),
+          }),
+        };
+        messageCacheRef.current.set(targetSid, updated);
+        return;
       }
     }
 
@@ -5425,6 +5516,20 @@ export function Chat({
         break;
       }
 
+      case 'user_identified': {
+        // 身份回传：把乐观用户气泡绑定到落盘消息 id（刷新/切换/回放时按 id 收敛，
+        // 不再回退文本启发）。受唯一性守卫保护，幂等。
+        setMessages((prev) => {
+          const next = bindUserMessageIdentity(prev, event.message_id);
+          if (next === prev) return prev;
+          messagesRef.current = next;
+          const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
+          if (currentSid) messageCacheRef.current.set(currentSid, next);
+          return next;
+        });
+        break;
+      }
+
       case 'text': {
         appendToLastAssistant(
           event.content,
@@ -5446,7 +5551,7 @@ export function Chat({
         // Thinking / chain-of-thought stream — collapsible block in the UI.
         setMessages((prev) => {
           const next = withAssistantIdentity(
-            paintAssistantReasoning(prev, event.content, requireReplayDedup),
+            paintAssistantReasoning(prev, event.content, requireReplayDedup, event.message_id),
             event.message_id,
             event.part_id,
           );
@@ -5475,7 +5580,7 @@ export function Chat({
           args: argsStr,
           status: 'pending',
           ...(subtasks ? { subtasks } : {}),
-        });
+        }, event.message_id);
         if (isTodoTool(event.name)) {
           const appliedIds = appliedTodoIdsFor(activeIdRef.current);
           setActiveTodos((cur) => {

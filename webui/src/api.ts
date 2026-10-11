@@ -158,9 +158,10 @@ export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
   | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number }
+  | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
   | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
   | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
-  | { type: 'tool_start'; id: string; name: string; arguments: unknown }
+  | { type: 'tool_start'; id: string; name: string; arguments: unknown; message_id?: string }
   | { type: 'tool_output'; id?: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
@@ -168,7 +169,7 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[] }[]; client_input_ids?: Array<string | null> }
+  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null> }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
@@ -1720,14 +1721,63 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+/**
+ * 跨实例增量事件（`GET /events`）。
+ *
+ * 与「失效信号→整表重拉」不同，每条都自带 payload：客户端按 id 就地 upsert/
+ * 删除自己的缓存；`sync` 只是冷启动对齐信号（客户端仍只做一次既有拉取）。
+ */
+export type GlobalWireEvent =
+  | { type: 'sync' }
+  | { type: 'session_upsert'; session: SessionMetaWithProject }
+  | { type: 'session_deleted'; session_id: string; project_hash: string }
+  | { type: 'activity'; session_id: string; running: boolean; terminal?: 'completed' | 'stopped' | 'failed' }
+  /** 该会话弹出了审批/提问卡：对该会话做一次定向 pending 拉取（单会话小请求）。 */
+  | { type: 'review_asked'; session_id: string }
+  /** 待交互已解决：按 id 就地从所有实例的通知卡片中移除。 */
+  | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number };
+
+/** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
+export async function streamGlobalEvents(
+  onEvent: (event: GlobalWireEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const resp = await apiFetch('/events', { headers: authHeaders(), signal });
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  }
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
+      if (!dataLine) continue;
+      const jsonStr = dataLine.slice('data:'.length).trim();
+      if (!jsonStr) continue;
+      try {
+        onEvent(JSON.parse(jsonStr) as GlobalWireEvent);
+      } catch {
+        /* keep-alive / malformed frame */
+      }
+    }
+  }
+}
+
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; session_name?: string; project_hash: string; provider: string; mode: ApprovalMode; working_dir?: string }
   | { type: 'provider'; provider: string }
   | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string; message_id?: string }
+  | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
   | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
   | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
-  | { type: 'tool_start'; id: string; name: string; arguments: string }
+  | { type: 'tool_start'; id: string; name: string; arguments: string; message_id?: string }
   | { type: 'tool_output'; id: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
@@ -1740,7 +1790,7 @@ export type LiveWireEvent =
   | { type: 'permission_request'; session_id?: string; runtime_instance_id: string; generation: number; request_id: number; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'user_input_request'; session_id?: string; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[] }[]; client_input_ids: Array<string | null> }
+  | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[]; message_id?: string }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
   | { type: 'working_dir'; working_dir: string }

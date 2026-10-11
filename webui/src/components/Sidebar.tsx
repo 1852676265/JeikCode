@@ -5,6 +5,8 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { mergeSessionRow, onGlobalEvent, removeSessionRows } from '../lib/globalEvents';
+import { deleteSessionCache } from '../lib/sessionCache';
 import { bakedAppVersion, formatAppVersionLabel, normalizeAppVersion } from '../lib/appVersion';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang, languageOptions } from '../i18n';
@@ -233,10 +235,21 @@ function FolderOpenIcon() {
   );
 }
 
+/** Power button glyph (IEC 5009 power symbol: vertical line through broken circle) */
+function PowerIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 2.2v4.8" />
+      <path d="M4 4.5a6 6 0 1 0 8 0" />
+    </svg>
+  );
+}
+
 /**
- * Two red/green enable–disable pills (GLOBAL / PROJECT) for one capability row.
- * Green = enabled, red = disabled. Both scopes are toggled independently and the
- * effective runtime state is their union (disabled at either scope ⇒ disabled).
+ * Two circular modern power switches (GLOBAL / PROJECT) for one capability row.
+ * Green = powered ON / enabled, red = powered OFF / disabled.
+ * Both scopes are toggled independently and the effective runtime state
+ * is their union (disabled at either scope ⇒ disabled).
  */
 function CapScopeToggles({
   item,
@@ -248,32 +261,38 @@ function CapScopeToggles({
   onToggle: (item: CapabilityItem, scope: CapScope, e: MouseEvent) => void;
 }) {
   const t = useT();
-  const pill = (scope: CapScope, label: string, disabled: boolean, title: string) => {
+  const toggleBtn = (scope: CapScope, label: string, disabled: boolean, baseTitle: string) => {
     const key = `${item.kind}:${item.id}:${scope}`;
+    const statusText = disabled
+      ? (scope === 'global' ? '全局：已禁用' : '项目：已禁用')
+      : (scope === 'global' ? '全局：已启用' : '项目：已启用');
+    const fullTitle = `${baseTitle} (${statusText})`;
     return (
-      <button
-        type="button"
-        class={'cap-toggle ' + (disabled ? 'off' : 'on') + (busy.has(key) ? ' busy' : '')}
-        title={title}
-        aria-label={title}
-        aria-pressed={!disabled}
-        disabled={busy.has(key)}
-        onMouseDown={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-        }}
-        onClick={(e) => onToggle(item, scope, e as unknown as MouseEvent)}
-      >
-        <span class="cap-toggle-label">{label}</span>
-        <span class="cap-toggle-pill" />
-      </button>
+      <div class="cap-scope-unit" title={fullTitle}>
+        <span class="cap-scope-tag">{label}</span>
+        <button
+          type="button"
+          class={'cap-power-btn ' + (disabled ? 'off' : 'on') + (busy.has(key) ? ' busy' : '')}
+          title={fullTitle}
+          aria-label={fullTitle}
+          aria-pressed={!disabled}
+          disabled={busy.has(key)}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={(e) => onToggle(item, scope, e as unknown as MouseEvent)}
+        >
+          <PowerIcon />
+        </button>
+      </div>
     );
   };
   return (
-    <span class="cap-toggles">
-      {pill('global', t('cap.global'), item.global_disabled, t('cap.toggleGlobal'))}
-      {pill('project', t('cap.project'), item.project_disabled, t('cap.toggleProject'))}
-    </span>
+    <div class="cap-toggles">
+      {toggleBtn('global', t('cap.global'), item.global_disabled, t('cap.toggleGlobal'))}
+      {toggleBtn('project', t('cap.project'), item.project_disabled, t('cap.toggleProject'))}
+    </div>
   );
 }
 
@@ -614,6 +633,60 @@ export function Sidebar({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey, refreshProjectSessions]);
+
+  // ── 跨实例增量订阅（无轮询、无整表重拉）──
+  // 服务端只推“变了什么”（带 payload），这里按 id 就地 upsert/删行并同步失效缓存；
+  // 刷新后仍以同一份本地缓存恢复，与后端保持最终一致。
+  useEffect(() => {
+    return onGlobalEvent((event) => {
+      if (event.type === 'session_upsert') {
+        const row = event.session;
+        setSessions((cur) => mergeSessionRow(cur, row));
+        setProjectSessionsMap((prev) => {
+          const list = prev[row.project_hash];
+          if (!list) return prev; // 未展开/未加载的项目不凭空造列表
+          return { ...prev, [row.project_hash]: mergeSessionRow(list, row) };
+        });
+        return;
+      }
+      if (event.type === 'session_deleted') {
+        const removed = new Set([event.session_id]);
+        setSessions((cur) => removeSessionRows(cur, removed));
+        setProjectSessionsMap((prev) => {
+          let changed = false;
+          const next: typeof prev = {};
+          for (const [hash, list] of Object.entries(prev)) {
+            const filtered = removeSessionRows(list, removed);
+            if (filtered !== list) changed = true;
+            next[hash] = filtered;
+          }
+          return changed ? next : prev;
+        });
+        setSelectedIds((cur) => {
+          if (!cur.has(event.session_id)) return cur;
+          const next = new Set(cur);
+          next.delete(event.session_id);
+          return next;
+        });
+        setActiveIds((cur) =>
+          cur.includes(event.session_id)
+            ? cur.filter((id) => id !== event.session_id)
+            : cur,
+        );
+        // 缓存必须同步失效，否则幽灵会话会在下一次读取时复活。
+        void deleteSessionCache(event.project_hash, event.session_id);
+        return;
+      }
+      if (event.type === 'activity') {
+        setActiveIds((cur) => {
+          const has = cur.includes(event.session_id);
+          if (event.running && !has) return [...cur, event.session_id];
+          if (!event.running && has) return cur.filter((id) => id !== event.session_id);
+          return cur;
+        });
+      }
+    });
+  }, []);
 
   useEffect(() => {
     if (activeSessionId !== previousActiveSessionIdRef.current) {

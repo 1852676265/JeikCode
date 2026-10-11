@@ -37,6 +37,7 @@ import {
   permissionInstanceKey,
   samePermissionInstance,
 } from '../lib/sessionNotify';
+import { onGlobalEvent } from '../lib/globalEvents';
 import { useT } from '../settings';
 import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
@@ -117,6 +118,8 @@ export function NotificationDock({
   const primedSeq = useRef(false);
   const recent = useRef(new Map<string, number>());
   const sentReview = useRef(new Set<string>());
+  /** 推送终态通知的本地序号（跨实例推送没有服务端 seq，用递增序号保证 toast id 唯一）。 */
+  const pushedTerminalSeqRef = useRef(0);
   const hintsRef = useRef(hints);
   hintsRef.current = hints;
   const modeRef = useRef(mode);
@@ -294,6 +297,69 @@ export function NotificationDock({
       postSystemNotifyFn: postSystemNotify,
     });
   }
+
+  useEffect(() => {
+    // ── 跨实例增量订阅：待交互卡片与终态通知（无轮询、无整表重拉）──
+    // review_asked 只对该会话做一次定向 pending 拉取（单会话小请求）；
+    // review_resolved 按 id 就地移除；activity.terminal 直接推右下角通知。
+    return onGlobalEvent((event) => {
+      if (event.type === 'session_upsert') {
+        const row = event.session;
+        setHints((prev) => ({
+          ...prev,
+          [row.id]: { name: row.name, workingDir: row.working_dir },
+        }));
+        return;
+      }
+      if (event.type === 'review_asked') {
+        const sessionId = event.session_id;
+        void getChatPending(sessionId)
+          .then((pending) => {
+            setPolled((prev) => {
+              const next = prev.filter((item) => item.sessionId !== sessionId);
+              next.push({
+                sessionId,
+                permission: pending.permission,
+                userInput: pending.user_input,
+              });
+              return next;
+            });
+          })
+          .catch(() => {});
+        return;
+      }
+      if (event.type === 'review_resolved') {
+        const { session_id, approval_id, request_id } = event;
+        setPolled((prev) => {
+          const next = prev.filter((item) => {
+            if (item.sessionId !== session_id) return true;
+            if (approval_id && item.permission?.approval_id === approval_id) return false;
+            if (request_id != null) {
+              if (item.userInput?.request_id === request_id) return false;
+            }
+            return true;
+          });
+          if (next.length !== prev.length) return next;
+          // id 未能直接命中：对该会话做一次定向核验，确实已无待交互才移除。
+          if (prev.some((item) => item.sessionId === session_id)) {
+            void getChatPending(session_id)
+              .then((pending) => {
+                if (pending.permission || pending.user_input) return;
+                setPolled((cur) => cur.filter((item) => item.sessionId !== session_id));
+              })
+              .catch(() => {});
+          }
+          return prev;
+        });
+        return;
+      }
+      if (event.type === 'activity' && event.terminal) {
+        pushedTerminalSeqRef.current += 1;
+        pushTerminal(event.session_id, event.terminal, pushedTerminalSeqRef.current);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

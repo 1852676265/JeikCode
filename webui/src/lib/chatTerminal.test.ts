@@ -514,6 +514,71 @@ test('idle snapshot keeps new live deltas and drops thinking that is already sho
   );
 });
 
+test('idle replay resolves the owning round by message identity (ghost batch guard)', () => {
+  const messages = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [
+        { kind: 'reasoning', text: '第一轮思考' },
+        { kind: 'tool', tool: { id: 'call-1', status: 'done', output: 'ok' } },
+      ],
+    },
+    {
+      role: 'assistant',
+      id: 'm-2',
+      parts: [{ kind: 'text', text: '第二轮回答' }],
+    },
+  ];
+  // 早先回合的重放：按 message_id 回到 m-1 判定，而不是拿 m-2 去比对。
+  assert.equal(
+    idleReplayAlreadyPainted(messages, {
+      type: 'reasoning',
+      content: '第一轮思考',
+      message_id: 'm-1',
+    }),
+    true,
+  );
+  assert.equal(
+    idleReplayAlreadyPainted(messages, { type: 'tool_start', id: 'call-1', message_id: 'm-1' }),
+    true,
+  );
+  assert.equal(
+    idleReplayAlreadyPainted(messages, { type: 'text', content: '第二轮回答', message_id: 'm-2' }),
+    true,
+  );
+  // 未画过的新尾流仍要放行落笔。
+  assert.equal(
+    idleReplayAlreadyPainted(messages, {
+      type: 'reasoning',
+      content: '第二轮新增思考',
+      message_id: 'm-2',
+    }),
+    false,
+  );
+});
+
+test('deltaContinuesLastAssistant binds an earlier round by identity, not by tail', () => {
+  const messages = [
+    { role: 'assistant', id: 'm-1', parts: [{ kind: 'text' as const, text: '第一轮正文' }] },
+    { role: 'assistant', id: 'm-2', parts: [{ kind: 'text' as const, text: '第二' }] },
+  ];
+  // 第二轮仍在流式：身份命中 m-2，判定为“继续”。
+  assert.equal(
+    deltaContinuesLastAssistant(messages, {
+      type: 'text',
+      content: '第二轮的后续正文',
+      message_id: 'm-2',
+    }),
+    true,
+  );
+  // 身份未命中且与末尾正文不搭：交给“新回合”处理，行为不回退。
+  assert.equal(
+    deltaContinuesLastAssistant(messages, { type: 'text', content: '完全不同的新回合' }),
+    false,
+  );
+});
+
 test('second identical ```text fence is a new code block, not a live replay', () => {
   assert.equal(isMarkdownFenceDelta('```text\n'), true);
   assert.equal(isMarkdownFenceDelta('```\n'), true);
@@ -921,6 +986,32 @@ test('coalesced replay appends only the unpainted suffix', () => {
   assert.equal(unpaintedReplaySuffix('hello world', 'hello world'), '');
   assert.equal(unpaintedReplaySuffix('', 'fresh'), 'fresh');
   assert.equal(unpaintedReplaySuffix('上一轮', '这一轮才开始'), '这一轮才开始');
+});
+
+test('a whitespace-only live delta keeps its newlines (never swallowed by replay dedup)', () => {
+  // provider 常把 "\n\n" 作为独立 delta 发出：画布末尾已有正文，但这段空白尚未画过。
+  // 旧实现 collapseWs 后 chunk 为空 → 被当成“已画过”丢弃 → 行/列表粘连（刷新才恢复）。
+  assert.equal(unpaintedReplaySuffix('不是死字段', '\n\n'), '\n\n');
+  assert.equal(unpaintedReplaySuffix('2. 但底层 Args', '\n'), '\n');
+  // 确已画过的同一段空白仍要去重（重放/重复帧不得叠空行）。
+  assert.equal(unpaintedReplaySuffix('第一点\n\n', '\n\n'), '');
+  assert.equal(unpaintedReplaySuffix('第一点\n', '\n'), '');
+  // 空白 + 正文：换行必须保留，不能折叠成 "2. 但底层"。
+  assert.equal(unpaintedReplaySuffix('第一点', '\n\n2. 但底层 Args'), '\n\n2. 但底层 Args');
+});
+
+test('a replayed chunk repairs a glued canvas by restoring only its layout whitespace', () => {
+  // 旧版本丢过换行导致的粘连画布：非空白内容已画过，重放帧只应补回换行，
+  // 不得重复正文，也不得永远粘着。
+  assert.equal(
+    unpaintedReplaySuffix('一、不是死字段2. 但底层也接受顶层开关', '\n\n2. 但底层也接受顶层开关'),
+    '\n\n',
+  );
+  // 同形重放（骨架一致）仍去重，不叠空行。
+  assert.equal(
+    unpaintedReplaySuffix('一、不是死字段\n\n2. 但底层也接受顶层开关', '\n\n2. 但底层也接受顶层开关'),
+    '',
+  );
 });
 
 test('running disk merge keeps the steer tail and drops a duplicated user echo', () => {

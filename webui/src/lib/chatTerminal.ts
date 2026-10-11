@@ -330,15 +330,37 @@ export function holdDuplicateUserEcho(input: {
   );
 }
 
+/** 归属消息优先：多回合 turn 中每一轮都是独立的 assistant 消息；只认“最后一条”
+ *  会把早先回合的日志重放判成新内容（幽灵思考块 / 幽灵正文）。
+ *  先按 message_id 定位回合，再按 tool call id 定位，最后回退到最后一条 assistant。 */
+function replayOwnerMessage<T extends { role: string; id?: string; parts: ReplayPart[] }>(
+  messages: T[],
+  event: { id?: string; message_id?: string },
+): T | undefined {
+  if (event.message_id) {
+    const owner = messages.find(
+      (message) => message.role === 'assistant' && message.id === event.message_id,
+    );
+    if (owner) return owner;
+  }
+  if (event.id) {
+    const holder = messages.find((message) =>
+      message.parts.some((part) => part.kind === 'tool' && part.tool?.id === event.id),
+    );
+    if (holder) return holder;
+  }
+  return [...messages].reverse().find((message) => message.role === 'assistant');
+}
+
 /** True when `incoming` still belongs on the last assistant (replay of this
  *  turn) rather than opening the next one. A brand-new thinking block does
  *  not start with the previous answer, and the previous answer is not a
  *  prefix of it. */
 export function deltaContinuesLastAssistant(
-  messages: Array<{ role: string; parts: ReplayPart[] }>,
-  event: { type: string; content?: string; id?: string },
+  messages: Array<{ role: string; id?: string; parts: ReplayPart[] }>,
+  event: { type: string; content?: string; id?: string; message_id?: string },
 ): boolean {
-  const last = [...messages].reverse().find((message) => message.role === 'assistant');
+  const last = replayOwnerMessage(messages, event);
   if (!last) return false;
   if (event.type === 'tool_start' || event.type === 'tool_output' || event.type === 'tool_result') {
     return !!event.id && last.parts.some((part) => part.kind === 'tool' && part.tool?.id === event.id);
@@ -665,8 +687,26 @@ export function unpaintedReplaySuffix(existing: string, incoming: string): strin
   if (incoming.startsWith(existing)) return incoming.slice(existing.length);
   const painted = collapseWs(existing);
   const chunk = collapseWs(incoming);
-  if (!chunk) return '';
-  if (painted === chunk || painted.endsWith(chunk) || painted.startsWith(chunk)) return '';
+  if (!chunk) {
+    // 纯空白增量（段落/列表分隔的换行、Markdown 缩进）绝不能当成"已画过"丢弃：
+    // provider 常把 "\n\n" 作为独立 delta 发出，丢了它 live 渲染就会把行/列表
+    // 粘在一起（刷新读全文才恢复）。
+    // 去重只针对"画布末尾已有同类空白"：重放/重复帧不得叠空行，
+    // 但末尾是空格之类非换行空白时，新的换行依然必须画上去。
+    const tail = existing.match(/\s+$/)?.[0] ?? '';
+    if (tail.endsWith(incoming)) return '';
+    if (incoming.includes('\n') && tail.includes('\n')) return '';
+    return incoming;
+  }
+  if (painted === chunk || painted.endsWith(chunk) || painted.startsWith(chunk)) {
+    // 折叠比较会把"非空白内容已画过、但换行骨架不同"的重放也判成已画过：
+    // 画布若已经粘连（旧版本丢过换行），直接丢弃就永远无法自愈。
+    // 安全收尾：非空白内容确实已存在时，只补回缺失的前导空白（不重写正文、不重复文本）。
+    const skeleton = (value: string) => value.replace(/[^\S\n]+/g, '');
+    if (!incoming.includes('\n') || skeleton(existing).endsWith(skeleton(incoming))) return '';
+    const leadingWhitespace = incoming.match(/^\s+/)?.[0] ?? '';
+    return leadingWhitespace && !existing.endsWith(leadingWhitespace) ? leadingWhitespace : '';
+  }
   if (chunk.startsWith(painted) && painted.length > 0) {
     let rest = incoming;
     let seen = 0;
@@ -924,10 +964,10 @@ export function liveContentDeltaAlreadyOnParts(
  *  on the canvas. A new text/thinking/tool delta means the turn kept going
  *  (a phone refresh mid-stream) and must be painted. */
 export function idleReplayAlreadyPainted(
-  messages: Array<{ role: string; parts: ReplayPart[] }>,
-  event: { type: string; content?: string; chunk?: string; id?: string },
+  messages: Array<{ role: string; id?: string; parts: ReplayPart[] }>,
+  event: { type: string; content?: string; chunk?: string; id?: string; message_id?: string },
 ): boolean {
-  const last = [...messages].reverse().find((message) => message.role === 'assistant');
+  const last = replayOwnerMessage(messages, event);
   const parts = last?.parts ?? [];
   switch (event.type) {
     case 'text':

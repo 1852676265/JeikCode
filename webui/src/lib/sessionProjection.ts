@@ -36,6 +36,49 @@ export interface ProjectionMessage {
   role: string;
   parts: MsgPart[];
   ts?: number;
+  /** 管线身份（kernel message id）。增量事件按此定向落笔，而非盲写“最后一条”。 */
+  id?: string;
+}
+
+/**
+ * 归属消息定位：`messageId` 命中画布上的 assistant 消息时返回其下标，否则 -1。
+ * 回合中途插入的 steer 气泡会把“最后一条”变成用户行；谁属于哪一轮由管线
+ * 身份（message_id）决定，绝不能用“最后一条 assistant”猜。
+ */
+export function identifiedAssistantIndex(
+  messages: Array<{ role: string; id?: string }>,
+  messageId?: string,
+): number {
+  if (!messageId) return -1;
+  const index = messages.findIndex((message) => message.id === messageId);
+  return index >= 0 && messages[index]!.role === 'assistant' ? index : -1;
+}
+
+/**
+ * Bind the STORED identity of the user prompt to its optimistic bubble.
+ *
+ * A refresh/switch/replay must keep the bubble on the same id the transcript
+ * carries; the live `user` echo cannot carry it (the kernel assigns the id when
+ * it pushes the message), so the identity arrives as its own boundary event.
+ *
+ * Targets the newest user row (a turned-in steer takes its id from the steer
+ * payload instead). Never reuses an id that already exists, and returns the
+ * same array when there is nothing to bind.
+ */
+export function bindUserMessageIdentity<T extends ProjectionMessage>(
+  messages: T[],
+  messageId?: string,
+): T[] {
+  if (!messageId) return messages;
+  if (messages.some((message) => message.id === messageId)) return messages;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== 'user') continue;
+    const next = messages.slice();
+    next[i] = { ...message, id: messageId };
+    return next;
+  }
+  return messages;
 }
 
 export interface SessionSurface<T> {
@@ -161,7 +204,17 @@ export function paintAssistantText<T extends ProjectionMessage>(
   messages: T[],
   content: string,
   replay: boolean,
+  /** 管线身份：命中则把增量落回该消息（迟到尾流必须回到原回合）。 */
+  targetId?: string,
 ): T[] {
+  const target = identifiedAssistantIndex(messages, targetId);
+  if (target >= 0) {
+    const parts = mergeTextIntoParts(messages[target]!.parts, content, replay);
+    if (!parts) return messages;
+    const next = messages.slice();
+    next[target] = { ...messages[target]!, parts };
+    return next;
+  }
   if (messages.length === 0) {
     if (!content) return messages;
     return [{ role: 'assistant', parts: [{ kind: 'text', text: content }] } as unknown as T];
@@ -172,20 +225,25 @@ export function paintAssistantText<T extends ProjectionMessage>(
     last = { role: 'assistant', parts: [] } as unknown as T;
     base = [...messages, last];
   }
+  const parts = mergeTextIntoParts(last.parts, content, replay);
+  if (!parts) return messages;
+  return [...base.slice(0, -1), { ...last, parts }];
+}
+
+/** 合并一段正文增量；返回 null 表示重播去重后无新内容可落笔。 */
+function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean): MsgPart[] | null {
   let delta = content;
   if (replay) {
-    const replaced = replaceTruncatedParts(last.parts, 'text', content);
-    if (replaced) {
-      return [...base.slice(0, -1), { ...last, parts: replaced }];
-    }
-    const painted = last.parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
+    const replaced = replaceTruncatedParts(parts, 'text', content);
+    if (replaced) return replaced;
+    const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
     delta = unpaintedReplaySuffix(painted, content);
-    if (!delta) return messages;
+    if (!delta) return null;
   }
-  const parts = last.parts.slice();
-  const tail = parts[parts.length - 1];
+  const next = parts.slice();
+  const tail = next[next.length - 1];
   if (tail && tail.kind === 'text') {
-    let next = tail.text + delta;
+    let merged = tail.text + delta;
     if (
       tail.text &&
       content &&
@@ -193,22 +251,33 @@ export function paintAssistantText<T extends ProjectionMessage>(
       /(?:\.\.\.|…|。)\s*$/.test(tail.text) &&
       /^(正在|Currently |Now )/.test(delta)
     ) {
-      next = `${tail.text}\n${delta}`;
+      merged = `${tail.text}\n${delta}`;
     }
-    parts[parts.length - 1] = { kind: 'text', text: next };
+    next[next.length - 1] = { kind: 'text', text: merged };
   } else {
-    parts.push({ kind: 'text', text: delta });
+    next.push({ kind: 'text', text: delta });
   }
-  return [...base.slice(0, -1), { ...last, parts }];
+  return next;
 }
 
 export function paintAssistantReasoning<T extends ProjectionMessage>(
   messages: T[],
   content: string,
   replay: boolean,
+  /** 管线身份：命中则把思考增量落回该消息（迟到尾流必须回到原回合）。 */
+  targetId?: string,
 ): T[] {
   const cleanContent = content.trim();
   if (!cleanContent) return messages;
+
+  const target = identifiedAssistantIndex(messages, targetId);
+  if (target >= 0) {
+    const parts = mergeReasoningIntoParts(messages[target]!.parts, content, replay);
+    if (!parts) return messages;
+    const next = messages.slice();
+    next[target] = { ...messages[target]!, parts };
+    return next;
+  }
 
   let last = messages[messages.length - 1];
   let base = messages;
@@ -216,31 +285,38 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
     last = { role: 'assistant', parts: [] } as unknown as T;
     base = [...messages, last];
   }
+  const parts = mergeReasoningIntoParts(last.parts, content, replay);
+  if (!parts) return messages;
+  return [...base.slice(0, -1), { ...last, parts }];
+}
+
+/** 合并一段思考增量；返回 null 表示重播去重后无新内容可落笔。 */
+function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: boolean): MsgPart[] | null {
+  const cleanContent = content.trim();
   if (replay) {
-    const replaced = replaceTruncatedParts(last.parts, 'reasoning', content);
+    const replaced = replaceTruncatedParts(parts, 'reasoning', content);
     if (replaced) {
-      if (replaced === last.parts) return messages;
-      return [...base.slice(0, -1), { ...last, parts: replaced }];
+      return replaced === parts ? null : replaced;
     }
-    for (let i = 0; i < last.parts.length; i++) {
-      const p = last.parts[i];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i]!;
       if (p.kind === 'reasoning' && p.text) {
         const cleanExisting = p.text.trim();
         if (cleanExisting === cleanContent || cleanExisting.includes(cleanContent)) {
-          return messages;
+          return null;
         }
         if (cleanContent.startsWith(cleanExisting)) {
-          const nextParts = last.parts.slice();
+          const nextParts = parts.slice();
           nextParts[i] = { ...p, text: content };
-          return [...base.slice(0, -1), { ...last, parts: nextParts }];
+          return nextParts;
         }
       }
     }
   }
-  const painted = last.parts.map((part) => (part.kind === 'reasoning' ? part.text || '' : '')).join('');
+  const painted = parts.map((part) => (part.kind === 'reasoning' ? part.text || '' : '')).join('');
   const delta = replay ? unpaintedReplaySuffix(painted, content) : content;
-  if (!delta) return messages;
-  return [...base.slice(0, -1), { ...last, parts: appendReasoningPart(last.parts, delta) }];
+  if (!delta) return null;
+  return appendReasoningPart(parts, delta);
 }
 
 /** Disk stored a capped field. The replay is the same text plus what was cut

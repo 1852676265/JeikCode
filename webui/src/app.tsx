@@ -9,6 +9,7 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { onboardingDone } from './lib/onboarding';
 import { LiveReviewState, NotificationDock } from './components/NotificationDock';
+import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 
@@ -68,6 +69,23 @@ export function App() {
   const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [liveReview, setLiveReview] = useState<LiveReviewState | null>(null);
+  // 跨实例增量流（每实例一条）：侧栏/通知 dock 各自订阅自己需要的增量，
+  // 全程按 id 就地 upsert/remove，无周期性轮询、无整表重拉。
+  useEffect(() => startGlobalEventStream(), []);
+  // 待交互卡在别处被解决时，同步清掉本实例正在展示的卡片状态。
+  useEffect(
+    () =>
+      onGlobalEvent((event) => {
+        if (event.type !== 'review_resolved') return;
+        setPending((cur: any | null) =>
+          cur && event.approval_id && cur.approval_id === event.approval_id ? null : cur,
+        );
+        setLiveReview((cur) =>
+          cur && cur.sessionId === event.session_id && !cur.userInput ? null : cur,
+        );
+      }),
+    [],
+  );
   const dismissLiveReview = useRef({
     permission: (_runtimeInstanceId: string, _generation: number, _requestId: number, _callId: string) => {},
     userInput: () => {},
