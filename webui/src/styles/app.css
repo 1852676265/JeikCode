@@ -78,6 +78,11 @@ body {
   container-type: inline-size;
   container-name: session-header;
 }
+:root[data-theme='light'] .session-header {
+  background: #ffffff;
+  border-bottom-color: #cbd5e1;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+}
 
 .header-spacer {
   flex: 1 1 auto;
@@ -3928,6 +3933,21 @@ body {
   max-height: 280px;
   overflow: auto;
 }
+:root[data-theme='light'] .reasoning-block {
+  border-left: 3px solid var(--app-warning-accent, #b45309);
+  background: rgba(180, 83, 9, 0.04);
+  border-radius: 0 6px 6px 0;
+}
+:root[data-theme='light'] .reasoning-toggle {
+  color: var(--app-warning-accent, #b45309);
+}
+:root[data-theme='light'] .reasoning-label {
+  color: var(--app-warning-accent, #b45309);
+  font-weight: 700;
+}
+:root[data-theme='light'] .reasoning-icon {
+  color: var(--app-warning-accent, #b45309);
+}
 
 /* === Parallel sub-agent (task fan-out) panel — TUI SubtaskProgress parity === */
 .subtask-panel {
@@ -5900,6 +5920,11 @@ body {
   flex-direction: column;
   gap: 2px;
 }
+:root[data-theme='light'] .item-menu {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.05);
+}
 .item-menu-row {
   display: flex;
   align-items: center;
@@ -7565,6 +7590,41 @@ body {
   font-family: var(--app-monospace-font-family);
   white-space: nowrap;
   flex-shrink: 0;
+}
+:root[data-theme='light'] .provider-group-badge {
+  background: #e2e8f0;
+  border-color: #cbd5e1;
+  color: #334155;
+}
+:root[data-theme='light'] .provider-group-url {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  color: #475569;
+}
+:root[data-theme='light'] .provider-group-count {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  color: #475569;
+}
+:root[data-theme='light'] .provider-group {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+:root[data-theme='light'] .provider-group:hover {
+  border-color: #94a3b8;
+}
+:root[data-theme='light'] .provider-group-models {
+  background: #f1f5f9;
+  border-top-color: #cbd5e1;
+}
+:root[data-theme='light'] .model-card {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+:root[data-theme='light'] .model-card:hover {
+  border-color: #2563eb;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.1);
 }
 
 .provider-group-url {
@@ -11457,38 +11517,116 @@ body {
 }
 .cap-toggles {
   display: inline-flex;
-  gap: 4px;
+  align-items: center;
+  gap: 5px;
   flex-shrink: 0;
 }
-.cap-toggle {
+.cap-scope-unit {
   display: inline-flex;
   align-items: center;
-  height: 20px;
-  padding: 0 8px;
-  border: 1px solid transparent;
+  gap: 4px;
+  padding: 1px 3px 1px 6px;
   border-radius: 999px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+:root[data-theme='light'] .cap-scope-unit {
+  background: #f1f3f6;
+  border-color: #d8dde3;
+}
+:root[data-theme='dark'] .cap-scope-unit {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+.cap-scope-tag {
   font-size: 10px;
-  font-family: var(--app-monospace-font-family);
+  font-weight: 500;
   line-height: 1;
+  color: var(--app-secondary-foreground);
+  user-select: none;
+}
+.cap-power-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
   cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  padding: 0;
+  outline: none;
+  background: transparent;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  box-sizing: border-box;
 }
-.cap-toggle.on {
-  background: rgba(34, 197, 94, 0.18);
-  color: #22c55e;
-  border-color: rgba(34, 197, 94, 0.5);
+.cap-power-btn svg {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  transition: transform 0.18s ease, filter 0.18s ease;
 }
-.cap-toggle.off {
-  background: rgba(239, 68, 68, 0.16);
-  color: #ef4444;
-  border-color: rgba(239, 68, 68, 0.5);
+.cap-power-btn:hover:not(:disabled) {
+  transform: scale(1.1);
 }
-.cap-toggle.busy {
+.cap-power-btn:active:not(:disabled) {
+  transform: scale(0.9);
+}
+
+/* 开启状态（ON）- 现代通电绿色微光 */
+.cap-power-btn.on {
+  background: radial-gradient(circle at 50% 35%, rgba(34, 197, 94, 0.28), rgba(22, 163, 74, 0.12));
+  border-color: rgba(34, 197, 94, 0.65);
+  color: #16a34a;
+  box-shadow: 0 0 5px rgba(34, 197, 94, 0.3), inset 0 1px 1px rgba(255, 255, 255, 0.25);
+}
+.cap-power-btn.on:hover:not(:disabled) {
+  border-color: #22c55e;
+  color: #15803d;
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.5), inset 0 1px 2px rgba(255, 255, 255, 0.35);
+}
+
+/* 禁用/关闭状态（OFF）- 鲜明现代感红色开关机按键！具有红色待机指示灯质感 */
+.cap-power-btn.off {
+  background: radial-gradient(circle at 50% 35%, rgba(239, 68, 68, 0.32), rgba(220, 38, 38, 0.16));
+  border-color: rgba(239, 68, 68, 0.75);
+  color: #dc2626;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.4), inset 0 1px 1px rgba(255, 255, 255, 0.2);
+}
+.cap-power-btn.off:hover:not(:disabled) {
+  border-color: #ef4444;
+  color: #b91c1c;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.65), inset 0 1px 2px rgba(255, 255, 255, 0.3);
+}
+
+/* 暗色模式专属微调 */
+:root[data-theme='dark'] .cap-power-btn.on {
+  background: radial-gradient(circle at 50% 35%, rgba(34, 197, 94, 0.25), rgba(16, 185, 129, 0.08));
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.6);
+  box-shadow: 0 0 7px rgba(34, 197, 94, 0.4);
+}
+:root[data-theme='dark'] .cap-power-btn.off {
+  background: radial-gradient(circle at 50% 35%, rgba(239, 68, 68, 0.28), rgba(185, 28, 28, 0.1));
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.65);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+}
+
+.cap-power-btn.busy {
   opacity: 0.6;
-  cursor: default;
+  cursor: wait;
 }
-.cap-toggle:disabled {
+.cap-power-btn.busy svg {
+  animation: cap-spin 0.8s linear infinite;
+}
+@keyframes cap-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.cap-power-btn:disabled {
   cursor: default;
 }
 .cap-error {
