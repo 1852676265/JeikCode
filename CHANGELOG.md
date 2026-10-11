@@ -23,6 +23,40 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.2 (2026-10-12)
+
+- **[WebUI & Daemon Interaction] Robust send-now, idempotent turn replay, and todolist replay dedup**:
+  - **Technical Root Cause / Detail**: Three replay/stop consistency defects. (1) "Send now" never stopped the running turn: `handleSendImmediately` only tried `requestIdRef.current`, which is cleared as soon as POST /chat is admitted, so the stop was skipped entirely and the immediate delivery hit 409 session_busy — the card flashed and bounced back into the queue. (2) The canvas projection appended any replay frame whose `message_id` was missing from the canvas to the LAST assistant row; a mid-turn steer splits a turn into several assistant rows, so old body/reasoning was repainted into the newest bubble on every reconnect — the background session cache had dropped the wire id when painting, and the id-less row was later adopted as the canvas and persisted to IndexedDB. (3) `todowrite` is stateless and a full plan / batch add replaces the whole list, so re-folding a replayed call restored the statuses frozen in that call's arguments; the idempotency key was deleted exactly when the list completed, was not persisted across refresh, and was seeded by overwriting (visible window only) — which is why a fully checked list reverted after a refresh.
+  - **Implementation Mechanism**: `stopRunningTurn` becomes the single stop channel shared with the stop button (session id + request id aliases); `POST /chat/stop` reports an authoritative `released` verdict and waits for the real release (no 2.5 s cap, false while a native-runtime turn still occupies the session). Queue cards are dequeued only when the message actually becomes content (`dispatchQueuedCard`), and every queue mutation goes through `persistSessionQueue` / `updateQueuedForSession` so the in-memory map, localStorage and the backend `/chat/queue` stay identical. Every canvas writer stamps the wire identity (background cache via `paintCachedAssistantDelta`, tool rows via `withAssistantIdentity`), `mayPaintUnroutedDelta` refuses to paint an unrouted frame when the trailing assistant row already owns another identity so replays stay byte-identical, and a healthy `/chat/watch` is no longer torn down on every focus/visibility change. New `todoAppliedIds` persists the applied call-id set per session (localStorage, synchronous hydration, merge-only seeds, never cleared on completion).
+  - **Verification & Testing**: webui 472 unit tests pass (new regression tests for stop aliases and the programmatic stop mark, projection idempotency, background-cache identity stamping, and the replayed-plan revert); `tsc --noEmit` clean; `npm run build` succeeds; `cargo check --lib -p jeikcode-daemon` and the two targeted `stop_and_wait` tests pass.
+
+- **[Repository Hygiene] Pinned LF line endings via `.gitattributes` + `.editorconfig`**:
+  - **Technical Root Cause / Detail**: Line endings were unpinned (no `.gitattributes`, `core.autocrlf=true`), so the working tree was checked out as CRLF while the index stored LF; any tool rewriting a file with its own EOL style left *mixed* endings behind, and the next save produced a whole-file whitespace diff with zero content change.
+  - **Implementation Mechanism**: `* text=auto eol=lf`, with CRLF explicitly kept for `*.bat`/`*.cmd`/`*.ps1` and binary assets marked `binary`; `.editorconfig` aligns editors and formatters (LF, final newline, no trailing whitespace, Rust at 4-space indent, Markdown exempt). The index already stored LF for 1172 of 1173 text files, so this is a zero-churn change.
+  - **Verification & Testing**: `git check-attr` confirms the rules; the 7 previously mixed-endings files were normalized on disk with unchanged git content; `git hash-object --path` matches the index blob for CRLF working-tree samples (zero churn).
+
+- **[WebUI & Docs / MCP Trust] Auto-confirm MCP project trust, capability switches become the only authority**:
+  - **Technical Root Cause / Detail**: The sidebar rendered a "blocked N MCP server(s) from an untrusted project" banner plus a "Trust this project" button, so enabling a project-level MCP server always ended in an authorization prompt.
+  - **Implementation Mechanism**: The WebUI now confirms that trust silently and never prompts (`maybeAutoTrustProjectMcp`); toggling a capability ON clears the gate first (`onToggleCapability`) while OFF never touches it; new `webui/src/lib/mcpTrust.ts` isolates the policy as pure functions with regression tests; project switches revalidate the capability list; the dead `mcp.trustProject` copy and styles were removed and the docs now state the boundary — the trust gate only audits whether a server MAY load, while the GLOBAL/PROJECT switches decide whether it DOES load.
+  - **Verification & Testing**: `npm run build` and `node --test` (478/478, including the new trust-policy cases) pass.
+
+---
+
+- **[WebUI 与 Daemon 交互] 立即发送可靠化、回合重放幂等与 todolist 重放去重**:
+  - **技术机理 / 现象溯源**: 三类停止/重放一致性缺陷：（1）“立即发送”从未真正停止运行中的回合——`handleSendImmediately` 只尝试 `requestIdRef.current`，而它在 POST /chat 被 admit（202）之后即被清空，停止被整体跳过，紧接着的投递必然撞上 409 session_busy，卡片闪一下又弹回队列；（2）画布投影会把“`message_id` 在画布上找不到”的重放帧追加到最后一条 assistant 上，而中途 steer 会把一个 turn 劈成多条 assistant 行，于是旧正文/思考每次重连都被画进最新气泡——根源是后台会话缓存落笔时丢掉了 wire 身份，缺 id 的行随后被采用为画布并写入 IndexedDB；（3）`todowrite` 无状态，全量 plan / 批量 add 是整表替换，重复折叠重放帧就会把清单打回该调用参数里冻结的状态，而幂等键恰好在清单全完成时被删除、不跨刷新持久化、种子是覆盖式（只看得到当前窗口），所以“全部打钩”的清单刷新后会回退。
+  - **实现防线 / 核心改动**: `stopRunningTurn` 成为与“停止”按钮共用的唯一停止通道（会话 id + request id 双别名）；`POST /chat/stop` 返回权威 `released` 结论并等待真正离场（去掉 2.5s 上限，native runtime 仍占用时保持 false）。队列卡片只在消息真正成为正文时才出队（`dispatchQueuedCard`），所有队列变更统一走 `persistSessionQueue` / `updateQueuedForSession`，保证内存映射、localStorage 与后端 `/chat/queue` 三处一致。所有画布写入者统一盖章 wire 身份（后台缓存经 `paintCachedAssistantDelta`，工具行经 `withAssistantIdentity`），新增 `mayPaintUnroutedDelta` 在末行已属别轮时拒绝落笔（同一帧重放任意多次，画布一字不变），健康中的 `/chat/watch` 不再在每次失焦/可见性变化时被拆除。新增 `todoAppliedIds`：按会话持久化“已消费的调用 id”（localStorage、同步水合、种子只并入、全完成不清空）。
+  - **验证与交付**: webui 472 项单测全绿（新增停止别名/程序化停止标记、投影幂等、后台缓存身份盖章、重放 plan 不得回退的回归测试）；`tsc --noEmit` 干净；`npm run build` 成功；`cargo check --lib -p jeikcode-daemon` 与两个 `stop_and_wait` 定向单测通过。
+
+- **[仓库卫生] 行尾约定钉死：`.gitattributes` + `.editorconfig`**:
+  - **技术机理 / 现象溯源**: 行尾此前未被钉死（无 `.gitattributes` 且 `core.autocrlf=true`）：索引存 LF、工作区检出为 CRLF，任何工具按自己的行尾风格重写文件都会留下 mixed 行尾，下一次保存就产出“整片空白 diff、内容零变化”的噪音。
+  - **实现防线 / 核心改动**: `* text=auto eol=lf`，`*.bat`/`*.cmd`/`*.ps1` 显式保留 CRLF，二进制资产标记 `binary`；`.editorconfig` 对齐编辑器/格式化器（LF、末尾换行、不留尾部空白，Rust 4 空格，Markdown 豁免）。索引中 1172/1173 个文本文件本就是 LF，因此零内容变更。
+  - **验证与交付**: `git check-attr` 确认规则生效；7 个 mixed 行尾文件已在工作区归一且 git 内容不变；`git hash-object --path` 与索引 blob 逐字节一致（零 churn）。
+
+- **[WebUI 与文档 / MCP 信任] MCP 项目信任自动确认，能力开关成为是否加载的唯一权威**:
+  - **技术机理 / 现象溯源**: 侧栏原先渲染“已拦截 N 个来自不受信任项目的 MCP server”横幅与“信任本项目”按钮，导致每次启用项目级 MCP 都要过一次授权提示。
+  - **实现防线 / 核心改动**: WebUI 静默完成该信任、不再弹任何提示（`maybeAutoTrustProjectMcp`）；开关 ON 前先清信任闸门（`onToggleCapability`），OFF 永不触碰信任闸门；新增 `webui/src/lib/mcpTrust.ts` 纯策略函数与回归测试；项目切换时重新校验能力列表；删除失效的 `mcp.trustProject` 文案与样式，文档统一到“信任闸门只管能不能加载，全局/项目开关决定是否加载”。
+  - **验证与交付**: `npm run build` 与 `node --test`（478/478，含新增信任策略用例）通过。
+
 ## v7.2.2-beta.1 (2026-10-12)
 
 - **[Unified Tool-Output Compression (capabilities/kernel/config)]**:
