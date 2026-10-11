@@ -93,7 +93,7 @@ impl Tool for EditFileTool {
                             "old_string": { "type": "string", "description": "Exact text to find and replace." },
                             "new_string": { "type": "string", "description": "Replacement text." },
                             "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)." },
-                            "occurrence": { "type": "integer", "minimum": 1, "description": "1-based match index when old_string appears multiple times." }
+                            "occurrence": { "type": "integer", "minimum": 1, "description": "1-based match index when old_string appears multiple times (ignored when replace_all is true)." }
                         },
                         "required": ["old_string", "new_string"]
                     }
@@ -118,6 +118,48 @@ impl Tool for EditFileTool {
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let t0 = std::time::Instant::now();
+        // 调用方是否真的传了非空 `edits[]`（而非便捷形）。必须在归一化前判定：
+        // 归一化会把顶层 old/new 对合成进 edits[]，之后无法再区分两者。
+        let caller_passed_edits = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|value| value.get("edits").cloned())
+            .is_some_and(|edits| edits.as_array().is_some_and(|list| !list.is_empty()));
+        // 定位式报错要在**原始 args** 上做：`deserialize_edits` 会把“只有 new_string”的
+        // hunk 静默丢掉，解析后就无法再点名是哪一条缺字段了。
+        let raw_edits_missing_old_string = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|value| value.get("edits").cloned())
+            .and_then(|edits| edits.as_array().cloned())
+            .and_then(|list| {
+                let missing: Vec<usize> = list
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, hunk)| {
+                        hunk.is_object()
+                            && ["old_string", "old_str", "oldText", "search"].iter().all(|key| {
+                                hunk.get(key)
+                                    .and_then(|value| value.as_str())
+                                    .map(str::trim)
+                                    .unwrap_or("")
+                                    .is_empty()
+                            })
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                (!missing.is_empty()).then_some((missing, list.len()))
+            });
+        // 混合情形（部分 hunk 缺 `old_string`）→ 在入参校验之前就点名第几条，
+        // 否则会被笼统的 "each hunk needs old_string and new_string" 抢先拒掉。
+        // 全缺则保留既有笼统提示（不改变旧行为）。
+        if let Some((missing, total)) = raw_edits_missing_old_string.clone() {
+            if missing.len() < total {
+                return err(format!(
+                    "edit: edits[{}] is missing `old_string` (the exact text to find). \
+                     Provide it or drop that hunk — the file was NOT modified.",
+                    missing[0]
+                ));
+            }
+        }
         let args = crate::tools::repair::normalize_edit_file_args(args);
         let a: Args = match parse_tool_args(
             "edit",
@@ -134,6 +176,28 @@ impl Tool for EditFileTool {
             Ok(a) => a,
             Err(e) => return e.into_tool_result(),
         };
+        // 顶层 `replace_all` 只属于“便捷形”（无 edits[]，顶层 old/new 对）。
+        // 一旦调用方用了 `edits[]`，顶层开关会静默失效（仅 hunk 级生效），
+        // 造成“我以为全局全替换、实际只替换第一处”——宁可响亮报错也不静默降级。
+        if caller_passed_edits && a.replace_all {
+            return err(
+                "edit: `replace_all` is per-hunk — move it inside `edits[]` \
+                 (e.g. edits:[{\"old_string\":…,\"new_string\":…,\"replace_all\":true}]). \
+                 The top-level `replace_all` only applies to the single-hunk convenience form \
+                 (old_string/new_string without `edits`). The file was NOT modified."
+                    .to_string(),
+            );
+        }
+        // 混合情形（部分 hunk 缺 `old_string`）已在入参校验前拦截；这里只保留全缺时的笼统提示。
+        if let Some((missing, total)) = raw_edits_missing_old_string {
+            if missing.len() == total && total > 1 {
+                return err(format!(
+                    "edit: edits[{}] is missing `old_string` (the exact text to find). \
+                     Provide it or drop that hunk — the file was NOT modified.",
+                    missing[0]
+                ));
+            }
+        }
         let hunks: Vec<EditHunk> = if !a.edits.is_empty() {
             a.edits
         } else if !a.old_string.is_empty() || !a.new_string.is_empty() {
@@ -156,6 +220,17 @@ impl Tool for EditFileTool {
                 "edit_file: provide a non-empty `edits` array with `old_string` and `new_string`."
                     .to_string(),
             );
+        }
+        // 定位式报错：直接点名第几条 hunk 缺哪个字段（`edits[N]`），让模型一次重试命中，
+        // 而不是回看整段 payload 猜是哪一条（否则只能拿到 "not found" 这类误导性错误）。
+        // 到此处已排除“全部 hunk 都空”的情形。
+        for (index, hunk) in hunks.iter().enumerate() {
+            if hunk.old_string.is_empty() {
+                return err(format!(
+                    "edit: edits[{index}] is missing `old_string` (the exact text to find). \
+                     Provide it or drop that hunk — the file was NOT modified."
+                ));
+            }
         }
         let path = resolve_path(&a.path, &ctx.working_dir);
         let raw = match tokio::fs::read(&path).await {
@@ -2203,6 +2278,102 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
             "x\nx\nx\n"
+        );
+    }
+
+    /// 顶层 `replace_all` 只能用于便捷形；与 `edits[]` 混用必须响亮报错，
+    /// 而不是静默按 hunk 级 false 处理（那会把“全替换”变成只替换第一处）。
+    #[tokio::test]
+    async fn top_level_replace_all_with_edits_array_is_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
+        let args = serde_json::json!({
+            "file_path": "a.txt",
+            "replace_all": true,
+            "edits": [{"old_string": "dup", "new_string": "x"}]
+        });
+        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("per-hunk"), "{}", r.content);
+        // 拒绝必须发生在写盘之前。
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "dup\ndup\n"
+        );
+    }
+
+    /// 支持的写法：`replace_all` 放进 hunk。
+    #[tokio::test]
+    async fn hunk_level_replace_all_still_works() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
+        let args = serde_json::json!({
+            "file_path": "a.txt",
+            "edits": [{"old_string": "dup", "new_string": "x", "replace_all": true}]
+        });
+        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "x\nx\n"
+        );
+    }
+
+    /// 便捷形（无 edits[]）的顶层 `replace_all` 照旧生效：零行为回归。
+    #[tokio::test]
+    async fn convenience_form_keeps_top_level_replace_all() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
+        let args = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "dup",
+            "new_string": "x",
+            "replace_all": true
+        });
+        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "x\nx\n"
+        );
+    }
+
+    /// `replace_all` 优先于 `occurrence`（已文档化在 schema 描述里）：同时给出时忽略定位。
+    #[tokio::test]
+    async fn replace_all_takes_precedence_over_occurrence() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "dup\ndup\ndup\n").unwrap();
+        let args = serde_json::json!({
+            "file_path": "a.txt",
+            "edits": [{"old_string": "dup", "new_string": "x", "replace_all": true, "occurrence": 2}]
+        });
+        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "x\nx\nx\n"
+        );
+    }
+
+    /// 缺字段时报错必须点名 `edits[N]`（模型一次重试命中）；
+    /// 且校验必须发生在写盘之前（不能写一半）。
+    #[tokio::test]
+    async fn missing_old_string_names_the_hunk_index() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
+        let args = serde_json::json!({
+            "file_path": "a.txt",
+            "edits": [
+                {"old_string": "hello", "new_string": "world"},
+                {"new_string": "新增"}
+            ]
+        });
+        let r = EditFileTool.execute(&args.to_string(), &ctx(d.path())).await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("edits[1]"), "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "hello\n"
         );
     }
 
