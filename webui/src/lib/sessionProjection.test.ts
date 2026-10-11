@@ -648,3 +648,31 @@ test('an unrouted delta still opens the placeholder round it belongs to', () => 
   assert.equal(replayed[1]?.parts[0]?.text, '旧正文（重放补充）');
   assert.equal(replayed[3]?.parts[0]?.text, '新正文', '最新 agent 消息绝不能被旧正文污染');
 });
+
+test('live streaming of multi-round turn (tools in round 1, final text in round 2) is NEVER blocked', () => {
+  // 模拟真实用户场景：
+  // 1. 提问后，助手气泡最初为占位
+  // 2. Round 1 执行工具调用（Read/Grep 等），被盖上 id: m-round-1
+  const user = { role: 'user', parts: [{ kind: 'text' as const, text: '我问你挂载的工具' }] };
+  const assistantRound1 = {
+    role: 'assistant',
+    id: 'm-round-1',
+    parts: [
+      { kind: 'tool' as const, tool: { id: 'call_1', name: 'read', status: 'done' as const } },
+      { kind: 'tool' as const, tool: { id: 'call_2', name: 'grep', status: 'done' as const } },
+    ],
+  };
+  const canvas = [user, assistantRound1];
+
+  // 3. Round 2 开始实时吐字：文本增量携带全新的 round id: m-round-2，且 replay: false（实时流）
+  // 核心断言：直播流绝不能被拦截，必须 0ms 立即实时合并进当前助手气泡，用户边看边吐字！
+  const streamed = paintAssistantText(canvas, '以下是挂载的工具清单：', false, 'm-round-2');
+  assert.equal(streamed.length, 2);
+  assert.equal(streamed[1]?.parts.length, 3);
+  assert.equal(streamed[1]?.parts[2]?.kind, 'text');
+  assert.equal(streamed[1]?.parts[2]?.text, '以下是挂载的工具清单：');
+
+  // 后续流式增量继续实时追加
+  const streamed2 = paintAssistantText(streamed, '\n一、内置工具', false, 'm-round-2');
+  assert.equal(streamed2[1]?.parts[2]?.text, '以下是挂载的工具清单：\n一、内置工具');
+});

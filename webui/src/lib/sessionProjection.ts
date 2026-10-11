@@ -43,34 +43,58 @@ export interface ProjectionMessage {
 /**
  * 身份未命中时，是否允许把增量落到“最后一条 assistant”。
  *
- * 这是重放幂等的闸门：额外盖了**别的**身份的收尾行意味着这帧内容属于另一轮
- * （典型：turn 中途插了 steer，轮次被劈成多条 assistant 行）。此时若退化成
- * “追加到最后一条”，旧正文/思考就会被画到最新消息附近，且每次重放都再画一遍
- * —— 画布不幂等，失焦重进多少次就脏多少（而正确的重放应当原地不动）。
- * 本轮的占位行（未盖章）与“旧 daemon 不带身份”的帧不受影响，保持原有语义。
+ * 核心铁律：
+ * 1. 直播推流（replay === false）：绝对放行！LLM 实时吐字必须 0 延迟实时上屏，
+ *    一个回合内哪怕多轮工具调用（工具轮 m-1、正文轮 m-2），正文也必须自然并入当前助手气泡，
+ *    绝不能等回合结束或刷新/失焦才出来！
+ * 2. 重放阶段（replay === true）：若该帧携带的 targetId 在画布上全无踪迹，
+ *    且当前画布存在中途插入的 user 消息（例如 Steer 导致轮次被分割成多个 assistant 气泡），
+ *    绝不允许将属于 Steer 之前的旧事件盲目外溢涂写到 Steer 之后的最新助手气泡中。
  */
 export function mayPaintUnroutedDelta<T extends ProjectionMessage>(
   messages: T[],
   targetId?: string,
+  replay?: boolean,
 ): boolean {
+  if (!replay) return true; // 直播推流：绝对不拦截！
   if (!targetId) return true; // 旧 daemon：无身份可依，保持既有尾随语义
   const last = messages[messages.length - 1];
-  if (!last || last.role !== 'assistant') return true; // 新回合的新行正由本次落笔创建
-  return !last.id; // 空行（本轮占位）可落笔；已属于别的轮次则拒绝
+  if (!last || last.role !== 'assistant') return true;
+  // 重放期：检查是否存在跨轮隔离（即末尾 assistant 前方存在 user 气泡，且该 user 气泡之前还有更早的 assistant）
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === 'user') {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx > 0 && messages.slice(0, lastUserIdx).some((m) => m.role === 'assistant')) {
+    // 存在 Steer 等跨轮隔离时，未寻址的老重放帧绝不污染跨轮后的末尾气泡
+    return !last.id;
+  }
+  return true;
 }
 
 /**
  * 归属消息定位：`messageId` 命中画布上的 assistant 消息时返回其下标，否则 -1。
- * 回合中途插入的 steer 气泡会把“最后一条”变成用户行；谁属于哪一轮由管线
- * 身份（message_id）决定，绝不能用“最后一条 assistant”猜。
+ * 1. 优先按 message.id 直接比对；
+ * 2. 兼容一轮多 round：若某个部件（part）由该 round 生成（part.id 以 `${messageId}:` 开头），
+ *    同样精确归属于包含该部件的 assistant 消息，彻底根治多轮工具后正文重放找不到宿主的隐患！
  */
 export function identifiedAssistantIndex(
-  messages: Array<{ role: string; id?: string }>,
+  messages: Array<{ role: string; id?: string; parts?: MsgPart[] }>,
   messageId?: string,
 ): number {
   if (!messageId) return -1;
-  const index = messages.findIndex((message) => message.id === messageId);
-  return index >= 0 && messages[index]!.role === 'assistant' ? index : -1;
+  const prefix = `${messageId}:`;
+  const index = messages.findIndex((message) => {
+    if (message.role !== 'assistant') return false;
+    if (message.id === messageId) return true;
+    return message.parts?.some((p) =>
+      ('id' in p && typeof p.id === 'string' && (p.id === messageId || p.id.startsWith(prefix)))
+    );
+  });
+  return index >= 0 ? index : -1;
 }
 
 /**
@@ -306,8 +330,8 @@ export function paintAssistantText<T extends ProjectionMessage>(
     next[target] = { ...messages[target]!, parts };
     return next;
   }
-  // 身份未命中：只有“本轮的占位行”可以接收，否则这帧属于另一轮，必须拒绝落笔。
-  if (!mayPaintUnroutedDelta(messages, targetId)) return messages;
+  // 身份未命中：重放期若末尾消息已被跨轮隔离，必须拒绝落笔；直播期 100% 放行流式吐字。
+  if (!mayPaintUnroutedDelta(messages, targetId, replay)) return messages;
   if (messages.length === 0) {
     if (!content) return messages;
     return [{ role: 'assistant', parts: [{ kind: 'text', text: content }] } as unknown as T];
@@ -371,8 +395,8 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
     next[target] = { ...messages[target]!, parts };
     return next;
   }
-  // 身份未命中：同 paintAssistantText，绝不能把旧回合的思考追加到最新消息上。
-  if (!mayPaintUnroutedDelta(messages, targetId)) return messages;
+  // 身份未命中：同 paintAssistantText，重放期若被跨轮隔离拒绝落笔，直播期 100% 实时上屏。
+  if (!mayPaintUnroutedDelta(messages, targetId, replay)) return messages;
 
   let last = messages[messages.length - 1];
   let base = messages;

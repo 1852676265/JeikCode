@@ -1822,6 +1822,8 @@ export function Chat({
       viewedProjectHashRef.current ||
       projectHashBySessionRef.current.get(loadId) ||
       '';
+    // 本端是否已收到终态；决定流正常关闭后要不要补一次磁盘对账。
+    let terminalSeen = false;
 
     void watchChatSession(
       loadId,
@@ -1851,6 +1853,7 @@ export function Chat({
             event.type === 'stopped' ||
             event.type === 'error'
           ) {
+            terminalSeen = true;
             sessionWatchersRef.current.delete(loadId);
             localActiveStreamsBySessionRef.current.delete(loadId);
             settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
@@ -1873,7 +1876,15 @@ export function Chat({
         }
       },
       watchAbort.signal,
-    ).catch((err) => {
+    ).then(() => {
+      // 流被服务端正常关闭却从未送达终态（终态帧丢失/竞态/服务端重启）：本端不会再收到推送，
+      // 立刻做一次磁盘对账并挂上兜底 tick，杜绝“通知响了、正文却要刷新/失焦才出现”。
+      if (terminalSeen || watchAbort.signal.aborted) return;
+      settleDiskCatchUp(effectiveProjectHash, loadId);
+      if (effectiveProjectHash) {
+        startDetachedTick(effectiveProjectHash, loadId, loadGeneration);
+      }
+    }).catch((err) => {
       if (err?.name === 'AbortError') return;
       sessionWatchersRef.current.delete(loadId);
       localActiveStreamsBySessionRef.current.delete(loadId);
@@ -1896,8 +1907,15 @@ export function Chat({
   // 共用。
   /** Live tokens win. Disk is touched only after the stream goes quiet, and
    *  only the transcript body is read when the file size or mtime changed. */
-  async function catchUpFromDisk(hash: string, id: string): Promise<boolean | null> {
-    if (Date.now() - lastLiveContentRef.current < 1500) return null;
+  async function catchUpFromDisk(
+    hash: string,
+    id: string,
+    opts?: { force?: boolean },
+  ): Promise<boolean | null> {
+    // force：回合收尾（终态到达 / 用户停止）时的一次性对账，必须跳过“流刚吐过内容”的
+    // 静默守卫，否则最后一段正文永远补不回来（表现为通知已响、正文要刷新/失焦才出现）。
+    const force = opts?.force === true;
+    if (!force && Date.now() - lastLiveContentRef.current < 1500) return null;
     const fresh = await getSessionFreshness(hash, id);
     const sig = `${fresh.bytes}:${fresh.mtime_ms}`;
     // Right after Send, /chat/active and the file can still say "idle" for a
@@ -1906,7 +1924,7 @@ export function Chat({
     const sinceSend = turnStartedAtRef.current == null
       ? Number.POSITIVE_INFINITY
       : Date.now() - turnStartedAtRef.current;
-    if (!fresh.running && sinceSend < 2500) return true;
+    if (!force && !fresh.running && sinceSend < 2500) return true;
     if (sig === freshnessSigRef.current) return fresh.running;
     freshnessSigRef.current = sig;
 
@@ -1944,6 +1962,28 @@ export function Chat({
       }
     }
     return fresh.running;
+  }
+
+  /**
+   * 回合收尾的一次性磁盘对账（终态到达、用户停止、或视图流未送终态即关闭）。
+   *
+   * 画布只靠 `/chat/watch` 一条流推进，而终态通知是另一套轮询（`/chat/active`）发出的——
+   * 因此“右下角已提示完成、最后一段正文却要刷新/失焦才出现”的根因就是：流可能没把尾段
+   * 或终态送到，而画布路径此前从不回读磁盘。磁盘是回合结算后的权威，这里强制拉取一次
+   * （仍在运行时按 800ms 重试至多 3 次），把尾段正文与 busy/看门狗状态一次性对齐。
+   */
+  function settleDiskCatchUp(projectHash: string, sid: string) {
+    if (!projectHash || !sid) return;
+    const attempt = (delay: number, triesLeft: number) => {
+      window.setTimeout(() => {
+        if (activeIdRef.current !== sid) return;
+        void catchUpFromDisk(projectHash, sid, { force: true }).then((running) => {
+          // false = 已确认空闲且完成对账；null/true 表示仍不确定（后端还在收尾）→ 重试。
+          if (running !== false && triesLeft > 0) attempt(800, triesLeft - 1);
+        });
+      }, delay);
+    };
+    attempt(0, 3);
   }
 
   function startDetachedTick(
@@ -2044,6 +2084,8 @@ export function Chat({
     // API turn 已落盘:通知 App 刷新侧栏(消息数/自动命名标题),新建会话才会出现。
     onLiveTurnDone?.();
     startIdleWatch(projectHash, loadId, loadGeneration);
+    // 终态已到：磁盘已结算，强制对账一次，补回流里可能丢掉（或被去重吞掉）的尾段正文。
+    settleDiskCatchUp(projectHash, loadId);
   }
   function startIdleWatch(
     projectHash: string,
@@ -7399,6 +7441,9 @@ export function Chat({
       const loadGeneration = sessionGenerationRef.current;
       if (projectHash && currentSid) {
         startIdleWatch(projectHash, currentSid, loadGeneration);
+        // 停止通道已 await 后端真实释放（快照已落盘）：立刻磁盘对账一次，
+        // 把被 abort 掉的那条流可能丢掉的最后一段正文补回画布（无需刷新/失焦）。
+        settleDiskCatchUp(projectHash, currentSid);
       }
     }
   }
