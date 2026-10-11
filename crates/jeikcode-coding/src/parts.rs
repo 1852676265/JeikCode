@@ -497,6 +497,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     for (dir, ns) in &opts.plugin_skill_dirs {
         skills.load_dir(dir, Some(ns));
     }
+    // Honor the persisted GLOBAL/PROJECT skill disable state: a disabled skill is
+    // dropped from BOTH the prompt catalog and `use_skill`. A capability reload
+    // re-runs `prepare`, so a fresh disable/enable lands in the very next prompt.
+    skills.retain_enabled(&jeikcode_capabilities::skills::controls::load_disabled(
+        &cfg.working_dir,
+    ));
     let skills = Arc::new(skills);
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
