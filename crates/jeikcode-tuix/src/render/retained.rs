@@ -15542,8 +15542,10 @@ mod tests {
         );
     }
 
-    /// Small frames must NOT chunk — single `write` per flush keeps
-    /// syscall count minimal on the steady-state keystroke path.
+    /// Small frames must NOT chunk — a steady-state keystroke stays within the paint write
+    /// budget. Unix emits a separate 3-byte DA1 query after painting to unstick the terminal
+    /// input parser; it is not part of the frame payload (pinned byte-for-byte by
+    /// `unstick_input_parser_emits_da1_query`), so it must not consume a frame slot.
     #[test]
     fn retained_small_frame_single_write() {
         let (mut r, chunks) = new_chunk_counting(80, 24);
@@ -15569,16 +15571,28 @@ mod tests {
         });
         r.flush_deferred();
         let sizes = chunks.lock().unwrap().clone();
+        #[cfg(unix)]
+        let frame_writes = {
+            // The parser-safety query is a separate terminal write; do not count it as a
+            // frame write or relax the four-write paint budget.
+            assert_eq!(sizes.last().copied(), Some(3), "Unix DA1 write missing");
+            &sizes[..sizes.len() - 1]
+        };
+        #[cfg(not(unix))]
+        let frame_writes = sizes.as_slice();
         assert!(
-            sizes.len() <= 4,
-            "steady-state keystroke should be within expected write count (sizes: {:?})",
-            sizes
+            !frame_writes.is_empty(),
+            "keystroke emitted no frame: {sizes:?}"
         );
-        if sizes.len() == 1 {
+        assert!(
+            frame_writes.len() <= 4,
+            "steady-state keystroke should be within expected write count (sizes: {sizes:?})"
+        );
+        if frame_writes.len() == 1 {
             assert!(
-                sizes[0] < 512,
+                frame_writes[0] < 512,
                 "keystroke delta should be well under 512 B (got {} B)",
-                sizes[0]
+                frame_writes[0]
             );
         }
     }
