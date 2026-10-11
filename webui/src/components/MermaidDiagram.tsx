@@ -45,16 +45,51 @@ function getMermaid() {
 }
 
 // SECURITY: Mermaid runs with `securityLevel: 'loose'` so rich HTML labels and `<br/>`
-// render, which also means untrusted diagram source can emit markup. Sanitize the
-// produced SVG (scripts / event handlers / javascript: URLs removed) before it is
-// injected through `dangerouslySetInnerHTML` — defence-in-depth for PR #35 follow-up.
-function sanitizeMermaidSvg(svg: string): string {
+// render, which also means untrusted diagram source can emit markup.
+//
+// NOTE: DOMPurify's default SVG namespace validation strictly forbids HTML elements
+// (like `<div>`, `<span>`, `<p>`) nested inside SVG elements (like `<foreignObject>`),
+// treating them as invalid namespace transitions (mXSS protection) and stripping all
+// children of `<foreignObject>`. Because Mermaid renders all flowchart node labels inside
+// `<foreignObject><div>...</div></foreignObject>`, calling DOMPurify directly on the full
+// SVG string wipes out all node text.
+//
+// To safely sanitize without stripping labels:
+// 1. Extract each `<foreignObject>` inner HTML and replace with an unguessable placeholder token.
+// 2. Sanitize the outer SVG structure with DOMPurify's SVG profile.
+// 3. Sanitize each `<foreignObject>` inner HTML with DOMPurify's HTML+SVG profile.
+// 4. Restore the sanitized inner HTML back into the placeholder locations.
+export function sanitizeMermaidSvg(svg: string): string {
   if (typeof window === 'undefined') return svg;
-  return DOMPurify.sanitize(svg, {
-    USE_PROFILES: { svg: true, svgFilters: true, html: true },
+
+  const foMap = new Map<string, string>();
+  let counter = 0;
+  const tokenPrefix = `__MERMAID_FO_${Math.random().toString(36).slice(2)}_${Date.now()}_`;
+
+  const placeholderSvg = svg.replace(
+    /(<foreignObject\b[^>]*>)([\s\S]*?)(<\/foreignObject>)/gi,
+    (_match, openTag, innerContent, closeTag) => {
+      const id = `${tokenPrefix}${counter++}__`;
+      const cleanInner = DOMPurify.sanitize(innerContent, {
+        USE_PROFILES: { html: true, svg: true },
+        ADD_ATTR: ['target', 'rel'],
+      });
+      foMap.set(id, cleanInner);
+      return `${openTag}${id}${closeTag}`;
+    }
+  );
+
+  let cleanSvg = DOMPurify.sanitize(placeholderSvg, {
+    USE_PROFILES: { svg: true, svgFilters: true },
     ADD_TAGS: ['foreignObject'],
     ADD_ATTR: ['dominant-baseline', 'text-anchor', 'paint-order', 'marker-end', 'marker-start', 'xmlns:xlink'],
   });
+
+  for (const [id, cleanInner] of foMap.entries()) {
+    cleanSvg = cleanSvg.replace(id, () => cleanInner);
+  }
+
+  return cleanSvg;
 }
 
 export function MermaidDiagram({ code, isDark = false, t: propT }: MermaidDiagramProps) {
