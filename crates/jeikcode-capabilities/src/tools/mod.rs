@@ -89,7 +89,7 @@ pub use grep::GrepTool;
 pub use jeikcode_config_guide::{JeikcodeConfigGuideTool, JeikcodeConfigTool};
 pub use output_artifact::{
     artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
-    ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
+    ARTIFACT_TRUNCATION_MARKER_PREFIX, TERMINAL_THRESHOLD_BYTES, THRESHOLD_BYTES,
 };
 pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};

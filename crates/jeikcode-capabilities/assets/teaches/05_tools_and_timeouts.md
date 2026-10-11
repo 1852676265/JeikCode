@@ -60,14 +60,15 @@ idle_ttl_secs = 600         # scope="session" 的 MCP 进程闲置回收超时�
 
 ---
 
-## 3. 工具输出折叠策略 (`[tools.tool_output]`)
+## 3. 工具输出压缩策略 (`[tools.tool_output]`)
 
-防止大输出占满上下文窗口：
+防止大输出占满上下文窗口。非豁免工具超过阈值即压缩为「头 1500 + 尾 2200 字节」预览 + `artifact` 钥匙；完整文本落盘，模型按需调用 `fetch_output` 取回：
 
 ```toml
 [tools.tool_output]
-max_bytes = 65536               # 输出折叠阈值（字节，默认 65536 = 64KiB；设为 0 完全禁用折叠）
-no_fold_tools = [               # 白名单工具列表：输出直接原样返回，绝不折叠
+max_bytes = 65536               # 通用压缩阈值（字节，默认 65536 = 64KiB；0 完全禁用压缩）
+terminal_max_bytes = 24576      # 终端（run_command/bash）更早的压缩线（字节，默认 24KiB；0 表示跟随 max_bytes）
+no_fold_tools = [               # 白名单工具列表：输出直接原样返回，绝不压缩
     "fetch_output",
     "code_explore",
     "web_fetch",
@@ -75,7 +76,9 @@ no_fold_tools = [               # 白名单工具列表：输出直接原样返�
 ]
 ```
 
-- 超过 `max_bytes` 的工具输出将截断为首尾预览并存入临时产物，模型需按需调用 `fetch_output` 提取完整文本。
+- 终端类工具的生效阈值 = `min(max_bytes, terminal_max_bytes)`；调低任意一项都会对终端收紧。
+- 豁免工具（`no_fold_tools` 名单 + 工具自带 `never_truncate_result()`）完全跳过压缩。
+- 两个阈值均支持 env 覆盖：`JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES` / `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES`（env 优先于 config.toml）。
 
 ---
 

@@ -376,19 +376,31 @@ impl ToolTimeoutsConfig {
     }
 }
 
-/// `[tools.tool_output]` — where oversized tool results are folded into a
-/// head+tail preview and spilled to an artifact (recoverable via fetch_output).
+/// `[tools.tool_output]` — where oversized tool results are compressed into a
+/// head+tail preview plus an artifact handle (the full text stays on disk and
+/// is recoverable via fetch_output). Tools listed in `no_fold_tools` (or
+/// declaring `never_truncate_result()`) bypass this entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolOutputConfig {
-    /// Fold threshold in bytes. Results larger than this are replaced by a
-    /// preview. `None` (or missing) → the built-in default
-    /// (`THRESHOLD_BYTES`, 64 KiB). `0` disables folding entirely.
+    /// Compression threshold in bytes. Results larger than this are replaced by
+    /// a head/tail preview plus an `artifact_id` handle. `None` (or missing) →
+    /// the built-in default (64 KiB). `0` disables compression entirely.
     #[serde(
         default = "default_tool_output_max_bytes",
         skip_serializing_if = "Option::is_none"
     )]
     pub max_bytes: Option<usize>,
+    /// Terminal (shell) compression threshold in bytes — the earlier line for
+    /// console streams (`run_command` / `bash`). The effective line for terminal
+    /// tools is `min(max_bytes, terminal_max_bytes)`. `None` (or missing) → the
+    /// built-in default (24 KiB). `0` drops the terminal early line (terminal
+    /// tools then follow `max_bytes`).
+    #[serde(
+        default = "default_tool_output_terminal_max_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub terminal_max_bytes: Option<usize>,
     /// Tool names whose output must reach the model verbatim (never folded),
     /// regardless of size. Batch whitelist: list any built-in tool name
     /// (see `.jeikcode/builtin-tools.txt` for the full catalog) and its
@@ -403,6 +415,10 @@ pub struct ToolOutputConfig {
 
 fn default_tool_output_max_bytes() -> Option<usize> {
     Some(65536)
+}
+
+fn default_tool_output_terminal_max_bytes() -> Option<usize> {
+    Some(24576)
 }
 
 fn default_no_fold_tools() -> Vec<String> {
@@ -420,6 +436,7 @@ impl Default for ToolOutputConfig {
     fn default() -> Self {
         Self {
             max_bytes: Some(65536),
+            terminal_max_bytes: Some(24576),
             no_fold_tools: default_no_fold_tools(),
         }
     }
@@ -3666,20 +3683,23 @@ context_window = 131072
 
     #[test]
     fn tool_output_config_defaults_and_parses() {
-        // Absent section → fork defaults (64 KiB + explore/search whitelist).
+        // Absent section → fork defaults (64 KiB + 24 KiB terminal + whitelist).
         let defaulted: Config = toml::from_str("").unwrap();
         assert_eq!(defaulted.tools.tool_output.max_bytes, Some(65536));
+        assert_eq!(defaulted.tools.tool_output.terminal_max_bytes, Some(24576));
         assert_eq!(
             defaulted.tools.tool_output.no_fold_tools,
             default_no_fold_tools()
         );
 
-        // Explicit value round-trips.
+        // Explicit values round-trip (both thresholds are configurable).
         let configured: Config =
-            toml::from_str("[tools.tool_output]\nmax_bytes = 131072\n").unwrap();
+            toml::from_str("[tools.tool_output]\nmax_bytes = 131072\nterminal_max_bytes = 32768\n")
+                .unwrap();
         assert_eq!(configured.tools.tool_output.max_bytes, Some(131072));
+        assert_eq!(configured.tools.tool_output.terminal_max_bytes, Some(32768));
 
-        // 0 explicitly disables folding (distinct from absent).
+        // 0 explicitly disables compression (distinct from absent).
         let zero: Config = toml::from_str("[tools.tool_output]\nmax_bytes = 0\n").unwrap();
         assert_eq!(zero.tools.tool_output.max_bytes, Some(0));
     }

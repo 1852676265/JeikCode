@@ -240,12 +240,18 @@ pub struct CodingAgentConfig {
     pub subagent_fast_provider: Option<Arc<TierProvider>>,
     /// Swap-aware, lazily-built CAPABLE-tier provider (same contract as above).
     pub subagent_capable_provider: Option<Arc<TierProvider>>,
-    /// Tool-result fold threshold in bytes. `None` → built-in default
-    /// (64 KiB); `Some(0)` disables folding entirely. Sourced from
+    /// Tool-result compression threshold in bytes. `None` → built-in default
+    /// (64 KiB); `Some(0)` disables compression entirely. Sourced from
     /// `[tools.tool_output] max_bytes` (config) / `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES` (env,
     /// wins).
     pub tool_output_max_bytes: Option<usize>,
-    /// Tool names exempt from output folding (config `[tools.tool_output]
+    /// Terminal (shell) compression threshold in bytes — the earlier line for
+    /// console streams. `None` → built-in default (24 KiB); `Some(0)` drops the
+    /// terminal early line (terminal tools then follow `tool_output_max_bytes`).
+    /// Sourced from `[tools.tool_output] terminal_max_bytes` (config) /
+    /// `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES` (env, wins).
+    pub tool_output_terminal_max_bytes: Option<usize>,
+    /// Tool names exempt from output compression (config `[tools.tool_output]
     /// no_fold_tools`). Their results reach the model verbatim regardless of
     /// size, like the intrinsic `never_truncate_result()` contract.
     pub tool_output_no_fold_tools: Vec<String>,
@@ -308,10 +314,14 @@ pub struct CodingRuntimeConfig {
     /// user_title). Applied only when the native runtime creates the session meta;
     /// existing sessions keep their stored name.
     pub session_display_name: Option<String>,
-    /// Tool-result fold threshold in bytes (`[tools.tool_output] max_bytes`).
-    /// `None` → built-in default (64 KiB); `Some(0)` disables folding.
+    /// Tool-result compression threshold in bytes (`[tools.tool_output] max_bytes`).
+    /// `None` → built-in default (64 KiB); `Some(0)` disables compression.
     pub tool_output_max_bytes: Option<usize>,
-    /// Tool names exempt from output folding (`[tools.tool_output] no_fold_tools`).
+    /// Terminal (shell) compression threshold in bytes (`[tools.tool_output]
+    /// terminal_max_bytes`). `None` → built-in default (24 KiB); `Some(0)` drops
+    /// the terminal early line (terminal tools then follow `tool_output_max_bytes`).
+    pub tool_output_terminal_max_bytes: Option<usize>,
+    /// Tool names exempt from output compression (`[tools.tool_output] no_fold_tools`).
     pub tool_output_no_fold_tools: Vec<String>,
     /// Optional shared, pre-warmed MCP registry (e.g. from daemon AppState cache).
     /// When provided and `mcp == true`, the runtime reuses this pre-connected
@@ -415,6 +425,13 @@ impl CodingRuntimeConfig {
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .or(config.tools.tool_output.max_bytes),
+            // Same env-wins rule for the terminal early line.
+            tool_output_terminal_max_bytes: std::env::var(
+                "JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES",
+            )
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .or(config.tools.tool_output.terminal_max_bytes),
             tool_output_no_fold_tools: config.tools.tool_output.no_fold_tools.clone(),
             shared_mcp_registry: None,
         }
@@ -469,6 +486,7 @@ impl CodingRuntimeConfig {
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.pricing = self.pricing;
         config.tool_output_max_bytes = self.tool_output_max_bytes;
+        config.tool_output_terminal_max_bytes = self.tool_output_terminal_max_bytes;
         config.tool_output_no_fold_tools = self.tool_output_no_fold_tools.clone();
         config
     }
@@ -805,6 +823,7 @@ impl CodingAgentConfig {
             subagent_fast_provider: None,
             subagent_capable_provider: None,
             tool_output_max_bytes: None,
+            tool_output_terminal_max_bytes: None,
             tool_output_no_fold_tools: Vec::new(),
         }
     }

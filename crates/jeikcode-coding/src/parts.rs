@@ -1656,20 +1656,28 @@ pub fn assemble(
     // Artifact spill middleware: intercepts oversized tool results and saves them to disk so
     // the conversation only carries a preview + handle. Only wired when a session is present
     // (no session = no on-disk store; the fetch_output tool is not registered either).
-    // Fold threshold: `cfg.tool_output_max_bytes` (env `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES`
-    // wins over `[tools.tool_output] max_bytes`); `None` → built-in default (64 KiB);
-    // `Some(0)` disables folding.
+    // Compression thresholds: `cfg.tool_output_max_bytes` (env
+    // `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES` wins over `[tools.tool_output]
+    // max_bytes`) for general tools — `None` → built-in default (64 KiB),
+    // `Some(0)` disables compression; `cfg.tool_output_terminal_max_bytes` (env
+    // `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES` wins over
+    // `terminal_max_bytes`) is the earlier line for terminal tools — `None` →
+    // built-in default (24 KiB), `Some(0)` drops the terminal early line.
     if let Some(store) = artifact_store {
         let threshold = cfg
             .tool_output_max_bytes
             .unwrap_or(jeikcode_capabilities::tools::THRESHOLD_BYTES);
+        let terminal_threshold = cfg
+            .tool_output_terminal_max_bytes
+            .unwrap_or(jeikcode_capabilities::tools::TERMINAL_THRESHOLD_BYTES);
         // Config-driven no-fold whitelist (`[tools.tool_output] no_fold_tools`):
-        // listed tool names skip folding entirely, like the intrinsic
+        // listed tool names skip compression entirely, like the intrinsic
         // `never_truncate_result()` contract (repo_map / code_explore).
         let no_fold = cfg.tool_output_no_fold_tools.clone();
         builder = builder.middleware(Arc::new(
             ArtifactMiddleware::new(store)
                 .with_threshold_bytes(threshold)
+                .with_terminal_threshold_bytes(terminal_threshold)
                 .with_no_fold_tools(no_fold),
         ));
     }

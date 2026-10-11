@@ -645,11 +645,18 @@ pub(crate) fn chat_runtime_config(
         session_display_name: None,
         // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
         // Mirrors `CodingRuntimeConfig::from_config` so the daemon path honors the
-        // same fold threshold as CLI/TUI.
+        // same compression thresholds as CLI/TUI.
         tool_output_max_bytes: std::env::var("JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .or(config.tools.tool_output.max_bytes),
+        // Same env-wins rule for the terminal early line.
+        tool_output_terminal_max_bytes: std::env::var(
+            "JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES",
+        )
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .or(config.tools.tool_output.terminal_max_bytes),
         tool_output_no_fold_tools: config.tools.tool_output.no_fold_tools.clone(),
         shared_mcp_registry: None,
     }
