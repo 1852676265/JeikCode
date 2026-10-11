@@ -509,6 +509,126 @@ mod chat_replay_tests {
 }
 
 #[cfg(test)]
+mod env_write_guard_tests {
+    /// 运行期禁止改写“会影响路径解析”的进程级环境变量。
+    ///
+    /// 契约：`Config::config_dir()` 在进程内只解析一次（`OnceLock`），因此任何
+    /// 运行期 `set_var` 这 5 个键的代码都会让“写”与“读”落到不同根目录 —— 这正是
+    /// 并行测试偶发的根因（scoped-home 测试改 env，另一个测试正好横跨读写窗口）。
+    ///
+    /// 正确做法：测试用 `jeikcode_config::test_util::isolated_home()`（线程级注入，
+    /// 不碰 env）；bins 的 `main` 用 `special_dirs::sanitize_process_temp_env()`
+    /// （仅启动期一次）。
+    ///
+    /// 白名单**只减不增**，且只允许“每测试进程/每进程恰好一次”的启动期写入。
+    const GUARDED_KEYS: [&str; 5] = ["JEIKCODE_HOME", "ATOMCODE_HOME", "TMPDIR", "TMP", "TEMP"];
+
+    const ALLOWED: [(&str, &str); 3] = [
+        (
+            "crates/jeikcode-kernel/src/test_support.rs",
+            "每测试进程一次的 isolate_home()（在任何测试解析路径之前）",
+        ),
+        (
+            "crates/jeikcode-capabilities/src/special_dirs.rs",
+            "bins main 启动期归一化 TMP/TMPDIR/TEMP",
+        ),
+        (
+            "crates/jeikcode-capabilities/tests/temp_env_sanitize.rs",
+            "该用例的测试对象就是 TMPDIR/TMP/TEMP 的归一化本身（集成测试独立进程）",
+        ),
+    ];
+
+    /// 已登记的历史站点（**只减不增**）。迁移完成后本表应为空。
+    const PENDING_MIGRATION: [&str; 0] = [];
+
+    #[test]
+    fn runtime_code_must_not_write_path_env_vars() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|crates| crates.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root.join("crates"), &mut files);
+        assert!(!files.is_empty(), "源码扫描必须能枚举到 crates/**/*.rs");
+
+        let mut hits: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(&repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ALLOWED.iter().any(|(path, _)| *path == relative) {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // 注释里的示例不算违规。
+                if trimmed.starts_with("//") || !(line.contains("set_var") || line.contains("remove_var")) {
+                    continue;
+                }
+                if GUARDED_KEYS
+                    .iter()
+                    .any(|key| line.contains(&format!("\"{key}\"")))
+                {
+                    hits.entry(relative.clone())
+                        .or_default()
+                        .push(format!("{}: {trimmed}", index + 1));
+                }
+            }
+        }
+
+        // ① 表外新违规 → 失败（阻止债务增长）。
+        let unexpected: Vec<String> = hits
+            .iter()
+            .filter(|(file, _)| !PENDING_MIGRATION.contains(&file.as_str()))
+            .map(|(file, lines)| format!("{file}\n  {}", lines.join("\n  ")))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "新增的运行期路径 env 写入（应改用线程级注入或启动期一次）；\n{}…",
+            unexpected.join("\n")
+        );
+
+        // ② 已登记但不再违规 → 失败（提醒收缩清单）。
+        let stale: Vec<&str> = PENDING_MIGRATION
+            .iter()
+            .copied()
+            .filter(|file| !hits.contains_key(*file))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "这些文件已不再违规，请从 PENDING_MIGRATION 里删除：{stale:?}"
+        );
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == "target" || name == ".git")
+                {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod global_events_tests {
     use super::*;
 
@@ -10573,14 +10693,18 @@ pub fn list_system_shortcuts() -> Vec<FsShortcut> {
             path: home_clean.to_string_lossy().to_string(),
         });
 
-        let desktop = home.join("Desktop");
-        if desktop.is_dir() {
-            let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(&desktop);
-            shortcuts.push(FsShortcut {
-                id: "desktop",
-                name: "Desktop",
-                path: clean.to_string_lossy().to_string(),
-            });
+        // 桌面：与 shell `$DESKTOP` / 内置工具 `$DESKTOP` 同源解析（Windows 走 OS Known
+        // Folder / 注册表 `User Shell Folders\Desktop`，重定向与 OneDrive 桌面均已生效），
+        // 不再假设 `~/Desktop`。
+        if let Some(desktop) = jeikcode_capabilities::special_dirs::desktop_dir() {
+            if desktop.is_dir() {
+                let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(&desktop);
+                shortcuts.push(FsShortcut {
+                    id: "desktop",
+                    name: "Desktop",
+                    path: clean.to_string_lossy().to_string(),
+                });
+            }
         }
 
         let downloads = home.join("Downloads");
@@ -12259,8 +12383,11 @@ mod tests {
 
     pub(crate) struct ScopedChatHome {
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
         _dir: tempfile::TempDir,
+        /// Thread-local home override instead of `set_var("JEIKCODE_HOME")`:
+        /// runtime env stays constant (the resolved-once production path depends
+        /// on that) and parallel tests keep the real home.
+        _home: jeikcode_config::test_util::IsolatedHome,
     }
 
     impl ScopedChatHome {
@@ -12268,22 +12395,12 @@ mod tests {
             let lock = jeikcode_home_test_lock()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let previous = std::env::var_os("JEIKCODE_HOME");
             let dir = tempfile::tempdir().expect("chat test home");
-            std::env::set_var("JEIKCODE_HOME", dir.path());
+            let home = jeikcode_config::test_util::IsolatedHome::at(dir.path());
             Self {
                 _lock: lock,
-                previous,
                 _dir: dir,
-            }
-        }
-    }
-
-    impl Drop for ScopedChatHome {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-                None => std::env::remove_var("JEIKCODE_HOME"),
+                _home: home,
             }
         }
     }

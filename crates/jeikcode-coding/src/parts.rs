@@ -413,11 +413,18 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-            let worker_names: Vec<String> =
-                ["read", "code_explore", "edit", "write", "run_command", "grep", "glob"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+            let worker_names: Vec<String> = [
+                "read",
+                "code_explore",
+                "edit",
+                "write",
+                "run_command",
+                "grep",
+                "glob",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
             let reg_e = child_reg.clone();
             let reg_w = child_reg.clone();
@@ -1980,7 +1987,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     fn reconcile_persona_embeds_config_working_dir_not_process_cwd() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let prompts = home.path().join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(
@@ -2213,7 +2221,8 @@ mod tests {
     async fn prepare_does_not_wait_for_mcp_network_readiness() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         #[cfg(unix)]
         let (command, args) = ("sh", vec!["-c", "sleep 5"]);
         #[cfg(windows)]
@@ -2452,7 +2461,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
@@ -2526,7 +2536,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let id = "incomplete-reassemble";
@@ -2558,7 +2569,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
 
@@ -2580,7 +2592,8 @@ mod tests {
     async fn external_snapshot_must_match_the_canonical_native_snapshot() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let id = "divergent-external";
@@ -2605,7 +2618,8 @@ mod tests {
     async fn external_snapshot_accepts_a_matching_complete_native_aggregate() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let id = "matching-external";
@@ -2677,7 +2691,8 @@ mod tests {
     async fn prepare_injects_checkpoint_only_for_persistent_sessions() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
 
         let mut persistent = io_free_opts();
@@ -2700,7 +2715,8 @@ mod tests {
     async fn runtime_prepare_keeps_fresh_session_staged_until_publish() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut opts = io_free_opts();
         opts.session = SessionMode::Fresh;
@@ -2724,7 +2740,8 @@ mod tests {
     async fn runtime_reprepare_reuses_injected_bash_runtime_state() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let bash_runtime = Arc::new(BashRuntimeState::new());
 
@@ -2747,7 +2764,8 @@ mod tests {
     async fn first_submit_seeds_provisional_title_and_message_count() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut opts = io_free_opts();
         opts.session = SessionMode::Fresh;
@@ -2776,7 +2794,8 @@ mod tests {
     async fn pinned_protocol_user_title_survives_first_submit_seed() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         cfg.session_display_name = Some("alice_a".into());
         let mut opts = io_free_opts();
@@ -2804,7 +2823,8 @@ mod tests {
     async fn prepare_rejects_a_second_binding_until_the_first_drops() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
         let manager = SessionManager::for_project(project.path());
@@ -2849,7 +2869,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn prepare_wires_cc_external_hooks_only_when_present() {
         let home = tempfile::tempdir().unwrap(); // empty → no user-level hooks
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         // No project hooks → nothing wired.
         let bare = tempfile::tempdir().unwrap();
@@ -2917,7 +2938,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn code_review_tool_is_unmounted() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         let proj = tempfile::tempdir().unwrap();
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
@@ -2937,7 +2959,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn subagent_registry_mounts_code_explore() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         std::env::remove_var("JEIKCODE_SUBAGENT");
 
         let proj = tempfile::tempdir().unwrap();
@@ -2984,13 +3007,22 @@ mod tests {
             "glob",
         ]);
         let worker_mounted_defs = worker.defs();
-        let worker_defs: Vec<&str> = worker_mounted_defs.iter().map(|d| d.name.as_str()).collect();
+        let worker_defs: Vec<&str> = worker_mounted_defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert!(
             worker_defs.contains(&"code_explore"),
             "worker subagent must have code_explore"
         );
-        assert!(worker_defs.contains(&"edit"), "worker subagent must have edit");
-        assert!(worker_defs.contains(&"write"), "worker subagent must have write");
+        assert!(
+            worker_defs.contains(&"edit"),
+            "worker subagent must have edit"
+        );
+        assert!(
+            worker_defs.contains(&"write"),
+            "worker subagent must have write"
+        );
     }
 
     /// A `/login` or `/model` swap updates `cfg.model` and re-runs `assemble` ONLY
@@ -3004,7 +3036,8 @@ mod tests {
     async fn primary_telemetry_hook_tracks_model_swapped_at_assemble() {
         use jeikcode_kernel::agent::AutoRespond;
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         let (tel, captured) = jeikcode_telemetry::Telemetry::in_memory("test".into());
         let proj = tempfile::tempdir().unwrap();
@@ -3040,7 +3073,8 @@ mod tests {
         use jeikcode_kernel::agent::AutoRespond;
 
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let project = tempfile::tempdir().unwrap();
         let datalog_root = home.path().join("custom-datalog");
         let mut cfg =
@@ -3087,7 +3121,8 @@ mod tests {
         use jeikcode_kernel::agent::AutoRespond;
 
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let project = tempfile::tempdir().unwrap();
         let mut cfg = CodingAgentConfig::new("k", "http://localhost", "model-a", project.path());
         cfg.provider_name = "provider-a".into();
@@ -3258,7 +3293,8 @@ mod tests {
     async fn no_session_means_no_fetch_output_tool() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         // Disabled session: no artifact store, so fetch_output must not be mounted.
         let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
@@ -3281,7 +3317,8 @@ mod tests {
     async fn session_presence_mounts_fetch_output_tool() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut opts = io_free_opts();
         opts.session = SessionMode::Fresh;

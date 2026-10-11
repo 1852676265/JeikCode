@@ -81,7 +81,7 @@ async fn full_assembly_lifecycle() {
     // machine's real ~/.claude/skills and leak host state into this test.
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     let cfg = cfg(project.path());
     let opts = || PrepareOptions {
         skill_dirs: Some(vec![project.path().join("skills")]),
@@ -111,7 +111,7 @@ async fn full_assembly_lifecycle() {
         let defs: Vec<&str> = calls[0].1.iter().map(|d| d.name.as_str()).collect();
         for expected in [
             "run_command",
-            "read_file",
+            "read",           // renamed from `read_file`
             "code_explore",
             "web_fetch",
             "use_skill",

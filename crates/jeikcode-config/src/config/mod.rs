@@ -1929,15 +1929,32 @@ impl Config {
     }
 
     pub fn config_dir() -> PathBuf {
-        Self::resolve_config_dir(
-            std::env::var("JEIKCODE_HOME")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            std::env::var("ATOMCODE_HOME")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            crate::util::real_home_dir(),
-        )
+        // Test-only isolation seam. Checked BEFORE the memo below (and never
+        // memoized): a guard gives THIS thread a private home. Always compiled —
+        // integration tests link the crate's own lib build, which never sees the
+        // dev-dependency's `test-util` feature, so a gated check would silently do
+        // nothing there. Production never installs an override.
+        if let Some(home) = crate::test_util::overridden_home() {
+            return home;
+        }
+        // Resolved ONCE: the home root must not change mid-process, otherwise a
+        // write and a read of the same logical path can land in two different
+        // buckets (the parallel-test flake). Runtime code is forbidden from writing
+        // the path env vars (see the daemon env guard).
+        static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                Self::resolve_config_dir(
+                    std::env::var("JEIKCODE_HOME")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    std::env::var("ATOMCODE_HOME")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    crate::util::real_home_dir(),
+                )
+            })
+            .clone()
     }
 
     pub fn default_path() -> PathBuf {

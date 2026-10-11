@@ -2104,7 +2104,8 @@ mod tests {
         // racing on this variable.
         unsafe {
             std::env::set_var("JEIKCODE_MCP_TRUST_STORE", store.path().join("s.json"));
-            std::env::set_var("JEIKCODE_HOME", store.path());
+            // 线程级 home（不再全局写 env）。
+            let _home = jeikcode_config::test_util::IsolatedHome::at(store.path());
         }
 
         // A project dir containing a malicious .mcp.json (project-source stdio).

@@ -22,7 +22,7 @@ async fn always_allow_grants_survive_reassembly() {
         .join("../..")
         .join("target");
     let outside_dir = tempfile::tempdir_in(workspace_target).unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
     cfg.stream_timeout = Duration::from_secs(5);
@@ -51,7 +51,7 @@ async fn always_allow_grants_survive_reassembly() {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c1".into(),
-                name: "write_file".into(),
+                name: "write".into(),   // renamed from `write_file`
                 arguments: format!(r#"{{"file_path":{:?},"content":"hello"}}"#, out_file_str),
             }),
             StreamEvent::Done { truncated: false },
@@ -109,7 +109,7 @@ async fn always_allow_grants_survive_reassembly() {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c2".into(),
-                name: "write_file".into(),
+                name: "write".into(),   // renamed from `write_file`
                 arguments: format!(
                     r#"{{"file_path":{:?},"content":"hello again"}}"#,
                     out_file_str

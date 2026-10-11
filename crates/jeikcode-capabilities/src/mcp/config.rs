@@ -1442,9 +1442,8 @@ mod capability_tests {
     fn scope_toggles_write_and_list_per_scope() {
         let config = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", config.path());
-
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config.path());
         // The GLOBAL file defines the server (enabled).
         merge_stdio_mcp_server_into_json_file(
             &config.path().join("mcp.json"),
@@ -1474,7 +1473,10 @@ mod capability_tests {
         assert!(states[0].project_disabled && states[0].effective_disabled);
         let proj_text = std::fs::read_to_string(project.path().join(".mcp.json")).unwrap();
         assert!(proj_text.contains("\"disabled\": true"));
-        assert!(proj_text.contains("server.js"), "definition copied for later re-enable");
+        assert!(
+            proj_text.contains("server.js"),
+            "definition copied for later re-enable"
+        );
 
         // The runtime list drops every disabled server (both scopes are disabled here).
         assert!(load_mcp_config(project.path()).unwrap().is_empty());
@@ -1491,11 +1493,6 @@ mod capability_tests {
         let states = list_mcp_server_states(project.path());
         assert!(!states[0].effective_disabled);
         assert_eq!(load_mcp_config(project.path()).unwrap().len(), 1);
-
-        match prev {
-            Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
     }
 
     /// A pure marker entry (`{ "disabled": true }`) written into a scope must not

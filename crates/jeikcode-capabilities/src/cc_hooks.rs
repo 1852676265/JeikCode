@@ -182,7 +182,16 @@ fn load_hooks_file(path: &Path) -> Vec<HookConfig> {
 }
 
 /// Resolve `$JEIKCODE_HOME` / `$ATOMCODE_HOME` (fallback `~/.jeikcode` / `~/.atomcode`).
+///
+/// NOTE: deliberately NOT `Config::config_dir()` — this module needs the *raw*
+/// env/home rule so `sudo`-without-`$JEIKCODE_HOME` keeps its documented behaviour.
+/// The one exception is the test seam: when a thread installed a private home
+/// (`jeikcode_config::test_util::isolated_home`, used by integration tests that
+/// assert hooks land in the same private home as config/sessions), honour it.
 fn jeikcode_home() -> Option<PathBuf> {
+    if let Some(home) = jeikcode_config::test_util::overridden_home() {
+        return Some(home);
+    }
     if let Ok(h) = std::env::var("JEIKCODE_HOME") {
         if !h.is_empty() {
             return Some(PathBuf::from(h));

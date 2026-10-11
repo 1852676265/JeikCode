@@ -6,6 +6,7 @@ use jeikcode_kernel::agent::AutoRespond;
 use jeikcode_kernel::message::Role;
 use jeikcode_kernel::stream::StreamEvent;
 use jeikcode_kernel::testkit::RecordingProvider;
+use serial_test::serial;
 use std::sync::Arc;
 
 #[ctor::ctor]
@@ -14,6 +15,7 @@ fn _isolate_jeikcode_home() {
 }
 
 #[tokio::test]
+#[serial]
 async fn session_context_block_reaches_the_provider() {
     let d = tempfile::tempdir().unwrap();
     const CONFLICTING_PROJECT_CLAIM: &str =
@@ -97,10 +99,11 @@ async fn session_context_block_reaches_the_provider() {
 }
 
 #[tokio::test]
+#[serial]
 async fn persona_blocks_hot_reload_on_turn() {
     let d = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     let prompts_dir = home.path().join("prompts");
     std::fs::create_dir_all(&prompts_dir).unwrap();
 

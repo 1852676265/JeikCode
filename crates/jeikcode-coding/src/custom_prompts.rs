@@ -133,35 +133,15 @@ fn cache() -> &'static RwLock<PromptCacheState> {
 }
 
 fn resolve_prompts_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("JEIKCODE_HOME") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p).join("prompts"));
-        }
-    }
-    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p).join("prompts"));
-        }
-    }
-    // Unit tests must not leak the developer's `~/.jeikcode/prompts` into persona
-    // snapshots. Production still loads the user home; tests opt in via JEIKCODE_HOME / ATOMCODE_HOME.
+    // Single source of truth for the home root (includes the thread-local test
+    // override). Unit tests must not leak the developer's real `~/.jeikcode/prompts`
+    // into persona snapshots, so they only resolve prompts when a test explicitly
+    // installed its own home (`jeikcode_config::test_util::isolated_home()`).
     #[cfg(test)]
-    {
+    if jeikcode_config::test_util::overridden_home().is_none() {
         return None;
     }
-    #[cfg(not(test))]
-    {
-        let home = dirs::home_dir()?;
-        let jeik = home.join(".jeikcode").join("prompts");
-        if jeik.exists() {
-            return Some(jeik);
-        }
-        let legacy_dir = home.join(".atomcode").join("prompts");
-        if legacy_dir.exists() {
-            return Some(legacy_dir);
-        }
-        Some(jeik)
-    }
+    Some(jeikcode_config::Config::config_dir().join("prompts"))
 }
 
 fn strip_utf8_bom(content: &str) -> &str {

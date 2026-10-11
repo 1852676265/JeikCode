@@ -63,6 +63,40 @@ pub fn load_disabled(project_dir: &Path) -> BTreeSet<String> {
     set
 }
 
+/// Check if a skill name is considered disabled given a set of disabled IDs.
+///
+/// Matches across qualified and bare names:
+/// - Exact match: `disabled.contains(name)`
+/// - Qualified `name` (e.g. `skills:foo` or `plugin:foo`) matches when bare `foo` or full `skills:foo` is disabled
+/// - Bare `name` (e.g. `foo`) matches when `skills:foo`, bare `foo`, or any `*:foo` is disabled
+pub fn is_skill_disabled(disabled: &BTreeSet<String>, skill_name: &str) -> bool {
+    if disabled.is_empty() || skill_name.trim().is_empty() {
+        return false;
+    }
+    if disabled.contains(skill_name) {
+        return true;
+    }
+    if let Some((_ns, bare)) = skill_name.split_once(':') {
+        if disabled.contains(bare) {
+            return true;
+        }
+        let skills_prefixed = format!("skills:{bare}");
+        if disabled.contains(&skills_prefixed) {
+            return true;
+        }
+    } else {
+        let skills_prefixed = format!("skills:{skill_name}");
+        if disabled.contains(&skills_prefixed) {
+            return true;
+        }
+        let suffix = format!(":{skill_name}");
+        if disabled.iter().any(|d| d.ends_with(&suffix)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Set (or clear) the disabled flag for `skill_id` at the chosen scope. Creates the file
 /// (and its parent directory) as needed. When enabling, the id is removed; an empty file
 /// stays behind so the scope remains explicit.
@@ -113,8 +147,8 @@ mod tests {
     fn toggles_each_scope_independently_and_unions_on_load() {
         let config = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", config.path());
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config.path());
 
         // Global disable of one skill, project disable of another.
         set_disabled(project.path(), "skills:alpha", true, true).unwrap();
@@ -132,11 +166,6 @@ mod tests {
         set_disabled(project.path(), "skills:alpha", true, false).unwrap();
         assert!(!load_global().contains("skills:alpha"));
         assert!(load_disabled(project.path()).contains("skills:beta"));
-
-        match prev {
-            Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
     }
 
     #[test]
@@ -144,14 +173,34 @@ mod tests {
     fn missing_files_read_as_empty() {
         let config = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", config.path());
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config.path());
         assert!(load_global().is_empty());
         assert!(load_project(project.path()).is_empty());
         assert!(load_disabled(project.path()).is_empty());
-        match prev {
-            Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
+    }
+
+    #[test]
+    fn is_skill_disabled_matches_bare_and_qualified() {
+        let mut disabled = BTreeSet::new();
+        disabled.insert("skills:jeik-web-fetch".to_string());
+        disabled.insert("plugin-a:custom-tool".to_string());
+        disabled.insert("bare-disabled".to_string());
+
+        // 1. Qualified in disabled, bare skill_name
+        assert!(is_skill_disabled(&disabled, "jeik-web-fetch"));
+        assert!(is_skill_disabled(&disabled, "skills:jeik-web-fetch"));
+
+        // 2. Plugin qualified in disabled, bare skill_name or full
+        assert!(is_skill_disabled(&disabled, "custom-tool"));
+        assert!(is_skill_disabled(&disabled, "plugin-a:custom-tool"));
+
+        // 3. Bare in disabled, qualified skill_name
+        assert!(is_skill_disabled(&disabled, "bare-disabled"));
+        assert!(is_skill_disabled(&disabled, "skills:bare-disabled"));
+
+        // 4. Non-disabled skills
+        assert!(!is_skill_disabled(&disabled, "find-skills"));
+        assert!(!is_skill_disabled(&disabled, "skills:find-skills"));
+        assert!(!is_skill_disabled(&disabled, "other-plugin:different"));
     }
 }

@@ -1471,6 +1471,11 @@ fn main() {
         return;
     }
 
+    // Before any thread or child process exists: a Git-Bash launch leaves TMP/TEMP/TMPDIR
+    // as POSIX paths, which native children spawned directly (not via the bash tool) would
+    // resolve as `<drive>:\tmp`. Best-effort and cheap; a no-op when already native.
+    jeikcode_capabilities::special_dirs::sanitize_process_temp_env();
+
     // Run the entire program on a thread with a large, explicit stack.
     // Rust gives the *main* OS thread the platform-default stack — on
     // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
@@ -2622,12 +2627,7 @@ fn into_tui_native_runtime(
 #[cfg(unix)]
 fn redirect_stderr_to_log_file() {
     use std::os::unix::io::AsRawFd;
-    let Some(home) = std::env::var_os("JEIKCODE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".jeikcode")))
-    else {
-        return;
-    };
+    let home = jeikcode_config::Config::config_dir();
     if std::fs::create_dir_all(&home).is_err() {
         return;
     }
