@@ -72,7 +72,7 @@ Prefer CI for every command below; run locally only under the CI-first exception
 The release process strictly adheres to [`docs/release-tutorial.md`](./docs/release-tutorial.md):
 
 1. **Version Bump**: Run `npm run bump[:beta|patch|minor|major]` to cascade version numbers repository-wide.
-2. **Changelog**: Document updates at the top of `CHANGELOG.md` following the bilingual template (English section + single line `---` + Chinese section). For stable releases, sync the latest 2 version logs across the 3 README files.
+2. **Changelog**: Document updates at the top of `CHANGELOG.md` following the bilingual template (English section + single line `---` + Chinese section, direct feature and bug fix bullet points without internal technical mechanism paragraphs). The 3 README files maintain a single authoritative reference.
 3. **Commit & Push**: Commit release notes and push to the remote tracking branch (`main` for stable, `beta` for pre-release).
 4. **Trigger Workflow**: Tag and push (`git tag vX.Y.Z && git push origin vX.Y.Z`).
 5. **Delivery Closure**: Run `gh run list --limit 3` to verify the `Build and Release` workflow is `in_progress`. When observing pipeline progress, introduce a 180s delay script between polling intervals to avoid spamming the API.
