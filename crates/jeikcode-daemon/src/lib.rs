@@ -122,6 +122,8 @@ pub(crate) struct ConfigResponse {
     pub accounts: Vec<AccountInfo>,
     /// Global UI language. `"en"` when the user has not chosen one.
     pub language: String,
+    /// Whether to display the GitHub repository logo in the UI.
+    pub github_logo: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,6 +645,7 @@ mod global_events_tests {
             session_id: "s-1".into(),
             running: true,
             terminal: None,
+            status: None,
         });
         publish_global(GlobalWireEvent::ReviewAsked {
             session_id: "s-1".into(),
@@ -744,6 +747,7 @@ mod global_events_tests {
             session_id: "s1".into(),
             running: false,
             terminal: Some("completed"),
+            status: None,
         })
         .unwrap();
         assert_eq!(terminal["type"], "activity");
@@ -752,6 +756,7 @@ mod global_events_tests {
             session_id: "s1".into(),
             running: true,
             terminal: None,
+            status: None,
         })
         .unwrap();
         assert!(running.get("terminal").is_none());
@@ -1316,6 +1321,7 @@ impl ActiveChatRegistry {
                 session_id: sid,
                 running: true,
                 terminal: None,
+                status: None,
             });
         }
 
@@ -1909,6 +1915,7 @@ impl ActiveChatRegistry {
                 session_id: sid,
                 running: false,
                 terminal: None,
+                status: None,
             });
         }
         true
@@ -2078,13 +2085,15 @@ pub(crate) enum GlobalWireEvent {
         session_id: String,
         project_hash: String,
     },
-    /// 活动/转圈变化；`terminal` 非空时同时携带终态供右下角通知去重。
+    /// 活动/转圈变化；`terminal` 非空时同时携带终态供右下角通知去重；`status` 可携带 "compacting" 等阶段状态。
     #[serde(rename = "activity")]
     Activity {
         session_id: String,
         running: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         terminal: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     /// 某会话弹出待交互卡片（审批/提问）。只带会话 id，客户端对该会话做一次
     /// 定向 pending 拉取（单会话、小请求），避免重拉整表。
@@ -2099,6 +2108,9 @@ pub(crate) enum GlobalWireEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
+    /// 全局配置热重载（如 CLI 执行 jeikcode ghimg 或后台变更）。
+    #[serde(rename = "config_reloaded")]
+    ConfigReloaded,
 }
 
 /// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
@@ -2363,6 +2375,7 @@ pub(crate) fn fanout_chat_events_for_session(
                             session_id: sid,
                             running: true,
                             terminal: None,
+                            status: None,
                         });
                     }
                 }
@@ -2375,6 +2388,7 @@ pub(crate) fn fanout_chat_events_for_session(
                         session_id: session_id.clone(),
                         running: false,
                         terminal: Some(chat_done_terminal_label(stop_reason.as_deref())),
+                        status: None,
                     });
                     if let Some(wd) = current_wd.clone() {
                         publish_session_upsert(&wd, session_id);
@@ -2386,6 +2400,7 @@ pub(crate) fn fanout_chat_events_for_session(
                             session_id: sid,
                             running: false,
                             terminal: Some("stopped"),
+                            status: None,
                         });
                     }
                 }
@@ -7329,7 +7344,7 @@ impl ChatRuntimeProjector {
         use jeikcode_coding::TurnCompletion;
 
         match event {
-            CodingRuntimeEvent::Agent(event) => self.project_agent(event),
+            CodingRuntimeEvent::Agent(event) => self.project_agent(event, permission_session_id),
             CodingRuntimeEvent::Request(request) => {
                 use jeikcode_capabilities::tools::{
                     request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,
@@ -7522,7 +7537,7 @@ impl ChatRuntimeProjector {
         self.last_part_kind = None;
     }
 
-    fn project_agent(&mut self, event: jeikcode_kernel::event::AgentEvent) -> Vec<ChatEvent> {
+    fn project_agent(&mut self, event: jeikcode_kernel::event::AgentEvent, session_id: &str) -> Vec<ChatEvent> {
         use jeikcode_kernel::event::AgentEvent as Agent;
 
         match event {
@@ -7670,6 +7685,64 @@ impl ChatRuntimeProjector {
                 });
                 events
             }
+            Agent::CompactionStarted { .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: Some("compacting".to_string()),
+                });
+                vec![ChatEvent::SessionStatus {
+                    session_id: session_id.to_string(),
+                    status: "compacting".to_string(),
+                }]
+            }
+            Agent::Compacted {
+                removed,
+                bytes_before,
+                bytes_after,
+                committed: true,
+                ..
+            } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                let est_before = (bytes_before as f32 / 3.5).ceil() as usize;
+                let est_after = (bytes_after as f32 / 3.5).ceil() as usize;
+                vec![
+                    ChatEvent::SessionStatus {
+                        session_id: session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                    ChatEvent::Warning {
+                        message: jeikcode_config::i18n::format_compaction_mark(
+                            removed,
+                            est_before,
+                            est_after,
+                        ),
+                    },
+                ]
+            }
+            Agent::CompactionFailed { error, .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![
+                    ChatEvent::SessionStatus {
+                        session_id: session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                    ChatEvent::Warning {
+                        message: format!("Compaction failed: {error}"),
+                    },
+                ]
+            }
             Agent::TurnStarted
             | Agent::ToolCallStreaming { .. }
             | Agent::ToolBatchCompleted { .. }
@@ -7677,9 +7750,7 @@ impl ChatRuntimeProjector {
             | Agent::Snapshot { .. }
             | Agent::TurnComplete { .. }
             | Agent::Cancelled
-            | Agent::CompactionStarted { .. }
-            | Agent::Compacted { .. }
-            | Agent::CompactionFailed { .. } => Vec::new(),
+            | Agent::Compacted { .. } => Vec::new(),
             _ => Vec::new(),
         }
     }

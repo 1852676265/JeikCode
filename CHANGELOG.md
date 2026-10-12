@@ -21,12 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
-## v7.2.4-beta.0 (2026-10-13)
+## v7.2.4-beta.1 (2026-10-13)
 
 - **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and contradictory edit banners**:
   - Fixed an issue where repeated URLs, common domain prefixes (`https://github.com`), or repeated code identifiers were erroneously truncated during live LLM streaming.
   - Substring deduplication is now strictly isolated to replay frames, with real-time stream deltas appended reliably via monotonic sequence cursors.
   - Fixed missing Markdown code blocks and Mermaid diagrams when switching back to a session that completed in the background by properly buffering `artifact_*` events in the background session cache.
+  - Resolved steer card state desync, stuck queues, and ghost duplicate bubbles during cross-session switching by folding steered inputs into target session caches.
+  - Fixed an issue where successive reasoning / thinking blocks were improperly backfilled and coalesced into the first block across tool boundaries; subsequent thinking blocks now render cleanly in sequential order.
+  - Introduced live `Compacting...` shimmer placeholder synchronized across all tabs and instances when background context compaction is underway.
+  - Restored context compaction notices (`format_compaction_mark`) in the native live architecture, rendering amber advisories in-stream as ordered notice parts.
+  - Added official GitHub badge to the sidebar footer with `config.toml` toggle and `jeikcode ghimg [on|off]` live hot-reloading CLI.
+  - Refined ambiguous match error messages in the edit tool from Rust range syntax to clear 1-based index instructions (`1 to N`).
   - Eliminated contradictory "not applied" diff banner on successfully completed file edits.
 - **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay and streamlined release matrices**:
   - Deployed an official Cloudflare Pages edge function (`/api/releases`) with Atom feed parsing and 70s edge caching, eliminating GitHub API 60 req/hr rate limits for overseas VPN and proxy users.
@@ -38,10 +44,16 @@
 
 ---
 
-- **[WebUI 实时流式传输与内容完整度] 彻底根除实时流式吞字、后台代码块丢失与编辑状态矛盾**:
+- **[WebUI 实时流式传输与内容完整度] 彻底根除实时流式吞字、后台代码块丢失、思考块倒流叠加与压缩状态同步**:
   - 修复大模型流式输出过程中因误判重复帧导致连续相同 URL、域名公共前缀（`https://github.com`）或重复代码标识符被吞字残缺的问题。
   - 所有子串级去重严格隔离在重放分支，实时流式输出完全依赖单调递增游标可靠就地追加。
   - 修复在后台会话生成 Markdown 或 Mermaid 图表时切回会话出现内容缺失的缺陷，将 `artifact_*` 代码块事件全量实时同步至后台会话缓存。
+  - 解决跨会话切换时 steer 转向卡片未能及时出队、状态卡死或重现双份气泡的缓存脱节缺陷，使后台转向与正文状态单调对齐。
+  - 彻底根治连续多个思考块跨越工具调用时被异常倒灌、错误叠加进第一个思考块的问题，使思考块严格按照产生时序独立渲染。
+  - 引入全实例全局同步的 `Compacting...` 流光状态，在上下文压缩提炼请求发送与执行期间为各端实时展示平滑过渡提示。
+  - 修复全新 Live 架构下上下文压缩通知（`Compacted`）被吞未发送的缺陷，将压缩与异常提示作为独立顺序部件在画布中端正渲染黄色警告条。
+  - 在侧栏底部新增官方 GitHub 仓库徽章，支持 `config.toml` 配置与 `jeikcode ghimg [on|off]` 命令行实时免重启热重载切换。
+  - 优化 edit 工具多处歧义匹配时的报错指引，由 Rust 区间语法改为通俗清晰的 1-based 序号提示（`1 to N`）。
   - 消除文件编辑成功（已完成）时因行数截断误报“预期替换（未写入，仅供参考）”的语义矛盾。
 - **[更新中继与发布工程基建] Cloudflare 边缘零限流发布中继与发布矩阵瘦身**:
   - 部署官方 Cloudflare Pages 边缘服务（`/api/releases`），通过 Atom 订阅流拉取元数据并执行 70 秒全球 CDN 缓存，彻底终结 GitHub API 60次/小时导致的海外 VPN 与代理出口 IP 限流。

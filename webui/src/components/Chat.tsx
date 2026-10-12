@@ -228,6 +228,7 @@ import {
   identifiedAssistantIndex,
   paintAssistantReasoning,
   paintAssistantText,
+  paintAssistantNotice,
   paintCachedAssistantDelta,
   ensureWorkingAssistant,
   paintUserMessage,
@@ -1359,6 +1360,9 @@ export function Chat({
 
   const [modelCatalog, setModelCatalog] = useState<ModelInfo[]>([]);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
+  const [isCompacting, setIsCompacting] = useState(false);
+  const isCompactingRef = useRef(false);
+  isCompactingRef.current = isCompacting;
   const [activeTodos, setActiveTodos] = useState<TodoItem[] | null>(null);
   const activeTodosRef = useRef<TodoItem[] | null>(null);
   activeTodosRef.current = activeTodos;
@@ -2291,10 +2295,16 @@ export function Chat({
       userInput: userInputReq,
     });
   }, [onLiveReview, sessionId, livePending, userInputReq]);
-  // 跨实例增量：待交互卡在别处被解决时，同步清掉本画布的待批准/待回答状态。
+  // 跨实例增量：待交互卡在别处被解决时，同步清掉本画布的待批准/待回答状态；同步压缩状态。
   useEffect(
     () =>
       onGlobalEvent((event) => {
+        if (event.type === 'activity') {
+          const sid = activeIdRef.current;
+          if (sid && event.session_id === sid) {
+            setIsCompacting(event.status === 'compacting');
+          }
+        }
         if (event.type !== 'review_resolved' || event.request_id == null) return;
         setLivePending((cur) =>
           cur && cur.request_id === event.request_id ? null : cur,
@@ -4057,6 +4067,7 @@ export function Chat({
   function foldSteeredInputs(
     inputs: { text: string; images?: ImageData[]; message_id?: string }[],
     clientInputIds?: Array<string | null>,
+    targetSessionId?: string,
   ) {
     const steeredInputs = (inputs ?? []).map((input) => ({
       text: stripSteerEnvelopeForDisplay(input.text || ''),
@@ -4066,9 +4077,12 @@ export function Chat({
     }));
     if (steeredInputs.length === 0) return;
 
+    const sid = targetSessionId || activeIdRef.current;
+    const isCurrentView = !!sid && activeIdRef.current === sid;
+
     // 1. 从排队消息 queued 中移除已被内核 fold 的转向消息，并暂存其携带的多模态原图
     const matchedQueuedItems: (QueuedMessage | undefined)[] = [];
-    setQueued((prevQueued) => {
+    const updateQueuedList = (prevQueued: QueuedMessage[]): QueuedMessage[] => {
       let nextQueued = prevQueued.slice();
       for (let i = 0; i < steeredInputs.length; i++) {
         const s = steeredInputs[i];
@@ -4086,10 +4100,17 @@ export function Chat({
         }
       }
       return nextQueued;
-    });
+    };
+
+    if (sid) {
+      updateQueuedForSession(sid, updateQueuedList);
+    }
+    if (isCurrentView) {
+      setQueued(updateQueuedList);
+    }
 
     // 2. 将转向消息作为真实普通用户消息发送并追加到会话中，并在其后紧跟新的 assistant 占位
-    setMessages((prev) => {
+    const foldIntoMessageList = (prev: Message[]): Message[] => {
       let next = prev.slice();
       const now = Date.now();
       for (let i = 0; i < steeredInputs.length; i++) {
@@ -4138,7 +4159,9 @@ export function Chat({
 
         const turnIndex = nextTurnNavIndex(next);
         const turnOrdinal = nextTurnNavOrdinal(next);
-        rememberTurnOutline(cleanText || '[图片]', turnIndex, turnOrdinal);
+        if (isCurrentView) {
+          rememberTurnOutline(cleanText || '[图片]', turnIndex, turnOrdinal);
+        }
 
         next.push({
           role: 'user',
@@ -4156,16 +4179,41 @@ export function Chat({
           sourceIndex: turnIndex + 1,
         });
       }
-      messagesRef.current = next;
-      const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
-      if (currentSid) {
-        messageCacheRef.current.set(currentSid, next);
-      }
       return next;
-    });
+    };
+
+    if (isCurrentView) {
+      setMessages((prev) => {
+        const next = foldIntoMessageList(prev);
+        messagesRef.current = next;
+        if (sid) {
+          messageCacheRef.current.set(sid, next);
+        }
+        return next;
+      });
+    } else if (sid) {
+      const msgs = messageCacheRef.current.get(sid) ?? [];
+      if (msgs.length > 0) {
+        const next = foldIntoMessageList(msgs);
+        messageCacheRef.current.set(sid, next);
+      }
+    }
 
     // 3. 消费 pendingSteers
-    setPendingSteers((pending) => acknowledgeLiveSteers(pending, steeredInputs, clientInputIds));
+    if (sid) {
+      const curSteers = pendingSteersBySessionRef.current.get(sid) ?? [];
+      const nextSteers = acknowledgeLiveSteers(curSteers, steeredInputs, clientInputIds);
+      if (nextSteers.length > 0) {
+        pendingSteersBySessionRef.current.set(sid, nextSteers);
+        setStoredSteers(sid, nextSteers);
+      } else {
+        pendingSteersBySessionRef.current.delete(sid);
+        setStoredSteers(sid, []);
+      }
+    }
+    if (isCurrentView) {
+      setPendingSteers((pending) => acknowledgeLiveSteers(pending, steeredInputs, clientInputIds));
+    }
   }
 
   function cancelTurnNavScroll() {
@@ -4719,23 +4767,39 @@ export function Chat({
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
   // never styled as an error). Mirrors appendToLastAssistant's last-assistant guard.
-  function pushNoticeToLastAssistant(text: string) {
+  function pushNoticeToLastAssistant(text: string, messageId?: string) {
     setMessages((prev) => {
-      if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
-      if (last.role !== 'assistant') return prev;
-      const parts: MsgPart[] = [...last.parts, { kind: 'notice', text }];
-      return [...prev.slice(0, -1), { ...last, parts }];
+      const next = paintAssistantNotice(prev, text, messageId);
+      messagesRef.current = next;
+      const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
+      if (currentSid) {
+        messageCacheRef.current.set(currentSid, next);
+      }
+      return next;
     });
   }
 
-  function pushRateLimitedToLastAssistant(text: string) {
+  function pushRateLimitedToLastAssistant(text: string, messageId?: string) {
     setMessages((prev) => {
-      if (prev.length === 0) return prev;
+      if (prev.length === 0) {
+        const next: Message[] = [{ role: 'assistant', parts: [{ kind: 'rate_limited', text }] }];
+        messagesRef.current = next;
+        return next;
+      }
       const last = prev[prev.length - 1];
-      if (last.role !== 'assistant') return prev;
-      const parts: MsgPart[] = [...last.parts, { kind: 'rate_limited', text }];
-      return [...prev.slice(0, -1), { ...last, parts }];
+      let next: Message[];
+      if (last.role === 'assistant') {
+        const parts: MsgPart[] = [...last.parts, { kind: 'rate_limited', text }];
+        next = [...prev.slice(0, -1), { ...last, parts }];
+      } else {
+        next = [...prev, { role: 'assistant', parts: [{ kind: 'rate_limited', text }] }];
+      }
+      messagesRef.current = next;
+      const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
+      if (currentSid) {
+        messageCacheRef.current.set(currentSid, next);
+      }
+      return next;
     });
   }
 
@@ -4830,8 +4894,16 @@ export function Chat({
    * 彻底实现：后台任务完成后切回会话，最后一条正文与工具结果 0ms 纯内存即现，无需刷新，绝不丢失！
    */
   function applyEventToSessionCache(targetSid: string, event: SSEEvent) {
+    if (event.type === 'steered') {
+      foldSteeredInputs(event.inputs ?? [], event.client_input_ids, targetSid);
+      return;
+    }
     const msgs = messageCacheRef.current.get(targetSid);
     if (!msgs || msgs.length === 0) return;
+    if (event.type === 'user_identified') {
+      messageCacheRef.current.set(targetSid, bindUserMessageIdentity(msgs, event.message_id));
+      return;
+    }
     if (event.type === 'text') {
       // 后台缓存与画布共用同一套身份盖章：行上盖住 message_id，后续 watch 重放
       // 才能回到自己那一轮，而不是被当成“新内容”追加到最新 agent 消息里。
@@ -4883,6 +4955,13 @@ export function Chat({
         messageId: event.message_id,
         partId: event.part_id,
       }));
+      return;
+    }
+    if (event.type === 'warning') {
+      messageCacheRef.current.set(
+        targetSid,
+        paintAssistantNotice(msgs, t('chat.warning', { msg: event.message }), event.message_id)
+      );
       return;
     }
     if (event.type === 'user') {
@@ -5577,6 +5656,7 @@ export function Chat({
         if (activeIdRef.current === event.session_id) {
           saveTokenSnapshot(event.session_id, tokensAuthoritativeRef.current);
         }
+        setIsCompacting(false);
         setBusyAndClock(false);
         closeOpenArtifactFence();
         finalizePendingToolsOnCanvas();
@@ -5612,8 +5692,15 @@ export function Chat({
         break;
       }
 
+      case 'session_status': {
+        const compacting = (event as { status?: string }).status === 'compacting';
+        setIsCompacting(compacting);
+        break;
+      }
+
       case 'stopped':
         transitionChatRecovery({ type: 'authoritative_terminal' });
+        setIsCompacting(false);
         if (activeIdRef.current) {
           backgroundRunningSessionsRef.current.delete(activeIdRef.current);
           localTurnSessionsRef.current.delete(activeIdRef.current);
@@ -5655,7 +5742,7 @@ export function Chat({
       case 'warning':
         // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
         // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
-        pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }));
+        pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }), event.message_id);
         break;
 
       case 'persistence_warning':
@@ -8097,6 +8184,7 @@ export function Chat({
                 timeFull={isLastInTurn ? timeFull : undefined}
                 liveElapsedMs={liveFromUser}
                 turnTotalMs={doneTotal}
+                isCompacting={isCompacting}
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
                 onRegenerate={isLastInTurn && !busy ? () => void handleRegenerateAssistant(msg.sourceIndex ?? origIdx, origIdx) : undefined}
@@ -8520,6 +8608,20 @@ export function Chat({
           </button>
         </div>
       )}
+      {historyHint && (
+        <div class="persistence-warning history-hint-warning" role="status">
+          <span aria-hidden="true">⚠</span>
+          <span>{historyHint}</span>
+          <button
+            type="button"
+            class="persistence-warning-dismiss"
+            aria-label={t('common.dismiss')}
+            onClick={() => setHistoryHint(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div class="input-container">
         <div class="input-wrap">
           {stickyTodoPanel}
@@ -8560,6 +8662,7 @@ function AssistantMessageView({
   timeFull,
   liveElapsedMs,
   turnTotalMs,
+  isCompacting,
   search,
   isActiveSearchMatch,
   onRegenerate,
@@ -8578,6 +8681,7 @@ function AssistantMessageView({
   liveElapsedMs?: number;
   /** User-bubble → this final answer. Only set on the last assistant of the turn. */
   turnTotalMs?: number;
+  isCompacting?: boolean;
   search: string;
   isActiveSearchMatch: boolean;
   onRegenerate?: () => void;
@@ -8734,7 +8838,12 @@ function AssistantMessageView({
           {renderAssistantParts(msg.parts, search)}
           {streaming && !hasContent && (
             <span class="codex-shimmer-status" aria-live="polite">
-              Working...
+              {isCompacting ? 'Compacting...' : 'Working...'}
+            </span>
+          )}
+          {streaming && hasContent && isCompacting && (
+            <span class="codex-shimmer-status" aria-live="polite" style={{ display: 'block', marginTop: '6px' }}>
+              Compacting...
             </span>
           )}
         </>

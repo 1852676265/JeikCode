@@ -1654,6 +1654,7 @@ impl LiveViewHub {
                     session_id: session_id.clone(),
                     running: true,
                     terminal: None,
+                    status: None,
                 });
             }
             _ => {}

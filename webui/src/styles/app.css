@@ -6065,6 +6065,46 @@ body {
 }
 .sidebar-bottom-spacer { flex: 1; min-width: 0; }
 
+/* GitHub repository logo button in sidebar bottom / rail (official black & white badge) */
+.sidebar-bottom-github-btn,
+.sidebar-rail-github-btn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: #24292e;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.sidebar-bottom-github-btn:hover,
+.sidebar-rail-github-btn:hover {
+  background: #1b1f23;
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.45);
+  transform: translateY(-1px) scale(1.08);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.25), 0 2px 6px rgba(0, 0, 0, 0.5);
+}
+[data-theme="light"] .sidebar-bottom-github-btn,
+[data-theme="light"] .sidebar-rail-github-btn {
+  background: #24292e;
+  color: #ffffff;
+  border: 1px solid #1b1f23;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+[data-theme="light"] .sidebar-bottom-github-btn:hover,
+[data-theme="light"] .sidebar-rail-github-btn:hover {
+  background: #000000;
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
 /* Icon buttons (remote / settings) in the bottom bar + collapsed rail bottom. */
 .sidebar-icon-btn {
   width: 30px;

@@ -1025,6 +1025,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<UpgradeAction>,
     },
+    /// Configure or toggle the GitHub logo visibility in WebUI (`jeikcode ghimg [on|off]`)
+    #[command(alias = "ghlogo", alias = "github-logo")]
+    Ghimg {
+        /// "on" to show, "off" to hide; omitted displays current status
+        status: Option<String>,
+    },
     /// Hidden internal command to run interactive or automatic config sync after binary upgrade
     #[command(hide = true, name = "__sync_config")]
     SyncConfig {
@@ -3370,6 +3376,7 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
             run_upgrade_cli(force, yes).await
         }
         Commands::Rollback => run_rollback_cli(),
+        Commands::Ghimg { status } => handle_ghimg(status),
         Commands::Uninstall {
             yes,
             purge,
@@ -4041,6 +4048,98 @@ fn handle_upgrade_reset() -> Result<()> {
         cfg_path.display()
     );
     handle_upgrade_get();
+    Ok(())
+}
+
+fn notify_daemon_config_reload() {
+    let listen_file = jeikcode_config::Config::config_dir().join("webui-listen.json");
+    if let Ok(text) = std::fs::read_to_string(&listen_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            let port = val.get("port").and_then(|p| p.as_u64()).unwrap_or(13456);
+            let token = val.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(600))
+                .build();
+            if let Ok(client) = client {
+                let mut req = client.post(format!("http://127.0.0.1:{port}/config/reload"));
+                if !token.is_empty() {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+                let _ = req.send();
+            }
+        }
+    }
+}
+
+fn handle_ghimg(status: Option<String>) -> Result<()> {
+    let store = jeikcode_config::ConfigStore::default_store();
+    let snapshot = store.read()?;
+    let current_state = snapshot.config.github_logo;
+
+    let lang = snapshot.config.language.unwrap_or_default().language_key();
+    let is_zh = lang.starts_with("zh");
+    let is_vi = lang.starts_with("vi");
+
+    let Some(raw_status) = status.filter(|s| !s.trim().is_empty()) else {
+        if is_zh {
+            println!("GitHub 仓库图标状态：{}", if current_state { "已开启 (on)" } else { "已隐藏 (off)" });
+            println!("\n用法：");
+            println!("  jeikcode ghimg on    - 开启并显示 GitHub 图标");
+            println!("  jeikcode ghimg off   - 隐藏 GitHub 图标（适合公司内部演示/投屏）");
+        } else if is_vi {
+            println!("Trạng thái biểu tượng GitHub: {}", if current_state { "Đã bật (on)" } else { "Đã ẩn (off)" });
+            println!("\nCách dùng:");
+            println!("  jeikcode ghimg on    - Bật và hiển thị biểu tượng GitHub");
+            println!("  jeikcode ghimg off   - Ẩn biểu tượng GitHub (phù hợp dùng trong nội bộ công ty)");
+        } else {
+            println!("GitHub logo display status: {}", if current_state { "ON (enabled)" } else { "OFF (hidden)" });
+            println!("\nUsage:");
+            println!("  jeikcode ghimg on    - Enable and show the GitHub repository logo");
+            println!("  jeikcode ghimg off   - Hide the GitHub repository logo (ideal for corporate/internal use)");
+        }
+        return Ok(());
+    };
+
+    let target_enabled = match raw_status.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "enable" | "enabled" | "yes" | "show" => true,
+        "off" | "false" | "0" | "disable" | "disabled" | "no" | "none" | "hide" => false,
+        other => {
+            if is_zh {
+                eprintln!("错误：无效的参数 \"{other}\"，仅支持 on 或 off。");
+            } else if is_vi {
+                eprintln!("Lỗi: Tham số không hợp lệ \"{other}\", chỉ hỗ trợ on hoặc off.");
+            } else {
+                eprintln!("Error: Invalid argument \"{other}\". Supported: on or off.");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    store.update(|cfg| {
+        cfg.github_logo = target_enabled;
+        Ok(())
+    })?;
+
+    notify_daemon_config_reload();
+
+    if target_enabled {
+        if is_zh {
+            println!("✓ 已开启 WebUI 中的 GitHub 仓库图标（配置已保存，实时热重载生效）。");
+        } else if is_vi {
+            println!("✓ Đã bật biểu tượng kho lưu trữ GitHub trong WebUI (đã lưu, tự động áp dụng ngay).");
+        } else {
+            println!("✓ GitHub repository logo enabled in WebUI (config saved, hot-reloaded).");
+        }
+    } else {
+        if is_zh {
+            println!("✓ 已隐藏 WebUI 中的 GitHub 仓库图标（配置已保存，实时热重载生效）。");
+        } else if is_vi {
+            println!("✓ Đã ẩn biểu tượng kho lưu trữ GitHub trong WebUI (đã lưu, tự động áp dụng ngay).");
+        } else {
+            println!("✓ GitHub repository logo hidden in WebUI (config saved, hot-reloaded).");
+        }
+    }
+
     Ok(())
 }
 

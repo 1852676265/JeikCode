@@ -790,3 +790,86 @@ test('直播思考流式输出中的重复词句绝不被误杀吞字', () => {
   assert.equal(part.text, '首先检查缓存一致性问题。接着再次确认缓存一致性问题，问题已被彻底定位。');
 });
 
+test('工具调用之后的第二段思考流式输出必须开启独立思考部件，绝不能跨越工具合并进第一段思考部件', () => {
+  const canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [
+        { kind: 'reasoning' as const, text: '第一阶段思考：需要读取配置文件。', id: 'm-1:1:reasoning' },
+        { kind: 'tool' as const, tool: { id: 'call_1', name: 'read', status: 'done' as const } },
+      ],
+    },
+  ];
+
+  // 模拟第二轮思考流式到达（partId 为 m-1:2:reasoning，或者无 partId）
+  let res = paintAssistantReasoning(canvas, '第二阶段思考：', false, 'm-1', 'm-1:2:reasoning');
+  res = paintAssistantReasoning(res, '配置文件已经读取完毕，准备进行下一步。', false, 'm-1', 'm-1:2:reasoning');
+
+  // 必须严格拥有两个独立的思考部件，中间夹着工具调用！
+  const parts = res[0]?.parts ?? [];
+  assert.equal(parts.length, 3);
+  assert.equal(parts[0]?.kind, 'reasoning');
+  assert.equal((parts[0] as any).text, '第一阶段思考：需要读取配置文件。');
+  assert.equal(parts[1]?.kind, 'tool');
+  assert.equal(parts[2]?.kind, 'reasoning');
+  assert.equal((parts[2] as any).text, '第二阶段思考：配置文件已经读取完毕，准备进行下一步。');
+});
+
+test('正文后的思考块以及思考块后的正文：极限交替输出严禁任何倒流叠加', () => {
+  let canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [],
+    },
+  ];
+
+  // 1. 思考 1
+  canvas = paintAssistantReasoning(canvas, '思考1：分析需求', false, 'm-1', 'm-1:1:reasoning');
+  // 2. 正文 1
+  canvas = paintAssistantText(canvas, '正文1：开始处理', false, 'm-1', 'm-1:2:text');
+  // 3. 思考 2（正文后的思考块！）
+  canvas = paintAssistantReasoning(canvas, '思考2：检查函数依赖', false, 'm-1', 'm-1:3:reasoning');
+  // 4. 正文 2（思考2后的正文！）
+  canvas = paintAssistantText(canvas, '正文2：函数正常', false, 'm-1', 'm-1:4:text');
+
+  const parts = canvas[0]?.parts ?? [];
+  assert.equal(parts.length, 4, '必须严格交替形成 4 个独立部件');
+  assert.equal(parts[0]?.kind, 'reasoning');
+  assert.equal((parts[0] as any).text, '思考1：分析需求');
+  assert.equal(parts[1]?.kind, 'text');
+  assert.equal((parts[1] as any).text, '正文1：开始处理');
+  assert.equal(parts[2]?.kind, 'reasoning');
+  assert.equal((parts[2] as any).text, '思考2：检查函数依赖');
+  assert.equal(parts[3]?.kind, 'text');
+  assert.equal((parts[3] as any).text, '正文2：函数正常');
+});
+
+test('正文与思考无 partId 极端重放恢复：严格按顺序呈现，绝无倒流叠加', () => {
+  let canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [],
+    },
+  ];
+
+  // 模拟没有 partId 的交替重放帧
+  canvas = paintAssistantReasoning(canvas, '阶段1思考', true);
+  canvas = paintAssistantText(canvas, '阶段1结论', true);
+  canvas = paintAssistantReasoning(canvas, '阶段2思考', true);
+  canvas = paintAssistantText(canvas, '阶段2结论', true);
+
+  const parts = canvas[0]?.parts ?? [];
+  assert.equal(parts.length, 4);
+  assert.equal(parts[0]?.kind, 'reasoning');
+  assert.equal((parts[0] as any).text, '阶段1思考');
+  assert.equal(parts[1]?.kind, 'text');
+  assert.equal((parts[1] as any).text, '阶段1结论');
+  assert.equal(parts[2]?.kind, 'reasoning');
+  assert.equal((parts[2] as any).text, '阶段2思考');
+  assert.equal(parts[3]?.kind, 'text');
+  assert.equal((parts[3] as any).text, '阶段2结论');
+});
+

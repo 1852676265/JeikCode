@@ -658,6 +658,10 @@ pub struct Config {
     /// to restore the legacy undo-on-cancel behaviour.
     #[serde(default = "default_true")]
     pub keep_interrupted_context: bool,
+    /// Whether to display the GitHub repository logo in the UI.
+    /// Defaults to `true` (on/show). Set `github_logo = "off"` or `false` to hide it.
+    #[serde(default = "default_true", deserialize_with = "deserialize_lenient_bool")]
+    pub github_logo: bool,
     /// Offline deployment switch (intranet / air-gapped). Default off = online build unchanged.
     #[serde(default)]
     pub offline_mode: offline::OfflineMode,
@@ -940,6 +944,7 @@ impl Default for Config {
             plugin: PluginConfig::default(),
             web_search: WebSearchConfig::default(),
             keep_interrupted_context: true,
+            github_logo: true,
             offline_mode: offline::OfflineMode::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),
@@ -1443,6 +1448,39 @@ pub struct NetworkConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn deserialize_lenient_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LenientBoolVisitor;
+    impl<'de> serde::de::Visitor<'de> for LenientBoolVisitor {
+        type Value = bool;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean or switch (true/false, on/off, yes/no)")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E>(self, v: &str) -> Result<bool, E>
+        where
+            E: serde::de::Error,
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "off" | "false" | "0" | "disable" | "disabled" | "no" | "none" | "hide" => Ok(false),
+                "on" | "true" | "1" | "enable" | "enabled" | "yes" | "show" => Ok(true),
+                other => Err(E::custom(format!("invalid switch value: {other}"))),
+            }
+        }
+    }
+    deserializer.deserialize_any(LenientBoolVisitor)
 }
 fn default_false() -> bool {
     false

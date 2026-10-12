@@ -1645,6 +1645,9 @@ pub(crate) enum LiveWireEvent {
     /// the title of tabs viewing other sessions.
     #[serde(rename = "session_renamed")]
     SessionRenamed { session_id: String, name: String },
+    /// Session execution status change (idle, running, compacting, aborted).
+    #[serde(rename = "session_status")]
+    SessionStatus { session_id: String, status: String },
     /// Working directory switched (any view's `/cd`). Every webui tab updates its
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
@@ -1852,16 +1855,48 @@ impl NativeLiveWireProjector {
                     cached: meta.tokens.cached as usize,
                 },
                 Kernel::Compacted {
+                    removed,
+                    bytes_before,
                     bytes_after,
                     committed: true,
                     ..
                 } => {
+                    crate::publish_global(crate::GlobalWireEvent::Activity {
+                        session_id: self.session_id.clone(),
+                        running: true,
+                        terminal: None,
+                        status: None,
+                    });
+                    let before_tokens = (bytes_before as f32 / 3.5).ceil() as usize;
                     let after_tokens = (bytes_after as f32 / 3.5).ceil() as usize;
-                    LiveWireEvent::Tokens {
-                        prompt: after_tokens,
-                        completion: 0,
-                        total: after_tokens,
-                        cached: 0,
+                    let mark = jeikcode_config::i18n::format_compaction_mark(
+                        removed,
+                        before_tokens,
+                        after_tokens,
+                    );
+                    LiveWireEvent::Warning { message: mark }
+                }
+                Kernel::CompactionFailed { error, .. } => {
+                    crate::publish_global(crate::GlobalWireEvent::Activity {
+                        session_id: self.session_id.clone(),
+                        running: true,
+                        terminal: None,
+                        status: None,
+                    });
+                    LiveWireEvent::Warning {
+                        message: format!("Compaction failed: {error}"),
+                    }
+                }
+                Kernel::CompactionStarted { .. } => {
+                    crate::publish_global(crate::GlobalWireEvent::Activity {
+                        session_id: self.session_id.clone(),
+                        running: true,
+                        terminal: None,
+                        status: Some("compacting".to_string()),
+                    });
+                    LiveWireEvent::SessionStatus {
+                        session_id: self.session_id.clone(),
+                        status: "compacting".to_string(),
                     }
                 }
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
@@ -1886,8 +1921,7 @@ impl NativeLiveWireProjector {
                 | Kernel::Snapshot { .. }
                 | Kernel::TurnComplete { .. }
                 | Kernel::Cancelled
-                | Kernel::CompactionStarted { .. }
-                | Kernel::CompactionFailed { .. } => return None,
+                | Kernel::Compacted { .. } => return None,
                 Kernel::Steered { count, inputs } => LiveWireEvent::Steered {
                     count,
                     inputs,

@@ -963,7 +963,7 @@ fn apply_text_hunk(
         if occurrence >= 1 {
             if occurrence as usize > count {
                 return Err(format!(
-                    "occurrence {occurrence} is out of range (1..={count}).\n{}",
+                    "occurrence {occurrence} is out of range (must be between 1 and {count}).\n{}",
                     format_match_sites(content, &old_match)
                 ));
             }
@@ -971,7 +971,7 @@ fn apply_text_hunk(
             return Ok((updated, 1, "exact-occurrence", None));
         }
         return Err(format!(
-            "old_string appears {count} times — it must be unique. Add surrounding context, set replace_all=true, or set occurrence to 1..={count}.\n{}",
+            "old_string appears {count} times — it must be unique. Add surrounding context, set replace_all=true, or set occurrence to a 1-based index (1 to {count}).\n{}",
             format_match_sites(content, &old_match)
         ));
     }

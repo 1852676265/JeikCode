@@ -24,6 +24,11 @@ export function onGlobalEvent(listener: GlobalEventListener): () => void {
 
 /** 分发一条事件。单个订阅者抛错不得影响其他订阅者与连接存活。 */
 export function emitGlobalEvent(event: GlobalWireEvent): void {
+  if (event.type === 'config_reloaded') {
+    try {
+      window.dispatchEvent(new CustomEvent('jeikcode:config-reloaded'));
+    } catch {}
+  }
   for (const listener of [...listeners]) {
     try {
       listener(event);

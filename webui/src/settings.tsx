@@ -20,6 +20,7 @@ interface SettingsCtx {
   lang: Lang;
   setLang: (l: Lang) => Promise<void>;
   t: (key: MsgKey, params?: TParams) => string;
+  githubLogo: boolean;
 }
 
 const Ctx = createContext<SettingsCtx | null>(null);
@@ -82,6 +83,7 @@ export function normalizeServerLang(value: string | undefined): Lang | null {
 export function SettingsProvider({ children }: { children: ComponentChildren }) {
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [lang, setLangState] = useState<Lang>(readLang);
+  const [githubLogo, setGithubLogo] = useState<boolean>(true);
 
   const selectionVersion = useRef(0);
   const pendingSave = useRef(Promise.resolve());
@@ -95,10 +97,27 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
         if (cancelled || version !== selectionVersion.current) return;
         const next = normalizeServerLang(cfg.language);
         if (next) setLangState(next);
+        if (typeof cfg.github_logo === 'boolean') {
+          setGithubLogo(cfg.github_logo);
+        }
       })
       .catch(() => {});
+
+    const handleReload = () => {
+      getConfig().then((cfg) => {
+        if (typeof cfg.github_logo === 'boolean') {
+          setGithubLogo(cfg.github_logo);
+        }
+      }).catch(() => {});
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('jeikcode:config-reloaded', handleReload);
+    }
     return () => {
       cancelled = true;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('jeikcode:config-reloaded', handleReload);
+      }
     };
   }, []);
 
@@ -145,7 +164,7 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
 
   return (
     <Ctx.Provider
-      value={{ theme, setTheme: setThemeState, lang, setLang, t }}
+      value={{ theme, setTheme: setThemeState, lang, setLang, t, githubLogo }}
     >
       {children}
     </Ctx.Provider>

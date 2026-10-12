@@ -185,7 +185,7 @@ export type SSEEvent =
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string }
+  | { type: 'warning'; message: string; message_id?: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
@@ -196,6 +196,7 @@ export type SSEEvent =
   | { type: 'artifact_content'; id: string; content: string }
   | { type: 'artifact_end'; id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
+  | { type: 'session_status'; session_id?: string; status: string }
   | { type: 'command_output'; text: string }
   | SessionMutationEvent;
 
@@ -1072,6 +1073,8 @@ export interface ConfigInfo {
   accounts?: AccountInfo[];
   /** "en", "vi-VN", or "zh-CN". Missing on older servers. */
   language?: string;
+  /** Whether to display the GitHub repository logo in the UI. Defaults to true. */
+  github_logo?: boolean;
 }
 
 export async function getConfig(): Promise<ConfigInfo> {
@@ -1769,11 +1772,13 @@ export type GlobalWireEvent =
   | { type: 'sync' }
   | { type: 'session_upsert'; session: SessionMetaWithProject }
   | { type: 'session_deleted'; session_id: string; project_hash: string }
-  | { type: 'activity'; session_id: string; running: boolean; terminal?: 'completed' | 'stopped' | 'failed' }
+  | { type: 'activity'; session_id: string; running: boolean; terminal?: 'completed' | 'stopped' | 'failed'; status?: string }
   /** 该会话弹出了审批/提问卡：对该会话做一次定向 pending 拉取（单会话小请求）。 */
   | { type: 'review_asked'; session_id: string }
   /** 待交互已解决：按 id 就地从所有实例的通知卡片中移除。 */
-  | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number };
+  | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number }
+  /** 全局配置热重载信号（如 CLI 执行 jeikcode ghimg 或后台配置更新）。 */
+  | { type: 'config_reloaded' };
 
 /** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
 export async function streamGlobalEvents(
@@ -1822,7 +1827,7 @@ export type LiveWireEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number; cached?: number }
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string }
+  | { type: 'warning'; message: string; message_id?: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; session_id?: string; runtime_instance_id: string; generation: number; request_id: number; tool_name: string; reason: string; call_id: string; arguments: string }
@@ -1831,6 +1836,7 @@ export type LiveWireEvent =
   | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[]; message_id?: string }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
+  | { type: 'session_status'; session_id?: string; status: string }
   | { type: 'working_dir'; working_dir: string }
   | { type: 'command_output'; text: string };
 

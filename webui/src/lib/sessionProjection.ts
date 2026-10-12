@@ -446,13 +446,6 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
       next[next.length - 1] = { kind: 'reasoning', text: (tail.text || '') + content, id: tail.id ?? partId };
       return next;
     }
-    const lastReasoningIdx = parts.map((p) => p.kind).lastIndexOf('reasoning');
-    if (lastReasoningIdx >= 0) {
-      const next = parts.slice();
-      const p = next[lastReasoningIdx] as { kind: 'reasoning'; text: string; id?: string };
-      next[lastReasoningIdx] = { ...p, text: (p.text || '') + content, id: p.id ?? partId };
-      return next;
-    }
     return appendReasoningPart(parts, content, partId);
   }
 
@@ -464,7 +457,7 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
 
   const existingIdx = partId
     ? parts.findIndex((p) => p.kind === 'reasoning' && p.id === partId)
-    : parts.findIndex((p) => p.kind === 'reasoning');
+    : (parts[parts.length - 1]?.kind === 'reasoning' ? parts.length - 1 : -1);
 
   if (existingIdx >= 0) {
     const p = parts[existingIdx] as { kind: 'reasoning'; text: string; id?: string };
@@ -548,4 +541,41 @@ export function foldLiveTodo(input: {
     callId: input.callId,
     appliedIds: input.appliedIds,
   });
+}
+
+/**
+ * 将非致命黄色通知（如上下文压缩、系统提示、重连告警）作为独立的 notice 部件
+ * 严格按顺序追加到当前助手的部件流中（即使末尾尚未生成 assistant，也会安全开启一个容器）。
+ */
+export function paintAssistantNotice<T extends ProjectionMessage>(
+  messages: T[],
+  text: string,
+  targetId?: string,
+): T[] {
+  if (!text) return messages;
+  if (messages.length === 0) {
+    return [{ role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T];
+  }
+  if (targetId) {
+    const target = messages.findIndex((m) => m.role === 'assistant' && m.id === targetId);
+    if (target >= 0) {
+      const next = messages.slice();
+      const existing = messages[target]!;
+      next[target] = {
+        ...existing,
+        parts: [...existing.parts, { kind: 'notice', text }],
+      };
+      return next;
+    }
+  }
+  const last = messages[messages.length - 1]!;
+  if (last.role === 'assistant') {
+    const next = messages.slice();
+    next[next.length - 1] = {
+      ...last,
+      parts: [...last.parts, { kind: 'notice', text }],
+    };
+    return next;
+  }
+  return [...messages, { role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T];
 }
