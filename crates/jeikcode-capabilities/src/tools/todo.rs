@@ -399,10 +399,6 @@ fn upsert_todo(
     idx + 1
 }
 
-/// A non-empty list whose every item is `completed` is a closed plan.
-/// The next `add` starts a new plan at id 1 instead of appending as 7,8,9…
-/// (models often skip `clear` when pivoting). An in-progress / pending list
-/// is left alone — that is still the current task.
 fn maybe_auto_clear_finished(list: &mut Vec<TodoItem>) {
     if !list.is_empty() && list.iter().all(|t| t.status == TodoStatus::Completed) {
         list.clear();
@@ -469,18 +465,12 @@ fn apply_actions_batch(
         return Ok(tmp);
     }
 
-    // Length the model last saw: after explicit `clear`, else the incoming list
-    // (auto-clear of a closed plan has not run yet).
+    // Length the model last saw: after explicit `clear`, else the incoming list.
     let visible_len = tmp.len();
 
-    // Adds first: append-only, existing 1..n stay put. A finished list (every
-    // item completed) is treated as a closed plan — auto-clear so a new batch
-    // of adds restarts at id 1 instead of appending as 7,8,9…
-    let mut add_landings = Vec::new();
     let has_add = arr.iter().any(|item| action_kind(item) == Some("add"));
     // `{id, content, status}` is inferred as update, so a new-plan payload on an
-    // empty/closed list would otherwise die with "unknown task id 1 (list has 0
-    // items)". Promote those content-bearing updates to adds, sorted by id.
+    // empty list would otherwise die with "unknown task id 1 (list has 0 items)".
     let seed_updates = if list_is_seedable(&tmp) && !has_add {
         let mut v: Vec<&serde_json::Value> = arr
             .iter()
@@ -491,17 +481,31 @@ fn apply_actions_batch(
     } else {
         Vec::new()
     };
-    if has_add || !seed_updates.is_empty() {
-        let add_count = arr
+
+    let mut add_landings = Vec::new();
+    let has_add = arr.iter().any(|item| action_kind(item) == Some("add"));
+    // `{id, content, status}` is inferred as update, so a new-plan payload on an
+    // empty list would otherwise die with "unknown task id 1 (list has 0 items)".
+    let seed_updates = if list_is_seedable(&tmp) && !has_add {
+        let mut v: Vec<&serde_json::Value> = arr
             .iter()
-            .filter(|item| action_kind(item) == Some("add"))
-            .count()
-            + seed_updates.len();
-        if add_count >= 2 {
-            tmp.clear();
-        } else {
+            .filter(|item| action_kind(item) == Some("update") && item_has_content(item))
+            .collect();
+        v.sort_by_key(|item| json_id(item).unwrap_or(u64::MAX));
+        v
+    } else {
+        Vec::new()
+    };
+
+    if has_add || !seed_updates.is_empty() {
+        // 关键修复：绝不能仅仅因为 add_count >= 2 就把还在进行中的任务列表暴力清空！
+        // 只有当已有列表此前已经全部完成（全是 Completed），且当前没有对未完成任务的引用时，才允许清除已闭环的旧计划。
+        // 若列表中仍有 pending 或 in_progress 的任务，100% 严格追加，绝不清空！
+        let is_unfinished = tmp.iter().any(|t| t.status != TodoStatus::Completed);
+        if !is_unfinished {
             maybe_auto_clear_finished(&mut tmp);
         }
+
         if has_add {
             for item in arr {
                 if action_kind(item) == Some("add") {
@@ -514,9 +518,7 @@ fn apply_actions_batch(
         }
     }
 
-    // Inserts next (id-shifting / re-rank), so later updates use post-insert ids.
-    // `position` is the 1-based slot on the list *before this batch's inserts*
-    // (after any adds). Apply high→low so two original positions don't scramble.
+    // 2. Inserts next (id-shifting / re-rank)
     let mut inserts: Vec<&serde_json::Value> = arr
         .iter()
         .filter(|a| action_kind(a) == Some("insert"))
@@ -530,8 +532,7 @@ fn apply_actions_batch(
         apply_insert(&mut tmp, item)?;
     }
 
-    // Updates last, against the list after add/insert. Array order does not
-    // matter except when two updates set `in_progress` (later one wins).
+    // 3. Updates last, against the list after add/insert.
     for item in arr {
         if action_kind(item) == Some("update") {
             if seed_updates.iter().any(|s| std::ptr::eq(*s, item)) {
@@ -540,6 +541,7 @@ fn apply_actions_batch(
             apply_update(&mut tmp, item, visible_len, &add_landings)?;
         }
     }
+
     Ok(tmp)
 }
 
@@ -1921,6 +1923,41 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].content, "导出Excel");
         assert_eq!(list[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn update_and_multiple_adds_on_in_progress_list_does_not_clear() {
+        let mut list = (1..=6)
+            .map(|i| TodoItem {
+                content: format!("task-{i}"),
+                status: if i == 6 {
+                    TodoStatus::InProgress
+                } else {
+                    TodoStatus::Completed
+                },
+            })
+            .collect::<Vec<_>>();
+
+        apply_todo_action(
+            &mut list,
+            r#"{"actions":[
+                {"action":"update","id":6,"status":"completed"},
+                {"action":"add","content":"task-7"},
+                {"action":"add","content":"task-8"},
+                {"action":"add","content":"task-9"},
+                {"action":"add","content":"task-10"}
+            ]}"#,
+        );
+
+        assert_eq!(
+            list.len(),
+            10,
+            "list must preserve original 6 tasks and append 4 new ones"
+        );
+        assert_eq!(list[5].content, "task-6");
+        assert_eq!(list[5].status, TodoStatus::Completed);
+        assert_eq!(list[6].content, "task-7");
+        assert_eq!(list[9].content, "task-10");
     }
 
     #[test]
