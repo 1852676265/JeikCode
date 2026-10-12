@@ -3,7 +3,7 @@
  * 
  * 作用：作为 GitHub Releases 的全球边缘智能缓存中继，
  * 解决海外 VPN / 共享出口 IP 遭遇 GitHub API 60次/小时 Rate Limit 的问题。
- * 全球 CDN 边缘缓存 5 分钟 (300 秒)，带跨域 CORS 头，支持并发。
+ * 全球 CDN 边缘缓存 70 秒，带跨域 CORS 头，支持并发。
  */
 
 export async function onRequest(context) {
@@ -59,11 +59,11 @@ export async function onRequest(context) {
       'Content-Type': 'application/json; charset=utf-8',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-      'Cache-Control': 'public, max-age=300, s-maxage=300, stale-while-revalidate=60',
+      'Cache-Control': 'public, max-age=70, s-maxage=70, stale-while-revalidate=10',
     },
   });
 
-  // 3. 异步写入 Cloudflare 全球边缘节点缓存 300 秒
+  // 3. 异步写入 Cloudflare 全球边缘节点缓存 70 秒
   try {
     context.waitUntil(cache.put(cacheKey, response.clone()));
   } catch (_) {

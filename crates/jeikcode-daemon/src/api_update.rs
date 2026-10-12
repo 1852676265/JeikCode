@@ -168,7 +168,7 @@ pub fn is_desktop_environment() -> bool {
     std::env::var("JEIKCODE_DESKTOP").is_ok()
 }
 
-/// 官方 Cloudflare Pages 全球边缘免限流发布源（经边缘缓存 5 分钟，不受 GitHub API 60次/小时限流影响）
+/// 官方 Cloudflare Pages 全球边缘免限流发布源（经边缘缓存 70 秒，不受 GitHub API 60次/小时限流影响）
 const DEFAULT_PRIMARY_RELEASES_API_URL: &str = "https://jeikcode.top/api/releases";
 const FALLBACK_GITHUB_RELEASES_API_URL: &str =
     "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=30";
