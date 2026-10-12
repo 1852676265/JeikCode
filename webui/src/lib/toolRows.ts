@@ -161,16 +161,19 @@ export function appendToolOutput(
   return next;
 }
 
-/** Append a reasoning delta to the last reasoning part, or start a new one. */
-export function appendReasoningPart(parts: MsgPart[], delta: string): MsgPart[] {
+/** Append a reasoning delta to the last reasoning part, or start a new one.
+ *  `id` 是线协议里的 part 身份：建新部件时立即盖章，后续重放/重连才能按 part
+ *  定向合并（没有身份就只能靠文本启发式，会在刷新时把整段思考重打一遍）。 */
+export function appendReasoningPart(parts: MsgPart[], delta: string, id?: string): MsgPart[] {
   if (!delta) return parts;
   const tail = parts[parts.length - 1];
-  if (tail && tail.kind === 'reasoning') {
+  // 只在 part 身份相同（或旧数据无身份）时并入尾部，否则另起思考部件。
+  if (tail && tail.kind === 'reasoning' && (!id || !tail.id || tail.id === id)) {
     const next = parts.slice();
-    next[next.length - 1] = { kind: 'reasoning', text: tail.text + delta };
+    next[next.length - 1] = { kind: 'reasoning', text: tail.text + delta, ...(tail.id || !id ? {} : { id }) };
     return next;
   }
-  return [...parts, { kind: 'reasoning', text: delta }];
+  return [...parts, { kind: 'reasoning', text: delta, ...(id ? { id } : {}) }];
 }
 
 export function toolResultStatus(

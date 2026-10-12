@@ -424,11 +424,16 @@ function mergeTurnRest<T extends ReconcileMessage>(diskRest: T[], canvasRest: T[
   const canvasText = joinedTurnText(canvasRest);
   const canvasInFlight = transcriptHasInFlightAssistant(canvasRest as unknown as Array<{ role: string; parts: InFlightPart[] }>);
   const canvasAhead = (canvasText.startsWith(diskText) && canvasText.length >= diskText.length) || canvasInFlight;
+  // 上下文压缩：磁盘被摘要替换后**比画布更短**（而且不再是画布的前缀）。
+  // 显示只增不减 —— 画布是权威，绝不能用更短的磁盘去覆盖，
+  // 否则一次刷新就把画布里的历史显示成了压缩版。
+  const diskCompacted =
+    diskText.length > 0 && canvasText.length > diskText.length && !canvasText.startsWith(diskText);
 
   // 1. 若前端画布处于活跃进行中（in-flight）或文本已经领先/包含落盘文本：
   // 画布是正在流式生成的绝对真实源！严禁从落后的 diskRest 抽取旧思考块追加到末尾！
   // 仅将 diskRest 中已结算的 tool 状态同步到 canvasRest 对应的 tool 调用中。
-  if (canvasAhead) {
+  if (canvasAhead || diskCompacted) {
     const diskToolsById = new Map<string, ReconcilePart['tool']>();
     for (const m of diskRest) {
       for (const p of m.parts) {
@@ -727,12 +732,23 @@ export function unpaintedReplaySuffix(existing: string, incoming: string): strin
  * Id-based tail dedup for snapshot reconciliation.
  * Drop canvas-tail messages whose stable `id` already exists in the settled
  * snapshot, so a replayed/echoed message is not appended a second time.
- * When neither side carries ids, the tail is returned unchanged (legacy path).
+ *
+ * Optimistic rows carry no stored id yet (just sent, not bound), so an id-only
+ * check re-appends them: after a mid-turn refresh the newest prompt showed up
+ * TWICE at the bottom of the canvas. User text is therefore the fallback
+ * identity — same content on the snapshot means the row is already there.
  */
-export function dropSnapshotDuplicates<T extends { id?: string }>(snapshot: T[], tail: T[]): T[] {
+export function dropSnapshotDuplicates<T extends { id?: string; role?: string; parts?: InFlightPart[] }>(
+  snapshot: T[],
+  tail: T[],
+): T[] {
   const ids = new Set(snapshot.map((m) => m.id).filter((value): value is string => !!value));
-  if (ids.size === 0) return tail;
-  return tail.filter((m) => !m.id || !ids.has(m.id));
+  return tail.filter((m) => {
+    if (m.id && ids.has(m.id)) return false;
+    if (m.role !== 'user') return true;
+    const text = m.parts?.filter((part) => part.kind === 'text').map((part) => part.text || '').join('') ?? '';
+    return !text || !userMessageAlreadyOnCanvas(snapshot as unknown as CanvasMessage[], text);
+  });
 }
 
 type InFlightPart = {

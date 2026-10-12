@@ -154,9 +154,21 @@ export async function getHealth(): Promise<HealthInfo> {
   return resp.json() as Promise<HealthInfo>;
 }
 
+/**
+ * 断点续传游标：只有「回放帧」带 `seq`（回合缓冲序号）；实时帧不带。
+ *
+ * 前端把收到的最大 seq 存起来，重连时当作 `after_seq` 带回去，服务器只补之后的
+ * 帧 —— 收到的每一帧都是新的，不再需要靠内容猜「这条画过没有」。
+ */
+export interface SeqTaggedFrame {
+  seq?: number;
+}
+
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
+  /** `after_seq = -1`（新会话）的握手帧：不补发，只告知起始游标。 */
+  | { type: 'session_start'; session_id?: string; cursor: number }
   | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number }
   | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
   | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
@@ -526,12 +538,14 @@ export async function getChatPending(sessionId: string): Promise<ChatPendingInte
  */
 export async function watchChatSession(
   sessionId: string,
-  onEvent: (event: SSEEvent) => void,
+  /** 回放帧带 `seq` 游标，调用方据此推进断点续传游标（见 `SeqTaggedFrame`）。 */
+  onEvent: (event: SSEEvent & SeqTaggedFrame) => void,
   signal?: AbortSignal,
-  opts?: { standbyOnly?: boolean },
+  opts?: { standbyOnly?: boolean; afterSeq?: number },
 ): Promise<void> {
   const params = new URLSearchParams({ session_id: sessionId });
   if (opts?.standbyOnly) params.set('standby', 'true');
+  if (opts?.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
   const resp = await apiFetch(
     `/chat/watch?${params.toString()}`,
     { headers: authHeaders(), signal },
@@ -1820,36 +1834,6 @@ export type LiveWireEvent =
   | { type: 'working_dir'; working_dir: string }
   | { type: 'command_output'; text: string };
 
-export async function streamLive(
-  onEvent: (e: LiveWireEvent) => void,
-  signal?: AbortSignal,
-  sessionId?: string | null,
-  // Called on every chunk received (events AND the 15s keepalive ping) so the
-  // caller can run a staleness watchdog that reconnects a silently-dead stream.
-  onActivity?: () => void,
-): Promise<void> {
-  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
-  const resp = await apiFetch(`/live${params}`, { headers: authHeaders(), signal });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    onActivity?.();
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const line = part.split('\n').find((l) => l.startsWith('data:'));
-      if (!line) continue;
-      const json = line.slice('data:'.length).trim();
-      if (!json) continue;
-      try { onEvent(JSON.parse(json) as LiveWireEvent); } catch { /* ignore keepalive */ }
-    }
-  }
-}
 
 export async function postLiveMessage(
   message: string,

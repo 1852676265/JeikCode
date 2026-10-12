@@ -40,7 +40,7 @@ const PROGRAMMATIC_STOP_MARK_TTL_MS = 15000;
  * （subscribe_live_with_replay），把已画完的正文/思考再落一遍。
  */
 const WATCH_REATTACH_AFTER_HIDDEN_MS = 60000;
-import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, streamLive, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
+import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
@@ -172,15 +172,11 @@ import {
   createLiveLifecycleState,
   isCurrentChatStream,
   liveDetachDisposition,
-  liveSnapshotQueueDisposition,
   reduceChatRecovery,
-  reduceLiveLifecycle,
   resolveUserInputRequest,
   toolResultClearsUserInput,
   transcriptLatestUserInputIsResolved,
   transcriptToolCallIsResolved,
-  restoreLiveSnapshot,
-  keepCanvasOnEmptyLiveSnapshot,
   shouldAdoptDiskTranscript,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
@@ -188,19 +184,12 @@ import {
   transcriptHasInFlightAssistant,
   transcriptHasOpenUserTurn,
   sessionAssignedClaimsLocalTurn,
-  holdDuplicateUserEcho,
-  deltaContinuesLastAssistant,
   liveSubmitKeepsTurn,
   shouldKeepCachedTranscript,
   thisTabOwnsTurn,
   liveSyncOwnsViewedSession,
   shouldLockSendAsDetached,
   isWatchTurnActivationEvent,
-  shouldIgnoreLiveReplayAfterIdleSnapshot,
-  idleReplayAlreadyPainted,
-  idleFlagAfterLiveSnapshot,
-  shouldClearIdleLiveSnapshotOnUser,
-  shouldKeepLiveBusyAcrossIdleSnapshot,
   resolveTokenCache,
   formatCacheHitRate,
   createTokenCacheState,
@@ -246,6 +235,12 @@ import {
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
+import {
+  clearStreamCursor,
+  readStreamCursor,
+  resolveAfterSeq,
+  writeStreamCursor,
+} from '../lib/streamCursor';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -1825,9 +1820,20 @@ export function Chat({
     // 本端是否已收到终态；决定流正常关闭后要不要补一次磁盘对账。
     let terminalSeen = false;
 
+    // 断点续传：有游标就续传（收到的全是新的）；新会话带 -1 让服务器跳过补发；
+    // 只有「无游标但画布有历史」（换设备/清缓存）才请求全量补发，并按身份幂等收敛。
+    const attachCursor = readStreamCursor(loadId);
+    const attachAfterSeq = resolveAfterSeq(attachCursor, messagesRef.current.length === 0);
+    const attachNeedsDedup = attachAfterSeq === undefined;
     void watchChatSession(
       loadId,
       (event) => {
+        // 游标推进：回放帧带 seq，握手帧带 cursor。
+        if (typeof event.seq === 'number') writeStreamCursor(loadId, event.seq);
+        if (event.type === 'session_start') {
+          writeStreamCursor(loadId, event.cursor);
+          return;
+        }
         // Ignore synthetic done events from clean idle/watch disconnects.
         if (
           event.type === 'done' &&
@@ -1846,7 +1852,12 @@ export function Chat({
           // permission_request / user_input_request for every non-Auto mode that
           // parks (Build / AcceptEdits / Plan). Must restore those modals or the
           // turn deadlocks in WaitingApproval with a blinking cursor.
-          handleEvent(event, { requireReplayDedup: true, repeatUserAfterSettled: false });
+          // 帧语义由「这次连接请求了什么」决定：续传/新会话收到的都是新内容，
+          // 直接画；只有主动请求全量补发时才按身份收敛去重。
+          handleEvent(event, {
+            requireReplayDedup: attachNeedsDedup,
+            repeatUserAfterSettled: false,
+          });
           timelineFollow.changed();
           if (
             event.type === 'done' ||
@@ -1854,6 +1865,8 @@ export function Chat({
             event.type === 'error'
           ) {
             terminalSeen = true;
+            // 游标是会话级的（跨回合严格递增），回合结束**不能**清 —— 清掉就丢掉了
+            // 断线期间的续传能力。只有会话变更（删/改/截断）才作废它。
             sessionWatchersRef.current.delete(loadId);
             localActiveStreamsBySessionRef.current.delete(loadId);
             settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
@@ -1876,6 +1889,7 @@ export function Chat({
         }
       },
       watchAbort.signal,
+      { afterSeq: attachAfterSeq },
     ).then(() => {
       // 流被服务端正常关闭却从未送达终态（终态帧丢失/竞态/服务端重启）：本端不会再收到推送，
       // 立刻做一次磁盘对账并挂上兜底 tick，杜绝“通知响了、正文却要刷新/失焦才出现”。
@@ -2111,9 +2125,20 @@ export function Chat({
     let activated = false;
     let terminalSeen = false;
     const connectedAt = Date.now();
+    // 待机连接不会补发（standby=true），直接按「无历史」握手；replayIfLive 的重连才续传。
+    const idleAfterSeq = opts?.replayIfLive === true
+      ? resolveAfterSeq(readStreamCursor(loadId), messagesRef.current.length === 0)
+      : -1;
+    const idleNeedsDedup = idleAfterSeq === undefined;
     void watchChatSession(
       loadId,
       (event) => {
+        // 游标推进：回放帧带 seq，握手帧带 cursor。
+        if (typeof event.seq === 'number') writeStreamCursor(loadId, event.seq);
+        if (event.type === 'session_start') {
+          writeStreamCursor(loadId, event.cursor);
+          return;
+        }
         // Ignore synthetic done events from clean idle/watch disconnects.
         if (
           event.type === 'done' &&
@@ -2180,7 +2205,7 @@ export function Chat({
           return;
         }
         // Restore permission/user-input for every non-Auto mode that parks.
-        handleEvent(event, { requireReplayDedup: true });
+        handleEvent(event, { requireReplayDedup: idleNeedsDedup });
         // Keep the main scroller pinned while we are following (user can scroll
         // up mid-turn to release follow).
         timelineFollow.changed();
@@ -2190,6 +2215,7 @@ export function Chat({
           event.type === 'error'
         ) {
           terminalSeen = true;
+          // 游标会话级递增，跨回合不清（清了就没法续传断线期间的内容）。
           idleWatchFlashDisconnectsRef.current.delete(loadId);
           // 回合结束:回空闲态重新待机,保证下一个 API turn 一 admit 就被推到。
           settleToIdleWatch(projectHash, loadId, loadGeneration);
@@ -2199,7 +2225,7 @@ export function Chat({
       // 刷新时 /chat/active 可能还没标上这个会话。standby 会跳过已经在跑的回放，
       // 思考和正文要等下一次落盘。第一次连接先要完整回放；回合真的空闲时服务端
       // 没有回放缓冲，仍然只是待机。
-      { standbyOnly: opts?.replayIfLive !== true },
+      { standbyOnly: opts?.replayIfLive !== true, afterSeq: idleAfterSeq },
     ).then(() => {
       // 连接在未收到终端事件的情况下被服务端关闭(Live-dying 竞态 / daemon
       // 重启 / 网络断)。若当前还是这条连接的 controller,说明没人接手——
@@ -2617,7 +2643,6 @@ export function Chat({
         })
       ) {
         liveSessionIdRef.current = sessionId;
-        startLiveStream();
       }
     }
 
@@ -2832,13 +2857,16 @@ export function Chat({
               // 关键修复：当会话未处于活跃轮次时，如果磁盘与缓存的消息结构或内容不一致（例如发生删除、改写或截断），以磁盘持久化为最高真相源！
               const diskCountDiffer = (!turnActive || serverActive === false) && !cacheInFlight && loaded.length !== currentCached.length;
               const diskUserDiffer = (!turnActive || serverActive === false) && !cacheInFlight && loadedUserCount !== cachedUserCount;
-              const cacheContentStale = (!turnActive || serverActive === false) && !cacheInFlight && (
+              // 上下文压缩会把硬盘上的老消息换成一条摘要 → 硬盘比画布**更短**。
+              // 显示只增不减：这种情况绝不能用硬盘覆盖画布（否则显示被阑割）。
+              const diskShrank = diskHasUser && transcriptTextLen(loaded) < transcriptTextLen(currentCached);
+              const cacheContentStale = !diskShrank && (!turnActive || serverActive === false) && !cacheInFlight && (
                 diskCountDiffer || diskUserDiffer || (diskHasUser && transcriptTextLen(loaded) !== transcriptTextLen(currentCached))
               );
 
               // 仅当缓存落后于磁盘最新状态，或磁盘内容被改写/删除产生结构差异时采用磁盘覆盖；
               // 否则如果缓存已经完整且一致，保持内存真相源，消除切换时的双重冲刷闪烁！
-              const shouldAdoptDisk = cacheMissingUser || cacheMissingSettled || (!turnActive && !cacheInFlight && diskHasUser && diskHasNewContent) || cacheContentStale;
+              const shouldAdoptDisk = !diskShrank && (cacheMissingUser || cacheMissingSettled || (!turnActive && !cacheInFlight && diskHasUser && diskHasNewContent) || cacheContentStale);
 
               if (shouldAdoptDisk) {
                 displayMessages = loaded;
@@ -3304,13 +3332,7 @@ export function Chat({
   }, [atIndex, atOpen, atRows.length]);
 
   // ── 遗留的 /live 实时流逻辑已彻底退役，统一收敛至 Single Event Bus (/chat/watch) ──
-  function startLiveStream() {
-    // Legacy /live sync stream has been retired. Unified under Single Event Bus (/chat/watch).
-  }
 
-  function stopLiveStream() {
-    // Legacy /live sync stream has been retired.
-  }
 
   // 同步模式已移除。画布只走 /chat + /chat/watch 这一条链路。
   // 旧书签里的 ?sync=1 不再打开第二条实时流，挂载时清掉。
@@ -3440,9 +3462,24 @@ export function Chat({
         }
         // Text comes first (the LLM speaks, then calls tools), so the part
         // order for a persisted round is [reasoning?, text, tool, tool, …].
+        // 段编号必须与线协议一致（`{轮id}:{段序}:{类型}`，段序「类型变化才 +1」）：
+        // 有思考时正文是 2，没思考时正文是 1。补上编号后，回放帧能按 id 精确对号
+        // 入座（而不需要拿文本拼接去猜），且压缩/重写历史也不会让路由失效。
         const parts: MsgPart[] = [];
-        if (msg.reasoning) parts.push({ kind: 'reasoning', text: msg.reasoning });
-        if (msg.content) parts.push({ kind: 'text', text: msg.content });
+        if (msg.reasoning) {
+          parts.push({
+            kind: 'reasoning',
+            text: msg.reasoning,
+            ...(msg.id ? { id: `${msg.id}:1:reasoning` } : {}),
+          });
+        }
+        if (msg.content) {
+          parts.push({
+            kind: 'text',
+            text: msg.content,
+            ...(msg.id ? { id: `${msg.id}:${msg.reasoning ? 2 : 1}:text` } : {}),
+          });
+        }
         for (const tc of msg.tool_calls ?? []) {
           const rawArgs = tc.arguments || tc.display || '';
           // Rebuild parallel subagent panel for `task` (same as live tool_start).
@@ -3515,29 +3552,6 @@ export function Chat({
   }
 
   // ── Live SSE adapter: map LiveWireEvent → SSEEvent (for variants that overlap) ──
-  function liveToSSE(e: LiveWireEvent): SSEEvent | null {
-    switch (e.type) {
-      case 'text': return { type: 'text', content: e.content, message_id: e.message_id, part_id: e.part_id, part_seq: e.part_seq };
-      case 'reasoning': return { type: 'reasoning', content: e.content, message_id: e.message_id, part_id: e.part_id, part_seq: e.part_seq };
-      case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments, message_id: e.message_id };
-      case 'tool_output': return { type: 'tool_output', id: e.id, chunk: e.chunk };
-      case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
-      case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
-      case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total, cached: e.cached };
-      case 'warning': return { type: 'warning', message: e.message };
-      case 'persistence_warning': return { type: 'persistence_warning', message: e.message };
-      case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
-      // NOTE: no artifact_* mapping. This is safe today because the /sync live
-      // wire forwards raw TextDelta with the ``` fences intact (see to_wire in
-      // live_api.rs — it does NOT run text through ArtifactDetector), so the
-      // Markdown renderer sees code blocks directly. The /chat path strips them
-      // into artifact_* events, which handleEvent reconstructs. If the live path
-      // ever adopts the ArtifactDetector, add artifact_start/content/end here or
-      // /sync will silently drop fenced code again.
-      case 'command_output': return { type: 'command_output', text: e.text };
-      default: return null;
-    }
-  }
 
   function flushHeldDuplicateUser(text: string) {
     const userText = visibleUserText(text) || text;
@@ -3561,505 +3575,6 @@ export function Chat({
   }
 
   // ── Live event handler ──
-  function onLiveEvent(e: LiveWireEvent) {
-    if (
-      e.type === 'text' || e.type === 'reasoning' || e.type === 'tool_start' ||
-      e.type === 'tool_output' || e.type === 'tool_result' || e.type === 'tool_progress' ||
-      e.type === 'user'
-    ) {
-      lastLiveContentRef.current = Date.now();
-    }
-    // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
-    if (e.type === 'snapshot') {
-      liveSessionIdRef.current = e.session_id || null;
-      const loaded = sessionMessagesToDisplay(e.messages);
-      const canvasInFlight = transcriptHasInFlightAssistant(messagesRef.current);
-      const targetSid = e.session_id || null;
-      const sessionIsRunning = !!(
-        targetSid &&
-        (backgroundRunningSessionsRef.current.has(targetSid) ||
-          localTurnSessionsRef.current.has(targetSid))
-      );
-      const snapshotInFlight = transcriptHasInFlightAssistant(loaded);
-      const openUserTurn =
-        transcriptHasOpenUserTurn(loaded) || transcriptHasOpenUserTurn(messagesRef.current);
-      const turnLive =
-        sessionIsRunning
-        || snapshotInFlight
-        || openUserTurn
-        || liveLifecycleRef.current.running
-        || busyRef.current
-        || pendingSelfEchoRef.current.length > 0
-        || canvasInFlight;
-      const queueDisposition = liveSnapshotQueueDisposition(
-        turnLive,
-        queuedRef.current.length,
-      );
-      const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, { type: 'snapshot' });
-      liveLifecycleRef.current = (sessionIsRunning || snapshotInFlight || openUserTurn)
-        ? { running: true, terminalConsumed: false }
-        : lifecycle.state;
-      const restored = restoreLiveSnapshot(loaded);
-      const viewingOther =
-        !!activeIdRef.current && !!e.session_id && activeIdRef.current !== e.session_id;
-      if (!viewingOther && e.project_hash) {
-        viewedProjectHashRef.current = e.project_hash;
-      }
-      // 关键防线：若当前页面持有活跃的本地发送流（abortRef 存在），绝对禁止 snapshot 冲刷重写当前画布！
-      if (abortRef.current !== null || activeStreamRequestIdRef.current !== null) {
-        return;
-      }
-      const canvasAheadOfSnapshot =
-        !viewingOther &&
-        transcriptTextLen(messagesRef.current) > transcriptTextLen(restored.messages) &&
-        (turnLive || canvasInFlight);
-      const keepCanvas = canvasAheadOfSnapshot || keepCanvasOnEmptyLiveSnapshot(
-        restored.messages.length,
-        messagesRef.current.length,
-        !viewingOther,
-      );
-      heldDuplicateUserRef.current = null;
-      replayBoundToAssistantRef.current = false;
-      liveIdleSnapshotRef.current = idleFlagAfterLiveSnapshot({
-        snapshotHasInFlight: snapshotInFlight,
-        keepCanvas,
-        canvasHasInFlight: canvasInFlight,
-        turnLive,
-        openUserTurn,
-      });
-      const effectiveRunning = (sessionIsRunning || snapshotInFlight || openUserTurn) ? true : restored.running;
-      onLiveRunningChange?.(e.session_id || null, effectiveRunning);
-      if (e.session_id && restored.messages.length > 0) {
-        const existing = messageCacheRef.current.get(e.session_id) ?? (activeIdRef.current === e.session_id ? messagesRef.current : undefined);
-        const reconciled = reconcileSnapshotWithCache(existing, restored.messages);
-        messageCacheRef.current.set(e.session_id, reconciled);
-      }
-      if (viewingOther) {
-        return;
-      }
-      if (!keepCanvas) {
-        const existing = messagesRef.current;
-        const reconciled = reconcileSnapshotWithCache(existing, restored.messages);
-        let next = reconciled.length > 0 ? reconciled : [];
-        if (transcriptHasOpenUserTurn(next)) next = ensureWorkingAssistant(next);
-        messagesRef.current = next;
-        setMessages(next);
-        if (restored.running || turnLive) {
-          const lastUserTs = [...next].reverse().find((m) => m.role === 'user')?.ts;
-          adoptTurnUserTs(lastUserTs, true);
-        }
-        if (!shouldKeepLiveBusyAcrossIdleSnapshot({
-          keepCanvas,
-          canvasInFlight,
-          turnLive,
-          openUserTurn,
-        })) {
-          setBusyAndClock(effectiveRunning);
-        } else if (effectiveRunning) {
-          setBusyAndClock(true);
-        }
-        if (queueDisposition.discardQueued) {
-          // 只过滤未发送的普通排队消息，绝对不能丢弃已经发送给后端的转向消息 (kind === 'steer' / 'steering')！
-          setQueued((arr) => arr.filter((item) => item.kind === 'steer' || item.kind === 'steering'));
-          pushCommandNotice(t('sync.reconnectTerminalUnknown'));
-        }
-        setLivePending(null);
-      }
-      if (!keepCanvas) {
-        adoptStickyFromMessages(
-          e.session_id || activeIdRef.current,
-          restored.messages,
-          (e.session_id
-            ? activeTodosBySessionRef.current.get(e.session_id)
-            : null) ?? activeTodosRef.current,
-        );
-      }
-      // Always drop the structured-input card on snapshot. A declined
-      // `request_user_input` (TUI Ctrl+C / "No answer was provided") used to
-      // survive keepCanvas reconnects and lock this tab while TUI kept chatting.
-      setUserInputReq(null);
-      transitionChatRecovery({ type: 'active_check_succeeded', active: false });
-      setHistoryHint(null);
-      if (e.provider && !providerPinnedRef.current) {
-        setProvider(e.provider);
-      }
-      if (e.mode) setModeState(initModeState(e.mode));
-      if (e.session_id) {
-        if (activeIdRef.current !== e.session_id) {
-          sessionGenerationRef.current += 1;
-        }
-        activeIdRef.current = e.session_id;
-        loadedForRef.current = e.session_id;
-        onSessionId(e.session_id);
-        restorePendingInteractive(e.session_id, sessionGenerationRef.current);
-      }
-      if (e.session_name) {
-        onSessionRenamed?.(e.session_name);
-      }
-      return;
-    }
-    // Provider events belong to the live runtime's session only. Other open
-    // sessions keep their own model selection.
-    if (e.type === 'provider') {
-      const liveSid = liveSessionIdRef.current;
-      if (liveSid) {
-        providerCacheRef.current.set(liveSid, e.provider);
-      }
-      if (!activeIdRef.current || activeIdRef.current === liveSid) {
-        setProvider(e.provider);
-        if (activeIdRef.current) {
-          providerCacheRef.current.set(activeIdRef.current, e.provider);
-          providerPinnedRef.current = true;
-        }
-      }
-      return;
-    }
-    // 审批模式切换是进程级（另一 tab / 未来 TUI）→ 始终同步 pill。
-    // Auto 立即放行已弹出的审批卡，不必等下一轮。
-    if (e.type === 'mode') {
-      setModeState(initModeState(e.mode));
-      if (e.mode === 'bypass') {
-        setLivePending(null);
-        onPermissionResolved?.(null);
-      }
-      return;
-    }
-    // 工作目录切换是进程级（另一端 /cd），与查看哪个会话无关 → 不门控，始终上报
-    // 让 App 更新 cwd 面包屑 + 侧栏目录过滤。会话本身不变（对话保留）。
-    if (e.type === 'working_dir') {
-      onCwdChanged?.(e.working_dir);
-      return;
-    }
-    // AI 自动命名了某个会话：通知 App 更新标题头，无需拉取列表。
-    // 实时流是进程级广播，会到达所有 tab；仅当被改名的正是本 tab 正在
-    // 查看的会话时才应用，否则会把别的会话的名字盖到当前标题头上。
-    if (e.type === 'session_renamed') {
-      if (!liveSessionIdRef.current || e.session_id === liveSessionIdRef.current || e.session_id === activeIdRef.current) {
-        onSessionRenamed?.(e.name);
-      }
-      return;
-    }
-    // 会话切换：另一端（webui 新建对话 / TUI /session）创建了新会话，
-    // 本端跟随切换——更新 session id 并重置画布。
-    // 不设置 loadedForRef：让 Chat useEffect 在 activeSession 到位后
-    // 正常走 getSession 加载（空）历史并清除 historyHint；
-    // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
-    // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
-    if (e.type === 'session_switched') {
-      // liveSessionIdRef tracks the execution session of the current /live
-      // connection (set by snapshot). A view-only switch must not overwrite it:
-      // that would paint in-flight tool/text onto the wrong canvas and force a
-      // reconnect when returning to the running session.
-      const alreadyViewing = activeIdRef.current === e.session_id;
-      const localTurn =
-        pendingSelfEchoRef.current.length > 0
-        || busyRef.current
-        || transcriptHasInFlightAssistant(messagesRef.current);
-      if (!alreadyViewing && activeIdRef.current && !localTurn) {
-        return;
-      }
-      if (alreadyViewing) {
-        return;
-      }
-      liveSessionIdRef.current = e.session_id;
-      activeIdRef.current = e.session_id;
-      onSessionId(e.session_id);
-      if (localTurn) {
-        if (sync) {
-          stopLiveStream();
-          startLiveStream();
-        }
-        return;
-      }
-      sessionGenerationRef.current += 1;
-      setMessages([]);
-      setSearch('');
-      setMatchIdx(0);
-      setSearchOpen(false);
-      setHistoryHint(null);
-      setPersistenceWarning(null);
-      applySessionTokens(e.session_id, []);
-      if (sync) {
-        stopLiveStream();
-        startLiveStream();
-      }
-      return;
-    }
-
-    // 门控：仅当"当前查看的会话"就是实时会话时，才把实时输出渲染进画布。否则用户
-    // 从侧栏打开了另一个历史会话，实时事件不应串进该页面（串进去刷新还会消失）。
-    // `state` 仍要上报侧栏转圈：切走后 live 任务还在跑。
-    const canvasInFlightNow = transcriptHasInFlightAssistant(messagesRef.current);
-    const openUserTurnNow = transcriptHasOpenUserTurn(messagesRef.current);
-    const turnLiveNow =
-      liveLifecycleRef.current.running
-      || busyRef.current
-      || pendingSelfEchoRef.current.length > 0
-      || canvasInFlightNow
-      || openUserTurnNow;
-    if (e.type === 'state') {
-      const sid = liveSessionIdRef.current;
-      const ignoreStaleRunning =
-        e.running &&
-        liveIdleSnapshotRef.current &&
-        !turnLiveNow &&
-        !heldDuplicateUserRef.current &&
-        !openUserTurnNow;
-      if (sid) {
-        if (e.running && !ignoreStaleRunning) backgroundRunningSessionsRef.current.add(sid);
-        else backgroundRunningSessionsRef.current.delete(sid);
-        if (!e.running) localTurnSessionsRef.current.delete(sid);
-      }
-      onLiveRunningChange?.(sid, ignoreStaleRunning ? false : e.running);
-    }
-    if (
-      liveSessionIdRef.current &&
-      activeIdRef.current &&
-      activeIdRef.current !== liveSessionIdRef.current
-    ) {
-      return;
-    }
-    if (shouldIgnoreLiveReplayAfterIdleSnapshot(liveIdleSnapshotRef.current, e.type, turnLiveNow)) {
-      // Replay of a finished turn is already on screen (this is what stopped
-      // the phone from painting a second thinking block). A delta that is not
-      // on screen is the rest of the live turn — open the gate and paint it.
-      // A delta that continues the last assistant stays on that assistant.
-      // One that does not is the next turn whose prompt repeated the previous
-      // text and was held above.
-      if (idleReplayAlreadyPainted(messagesRef.current, e)) {
-        replayBoundToAssistantRef.current = true;
-        return;
-      }
-      const continues = deltaContinuesLastAssistant(messagesRef.current, e);
-      if (continues) replayBoundToAssistantRef.current = true;
-      if (
-        heldDuplicateUserRef.current &&
-        !replayBoundToAssistantRef.current &&
-        !continues
-      ) {
-        const held = heldDuplicateUserRef.current;
-        heldDuplicateUserRef.current = null;
-        flushHeldDuplicateUser(held);
-      }
-      liveIdleSnapshotRef.current = false;
-      liveLifecycleRef.current = { running: true, terminalConsumed: false };
-      setBusyAndClock(true);
-    }
-
-    switch (e.type) {
-            case 'user': {
-        const userText = visibleUserText(e.text);
-        const alreadyOnCanvas = userMessageAlreadyOnCanvas(messagesRef.current, userText || e.text);
-        if (holdDuplicateUserEcho({
-          idleSnapshot: liveIdleSnapshotRef.current,
-          alreadyOnCanvas,
-          openUserTurn: openUserTurnNow,
-          canvasInFlight: canvasInFlightNow,
-          turnLive: turnLiveNow,
-        })) {
-          heldDuplicateUserRef.current = userText || e.text;
-          break;
-        }
-        if (liveIdleSnapshotRef.current) {
-          if (!shouldClearIdleLiveSnapshotOnUser({
-            alreadyOnCanvas,
-            canvasInFlight: canvasInFlightNow,
-            turnLive: turnLiveNow,
-            openUserTurn: openUserTurnNow,
-          })) {
-            break;
-          }
-        }
-        liveIdleSnapshotRef.current = false;
-        heldDuplicateUserRef.current = null;
-        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
-          type: 'input_accepted',
-        });
-        liveLifecycleRef.current = lifecycle.state;
-        setBusyAndClock(lifecycle.state.running);
-        // Dedup THIS tab's own echo: we already optimistically appended it on send
-        // (leaving the landing page instantly). Consume the marker and skip the
-        // re-append; a peer's message still falls through and renders.
-        const ownEchoIndex = e.client_input_id
-          ? pendingSelfEchoRef.current.findIndex((pending) => pending.id === e.client_input_id)
-          : pendingSelfEchoRef.current[0] && visibleUserText(pendingSelfEchoRef.current[0].text) === userText ? 0 : -1;
-        if (ownEchoIndex >= 0) {
-          pendingSelfEchoRef.current.splice(ownEchoIndex, 1);
-          break;
-        }
-        const now = Date.now();
-        setMessages((prev) => {
-          const next = paintUserMessage(prev, userText || e.text, now, (base) => {
-            const turnIndex = nextTurnNavIndex(base);
-            const turnOrdinal = nextTurnNavOrdinal(base);
-            rememberTurnOutline(userText || e.text, turnIndex, turnOrdinal);
-            return {
-              role: 'user' as const,
-              parts: [{ kind: 'text', text: userText || e.text }],
-              images: e.images && e.images.length ? e.images : undefined,
-              ts: now,
-              sourceIndex: turnIndex,
-              turnNavOrdinal: turnOrdinal,
-            };
-          });
-          messagesRef.current = next;
-          return next;
-        });
-        break;
-      }
-
-      case 'state': {
-        if (e.running && heldDuplicateUserRef.current) {
-          const held = heldDuplicateUserRef.current;
-          heldDuplicateUserRef.current = null;
-          liveIdleSnapshotRef.current = false;
-          flushHeldDuplicateUser(held);
-        }
-        if (e.running && liveIdleSnapshotRef.current && !turnLiveNow && !openUserTurnNow) {
-          break;
-        }
-        if (e.running) {
-          liveIdleSnapshotRef.current = false;
-        }
-        if (!e.running) {
-          liveIdleSnapshotRef.current = false;
-          finalizePendingToolsOnCanvas();
-          // 回合停止：清理已在消息流中体现的转向卡片，避免废卡片残留
-          setQueued((current) => current.filter((q) => {
-            if (q.kind === 'steer' || q.kind === 'steering') {
-              const clean = q.text.trim();
-              return !messagesRef.current.some((m) =>
-                m.role === 'user' && m.parts.some((p) => p.kind === 'text' && p.text?.trim() === clean)
-              );
-            }
-            return true;
-          }));
-        }
-        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
-          type: 'state',
-          running: e.running,
-          stopReason: e.stop_reason,
-          message: e.message,
-        });
-        liveLifecycleRef.current = lifecycle.state;
-        setBusyAndClock(lifecycle.state.running);
-          if (lifecycle.terminal) {
-          // A submit whose HTTP receipt is still in flight may belong to the
-          // next turn; only confirmed steers are recoverable at this terminal.
-          restorePendingSteers(false);
-          if (lifecycle.terminal.discardQueued) {
-            setQueued([]);
-            pushNoticeToLastAssistant(t('chat.incomplete', { msg: lifecycle.terminal.detail }));
-          }
-          // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
-          // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
-          setLivePending(null);
-          setUserInputReq(null);
-          // turn 完成后 session 已落盘，通知 App 刷新侧栏列表。
-          onLiveTurnDone?.();
-          onLiveRunningChange?.(liveSessionIdRef.current, false);
-        }
-        break;
-      }
-      case 'steered': {
-        foldSteeredInputs(e.inputs, e.client_input_ids);
-        break;
-      }
-
-      case 'user_identified': {
-        setMessages((prev) => {
-          const next = bindUserMessageIdentity(prev, e.message_id);
-          if (next === prev) return prev;
-          messagesRef.current = next;
-          const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
-          if (currentSid) messageCacheRef.current.set(currentSid, next);
-          return next;
-        });
-        break;
-      }
-      case 'error': {
-        const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
-          type: 'error',
-          message: e.message,
-        });
-        liveLifecycleRef.current = lifecycle.state;
-        pushNoticeToLastAssistant(t('chat.error', { msg: lifecycle.diagnostic ?? e.message }));
-        break;
-      }
-      case 'permission_request': {
-        if (
-          nativeModeRef.current === 'bypass'
-          || modeState.confirmedMode === 'bypass'
-          || transcriptToolCallIsResolved(messagesRef.current, e.call_id)
-        ) {
-          break;
-        }
-        updateToolInLastAssistant(e.call_id, { status: 'waiting_approval' });
-        setLivePending({ runtime_instance_id: e.runtime_instance_id, generation: e.generation, request_id: e.request_id, tool_name: e.tool_name, reason: e.reason, call_id: e.call_id, arguments: e.arguments });
-        const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((part) => part.length > 0).pop() ?? '';
-        const sessionName = activeSession?.name || folder || 'JeikCode';
-        const sid = e.session_id || activeIdRef.current;
-        dispatchSystemNotification({
-          title: t('notify.review.title'),
-          body: t('notify.review.body', { session: sessionName, detail: e.tool_name }),
-          sessionId: sid,
-          tag: `${sid}:review:${e.runtime_instance_id}:${e.generation}:${e.request_id}`,
-          postSystemNotifyFn: postSystemNotify,
-        });
-        break;
-      }
-      case 'user_input_request': {
-        // Show the UserInputCard for the bound live runtime.
-        setUserInputReq(e);
-        const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((part) => part.length > 0).pop() ?? '';
-        const sessionName = activeSession?.name || folder || 'JeikCode';
-        const sid = e.session_id || activeIdRef.current;
-        const detail = e.question || e.header || 'Input requested';
-        dispatchSystemNotification({
-          title: t('notify.ask.title'),
-          body: t('notify.ask.body', { session: sessionName, detail }),
-          sessionId: sid,
-          tag: `${sid}:ask:${e.request_id}`,
-          postSystemNotifyFn: postSystemNotify,
-        });
-        break;
-      }
-      case 'user_input_resolved': {
-        setUserInputReq((current) => resolveUserInputRequest(current, e.request_id));
-        break;
-      }
-      default: {
-        // 关键防线：若当前 Tab 正在通过本地 POST /chat 跑实时流（abortRef 存在），
-        // 或已经通过 /chat/watch（detachedWatchAbortRef 存在）接入了权威观察流，
-        // streamChat / watchChatSession 已经在实时消费该轮次的事件，来自 /live 的镜像事件绝对禁止重复投递给 handleEvent！
-        // 彻底终结 streamChat / watchChat 与 streamLive 多 SSE 信道互搏、交错追加导致正文与工具疯狂重复的灾难！
-        const isWatchingDetached =
-          detachedWatchAbortRef.current !== null &&
-          !detachedWatchAbortRef.current.signal.aborted;
-        if (
-          abortRef.current !== null ||
-          activeStreamRequestIdRef.current !== null ||
-          isWatchingDetached ||
-          (activeIdRef.current && localTurnSessionsRef.current.has(activeIdRef.current))
-        ) {
-          break;
-        }
-        const mapped = liveToSSE(e);
-        if (mapped) {
-          if (mapped.type === 'text' || mapped.type === 'reasoning') {
-            ensureAssistantBubbleForWatch();
-          }
-          handleEvent(mapped, { requireReplayDedup: true });
-        }
-        // 工具结果到达即代表该工具的审批已被处理（本端或对端 TUI 批准后工具已执行），
-        // 清掉与之对应的残留审批卡片（call_id 匹配才清，避免误删尚未处理的其它请求）。
-        if (e.type === 'tool_result') {
-          setLivePending((cur) => resolvePendingAfterDecision(cur, e.id));
-        }
-        break;
-      }
-    }
-  }
 
   // ── Sync mode removed as obsolete / redundant ──
 
@@ -4074,7 +3589,7 @@ export function Chat({
     const replay = opts?.requireReplayDedup === true && opts?.skipReplayDedup !== true;
     setMessages((prev) => {
       const next = withAssistantIdentity(
-        paintAssistantText(prev, content, replay, ids?.messageId),
+        paintAssistantText(prev, content, replay, ids?.messageId, ids?.partId),
         ids?.messageId,
         ids?.partId,
       );
@@ -5506,6 +5021,42 @@ export function Chat({
     }
   }
 
+  /**
+   * 画布反哺缓存（防抖 800ms）。
+   *
+   * 断点续传只保证「不再重发已画过的帧」，它不负责把画布存下来：如果画布不落缓存，
+   * 刷新后画布会退回旧缓存，而游标却已超前 —— 服务器就只补新帧，中间那段直接丢。
+   * 所以每处理完一帧就排队一次缓存写入（L1 同步、L2 异步），回合收尾另有强制写入。
+   */
+  const canvasCacheTimerRef = useRef<number | null>(null);
+  function scheduleCanvasCacheSave() {
+    if (canvasCacheTimerRef.current != null) return;
+    canvasCacheTimerRef.current = window.setTimeout(() => {
+      canvasCacheTimerRef.current = null;
+      const target = activeIdRef.current ?? sessionId;
+      if (!target) return;
+      const hash =
+        projectHashBySessionRef.current.get(target) ??
+        activeSession?.project_hash ??
+        viewedProjectHashRef.current ??
+        '';
+      if (!hash) return;
+      const outline =
+        turnOutlineRef.current.length > 0
+          ? turnOutlineRef.current
+          : turnOutlineBySessionRef.current.get(target) ?? [];
+      void saveSessionCache(
+        hash,
+        target,
+        messagesRef.current,
+        activeTodosRef.current,
+        undefined,
+        outline,
+        tokensAuthoritativeRef.current,
+      );
+    }, 800);
+  }
+
   /** @param opts.observerOnly Reserved for pure third-party observers that must
    *  not own interactive modals. /chat/watch reattach after refresh MUST call
    *  without this flag so Build-mode permission_request is restored. */
@@ -5639,7 +5190,7 @@ export function Chat({
         // Thinking / chain-of-thought stream — collapsible block in the UI.
         setMessages((prev) => {
           const next = withAssistantIdentity(
-            paintAssistantReasoning(prev, event.content, requireReplayDedup, event.message_id),
+            paintAssistantReasoning(prev, event.content, requireReplayDedup, event.message_id, event.part_id),
             event.message_id,
             event.part_id,
           );
@@ -6138,6 +5689,10 @@ export function Chat({
       }
       case 'session_mutation': {
         const mutation = event as SessionMutationEvent;
+        // 会话变更改写了权威转录：本会话的续传游标立即作废（两条流都作废），
+        // 否则带旧游标重连会把变更前发出的旧帧补回来 —— 已删内容会复活。
+        clearStreamCursor(mutation.session_id);
+        clearStreamCursor(mutation.session_id, 'sync');
         // Update cached session in memory if exists
         const cached = messageCacheRef.current.get(mutation.session_id);
         let updatedCached: Message[] | undefined = undefined;
@@ -6286,6 +5841,9 @@ export function Chat({
         // Ignore tool_batch, etc.
         break;
     }
+    // 反哺缓存：断点续传的游标只负责「新帧」，画布本身必须同步落进 L1/L2 缓存 ——
+    // 否则刷新后「画布来自旧缓存 + 游标已超前」会把中间那段内容整段跳过（丢帧）。
+    scheduleCanvasCacheSave();
   }
 
   // 实际投递一条消息（同步 / 常规两条路径）；busy 由各自的事件流复位。
@@ -6340,10 +5898,6 @@ export function Chat({
     }
 
     if (attachedToLiveRuntime()) {
-      // 确保 /live 接收长连接处于活跃连通状态，防止静默半开连接导致只发不收、卡在闪烁
-      if (!liveAbortRef.current || liveAbortRef.current.signal.aborted) {
-        startLiveStream();
-      }
       // ── Sync path: send to /live/message. Optimistically append the user
       //    message NOW so the view leaves the "new conversation" landing page
       //    immediately (the server `user` echo — which keeps OTHER tabs in sync —

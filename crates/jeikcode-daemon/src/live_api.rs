@@ -24,6 +24,35 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use std::sync::OnceLock;
 
+/// One `/sync` live-wire SSE payload.
+///
+/// `replay: true` marks a frame from the snapshot/replay head — the WebUI must
+/// merge it idempotently. Live frames stay UNTAGGED because they are true deltas
+/// and must be painted verbatim: a live delta routed through the replay heuristics
+/// gets swallowed, which is how thinking/body after a tool round used to vanish
+/// from the canvas until a manual refresh. Mirrors `chat_watch_frame_json`.
+fn live_wire_frame_json<W: serde::Serialize>(wire: &W, replay: bool) -> String {
+    let mut val = match serde_json::to_value(wire) {
+        Ok(val) => val,
+        Err(error) => {
+            crate::ctrace!(
+                "LIVE",
+                "live_stream: serde_json serialization failed: {error}"
+            );
+            serde_json::json!({
+                "type": "error",
+                "message": format!("live event serialization failed: {error}"),
+            })
+        }
+    };
+    if replay {
+        if let serde_json::Value::Object(ref mut map) = val {
+            map.insert("replay".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    serde_json::to_string(&val).unwrap_or_default()
+}
+
 /// Truncate a value for the file-sink diagnostic log at a char boundary (CJK-safe).
 fn log_truncate_live(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
@@ -1664,6 +1693,13 @@ impl NativeLiveWireProjector {
         (message_id, part_id, has_id.then_some(self.part_seq))
     }
 
+    /// Close the current streaming part so the next delta opens a fresh one.
+    /// Called on tool boundaries: the run after a tool must carry its own
+    /// `part_id` or a replay cannot converge the two runs separately.
+    fn end_streaming_part(&mut self) {
+        self.last_part_kind = None;
+    }
+
     #[cfg(test)]
     fn project(&mut self, event: crate::live_hub::LiveViewEvent) -> Option<LiveWireEvent> {
         self.project_at_generation(None, 0, event)
@@ -1767,6 +1803,8 @@ impl NativeLiveWireProjector {
                     }
                 }
                 Kernel::ToolStarted { call } => {
+                    // Tool boundary: the post-tool prose is a new streaming part.
+                    self.end_streaming_part();
                     self.tools.insert(
                         call.id.clone(),
                         (call.name.clone(), std::time::Instant::now()),
@@ -2196,6 +2234,9 @@ fn live_stream_from_registry(
     let project_hash = crate::hash_path(&working_dir);
     let provider = live_current_provider();
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    // Snapshot + replay head is emitted ahead of the live bus and tagged
+    // `replay: true`; only those frames may be de-duplicated client-side.
+    let mut head: Vec<LiveWireEvent> = Vec::new();
     let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot
         .messages
         .iter()
@@ -2203,7 +2244,7 @@ fn live_stream_from_registry(
         .collect();
     crate::stamp_turn_elapsed_on_last_assistants(&mut snapshot_messages, &[]);
     crate::attach_display_images(&mut snapshot_messages, &working_dir, &session_id);
-    let _ = tx.send(LiveWireEvent::Snapshot {
+    head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
         session_id: session_id.clone(),
         session_name,
@@ -2231,7 +2272,7 @@ fn live_stream_from_registry(
     };
     for sequenced in replay {
         if let Some(w) = project_registry_event(&mut projector, sequenced) {
-            let _ = tx.send(w);
+            head.push(w);
         }
     }
 
@@ -2258,20 +2299,13 @@ fn live_stream_from_registry(
         }
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            crate::ctrace!(
-                "LIVE",
-                "live_stream: serde_json serialization failed: {error}"
-            );
-            serde_json::json!({
-                "type": "error",
-                "message": format!("live event serialization failed: {error}"),
-            })
-            .to_string()
-        });
-        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    let head_stream = futures::stream::iter(head).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
     });
+    let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
+    });
+    let stream = head_stream.chain(live_stream);
     let mut resp = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -2311,6 +2345,9 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     };
     let project_hash = crate::hash_path(&snapshot_wd);
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    // Snapshot + replay head is emitted ahead of the live bus and tagged
+    // `replay: true`; only those frames may be de-duplicated client-side.
+    let mut head: Vec<LiveWireEvent> = Vec::new();
     let mut snapshot_messages: Vec<crate::MessageInfo> = join
         .snapshot
         .messages
@@ -2326,7 +2363,7 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
         &snapshot_wd,
         &join.binding.session_id,
     );
-    let _ = tx.send(LiveWireEvent::Snapshot {
+    head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
         session_id: join.binding.session_id.clone(),
         session_name,
@@ -2346,7 +2383,7 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
             observation.generation,
             observation.event,
         ) {
-            let _ = tx.send(w);
+            head.push(w);
         }
     }
     let binding_id = join.binding.id;
@@ -2377,20 +2414,13 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
         }
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            crate::ctrace!(
-                "LIVE",
-                "live_stream: serde_json serialization failed: {error}"
-            );
-            serde_json::json!({
-                "type": "error",
-                "message": format!("live event serialization failed: {error}"),
-            })
-            .to_string()
-        });
-        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    let head_stream = futures::stream::iter(head).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
     });
+    let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
+    });
+    let stream = head_stream.chain(live_stream);
     let mut resp = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()

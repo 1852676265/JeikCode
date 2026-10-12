@@ -1147,6 +1147,9 @@ struct ActiveChatOperation {
     /// *after* subscribe and loses thinking/text/tools already streamed.
     /// Consecutive text/reasoning deltas are coalesced to bound memory.
     replay: Arc<std::sync::Mutex<Vec<ChatEvent>>>,
+    /// 本回合帧的起始游标：第 i 条缓冲帧的 seq = `seq_base + i + 1`。
+    /// 回合结束时把 `seq_base + 缓冲长度` 回写到会话计数器，下一回合接着往上走。
+    seq_base: u64,
     /// Mid-turn steer inbox. Present only while `run_chat_turn_v2` is reading it.
     /// A submit on this channel is folded at the next round boundary; it does not
     /// cancel the in-flight model call or tool batch.
@@ -1167,6 +1170,11 @@ struct ActiveChatIndex {
     /// WebUI gets a push the moment an API turn starts instead of having to
     /// poll. Keyed by session id (the `session_id` alias the watcher used).
     standby_watchers: HashMap<String, Vec<mpsc::UnboundedSender<ChatEvent>>>,
+    /// 会话级断点续传游标（严格单调递增）。
+    ///
+    /// 它是我们自己定义的序号，与模型上下文无关 —— 回合结束清空回合缓冲、
+    /// 上下文压缩、历史改写都不会重置它，所以跨回合重连可以带着旧游标精准续传。
+    session_seq: HashMap<String, u64>,
 }
 
 /// Atomic admission and identity-aware cleanup for background `/chat` turns.
@@ -1240,6 +1248,11 @@ impl ActiveChatRegistry {
         let operation_id = uuid::Uuid::new_v4().to_string();
         let cancellation = CancellationToken::new();
         let stop_gate = Arc::new(Mutex::new(false));
+        // 会话级游标起点：接着上一回合的序号继续走（严格单调递增）。
+        let seq_base = session_id
+            .as_deref()
+            .and_then(|sid| index.session_seq.get(sid).copied())
+            .unwrap_or(0);
         // Capacity: lagging watchers drop oldest; primary SSE is separate.
         let (event_bus, _) = tokio::sync::broadcast::channel(512);
         // Clone for waking standby watchers (the original moves into the operation).
@@ -1278,6 +1291,7 @@ impl ActiveChatRegistry {
                 event_bus,
                 admitted_user: None,
                 replay: Arc::new(std::sync::Mutex::new(Vec::new())),
+                seq_base,
                 steer_tx: None,
                 steer_client_ids: std::collections::VecDeque::new(),
             },
@@ -1347,6 +1361,15 @@ impl ActiveChatRegistry {
         let index = self.inner.read().await;
         if let Some(operation_id) = index.aliases.get(session_id) {
             if let Some(operation) = index.operations.get(operation_id) {
+                // 会话变更（删/改/截断）改写了权威转录：本回合的旧帧立即作废，
+                // 否则带旧游标或全量重连会把变更前发出的帧补回来（已删内容复活）。
+                if matches!(event, ChatEvent::SessionMutation { .. }) {
+                    operation
+                        .replay
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
                 let _ = operation.event_bus.send(event.clone());
             }
         }
@@ -1363,7 +1386,10 @@ impl ActiveChatRegistry {
     async fn subscribe_live_with_replay(
         &self,
         session_id: &str,
-    ) -> Option<(Vec<ChatEvent>, tokio::sync::broadcast::Receiver<ChatEvent>)> {
+    ) -> Option<(
+        Vec<(u64, ChatEvent)>,
+        tokio::sync::broadcast::Receiver<ChatEvent>,
+    )> {
         let index = self.inner.read().await;
         let operation_id = index.aliases.get(session_id)?.clone();
         let operation = index.operations.get(&operation_id)?;
@@ -1374,23 +1400,36 @@ impl ActiveChatRegistry {
             .replay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut snapshot = guard.clone();
+        // 游标就是缓冲序号（从 1 开始）：缓冲是追加式的（连续同身份合并只改最后一条的内容，
+        // 不改它的位置），所以同一个事件的 seq 永远稳定 —— 断点续传靠的就是这一点。
+        let mut snapshot: Vec<(u64, ChatEvent)> = guard
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (operation.seq_base + index as u64 + 1, event.clone()))
+            .collect();
         let rx = operation.event_bus.subscribe();
         drop(guard);
         if let Some(ref admitted) = operation.admitted_user {
-            if !snapshot.iter().any(|e| matches!(e, ChatEvent::User { .. })) {
+            if !snapshot
+                .iter()
+                .any(|(_, e)| matches!(e, ChatEvent::User { .. }))
+            {
+                // 本轮提问的回声：不占游标（seq 0），因为它是幂等的用户气泡。
                 snapshot.insert(
                     0,
-                    ChatEvent::User {
-                        content: admitted.content.clone(),
-                        session_id: Some(session_id.to_string()),
-                        created_at: admitted
-                            .created_at
-                            .or((operation.started_at > 0).then_some(operation.started_at)),
-                        message_id: None,
-                        order: None,
-                        turn_ordinal: None,
-                    },
+                    (
+                        operation.seq_base,
+                        ChatEvent::User {
+                            content: admitted.content.clone(),
+                            session_id: Some(session_id.to_string()),
+                            created_at: admitted
+                                .created_at
+                                .or((operation.started_at > 0).then_some(operation.started_at)),
+                            message_id: None,
+                            order: None,
+                            turn_ordinal: None,
+                        },
+                    ),
                 );
             }
         }
@@ -1843,6 +1882,17 @@ impl ActiveChatRegistry {
         let Some(operation) = index.operations.remove(operation_id) else {
             return false;
         };
+        // 会话级游标推进：把本回合已发出的帧数累加进去，下一回合从更高的序号开始。
+        // 严格单调递增，且与上下文/压缩无关。
+        let turn_frames = operation
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        let next_base = operation.seq_base + turn_frames;
+        for alias in &operation.aliases {
+            index.session_seq.insert(alias.clone(), next_base);
+        }
         for alias in operation.aliases {
             if index
                 .aliases
@@ -7465,6 +7515,13 @@ impl ChatRuntimeProjector {
         (message_id, part_id, has_id.then_some(self.part_seq))
     }
 
+    /// Close the current streaming part so the next delta opens a fresh one.
+    /// Called on tool boundaries: a tool ends the prose run, and the run after it
+    /// must carry its own `part_id` or a replay cannot converge them separately.
+    fn end_streaming_part(&mut self) {
+        self.last_part_kind = None;
+    }
+
     fn project_agent(&mut self, event: jeikcode_kernel::event::AgentEvent) -> Vec<ChatEvent> {
         use jeikcode_kernel::event::AgentEvent as Agent;
 
@@ -7531,9 +7588,17 @@ impl ChatRuntimeProjector {
                 }]
             }
             Agent::ToolBatchStarted { calls, .. } => {
+                // A tool batch closes the current prose run: the next delta must open a
+                // NEW part id. Sharing one part id across a tool boundary makes pre- and
+                // post-tool prose indistinguishable on replay, so the browser cannot
+                // converge the part in place and re-appends it instead.
+                self.end_streaming_part();
                 vec![ChatEvent::ToolBatchStarted { calls }]
             }
-            Agent::ToolStarted { call } => self.project_tool_started(call),
+            Agent::ToolStarted { call } => {
+                self.end_streaming_part();
+                self.project_tool_started(call)
+            }
             Agent::ToolProgress { call_id, message } => {
                 if let Some(progress) = message.strip_prefix('\u{1e}') {
                     vec![ChatEvent::ToolProgress {
@@ -8403,6 +8468,110 @@ struct StopChatResponse {
     message: String,
 }
 
+/// One `/chat/watch` replay frame.
+///
+/// `seq` is the frame's position in the turn replay buffer (the resume cursor).
+/// Only REPLAYED frames carry it: a frame without `seq` is a live delta and is
+/// always new to the client. The browser stores the highest `seq` it applied and
+/// sends it back as `after_seq` on reconnect, so a reconnect never re-paints what
+/// is already on screen (and never has to guess by content).
+fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) -> String {
+    let mut val = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = val {
+        if !map.contains_key("session_id") {
+            map.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(seq) = seq {
+            map.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+        }
+    }
+    serde_json::to_string(&val).unwrap_or_default()
+}
+
+/// Handshake for `after_seq = -1` (a brand-new session / empty canvas).
+///
+/// There is nothing to catch up on, so the server skips the replay entirely and
+/// only tells the client where the cursor starts; every later frame is live.
+fn chat_watch_session_start_json(session_id: &str, cursor: u64) -> String {
+    serde_json::json!({
+        "type": "session_start",
+        "session_id": session_id,
+        "cursor": cursor,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod chat_watch_frame_tests {
+    use super::*;
+
+    fn text_delta() -> ChatEvent {
+        ChatEvent::TextDelta {
+            content: "正文 2".into(),
+            message_id: Some("m-round-2".into()),
+            part_id: Some("m-round-2:2:text".into()),
+            part_seq: Some(2),
+        }
+    }
+
+    #[test]
+    fn replayed_frames_carry_the_cursor_and_live_frames_do_not() {
+        let replayed: serde_json::Value =
+            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", Some(7))).unwrap();
+        assert_eq!(replayed["seq"], serde_json::Value::Number(7.into()));
+        assert_eq!(replayed["type"], "text");
+        assert_eq!(replayed["session_id"], "s-1");
+        assert_eq!(replayed["part_id"], "m-round-2:2:text");
+
+        // A live delta carries no cursor: it is always new, never re-painted.
+        let live: serde_json::Value =
+            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", None)).unwrap();
+        assert!(live.get("seq").is_none());
+        assert_eq!(live["content"], "正文 2");
+    }
+
+    #[test]
+    fn session_start_handshake_carries_the_starting_cursor() {
+        let handshake: serde_json::Value =
+            serde_json::from_str(&chat_watch_session_start_json("s-1", 42)).unwrap();
+        assert_eq!(handshake["type"], "session_start");
+        assert_eq!(handshake["session_id"], "s-1");
+        assert_eq!(handshake["cursor"], serde_json::Value::Number(42.into()));
+    }
+}
+
+#[cfg(test)]
+mod chat_part_identity_tests {
+    use super::*;
+
+    #[test]
+    fn tool_boundary_opens_a_new_text_part() {
+        use jeikcode_kernel::event::AgentEvent as Agent;
+        let mut projector = ChatRuntimeProjector::default();
+        projector.project_agent(Agent::AssistantMessage {
+            message_id: "m-1".into(),
+        });
+        let part_of = |events: Vec<ChatEvent>| match events.into_iter().next() {
+            Some(ChatEvent::TextDelta { part_id, .. }) => part_id.unwrap_or_default(),
+            other => panic!("expected a text delta, got {other:?}"),
+        };
+        let before = part_of(projector.project_agent(Agent::TextDelta("正文 1".into())));
+        projector.project_agent(Agent::ToolBatchStarted {
+            batch_id: "b1".into(),
+            calls: Vec::new(),
+        });
+        let after = part_of(projector.project_agent(Agent::TextDelta("正文 2".into())));
+        assert_eq!(before, "m-1:1:text");
+        // Sharing one part id across a tool boundary makes the two prose runs
+        // indistinguishable on replay: the browser then re-appends instead of
+        // converging the part in place.
+        assert_eq!(after, "m-1:2:text");
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatWatchQuery {
     session_id: String,
@@ -8411,6 +8580,12 @@ struct ChatWatchQuery {
     /// armed the stop button and blinking cursor on completed sessions.
     #[serde(default)]
     standby: bool,
+    /// 断点续传游标：
+    /// - `-1`：我没有缓存（新会话/空画布）→ 不补发，只回一条 `session_start`；
+    /// - `N`：只补 `seq >= N` 的回放帧，然后转实时；
+    /// - 缺省：全量补发（无游标兜底，前端按身份幂等收敛）。
+    #[serde(default)]
+    after_seq: Option<i64>,
 }
 
 /// GET /chat/watch?session_id=… — reattach to a turn owned by another client.
@@ -8436,6 +8611,13 @@ async fn chat_watch(
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+    // 断点续传：回放帧带 seq（回合缓冲序号 = 游标），实时帧不带。
+    // 帧语义由「这次连接请求了什么」决定 —— 前端自己就知道，不需要逐帧猜：
+    //   after_seq = -1 → 新会话/空画布：不补发，只回 session_start 后转实时
+    //   after_seq = N  → 只补 seq >= N 的回放帧，然后转实时
+    //   缺省           → 全量补发（无游标兜底，前端按身份幂等收敛）
+    let mut replay_head: Vec<(u64, ChatEvent)> = Vec::new();
+    let mut handshake: Option<String> = None;
     // Prefer atomic snapshot+subscribe when a turn is live so a mid-stream
     // browser refresh gets the full thinking/text/tool history, not only
     // deltas after reconnect. Idle standby watchers skip this so a leftover
@@ -8446,45 +8628,66 @@ async fn chat_watch(
             .subscribe_live_with_replay(&session_id)
             .await
         {
+            let buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
             tracing::debug!(
                 session_id = %session_id,
                 replay_events = snapshot.len(),
+                after_seq = ?q.after_seq,
                 "chat_watch: LIVE with replay"
             );
-            tokio::spawn(async move {
-                for event in snapshot {
-                    let terminal = matches!(
-                        event,
-                        ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
-                    );
-                    if tx.send(event).is_err() {
-                        return;
-                    }
-                    if terminal {
-                        return;
-                    }
+            match q.after_seq {
+                Some(-1) => {
+                    // 新会话：画布本来就是空的，补发毫无意义；只给一个起始游标。
+                    handshake = Some(chat_watch_session_start_json(&session_id, buffer_len));
                 }
-                loop {
-                    match bus_rx.recv().await {
-                        Ok(event) => {
-                            let terminal = matches!(
-                                event,
-                                ChatEvent::Done { .. }
-                                    | ChatEvent::Error { .. }
-                                    | ChatEvent::Stopped
-                            );
-                            if tx.send(event).is_err() {
-                                break;
-                            }
-                            if terminal {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
+                // 游标有效（没越过缓冲末尾）：只补它之后的帧。
+                Some(after) if after >= 0 && (after as u64) <= buffer_len => {
+                    replay_head = snapshot
+                        .into_iter()
+                        .filter(|(seq, _)| *seq >= after as u64)
+                        .collect();
                 }
+                // 无游标，或游标已失效（换设备 / 清缓存 / 新回合）：全量补发。
+                _ => replay_head = snapshot,
+            }
+            // 终态已在补发里：截到终态为止，且绝不再挂实时总线。
+            let terminal_at = replay_head.iter().position(|(_, event)| {
+                matches!(
+                    event,
+                    ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+                )
             });
+            if let Some(cut) = terminal_at {
+                replay_head.truncate(cut + 1);
+            }
+            if terminal_at.is_none() {
+                tokio::spawn(async move {
+                    loop {
+                        match bus_rx.recv().await {
+                            Ok(event) => {
+                                let terminal = matches!(
+                                    event,
+                                    ChatEvent::Done { .. }
+                                        | ChatEvent::Error { .. }
+                                        | ChatEvent::Stopped
+                                );
+                                if tx.send(event).is_err() {
+                                    break;
+                                }
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            } else {
+                // No live pump: drop the sender so the SSE stream ends cleanly
+                // after the replayed terminal instead of hanging on keepalive.
+                drop(tx);
+            }
         } else {
             match state
                 .active_chats
@@ -8588,20 +8791,28 @@ async fn chat_watch(
 
     let active_conns = state.active_connections.clone();
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stream_session_id = session_id.clone();
-    let stream = UnboundedReceiverStream::new(rx).map(move |event| {
-        let mut val = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(ref mut map) = val {
-            if !map.contains_key("session_id") {
-                map.insert(
-                    "session_id".to_string(),
-                    serde_json::Value::String(stream_session_id.clone()),
-                );
-            }
-        }
-        let json = serde_json::to_string(&val).unwrap_or_default();
+    let head_session_id = session_id.clone();
+    let live_session_id = session_id.clone();
+    // 补发/握手帧在前（带 seq），实时帧在后（不带）。前端把收到的最大 seq 存成游标，
+    // 下次重连带回来续传 —— 不重复、不乱序、不靠内容猜。
+    let head_json: Vec<String> = handshake
+        .into_iter()
+        .chain(
+            replay_head
+                .iter()
+                .map(|(seq, event)| chat_watch_frame_json(event, &head_session_id, Some(*seq))),
+        )
+        .collect();
+    let head_stream = futures::stream::iter(head_json).map(|json| {
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
+    let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default()
+                .data(chat_watch_frame_json(&event, &live_session_id, None)),
+        )
+    });
+    let stream = head_stream.chain(live_stream);
     let conn_guard = SseConnectionGuard(active_conns);
     let guarded = stream.chain(futures::stream::once(async move {
         drop(conn_guard);

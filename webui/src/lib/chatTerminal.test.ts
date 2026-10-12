@@ -7,11 +7,8 @@ import {
   isCurrentChatStream,
   liveDetachDisposition,
   liveSessionSwitchDisposition,
-  liveSnapshotQueueDisposition,
   reduceChatRecovery,
-  reduceLiveLifecycle,
   resolveUserInputRequest,
-  restoreLiveSnapshot,
   syncAttachDisposition,
   resolveTokenCache,
   formatCacheHitRate,
@@ -27,7 +24,6 @@ import {
   visibleUserText,
   reconcileRunningTranscript,
   unpaintedReplaySuffix,
-  keepCanvasOnEmptyLiveSnapshot,
   shouldAdoptDiskTranscript,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
@@ -37,23 +33,17 @@ import {
   thisTabOwnsTurn,
   shouldLockSendAsDetached,
   isWatchTurnActivationEvent,
-  shouldIgnoreLiveReplayAfterIdleSnapshot,
-  idleFlagAfterLiveSnapshot,
-  shouldClearIdleLiveSnapshotOnUser,
-  shouldKeepLiveBusyAcrossIdleSnapshot,
   assistantDeltaAlreadyPainted,
   isMarkdownFenceDelta,
   liveContentDeltaAlreadyOnParts,
-  idleReplayAlreadyPainted,
   transcriptHasOpenUserTurn,
   sessionAssignedClaimsLocalTurn,
-  holdDuplicateUserEcho,
-  deltaContinuesLastAssistant,
   liveSubmitKeepsTurn,
   liveSyncOwnsViewedSession,
   toolResultClearsUserInput,
   transcriptLatestUserInputIsResolved,
   transcriptToolCallIsResolved,
+  dropSnapshotDuplicates,
   userTextsMatch,
 } from './chatTerminal.ts';
 
@@ -98,118 +88,8 @@ test('unknown explicit stop reasons fail closed instead of being reported as suc
   });
 });
 
-test('live errors are diagnostic until one authoritative idle state consumes the terminal', () => {
-  let state = createLiveLifecycleState();
-  ({ state } = reduceLiveLifecycle(state, { type: 'state', running: true }));
 
-  const diagnostic = reduceLiveLifecycle(state, {
-    type: 'error',
-    message: 'provider stream failed',
-  });
-  state = diagnostic.state;
-  assert.equal(state.running, true);
-  assert.equal(diagnostic.diagnostic, 'provider stream failed');
-  assert.equal(diagnostic.terminal, undefined);
 
-  const terminal = reduceLiveLifecycle(state, {
-    type: 'state',
-    running: false,
-    stopReason: 'tool_loop_detected',
-  });
-  state = terminal.state;
-  assert.equal(state.running, false);
-  assert.deepEqual(terminal.terminal, {
-    kind: 'incomplete',
-    discardQueued: true,
-    detail: 'tool_loop_detected',
-  });
-
-  const duplicate = reduceLiveLifecycle(state, {
-    type: 'state',
-    running: false,
-    stopReason: 'tool_loop_detected',
-  });
-  assert.equal(duplicate.terminal, undefined);
-});
-
-test('observer refresh keeps an open user turn live and does not claim watch replay', () => {
-  const open = [
-    { role: 'user', parts: [{ kind: 'text', text: '上一问' }] },
-    { role: 'assistant', parts: [{ kind: 'text', text: '答完了' }] },
-    { role: 'user', parts: [{ kind: 'text', text: 'OK啊 挺好的' }] },
-  ];
-  assert.equal(transcriptHasOpenUserTurn(open), true);
-  assert.equal(
-    transcriptHasOpenUserTurn([
-      { role: 'user', parts: [{ kind: 'text', text: 'OK啊 挺好的' }] },
-      { role: 'assistant', parts: [] },
-    ]),
-    true,
-  );
-  assert.equal(
-    transcriptHasOpenUserTurn([
-      { role: 'user', parts: [{ kind: 'text', text: 'OK啊 挺好的' }] },
-      { role: 'assistant', parts: [{ kind: 'reasoning', text: '先看目录结构' }] },
-    ]),
-    false,
-  );
-  assert.equal(
-    idleFlagAfterLiveSnapshot({
-      snapshotHasInFlight: false,
-      keepCanvas: false,
-      canvasHasInFlight: false,
-      turnLive: false,
-      openUserTurn: true,
-    }),
-    false,
-    'a prompt with no assistant yet must not arm the leftover-journal gate',
-  );
-  assert.equal(
-    sessionAssignedClaimsLocalTurn({ ownsOpenStream: false, previousIdIsLocalTurn: false }),
-    false,
-  );
-  assert.equal(
-    sessionAssignedClaimsLocalTurn({ ownsOpenStream: true, previousIdIsLocalTurn: false }),
-    true,
-  );
-  assert.equal(holdDuplicateUserEcho({
-    idleSnapshot: true,
-    alreadyOnCanvas: true,
-    openUserTurn: false,
-    canvasInFlight: false,
-    turnLive: false,
-  }), true);
-  const settled = [
-    { role: 'user', parts: [{ kind: 'text', text: 'OK啊 挺好的' }] },
-    {
-      role: 'assistant',
-      parts: [
-        { kind: 'reasoning', text: '先看目录结构' },
-        { kind: 'text', text: '目录里有 crates。' },
-      ],
-    },
-  ];
-  assert.equal(
-    deltaContinuesLastAssistant(settled, { type: 'reasoning', content: '先看目录结构' }),
-    true,
-  );
-  assert.equal(
-    deltaContinuesLastAssistant(settled, { type: 'reasoning', content: '接下来核对刷新后的回放。' }),
-    false,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(settled, { type: 'reasoning', content: '先看目录结构' }),
-    true,
-  );
-});
-
-test('live snapshot never infers running from a trailing user message', () => {
-  const restored = restoreLiveSnapshot([{ role: 'user', text: 'persisted but idle' }]);
-  assert.deepEqual(restored, {
-    messages: [{ role: 'user', text: 'persisted but idle' }],
-    running: false,
-  });
-});
 
 test('user echo already on canvas is not appended again', () => {
   const user = { role: 'user', parts: [{ kind: 'text', text: '你好啊' }] };
@@ -355,83 +235,7 @@ test('disk transcript replaces a canvas that is behind the saved session', () =>
   );
 });
 
-test('idle live snapshot ignores leftover journal content until a new turn', () => {
-  assert.equal(shouldIgnoreLiveReplayAfterIdleSnapshot(true, 'text'), true);
-  assert.equal(shouldIgnoreLiveReplayAfterIdleSnapshot(true, 'tool_start'), true);
-  assert.equal(shouldIgnoreLiveReplayAfterIdleSnapshot(true, 'reasoning'), true);
-  assert.equal(shouldIgnoreLiveReplayAfterIdleSnapshot(true, 'user'), false);
-  assert.equal(shouldIgnoreLiveReplayAfterIdleSnapshot(true, 'state'), false);
-  assert.equal(shouldIgnoreLiveReplayAfterIdleSnapshot(false, 'text'), false);
-  assert.equal(
-    shouldIgnoreLiveReplayAfterIdleSnapshot(true, 'text', true),
-    false,
-    'a live in-flight turn must still stream after an idle snapshot',
-  );
-});
 
-test('idle snapshot gate yields to an in-flight send on this tab', () => {
-  assert.equal(
-    idleFlagAfterLiveSnapshot({
-      snapshotHasInFlight: false,
-      keepCanvas: false,
-      canvasHasInFlight: true,
-      turnLive: true,
-    }),
-    false,
-  );
-  assert.equal(
-    idleFlagAfterLiveSnapshot({
-      snapshotHasInFlight: false,
-      keepCanvas: true,
-      canvasHasInFlight: true,
-      turnLive: false,
-    }),
-    false,
-  );
-  assert.equal(
-    idleFlagAfterLiveSnapshot({
-      snapshotHasInFlight: false,
-      keepCanvas: false,
-      canvasHasInFlight: false,
-      turnLive: false,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldClearIdleLiveSnapshotOnUser({
-      alreadyOnCanvas: true,
-      canvasInFlight: true,
-      turnLive: false,
-    }),
-    true,
-    'own optimistic echo must reopen the live turn',
-  );
-  assert.equal(
-    shouldClearIdleLiveSnapshotOnUser({
-      alreadyOnCanvas: true,
-      canvasInFlight: false,
-      turnLive: false,
-    }),
-    false,
-    'leftover journal user of a finished turn stays idle',
-  );
-  assert.equal(
-    shouldKeepLiveBusyAcrossIdleSnapshot({
-      keepCanvas: false,
-      canvasInFlight: true,
-      turnLive: false,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldKeepLiveBusyAcrossIdleSnapshot({
-      keepCanvas: false,
-      canvasInFlight: false,
-      turnLive: false,
-    }),
-    false,
-  );
-});
 
 test('returning to a session does not re-append snapshot/journal text', () => {
   const painted =
@@ -474,110 +278,8 @@ test('returning to a session does not re-append snapshot/journal text', () => {
   );
 });
 
-test('idle snapshot keeps new live deltas and drops thinking that is already shown', () => {
-  const messages = [
-    {
-      role: 'assistant',
-      parts: [
-        { kind: 'reasoning', text: '先看目录结构' },
-        { kind: 'text', text: '目录里有 crates。' },
-      ],
-    },
-  ];
-  assert.equal(
-    idleReplayAlreadyPainted(messages, { type: 'reasoning', content: '先看目录结构' }),
-    true,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(messages, { type: 'text', content: '目录里有 crates。' }),
-    true,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(messages, { type: 'text', content: '接下来读 read.rs。' }),
-    false,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(messages, { type: 'tool_start', id: 'call-1' }),
-    false,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(
-      [
-        {
-          role: 'assistant',
-          parts: [{ kind: 'tool', tool: { id: 'call-1', status: 'pending', output: '' } }],
-        },
-      ],
-      { type: 'tool_result', id: 'call-1' },
-    ),
-    false,
-  );
-});
 
-test('idle replay resolves the owning round by message identity (ghost batch guard)', () => {
-  const messages = [
-    {
-      role: 'assistant',
-      id: 'm-1',
-      parts: [
-        { kind: 'reasoning', text: '第一轮思考' },
-        { kind: 'tool', tool: { id: 'call-1', status: 'done', output: 'ok' } },
-      ],
-    },
-    {
-      role: 'assistant',
-      id: 'm-2',
-      parts: [{ kind: 'text', text: '第二轮回答' }],
-    },
-  ];
-  // 早先回合的重放：按 message_id 回到 m-1 判定，而不是拿 m-2 去比对。
-  assert.equal(
-    idleReplayAlreadyPainted(messages, {
-      type: 'reasoning',
-      content: '第一轮思考',
-      message_id: 'm-1',
-    }),
-    true,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(messages, { type: 'tool_start', id: 'call-1', message_id: 'm-1' }),
-    true,
-  );
-  assert.equal(
-    idleReplayAlreadyPainted(messages, { type: 'text', content: '第二轮回答', message_id: 'm-2' }),
-    true,
-  );
-  // 未画过的新尾流仍要放行落笔。
-  assert.equal(
-    idleReplayAlreadyPainted(messages, {
-      type: 'reasoning',
-      content: '第二轮新增思考',
-      message_id: 'm-2',
-    }),
-    false,
-  );
-});
 
-test('deltaContinuesLastAssistant binds an earlier round by identity, not by tail', () => {
-  const messages = [
-    { role: 'assistant', id: 'm-1', parts: [{ kind: 'text' as const, text: '第一轮正文' }] },
-    { role: 'assistant', id: 'm-2', parts: [{ kind: 'text' as const, text: '第二' }] },
-  ];
-  // 第二轮仍在流式：身份命中 m-2，判定为“继续”。
-  assert.equal(
-    deltaContinuesLastAssistant(messages, {
-      type: 'text',
-      content: '第二轮的后续正文',
-      message_id: 'm-2',
-    }),
-    true,
-  );
-  // 身份未命中且与末尾正文不搭：交给“新回合”处理，行为不回退。
-  assert.equal(
-    deltaContinuesLastAssistant(messages, { type: 'text', content: '完全不同的新回合' }),
-    false,
-  );
-});
 
 test('second identical ```text fence is a new code block, not a live replay', () => {
   assert.equal(isMarkdownFenceDelta('```text\n'), true);
@@ -632,17 +334,6 @@ test('idle watch does not activate on leftover user or runtime_info events', () 
   assert.equal(isWatchTurnActivationEvent('watch_closed'), false);
 });
 
-test('live replay input and running state restore an active turn after an idle snapshot', () => {
-  let state = createLiveLifecycleState();
-  ({ state } = reduceLiveLifecycle(state, { type: 'snapshot' }));
-  assert.equal(state.running, false);
-
-  ({ state } = reduceLiveLifecycle(state, { type: 'input_accepted' }));
-  assert.equal(state.running, true);
-
-  ({ state } = reduceLiveLifecycle(state, { type: 'state', running: true }));
-  assert.equal(state.running, true);
-});
 
 test('an active live turn cannot be detached locally without a recoverable protocol', () => {
   assert.deepEqual(liveDetachDisposition(true), {
@@ -657,18 +348,6 @@ test('switching the viewed session is always allowed; live tasks stay in the bac
   assert.deepEqual(liveSessionSwitchDisposition(false), { allowed: true });
 });
 
-test('reconnect snapshot discards an unresolved queue when terminal replay is unavailable', () => {
-  assert.deepEqual(liveSnapshotQueueDisposition(true, 2), {
-    discardQueued: true,
-    reason: 'terminal_unknown',
-  });
-  assert.deepEqual(liveSnapshotQueueDisposition(false, 2), {
-    discardQueued: false,
-  });
-  assert.deepEqual(liveSnapshotQueueDisposition(true, 0), {
-    discardQueued: false,
-  });
-});
 
 test('viewing a session never occupancy-locks send or stop', () => {
   let state = reduceChatRecovery('ready', {
@@ -919,12 +598,6 @@ test('stacked turn billing is occupancy over the window with ~100% cache', () =>
   );
 });
 
-test('empty live snapshot does not wipe an in-progress canvas', () => {
-  assert.equal(keepCanvasOnEmptyLiveSnapshot(0, 2, true), true);
-  assert.equal(keepCanvasOnEmptyLiveSnapshot(0, 0, true), false);
-  assert.equal(keepCanvasOnEmptyLiveSnapshot(3, 2, true), false);
-  assert.equal(keepCanvasOnEmptyLiveSnapshot(0, 2, false), false);
-});
 
 test('returning to the live execution session reuses the open stream', () => {
   assert.equal(
@@ -1257,6 +930,34 @@ test('reconcileRunningTranscript aligns turns by message id before text (duplica
     'A-from-m1',
     '必须按 id 对齐，而非首个同文本轮次',
   );
+});
+
+test('快照合并：无落盘 id 的乐观提问也去重，不得在底部出现两次', () => {
+  const snapshot = [
+    { role: 'user', id: 'm-user-9', parts: [{ kind: 'text', text: '我是大王' }] },
+    { role: 'assistant', id: 'm-asst-9', parts: [{ kind: 'text', text: '收到' }] },
+  ];
+  // 本端刚发出、尚未绑定落盘 id 的乐观尾部：文本已在快照里 → 不得再追加一遍
+  const tail = [
+    { role: 'user', parts: [{ kind: 'text', text: '我是大王' }] },
+    { role: 'assistant', parts: [] },
+  ];
+  assert.deepEqual(
+    dropSnapshotDuplicates(snapshot, tail).map((m: { role?: string }) => m.role),
+    ['assistant'],
+  );
+
+  // 真正的新提问绝不能被吃掉（快照里没有它，必须保留）
+  const fresh = dropSnapshotDuplicates(snapshot, [
+    { role: 'user', parts: [{ kind: 'text', text: '全新提问' }] },
+  ]);
+  assert.equal(fresh.length, 1);
+
+  // id 命中依旧优先去重（历史重载路径不变）
+  const byId = dropSnapshotDuplicates(snapshot, [
+    { role: 'user', id: 'm-user-9', parts: [{ kind: 'text', text: '别的内容' }] },
+  ]);
+  assert.equal(byId.length, 0);
 });
 
 

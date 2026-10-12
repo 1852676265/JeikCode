@@ -41,41 +41,6 @@ export interface ProjectionMessage {
 }
 
 /**
- * 身份未命中时，是否允许把增量落到“最后一条 assistant”。
- *
- * 核心铁律：
- * 1. 直播推流（replay === false）：绝对放行！LLM 实时吐字必须 0 延迟实时上屏，
- *    一个回合内哪怕多轮工具调用（工具轮 m-1、正文轮 m-2），正文也必须自然并入当前助手气泡，
- *    绝不能等回合结束或刷新/失焦才出来！
- * 2. 重放阶段（replay === true）：若该帧携带的 targetId 在画布上全无踪迹，
- *    且当前画布存在中途插入的 user 消息（例如 Steer 导致轮次被分割成多个 assistant 气泡），
- *    绝不允许将属于 Steer 之前的旧事件盲目外溢涂写到 Steer 之后的最新助手气泡中。
- */
-export function mayPaintUnroutedDelta<T extends ProjectionMessage>(
-  messages: T[],
-  targetId?: string,
-  replay?: boolean,
-): boolean {
-  if (!replay) return true; // 直播推流：绝对不拦截！
-  if (!targetId) return true; // 旧 daemon：无身份可依，保持既有尾随语义
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== 'assistant') return true;
-  // 重放期：检查是否存在跨轮隔离（即末尾 assistant 前方存在 user 气泡，且该 user 气泡之前还有更早的 assistant）
-  let lastUserIdx = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === 'user') {
-      lastUserIdx = i;
-      break;
-    }
-  }
-  if (lastUserIdx > 0 && messages.slice(0, lastUserIdx).some((m) => m.role === 'assistant')) {
-    // 存在 Steer 等跨轮隔离时，未寻址的老重放帧绝不污染跨轮后的末尾气泡
-    return !last.id;
-  }
-  return true;
-}
-
-/**
  * 归属消息定位：`messageId` 命中画布上的 assistant 消息时返回其下标，否则 -1。
  * 1. 优先按 message.id 直接比对；
  * 2. 兼容一轮多 round：若某个部件（part）由该 round 生成（part.id 以 `${messageId}:` 开头），
@@ -216,8 +181,8 @@ export function paintCachedAssistantDelta<T extends ProjectionMessage>(
   identity?: { messageId?: string; partId?: string },
 ): T[] {
   const painted = part === 'text'
-    ? paintAssistantText(messages, content, false, identity?.messageId)
-    : paintAssistantReasoning(messages, content, false, identity?.messageId);
+    ? paintAssistantText(messages, content, false, identity?.messageId, identity?.partId)
+    : paintAssistantReasoning(messages, content, false, identity?.messageId, identity?.partId);
   return withAssistantIdentity(painted, identity?.messageId, identity?.partId);
 }
 
@@ -321,17 +286,19 @@ export function paintAssistantText<T extends ProjectionMessage>(
   replay: boolean,
   /** 管线身份：命中则把增量落回该消息（迟到尾流必须回到原回合）。 */
   targetId?: string,
+  /** 部件身份：回放帧的累积文本按 part 定向合并，不能拿整条消息的正文拼接做基线。 */
+  partId?: string,
 ): T[] {
   const target = identifiedAssistantIndex(messages, targetId);
   if (target >= 0) {
-    const parts = mergeTextIntoParts(messages[target]!.parts, content, replay);
+    const parts = mergeTextIntoParts(messages[target]!.parts, content, replay, partId);
     if (!parts) return messages;
     const next = messages.slice();
     next[target] = { ...messages[target]!, parts };
     return next;
   }
-  // 身份未命中：重放期若末尾消息已被跨轮隔离，必须拒绝落笔；直播期 100% 放行流式吐字。
-  if (!mayPaintUnroutedDelta(messages, targetId, replay)) return messages;
+  // 身份未命中：这帧属于画布上还没有的轮（新一轮 / 迟到尾流）→ 直接落到当前气泡。
+  // 不再用「跨轮隔离」猜测拦截：帧身份由线协议（轮编号 + 游标）给出，未命中就是新的。
   if (messages.length === 0) {
     if (!content) return messages;
     return [{ role: 'assistant', parts: [{ kind: 'text', text: content }] } as unknown as T];
@@ -342,24 +309,65 @@ export function paintAssistantText<T extends ProjectionMessage>(
     last = { role: 'assistant', parts: [] } as unknown as T;
     base = [...messages, last];
   }
-  const parts = mergeTextIntoParts(last.parts, content, replay);
+  // 未命中轮编号：若这是**回放帧**、且末尾气泡属于另一轮（id 不同），它属于新的一轮 ——
+  // 必须另起部件，绝不能并进上一轮的正文里（否则两轮正文粘成一段 = 视觉分叉）。
+  // 直播帧不加这道判断：它本来就是按序新内容，直接并入当前段（行为不变）。
+  const startNewPart = replay && !partId && !!targetId && !!last.id && last.id !== targetId;
+  const parts = mergeTextIntoParts(last.parts, content, replay, partId, startNewPart);
   if (!parts) return messages;
   return [...base.slice(0, -1), { ...last, parts }];
 }
 
-/** 合并一段正文增量；返回 null 表示重播去重后无新内容可落笔。 */
-function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean): MsgPart[] | null {
+/** 合并一段正文增量；返回 null 表示重播去重后无新内容可落笔。
+ *
+ * 回放帧（replay=true）必须按 part 身份定向合并：
+ * - 已画过的 part 再次回放（重连/刷新）：命中同一 part 后增量是既有文本的后缀 → 去重为空；
+ * - 在途 part 的迟到尾段：只补上与已有部分不重叠的后缀；
+ * - 帧声明了段身份但画布上没有这一段 → 它就是新的一段，直接追加；
+ * - 未命中轮编号且末尾气泡属于另一轮（startNewPart）→ 另起部件，绝不跨轮粘连。
+ */
+function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string, startNewPart = false): MsgPart[] | null {
   let delta = content;
   if (replay) {
     const replaced = replaceTruncatedParts(parts, 'text', content);
     if (replaced) return replaced;
-    const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
-    delta = unpaintedReplaySuffix(painted, content);
-    if (!delta) return null;
+    if (partId) {
+      const index = parts.findIndex((part) => part.kind === 'text' && part.id === partId);
+      if (index >= 0) {
+        const existing = (parts[index] as { text: string }).text || '';
+        const body = withoutDisplayTruncation(existing);
+        // 回放帧命中同一 part = 「这段可能已经画过」：
+        // 1) 帧内容已在该 part 内（包括从开头重发、中段重发）→ 幂等丢弃；
+        // 2) 帧以该 part 为前缀（累积帧更长）→ 只补未画过的后缀；
+        // 3) 其余才是真正的新内容 → 追加。
+        // 旧实现拿「整条消息所有正文的拼接」做基线：画布已领先时，重发的中段
+        // 既非前缀也非后缀，于是被当成新内容再追加一遍（整轮重打的根因）。
+        if (!content || body.includes(content)) return null;
+        if (content.startsWith(body)) {
+          const next = parts.slice();
+          next[index] = { kind: 'text', text: content, id: partId };
+          return next;
+        }
+        const suffix = unpaintedReplaySuffix(existing, content);
+        if (!suffix) return null;
+        const next = parts.slice();
+        next[index] = { kind: 'text', text: body + suffix, id: partId };
+        return next;
+      }
+      // 帧声明了段身份、但画布上没有这一段 → 它是一段新内容，直接追加。
+      // 不再拿「整条消息正文拼接」去猜（那套既会漏画也会重画）。
+      delta = content;
+    } else {
+      const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
+      delta = unpaintedReplaySuffix(painted, content);
+      if (!delta) return null;
+    }
   }
   const next = parts.slice();
   const tail = next[next.length - 1];
-  if (tail && tail.kind === 'text') {
+  // 同一 part（或旧数据无身份）才并入尾部文本；part 身份不同、或这帧属于新的一轮，
+  // 都必须另起部件保住分段边界（否则重放无法按 part 定向收敛）。
+  if (tail && tail.kind === 'text' && !startNewPart && (!partId || !tail.id || tail.id === partId)) {
     let merged = tail.text + delta;
     if (
       tail.text &&
@@ -370,9 +378,9 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean):
     ) {
       merged = `${tail.text}\n${delta}`;
     }
-    next[next.length - 1] = { kind: 'text', text: merged };
+    next[next.length - 1] = { kind: 'text', text: merged, ...(tail.id || !partId ? {} : { id: partId }) };
   } else {
-    next.push({ kind: 'text', text: delta });
+    next.push({ kind: 'text', text: delta, ...(partId ? { id: partId } : {}) });
   }
   return next;
 }
@@ -383,20 +391,21 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
   replay: boolean,
   /** 管线身份：命中则把思考增量落回该消息（迟到尾流必须回到原回合）。 */
   targetId?: string,
+  /** 部件身份：回放帧按 part 定向合并，避免整段思考被重打。 */
+  partId?: string,
 ): T[] {
   const cleanContent = content.trim();
   if (!cleanContent) return messages;
 
   const target = identifiedAssistantIndex(messages, targetId);
   if (target >= 0) {
-    const parts = mergeReasoningIntoParts(messages[target]!.parts, content, replay);
+    const parts = mergeReasoningIntoParts(messages[target]!.parts, content, replay, partId);
     if (!parts) return messages;
     const next = messages.slice();
     next[target] = { ...messages[target]!, parts };
     return next;
   }
-  // 身份未命中：同 paintAssistantText，重放期若被跨轮隔离拒绝落笔，直播期 100% 实时上屏。
-  if (!mayPaintUnroutedDelta(messages, targetId, replay)) return messages;
+  // 身份未命中：同 paintAssistantText —— 未命中的帧就是画布上还没有的轮，直接落笔。
 
   let last = messages[messages.length - 1];
   let base = messages;
@@ -404,18 +413,42 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
     last = { role: 'assistant', parts: [] } as unknown as T;
     base = [...messages, last];
   }
-  const parts = mergeReasoningIntoParts(last.parts, content, replay);
+  // 同 paintAssistantText：回放帧且末尾属于另一轮 → 思考也必须另起部件。
+  const startNewPart = replay && !partId && !!targetId && !!last.id && last.id !== targetId;
+  const parts = mergeReasoningIntoParts(last.parts, content, replay, partId, startNewPart);
   if (!parts) return messages;
   return [...base.slice(0, -1), { ...last, parts }];
 }
 
 /** 合并一段思考增量；返回 null 表示重播去重后无新内容可落笔。 */
-function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: boolean): MsgPart[] | null {
+function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string, startNewPart = false): MsgPart[] | null {
   const cleanContent = content.trim();
   if (replay) {
     const replaced = replaceTruncatedParts(parts, 'reasoning', content);
     if (replaced) {
       return replaced === parts ? null : replaced;
+    }
+    if (partId) {
+      const index = parts.findIndex((part) => part.kind === 'reasoning' && part.id === partId);
+      if (index >= 0) {
+        const existing = (parts[index] as { text: string }).text || '';
+        const body = withoutDisplayTruncation(existing);
+        // 同 mergeTextIntoParts：命中同一 part 的回放帧先判「是否已画过」（含中段重发），
+        // 否则画布已领先时重发的思考中段会被再追加一遍。
+        if (!cleanContent || body.includes(cleanContent)) return null;
+        if (content.startsWith(body)) {
+          const next = parts.slice();
+          next[index] = { kind: 'reasoning', text: content, id: partId };
+          return next;
+        }
+        const suffix = unpaintedReplaySuffix(existing, content);
+        if (!suffix) return null;
+        const next = parts.slice();
+        next[index] = { kind: 'reasoning', text: body + suffix, id: partId };
+        return next;
+      }
+      // 帧声明了段身份但画布上没有这一段 → 新一段思考，直接追加。
+      return appendReasoningPart(parts, content, partId);
     }
     for (let i = 0; i < parts.length; i++) {
       const p = parts[i]!;
@@ -435,7 +468,9 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
   const painted = parts.map((part) => (part.kind === 'reasoning' ? part.text || '' : '')).join('');
   const delta = replay ? unpaintedReplaySuffix(painted, content) : content;
   if (!delta) return null;
-  return appendReasoningPart(parts, delta);
+  return startNewPart && parts.length > 0 && parts[parts.length - 1]!.kind === 'reasoning'
+    ? [...parts, { kind: 'reasoning', text: delta, ...(partId ? { id: partId } : {}) }]
+    : appendReasoningPart(parts, delta, partId);
 }
 
 /** Disk stored a capped field. The replay is the same text plus what was cut

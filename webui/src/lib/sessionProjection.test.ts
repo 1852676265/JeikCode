@@ -578,9 +578,8 @@ test('withAssistantIdentity keeps one wire id on exactly one row', () => {
   assert.equal(msgs[1]?.id, undefined);
 });
 
-test('a replay whose identity is absent never repaints old body/reasoning into the newest bubble', () => {
+test('未命中轮编号的回放帧按「画布上还没有的轮」落笔（重复保护改由断点续传游标承担）', () => {
   const orig = { role: 'user', parts: [{ kind: 'text' as const, text: '重构网络层' }] };
-  // 早期后台缓存路径落笔不盖章 → 这一行没有身份
   const roundA = {
     role: 'assistant',
     parts: [
@@ -592,22 +591,18 @@ test('a replay whose identity is absent never repaints old body/reasoning into t
   const roundB = { role: 'assistant', id: 'm-B', parts: [{ kind: 'text' as const, text: '新正文' }] };
   const canvas = [orig, roundA, steer, roundB];
 
-  // 身份 m-A 在画布上找不到，且末行已属于另一轮：
-  // 重放必须原地不动（位置唯一），绝不能把旧正文/思考追加到最新消息上。
-  assert.equal(paintAssistantText(canvas, '旧正文', true, 'm-A'), canvas);
-  assert.equal(paintAssistantReasoning(canvas, '旧思考', true, 'm-A'), canvas);
-
-  // 幂等：同一帧重放多少次，画布都一字不变。
-  let again = canvas;
-  for (let i = 0; i < 3; i += 1) {
-    again = paintAssistantReasoning(
-      paintAssistantText(again, '旧正文', true, 'm-A'),
-      '旧思考',
-      true,
-      'm-A',
-    );
-  }
-  assert.equal(again, canvas);
+  // 旧守卫 mayPaintUnroutedDelta 已删除：未命中轮编号的帧不再被「猜」成老帧拦下。
+  // 不重复的保证改由断点续传游标承担（只发客户端没收到过的帧），
+  // 所以这里只要求：落笔发生在当前气泡内，且同一文本重复回放是幂等的。
+  const once = paintAssistantText(canvas, '旧正文', true, 'm-A');
+  assert.equal(once.length, 4, '未命中身份的帧直接落到当前气泡，不再凭空多一条');
+  // 末尾气泡属于另一轮（m-B）→ 必须另起部件，不能并进上一轮正文（否则两轮正文粘成一段）
+  assert.deepEqual(
+    (once[3]?.parts as Array<{ text?: string }>).map((p) => p.text),
+    ['新正文', '旧正文'],
+  );
+  // 同一文本再回放一次：已在该气泡内 → 幂等丢弃（不会越叠越多）
+  assert.equal(paintAssistantText(once, '旧正文', true, 'm-A'), once);
 });
 
 test('an unrouted delta still opens the placeholder round it belongs to', () => {
@@ -675,4 +670,81 @@ test('live streaming of multi-round turn (tools in round 1, final text in round 
   // 后续流式增量继续实时追加
   const streamed2 = paintAssistantText(streamed, '\n一、内置工具', false, 'm-round-2');
   assert.equal(streamed2[1]?.parts[2]?.text, '以下是挂载的工具清单：\n一、内置工具');
+});
+
+test('历史回合存在时，工具轮之后的实时正文与思考仍必须逐字上屏', () => {
+  // 真实失败场景（修复前线上复现）：会话中已有历史回合，当前回合 Round 1（工具轮）
+  // 已给助手气泡盖 message_id，Round 2 正文带着全新 message_id 到达——
+  // 该帧未被路由到已知消息，旧逻辑的跨轮隔离守卫直接拒绝，思考与正文全部丢失。
+  const canvas = [
+    { role: 'user', parts: [{ kind: 'text' as const, text: '第一轮提问' }], id: 'm-old-user' },
+    { role: 'assistant', id: 'm-old', parts: [{ kind: 'text' as const, text: '历史回答' }] },
+    { role: 'user', parts: [{ kind: 'text' as const, text: '第二轮提问' }], id: 'm-cur-user' },
+    {
+      role: 'assistant',
+      id: 'm-round-1',
+      parts: [
+        { kind: 'text' as const, text: '正文 1', id: 'm-round-1:2:text' },
+        { kind: 'tool' as const, tool: { id: 'call_1', name: 'bash', args: '', status: 'done' as const } },
+      ],
+    },
+  ];
+
+  // 直播帧（线协议不带 replay 标记）必须并入当前助手气泡，绝不能被拦。
+  const streamed = paintAssistantText(canvas, '正文 2', false, 'm-round-2');
+  assert.equal(streamed.length, 4);
+  assert.deepEqual(streamed[3]?.parts.map((p) => p.kind), ['text', 'tool', 'text']);
+  assert.equal((streamed[3]?.parts[2] as { text: string }).text, '正文 2');
+
+  const reasoned = paintAssistantReasoning(streamed, '第二轮思考', false, 'm-round-2');
+  assert.deepEqual(reasoned[3]?.parts.map((p) => p.kind), ['text', 'tool', 'text', 'reasoning']);
+
+  // 旧守卫已删除：未命中轮编号的帧一律视为「画布上还没有的内容」直接落笔。
+  // （不重复的保证改由断点续传游标承担：续传只发客户端没收到过的帧。）
+  const replayed = paintAssistantText(canvas, '正文 2', true, 'm-round-2');
+  assert.equal(replayed.length, 4);
+  assert.deepEqual(replayed[3]?.parts.map((p) => p.kind), ['text', 'tool', 'text']);
+});
+
+test('回放帧按 part 身份收敛：画布已领先时不得把中段再追加一遍', () => {
+  // 刷新后从缓存恢复的在途 part（已画到「请求C」），回放却从更早的片段逐段重发。
+  // 旧实现用「整条消息所有正文的拼接」做基线：重发的中段既非前缀也非后缀，
+  // 于是被当成新内容再追加一遍 —— 整合在途回合被逐帧重打一遍的根因。
+  const canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [{ kind: 'text' as const, text: '请求A请求B请求C', id: 'm-1:2:text' }],
+    },
+  ];
+  assert.equal(paintAssistantText(canvas, '请求A', true, 'm-1', 'm-1:2:text'), canvas);
+  assert.equal(paintAssistantText(canvas, '请求B', true, 'm-1', 'm-1:2:text'), canvas);
+  assert.equal(paintAssistantText(canvas, '请求C', true, 'm-1', 'm-1:2:text'), canvas);
+  // 累积帧更长（迟到的尾段）：原地收敛，绝不新起部件
+  const grown = paintAssistantText(canvas, '请求A请求B请求C请求D', true, 'm-1', 'm-1:2:text');
+  assert.equal(grown[0]?.parts.length, 1);
+  assert.equal((grown[0]?.parts[0] as { text: string }).text, '请求A请求B请求C请求D');
+});
+
+test('新部件写入即盖身份戳，后续重放才能按 part 定向收敛', () => {
+  const canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [{ kind: 'text' as const, text: '正文 1', id: 'm-1:2:text' }],
+    },
+  ];
+  // 工具后的新正文轮：帧携带自己的 part id → 建新部件时立即盖章
+  const next = paintAssistantText(canvas, '正文 2', true, 'm-1', 'm-1:4:text');
+  assert.equal(next[0]?.parts.length, 2);
+  assert.equal((next[0]?.parts[1] as { id?: string }).id, 'm-1:4:text');
+  // 同一帧再次回放：命中 part → 幂等丢弃
+  assert.equal(paintAssistantText(next, '正文 2', true, 'm-1', 'm-1:4:text'), next);
+  // 思考同理：建部件时盖章，重放时幂等
+  const withThinking = paintAssistantReasoning(next, '第二轮思考', true, 'm-1', 'm-1:5:reasoning');
+  assert.equal((withThinking[0]?.parts[2] as { id?: string }).id, 'm-1:5:reasoning');
+  assert.equal(
+    paintAssistantReasoning(withThinking, '第二轮思考', true, 'm-1', 'm-1:5:reasoning'),
+    withThinking,
+  );
 });
