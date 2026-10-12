@@ -9,7 +9,6 @@ import {
   liveSessionSwitchDisposition,
   reduceChatRecovery,
   resolveUserInputRequest,
-  syncAttachDisposition,
   resolveTokenCache,
   formatCacheHitRate,
   estimatePrefixCached,
@@ -33,9 +32,6 @@ import {
   thisTabOwnsTurn,
   shouldLockSendAsDetached,
   isWatchTurnActivationEvent,
-  assistantDeltaAlreadyPainted,
-  isMarkdownFenceDelta,
-  liveContentDeltaAlreadyOnParts,
   transcriptHasOpenUserTurn,
   sessionAssignedClaimsLocalTurn,
   liveSubmitKeepsTurn,
@@ -237,92 +233,7 @@ test('disk transcript replaces a canvas that is behind the saved session', () =>
 
 
 
-test('returning to a session does not re-append snapshot/journal text', () => {
-  const painted =
-    '正在检索上下文组装与思考内容处理相关的代码与提交记录。\n正在查看 ContextManager 及各端思考内容与上下文拼接逻辑。';
-  assert.equal(
-    assistantDeltaAlreadyPainted(painted, '正在查看 ContextManager 及各端思考内容与上下文拼接逻辑。'),
-    true,
-  );
-  assert.equal(
-    assistantDeltaAlreadyPainted(painted, '正在对比 v4.6.1 之前、4.6.1、4.6.7 的具体源码实现。'),
-    false,
-  );
-  assert.equal(assistantDeltaAlreadyPainted(painted, '的'), false);
-  assert.equal(
-    liveContentDeltaAlreadyOnParts(
-      [
-        { kind: 'reasoning', text: '核对版本标签' },
-        { kind: 'text', text: painted },
-      ],
-      { type: 'reasoning', content: '核对版本标签' },
-    ),
-    true,
-  );
-  assert.equal(
-    liveContentDeltaAlreadyOnParts(
-      [
-        { kind: 'reasoning', text: '核对版本标签' },
-        { kind: 'text', text: painted },
-      ],
-      { type: 'text', content: '正在检索上下文组装与思考内容处理相关的代码与提交记录。' },
-    ),
-    true,
-  );
-  assert.equal(
-    liveContentDeltaAlreadyOnParts(
-      [{ kind: 'text', text: painted }],
-      { type: 'text', content: '正在查看 Claude 协议和 OpenAI 协议中上下文组装顺序与思考拼接逻辑。' },
-    ),
-    false,
-  );
-});
-
-
-
-
-test('second identical ```text fence is a new code block, not a live replay', () => {
-  assert.equal(isMarkdownFenceDelta('```text\n'), true);
-  assert.equal(isMarkdownFenceDelta('```\n'), true);
-  const first = '1. **任务 1** 输出：\n```text\n   Hello World 1\n```\n\n2. **任务 2** 输出：\n';
-  assert.equal(assistantDeltaAlreadyPainted(first, '```text\n'), false);
-  assert.equal(
-    liveContentDeltaAlreadyOnParts([{ kind: 'text', text: first }], {
-      type: 'text',
-      content: '```text\n',
-    }),
-    false,
-  );
-  // Closing ticks already at the tail (true replay) are still skipped.
-  assert.equal(
-    assistantDeltaAlreadyPainted(first + '```text\n   Hello World 2\n```\n', '```\n'),
-    true,
-  );
-});
-
-test('isMarkdownFenceDelta recognizes 4+ backtick fences', () => {
-  assert.equal(isMarkdownFenceDelta('````markdown\n'), true);
-  assert.equal(isMarkdownFenceDelta('````\n'), true);
-  assert.equal(isMarkdownFenceDelta('`````\n'), true);
-  assert.equal(isMarkdownFenceDelta('```\n'), true);
-});
-
-test('repeated headings and templates in prose are not swallowed by replay dedup', () => {
-  const existing =
-    '### 1. 错误\n* **输入命令**：\n```bash\ncmd 1\n```\n* **报错输出**：\n```text\nerr 1\n```\n* **原因分析**：\nreason 1\n\n' +
-    '### 2. 错误\n* **输入命令**：\n```bash\ncmd 2\n```\n';
-  // A repeated template item in section 2 must not be dropped just because it appeared in section 1
-  assert.equal(assistantDeltaAlreadyPainted(existing, '* **报错输出**：\n'), false);
-  assert.equal(
-    liveContentDeltaAlreadyOnParts([{ kind: 'text', text: existing }], {
-      type: 'text',
-      content: '* **报错输出**：\n',
-    }),
-    false,
-  );
-});
-
-test('idle watch does not activate on leftover user or runtime_info events', () => {
+test('legacy done and stopped are natural completions that preserve queued messages', () => {
   assert.equal(isWatchTurnActivationEvent('text'), true);
   assert.equal(isWatchTurnActivationEvent('tool_start'), true);
   assert.equal(isWatchTurnActivationEvent('permission_request'), true);
@@ -386,14 +297,6 @@ test('observing a live turn still allows send (interrupt) and stop', () => {
     allowQueueDrain: true,
     allowStop: false,
   });
-});
-
-test('sync attach is always allowed for an observer view', () => {
-  assert.deepEqual(syncAttachDisposition(true, 'ready'), { allowed: true });
-  assert.deepEqual(syncAttachDisposition(false, 'terminal_unknown'), {
-    allowed: true,
-  });
-  assert.deepEqual(syncAttachDisposition(false, 'ready'), { allowed: true });
 });
 
 test('late chat events are rejected by request and session generation', () => {

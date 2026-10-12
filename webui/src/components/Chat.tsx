@@ -205,7 +205,6 @@ import {
   visibleUserText,
   userTextsMatch,
   dropSnapshotDuplicates,
-  syncAttachDisposition,
   type ChatRecoveryEvent,
   type ChatRecoveryState,
 } from '../lib/chatTerminal';
