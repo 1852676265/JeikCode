@@ -167,10 +167,16 @@ export function appendToolOutput(
 export function appendReasoningPart(parts: MsgPart[], delta: string, id?: string): MsgPart[] {
   if (!delta) return parts;
   const tail = parts[parts.length - 1];
-  // 只在 part 身份相同（或旧数据无身份）时并入尾部，否则另起思考部件。
-  if (tail && tail.kind === 'reasoning' && (!id || !tail.id || tail.id === id)) {
+  // 若末尾已经是思考部件：同一段思考流式输出期间（id 相同或未提供）必须平滑合并文本！
+  // 只有在明确声明了不同 part id（例如跨工具轮次）时才另起思考部件。
+  const isDifferentPart = !!tail && tail.kind === 'reasoning' && !!tail.id && !!id && tail.id !== id;
+  if (tail && tail.kind === 'reasoning' && !isDifferentPart) {
     const next = parts.slice();
-    next[next.length - 1] = { kind: 'reasoning', text: tail.text + delta, ...(tail.id || !id ? {} : { id }) };
+    next[next.length - 1] = {
+      kind: 'reasoning',
+      text: tail.text + delta,
+      id: tail.id ?? id,
+    };
     return next;
   }
   return [...parts, { kind: 'reasoning', text: delta, ...(id ? { id } : {}) }];

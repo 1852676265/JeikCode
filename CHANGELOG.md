@@ -23,6 +23,28 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.5 (2026-10-12)
+
+- **[WebUI & Daemon Live Stream / Canvas] Fix post-refresh user prompt loss and streaming reasoning/text fragmentation**:
+  - **Technical Root Cause / Detail**: 
+    1. Prompt disappearance on refresh: When a turn was active, `/chat/watch` filtered replay frames using `seq >= after_seq`. Because the turn's `ChatEvent::User` was tagged with `seq_base`, any connection reconnecting with an advanced cursor filtered out the active turn's user prompt. Simultaneously, reloading disk history during an active turn lacked unpersisted user prompts and erroneously overwrote the memory/IndexedDB cache, completely vanishing the user prompt across refresh.
+    2. Streaming fragmentation across refresh/blur: During continuous live streaming, `appendReasoningPart` and `mergeTextIntoParts` erroneously checked `tail.id === id`. Whenever a slight part-id divergence or focus reconnection occurred, incoming chunks failed this check and were pushed as entirely separate parts rather than appending text in place, fragmenting single coherent thoughts and responses into dozens of disjointed blocks.
+  - **Implementation Mechanism**: 
+    1. Guard active user prompts in replay: Daemon's `subscribe_live_with_replay` now explicitly preserves `ChatEvent::User` at the head of `replay_head` regardless of `after_seq` filtering. Front-end `paintUserMessage` idempotently restores missing user prompts while deduplicating existing ones. In `Chat.tsx`, active sessions strictly skip `saveSessionCache` overwrites from incomplete disk state.
+    2. Seamless text and reasoning streaming: `appendReasoningPart` and `mergeTextIntoParts` now unconditionally append incoming streaming chunks to the trailing part of the same kind unless a distinct part-id boundary is explicitly encountered, eliminating streaming text/thinking splitting.
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+
+---
+
+- **[WebUI 与 Daemon 流式与画布] 修复刷新后最新用户消息丢失与思考/正文流式输出碎裂分叉**:
+  - **技术机理 / 现象溯源**: 
+    1. 刷新后用户提问消失：当回合处于活跃执行中，后端 `/chat/watch` 重放过滤以 `seq >= after_seq` 截断。本回合提问 `ChatEvent::User` 携带 `seq_base`，任何持有递增游标重连的连接均将本轮用户消息过滤拦截；同时刷新时读取磁盘因尚未完结落盘而缺少最新提问，并错误覆写了缓存，导致刷新后用户消息 100% 丢失。
+    2. 失焦/刷新导致思考与正文碎裂断开：在流式生成期间，`appendReasoningPart` 与 `mergeTextIntoParts` 严苛校验 `tail.id === id`。一旦发生失焦重连或部件 ID 微小差异，后续到来的 chunk 校验失败便全部作为新部件 push，将原本同一段连续输出切碎为十几个孤立的折叠块与文本块。
+  - **实现防线 / 核心改动**: 
+    1. 活跃用户提问重放铁律守护：后端 `subscribe_live_with_replay` 明确保证无论 `after_seq` 游标如何过滤，本回合活跃提问 `ChatEvent::User` 恒定保留在重放头部送达；前端 `paintUserMessage` 幂等自愈恢复提问并自动去重；`Chat.tsx` 严格禁止在活跃期间用未落盘的磁盘历史覆写会话缓存。
+    2. 流式思考与正文连贯合并：`appendReasoningPart` 与 `mergeTextIntoParts` 恢复同类型部件流式文本无缝合并原则，仅在跨工具或显式跨段时另起部件，彻底根治流式内容被碎尸万段的顽疾。
+  - **验证与交付**: WebUI 472 项单测全绿，daemon 401 项单测全绿，`tsc --noEmit` 0 报错。
+
 ## v7.2.2-beta.4 (2026-10-12)
 
 - **[WebUI / Daemon Streaming] Session-level resume cursor and identity-idempotent canvas**:

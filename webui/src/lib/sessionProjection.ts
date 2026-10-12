@@ -305,15 +305,11 @@ export function paintAssistantText<T extends ProjectionMessage>(
   }
   let last = messages[messages.length - 1]!;
   let base = messages;
-  if (last.role !== 'assistant') {
+  if (!last || last.role !== 'assistant') {
     last = { role: 'assistant', parts: [] } as unknown as T;
     base = [...messages, last];
   }
-  // 未命中轮编号：若这是**回放帧**、且末尾气泡属于另一轮（id 不同），它属于新的一轮 ——
-  // 必须另起部件，绝不能并进上一轮的正文里（否则两轮正文粘成一段 = 视觉分叉）。
-  // 直播帧不加这道判断：它本来就是按序新内容，直接并入当前段（行为不变）。
-  const startNewPart = replay && !partId && !!targetId && !!last.id && last.id !== targetId;
-  const parts = mergeTextIntoParts(last.parts, content, replay, partId, startNewPart);
+  const parts = mergeTextIntoParts(last.parts, content, replay, partId);
   if (!parts) return messages;
   return [...base.slice(0, -1), { ...last, parts }];
 }
@@ -326,7 +322,7 @@ export function paintAssistantText<T extends ProjectionMessage>(
  * - 帧声明了段身份但画布上没有这一段 → 它就是新的一段，直接追加；
  * - 未命中轮编号且末尾气泡属于另一轮（startNewPart）→ 另起部件，绝不跨轮粘连。
  */
-function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string, startNewPart = false): MsgPart[] | null {
+function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string): MsgPart[] | null {
   let delta = content;
   if (replay) {
     const replaced = replaceTruncatedParts(parts, 'text', content);
@@ -365,9 +361,8 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
   }
   const next = parts.slice();
   const tail = next[next.length - 1];
-  // 同一 part（或旧数据无身份）才并入尾部文本；part 身份不同、或这帧属于新的一轮，
-  // 都必须另起部件保住分段边界（否则重放无法按 part 定向收敛）。
-  if (tail && tail.kind === 'text' && !startNewPart && (!partId || !tail.id || tail.id === partId)) {
+  const isDifferentPart = !!tail && tail.kind === 'text' && !!tail.id && !!partId && tail.id !== partId;
+  if (tail && tail.kind === 'text' && !isDifferentPart) {
     let merged = tail.text + delta;
     if (
       tail.text &&
@@ -378,7 +373,7 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
     ) {
       merged = `${tail.text}\n${delta}`;
     }
-    next[next.length - 1] = { kind: 'text', text: merged, ...(tail.id || !partId ? {} : { id: partId }) };
+    next[next.length - 1] = { kind: 'text', text: merged, id: tail.id ?? partId };
   } else {
     next.push({ kind: 'text', text: delta, ...(partId ? { id: partId } : {}) });
   }
@@ -413,15 +408,13 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
     last = { role: 'assistant', parts: [] } as unknown as T;
     base = [...messages, last];
   }
-  // 同 paintAssistantText：回放帧且末尾属于另一轮 → 思考也必须另起部件。
-  const startNewPart = replay && !partId && !!targetId && !!last.id && last.id !== targetId;
-  const parts = mergeReasoningIntoParts(last.parts, content, replay, partId, startNewPart);
+  const parts = mergeReasoningIntoParts(last.parts, content, replay, partId);
   if (!parts) return messages;
   return [...base.slice(0, -1), { ...last, parts }];
 }
 
 /** 合并一段思考增量；返回 null 表示重播去重后无新内容可落笔。 */
-function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string, startNewPart = false): MsgPart[] | null {
+function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string): MsgPart[] | null {
   const cleanContent = content.trim();
   if (replay) {
     const replaced = replaceTruncatedParts(parts, 'reasoning', content);
@@ -468,9 +461,7 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
   const painted = parts.map((part) => (part.kind === 'reasoning' ? part.text || '' : '')).join('');
   const delta = replay ? unpaintedReplaySuffix(painted, content) : content;
   if (!delta) return null;
-  return startNewPart && parts.length > 0 && parts[parts.length - 1]!.kind === 'reasoning'
-    ? [...parts, { kind: 'reasoning', text: delta, ...(partId ? { id: partId } : {}) }]
-    : appendReasoningPart(parts, delta, partId);
+  return appendReasoningPart(parts, delta, partId);
 }
 
 /** Disk stored a capped field. The replay is the same text plus what was cut

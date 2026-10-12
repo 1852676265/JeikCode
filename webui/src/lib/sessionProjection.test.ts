@@ -578,10 +578,11 @@ test('withAssistantIdentity keeps one wire id on exactly one row', () => {
   assert.equal(msgs[1]?.id, undefined);
 });
 
-test('未命中轮编号的回放帧按「画布上还没有的轮」落笔（重复保护改由断点续传游标承担）', () => {
+test('更早轮次的回放帧定向命中原助手气泡，绝不外溢涂写到 steer 后的最新气泡中', () => {
   const orig = { role: 'user', parts: [{ kind: 'text' as const, text: '重构网络层' }] };
   const roundA = {
     role: 'assistant',
+    id: 'm-A',
     parts: [
       { kind: 'text' as const, text: '旧正文' },
       { kind: 'reasoning' as const, text: '旧思考' },
@@ -591,18 +592,12 @@ test('未命中轮编号的回放帧按「画布上还没有的轮」落笔（�
   const roundB = { role: 'assistant', id: 'm-B', parts: [{ kind: 'text' as const, text: '新正文' }] };
   const canvas = [orig, roundA, steer, roundB];
 
-  // 旧守卫 mayPaintUnroutedDelta 已删除：未命中轮编号的帧不再被「猜」成老帧拦下。
-  // 不重复的保证改由断点续传游标承担（只发客户端没收到过的帧），
-  // 所以这里只要求：落笔发生在当前气泡内，且同一文本重复回放是幂等的。
-  const once = paintAssistantText(canvas, '旧正文', true, 'm-A');
-  assert.equal(once.length, 4, '未命中身份的帧直接落到当前气泡，不再凭空多一条');
-  // 末尾气泡属于另一轮（m-B）→ 必须另起部件，不能并进上一轮正文（否则两轮正文粘成一段）
-  assert.deepEqual(
-    (once[3]?.parts as Array<{ text?: string }>).map((p) => p.text),
-    ['新正文', '旧正文'],
-  );
-  // 同一文本再回放一次：已在该气泡内 → 幂等丢弃（不会越叠越多）
-  assert.equal(paintAssistantText(once, '旧正文', true, 'm-A'), once);
+  // 身份 m-A 精准定位到 roundA 并幂等收敛，绝不追加到 roundB
+  const replayed = paintAssistantText(canvas, '旧正文', true, 'm-A');
+  assert.equal(replayed.length, 4);
+  assert.equal((replayed[1]?.parts[0] as { text: string }).text, '旧正文');
+  assert.equal((replayed[3]?.parts[0] as { text: string }).text, '新正文');
+  assert.equal(replayed[3]?.parts.length, 1);
 });
 
 test('an unrouted delta still opens the placeholder round it belongs to', () => {

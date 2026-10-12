@@ -8635,17 +8635,32 @@ async fn chat_watch(
                 after_seq = ?q.after_seq,
                 "chat_watch: LIVE with replay"
             );
+            let maybe_user = snapshot
+                .iter()
+                .find(|(_, e)| matches!(e, ChatEvent::User { .. }))
+                .cloned();
+
             match q.after_seq {
                 Some(-1) => {
                     // 新会话：画布本来就是空的，补发毫无意义；只给一个起始游标。
+                    // 但是如果本轮存在活跃用户提问，必须在头部送达，防止刷新后用户提问丢失！
                     handshake = Some(chat_watch_session_start_json(&session_id, buffer_len));
+                    if let Some(user) = maybe_user {
+                        replay_head = vec![user];
+                    }
                 }
                 // 游标有效（没越过缓冲末尾）：只补它之后的帧。
+                // 核心防线：当前回合的活跃用户提问（ChatEvent::User）必须始终放在头部，
+                // 绝不受 after_seq 过滤丢弃，确保断线重连或 F5 刷新后用户消息绝不丢失！
                 Some(after) if after >= 0 && (after as u64) <= buffer_len => {
-                    replay_head = snapshot
+                    let mut filtered: Vec<(u64, ChatEvent)> = snapshot
                         .into_iter()
-                        .filter(|(seq, _)| *seq >= after as u64)
+                        .filter(|(seq, e)| !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64)
                         .collect();
+                    if let Some(user) = maybe_user {
+                        filtered.insert(0, user);
+                    }
+                    replay_head = filtered;
                 }
                 // 无游标，或游标已失效（换设备 / 清缓存 / 新回合）：全量补发。
                 _ => replay_head = snapshot,

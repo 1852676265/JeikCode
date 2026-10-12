@@ -2831,7 +2831,10 @@ export function Chat({
               setTurnOutline(sessionResult.value.turns);
               turnOutlineBySessionRef.current.set(loadId, sessionResult.value.turns);
             }
-            void saveSessionCache(projectHash, loadId, loaded, sessionResult.value.todos, undefined, sessionResult.value.turns, sessionResult.value.token_usage);
+            // 运行中的会话磁盘尚未落盘本轮未结消息，绝不能用落后磁盘历史覆盖缓存！
+            if (serverActive === false) {
+              void saveSessionCache(projectHash, loadId, loaded, sessionResult.value.todos, undefined, sessionResult.value.turns, sessionResult.value.token_usage);
+            }
             let displayMessages: Message[] = currentCached && currentCached.length > 0 ? currentCached : loaded;
 
             if (currentCached && currentCached.length > 0) {
@@ -2847,6 +2850,8 @@ export function Chat({
 
               const cachedUserCount = currentCached.filter((m) => m.role === 'user').length;
               const loadedUserCount = loaded.filter((m) => m.role === 'user').length;
+              // 缓存中包含尚未在磁盘落盘的在途用户提问，绝不能被落后磁盘历史覆盖！
+              const cacheHasInFlightUser = turnActive && cachedUserCount > loadedUserCount;
               // 外部新增了轮次（例如其他标签页或 TUI 新增了提问）
               const cacheMissingUser = loadedUserCount > cachedUserCount;
               // 磁盘内容比内存缓存多出新的结算内容
@@ -2865,7 +2870,7 @@ export function Chat({
 
               // 仅当缓存落后于磁盘最新状态，或磁盘内容被改写/删除产生结构差异时采用磁盘覆盖；
               // 否则如果缓存已经完整且一致，保持内存真相源，消除切换时的双重冲刷闪烁！
-              const shouldAdoptDisk = !diskShrank && (cacheMissingUser || cacheMissingSettled || (!turnActive && !cacheInFlight && diskHasUser && diskHasNewContent) || cacheContentStale);
+              const shouldAdoptDisk = !cacheHasInFlightUser && !diskShrank && (cacheMissingUser || cacheMissingSettled || (!turnActive && !cacheInFlight && diskHasUser && diskHasNewContent) || cacheContentStale);
 
               if (shouldAdoptDisk) {
                 displayMessages = loaded;
