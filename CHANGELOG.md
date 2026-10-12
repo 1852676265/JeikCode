@@ -23,6 +23,20 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.3-beta.0 (2026-10-12)
+
+- **[WebUI Live Stream Projection / Dedup] Eliminate substring-inclusion checks from live streams and rely strictly on transport sequence cursors**:
+  - **Technical Root Cause / Detail**: `mergeTextIntoParts` and `mergeReasoningIntoParts` erroneously applied substring deduplication (`existing.includes(content)`) outside the `if (replay)` check. Because the LLM streams tokens incrementally, any token chunk whose text happened to appear earlier in the message (such as repeated URLs, common domain prefixes like `https://github.com`, or repeated identifiers) was erroneously dropped as duplicate replay data, severely corrupting URLs and repeated phrases on screen.
+  - **Implementation Mechanism**: Confined all substring and prefix deduplication strictly to replay frames (`replay === true`). For live stream deltas (`replay === false`), chunks are unconditionally appended in place to active parts, fully trusting the authoritative transport-layer monotonic sequence cursor (`AtomicU64 seq`) and part identities to prevent duplicate deliveries.
+  - **Verification & Testing**: 474 WebUI unit tests pass (`node --test`), including regression tests verifying that consecutive identical URLs and phrases stream cleanly without character loss; TypeScript checks clean (`tsc --noEmit`); production build succeeds (`npm run build`).
+
+---
+
+- **[WebUI 实时流式投影与去重] 彻底移除非重放流式子串检查，全权依归传输层单调游标**:
+  - **技术机理 / 现象溯源**: `mergeTextIntoParts` 与 `mergeReasoningIntoParts` 将子串包含去重检查（`existing.includes(content)`）写在了 `if (replay)` 守卫外部。大模型实时推流逐 token 到达时，任何恰好包含在先前正文中的 token 片段（例如连续相同的 URL、域名公共前缀 `https://github.com`、重复代码标识符）均被误判为重放数据而被静默丢弃，导致画布上重复链接和重复词句严重碎裂残缺。
+  - **实现防线 / 核心改动**: 将所有子串及前缀去重逻辑严格隔离在重放帧（`replay === true`）分支之内。对实时直播流（`replay === false`）无条件原汁原味就地追加，全权依托传输层权威的单调递增游标（`AtomicU64 seq`）与部件身份（`partId`）保障不重复、不漏帧。
+  - **验证与交付**: WebUI 474 项单元测试全绿（新增连续相同 URL 与重复文本流式追加回归用例）；TypeScript 0 错误（`tsc --noEmit`）；生产构建成功（`npm run build`）。
+
 ## v7.2.2 (2026-10-12)
 
 - **[Chat Streaming & Session Continuity] Single event bus, resumable cursors, and idempotent rendering across refresh, switching, and multi-instance viewing**:
