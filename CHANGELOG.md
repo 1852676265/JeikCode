@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.3 (2026-10-13)
+
+- **[Task List Lifecycle & Workspace Stability] Fix premature checklist clearing and synchronize persona rules**:
+  - Fixed premature clearing of active in-progress checklists in `apply_actions_batch` when appending multiple new tasks alongside existing status updates.
+  - Aligned checklist auto-clearing lifecycle to trigger strictly upon terminal turn completion via `LifecycleHooks::turn_complete` when all tasks are finished.
+  - Streamlined `<todo_rules>` persona guidelines with concise terminal-clearing timing and "Do not proactively remove or clear task items" guard.
+  - Fixed missing `github_logo` field in `Config` test initializer, ensuring 100% green `--workspace --all-targets` pipeline compilation.
+
+---
+
+- **[任务清单生命周期与全目标编译修复] 修复待办列表早熟清空缺陷、精简提示词与 CI 编译全绿**:
+  - 彻底修复 `apply_actions_batch` 在向进行中清单追加多个新任务时因 `add_count >= 2` 误判导致列表被暴力清空的重大缺陷，保持任务 ID 连续性。
+  - 将任务清单自动清空时机严格绑定至终态回复完成（`LifecycleHooks::turn_complete`），仅在所有任务全部完成时才自动归档清空。
+  - 精简 `<todo_rules>` 人设提示词，去除冗余修饰，严格对齐终态清空与“不主动删除任务项”安全法则。
+  - 修复 `jeikcode-config` 单元测试初始化中遗漏 `github_logo` 字段的编译问题，确保 CI 全目标编译 100% 全绿。
+
 ## v7.2.4-beta.2 (2026-10-13)
 
 - **[WebUI Modern Modals, Toast System & Git Controls] Modern theme-adaptive dialogs, VSCode-style discard all, and page zoom**:
