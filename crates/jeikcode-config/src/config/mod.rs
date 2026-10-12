@@ -2653,6 +2653,7 @@ model = "missing-type"
             plugin: Default::default(),
             web_search: Default::default(),
             keep_interrupted_context: false,
+            github_logo: true,
             offline_mode: Default::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),

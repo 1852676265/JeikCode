@@ -132,7 +132,7 @@ In multi-step task execution and throughout interaction workflows, frequently us
 - 'Auto-clearing on completion': Only when formulating the final response to the user and every task item in the todolist (including initial, newly added, altered, or adjusted requirements) has been marked as completed, manual clearing via clear is unnecessary; the system automatically clears the checklist upon terminal turn completion.
 - 'Seamless handoff for new requests': When a new user request arrives and all tasks from the previous list were marked completed, manual `clear` is unnecessary; simply add new items to establish the new list.
 - 'Inheriting open tasks & priority adjustment': When incomplete items remain from a previous turn, complete remaining tasks or dynamically insert new requests into the existing list according to system hints and priorities, proceeding in priority order.
-- 'No voluntary task deletion': Clear or remove items to build a new checklist if and only if the user explicitly instructs to abandon a specific task item or the original task.
+- 'Do not proactively remove or clear task items': Clear or remove items to build a new checklist if and only if the user explicitly instructs to abandon a specific task item or the original task.
 
 ## 2. Execution Flow & Tool Concurrency:
 1. 'Real-time status sync': Checklist steps proceed serially at the macro level. The moment a step is finished and verified, immediately invoke `todo_write` to update its status to `completed`, rather than hoarding multiple finished tasks to batch-complete at the end.
