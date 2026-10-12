@@ -23,6 +23,138 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2 (2026-10-12)
+
+- **[Chat Streaming & Session Continuity] Single event bus, resumable cursors, and idempotent rendering across refresh, switching, and multi-instance viewing**:
+  - Cache performance and canvas data consistency are comprehensively improved, preventing duplicate replays, message rendering misalignment, and related issues.
+  - All chat streaming now flows through one broadcast event bus triggered by a stateless `/chat` RPC; the legacy replay machinery is retired.
+  - Monotonic session cursors let reconnects resume exactly where they left off — refreshing, blurring, or switching sessions never duplicates or loses prompts, thinking, or answers.
+  - Fixed multi-round output after tool calls, mid-stream thinking/answer fragmentation, and the disappearance of the latest prompt after refresh; repeated replays render strictly idempotently.
+  - Stable message/part identities span kernel, daemon, and WebUI, backed by a cross-instance incremental event channel for live multi-tab and multi-device synchronization.
+  - Session streams are isolated per session; warm switching reconciles settled disk state automatically; sidebar running indicators self-heal and reconnect loop storms are eliminated.
+
+- **[Chat History & Interaction] Inline editing, rollback & regeneration, reliable steering, and precise stop controls**:
+  - History bubbles support inline editing with multi-image drop-back: "Rewrite History" (in-place, no regeneration) and "Rollback & Submit" (branch a fresh generation), plus per-turn temporary model overrides; assistant replies gain "Regenerate" and "Delete".
+  - All history mutations are atomic on disk and broadcast differentially to every open tab.
+  - Steer cards survive refresh and cancellation clears the kernel buffer; the turn clock resumes real elapsed time after reconnects.
+  - "Send now" reliably stops the running turn and delivers immediately; stop waits for real release without arbitrary timeouts; 409 conflicts fold back into the queue gracefully; the stop button responds instantly with an anti-bounce guard.
+
+- **[Performance & Cold Start] Instant first paint, tiered caching, and zero idle polling**:
+  - A two-tier session cache (memory + IndexedDB) with idle prefetch restores the full canvas instantly after refresh — including question outline, todo checklist, and token usage.
+  - Embedded assets use tiered HTTP cache headers; heavy panels are lazy-loaded (main bundle reduced by over 70 kB) and non-critical startup checks are deferred.
+  - Aggressive background polling (500 ms – 5 s timers) is eliminated in favor of event-driven updates, with a manual model refresh button; idle network traffic drops to zero.
+
+- **[WebUI Experience & Visual Polish] Git panel, canvas search, Mermaid, Markdown, media, and theming**:
+  - Git panel rebuilt with a project-level single-flight cache, commit-graph caching bound to HEAD, and DOM keep-alive — background Git processes cut from ~11 to 2; Chinese filenames and branch switching are fixed.
+  - Canvas Ctrl+F searches the entire conversation with smooth centered navigation; the question outline anchors correctly; auto-follow respects manual browsing.
+  - Mermaid diagrams no longer vanish (hydration crash fixed, flowchart labels preserved, nested fences handled) with a simplified toolbar; streaming Markdown fences, headings, and lists render without fragmentation.
+  - Image uploads up to 8 MB with aspect-ratio-preserving transcoding; composer input recall with ↑/↓; mobile layout fixes; eye-care light palette and circular power-switch controls.
+  - TUIx: legacy `list` action support, mid-stream `/clear` and `/new`, and `read` tool detail formatting.
+
+- **[Background Processes & Terminal Runtime] Resident services decoupled from turns, live logs, and native PIDs**:
+  - Detached background services now survive turn completion, user stops, refreshes, and session switches — terminated only by explicit kill, session deletion, or host exit.
+  - Background output streams to OS temp log files with tail-read guidance; session-scoped log pools roll with LRU cleanup.
+  - Virtual IDs are retired end to end: registries, cancellation, and status hooks all use native OS PIDs.
+  - Git-Bash/MSYS reliability on Windows: paths and environment normalized (`$TMPDIR` / `$DESKTOP`), real background PIDs reported, mixed-encoding output decoded, interactive commands fail fast instead of hanging, and pipes are drained on exit.
+
+- **[Tools, Editing & Code Intelligence] Compressed outputs with retrieval handles, canonical tool names, and hardened editing**:
+  - Oversized tool outputs are uniformly compressed and carry an artifact handle for full retrieval; terminal outputs get a dedicated configurable threshold.
+  - Tool names converge on canonical `read` / `write` / `edit` / `run_command` across the stack with legacy aliases still accepted; worker scope gates recognize modern calls.
+  - Edit tool: lossy-recovery rejection, a 50% similarity gate with cross-file hints, richer mismatch diagnostics, and unambiguous errors for conflicting options.
+  - grep tolerates bare braces and falls back gracefully on missing paths; Windows path normalization hardened (verbatim UNC casing, multibyte path slicing).
+  - Directory pickers modernized (native Windows dialog + built-in web explorer for remote sessions); Python venv launcher context preserved on Windows.
+  - Subagents gain `code_explore` plus lenient task dispatch with aliases and error self-healing; the todo `list` action becomes first-class.
+
+- **[Kernel, Context & Prompts] Watermark budgeting, persona architecture, and workflow discipline**:
+  - Context budgeting now uses a safety watermark — no more "warns every turn but never compacts" confusion — with model tier presets (32K–384K plus custom) in the editor.
+  - The system persona is reorganized into a four-block architecture with a dedicated explore strategy; prompts align to a modern structured workflow (todo rules, task-scope awareness); noisy dynamic turn-start reminders are retired.
+  - Prompt/persona baselines resolve reliably so built-in safeguards are never silently dropped; MCP child processes are reclaimed deterministically; home/config resolution is unified to a single source.
+
+- **[MCP, Skills & Capabilities] One capability surface with hot reload**:
+  - MCP servers and skills share a unified GLOBAL/PROJECT capability state with hot reload; capability switches are the single authority and project trust is confirmed silently.
+
+- **[Networking & Remote Access] IPv6 dual-stack support**:
+  - WebUI binds IPv6 alongside IPv4 with shareable-address ranking and RFC-compliant bracketed URLs; the remote access panel surfaces IPv6 addresses across platforms.
+
+- **[Security & Dependencies] Hardened dependency chains and path guards**:
+  - Vulnerable WebUI dependency chains removed and `npm audit` gated in CI; Mermaid output sanitized before injection; `code_explore` honors the sensitive-path gate; credential files are excluded from the code graph via a dedicated ignore list.
+
+- **[Internationalization, Desktop & VSCode]**:
+  - Full Vietnamese localization across WebUI, TUIx, daemon, desktop startup, and the VSCode extension, with three-tier OS locale detection.
+  - Desktop startup status localized (EN/ZH/VI); accessibility labels and native terminal guidance localized; VSCode extension receives an updated icon and packaging fixes.
+
+- **[CI, Release Pipeline & Engineering]**:
+  - The release pipeline is rebuilt as a fully parallel per-architecture matrix with global Rust caching, nearly halving critical-path build time; temporary release watchers are removed.
+  - The portability workflow runs native and subset cross-platform suites; the TUI library suite is gated in CI; the all-features suite is made hermetic; the CI-first verification policy is documented.
+  - Repository hygiene: LF line endings pinned via `.gitattributes` / `.editorconfig`; the version bump script cascades the Tauri lockfile and desktop metadata; bilingual commit bodies are now required.
+  - Build health restored across jobs (workspace warnings cleared, compile blockers and cross-platform assertions fixed).
+
+---
+
+- **[对话流式与会话连续性] 单事件总线、可续传游标与全链路幂等渲染，刷新/切换/多端查看全部稳妥**:
+  - 缓存性能与画布数据一致性全面提升，防止重复重放、消息渲染错位等情况。
+  - 全量对话流式收敛至唯一广播事件总线，`/chat` 以无状态 RPC 触发；历史重放旧机制物理退役。
+  - 会话级单调游标让断线重连精确续接：刷新、失焦、切换会话后，提问、思考与正文不再重复或丢失。
+  - 修复工具调用后的多轮实时输出、流式思考/正文中途碎裂、刷新后最新提问消失等问题；重复重放严格幂等。
+  - 消息与部件身份贯穿 kernel、daemon 与 WebUI，配合跨实例增量事件通道，多标签页与多设备实时同步。
+  - 会话流按会话隔离；热切换自动对账磁盘态；侧栏运行指示自愈校准，重连风暴彻底平息。
+
+- **[对话历史与交互] 气泡内联编辑、回溯与重新生成，可靠的转向与停止控制**:
+  - 历史气泡支持内联编辑与多图回填：「改写历史」（原地更新、不触发重新生成）与「回溯并提交」（截断后续历史、重新分支生成），并支持单轮临时模型覆盖；助手回答支持「重新生成」与「删除」。
+  - 所有历史变更原子落盘，并差量广播到全部打开的标签页。
+  - Steer 卡片刷新不丢失，取消即清理内核缓冲；回合时钟在断线重连后继续累计真实耗时。
+  - 「立即发送」可靠终止在跑回合并即时投递；停止会等待真实离场、不再有任意超时；409 冲突平滑回退到队列；停止按钮秒级响应并带防反弹屏障。
+
+- **[性能与冷启动] 画布秒开、分级缓存与空闲零轮询**:
+  - 内存 + IndexedDB 双层会话缓存配合空闲预取，刷新后全态画布瞬时还原：提问大纲、待办清单、Token 用量一并恢复。
+  - 内嵌静态资源分级 HTTP 强缓存；重量级面板懒加载（主包缩减逾 70 kB）；非关键启动检测错峰延后。
+  - 彻底拔除 500ms~5s 高频轮询，全面事件驱动；新增模型手动刷新按钮；空闲态网络请求归零。
+
+- **[WebUI 体验与视觉] Git 面板、画布搜索、Mermaid、Markdown、媒体与主题**:
+  - Git 面板重建为项目级单飞缓存 + HEAD 锚定图谱缓存 + DOM 常驻保活，后台 Git 进程由约 11 个压到 2 个；中文文件名与分支切换问题修复。
+  - 画布 Ctrl+F 全量搜索并居中平滑跳转；提问大纲锚定修复；自动跟屏尊重手动翻阅。
+  - Mermaid 图表不再消失（水合崩溃修复、流程图标签保留、嵌套围栏妥善处理），工具栏精简；流式 Markdown 的围栏、标题、列表不再碎裂。
+  - 支持 8MB 图片上传并保持纵横比转码；输入框 ↑/↓ 历史召回；移动端布局修复；护眼亮色主题与圆形电源开关。
+  - TUIx：支持 legacy `list` 动作、流式中 `/clear` 与 `/new`、`read` 工具详情格式化。
+
+- **[后台进程与终端运行时] 常驻服务与回合解耦、实时日志与原生 PID**:
+  - 后台常驻服务在回合结束、用户停止、刷新与会话切换后依然存活，仅在显式 kill、删除会话或宿主退出时终止。
+  - 后台输出实时落盘为系统临时日志并附 tail 读取指南；会话级日志池滚动复用、级联清理。
+  - 虚拟 ID 全链路退役：注册、取消与状态钩子全部改用操作系统原生 PID。
+  - Windows Git-Bash/MSYS 可靠性：路径与环境归一（`$TMPDIR` / `$DESKTOP`）、后台任务回报真实 PID、混合编码正确解码、交互式命令快速失败不再挂起、退出前排空管道。
+
+- **[工具、编辑与代码智能] 压缩输出带取回钥匙、规范工具名与编辑加固**:
+  - 超长工具输出统一压缩并携带 artifact 钥匙，可随时取回全文；终端输出拥有独立可配置阈值。
+  - 工具名全栈收敛为规范 `read` / `write` / `edit` / `run_command`，旧名仅作别名继续兼容；worker 作用域闸门识别现代调用。
+  - edit 工具：拒绝失真恢复、50% 相似度守卫与跨文件提示、更丰富的失配诊断、冲突选项明确报错。
+  - grep 容忍裸花括号并在目标缺失时优雅兜底；Windows 路径归一加固（verbatim UNC 大小写、多字节路径切片）。
+  - 目录选择器现代化（Windows 原生对话框 + 远程会话内置网页浏览器）；Windows 下 Python venv 启动器上下文保留。
+  - 子代理获得 `code_explore`，task 分发宽松化并支持别名与错误自愈；todo 的只读 `list` 动作转正。
+
+- **[内核、上下文与提示词] 水位预算、persona 架构与工作流纪律**:
+  - 上下文预算采用水位机制，消除「每轮报警但从不压缩」的困扰；模型面板提供 32K~384K 档位与自定义。
+  - 系统 persona 重组为四段式架构并引入独立 explore 策略；提示词对齐现代结构化工作流（todo 规范、任务边界意识）；无意义的回合开始动态提醒退役。
+  - 提示词/persona 基线解析稳定，不再静默丢失内置防线；MCP 子进程确定性回收；home/配置解析统一为单一来源。
+
+- **[MCP、Skills 与能力面] 统一能力状态与热重载**:
+  - MCP 与 Skills 共享统一的 GLOBAL/PROJECT 能力状态并支持热重载；能力开关是唯一权威，项目信任静默确认。
+
+- **[网络与远程访问] IPv6 双栈支持**:
+  - WebUI 同时监听 IPv6 与 IPv4，可分享地址按优先级排序并采用 RFC 规范中括号 URL；远程访问面板跨平台展示 IPv6 地址。
+
+- **[安全与依赖] 依赖链与路径防护加固**:
+  - 移除存在漏洞的 WebUI 依赖链并将 `npm audit` 纳入 CI；Mermaid 输出注入前净化；`code_explore` 纳入敏感路径闸门；凭据文件由图谱专用忽略清单隔离。
+
+- **[国际化、桌面与 VSCode]**:
+  - WebUI、TUIx、daemon、桌面启动与 VSCode 扩展全面支持越南语，配合三级系统语言自动探测。
+  - 桌面启动状态本地化（英/中/越）；无障碍标签与原生终端引导本地化；VSCode 扩展更新图标并修复打包。
+
+- **[CI、发布流水线与工程化]**:
+  - 发布流水线重建为全架构真并行矩阵并接入全局 Rust 编译缓存，关键路径耗时缩短近半；临时发布监控脚本下线。
+  - portability 工作流全量运行 native 与 subset 跨平台测试；TUI 套件纳入 CI 门禁；all-features 套件密闭化；CI-first 验证策略成文。
+  - 仓库卫生：LF 行尾全局钉死（`.gitattributes` / `.editorconfig`）；版本 bump 脚本级联 Tauri 锁文件与桌面元数据；提交正文双语规范确立。
+  - 构建健康恢复：workspace 告警清零，编译阻塞与跨平台断言问题修复。
+
 ## v7.2.2-beta.7 (2026-10-12)
 
 - **[Daemon & WebUI Live Streaming / Canvas] Monotonic live sequence tagging and global idempotency against duplicate replays**:
