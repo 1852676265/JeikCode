@@ -23,6 +23,22 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.3-beta.1 (2026-10-12)
+
+- **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay, streamlined desktop matrix, and dual-channel docs indicators**:
+  - **Zero-Rate-Limit Release Relay**: Deployed a Cloudflare Pages Function (`/api/releases`) caching GitHub releases on the edge CDN for 70 seconds with full CORS support. Parses GitHub's public Atom feed (`releases.atom`) to eliminate unauthenticated GitHub REST API 60 req/hr rate limits for overseas VPN and proxy users. Updated daemon update checker (`api_update.rs`) to query the edge relay first with graceful fallbacks.
+  - **Updater Self-Defense Gate**: Fixed `run_upgrade` to refuse self-modification immediately when `is_package_managed()` is true without making speculative network requests to fetch the remote manifest, ensuring deterministic packaging tests in CI.
+  - **Streamlined Desktop & Portability Matrix**: Removed redundant Linux ARM64 desktop packaging and dropped the redundant `.rpm` bundle format, retaining universal `.deb` and `.AppImage` for x86_64 Linux desktop while keeping 100% of headless CLI builds across x86_64 and ARM64. Pruned cross-OS feature-subset redundancy in `portability.yml` down from 9 jobs to 5 fast jobs.
+  - **Dual-Version Docs Indicators**: Upgraded documentation hero section with side-by-side Stable (`v7.2.2`) and Beta (`v7.2.3-beta.1`) badges with live edge fetching and synchronized bump scripting.
+
+---
+
+- **[更新中继与发布工程基建] Cloudflare 边缘零限流发布中继、桌面打包矩阵瘦身与文档站双通道版本指示器**:
+  - **零限流官方发布中继**: 在 Cloudflare Pages 部署边缘微服务 (`/api/releases`) 并设置 70 秒全球 CDN 缓存。优先解析 GitHub 官方公开的 `releases.atom` 订阅源，彻底终结未授权 GitHub REST API 60次/小时导致的海外 VPN 与代理出口 IP 限流问题；更新守护进程探测逻辑，优先请求边缘中继并保留多级优雅回退。
+  - **包管理器升级门禁自愈**: 修复 `run_upgrade`，在包管理器分发构建中无需发起任何外部网络请求即可即时返回 `PACKAGE_MANAGED` 拒绝自升级，彻底杜绝 CI 门禁因网络抖动偶发失败。
+  - **桌面打包与测试矩阵深度精简**: 剔除冗余的 Linux ARM64 桌面端 GUI 壳与多余的 `.rpm` 格式（保留通用的 `.deb` 与 `.AppImage`），并 100% 保留 x86_64 与 ARM64 无头设备 CLI 核心产物；将 `portability.yml` 特性子集测试精简为仅在 Ubuntu 运行，作业数从 9 个压缩至 5 个。
+  - **文档站双版本展示与 Bump 同步**: 升级官网首页呈现并排的正式版与测试版双徽章，从边缘接口实时动态获取两类最新版本号，并联动版本 bump 脚本自动更新两个兜底值。
+
 ## v7.2.3-beta.0 (2026-10-12)
 
 - **[WebUI Live Stream Projection / Dedup] Eliminate substring-inclusion checks from live streams and rely strictly on transport sequence cursors**:
