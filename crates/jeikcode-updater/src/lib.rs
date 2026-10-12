@@ -827,6 +827,9 @@ pub async fn run_upgrade(
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
     let manifest = fetch_manifest().await?;
     run_upgrade_with_manifest(manifest, current_version, force, tx).await
 }
