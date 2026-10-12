@@ -8618,6 +8618,7 @@ async fn chat_watch(
     //   缺省           → 全量补发（无游标兜底，前端按身份幂等收敛）
     let mut replay_head: Vec<(u64, ChatEvent)> = Vec::new();
     let mut handshake: Option<String> = None;
+    let mut buffer_len = 0u64;
     // Prefer atomic snapshot+subscribe when a turn is live so a mid-stream
     // browser refresh gets the full thinking/text/tool history, not only
     // deltas after reconnect. Idle standby watchers skip this so a leftover
@@ -8628,7 +8629,7 @@ async fn chat_watch(
             .subscribe_live_with_replay(&session_id)
             .await
         {
-            let buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+            buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
             tracing::debug!(
                 session_id = %session_id,
                 replay_events = snapshot.len(),
@@ -8808,8 +8809,14 @@ async fn chat_watch(
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let head_session_id = session_id.clone();
     let live_session_id = session_id.clone();
-    // 补发/握手帧在前（带 seq），实时帧在后（不带）。前端把收到的最大 seq 存成游标，
-    // 下次重连带回来续传 —— 不重复、不乱序、不靠内容猜。
+    // 补发/握手帧在前（带 seq），实时帧在后（同样携带单调递增 seq）。
+    // 前端每收到一帧就实时推进本地游标，断线/刷新重连带回来续传 —— 精准无缝续接，不重复、不重播！
+    let last_head_seq = replay_head
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max()
+        .unwrap_or(buffer_len);
+
     let head_json: Vec<String> = handshake
         .into_iter()
         .chain(
@@ -8821,10 +8828,13 @@ async fn chat_watch(
     let head_stream = futures::stream::iter(head_json).map(|json| {
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
+
+    let live_seq_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
     let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok::<_, std::convert::Infallible>(
             axum::response::sse::Event::default()
-                .data(chat_watch_frame_json(&event, &live_session_id, None)),
+                .data(chat_watch_frame_json(&event, &live_session_id, Some(seq))),
         )
     });
     let stream = head_stream.chain(live_stream);

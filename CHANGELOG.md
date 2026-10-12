@@ -23,6 +23,28 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.7 (2026-10-12)
+
+- **[Daemon & WebUI Live Streaming / Canvas] Monotonic live sequence tagging and global idempotency against duplicate replays**:
+  - **Technical Root Cause / Detail**: 
+    1. Stale client cursor: Live stream frames from `live_stream` omitted `seq` tags (`None`), causing client-side stream cursors (`streamCursor`) to freeze at 0 during active generation. Upon blur or refresh, the client requested reconnects with stale cursors (`after_seq = 0`), prompting the server to re-emit the entire turn replay from the beginning.
+    2. Missing global text/thinking deduplication: When a full replay re-emitted initial reasoning while the canvas already displayed trailing text, `mergeReasoningIntoParts` and `mergeTextIntoParts` erroneously appended new parts instead of updating in place, resulting in duplicate interleaved blocks (`[reasoning] -> text -> [reasoning] -> duplicate text`).
+  - **Implementation Mechanism**: 
+    1. Continuous monotonic sequence counter: Daemon's `live_stream` now tags all live events with monotonically increasing `seq` values (`AtomicU64`), ensuring client cursors advance in real time and reconnects only pull unreceived suffixes.
+    2. Global content idempotency: In `sessionProjection.ts`, `mergeReasoningIntoParts` and `mergeTextIntoParts` now globally search existing parts: if content is already present or identical, it is cleanly discarded; if it is a prefix extension, it updates in place.
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+
+---
+
+- **[Daemon 与 WebUI 流式与画布] 实时流递增序号赋权与防重复重播全局内容幂等**:
+  - **技术机理 / 现象溯源**: 
+    1. 客户端游标僵死：后端在推送实时事件（`live_stream`）时帧上未带 `seq`（为 None），导致前端在推流期间本地游标始终定格在 0。失焦或刷新重连时前端只能发回 `after_seq = 0`，服务端被迫将本轮整段历史（从最早的思考到正文）全量重新重播一遍。
+    2. 全量重播跨类型追加：当全量重播帧到达时，画布末尾已经是正文，此时首帧思考过程到来因类型不同被强制在正文后面新建了思考块；紧随其后的正文帧又在思考块后新建了正文块，导致思考与正文被双倍重复追加。
+  - **实现防线 / 核心改动**: 
+    1. 实时流全链路单调递增游标：后端 `live_stream` 全局使用 `AtomicU64` 为每一帧实时流赋以严格单调递增的 `seq` 序号，前端毫秒级实时推进本地游标，断线/刷新重连精准按序续接，服务端绝不多发一条旧内容。
+    2. 全局内容级幂等防线：在 `sessionProjection.ts` 中，`mergeReasoningIntoParts` 与 `mergeTextIntoParts` 建立全局检测防线：若已有部件已包含该内容，直接丢弃，绝不在末尾造出第二个重复块；若为前缀延伸则原地扩展。
+  - **验证与交付**: WebUI 472 项单测全绿，daemon 401 项单测全绿，`tsc --noEmit` 0 报错。
+
 ## v7.2.2-beta.6 (2026-10-12)
 
 - **[WebUI Live Stream / Canvas] Unify thinking blocks and eliminate reasoning duplication across tool rounds**:

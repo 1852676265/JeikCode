@@ -323,51 +323,55 @@ export function paintAssistantText<T extends ProjectionMessage>(
  * - 未命中轮编号且末尾气泡属于另一轮（startNewPart）→ 另起部件，绝不跨轮粘连。
  */
 function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string): MsgPart[] | null {
-  let delta = content;
+  if (!content) return null;
+
   if (replay) {
     const replaced = replaceTruncatedParts(parts, 'text', content);
     if (replaced) return replaced;
-    if (partId) {
-      const index = parts.findIndex((part) => part.kind === 'text' && part.id === partId);
-      if (index >= 0) {
-        const existing = (parts[index] as { text: string }).text || '';
-        const body = withoutDisplayTruncation(existing);
-        if (!content || body.includes(content)) return null;
-        if (content.startsWith(body)) {
-          const next = parts.slice();
-          next[index] = { kind: 'text', text: content, id: partId };
-          return next;
-        }
-        const suffix = unpaintedReplaySuffix(existing, content);
-        if (!suffix) return null;
+  }
+
+  // 1. 若 partId 精确命中已有正文部件，直接在命中部件上原地更新/补后缀
+  if (partId) {
+    const index = parts.findIndex((part) => part.kind === 'text' && part.id === partId);
+    if (index >= 0) {
+      const existing = (parts[index] as { text: string }).text || '';
+      const body = withoutDisplayTruncation(existing);
+      if (body.includes(content.trim()) || content.trim() === body.trim()) return null;
+      if (content.startsWith(body)) {
         const next = parts.slice();
-        next[index] = { kind: 'text', text: body + suffix, id: partId };
+        next[index] = { kind: 'text', text: content, id: partId };
         return next;
       }
+      const suffix = unpaintedReplaySuffix(existing, content);
+      if (!suffix) return null;
+      const next = parts.slice();
+      next[index] = { kind: 'text', text: body + suffix, id: partId };
+      return next;
     }
-    const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
-    delta = unpaintedReplaySuffix(painted, content);
-    if (!delta) return null;
   }
-  const next = parts.slice();
-  const tail = next[next.length - 1];
+
+  // 2. 全局内容级防线：若已有正文完全包含新内容（重播），直接丢弃！
+  const lastTextIdx = parts.map((p) => p.kind).lastIndexOf('text');
+  if (lastTextIdx >= 0) {
+    const existing = (parts[lastTextIdx] as { text: string }).text || '';
+    if (existing.trim() === content.trim() || (content.length > 8 && existing.includes(content.trim()))) {
+      return null;
+    }
+  }
+
+  // 3. 正常拼接：
+  const tail = parts[parts.length - 1];
   const isDifferentPart = !!tail && tail.kind === 'text' && !!tail.id && !!partId && tail.id !== partId;
   if (tail && tail.kind === 'text' && !isDifferentPart) {
-    let merged = tail.text + delta;
-    if (
-      tail.text &&
-      content &&
-      !tail.text.endsWith('\n') &&
-      /(?:\.\.\.|…|。)\s*$/.test(tail.text) &&
-      /^(正在|Currently |Now )/.test(delta)
-    ) {
-      merged = `${tail.text}\n${delta}`;
-    }
+    const suffix = replay ? unpaintedReplaySuffix(tail.text || '', content) : content;
+    if (!suffix) return null;
+    let merged = tail.text + suffix;
+    const next = parts.slice();
     next[next.length - 1] = { kind: 'text', text: merged, id: tail.id ?? partId };
-  } else {
-    next.push({ kind: 'text', text: delta, ...(partId ? { id: partId } : {}) });
+    return next;
   }
-  return next;
+
+  return [...parts, { kind: 'text', text: content, ...(partId ? { id: partId } : {}) }];
 }
 
 export function paintAssistantReasoning<T extends ProjectionMessage>(
@@ -406,48 +410,43 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
 /** 合并一段思考增量；返回 null 表示重播去重后无新内容可落笔。 */
 function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string): MsgPart[] | null {
   const cleanContent = content.trim();
+  if (!cleanContent) return null;
+
   if (replay) {
     const replaced = replaceTruncatedParts(parts, 'reasoning', content);
     if (replaced) {
       return replaced === parts ? null : replaced;
     }
-    if (partId) {
-      const index = parts.findIndex((part) => part.kind === 'reasoning' && part.id === partId);
-      if (index >= 0) {
-        const existing = (parts[index] as { text: string }).text || '';
-        const body = withoutDisplayTruncation(existing);
-        if (!cleanContent || body.includes(cleanContent)) return null;
-        if (content.startsWith(body)) {
-          const next = parts.slice();
-          next[index] = { kind: 'reasoning', text: content, id: partId };
-          return next;
-        }
-        const suffix = unpaintedReplaySuffix(existing, content);
-        if (!suffix) return null;
-        const next = parts.slice();
-        next[index] = { kind: 'reasoning', text: body + suffix, id: partId };
-        return next;
-      }
-    }
-    for (let i = 0; i < parts.length; i++) {
-      const p = parts[i]!;
-      if (p.kind === 'reasoning' && p.text) {
-        const cleanExisting = p.text.trim();
-        if (cleanExisting === cleanContent || cleanExisting.includes(cleanContent)) {
-          return null;
-        }
-        if (cleanContent.startsWith(cleanExisting)) {
-          const nextParts = parts.slice();
-          nextParts[i] = { ...p, text: content };
-          return nextParts;
-        }
-      }
-    }
   }
-  const painted = parts.map((part) => (part.kind === 'reasoning' ? part.text || '' : '')).join('');
-  const delta = replay ? unpaintedReplaySuffix(painted, content) : content;
-  if (!delta) return null;
-  return appendReasoningPart(parts, delta, partId);
+
+  // 1. 查找已有的思考部件（按 partId 优先，或者按 kind === 'reasoning'）
+  const existingIdx = partId
+    ? parts.findIndex((p) => p.kind === 'reasoning' && p.id === partId)
+    : parts.findIndex((p) => p.kind === 'reasoning');
+
+  if (existingIdx >= 0) {
+    const p = parts[existingIdx] as { kind: 'reasoning'; text: string; id?: string };
+    const existing = (p.text || '').trim();
+    // 已有思考已包含该内容 → 幂等丢弃，绝不在末尾追加第二个思考块！
+    if (existing === cleanContent || existing.includes(cleanContent)) {
+      return null;
+    }
+    // 新内容是已有思考的延伸（累积帧）→ 原地更新！
+    if (cleanContent.startsWith(existing)) {
+      const nextParts = parts.slice();
+      nextParts[existingIdx] = { ...p, text: content, id: p.id ?? partId };
+      return nextParts;
+    }
+    // 未画过的增量后缀 → 原地追加到该思考部件尾部！
+    const suffix = unpaintedReplaySuffix(p.text || '', content);
+    if (!suffix) return null;
+    const nextParts = parts.slice();
+    nextParts[existingIdx] = { ...p, text: (p.text || '') + suffix, id: p.id ?? partId };
+    return nextParts;
+  }
+
+  // 2. 如果画布上尚无思考部件，才在末尾开启新的思考部件
+  return appendReasoningPart(parts, content, partId);
 }
 
 /** Disk stored a capped field. The replay is the same text plus what was cut

@@ -1813,7 +1813,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jeikcode"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-auth"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "fs2",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-capabilities"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-clix"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-coding"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-config"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-daemon"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-kernel"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-review"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-telemetry"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-tuix"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "jeikcode-updater"
-version = "7.2.2-beta.6"
+version = "7.2.2-beta.7"
 dependencies = [
  "anyhow",
  "chrono",
