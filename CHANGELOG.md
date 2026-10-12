@@ -23,6 +23,20 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.6 (2026-10-12)
+
+- **[WebUI Live Stream / Canvas] Unify thinking blocks and eliminate reasoning duplication across tool rounds**:
+  - **Technical Root Cause / Detail**: During stream reconnection or focus changes, `appendReasoningPart` checked `tail.id !== id` and `mergeReasoningIntoParts` returned early when part ids diverged. Consequently, replayed or newly arriving thinking deltas failed part-id matching against existing elements and bypassed whole-text deduplication (`existing.includes(content)`), creating consecutive duplicated thinking blocks on screen.
+  - **Implementation Mechanism**: Restored the fundamental rule for reasoning streams in `appendReasoningPart`: as long as the trailing part is a reasoning block, incoming thinking chunks unconditionally append in place (`tail.text += delta`), strictly preventing multiple consecutive thinking blocks. Restored full-text deduplication in `mergeReasoningIntoParts` across all part-id checks.
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+
+---
+
+- **[WebUI 流式与画布] 合并思考流式输出，杜绝工具轮次间思考块分叉与重复**:
+  - **技术机理 / 现象溯源**: 在流式断点重连或失焦切回时，`appendReasoningPart` 严苛校验 `tail.id !== id`，且 `mergeReasoningIntoParts` 在 partId 不匹配时直接提前 return。导致已存在的思考块无法被命中，进而跳过了全量文本去重防线（`existing.includes(content)`），在工具调用之间硬生生追加出了多个连续重复的思考折叠块。
+  - **实现防线 / 核心改动**: 确立思考流式输出的绝对合并铁律：在 `appendReasoningPart` 中只要末尾已是思考部件，任何新来的思考 chunk 无条件在尾部拼接（`tail.text += delta`），绝不分裂；并在 `mergeReasoningIntoParts` 中恢复全量文本去重防线。
+  - **验证与交付**: WebUI 472 项单测全绿，daemon 401 项单测全绿，`tsc --noEmit` 0 报错。
+
 ## v7.2.2-beta.5 (2026-10-12)
 
 - **[WebUI & Daemon Live Stream / Canvas] Fix post-refresh user prompt loss and streaming reasoning/text fragmentation**:

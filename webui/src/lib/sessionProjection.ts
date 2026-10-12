@@ -332,12 +332,6 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
       if (index >= 0) {
         const existing = (parts[index] as { text: string }).text || '';
         const body = withoutDisplayTruncation(existing);
-        // 回放帧命中同一 part = 「这段可能已经画过」：
-        // 1) 帧内容已在该 part 内（包括从开头重发、中段重发）→ 幂等丢弃；
-        // 2) 帧以该 part 为前缀（累积帧更长）→ 只补未画过的后缀；
-        // 3) 其余才是真正的新内容 → 追加。
-        // 旧实现拿「整条消息所有正文的拼接」做基线：画布已领先时，重发的中段
-        // 既非前缀也非后缀，于是被当成新内容再追加一遍（整轮重打的根因）。
         if (!content || body.includes(content)) return null;
         if (content.startsWith(body)) {
           const next = parts.slice();
@@ -350,14 +344,10 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
         next[index] = { kind: 'text', text: body + suffix, id: partId };
         return next;
       }
-      // 帧声明了段身份、但画布上没有这一段 → 它是一段新内容，直接追加。
-      // 不再拿「整条消息正文拼接」去猜（那套既会漏画也会重画）。
-      delta = content;
-    } else {
-      const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
-      delta = unpaintedReplaySuffix(painted, content);
-      if (!delta) return null;
     }
+    const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
+    delta = unpaintedReplaySuffix(painted, content);
+    if (!delta) return null;
   }
   const next = parts.slice();
   const tail = next[next.length - 1];
@@ -426,8 +416,6 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
       if (index >= 0) {
         const existing = (parts[index] as { text: string }).text || '';
         const body = withoutDisplayTruncation(existing);
-        // 同 mergeTextIntoParts：命中同一 part 的回放帧先判「是否已画过」（含中段重发），
-        // 否则画布已领先时重发的思考中段会被再追加一遍。
         if (!cleanContent || body.includes(cleanContent)) return null;
         if (content.startsWith(body)) {
           const next = parts.slice();
@@ -440,8 +428,6 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
         next[index] = { kind: 'reasoning', text: body + suffix, id: partId };
         return next;
       }
-      // 帧声明了段身份但画布上没有这一段 → 新一段思考，直接追加。
-      return appendReasoningPart(parts, content, partId);
     }
     for (let i = 0; i < parts.length; i++) {
       const p = parts[i]!;
