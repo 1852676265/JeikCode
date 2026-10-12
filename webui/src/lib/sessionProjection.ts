@@ -325,18 +325,40 @@ export function paintAssistantText<T extends ProjectionMessage>(
 function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, partId?: string): MsgPart[] | null {
   if (!content) return null;
 
-  if (replay) {
-    const replaced = replaceTruncatedParts(parts, 'text', content);
-    if (replaced) return replaced;
+  // 1. 直播流式输出（replay === false）：
+  // 每一帧都是真实 LLM 实时增量 token，由后端 SSE 游标（AtomicU64 seq）保证单调性与不重发。
+  // 绝对严禁执行任何子串包含去重（includes），直接就地追加！
+  if (!replay) {
+    if (partId) {
+      const index = parts.findIndex((part) => part.kind === 'text' && part.id === partId);
+      if (index >= 0) {
+        const next = parts.slice();
+        const p = next[index] as { kind: 'text'; text: string; id?: string };
+        next[index] = { ...p, text: (p.text || '') + content };
+        return next;
+      }
+    }
+    const tail = parts[parts.length - 1];
+    const isDifferentPart = !!tail && tail.kind === 'text' && !!tail.id && !!partId && tail.id !== partId;
+    if (tail && tail.kind === 'text' && !isDifferentPart) {
+      const next = parts.slice();
+      next[next.length - 1] = { kind: 'text', text: (tail.text || '') + content, id: tail.id ?? partId };
+      return next;
+    }
+    return [...parts, { kind: 'text', text: content, ...(partId ? { id: partId } : {}) }];
   }
 
-  // 1. 若 partId 精确命中已有正文部件，直接在命中部件上原地更新/补后缀
+  // 2. 重放帧（replay === true）：
+  const replaced = replaceTruncatedParts(parts, 'text', content);
+  if (replaced) return replaced;
+
+  // 若 partId 精确命中已有正文部件，执行权威身份幂等对账
   if (partId) {
     const index = parts.findIndex((part) => part.kind === 'text' && part.id === partId);
     if (index >= 0) {
       const existing = (parts[index] as { text: string }).text || '';
       const body = withoutDisplayTruncation(existing);
-      if (body.includes(content.trim()) || content.trim() === body.trim()) return null;
+      if (body.includes(content)) return null;
       if (content.startsWith(body)) {
         const next = parts.slice();
         next[index] = { kind: 'text', text: content, id: partId };
@@ -350,28 +372,21 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
     }
   }
 
-  // 2. 全局内容级防线：若已有正文完全包含新内容（重播），直接丢弃！
-  const lastTextIdx = parts.map((p) => p.kind).lastIndexOf('text');
-  if (lastTextIdx >= 0) {
-    const existing = (parts[lastTextIdx] as { text: string }).text || '';
-    if (existing.trim() === content.trim() || (content.length > 8 && existing.includes(content.trim()))) {
-      return null;
-    }
-  }
+  // 未携带 partId 或未命中时，对已有全部正文计算未画过的重放后缀
+  const painted = parts.map((part) => (part.kind === 'text' ? part.text || '' : '')).join('');
+  const delta = unpaintedReplaySuffix(painted, content);
+  if (!delta) return null;
 
-  // 3. 正常拼接：
   const tail = parts[parts.length - 1];
   const isDifferentPart = !!tail && tail.kind === 'text' && !!tail.id && !!partId && tail.id !== partId;
   if (tail && tail.kind === 'text' && !isDifferentPart) {
-    const suffix = replay ? unpaintedReplaySuffix(tail.text || '', content) : content;
-    if (!suffix) return null;
-    let merged = tail.text + suffix;
+    let merged = tail.text + delta;
     const next = parts.slice();
     next[next.length - 1] = { kind: 'text', text: merged, id: tail.id ?? partId };
     return next;
   }
 
-  return [...parts, { kind: 'text', text: content, ...(partId ? { id: partId } : {}) }];
+  return [...parts, { kind: 'text', text: delta, ...(partId ? { id: partId } : {}) }];
 }
 
 export function paintAssistantReasoning<T extends ProjectionMessage>(
@@ -412,14 +427,41 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
   const cleanContent = content.trim();
   if (!cleanContent) return null;
 
-  if (replay) {
-    const replaced = replaceTruncatedParts(parts, 'reasoning', content);
-    if (replaced) {
-      return replaced === parts ? null : replaced;
+  // 1. 直播流式输出（replay === false）：
+  // 思考增量直接并入当前思考部件，绝不能对思考文本做子串去重！
+  if (!replay) {
+    if (partId) {
+      const index = parts.findIndex((part) => part.kind === 'reasoning' && part.id === partId);
+      if (index >= 0) {
+        const next = parts.slice();
+        const p = next[index] as { kind: 'reasoning'; text: string; id?: string };
+        next[index] = { ...p, text: (p.text || '') + content };
+        return next;
+      }
     }
+    const tail = parts[parts.length - 1];
+    const isDifferentPart = !!tail && tail.kind === 'reasoning' && !!tail.id && !!partId && tail.id !== partId;
+    if (tail && tail.kind === 'reasoning' && !isDifferentPart) {
+      const next = parts.slice();
+      next[next.length - 1] = { kind: 'reasoning', text: (tail.text || '') + content, id: tail.id ?? partId };
+      return next;
+    }
+    const lastReasoningIdx = parts.map((p) => p.kind).lastIndexOf('reasoning');
+    if (lastReasoningIdx >= 0) {
+      const next = parts.slice();
+      const p = next[lastReasoningIdx] as { kind: 'reasoning'; text: string; id?: string };
+      next[lastReasoningIdx] = { ...p, text: (p.text || '') + content, id: p.id ?? partId };
+      return next;
+    }
+    return appendReasoningPart(parts, content, partId);
   }
 
-  // 1. 查找已有的思考部件（按 partId 优先，或者按 kind === 'reasoning'）
+  // 2. 重放帧（replay === true）：
+  const replaced = replaceTruncatedParts(parts, 'reasoning', content);
+  if (replaced) {
+    return replaced === parts ? null : replaced;
+  }
+
   const existingIdx = partId
     ? parts.findIndex((p) => p.kind === 'reasoning' && p.id === partId)
     : parts.findIndex((p) => p.kind === 'reasoning');
@@ -427,7 +469,7 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
   if (existingIdx >= 0) {
     const p = parts[existingIdx] as { kind: 'reasoning'; text: string; id?: string };
     const existing = (p.text || '').trim();
-    // 已有思考已包含该内容 → 幂等丢弃，绝不在末尾追加第二个思考块！
+    // 已有思考已包含该重放内容 → 幂等丢弃
     if (existing === cleanContent || existing.includes(cleanContent)) {
       return null;
     }
@@ -445,7 +487,7 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
     return nextParts;
   }
 
-  // 2. 如果画布上尚无思考部件，才在末尾开启新的思考部件
+  // 如果画布上尚无思考部件，才在末尾开启新的思考部件
   return appendReasoningPart(parts, content, partId);
 }
 

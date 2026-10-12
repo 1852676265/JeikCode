@@ -743,3 +743,50 @@ test('新部件写入即盖身份戳，后续重放才能按 part 定向收敛',
     withThinking,
   );
 });
+
+test('直播流式输出中的重复 URL、重复前缀与重复代码块内容绝不被吞字', () => {
+  const canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [],
+    },
+  ];
+
+  // 模拟真实 LLM 流式输出：先输出第一条链接
+  let res = paintAssistantText(canvas, '1. https://github.com/jeikl/JeikCode/tree/v7.2.2\n', false, 'm-1', 'm-1:1:text');
+  // 再分 chunk 流式输出第二条完全相同的链接（测试前缀重复 token 绝不能被 includes 丢弃）
+  res = paintAssistantText(res, '2. ', false, 'm-1', 'm-1:1:text');
+  res = paintAssistantText(res, 'https://github.com', false, 'm-1', 'm-1:1:text');
+  res = paintAssistantText(res, '/jeikl/JeikCode', false, 'm-1', 'm-1:1:text');
+  res = paintAssistantText(res, '/tree/v7.2.2\n', false, 'm-1', 'm-1:1:text');
+
+  // 第三条链接整块到达
+  res = paintAssistantText(res, '3. https://github.com/jeikl/JeikCode/tree/v7.2.2\n', false, 'm-1', 'm-1:1:text');
+
+  const textPart = res[0]?.parts[0] as { kind: 'text'; text: string };
+  assert.equal(textPart.kind, 'text');
+  assert.equal(
+    textPart.text,
+    '1. https://github.com/jeikl/JeikCode/tree/v7.2.2\n2. https://github.com/jeikl/JeikCode/tree/v7.2.2\n3. https://github.com/jeikl/JeikCode/tree/v7.2.2\n',
+  );
+});
+
+test('直播思考流式输出中的重复词句绝不被误杀吞字', () => {
+  const canvas = [
+    {
+      role: 'assistant',
+      id: 'm-1',
+      parts: [],
+    },
+  ];
+
+  let res = paintAssistantReasoning(canvas, '首先检查缓存一致性问题。', false, 'm-1', 'm-1:1:reasoning');
+  res = paintAssistantReasoning(res, '接着再次确认缓存一致性问题，', false, 'm-1', 'm-1:1:reasoning');
+  res = paintAssistantReasoning(res, '问题已被彻底定位。', false, 'm-1', 'm-1:1:reasoning');
+
+  const part = res[0]?.parts[0] as { kind: 'reasoning'; text: string };
+  assert.equal(part.kind, 'reasoning');
+  assert.equal(part.text, '首先检查缓存一致性问题。接着再次确认缓存一致性问题，问题已被彻底定位。');
+});
+
