@@ -136,7 +136,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 3. **一次 Release，清单不进 git**：
    - `publish` 先验证 checkout HEAD 与触发 Tag 都等于 `GITHUB_SHA`，再用本地六个二进制计算 SHA256 与大小，生成 `latest.json` 并上传；
    - 客户端与 `install.sh` / `install.ps1` 读取 `https://github.com/jeikl/JeikCode/releases/latest/download/latest.json`，下载后仍校验 SHA256；
-   - Release 正文顶部提供稳定的 Release Assets 页面入口；桌面安装包由后续矩阵追加到同一 Release，正文不再提前发布尚未生成的文件直链，避免构建中或失败时出现 404。下方仍采用“英文段落 + 分割线 `---` + 中文段落”的规范结构；
+   - Release 正文顶部提供清晰的直达安装包下载表格（Windows .exe、macOS .dmg、Linux .deb/.AppImage），点击直接下载对应安装包；下方采用“英文段落 + 分割线 `---` + 中文段落”的双语规范结构；
    - **不**修改 `Cargo.toml`、锁文件、README，也**不**再推送 `chore(release)`。下游分支不会因为发版而落后 `main`。
    - 带 `-` 的 Tag 标为 prerelease，不占 `releases/latest`。
 
