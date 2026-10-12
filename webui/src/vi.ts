@@ -76,6 +76,8 @@ export const vi: Record<keyof typeof en, string> = {
   'git.stageAll': 'Đưa tất cả vào vùng chờ',
   'git.unstageAll': 'Bỏ tất cả khỏi vùng chờ',
   'git.discardAll': 'Hủy tất cả thay đổi',
+  'git.discardAllConfirm': 'Hủy tất cả các thay đổi chưa được lưu tạm? Thao tác này không thể hoàn tác!',
+  'git.discardAllCountConfirm': 'Hủy tất cả thay đổi trong {count} tệp chưa được lưu tạm? Thao tác này không thể hoàn tác!',
   'git.stageFile': 'Đưa tệp vào vùng chờ',
   'git.unstageFile': 'Bỏ tệp khỏi vùng chờ',
   'git.discardFile': 'Hủy thay đổi',
@@ -698,4 +700,7 @@ export const vi: Record<keyof typeof en, string> = {
   'update.preparing': "Đang chuẩn bị cài đặt…",
   'update.installing': "Đang cập nhật…",
   'common.cancel': 'Hủy',
+  'common.confirm': 'Xác nhận',
+  'common.delete': 'Xóa',
+  'common.create': 'Tạo',
 };

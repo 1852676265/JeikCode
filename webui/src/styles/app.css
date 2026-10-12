@@ -9735,8 +9735,6 @@ body {
     -webkit-backdrop-filter: blur(8px);
     z-index: 9999 !important;
   }
-  .modal-card,
-  .modal-card.modal-card-sm,
   .modal-card.modal-card-lg,
   .modal-card.modal-card-xl {
     width: 100% !important;
@@ -9750,6 +9748,16 @@ body {
     margin: 0 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.5);
     animation: mobileSheetSlideUp 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  /* 移动端确认弹窗：居中卡片展示，自适应宽度，避免拉长成底部抽屉 */
+  .modal-card.modal-card-sm {
+    width: min(92vw, 380px) !important;
+    max-width: min(92vw, 380px) !important;
+    max-height: 85dvh !important;
+    margin: auto !important;
+    border-radius: 16px !important;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6) !important;
+    animation: fadeIn 0.18s ease-out !important;
   }
   /* 移动端搜索弹窗：在中上方展示，防止键盘遮挡与掉到屏幕最底下 */
   .modal-card.search-modal-card {
@@ -11694,3 +11702,153 @@ body {
   cursor: grabbing;
   opacity: 0.7;
 }
+
+/* --- WebUI Global Toast System (Light & Dark Theme Adaptive) --- */
+.webui-toast-container {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  z-index: 1000000;
+  pointer-events: none;
+  width: 100%;
+  max-width: 100vw;
+  padding: 0 16px;
+  box-sizing: border-box;
+}
+
+.webui-toast {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  min-width: 180px;
+  max-width: min(520px, calc(100vw - 32px));
+  background: var(--app-menu-background, #1e1e22);
+  color: var(--app-primary-foreground, #f0f0f2);
+  border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.12));
+  border-radius: 9999px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.16);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  font-size: 13px;
+  font-weight: 500;
+  animation: toastSlideDown 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: all 0.2s ease;
+}
+
+@keyframes toastSlideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-14px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.webui-toast-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.webui-toast-success .webui-toast-icon {
+  background: #10b981;
+  color: #ffffff;
+}
+
+.webui-toast-error .webui-toast-icon {
+  background: #ef4444;
+  color: #ffffff;
+}
+
+.webui-toast-warning .webui-toast-icon {
+  background: #f59e0b;
+  color: #ffffff;
+}
+
+.webui-toast-info .webui-toast-icon {
+  background: #3b82f6;
+  color: #ffffff;
+}
+
+.webui-toast-msg {
+  flex: 1;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.webui-toast-close {
+  background: none;
+  border: none;
+  color: var(--app-secondary-foreground, #8e8e93);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  margin-left: 4px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.webui-toast-close:hover {
+  opacity: 1;
+}
+
+.modal-input-wrap {
+  margin-top: 4px;
+}
+
+.modal-input-wrap .modal-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  font-size: 13px;
+  border-radius: 8px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.2));
+  color: var(--app-primary-foreground);
+  border: 1px solid var(--app-menu-border);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.modal-input-wrap .modal-input:focus {
+  border-color: var(--app-accent, #3b82f6);
+}
+
+/* Chrome-like Zoom Indicator Pill */
+.zoom-indicator {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  background: var(--app-menu-background, #1c1c1f);
+  color: var(--app-primary-foreground, #f0f0f2);
+  border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.15));
+  padding: 5px 12px;
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--app-monospace-font-family, sans-serif);
+  z-index: 10000001;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+

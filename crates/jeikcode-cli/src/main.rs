@@ -4082,17 +4082,40 @@ fn handle_ghimg(status: Option<String>) -> Result<()> {
 
     let Some(raw_status) = status.filter(|s| !s.trim().is_empty()) else {
         if is_zh {
-            println!("GitHub 仓库图标状态：{}", if current_state { "已开启 (on)" } else { "已隐藏 (off)" });
+            println!(
+                "GitHub 仓库图标状态：{}",
+                if current_state {
+                    "已开启 (on)"
+                } else {
+                    "已隐藏 (off)"
+                }
+            );
             println!("\n用法：");
             println!("  jeikcode ghimg on    - 开启并显示 GitHub 图标");
             println!("  jeikcode ghimg off   - 隐藏 GitHub 图标（适合公司内部演示/投屏）");
         } else if is_vi {
-            println!("Trạng thái biểu tượng GitHub: {}", if current_state { "Đã bật (on)" } else { "Đã ẩn (off)" });
+            println!(
+                "Trạng thái biểu tượng GitHub: {}",
+                if current_state {
+                    "Đã bật (on)"
+                } else {
+                    "Đã ẩn (off)"
+                }
+            );
             println!("\nCách dùng:");
             println!("  jeikcode ghimg on    - Bật và hiển thị biểu tượng GitHub");
-            println!("  jeikcode ghimg off   - Ẩn biểu tượng GitHub (phù hợp dùng trong nội bộ công ty)");
+            println!(
+                "  jeikcode ghimg off   - Ẩn biểu tượng GitHub (phù hợp dùng trong nội bộ công ty)"
+            );
         } else {
-            println!("GitHub logo display status: {}", if current_state { "ON (enabled)" } else { "OFF (hidden)" });
+            println!(
+                "GitHub logo display status: {}",
+                if current_state {
+                    "ON (enabled)"
+                } else {
+                    "OFF (hidden)"
+                }
+            );
             println!("\nUsage:");
             println!("  jeikcode ghimg on    - Enable and show the GitHub repository logo");
             println!("  jeikcode ghimg off   - Hide the GitHub repository logo (ideal for corporate/internal use)");
@@ -4134,7 +4157,9 @@ fn handle_ghimg(status: Option<String>) -> Result<()> {
         if is_zh {
             println!("✓ 已隐藏 WebUI 中的 GitHub 仓库图标（配置已保存，实时热重载生效）。");
         } else if is_vi {
-            println!("✓ Đã ẩn biểu tượng kho lưu trữ GitHub trong WebUI (đã lưu, tự động áp dụng ngay).");
+            println!(
+                "✓ Đã ẩn biểu tượng kho lưu trữ GitHub trong WebUI (đã lưu, tự động áp dụng ngay)."
+            );
         } else {
             println!("✓ GitHub repository logo hidden in WebUI (config saved, hot-reloaded).");
         }

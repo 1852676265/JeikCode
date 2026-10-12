@@ -660,7 +660,10 @@ pub struct Config {
     pub keep_interrupted_context: bool,
     /// Whether to display the GitHub repository logo in the UI.
     /// Defaults to `true` (on/show). Set `github_logo = "off"` or `false` to hide it.
-    #[serde(default = "default_true", deserialize_with = "deserialize_lenient_bool")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_lenient_bool"
+    )]
     pub github_logo: bool,
     /// Offline deployment switch (intranet / air-gapped). Default off = online build unchanged.
     #[serde(default)]
@@ -1474,7 +1477,9 @@ where
             E: serde::de::Error,
         {
             match v.trim().to_ascii_lowercase().as_str() {
-                "off" | "false" | "0" | "disable" | "disabled" | "no" | "none" | "hide" => Ok(false),
+                "off" | "false" | "0" | "disable" | "disabled" | "no" | "none" | "hide" => {
+                    Ok(false)
+                }
                 "on" | "true" | "1" | "enable" | "enabled" | "yes" | "show" => Ok(true),
                 other => Err(E::custom(format!("invalid switch value: {other}"))),
             }

@@ -6665,14 +6665,17 @@ mod chat_event_type_tests {
     #[test]
     fn native_steered_event_reaches_chat_projection() {
         let mut projector = ChatRuntimeProjector::default();
-        let events = projector.project_agent(jeikcode_kernel::event::AgentEvent::Steered {
-            count: 1,
-            inputs: vec![jeikcode_kernel::event::SteeredInput {
-                text: "next instruction".into(),
-                images: Vec::new(),
-                message_id: Some("m-steer-1".into()),
-            }],
-        });
+        let events = projector.project_agent(
+            jeikcode_kernel::event::AgentEvent::Steered {
+                count: 1,
+                inputs: vec![jeikcode_kernel::event::SteeredInput {
+                    text: "next instruction".into(),
+                    images: Vec::new(),
+                    message_id: Some("m-steer-1".into()),
+                }],
+            },
+            "test-session",
+        );
         assert!(matches!(
             events.as_slice(),
             [ChatEvent::Steered { count: 1, inputs, .. }] if inputs[0].text == "next instruction"
@@ -6682,8 +6685,8 @@ mod chat_event_type_tests {
     #[test]
     fn native_tool_batch_reaches_chat_without_core_projection() {
         let mut projector = ChatRuntimeProjector::default();
-        let events =
-            projector.project_agent(jeikcode_kernel::event::AgentEvent::ToolBatchStarted {
+        let events = projector.project_agent(
+            jeikcode_kernel::event::AgentEvent::ToolBatchStarted {
                 batch_id: "batch-1".into(),
                 calls: vec![jeikcode_kernel::event::ToolBatchCall {
                     id: "call-1".into(),
@@ -6691,7 +6694,9 @@ mod chat_event_type_tests {
                     arguments: "{}".into(),
                     parallel_safe: true,
                 }],
-            });
+            },
+            "test-session",
+        );
 
         assert!(matches!(
             events.as_slice(),
@@ -6710,7 +6715,10 @@ mod chat_event_type_tests {
             },
             ..Default::default()
         };
-        let events = projector.project_agent(jeikcode_kernel::event::AgentEvent::Usage(meta));
+        let events = projector.project_agent(
+            jeikcode_kernel::event::AgentEvent::Usage(meta),
+            "test-session",
+        );
 
         assert!(matches!(
             events.as_slice(),
@@ -7537,7 +7545,11 @@ impl ChatRuntimeProjector {
         self.last_part_kind = None;
     }
 
-    fn project_agent(&mut self, event: jeikcode_kernel::event::AgentEvent, session_id: &str) -> Vec<ChatEvent> {
+    fn project_agent(
+        &mut self,
+        event: jeikcode_kernel::event::AgentEvent,
+        session_id: &str,
+    ) -> Vec<ChatEvent> {
         use jeikcode_kernel::event::AgentEvent as Agent;
 
         match event {
@@ -7719,9 +7731,7 @@ impl ChatRuntimeProjector {
                     },
                     ChatEvent::Warning {
                         message: jeikcode_config::i18n::format_compaction_mark(
-                            removed,
-                            est_before,
-                            est_after,
+                            removed, est_before, est_after,
                         ),
                     },
                 ]
@@ -8622,19 +8632,25 @@ mod chat_part_identity_tests {
     fn tool_boundary_opens_a_new_text_part() {
         use jeikcode_kernel::event::AgentEvent as Agent;
         let mut projector = ChatRuntimeProjector::default();
-        projector.project_agent(Agent::AssistantMessage {
-            message_id: "m-1".into(),
-        });
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-1".into(),
+            },
+            "sess-1",
+        );
         let part_of = |events: Vec<ChatEvent>| match events.into_iter().next() {
             Some(ChatEvent::TextDelta { part_id, .. }) => part_id.unwrap_or_default(),
             other => panic!("expected a text delta, got {other:?}"),
         };
-        let before = part_of(projector.project_agent(Agent::TextDelta("正文 1".into())));
-        projector.project_agent(Agent::ToolBatchStarted {
-            batch_id: "b1".into(),
-            calls: Vec::new(),
-        });
-        let after = part_of(projector.project_agent(Agent::TextDelta("正文 2".into())));
+        let before = part_of(projector.project_agent(Agent::TextDelta("正文 1".into()), "sess-1"));
+        projector.project_agent(
+            Agent::ToolBatchStarted {
+                batch_id: "b1".into(),
+                calls: Vec::new(),
+            },
+            "sess-1",
+        );
+        let after = part_of(projector.project_agent(Agent::TextDelta("正文 2".into()), "sess-1"));
         assert_eq!(before, "m-1:1:text");
         // Sharing one part id across a tool boundary makes the two prose runs
         // indistinguishable on replay: the browser then re-appends instead of
@@ -8727,7 +8743,9 @@ async fn chat_watch(
                 Some(after) if after >= 0 && (after as u64) <= buffer_len => {
                     let mut filtered: Vec<(u64, ChatEvent)> = snapshot
                         .into_iter()
-                        .filter(|(seq, e)| !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64)
+                        .filter(|(seq, e)| {
+                            !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64
+                        })
                         .collect();
                     if let Some(user) = maybe_user {
                         filtered.insert(0, user);
@@ -8900,12 +8918,16 @@ async fn chat_watch(
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
 
-    let live_seq_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
+    let live_seq_counter =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
     let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
         let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok::<_, std::convert::Infallible>(
-            axum::response::sse::Event::default()
-                .data(chat_watch_frame_json(&event, &live_session_id, Some(seq))),
+            axum::response::sse::Event::default().data(chat_watch_frame_json(
+                &event,
+                &live_session_id,
+                Some(seq),
+            )),
         )
     });
     let stream = head_stream.chain(live_stream);

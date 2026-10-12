@@ -21,6 +21,34 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.2 (2026-10-13)
+
+- **[WebUI Modern Modals, Toast System & Git Controls] Modern theme-adaptive dialogs, VSCode-style discard all, and page zoom**:
+  - Replaced all legacy browser dialogs (`window.confirm`, `window.alert`, `window.prompt`) featuring `127.0.0.1:port` popups with beautiful, theme-adaptive modals and floating toast capsules matching light and dark themes.
+  - Added a dedicated "Discard All Changes" (`↺`) action in GitPanel unstaged changes header with secondary confirmation and full i18n support matching VSCode workflow.
+  - Replaced file discard, branch deletion, merge, revert, and cherry-pick native popups with responsive modern confirm modals.
+  - Replaced prompt popups (creating branches, creating tags, renaming branches) with modern styled input dialogs.
+  - Replaced raw configuration overwrite and clipboard copy alerts with elegant non-blocking toasts that auto-dismiss.
+  - Configuration sync dialog now silently closes without annoying toasts when 0 files are selected upon clicking confirm.
+  - Implemented Chrome-like `Ctrl + Mouse Wheel` (and `Ctrl + +/-/0`) page zoom scaling with persistent zoom levels in `localStorage` and a floating percentage indicator pill.
+  - Optimized responsive layouts for small screens and mobile devices so confirmation cards center neatly and toasts adapt to viewport widths without horizontal overflow.
+- **[CI & Daemon Test Fixes] Synchronize unit test signatures**:
+  - Fixed `project_agent` method invocations across 7 unit test sites in `jeikcode-daemon` to supply the required `session_id` argument, resolving the `Rust quality` pipeline compilation failure.
+
+---
+
+- **[WebUI 现代主题提示框、全局 Toast 与 Git 撤销控制] 告别老旧浏览器原生弹窗、VSCode 风格放弃全部更改与滚轮缩放**:
+  - 全面替换所有带有 `127.0.0.1:port` 的老旧浏览器原生弹窗（`window.confirm`、`window.alert`、`window.prompt`），升级为完美适配亮色与暗色模式的现代卡片式 `ConfirmDialog` 与磨砂胶囊 `Toast`。
+  - 在 GitPanel 代码更改标题栏新增 VSCode 风格的“放弃所有更改”（`↺` 拐弯撤销图标）按钮，配备二次确认保护弹窗与全套多语言适配。
+  - 将单文件修改放弃、分支删除、分支合并、提交回滚（Revert）与拣选（Cherry-pick）全部接入现代确认弹窗。
+  - 将创建分支、创建标签与重命名分支的原生输入框升级为圆角输入对话框，支持回车提交与 Esc 取消。
+  - 将开局配置更新覆盖与剪贴板复制提示替换为右上角优雅悬浮的无阻碍 Toast 气泡，3 秒自动平滑淡出。
+  - 优化默认配置同步交互：当选中 0 个文件点击确定时直接静默完成，不再弹出多余提示。
+  - 引入仿 Google Chrome 的 `Ctrl + 鼠标滚轮`（以及 `Ctrl + +/-/0`）页面缩放能力，支持 50%~300% 步进调节、`localStorage` 持久化记忆与右上角实时百分比气泡展示。
+  - 深度优化移动端与窄窗口自适应布局，确保弹窗自适应视口宽度、居中展示且无任何横向溢出。
+- **[CI 流水线与 Daemon 单元测试修复] 对齐测试用例签名参数**:
+  - 修复 `jeikcode-daemon` 内部 7 处单元测试中 `project_agent` 未传入 `session_id` 的签名失配缺陷，彻底解决 `Rust quality` 流水线编译失败问题。
+
 ## v7.2.4-beta.1 (2026-10-13)
 
 - **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and contradictory edit banners**:

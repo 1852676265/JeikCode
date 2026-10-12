@@ -812,7 +812,10 @@ mod tests {
         let mut files: Vec<PathBuf> = Vec::new();
         for _ in 0..50 {
             if let Ok(entries) = fs::read_dir(&project_dir) {
-                files = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
+                files = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect();
                 if files.len() >= 4 {
                     break;
                 }

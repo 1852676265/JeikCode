@@ -43,6 +43,7 @@ const WATCH_REATTACH_AFTER_HIDDEN_MS = 60000;
 import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
+import { showToast } from './Toast';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -6750,7 +6751,7 @@ export function Chat({
       void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
       setEditingSourceIndex(null);
     } catch (e) {
-      window.alert(t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)));
+      showToast(t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)), 'error');
     }
   }
 
@@ -8725,7 +8726,7 @@ function AssistantMessageView({
         setTimeout(() => setCopiedLast(false), 2000);
       } else {
         // Surface failure — silent .catch previously made the button look dead.
-        window.alert(t('copy.failed'));
+        showToast(t('copy.failed'), 'error');
       }
     });
   }
@@ -8738,7 +8739,7 @@ function AssistantMessageView({
         setCopiedAll(true);
         setTimeout(() => setCopiedAll(false), 2000);
       } else {
-        window.alert(t('copy.failed'));
+        showToast(t('copy.failed'), 'error');
       }
     });
   }
@@ -9132,7 +9133,7 @@ function UserMessageView({
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
       } else {
-        window.alert(t('copy.failed'));
+        showToast(t('copy.failed'), 'error');
       }
     });
   }
@@ -9538,7 +9539,7 @@ function CopyableCodeBlock({
           e.stopPropagation();
           void copyTextToClipboard(text).then((ok) => {
             if (!ok) {
-              window.alert(t('copy.failed'));
+              showToast(t('copy.failed'), 'error');
               return;
             }
             setCopied(true);
@@ -9595,7 +9596,7 @@ function DiffBody({
             e.stopPropagation();
             void copyTextToClipboard(raw).then((ok) => {
               if (!ok) {
-                window.alert(t('copy.failed'));
+                showToast(t('copy.failed'), 'error');
                 return;
               }
               setCopied(true);
@@ -9685,7 +9686,7 @@ function ToolTerminalBody({
     if (!contentToCopy) return;
     void copyTextToClipboard(contentToCopy).then((ok) => {
       if (!ok) {
-        window.alert(t('copy.failed'));
+        showToast(t('copy.failed'), 'error');
         return;
       }
       setCopied(true);

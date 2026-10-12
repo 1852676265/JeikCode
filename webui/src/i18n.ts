@@ -95,6 +95,8 @@ const zh = {
   'git.stageAll': '暂存全部',
   'git.unstageAll': '取消全部暂存',
   'git.discardAll': '放弃所有更改',
+  'git.discardAllConfirm': '确定放弃所有更改吗？此操作不可逆！',
+  'git.discardAllCountConfirm': '确定放弃所有 {count} 个未暂存文件的更改吗？此操作不可逆！',
   'git.stageFile': '暂存文件',
   'git.unstageFile': '取消暂存',
   'git.discardFile': '放弃更改',
@@ -765,6 +767,9 @@ const zh = {
   'update.preparing': "正在准备安装…",
   'update.installing': "正在更新…",
   'common.cancel': '取消',
+  'common.confirm': '确定',
+  'common.delete': '删除',
+  'common.create': '创建',
 } as const;
 
 export type MsgKey = keyof typeof zh;
@@ -847,6 +852,8 @@ export const en: Record<MsgKey, string> = {
   'git.stageAll': 'Stage All',
   'git.unstageAll': 'Unstage All',
   'git.discardAll': 'Discard All Changes',
+  'git.discardAllConfirm': 'Discard all unstaged changes? This cannot be undone!',
+  'git.discardAllCountConfirm': 'Discard all changes in {count} unstaged files? This cannot be undone!',
   'git.stageFile': 'Stage file',
   'git.unstageFile': 'Unstage file',
   'git.discardFile': 'Discard changes',
@@ -1503,6 +1510,9 @@ export const en: Record<MsgKey, string> = {
   'update.preparing': "Preparing installation…",
   'update.installing': "Updating…",
   'common.cancel': 'Cancel',
+  'common.confirm': 'Confirm',
+  'common.delete': 'Delete',
+  'common.create': 'Create',
 };
 
 export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en, vi };

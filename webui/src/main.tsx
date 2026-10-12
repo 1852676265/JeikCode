@@ -2,6 +2,7 @@ import { render } from 'preact';
 import { App } from './app';
 import { SettingsProvider } from './settings';
 import { ensureRandomUUIDPolyfill } from './lib/randomId';
+import { initPageZoom } from './lib/pageZoom';
 // Bundled serif for the landing greeting (close to claude.ai's display serif).
 import '@fontsource/source-serif-4/400.css';
 import '@fontsource/source-serif-4/500.css';
@@ -25,6 +26,9 @@ if (typeof window !== 'undefined') {
 // http://LAN-IP (jeikcode serve remote clients) is not a secure context —
 // crypto.randomUUID is missing there. Polyfill before any component mounts.
 ensureRandomUUIDPolyfill();
+
+// 初始化类似 Chrome 的页面缩放（Ctrl + 滚轮 / 快捷键）
+initPageZoom();
 
 render(
   <SettingsProvider>

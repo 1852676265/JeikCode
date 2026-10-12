@@ -1,5 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'preact/hooks';
 import { useSettings } from '../settings';
+import { modalConfirm, modalPrompt } from './ConfirmDialog';
+import { showToast } from './Toast';
 import {
   fetchGitBranches,
   fetchGitGraph,
@@ -226,12 +228,20 @@ export function GitPanel({
   };
 
   const handleCreateBranchAt = async (commit: GitCommitItem) => {
-    const name = window.prompt(t('git.promptBranchName'));
+    const name = await modalPrompt({
+      title: t('git.ctxCreateBranch'),
+      body: t('git.promptBranchName'),
+      placeholder: 'feature/xxx',
+      icon: '🌱',
+      confirmLabel: t('common.create') || '创建',
+      cancelLabel: t('common.cancel') || '取消',
+    });
     if (!name || !name.trim()) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'create_branch', target: commit.hash, name: name.trim(), cwd: effectiveCwd });
       setSuccessMsg(res.message || `Branch ${name.trim()} created`);
+      showToast(res.message || `Branch ${name.trim()} created`, 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to create branch');
@@ -239,12 +249,20 @@ export function GitPanel({
   };
 
   const handleCreateTagAt = async (commit: GitCommitItem) => {
-    const name = window.prompt(t('git.promptTagName'));
+    const name = await modalPrompt({
+      title: t('git.ctxCreateTag'),
+      body: t('git.promptTagName'),
+      placeholder: 'v1.0.0',
+      icon: '🏷️',
+      confirmLabel: t('common.create') || '创建',
+      cancelLabel: t('common.cancel') || '取消',
+    });
     if (!name || !name.trim()) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'create_tag', target: commit.hash, name: name.trim(), cwd: effectiveCwd });
       setSuccessMsg(res.message || `Tag ${name.trim()} created`);
+      showToast(res.message || `Tag ${name.trim()} created`, 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to create tag');
@@ -252,11 +270,20 @@ export function GitPanel({
   };
 
   const handleCherryPick = async (commit: GitCommitItem) => {
-    if (!window.confirm(`Cherry pick ${commit.short_hash} "${commit.message}"?`)) return;
+    const ok = await modalConfirm({
+      title: t('git.ctxCherryPick'),
+      body: `Cherry pick ${commit.short_hash} "${commit.message}"?`,
+      icon: '🍒',
+      danger: false,
+      confirmLabel: t('git.ctxCherryPick'),
+      cancelLabel: t('common.cancel'),
+    });
+    if (!ok) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'cherry_pick', target: commit.hash, cwd: effectiveCwd });
       setSuccessMsg(res.message || 'Cherry-pick successful');
+      showToast(res.message || 'Cherry-pick successful', 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Cherry-pick failed');
@@ -264,11 +291,20 @@ export function GitPanel({
   };
 
   const handleRevert = async (commit: GitCommitItem) => {
-    if (!window.confirm(`Revert commit ${commit.short_hash} "${commit.message}"?`)) return;
+    const ok = await modalConfirm({
+      title: t('git.ctxRevert'),
+      body: `Revert commit ${commit.short_hash} "${commit.message}"?`,
+      icon: '↺',
+      danger: true,
+      confirmLabel: t('git.ctxRevert'),
+      cancelLabel: t('common.cancel'),
+    });
+    if (!ok) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'revert', target: commit.hash, cwd: effectiveCwd });
       setSuccessMsg(res.message || 'Revert successful');
+      showToast(res.message || 'Revert successful', 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Revert failed');
@@ -310,12 +346,20 @@ export function GitPanel({
   };
 
   const handleRenameBranch = async (branch: string) => {
-    const newName = window.prompt(t('git.promptRenameBranch'), branch);
+    const newName = await modalPrompt({
+      title: t('git.ctxRenameBranch'),
+      body: t('git.promptRenameBranch'),
+      defaultValue: branch,
+      icon: '✏️',
+      confirmLabel: t('common.confirm') || '确定',
+      cancelLabel: t('common.cancel') || '取消',
+    });
     if (!newName || !newName.trim() || newName.trim() === branch) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'rename_branch', target: branch, name: newName.trim(), cwd: effectiveCwd });
       setSuccessMsg(res.message || `Branch renamed to ${newName.trim()}`);
+      showToast(res.message || `Branch renamed to ${newName.trim()}`, 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to rename branch');
@@ -330,12 +374,21 @@ export function GitPanel({
     const confirmPrompt = isRemote
       ? t('git.confirmDeleteRemoteBranch').replace('{b}', branch)
       : t('git.confirmDeleteBranch').replace('{b}', branch);
-    if (!window.confirm(confirmPrompt)) return;
+    const ok = await modalConfirm({
+      title: isRemote ? t('git.ctxDeleteRemoteBranch') : t('git.ctxDeleteBranch'),
+      body: confirmPrompt,
+      icon: '🗑',
+      danger: true,
+      confirmLabel: t('common.delete') || '删除',
+      cancelLabel: t('common.cancel') || '取消',
+    });
+    if (!ok) return;
     setError(null);
     try {
       const action = isRemote ? 'delete_remote_branch' : 'delete_branch';
       const res = await gitAction({ action, target: branch, cwd: effectiveCwd });
       setSuccessMsg(res.message || `Branch ${branch} deleted`);
+      showToast(res.message || `Branch ${branch} deleted`, 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to delete branch');
@@ -343,11 +396,20 @@ export function GitPanel({
   };
 
   const handleMergeBranch = async (branch: string) => {
-    if (!window.confirm(`Merge "${branch}" into "${currentBranch}"?`)) return;
+    const ok = await modalConfirm({
+      title: t('git.ctxMergeBranch').replace('{b}', currentBranch),
+      body: `Merge "${branch}" into "${currentBranch}"?`,
+      icon: '🔀',
+      danger: false,
+      confirmLabel: t('common.confirm') || '合并',
+      cancelLabel: t('common.cancel') || '取消',
+    });
+    if (!ok) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'merge_branch', target: branch, cwd: effectiveCwd });
       setSuccessMsg(res.message || 'Merge successful');
+      showToast(res.message || 'Merge successful', 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Merge failed');
@@ -359,6 +421,7 @@ export function GitPanel({
     try {
       const res = await gitAction({ action: 'push_branch', target: branch, cwd: effectiveCwd });
       setSuccessMsg(res.message || `Pushed ${branch} to remote`);
+      showToast(res.message || `Pushed ${branch} to remote`, 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Push failed');
@@ -366,12 +429,20 @@ export function GitPanel({
   };
 
   const handleCreateBranchFrom = async (branch: string) => {
-    const name = window.prompt(t('git.promptBranchName'));
+    const name = await modalPrompt({
+      title: t('git.ctxCreateBranchFrom').replace('{b}', branch),
+      body: t('git.promptBranchName'),
+      placeholder: 'feature/xxx',
+      icon: '🌱',
+      confirmLabel: t('common.create') || '创建',
+      cancelLabel: t('common.cancel') || '取消',
+    });
     if (!name || !name.trim()) return;
     setError(null);
     try {
       const res = await gitAction({ action: 'create_branch', target: branch, name: name.trim(), cwd: effectiveCwd });
       setSuccessMsg(res.message || `Branch ${name.trim()} created from ${branch}`);
+      showToast(res.message || `Branch ${name.trim()} created from ${branch}`, 'success');
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Failed to create branch');
@@ -471,7 +542,15 @@ export function GitPanel({
 
   // Discard changes
   const handleDiscard = async (file: GitStatusItem) => {
-    if (!window.confirm(t('git.discardConfirm').replace('{path}', file.path))) return;
+    const ok = await modalConfirm({
+      title: t('git.discardFile'),
+      body: t('git.discardConfirm').replace('{path}', file.path),
+      icon: '⚠️',
+      danger: true,
+      confirmLabel: t('git.discardFile'),
+      cancelLabel: t('common.cancel'),
+    });
+    if (!ok) return;
     setActionLoadingPath(file.path);
     setError(null);
     try {
@@ -479,6 +558,34 @@ export function GitPanel({
       await loadGitData(true);
     } catch (err: any) {
       setError(err?.message || 'Discard failed');
+    } finally {
+      setActionLoadingPath(null);
+    }
+  };
+
+  // Discard all changes
+  const handleDiscardAll = async () => {
+    if (unstagedItems.length === 0) return;
+    const ok = await modalConfirm({
+      title: t('git.discardAll'),
+      body: t('git.discardAllCountConfirm').replace('{count}', String(unstagedItems.length)),
+      icon: '⚠️',
+      danger: true,
+      confirmLabel: t('git.discardAll'),
+      cancelLabel: t('common.cancel'),
+    });
+    if (!ok) return;
+
+    setActionLoadingPath('all');
+    setError(null);
+    try {
+      for (const file of unstagedItems) {
+        await gitDiscard({ path: file.path, isUntracked: file.status === '?', cwd: effectiveCwd });
+      }
+      showToast(t('git.discardAll') + ` (${unstagedItems.length})`, 'info');
+      await loadGitData(true);
+    } catch (err: any) {
+      setError(err?.message || 'Discard all failed');
     } finally {
       setActionLoadingPath(null);
     }
@@ -500,7 +607,15 @@ export function GitPanel({
         setError('No changes to commit');
         return;
       }
-      if (!window.confirm(t('git.commitNoStagedPrompt'))) {
+      const ok = await modalConfirm({
+        title: t('git.commitBtn'),
+        body: t('git.commitNoStagedPrompt'),
+        icon: '📦',
+        danger: false,
+        confirmLabel: t('git.stageAll') || '暂存全部并提交',
+        cancelLabel: t('common.cancel'),
+      });
+      if (!ok) {
         return;
       }
       // Auto stage all
@@ -877,8 +992,18 @@ export function GitPanel({
                   <button
                     type="button"
                     class="git-icon-action-btn"
+                    onClick={handleDiscardAll}
+                    title={t('git.discardAll')}
+                    disabled={actionLoadingPath === 'all'}
+                  >
+                    ↺
+                  </button>
+                  <button
+                    type="button"
+                    class="git-icon-action-btn"
                     onClick={() => handleStage(undefined, true)}
                     title={t('git.stageAll')}
+                    disabled={actionLoadingPath === 'all'}
                   >
                     +
                   </button>

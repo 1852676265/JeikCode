@@ -12,6 +12,7 @@ import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang, languageOptions } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { ConfirmDialog } from './ConfirmDialog';
+import { showToast } from './Toast';
 import { CwdPicker } from './CwdPicker';
 import { mergeOptimisticSession, mergeOptimisticSessions } from '../lib/sessionList';
 import { mcpAutoTrustSignature, mcpEnableNeedsTrust } from '../lib/mcpTrust';
@@ -1082,7 +1083,7 @@ export function Sidebar({
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
-      alert(t('sidebar.exportFailed'));
+      showToast(t('sidebar.exportFailed'), 'error');
     }
   }
 

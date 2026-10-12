@@ -12,6 +12,8 @@ import { LiveReviewState, NotificationDock } from './components/NotificationDock
 import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
+import { ToastHost, showToast } from './components/Toast';
+import { ConfirmModalHost } from './components/ConfirmDialog';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销
 const ThemeDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ThemeDialog })));
@@ -523,10 +525,10 @@ export function App() {
       if (res.has_update) {
         setShowUpdateDialog(true);
       } else {
-        alert(t('update.latest', { version: res.current_version }));
+        showToast(t('update.latest', { version: res.current_version }), 'info');
       }
     } catch (e: any) {
-      alert(t('update.failed', { error: e?.message || String(e) }));
+      showToast(t('update.failed', { error: e?.message || String(e) }), 'error');
     } finally {
       setIsCheckingUpdate(false);
     }
@@ -762,7 +764,7 @@ export function App() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
-      alert(t('sidebar.exportFailed'));
+      showToast(t('sidebar.exportFailed'), 'error');
     } finally {
       setHeaderExporting(false);
     }
@@ -1404,7 +1406,10 @@ export function App() {
             diffs={configDiffs}
             onDone={(count) => {
               setConfigDiffs(null);
-              alert(t('configSync.successToast', { n: count }));
+              // 选中大于 0 个文件才弹出成功提示；若选中 0 个文件点击确定直接静默完成，不跳提示
+              if (count > 0) {
+                showToast(t('configSync.successToast', { n: count }), 'success');
+              }
             }}
             onSkip={() => {
               setConfigDiffs(null);
@@ -1412,6 +1417,8 @@ export function App() {
           />
         )}
       </Suspense>
+      <ConfirmModalHost />
+      <ToastHost />
       <NotificationDock
         liveReview={liveReview}
         chatPermission={pending}
