@@ -2343,6 +2343,7 @@ export function Chat({
   // swallow the whole block).
   const artifactOpenRef = useRef(false);
   const artifactFenceLenRef = useRef(3);
+  const artifactOpenBySessionRef = useRef<Map<string, number>>(new Map());
 
   // 切换/恢复会话时重置画布并加载历史。依赖 project_hash：刷新后 sessionId 先于
   // 元数据就绪，此时只显示提示；待 App 从会话列表回填 project_hash，本 effect 因
@@ -2454,8 +2455,9 @@ export function Chat({
         setPendingSteers([]);
       }
       loadedForRef.current = null;
-      artifactOpenRef.current = false;
-      artifactFenceLenRef.current = 3;
+      const openFence = sessionId ? artifactOpenBySessionRef.current.get(sessionId) : undefined;
+      artifactOpenRef.current = openFence != null;
+      artifactFenceLenRef.current = openFence || 3;
       if (!prevWasRunning && prevId) {
         sessionWatchersRef.current.get(prevId)?.abort();
         sessionWatchersRef.current.delete(prevId);
@@ -4775,6 +4777,7 @@ export function Chat({
     const marker = '`'.repeat(fenceLen);
     appendToLastAssistant('\n' + marker + '\n', { skipReplayDedup: true });
     artifactFenceLenRef.current = 3;
+    if (activeIdRef.current) artifactOpenBySessionRef.current.delete(activeIdRef.current);
   }
 
   function addToolToLastAssistant(tool: ToolRow, messageId?: string) {
@@ -4836,6 +4839,43 @@ export function Chat({
         messageId: event.message_id,
         partId: event.part_id,
       }));
+      return;
+    }
+    if (event.type === 'artifact_start') {
+      if (event.id?.startsWith('file-')) {
+        artifactOpenBySessionRef.current.delete(targetSid);
+        return;
+      }
+      const lang = (event.language ?? '').trim();
+      const fenceLen = typeof event.fence_len === 'number' && event.fence_len >= 3 ? event.fence_len : 3;
+      const marker = '`'.repeat(fenceLen);
+      const fence = (lang ? marker + lang : marker) + '\n';
+      const lastMsg = msgs[msgs.length - 1];
+      let prefix = '';
+      if (lastMsg && lastMsg.role === 'assistant') {
+        const lastPart = lastMsg.parts[lastMsg.parts.length - 1];
+        if (lastPart && lastPart.kind === 'text' && lastPart.text && !lastPart.text.endsWith('\n')) {
+          prefix = '\n';
+        }
+      }
+      messageCacheRef.current.set(targetSid, paintCachedAssistantDelta(msgs, 'text', prefix + fence));
+      artifactOpenBySessionRef.current.set(targetSid, fenceLen);
+      return;
+    }
+    if (event.type === 'artifact_content') {
+      if (event.id?.startsWith('file-')) return;
+      messageCacheRef.current.set(targetSid, paintCachedAssistantDelta(msgs, 'text', event.content));
+      return;
+    }
+    if (event.type === 'artifact_end') {
+      if (event.id?.startsWith('file-')) {
+        artifactOpenBySessionRef.current.delete(targetSid);
+        return;
+      }
+      const fenceLen = artifactOpenBySessionRef.current.get(targetSid) || 3;
+      const marker = '`'.repeat(fenceLen);
+      messageCacheRef.current.set(targetSid, paintCachedAssistantDelta(msgs, 'text', '\n' + marker + '\n'));
+      artifactOpenBySessionRef.current.delete(targetSid);
       return;
     }
     if (event.type === 'reasoning') {
@@ -5001,6 +5041,18 @@ export function Chat({
       case 'done':
       case 'stopped':
       case 'error': {
+        const openFence = artifactOpenBySessionRef.current.get(targetSid);
+        if (openFence) {
+          artifactOpenBySessionRef.current.delete(targetSid);
+          const marker = '`'.repeat(openFence);
+          const msgsAfter = messageCacheRef.current.get(targetSid);
+          if (msgsAfter && msgsAfter.length > 0) {
+            messageCacheRef.current.set(
+              targetSid,
+              paintCachedAssistantDelta(msgsAfter, 'text', '\n' + marker + '\n')
+            );
+          }
+        }
         backgroundRunningSessionsRef.current.delete(targetSid);
         localTurnSessionsRef.current.delete(targetSid);
         onLiveRunningChange?.(targetSid, false);
@@ -5670,6 +5722,7 @@ export function Chat({
         });
         artifactOpenRef.current = true;
         artifactFenceLenRef.current = fenceLen;
+        if (activeIdRef.current) artifactOpenBySessionRef.current.set(activeIdRef.current, fenceLen);
         break;
       }
       case 'artifact_content': {
@@ -5689,6 +5742,7 @@ export function Chat({
         }
         artifactOpenRef.current = false;
         artifactFenceLenRef.current = 3;
+        if (activeIdRef.current) artifactOpenBySessionRef.current.delete(activeIdRef.current);
         break;
       }
       case 'session_mutation': {
@@ -9592,8 +9646,9 @@ function ToolExpandedBody({
   const argsPretty = tool.args ? prettyToolText(tool.args) : null;
   const outputPretty = tool.output ? prettyToolText(tool.output) : null;
   const diffPreview = resolveToolDiffPreview(tool.name, tool.output, tool.args, tool.status);
-  const diffIsPlanned = diffPreview?.source === 'args';
-  const isDiagnostic = diffPreview?.source === 'diagnostic';
+  const isDone = tool.status === 'done';
+  const diffIsPlanned = !isDone && diffPreview?.source === 'args';
+  const isDiagnostic = !isDone && diffPreview?.source === 'diagnostic';
   const isFailed = tool.status === 'error';
   const diffCaption = isDiagnostic
     ? t('tool.diffDiagnostic')

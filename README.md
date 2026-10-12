@@ -81,7 +81,7 @@ irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | 
 
 ---
 
-## 💡 Quick Start
+## 💡 Quick Start & Full Documentation & Advanced Guides
 
 ### 1. Launching
 
@@ -110,72 +110,9 @@ jeikcode -p "Investigate and fix OAuth callback 404 issue"
 jeikcode update
 ```
 
-### 2. Model Configuration (`~/.jeikcode/config.toml`)
+### 2. Full Documentation & Tutorials
 
-On first launch, `~/.jeikcode/config.toml` is created automatically. You can configure models visually or interactively:
-
-- Run `/modeladd` in the terminal to open the interactive setup wizard;
-- **Or directly instruct JeikCode**: *"Configure my Anthropic API Key (sk-ant-xxx) and set claude-3-7-sonnet as default"*. JeikCode will safely update `config.toml` with zero-restart live reload!
-
-Typical configuration example:
-
-```toml
-# Default active model profile
-default_model = "xai/grok-4.7"
-language = "en"
-
-# ── 1. Provider Accounts (API Keys and Base URLs) ──
-[provider_accounts.xai]
-provider = "openai-compatible"
-api_key  = "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.x.ai/v1"
-
-[provider_accounts.anthropic]
-provider = "anthropic"
-api_key  = "sk-ant-api03-xxxxxxxxxxxxxxxx"
-
-[provider_accounts.gemini]
-provider = "gemini"
-api_key  = "AIzaxxxxxxxxxxxxxxxxxxxxxxxx"
-
-[provider_accounts.xiaomi-mimo]
-provider = "openai-compatible"
-api_key  = "mimo-xxxxxxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.xiaomimimo.com/v1"
-
-[provider_accounts.ollama]
-provider = "ollama"
-base_url = "http://localhost:11434"
-
-# ── 2. Model Profiles (Tiering, Reasoning & Protocol Mapping) ──
-[models."xai/grok-4.7"]
-account          = "xai"
-model            = "grok-4.7"
-reasoning_model  = true
-reasoning_effort = "high"
-
-[models."anthropic/claude-3-7-sonnet"]
-account          = "anthropic"
-model            = "claude-3-7-sonnet-20250219"
-thinking_enabled = true
-thinking_budget  = 8192
-
-[models."gemini/2.5-pro"]
-account          = "gemini"
-model            = "gemini-2.5-pro"
-thinking_enabled = true
-thinking_budget  = 8192
-
-[models."mimo/v2.6-pro"]
-account          = "xiaomi-mimo"
-model            = "mimo-v2.6-pro"
-reasoning_model  = true
-reasoning_effort = "high"
-```
-
----
-
-## 📚 Full Documentation & Advanced Guides
+> 💡 **Tutorials & Guides**: Please visit the official documentation portal 👉 **[https://jeikcode.top](https://jeikcode.top)**
 
 For comprehensive tutorials, architectural specifications, and ecosystem integrations, visit the official docs:
 

@@ -243,13 +243,15 @@ function main() {
 
   const isPrerelease = nextVersion.includes('-');
   console.log(`\n📌 Next steps for ${isPrerelease ? 'Prerelease (Beta)' : 'Stable Release'}:`);
-  console.log(`   git commit -am "chore(release): bump version to ${nextTag}"`);
-  console.log(`   git tag ${nextTag}`);
+  console.log(`   1. Update CHANGELOG.md following the standard template (English + --- + Chinese).`);
+  console.log(`      ⚠️  Notice: Do NOT copy changelog history into README files! READMEs maintain a single permanent reference.`);
+  console.log(`   2. git commit -am "chore(release): bump version to ${nextTag}"`);
+  console.log(`   3. git tag ${nextTag}`);
   if (isPrerelease) {
-    console.log(`   git push origin ${nextTag}`);
-    console.log(`   (Or push to beta branch: git push origin beta)`);
+    console.log(`   4. git push origin ${nextTag}`);
+    console.log(`      (Or push to beta branch: git push origin beta)`);
   } else {
-    console.log(`   git push origin main ${nextTag}`);
+    console.log(`   4. git push origin main ${nextTag}`);
   }
   console.log('');
 }

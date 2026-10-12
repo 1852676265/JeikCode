@@ -21,6 +21,36 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.0 (2026-10-13)
+
+- **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and contradictory edit banners**:
+  - Fixed an issue where repeated URLs, common domain prefixes (`https://github.com`), or repeated code identifiers were erroneously truncated during live LLM streaming.
+  - Substring deduplication is now strictly isolated to replay frames, with real-time stream deltas appended reliably via monotonic sequence cursors.
+  - Fixed missing Markdown code blocks and Mermaid diagrams when switching back to a session that completed in the background by properly buffering `artifact_*` events in the background session cache.
+  - Eliminated contradictory "not applied" diff banner on successfully completed file edits.
+- **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay and streamlined release matrices**:
+  - Deployed an official Cloudflare Pages edge function (`/api/releases`) with Atom feed parsing and 70s edge caching, eliminating GitHub API 60 req/hr rate limits for overseas VPN and proxy users.
+  - Release installer links now connect directly to downloadable binaries (Windows `.exe`, macOS `.dmg`, Linux `.deb`/`.AppImage`), completely removing obsolete `.rpm` references.
+  - Streamlined desktop release and portability test matrices, preserving 100% of headless CLI builds across x86_64 and ARM64.
+- **[Documentation & Portal Experience] Dual-channel version indicators and clean quickstart guides**:
+  - The documentation homepage now presents independent Stable and Beta version badges linked directly to respective releases.
+  - Unified Quick Start and Documentation navigation across all README files with direct links to the official portal (`jeikcode.top`).
+
+---
+
+- **[WebUI 实时流式传输与内容完整度] 彻底根除实时流式吞字、后台代码块丢失与编辑状态矛盾**:
+  - 修复大模型流式输出过程中因误判重复帧导致连续相同 URL、域名公共前缀（`https://github.com`）或重复代码标识符被吞字残缺的问题。
+  - 所有子串级去重严格隔离在重放分支，实时流式输出完全依赖单调递增游标可靠就地追加。
+  - 修复在后台会话生成 Markdown 或 Mermaid 图表时切回会话出现内容缺失的缺陷，将 `artifact_*` 代码块事件全量实时同步至后台会话缓存。
+  - 消除文件编辑成功（已完成）时因行数截断误报“预期替换（未写入，仅供参考）”的语义矛盾。
+- **[更新中继与发布工程基建] Cloudflare 边缘零限流发布中继与发布矩阵瘦身**:
+  - 部署官方 Cloudflare Pages 边缘服务（`/api/releases`），通过 Atom 订阅流拉取元数据并执行 70 秒全球 CDN 缓存，彻底终结 GitHub API 60次/小时导致的海外 VPN 与代理出口 IP 限流。
+  - Release 说明下载表格直接提供 Windows `.exe`、macOS `.dmg`、Linux `.deb`/`.AppImage` 安装包直链下载，并彻底移除无用的 `.rpm` 格式。
+  - 精简桌面安装包与跨平台兼容性测试矩阵，同时 100% 完整保留 x86_64 与 ARM64 无头设备 CLI 核心产物。
+- **[文档中心与门户体验] 官网首页双版本指示器与精简上手指南**:
+  - 官网首页并排展示独立的正式版（Stable）与测试版（Beta）版本胶囊，支持动态数据获取与 bump 脚本双兜底同步。
+  - 全面精简中英双语 README，收揽统一为“快速上手与官方文档”，核心教程与高级指南统一收拢至官方文档站点（`jeikcode.top`）。
+
 ## v7.2.3-beta.1 (2026-10-12)
 
 - **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay, streamlined desktop matrix, and dual-channel docs indicators**:

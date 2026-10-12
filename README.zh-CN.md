@@ -81,7 +81,7 @@ irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | 
 
 ---
 
-## 💡 快速上手 (Quick Start)
+## 💡 快速上手与官方文档 (Quick Start & Documentation)
 
 ### 1. 启动体验
 
@@ -110,81 +110,18 @@ jeikcode -p "排查并修复 OAuth 回调 404 错误"
 jeikcode update
 ```
 
-### 2. 模型配置 (`~/.jeikcode/config.toml`)
+### 2. 官方文档与高级指南
 
-首次启动会自动生成配置文件 `~/.jeikcode/config.toml`。你可以使用内置可视化向导或直接配置：
+> 💡 **教程请访问官方文档**：👉 **[https://jeikcode.top](https://jeikcode.top)**
 
-- 终端输入 `/modeladd` 打开可视化交互配置向导；
-- **或直接吩咐 JeikCode**：*“帮我配置小米 MiMo API Key (sk-xxxx) 并设为默认模型”*，JeikCode 会自动调用安全配置工具写入并免重启热重载生效！
-
-典型配置示例：
-
-```toml
-# 默认激活模型
-default_model = "xai/grok-4.7"
-language = "zh-CN"
-
-# ── 1. 账号连接定义 (API Key 与 Base URL) ──
-[provider_accounts.xai]
-provider = "openai-compatible"
-api_key  = "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.x.ai/v1"
-
-[provider_accounts.anthropic]
-provider = "anthropic"
-api_key  = "sk-ant-api03-xxxxxxxxxxxxxxxx"
-
-[provider_accounts.gemini]
-provider = "gemini"
-api_key  = "AIzaxxxxxxxxxxxxxxxxxxxxxxxx"
-
-[provider_accounts.xiaomi-mimo]
-provider = "openai-compatible"
-api_key  = "mimo-xxxxxxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.xiaomimimo.com/v1"
-
-[provider_accounts.ollama]
-provider = "ollama"
-base_url = "http://localhost:11434"
-
-# ── 2. 模型档案定义 (多档位、深度思考与协议映射) ──
-[models."xai/grok-4.7"]
-account          = "xai"
-model            = "grok-4.7"
-reasoning_model  = true
-reasoning_effort = "high"
-
-[models."anthropic/claude-3-7-sonnet"]
-account          = "anthropic"
-model            = "claude-3-7-sonnet-20250219"
-thinking_enabled = true
-thinking_budget  = 8192
-
-[models."gemini/2.5-pro"]
-account          = "gemini"
-model            = "gemini-2.5-pro"
-thinking_enabled = true
-thinking_budget  = 8192
-
-[models."mimo/v2.6-pro"]
-account          = "xiaomi-mimo"
-model            = "mimo-v2.6-pro"
-reasoning_model  = true
-reasoning_effort = "high"
-```
-
----
-
-## 📚 详细文档与进阶指南
-
-JeikCode 拥有完备的官方在线文档库，覆盖深度架构、实战技巧与生态扩展：
+JeikCode 拥有完备的官方在线文档库，覆盖深度架构、模型配置、实战技巧与生态扩展：
 
 - 📖 **官方文档站点**：[https://jeikcode.top](https://jeikcode.top)
 - 🚀 [快速安装与起步指南](https://jeikcode.top/zh/guide/getting-started)
 - ⚙️ [模型接入与配置指南](https://jeikcode.top/zh/guide/login)
-- 🔌 [Model Context Protocol (MCP) 扩展接入](https://jeikcode.top/zh/advanced/mcp)
-- 🧩 [Agent Skills 技能系统开发](https://jeikcode.top/zh/advanced/skills)
-- 🖥️ [WebUI、桌面端与长驻后台 Daemon 部署](https://jeikcode.top/zh/deploy/daemon)
+- 🔌 [Model Context Protocol (MCP) 集成](https://jeikcode.top/zh/advanced/mcp)
+- 🧩 [Agent Skills 技能系统](https://jeikcode.top/zh/advanced/skills)
+- 🖥️ [WebUI、桌面端与后台 Daemon 部署](https://jeikcode.top/zh/deploy/daemon)
 - 📝 [更新日志完整历史 (Changelog)](https://github.com/jeikl/JeikCode/releases)
 
 ---
