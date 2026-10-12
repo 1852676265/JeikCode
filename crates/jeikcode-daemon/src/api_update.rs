@@ -168,7 +168,9 @@ pub fn is_desktop_environment() -> bool {
     std::env::var("JEIKCODE_DESKTOP").is_ok()
 }
 
-const GITHUB_RELEASES_API_URL: &str =
+/// 官方 Cloudflare Pages 全球边缘免限流发布源（经边缘缓存 5 分钟，不受 GitHub API 60次/小时限流影响）
+const DEFAULT_PRIMARY_RELEASES_API_URL: &str = "https://jeikcode.top/api/releases";
+const FALLBACK_GITHUB_RELEASES_API_URL: &str =
     "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=30";
 const GITHUB_LATEST_API_URL: &str = "https://api.github.com/repos/jeikl/JeikCode/releases/latest";
 
@@ -398,13 +400,31 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     let mut released_at = None;
     let mut download_url = None;
 
-    // 优先从 GitHub Releases 列表获取所有最新发布，并根据通道语义化版本算法找出最高版本（实现跨版本直升）
+    // 优先从官方 Cloudflare 边缘缓存源获取所有最新发布（支持 Beta 与 Stable，且全球免限流），
+    // 失败时优雅回退到 GitHub 官方 API 接口
     let mut fetched_release: Option<GitHubRelease> = None;
     if let Some(ref c) = client {
-        if let Ok(resp) = c.get(GITHUB_RELEASES_API_URL).send().await {
+        let primary_url = std::env::var("JEIKCODE_RELEASES_API_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_PRIMARY_RELEASES_API_URL.to_string());
+
+        // 1. 尝试 Cloudflare 边缘免限流源
+        if let Ok(resp) = c.get(&primary_url).send().await {
             if resp.status().is_success() {
                 if let Ok(releases) = resp.json::<Vec<GitHubRelease>>().await {
                     fetched_release = find_highest_release(&releases, channel);
+                }
+            }
+        }
+
+        // 2. 边缘源若未就绪或受阻，回退至 GitHub 官方 API
+        if fetched_release.is_none() {
+            if let Ok(resp) = c.get(FALLBACK_GITHUB_RELEASES_API_URL).send().await {
+                if resp.status().is_success() {
+                    if let Ok(releases) = resp.json::<Vec<GitHubRelease>>().await {
+                        fetched_release = find_highest_release(&releases, channel);
+                    }
                 }
             }
         }
