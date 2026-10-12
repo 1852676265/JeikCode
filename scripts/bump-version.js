@@ -149,9 +149,11 @@ function bumpAllFiles(newVersion) {
 
   // 8. docs-site/.vitepress/theme/HeroImageWithVersion.vue
   if (updateFile(path.join(root, 'docs-site', '.vitepress', 'theme', 'HeroImageWithVersion.vue'), text => {
-    return text
-      .replace(/const version = ref\('v.*?'\)/, `const version = ref('v${newVersion}')`)
-      .replace(/const version = 'v.*?'/, `const version = 'v${newVersion}'`);
+    if (newVersion.includes('-')) {
+      return text.replace(/const betaVersion = ref\('v.*?'\)/, `const betaVersion = ref('v${newVersion}')`);
+    } else {
+      return text.replace(/const stableVersion = ref\('v.*?'\)/, `const stableVersion = ref('v${newVersion}')`);
+    }
   })) updatedFiles.push('docs-site/.vitepress/theme/HeroImageWithVersion.vue');
 
   // 9. docs-site/package.json
