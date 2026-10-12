@@ -152,7 +152,7 @@ impl LifecycleHooks for TodoHook {
     async fn turn_complete(
         &self,
         convo: &Conversation,
-        _reason: &jeikcode_kernel::hook::TurnCompleteReason,
+        _reason: &jeikcode_kernel::event::StopReason,
         _ctx: &TurnCtx,
     ) {
         let todos = derive_current_todos(&convo.messages);

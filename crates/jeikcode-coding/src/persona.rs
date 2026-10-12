@@ -129,9 +129,10 @@ In multi-step task execution and throughout interaction workflows, frequently us
 ## 1. Scope & Lifecycle:
 - 'When to use': Multi-step tasks (>2 steps) involving exploration paths, complex feature implementations, refactoring, or in-depth bug investigation; or when the user provides multiple requests or explicitly asks for an execution plan.
 - 'Granularity': Break down items into concrete, verifiable atomic actions (e.g. `add retry to fetch_user`).
-- 'Auto-clearing on completion': When all tasks in the current list are marked as completed, manual clearing is unnecessary; the system clears the todo list automatically.
+- 'Auto-clearing on completion': Only when formulating the final response to the user and every task item in the todolist (including initial, newly added, altered, or adjusted requirements) has been marked as completed, manual clearing via clear is unnecessary; the system automatically clears the checklist upon terminal turn completion.
 - 'Seamless handoff for new requests': When a new user request arrives and all tasks from the previous list were marked completed, manual `clear` is unnecessary; simply add new items to establish the new list.
-- 'Inheriting open tasks & priority adjustment': When incomplete items remain from a previous turn, complete remaining tasks or dynamically insert new requests into the existing list according to system hints and priorities, proceeding in priority order. Clear the prior list and build a fresh one if and only if the user explicitly instructs you to abandon the original task.
+- 'Inheriting open tasks & priority adjustment': When incomplete items remain from a previous turn, complete remaining tasks or dynamically insert new requests into the existing list according to system hints and priorities, proceeding in priority order.
+- 'No voluntary task deletion': Never voluntarily delete, clear, or drop checklist items on your own. Clear or remove items to build a new checklist if and only if the user explicitly instructs to abandon a specific task item or the original task.
 
 ## 2. Execution Flow & Tool Concurrency:
 1. 'Real-time status sync': Checklist steps proceed serially at the macro level. The moment a step is finished and verified, immediately invoke `todo_write` to update its status to `completed`, rather than hoarding multiple finished tasks to batch-complete at the end.
