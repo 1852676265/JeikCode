@@ -23,6 +23,20 @@
   - **验证与交付**: 运行的单元测试与端到端验证...
 -->
 
+## v7.2.2-beta.4 (2026-10-12)
+
+- **[WebUI / Daemon Streaming] Session-level resume cursor and identity-idempotent canvas**:
+  - **Technical Root Cause / Detail**: The canvas is fed by a single event bus (`/chat/watch`) that carries BOTH replayed buffer frames and live deltas. The client hard-coded "this frame may already be painted" for the whole stream, so `mayPaintUnroutedDelta` rejected every round after the first tool call whenever the session already had an earlier turn — thinking and body text after tool execution never appeared until a manual refresh re-read the disk. Replay de-duplication additionally compared a frame against the concatenation of ALL text parts of a message, so re-sent mid-segments were re-appended (the whole in-flight turn was re-typed) and cross-round frames were glued into the previous round's parts (thinking split in two, body text swallowed).
+  - **Implementation Mechanism**: `/chat/watch` now takes `after_seq` (`-1` = brand-new session → no replay, only a `session_start` handshake carrying the starting cursor; `N` = replay only frames with `seq >= N`; absent = full replay). Replayed frames carry `seq`, live frames do not; the cursor is a strictly increasing SESSION-level counter that survives turn boundaries, context compaction, and history rewrites. Tool boundaries open a new streaming part id (`end_streaming_part`). The WebUI stores the cursor per session and per stream (`streamCursor.ts`), dispatches by WHAT THE CONNECTION REQUESTED instead of guessing per frame, merges replay frames by part id (idempotent), deletes the legacy gate, never merges cross-round frames into the previous round's parts, writes the canvas back to the L1/L2 session cache (debounced 800ms plus forced writes at turn end and on mutations), keeps display monotonic under compaction, and invalidates the cursor (clearing the stale turn buffer server-side) on session mutations.
+  - **Verification & Testing**: `tsc --noEmit` clean; 477 WebUI unit tests pass; 401 daemon lib tests pass; `cargo check --lib -p jeikcode-daemon` clean.
+
+---
+
+- **[WebUI / Daemon 流式传输] 会话级断点续传游标与纯身份幂等画布**:
+  - **技术机理 / 现象溯源**: 画布由单事件总线（`/chat/watch`）推进，而这条流同时搬运回放帧与实时增量。前端对整条流硬编码「这帧可能已经画过」，于是只要会话已有历史回合，`mayPaintUnroutedDelta` 就会拦掉第一轮工具调用之后的每一轮思考与正文 —— 只有手动刷新才出现。回放去重还拿「整条消息所有正文的拼接」当基线：从中间重发的片段被再次追加（整个在途回合被逐帧重打一遍），跨轮的帧还会被粘进上一轮的部件里（思考被拆成两段、正文被吞掉开头）。
+  - **实现防线 / 核心改动**: `/chat/watch` 支持 `after_seq`（`-1` = 新会话 → 不补发，只回一条携带起始游标的 `session_start` 握手帧；`N` = 只补 `seq >= N` 的回放帧；缺省 = 全量补发）。回放帧带 `seq`，实时帧不带；游标为会话级严格递增计数器，跨回合、跨上下文压缩、跨历史改写都成立。工具调用处闭合当前流式部件（`end_streaming_part`），工具前后的正文各自拥有独立段编号。前端新增 `streamCursor.ts` 按会话、按流分别存游标，按「本次连接请求了什么」分发，回放帧按段编号幂等合并，删除旧守卫，跨轮帧绝不并进上一轮，画布反哺 L1/L2 缓存（防抖 800ms + 回合收尾与变更时强制写入），压缩时显示只增不减，会话变更即时作废游标并清空服务端失效缓冲。
+  - **验证与交付**: `tsc --noEmit` 干净；webui 477 项单测全过；daemon 401 项 lib 测试全过；`cargo check --lib -p jeikcode-daemon` 通过。
+
 ## v7.2.2-beta.3 (2026-10-12)
 
 - **[WebUI Live Streaming & Turn Settlement] Unblock multi-round live streaming and auto-reconcile disk at turn boundary**:
