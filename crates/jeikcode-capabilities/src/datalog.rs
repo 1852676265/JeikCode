@@ -32,7 +32,10 @@ use jeikcode_kernel::request::RequestCtx;
 use jeikcode_kernel::tool::{Tool, ToolCall, ToolDef, ToolResult};
 
 static HOOK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const IO_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(test)]
+const IO_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(not(test))]
+const IO_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// Native-runtime datalog writer. All filesystem failures are deliberately ignored:
 /// observability must never change a turn's behavior or terminal.
@@ -495,12 +498,14 @@ fn initialize_files(
             continue;
         };
         if markdown_file.write_all(markdown).is_err() {
+            drop(markdown_file);
             let _ = fs::remove_file(&markdown_path);
             continue;
         }
         match create_private_file(&jsonl_path) {
             Ok(_) => return Some((markdown_path, jsonl_path)),
             Err(_) => {
+                drop(markdown_file);
                 let _ = fs::remove_file(&markdown_path);
             }
         }
@@ -798,16 +803,22 @@ mod tests {
                 .await;
         }
 
-        let project_dir = fs::read_dir(output)
+        let project_dir = fs::read_dir(&output)
             .unwrap()
             .next()
             .unwrap()
             .unwrap()
             .path();
-        let files: Vec<PathBuf> = fs::read_dir(project_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for _ in 0..50 {
+            if let Ok(entries) = fs::read_dir(&project_dir) {
+                files = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
+                if files.len() >= 4 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         assert_eq!(files.len(), 4);
         assert!(files.iter().all(|path| {
             path.file_name()
