@@ -21,6 +21,24 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.5 (2026-10-13)
+
+- **[Agent Shell] Silent delay tasks finish; git log -p is allowed**:
+  - Sleep and other quiet waits keep running until they complete or hit the 30-minute hard cap. Every 60 seconds the shell only rechecks: pagers, REPLs, full-screen TUIs, and foreground servers are still stopped.
+  - `git log -p`, `git show -p`, `git diff -p`, and `git log -i` / `git grep -i` run as normal output commands. Interactive git such as `git add -p` and `git rebase -i` remains blocked.
+- **[Protocol API & WebUI] Conversations stay in the serve workspace**:
+  - OpenAI Chat Completions, Responses, and Anthropic endpoints keep using the directory where `jeikcode serve --host --port` was started. Switching projects in the sidebar no longer moves those sessions into the first project.
+  - The top New Chat button creates a session in the current workspace.
+
+---
+
+- **[Agent 终端] 安静等待任务可以跑完；git log -p 不再被拦截**:
+  - `sleep` 以及没有输出的延迟脚本会一直跑到自己结束，或达到 30 分钟硬顶。每 60 秒只做体检：pager、REPL、全屏 TUI 和前台常驻服务仍会终止。
+  - `git log -p`、`git show -p`、`git diff -p` 以及 `git log -i` / `git grep -i` 按普通输出命令放行。`git add -p`、`git rebase -i` 等真正交互命令继续拦截。
+- **[协议 API 与 WebUI] 对话留在启动工作区**:
+  - OpenAI Chat Completions、Responses、Anthropic 端点继续使用 `jeikcode serve --host --port` 启动时所在目录。侧栏切换项目不再把这些会话送进第一个项目。
+  - 顶部「新建对话」在当前工作区创建会话。
+
 ## v7.2.4-beta.4 (2026-10-13)
 
 - **[Liveness & Stream Timeout Architecture] Three-phase timeout policy, thinking stall detection, and retry hardening**:
