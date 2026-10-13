@@ -763,8 +763,10 @@ async fn run_cli_update(
                 // File is already swapped in place. Restart so remote WebUI /
                 // serve picks up the new image (Unix exec; Windows delayed spawn).
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                    let _ = jeikcode_updater::restart_replaced_process(&exe);
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    let _ = jeikcode_updater::restart_replaced_process(&exe).map_err(|e| {
+                        tracing::error!("in-place upgrade restart failed: {e}");
+                    });
                 });
             }
             jeikcode_updater::UpgradeEvent::Failed(err) => {

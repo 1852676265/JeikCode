@@ -467,49 +467,122 @@ pub async fn run_upgrade_for_channel(
     run_upgrade_with_manifest(manifest, current_version, force, tx).await
 }
 
-/// After an in-place swap, start the new binary with the current argv.
-///
-/// Unix: `execv` (same PID). Windows: spawn the new exe and exit the parent
-/// without waiting so a running `serve`/`webui` can rebind the port once
-/// this process releases it.
-pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> {
+/// Child waits for this parent pid to exit before binding the listen port.
+pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
+
+fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        return re_exec_self(Some(exe));
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(pid as i32, 0) == 0 }
     }
     #[cfg(windows)]
     {
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        // Delay via `cmd` so this process can exit and drop the listen port
-        // before the replacement binary binds it again.
-        let exe_s = exe.display().to_string();
-        let mut tail = String::from("ping 127.0.0.1 -n 3 >nul & ");
-        tail.push('"');
-        tail.push_str(&exe_s);
-        tail.push('"');
-        for a in &args {
-            tail.push(' ');
-            let s = a.to_string_lossy();
-            if s.chars().any(|c| c.is_whitespace()) {
-                tail.push('"');
-                tail.push_str(&s);
-                tail.push('"');
-            } else {
-                tail.push_str(&s);
-            }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
         }
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", &tail])
-            .spawn();
-        std::process::exit(0);
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = exe;
-        Err(anyhow!(
-            "restart after in-place replace is not supported on this OS"
-        ))
+        let _ = pid;
+        false
     }
+}
+
+/// Call at process start, before binding any port. The successor started by
+/// [`restart_replaced_process`] waits here until the old process has exited
+/// and released the listen socket.
+pub fn wait_for_predecessor_if_requested() {
+    let Ok(raw) = std::env::var(RESTART_WAIT_PID_ENV) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    std::env::remove_var(RESTART_WAIT_PID_ENV);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn supervised_by_service_manager() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("LAUNCH_JOBNAME").is_some()
+        || std::env::var_os("XPC_SERVICE_NAME").is_some()
+}
+
+/// After an in-place swap, start the new binary with the current argv, then
+/// exit this process so the listen port is released.
+///
+/// Spawn a detached successor that waits for this pid (`RESTART_WAIT_PID_ENV`)
+/// before binding. Do not use `cmd.exe`: the helper is killed when this
+/// process exits. Under systemd/launchd, `exec` keeps the supervised pid.
+///
+/// If the successor cannot be started, returns `Err` and the caller MUST keep
+/// serving so a remote browser is not left with a dead port.
+pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> {
+    #[cfg(unix)]
+    if supervised_by_service_manager() {
+        return re_exec_self(Some(exe));
+    }
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args)
+        .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        extern "C" {
+            fn setsid() -> i32;
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("spawning replacement binary {}", exe.display()))?;
+    std::process::exit(0);
 }
 
 /// Fetch and parse `Manifest` from a specific manifest URL.

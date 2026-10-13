@@ -1492,6 +1492,10 @@ fn main() {
         return;
     }
 
+    // Successor after an in-place WebUI/serve upgrade waits here until the
+    // old process has exited and released the listen port.
+    jeikcode_updater::wait_for_predecessor_if_requested();
+
     // Before any thread or child process exists: a Git-Bash launch leaves TMP/TEMP/TMPDIR
     // as POSIX paths, which native children spawned directly (not via the bash tool) would
     // resolve as `<drive>:\tmp`. Best-effort and cheap; a no-op when already native.

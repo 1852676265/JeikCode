@@ -87,7 +87,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         try {
           window.location.reload();
         } catch {}
-      }, 2500);
+      }, 4000);
     };
     if (updating) {
       timer = setInterval(async () => {
