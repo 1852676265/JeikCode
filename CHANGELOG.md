@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.9 (2026-10-14)
+
+- **[Updates] Force reinstall and dual-copy CLI swap**:
+  - When the channel latest equals the running version, the WebUI button becomes Force Update (zh / en / vi) and re-downloads the binary. A newer latest still shows Update Now.
+  - An in-place upgrade replaces the running binary, `~/.local/bin`, PATH copies, and the desktop bundled `cli-bin`, then restarts with the original argv so `--token` stays the same.
+  - Desktop launch keeps a newer `~/.local/bin` instead of copying an older installer resource over it.
+
+---
+
+- **[更新] 强制更新与双份 CLI 替换**:
+  - 当前版本与通道最新版相同时，WebUI 按钮变为「强制更新」（中/英/越）并重新下载二进制。有更新版本时仍显示「立即更新」。
+  - 就地升级会替换正在运行的二进制、`~/.local/bin`、PATH 副本以及桌面安装包里的 `cli-bin`，然后用原 argv 重启，带 `--token` 时秘钥保持不变。
+  - 桌面启动时若 `~/.local/bin` 更新，不再用安装包里的旧资源盖回去。
+
 ## v7.2.4-beta.8 (2026-10-14)
 
 - **[Updates] In-place upgrade no longer kills remote WebUI**:
