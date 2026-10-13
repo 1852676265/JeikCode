@@ -655,7 +655,8 @@ export function App() {
 
   function handleNewSession(targetDir?: string) {
     setSidebarOpen(false);
-    openNewSession(targetDir || '~');
+    // Top-level 「新建对话」 stays in the current/serve workspace.
+    openNewSession(targetDir || cwd || undefined);
   }
 
   function applySessionSelection(session: SessionMetaWithProject) {

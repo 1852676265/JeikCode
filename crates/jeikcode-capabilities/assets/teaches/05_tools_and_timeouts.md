@@ -6,16 +6,18 @@
 
 ## 1. 命令类工具硬寿命与空闲探测 (`[tools.bash]`)
 
-控制 `run_command` 等生成子进程的执行超时与空闲终止：
+控制 `run_command` 等生成子进程的执行超时与空闲体检：
 
 ```toml
 [tools.bash]
 max_timeout_secs = 1800         # 子进程硬上限（秒，默认 1800 = 30 分钟）。到期强制终止，模型无法覆盖
 default_timeout_secs = 120      # 仅供用户 !cmd 省略超时参数时的默认超时（秒）
-silent_kill_secs = 60           # 第一档空闲探测：无任何新输出满 60 秒时触发探测（0 为关闭）
-second_levell_secs = 120        # 第二档宽限：有过输出但之后输出中断且 CPU 空闲时的等待秒数（0 为关闭宽限）
-long_bash_command_keyword = []  # 长任务关键词列表（如 ["build", "test"]）。匹配的命令豁免空闲探测，可跑至硬上限
+silent_kill_secs = 60           # 短命令复查间隔（秒）：到点只体检，不因安静等待就杀（0 为关闭复查）
+second_levell_secs = 120        # 自动升档后的空闲窗口（秒）
+long_bash_command_keyword = []  # 长任务关键词列表（如 ["build", "test"]）。匹配的命令豁免空闲复查，可跑至硬上限
 ```
+
+短命令每到 `silent_kill_secs` 做一次体检：pager/REPL/全屏 TUI 指纹与前台常驻服务会被终止；CPU 忙碌则升为长任务；进程仍活着、CPU 空闲、没有新字节、也没有交互指纹时当作等待，继续跑到自己退出或 `max_timeout_secs`。
 
 ### 1.1 `run_command` 细微调用参数说明
 - **后台常驻服务 (`"background": true`)**：

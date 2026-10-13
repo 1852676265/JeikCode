@@ -1,10 +1,14 @@
 //! `bash` — run a shell command in the working directory until it exits, the
-//! configured `[tools.bash] max_timeout_secs` hard cap, a short-command idle
-//! kill (`[tools.bash] silent_kill_secs`, skipped for compile/test families),
-//! or cancel (cancel ⇒ the child is killed via `kill_on_drop`). Live
+//! configured `[tools.bash] max_timeout_secs` hard cap, or cancel (cancel ⇒
+//! the child is killed via `kill_on_drop`). `[tools.bash] silent_kill_secs` is
+//! a short-command **recheck interval** (skipped for compile/test families):
+//! pager/REPL/TUI fingerprints and foreground resident servers are killed;
+//! CPU-busy work is auto-promoted; a silent CPU-idle process with no
+//! interactive fingerprint keeps running until exit or the hard cap. Live
 //! stdout/stderr is forwarded through [`ToolContext::progress`]. There is no
 //! per-call `timeout` argument: the model does not choose a wait budget.
-//! Captured output is kept even when the hard cap or idle kill stops the process.
+//! Captured output is kept even when the hard cap or a fingerprint kill stops
+//! the process.
 //!
 //! `risk()` is ARG-AWARE: a command is `Risky` only when [`check_destructive_command`]
 //! flags it (a faithful port of the production destructive-command classifier —
@@ -943,42 +947,10 @@ impl Tool for BashTool {
                                     ),
                                 )));
                             }
-                            let already_second = live.second_level.swap(true, Ordering::SeqCst);
-                            if has_output()
-                                && second_levell_secs > 0
-                                && !already_second
-                                && !live.promoted.load(Ordering::SeqCst)
-                            {
-                                *last_byte.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Instant::now();
-                                progress.emit(format!(
-                                    "[bash second-level idle {second_levell_secs}s] \
-                                     output already seen; giving a silent compile a chance to start.\n"
-                                ));
-                            } else if has_output()
-                                && !live.promoted.load(Ordering::SeqCst)
-                            {
-                                break Drive::Yield;
-                            } else {
-                            #[cfg(windows)]
-                            crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-                            #[cfg(not(target_os = "windows"))]
-                            if let Some(pgid) = child_pid {
-                                unsafe { killpg(pgid as i32, SIGKILL) };
-                            }
-                            runtime.unregister_live_bash(child_pid_val);
-                            let (out, errb) = snapshot();
-                            break Drive::Result(err(with_note(
-                                &out,
-                                &errb,
-                                &format!(
-                                    "bash: no new output for {idle_note_secs}s and the process is idle \
-                                     (pager, follow/watch, REPL, or waiting for a key). \
-                                     Captured output is above. Do not retry the same blocking command. \
-                                     Resident services must be started detached (nohup/systemd/docker -d)."
-                                ),
-                            )));
-                            }
+                            // Silent wait: `silent_kill_secs` is a recheck interval.
+                            // No pager/REPL/TUI fingerprint → keep running until the
+                            // process exits or `max_timeout_secs`.
+                            *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                         }
                         IdleAction::KillResident => {
                             #[cfg(windows)]
@@ -1184,11 +1156,11 @@ fn shell_tool_description(
              key or Ctrl+C — they hang the tool even after the useful output is printed. \
              Use one-shot flags (`--no-pager`, `-n`, `-c`, `--batch`) and \
              `systemctl is-active`/`show` or `ss`/`lsof` for ports. Never chain a \
-             blocking command with later steps in one call. Short commands idle after \
-             config `silent_kill_secs`: CPU-busy work is auto-promoted to a batch job; \
-             disk/network IO is NOT auto-promoted and takes the `second_levell_secs` \
-             grace, then `[bash-await-decision]` so you can kill or temporarily upgrade. \
-             A silent idle with no output is killed (pager/REPL). \
+             blocking command with later steps in one call. Short commands recheck \
+             every config `silent_kill_secs`: CPU-busy work is auto-promoted to a batch job; \
+             pager/REPL/TUI fingerprints and foreground resident servers are killed. \
+             A silent CPU-idle process with no interactive fingerprint is a wait and \
+             keeps running until it exits or `max_timeout_secs`. \
              Resident servers (uvicorn/nginx/npm run dev) should be started with background=true (or started detached). \
              Compile/test families wait on `max_timeout_secs`."
         };
@@ -4117,17 +4089,13 @@ pub fn check_interactive_command(command: &str) -> Option<String> {
             }
         }
 
-        // 3. Git interactive prompts
-        if bin == "git" {
-            let has_interactive_flag = args.iter().any(|a| {
-                let w = arg_word(a);
-                matches!(w, "-p" | "--patch" | "-i" | "--interactive")
-            });
-            if has_interactive_flag {
-                return Some(
-                    "bash: interactive git flag (-p/--patch/-i/--interactive) requires a TTY and cannot run. Use non-interactive git commands instead.".to_string(),
-                );
-            }
+        // 3. Git interactive prompts. Flag meaning is subcommand-specific:
+        // `git log -p` / `git show -p` dump patches; `git log -i` is ignore-case.
+        // Only hunk-picking / interactive-add / rebase -i need a TTY.
+        if bin == "git" && git_args_are_interactive(args) {
+            return Some(
+                "bash: interactive git flag (-p/--patch/-i/--interactive) requires a TTY and cannot run. Use non-interactive git commands instead.".to_string(),
+            );
         }
 
         // 4. Bare REPLs (only when stdin is not redirected/piped)
@@ -4714,6 +4682,56 @@ fn arg_word(s: &str) -> &str {
     s.trim_matches(|c| c == '"' || c == '\'' || c == '`')
 }
 
+/// Git global flags that consume the next argv token before the subcommand.
+const GIT_GLOBAL_VALUE_FLAGS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+    "--list-cmds",
+    "--attr-source",
+];
+
+fn git_invocation_subcommand(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let w = arg_word(&args[i]);
+        if w.starts_with('-') {
+            let glued = w.contains('=');
+            let takes_value = GIT_GLOBAL_VALUE_FLAGS
+                .iter()
+                .any(|f| w.eq_ignore_ascii_case(f));
+            i += if takes_value && !glued { 2 } else { 1 };
+            continue;
+        }
+        return Some(w);
+    }
+    None
+}
+
+/// `-p`/`-i` are interactive only on the subcommands that pick hunks or open a TUI.
+fn git_args_are_interactive(args: &[String]) -> bool {
+    let Some(sub) = git_invocation_subcommand(args) else {
+        return false;
+    };
+    let patch_picks_hunks = matches!(
+        sub,
+        "add" | "checkout" | "restore" | "reset" | "stash" | "commit"
+    );
+    let dash_i_is_tui = matches!(sub, "add" | "rebase" | "clean" | "commit");
+    args.iter().any(|a| {
+        let w = arg_word(a);
+        match w {
+            "-p" | "--patch" => patch_picks_hunks,
+            "-i" | "--interactive" => dash_i_is_tui,
+            _ => false,
+        }
+    })
+}
+
 /// Non-flag argv words. Skips `-x`, `--foo`, and cargo toolchains (`+nightly`).
 fn non_flag_words(args: &[String]) -> Vec<&str> {
     args.iter()
@@ -5134,9 +5152,9 @@ pub(crate) fn looks_like_resident_service(command: &str) -> bool {
         .any(|tok| RESIDENT_BINS.contains(&command_basename(tok).as_str()))
 }
 
-/// Idle budget for agent `bash` / `!cmd` short commands from
+/// Recheck interval for agent `bash` short commands from
 /// `[tools.bash] silent_kill_secs`. Long compile/install subcommands skip it.
-/// Unknown binaries are short. `silent_kill_secs = 0` disables.
+/// Unknown binaries are short. `silent_kill_secs = 0` disables rechecks.
 fn agent_bash_idle_timeout(command: &str, silent_kill_secs: u64) -> Option<Duration> {
     let runtime = legacy_bash_runtime_state();
     agent_bash_idle_timeout_with_runtime(runtime.as_ref(), command, silent_kill_secs)
@@ -7600,37 +7618,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn execute_idle_kills_short_command_with_no_output() {
+    async fn execute_silent_sleep_survives_idle_recheck() {
         let _guard = super::TestIdleGuard::set(1);
         let d = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let r = BashTool
-            .execute(r#"{"command":"sleep 30"}"#, &ctx(d.path()))
+            .execute(r#"{"command":"sleep 2"}"#, &ctx(d.path()))
             .await;
         assert!(
             started.elapsed() < Duration::from_secs(8),
-            "idle kill should return in ~1s, took {:.1}s",
+            "sleep 2 should finish on its own, took {:.1}s",
             started.elapsed().as_secs_f64()
         );
-        assert!(r.is_error, "{}", r.content);
         assert!(
-            r.content.contains("process is idle") || r.content.contains("stuck"),
-            "idle-kill note missing: {}",
+            !r.is_error,
+            "silent wait must not be idle-killed: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("process is idle"),
+            "must not report idle-kill: {}",
             r.content
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn execute_idle_after_output_kills_when_cpu_idle() {
+    async fn execute_output_then_sleep_survives_idle_recheck() {
         let _guard = super::TestIdleGuard::set(1);
         let d = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let r = BashTool
-            .execute(r#"{"command":"echo ready && sleep 30"}"#, &ctx(d.path()))
+            .execute(r#"{"command":"echo ready && sleep 2"}"#, &ctx(d.path()))
             .await;
         assert!(
             started.elapsed() < Duration::from_secs(8),
-            "idle path should return in ~1s, took {:.1}s",
+            "echo+sleep 2 should finish on its own, took {:.1}s",
             started.elapsed().as_secs_f64()
         );
         assert!(
@@ -7638,16 +7660,17 @@ mod tests {
             "captured output must be kept: {}",
             r.content
         );
-        let killed = r.is_error
-            && (r.content.contains("process is idle")
-                || r.content.contains("stuck")
-                || r.content.contains("resident service"));
-        let asked = r
-            .content
-            .contains(crate::tools::bash_runtime::AWAIT_DECISION_MARK);
         assert!(
-            killed || asked,
-            "0-CPU after output must kill (or await if CPU sample unknown): {}",
+            !r.is_error,
+            "wait after output must not be idle-killed: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("process is idle")
+                && !r
+                    .content
+                    .contains(crate::tools::bash_runtime::AWAIT_DECISION_MARK),
+            "must not idle-kill or await-decision a finite sleep: {}",
             r.content
         );
     }
@@ -7938,7 +7961,7 @@ mod tests {
         assert!(check_interactive_command("btop").is_some());
         assert!(check_interactive_command("top -b -n 1").is_none());
 
-        // Git interactive flags
+        // Git interactive flags (hunk picking / rebase -i)
         assert!(check_interactive_command("git add -p").is_some());
         assert!(check_interactive_command("git checkout -p").is_some());
         assert!(check_interactive_command("git rebase -i HEAD~2").is_some());
@@ -7946,6 +7969,16 @@ mod tests {
         assert!(check_interactive_command("git add .").is_none());
         assert!(check_interactive_command("git commit -m 'feat: test'").is_none());
         assert!(check_interactive_command("git rebase --continue").is_none());
+        // `git log/show/diff/grep -p|-i` are output/search flags, not a TTY picker.
+        assert!(check_interactive_command(r#"git log -S "allow-lan" -p myori.yaml"#).is_none());
+        assert!(
+            check_interactive_command("cd config && git log -S allow-lan -p myori.yaml").is_none()
+        );
+        assert!(check_interactive_command("git show -p HEAD").is_none());
+        assert!(check_interactive_command("git diff -p").is_none());
+        assert!(check_interactive_command("git log -i -S foo").is_none());
+        assert!(check_interactive_command("git grep -i -p allow-lan").is_none());
+        assert!(check_interactive_command("git -C config log -p myori.yaml").is_none());
 
         // Bare REPLs
         assert!(check_interactive_command("python").is_some());

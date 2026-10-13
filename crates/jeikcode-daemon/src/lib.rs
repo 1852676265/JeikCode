@@ -2560,6 +2560,12 @@ pub struct AppState {
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
     pub bind_host: String,
     pub bind_port: u16,
+    /// Workspace the OpenAI / Responses / Anthropic protocol surface is pinned
+    /// to: the directory this process was started in (`jeikcode serve --host
+    /// --port` cwd, or `working_dir_override`). WebUI multi-project switches
+    /// update `project` for the session panel; they must not move protocol
+    /// conversations into the first sidebar project.
+    pub bind_working_dir: PathBuf,
     /// This instance's port-scoped webui cookie name (`jeikcode_webui_<port>`),
     /// resolved ONCE at construction from the actual bound port. Read it directly
     /// — never re-derive the name from the bare `WEBUI_COOKIE` const at a call
@@ -11652,6 +11658,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         pending_user_inputs: permission_bridge::UserInputResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
+        bind_working_dir: initial_mcp_project.clone(),
         // `port` here is the ACTUAL bound port (the enforce_token=true webui path
         // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
         // instances get distinct cookie names.
@@ -12808,6 +12815,7 @@ mod tests {
             pending_user_inputs: permission_bridge::UserInputResponders::new(),
             bind_host: "127.0.0.1".into(),
             bind_port: 13456,
+            bind_working_dir: working_dir.clone(),
             webui_cookie_name: auth_token::webui_cookie_name(13456),
             yolo: false,
             token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -12843,6 +12851,24 @@ mod tests {
             event_rx.try_recv(),
             Ok(ChatEvent::SessionAssigned { session_id: assigned }) if assigned == session_id
         ));
+    }
+
+    #[test]
+    fn protocol_bind_dir_stays_on_serve_cwd_when_webui_switches_project() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let bind = state.bind_working_dir.clone();
+        let other = home._dir.path().join("other-project");
+        std::fs::create_dir_all(&other).unwrap();
+        {
+            let mut project = state.project.try_write().expect("project lock");
+            crate::update_project_state(&mut project, &other);
+        }
+        assert_eq!(state.bind_working_dir, bind);
+        assert_ne!(
+            state.project.try_read().expect("project lock").working_dir,
+            state.bind_working_dir
+        );
     }
 
     #[test]

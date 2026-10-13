@@ -91,7 +91,8 @@ pub enum BusyKind {
 pub enum IdleAction {
     /// Keep running; treat this invocation as a batch job.
     AutoPromote,
-    /// Pager / REPL / wait-for-key. Kill, keep captured output.
+    /// CPU idle with no new bytes. The driver kills only when an interactive
+    /// fingerprint is present; otherwise this is a wait recheck.
     #[allow(dead_code)]
     KillStuck,
     /// Foreground server. Kill and tell the model to detach.

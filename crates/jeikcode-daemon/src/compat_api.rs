@@ -10,6 +10,12 @@
 //! - `GET  /v1/sessions`            — list JeikCode sessions (filter by `user` title)
 //! - `GET  /v1/sessions/:id`        — session detail
 //!
+//! Workspace: protocol turns are pinned to `AppState.bind_working_dir` (the
+//! directory `jeikcode serve --host --port` was started in). WebUI multi-project
+//! switches update the live `project` for the session panel; they do not move
+//! `/v1/chat/completions`, `/v1/responses`, or `/v1/messages` into the first
+//! sidebar project.
+//!
 //! Design (JeikCode core, not a dumb proxy):
 //! - Client multi-turn history is **ignored**; only the latest user query is admitted.
 //! - System prompts from the request are appended **after** AGENTS.md / glossary / db packs.
@@ -558,7 +564,7 @@ pub(crate) async fn list_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionListQuery>,
 ) -> Response {
-    let working_dir = state.project.read().await.working_dir.clone();
+    let working_dir = state.bind_working_dir.clone();
     let limit = q.limit.unwrap_or(100).min(500);
     let filter = normalize_session_key(q.user.as_deref());
     let data: Vec<CompatSession> = list_project_sessions(&working_dir)
@@ -585,7 +591,7 @@ pub(crate) async fn list_sessions(
 
 /// GET /v1/sessions/:id  (UUID, prefix, or exact session key / `user` value)
 pub(crate) async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let working_dir = state.project.read().await.working_dir.clone();
+    let working_dir = state.bind_working_dir.clone();
     let key = normalize_session_key(Some(id.as_str())).unwrap_or(id.clone());
     match list_project_sessions(&working_dir)
         .into_iter()
@@ -902,7 +908,7 @@ pub(super) enum WireFormat {
 }
 
 async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) -> Response {
-    let working_dir = state.project.read().await.working_dir.clone();
+    let working_dir = state.bind_working_dir.clone();
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "config_error"),

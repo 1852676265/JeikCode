@@ -1831,7 +1831,7 @@ export function Sidebar({
           </button>
           <button
             class="rail-btn"
-            onClick={() => onNew('~')}
+            onClick={() => onNew()}
             title={t('sidebar.newChat')}
             aria-label={t('sidebar.newChat')}
           >
@@ -1933,7 +1933,7 @@ export function Sidebar({
       </div>
 
       <div class="sidebar-actions">
-        <button class="sidebar-action" onClick={() => { exitSelectMode(); onNew('~'); }}>
+        <button class="sidebar-action" onClick={() => { exitSelectMode(); onNew(); }}>
           <span class="sidebar-action-icon"><PlusIcon /></span>
           <span class="sidebar-action-label">{t('sidebar.newChat')}</span>
         </button>
