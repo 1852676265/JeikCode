@@ -21,6 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.8 (2026-10-14)
+
+- **[Updates] In-place upgrade no longer kills remote WebUI**:
+  - After replacing the binary, a detached successor waits for the old process to exit and then binds the same port. Windows no longer uses a `cmd` helper that died with the parent.
+  - If the successor cannot start, the old process keeps serving so a remote browser is not left with connection refused.
+
+---
+
+- **[更新] 就地升级不再把异地 WebUI 杀停**:
+  - 替换二进制后，脱离的后继进程会等旧进程退出再绑定同一端口。Windows 不再使用会随父进程一起退出的 `cmd` 助手。
+  - 后继进程拉不起来时，旧进程继续提供服务，避免异地浏览器刷出「无法访问」。
+
 ## v7.2.4-beta.7 (2026-10-14)
 
 - **[Agent Shell] Quiet waits finish on macOS**:
