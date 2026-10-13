@@ -23,7 +23,7 @@ fn _isolate_jeikcode_home() {
 
 fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {
     let mut c = CodingAgentConfig::new("k", "http://unused", "test-model", working_dir);
-    c.stream_timeout = Duration::from_secs(5);
+    c.timeouts = c.timeouts.with_content_liveness(Duration::from_secs(5));
     c.request_timeout = Some(Duration::from_secs(5));
     c
 }

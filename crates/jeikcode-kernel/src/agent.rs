@@ -131,7 +131,7 @@ const MAX_STREAM_RETRIES: u32 = 5;
 /// re-issues the same round (per-round accumulators reset on `continue`, so
 /// partial output is never double-pushed). After this budget the turn fails with
 /// the explicit "model unresponsive / high latency" terminal error. User-facing
-/// expectation: 60s wait × retry3 → "模型延迟过高,请稍后再试".
+/// expectation: 180s wait × retry3 → "模型延迟过高,请稍后再试".
 const MAX_FIRST_TOKEN_RETRIES: u32 = 3;
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
@@ -494,11 +494,17 @@ fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
 /// case. `ctx_window == 0` (window unknown) can never claim an over-size cause.
 fn empty_exhaustion_message(
     saw_malformed: bool,
+    thinking_only: bool,
     est_prompt_tokens: u32,
     ctx_window: u32,
     max_retries: u32,
     already_advised: bool,
 ) -> String {
+    if thinking_only {
+        return format!(
+            "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。可直接重试，或稍后再试。"
+        );
+    }
     if saw_malformed {
         return format!(
             "模型连续 {max_retries} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。"
@@ -1045,14 +1051,9 @@ pub struct Agent {
     /// Optional durable writer for committed manual compactions. `None` is an
     /// explicitly ephemeral agent; session-bound production assembly injects one.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: max time to wait for the NEXT stream event (bounds both
-    /// first-token and inter-token latency). `None` (default) = unbounded. See
-    /// `AgentBuilder::stream_timeout`.
-    stream_timeout: Option<std::time::Duration>,
-    /// LIVENESS: max wall-clock wait for the FIRST stream token of a round,
-    /// before any content. `None` (default) = no first-token arm. See
-    /// `AgentBuilder::first_token_timeout`.
-    first_token_timeout: Option<std::time::Duration>,
+    /// LIVENESS: transport + three-phase content clocks. See [`TimeoutPolicy`].
+    /// Content fields default `None` (unbounded) on the neutral kernel.
+    timeouts: crate::timeouts::TimeoutPolicy,
     /// Max re-issues after a first-token timeout (see
     /// `AgentBuilder::first_token_timeout_retries`). Default
     /// [`MAX_FIRST_TOKEN_RETRIES`].
@@ -1160,8 +1161,7 @@ impl Agent {
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
-            stream_timeout: self.stream_timeout,
-            first_token_timeout: self.first_token_timeout,
+            timeouts: self.timeouts,
             first_token_retries: self.first_token_retries,
             chat_options: self.chat_options,
             // Resolve the effective working dir into a single shared handle: an explicit
@@ -1269,11 +1269,8 @@ struct RunningAgent {
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
-    stream_timeout: Option<std::time::Duration>,
-    /// LIVENESS: first-token wall-clock wait bound (see `Agent::first_token_timeout`).
-    /// `None` = no first-token arm.
-    first_token_timeout: Option<std::time::Duration>,
+    /// LIVENESS: three-phase content clocks + transport defaults.
+    timeouts: crate::timeouts::TimeoutPolicy,
     /// Max times a round is re-issued after a first-token timeout. Set by the
     /// specialization (config `[coding] first_token_timeout_retries` / env) and
     /// forwarded to the stream loop, replacing the old hard-coded constant.
@@ -2739,6 +2736,7 @@ impl RunningAgent {
             // empty 200), so it must NOT be retried as empty. Set true on the raw
             // arrival in each content arm below.
             let mut saw_stream_content = false;
+            let mut saw_text_or_tool = false;
             let mut saw_suppressed_reasoning_filler = false;
             // Did the adapter report dropping an UNPARSEABLE chunk this round (a
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
@@ -2747,6 +2745,8 @@ impl RunningAgent {
             // Set to true by the mid-stream 429 WaitAndRetry arm so we can break
             // out of the inner stream loop and retry the round from the outer loop.
             let mut retry_this_round = false;
+            let mut phase = crate::timeouts::StreamPhase::Ttft;
+            let mut last_content = tokio::time::Instant::now();
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -2754,16 +2754,13 @@ impl RunningAgent {
                 // nothing dangling to backfill: just emit Cancelled + TurnComplete
                 // and return (no bogus partial-success assistant message).
                 //
-                // LIVENESS stream timeout: when `stream_timeout` is Some(d), a THIRD
-                // arm races EACH `stream.next()` await against `sleep(d)` — bounding
-                // BOTH first-token AND inter-token latency (every await of the next
-                // event is bounded). The arm is GUARDED by `if .. .is_some()`: when
-                // None the arm is disabled and `sleep` is never even constructed, so
-                // the None path polls NO timer (unbounded, exactly as today). On
-                // timeout we take the EXISTING clean-fail path — identical to a
-                // mid-stream StreamEvent::Error: on_error + Error + TurnComplete +
-                // return (no partial assistant pushed, no fake success). `biased`
-                // keeps cancel first; the timer is tried before the (silent) stream.
+                // Three-phase content clock: TTFT / thinking→text transition /
+                // sliding window. Deadline is Instant-based so ResponseId / Usage
+                // / keepalive cannot reset it. `biased` keeps cancel first.
+                let phase_deadline = self
+                    .timeouts
+                    .phase_limit(phase)
+                    .map(|limit| last_content + limit);
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -2781,94 +2778,86 @@ impl RunningAgent {
                         self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                         return;
                     }
-                    _ = async { tokio::time::sleep(self.first_token_timeout.unwrap()).await }, if !saw_stream_content && self.first_token_timeout.is_some() => {
-                        // FIRST-TOKEN TIMEOUT: the model has emitted NO token within
-                        // `first_token_timeout` this round. Distinct from the stream
-                        // timeout arm below (which bounds EVERY inter-token gap): this
-                        // only fires when SO FAR the provider has produced nothing.
-                        // Re-issue the same round up to MAX_FIRST_TOKEN_RETRIES times
-                        // (fresh connection + reset per-round accumulators via
-                        // `continue`, so no partial output is ever double-pushed).
-                        // Guarded on `!saw_stream_content` so once ANY token arrives
-                        // the first-token arm is inert for the rest of the round.
-                        let first_token_secs = self.first_token_timeout.unwrap().as_secs();
-                        let retry_budget = self.first_token_retries;
-                        if first_token_retries < retry_budget {
-                            first_token_retries += 1;
-                            self.rt.emit(AgentEvent::Warning(format!(
-                                "模型延迟高:{} 秒内无响应,正在重试({}/{})…",
-                                first_token_secs, first_token_retries, retry_budget
-                            )));
-                            // Cancellable wait so Esc during the retry gap aborts.
-                            tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
-                                    return;
+                    _ = async { tokio::time::sleep_until(phase_deadline.unwrap()).await }, if phase_deadline.is_some() => {
+                        if phase == crate::timeouts::StreamPhase::Thinking && !saw_text_or_tool {
+                            phase = crate::timeouts::StreamPhase::Transition;
+                            last_content = tokio::time::Instant::now();
+                            continue;
+                        }
+                        if !saw_text_or_tool && !saw_stream_content {
+                            if self.timeouts.ttft.is_some() {
+                                let first_token_secs = self
+                                    .timeouts
+                                    .phase_limit(crate::timeouts::StreamPhase::Ttft)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let retry_budget = self.first_token_retries;
+                                if first_token_retries < retry_budget {
+                                    first_token_retries += 1;
+                                    self.rt.emit(AgentEvent::Warning(format!(
+                                        "模型延迟高:{} 秒内无响应,正在重试({}/{})…",
+                                        first_token_secs, first_token_retries, retry_budget
+                                    )));
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => {
+                                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                            return;
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                    }
+                                    retry_this_round = true;
+                                    break;
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                let msg = format!(
+                                    "模型延迟过高,请稍后再试(连续 {} 次在 {} 秒内未收到首token)",
+                                    retry_budget, first_token_secs
+                                );
+                                self.hooks.on_error(&msg).await;
+                                self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
+                                Self::persist_turn_diagnostic(convo, &msg);
+                                self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
+                                return;
                             }
-                            retry_this_round = true;
+                            if stream_retry < MAX_STREAM_RETRIES {
+                                stream_retry += 1;
+                                self.rt.emit(AgentEvent::Warning(format!(
+                                    "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
+                                )));
+                                let backoff = std::time::Duration::from_millis(
+                                    (200u64 << (stream_retry - 1).min(31)).min(8_000),
+                                );
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(backoff) => {}
+                                }
+                                retry_this_round = true;
+                                break;
+                            }
+                            let msg = "stream timeout after automatic reconnects".to_string();
+                            self.hooks.on_error(&msg).await;
+                            self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
+                            Self::persist_turn_diagnostic(convo, &msg);
+                            self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
+                            return;
+                        }
+                        if !saw_text_or_tool {
                             break;
                         }
-                        // Budget spent: fail with the explicit high-latency terminal
-                        // error (user-facing expectation: "模型延迟过高,请稍后再试").
-                        let msg = format!(
-                            "模型延迟过高,请稍后再试(连续 {} 次在 {} 秒内未收到首token)",
-                            retry_budget, first_token_secs
+                        Self::persist_partial_assistant(
+                            convo,
+                            &assistant_text,
+                            &reasoning,
+                            &reasoning_blocks,
+                            &pending_calls,
+                            suppress_internal_stream,
+                            Some(&assistant_message_id),
                         );
-                        self.hooks.on_error(&msg).await;
-                        self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
-                        Self::persist_turn_diagnostic(convo, &msg);
-                        self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
-                        return;
-                    }
-                    _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
-                        // STREAM IDLE TIMEOUT: no event for `stream_timeout`. Rather than
-                        // fail the turn outright, RECONNECT up to MAX_STREAM_RETRIES times
-                        // (codex parity) — re-issue the SAME round from history (the
-                        // per-round accumulators reset on `continue`, so partial output is
-                        // discarded and never pushed), with exponential backoff. Only after
-                        // the budget is spent do we take the clean-fail path.
-                        if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
-                            stream_retry += 1;
-                            self.rt.emit(AgentEvent::Warning(format!(
-                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
-                            )));
-                            // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
-                            let backoff = std::time::Duration::from_millis(
-                                // `.min(31)` on the shift keeps it well-defined if
-                                // MAX_STREAM_RETRIES is ever raised past 32 (the cap
-                                // clamps the value regardless).
-                                (200u64 << (stream_retry - 1).min(31)).min(8_000),
-                            );
-                            tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
-                                    return;
-                                }
-                                _ = tokio::time::sleep(backoff) => {}
-                            }
-                            retry_this_round = true;
-                            break;
-                        }
-                        if saw_stream_content {
-                            Self::persist_partial_assistant(
-                                convo,
-                                &assistant_text,
-                                &reasoning,
-                                &reasoning_blocks,
-                                &pending_calls,
-                                suppress_internal_stream,
-                                Some(&assistant_message_id),
-                            );
-                        }
-                        let msg = if saw_stream_content {
-                            "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved"
-                        } else {
-                            "stream timeout after automatic reconnects"
-                        }.to_string();
+                        let msg = "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved".to_string();
                         self.hooks.on_error(&msg).await;
                         self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
                         Self::persist_turn_diagnostic(convo, &msg);
@@ -2880,6 +2869,16 @@ impl RunningAgent {
                         None => break,
                     },
                 };
+                if ev.is_thinking() {
+                    saw_stream_content = true;
+                    phase = crate::timeouts::StreamPhase::Thinking;
+                    last_content = tokio::time::Instant::now();
+                } else if ev.is_visible_output() {
+                    saw_stream_content = true;
+                    saw_text_or_tool = true;
+                    phase = crate::timeouts::StreamPhase::Streaming;
+                    last_content = tokio::time::Instant::now();
+                }
                 match &ev {
                     StreamEvent::Reasoning(_) | StreamEvent::ReasoningSignature { .. } => {
                         if reasoning_started_at.is_none() {
@@ -3205,7 +3204,14 @@ impl RunningAgent {
                 && reasoning_blocks.is_empty()
                 && (saw_suppressed_reasoning_filler || !reasoning.trim().is_empty())
                 && cleaned_reasoning.trim().is_empty();
-            let empty_completion = (!saw_stream_content || filler_only_reasoning) && !truncated;
+            let thinking_only = saw_stream_content
+                && !saw_text_or_tool
+                && assistant_text.trim().is_empty()
+                && pending_calls.is_empty()
+                && !filler_only_reasoning
+                && !truncated;
+            let empty_completion =
+                (!saw_stream_content || filler_only_reasoning || thinking_only) && !truncated;
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
@@ -3216,7 +3222,9 @@ impl RunningAgent {
                     let wait = (((empty_retries + 1) / 2).min(3)) as u64;
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
                     // from a truly EMPTY one — different upstream faults, different wording.
-                    let notice = if saw_malformed {
+                    let notice = if thinking_only {
+                        format!("模型只返回了思考，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    } else if saw_malformed {
                         format!("响应格式异常，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
                     } else {
                         format!("模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
@@ -3248,6 +3256,7 @@ impl RunningAgent {
                 let est_prompt: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
                 let msg = empty_exhaustion_message(
                     saw_malformed,
+                    thinking_only,
                     est_prompt,
                     self.provider.context_window(),
                     EMPTY_RESPONSE_MAX_RETRIES,
@@ -4256,22 +4265,7 @@ pub struct AgentBuilder {
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    stream_timeout: Option<std::time::Duration>,
-    /// LIVENESS: max wall-clock wait for the FIRST stream event (the first
-    /// reasoning/tool-call/text token) of each round, BEFORE any content has
-    /// been produced. Complementary to `stream_timeout` (which bounds the wait
-    /// for EVERY event inter-token gap): a model that silently goes quiet for
-    /// a long stretch during hidden reasoning before emitting its first byte
-    /// is caught here at a finer granularity. `None` (default) = no
-    /// first-token arm — wait for the first event with only `stream_timeout`.
-    ///
-    /// On timeout BEFORE any content this round, the round is RETRIED up to
-    /// `MAX_FIRST_TOKEN_RETRIES` times (a fresh connection + reset
-    /// accumulators, so partial output is never double-pushed); once the
-    /// budget is spent the turn fails with an explicit "model unresponsive /
-    /// high latency" terminal error. Once ANY first token arrives, this timer
-    /// stops mattering — the ordinary `stream_timeout` takes over.
-    first_token_timeout: Option<std::time::Duration>,
+    timeouts: crate::timeouts::TimeoutPolicy,
     /// Max re-issues after a first-token timeout before failing the turn.
     /// Default [`MAX_FIRST_TOKEN_RETRIES`]; config `[coding]
     /// first_token_timeout_retries` / env `JEIKCODE_FIRST_TOKEN_RETRIES`.
@@ -4328,12 +4322,10 @@ impl Default for AgentBuilder {
             compaction: Arc::new(NoCompaction),
             compact_threshold: None,
             compaction_checkpoint: None,
-            // NEUTRAL default: no liveness timeout → the kernel never adds a timer.
-            // Production SHOULD set both (see the builder methods) so a turn can
-            // never park forever on a stalled provider or a silent driver.
-            stream_timeout: None,
+            // NEUTRAL default: content clocks off. Production fills TimeoutPolicy
+            // so a stalled provider cannot park a turn forever.
+            timeouts: crate::timeouts::TimeoutPolicy::unbounded(),
             request_timeout: None,
-            first_token_timeout: None,
             first_token_retries: MAX_FIRST_TOKEN_RETRIES,
             // NEUTRAL default: a no-opinion request (all None + ToolChoice::Auto).
             // The provider receives `ChatOptions::default()` unless a specialization
@@ -4495,35 +4487,25 @@ impl AgentBuilder {
         self.compact_threshold = Some(frac);
         self
     }
-    /// LIVENESS: bound how long the turn waits for the NEXT stream event. When set,
-    /// EACH `stream.next()` is raced against this duration, so it bounds BOTH
-    /// first-token latency (a provider that opens the stream then goes silent) AND
-    /// inter-token latency (a model that stalls mid-response / a TCP half-open). On
-    /// a timeout the turn CLEANLY FAILS — exactly like a mid-stream provider error
-    /// (`on_error` hook + `AgentEvent::Error{"stream timeout"}` + `TurnComplete`),
-    /// with NO partial assistant message and NO fake success. Without this call the
-    /// default is `None` → UNBOUNDED (no timer is added). This is a neutral kernel,
-    /// so the value is policy; PRODUCTION SHOULD set this so a stalled provider can
-    /// never park a turn forever.
-    pub fn stream_timeout(mut self, d: std::time::Duration) -> Self {
-        self.stream_timeout = Some(d);
+    /// Install the full transport + three-phase content policy. Production
+    /// assembly uses [`crate::timeouts::TimeoutPolicy::production`] (or the
+    /// config-resolved equivalent). Tests that only need a single idle bound
+    /// can keep calling [`Self::stream_timeout`].
+    pub fn timeouts(mut self, policy: crate::timeouts::TimeoutPolicy) -> Self {
+        self.timeouts = policy;
         self
     }
-    /// LIVENESS: bound the wall-clock wait for the FIRST stream event of each
-    /// round (first reasoning / tool-call / text token), before any content has
-    /// been produced. Complementary to [`Self::stream_timeout`]: a model that
-    /// goes quiet during hidden reasoning before emitting its first byte is
-    /// caught here at fine granularity; once the first token arrives this arm
-    /// stops and `stream_timeout` governs the inter-token gap.
-    ///
-    /// On timeout BEFORE any content, the round is retried up to
-    /// [`MAX_FIRST_TOKEN_RETRIES`] times (fresh connection, reset accumulators
-    /// — partial output is never double-pushed); after the budget, the turn
-    /// FAILS with the explicit "model unresponsive / high latency" terminal
-    /// error ([`STOP_REASON_FIRST_TOKEN`]). Without this call the default is
-    /// `None` → no first-token arm (only `stream_timeout` bounds the wait).
+    /// LIVENESS: sliding window between business tokens. When TTFT is unset,
+    /// this value also bounds the first-token wait (existing test contract).
+    /// `Duration::ZERO` leaves content clocks unbounded.
+    pub fn stream_timeout(mut self, d: std::time::Duration) -> Self {
+        self.timeouts.streaming = if d.is_zero() { None } else { Some(d) };
+        self
+    }
+    /// LIVENESS: first business token (thinking / text / tool). `Duration::ZERO`
+    /// disables the TTFT arm; the sliding window still applies if set.
     pub fn first_token_timeout(mut self, d: std::time::Duration) -> Self {
-        self.first_token_timeout = if d.is_zero() { None } else { Some(d) };
+        self.timeouts.ttft = if d.is_zero() { None } else { Some(d) };
         self
     }
     /// Set how many times a round is re-issued after a first-token timeout
@@ -4651,8 +4633,7 @@ impl AgentBuilder {
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
-            stream_timeout: self.stream_timeout,
-            first_token_timeout: self.first_token_timeout,
+            timeouts: self.timeouts,
             first_token_retries: self.first_token_retries,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
@@ -4742,7 +4723,7 @@ mod empty_exhaustion_message_tests {
     fn size_aware_when_near_or_over_window() {
         // 339k prompt into a 200k window (170%) must blame request size, NOT
         // assert it's context-independent.
-        let m = empty_exhaustion_message(false, 339_000, 200_000, 5, false);
+        let m = empty_exhaustion_message(false, false, 339_000, 200_000, 5, false);
         assert!(m.contains("请求过大"), "over-window must blame size: {m}");
         assert!(
             !m.contains("与上下文长度无关"),
@@ -4752,7 +4733,7 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn upstream_framing_when_comfortably_within_window() {
-        let m = empty_exhaustion_message(false, 5_000, 200_000, 5, false);
+        let m = empty_exhaustion_message(false, false, 5_000, 200_000, 5, false);
         assert!(
             m.contains("与上下文长度无关"),
             "small request keeps upstream framing: {m}"
@@ -4763,7 +4744,7 @@ mod empty_exhaustion_message_tests {
     #[test]
     fn unknown_window_cannot_claim_over_size() {
         // window unknown (0) — never attribute to size even with a huge estimate.
-        let m = empty_exhaustion_message(false, 999_999, 0, 5, false);
+        let m = empty_exhaustion_message(false, false, 999_999, 0, 5, false);
         assert!(
             !m.contains("请求过大"),
             "unknown window cannot claim over-size: {m}"
@@ -4772,7 +4753,7 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn malformed_keeps_distinct_wording_and_no_size_blame() {
-        let m = empty_exhaustion_message(true, 339_000, 200_000, 5, false);
+        let m = empty_exhaustion_message(true, false, 339_000, 200_000, 5, false);
         assert!(m.contains("无法解析"), "malformed keeps its wording: {m}");
         assert!(
             !m.contains("请求过大"),
@@ -4785,7 +4766,7 @@ mod empty_exhaustion_message_tests {
         // When the pre-send over-window advisory already fired this turn, the
         // exhaustion terminal must be SHORT and reference it — not repeat the
         // full "约 NNN K tokens … 接近或超过窗口" blurb (the double-show fix).
-        let m = empty_exhaustion_message(false, 339_000, 200_000, 5, true);
+        let m = empty_exhaustion_message(false, false, 339_000, 200_000, 5, true);
         assert!(
             m.contains("如开头"),
             "should point back to the earlier advisory: {m}"

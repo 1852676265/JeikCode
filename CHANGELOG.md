@@ -21,6 +21,30 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.4 (2026-10-13)
+
+- **[Liveness & Stream Timeout Architecture] Three-phase timeout policy, thinking stall detection, and retry hardening**:
+  - Refactored stream liveness monitoring with a unified `TimeoutPolicy` covering first-token arrival (default 180s), inter-token idle bounds, and transport timeouts.
+  - Added dedicated detection for thinking-only output stalls, presenting clear user diagnostics when models emit reasoning without generating subsequent text or tool calls across retries.
+  - Standardized timeout propagation across all provider integrations (Anthropic, Gemini, Ollama, OpenAI-compatible, and Responses).
+- **[Sidebar Projects Synchronization & Real-time State] Event-driven project visibility across instances**:
+  - Implemented `sidebar_projects` event broadcasting over the global SSE bus, keeping project hide and reveal states synchronized across all tabs and desktop windows.
+  - Optimized pending hide/reveal state tracking to prevent race conditions during rapid project visibility changes.
+- **[Documentation & Presets] Synchronized timeout configuration guides**:
+  - Updated tool and timeout documentation alongside default configuration templates to reflect the updated timeout structure.
+
+---
+
+- **[保活监控与流式超时架构] 三阶段流式超时策略、纯思考卡死检测与重试加固**:
+  - 重构模型流式连接与保活超时架构，引入统一的 `TimeoutPolicy`，涵盖首字到达超时（默认 180 秒）、分块闲置与传输层超时控制。
+  - 针对大模型仅输出深度思考却未生成正文或工具调用的停滞卡死场景提供专用检测与清晰的排障指引。
+  - 在全系提供商接入（Anthropic、Gemini、Ollama、OpenAI 兼容协议、Responses）中统一步调与超时参数传递。
+- **[侧栏项目实时同步与状态收敛] 跨实例多窗口项目显示状态即时协同**:
+  - 通过全局事件总线广播 `sidebar_projects` 变更，实现多标签页与桌面端窗口之间项目隐藏与显示状态的毫秒级同步。
+  - 优化隐藏与展示状态的竞态防护，防止快速切换项目时状态不一致或幽灵项目残留。
+- **[文档与配置预设同步] 更新超时配置指南与默认模版**:
+  - 同步更新工具与超时指南文档，并在全仓默认配置文件模版中补齐最新超时架构定义。
+
 ## v7.2.3 (2026-10-13)
 
 - **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and sequential reasoning display**:

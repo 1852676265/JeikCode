@@ -646,14 +646,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.max_rounds,
             std::env::var("JEIKCODE_TURN_MAX_ROUNDS").ok().as_deref(),
         ),
-        // First-token liveness: mirror the canonical resolution (env > [coding]).
-        first_token_timeout: {
-            let secs = std::env::var("JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(config.coding.first_token_timeout_secs);
-            std::time::Duration::from_secs(secs)
-        },
+        timeouts: jeikcode_coding::resolve_timeout_policy(&config.coding),
         first_token_timeout_retries: {
             std::env::var("JEIKCODE_FIRST_TOKEN_RETRIES")
                 .ok()

@@ -6610,6 +6610,11 @@ body {
   animation: fadeIn 0.15s ease-out;
 }
 
+/* 确认框叠在已打开的设置/模型配置之上（SettingsModal 为 99999；移动端 .modal-overlay 为 9999 !important）。 */
+.modal-overlay.confirm-modal-overlay {
+  z-index: 100000 !important;
+}
+
 .modal-card {
   width: min(560px, 100%);
   max-height: 85dvh;

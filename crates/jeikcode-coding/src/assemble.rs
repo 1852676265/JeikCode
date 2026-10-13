@@ -4,7 +4,7 @@ use crate::config::CodingAgentConfig;
 use crate::execution_policy::TurnExecutionPolicy;
 use jeikcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 
-use jeikcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider};
+use jeikcode_capabilities::provider::{ApplyTimeouts, OpenAiCompatConfig, OpenAiCompatProvider};
 use jeikcode_capabilities::session::SessionContextHook;
 use jeikcode_capabilities::tools::{
     coding_tool_names, register_coding_tools_with_vision, ApprovalMiddleware,
@@ -34,17 +34,7 @@ use std::sync::Arc;
 pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     let mut provider_cfg = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
     provider_cfg.context_window = cfg.context_window;
-    // Thread the coding layer's liveness knob down to the L1 adapter's byte-idle
-    // watchdog. Without this, `OpenAiCompatConfig::new`'s hardcoded 120s default
-    // stays in effect even when the user raised `JEIKCODE_STREAM_TIMEOUT_SECS`
-    // (or relied on the 300s default documented in `config.rs`). Thinking models
-    // (GLM-5.2, DeepSeek V4 Flash, …) go quiet for >2min during hidden reasoning
-    // after a large prompt; the 120s ceiling cut them off mid-think and surfaced
-    // as a spurious `[Error: stream idle timeout]` even though the connection
-    // was healthy. `cfg.stream_timeout` already carries the env-overridable value
-    // (default 300s), so propagating it here makes the documented tunable actually
-    // govern the L1 watchdog end-to-end.
-    provider_cfg.idle_timeout = cfg.stream_timeout;
+    provider_cfg.apply_timeouts(&cfg.timeouts);
     // Text-only models must NOT receive image content — a resumed conversation whose
     // history contains an image would otherwise 400 every turn. Driven by the
     // config/protocol `supports_vision` flag (same gate as tool-mount / paste).
@@ -161,8 +151,7 @@ fn build_coding_agent_from_tools(
             ),
         ))
         .compact_threshold(cfg.compact_threshold)
-        .stream_timeout(cfg.stream_timeout)
-        .first_token_timeout(cfg.first_token_timeout)
+        .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)
         .max_continuations(cfg.max_continuations)
         // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.

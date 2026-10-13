@@ -31,7 +31,7 @@ async fn always_allow_grants_survive_reassembly() {
     let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
-    cfg.stream_timeout = Duration::from_secs(5);
+    cfg.timeouts = cfg.timeouts.with_content_liveness(Duration::from_secs(5));
     cfg.request_timeout = Some(Duration::from_secs(5));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,

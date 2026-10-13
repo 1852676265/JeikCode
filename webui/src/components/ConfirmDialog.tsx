@@ -1,6 +1,7 @@
 // Generic confirmation modal. Replaces native window.confirm/alert/prompt so every
 // confirmation shares the webui modal style (adaptive to light & dark themes).
 
+import { createPortal } from 'preact/compat';
 import { useEffect, useState, useRef } from 'preact/hooks';
 
 export interface ConfirmDialogProps {
@@ -73,9 +74,9 @@ export function ConfirmDialog({
     }
   }
 
-  return (
+  const overlay = (
     <div
-      class="modal-overlay"
+      class="modal-overlay confirm-modal-overlay"
       onClick={(e) => {
         if (e.target === e.currentTarget && !busy) onClose();
       }}
@@ -128,6 +129,9 @@ export function ConfirmDialog({
       </div>
     </div>
   );
+
+  // 挂到 body，避免被 SettingsModal（z-index: 99999）等已 portal 的窗口盖住。
+  return typeof document !== 'undefined' ? createPortal(overlay, document.body) : overlay;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

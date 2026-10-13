@@ -1197,7 +1197,7 @@ function getSidebarBroadcastChannel(): BroadcastChannel | null {
   return sidebarBroadcastChannel;
 }
 
-/** Same-browser tabs plus a refetch hint. Other machines pick this up on the sidebar poll. */
+/** Same-browser tabs plus a refetch hint. Other machines follow `/events` `sidebar_projects`. */
 export function broadcastSidebarProjects(): void {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent('jeikcode:sidebar_projects'));
@@ -1212,9 +1212,13 @@ export async function getSidebarProjects(): Promise<SidebarProjects> {
   const resp = await apiFetch('/projects/sidebar', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`sidebar projects failed: ${resp.status}`);
   const body = await resp.json() as Partial<SidebarProjects>;
+  return parseSidebarProjects(body);
+}
+
+function parseSidebarProjects(body: Partial<SidebarProjects> | null | undefined): SidebarProjects {
   return {
-    hidden: Array.isArray(body.hidden) ? body.hidden.filter((h) => typeof h === 'string') : [],
-    pinned: Array.isArray(body.pinned) ? body.pinned : [],
+    hidden: Array.isArray(body?.hidden) ? body.hidden.filter((h) => typeof h === 'string') : [],
+    pinned: Array.isArray(body?.pinned) ? body.pinned : [],
   };
 }
 
@@ -1225,9 +1229,9 @@ export async function hideSidebarProject(hash: string): Promise<SidebarProjects>
     body: JSON.stringify({ hash }),
   });
   if (!resp.ok) throw new Error(`hide project failed: ${resp.status}`);
-  const body = await resp.json() as SidebarProjects;
+  const body = await resp.json() as Partial<SidebarProjects>;
   broadcastSidebarProjects();
-  return body;
+  return parseSidebarProjects(body);
 }
 
 /** Pin a directory into the shared sidebar and clear any hide flag. */
@@ -1248,14 +1252,16 @@ export async function showSidebarProject(path: string): Promise<ProjectInfo> {
 }
 
 /** Put a hidden project back. Used when a session in it is still running. */
-export async function revealSidebarProject(hash: string): Promise<void> {
+export async function revealSidebarProject(hash: string): Promise<SidebarProjects> {
   const resp = await apiFetch('/projects/sidebar/reveal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ hash }),
   });
   if (!resp.ok) throw new Error(`reveal project failed: ${resp.status}`);
+  const body = await resp.json() as Partial<SidebarProjects>;
   broadcastSidebarProjects();
+  return parseSidebarProjects(body);
 }
 
 // --- Current project state ---
@@ -1778,7 +1784,9 @@ export type GlobalWireEvent =
   /** 待交互已解决：按 id 就地从所有实例的通知卡片中移除。 */
   | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number }
   /** 全局配置热重载信号（如 CLI 执行 jeikcode ghimg 或后台配置更新）。 */
-  | { type: 'config_reloaded' };
+  | { type: 'config_reloaded' }
+  /** 侧栏项目可见性（隐藏/钉住/运行中自动恢复），跨实例就地对齐。 */
+  | { type: 'sidebar_projects'; hidden: string[]; pinned?: ProjectInfo[] };
 
 /** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
 export async function streamGlobalEvents(

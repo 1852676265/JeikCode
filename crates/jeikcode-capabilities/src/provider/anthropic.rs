@@ -113,9 +113,9 @@ impl AnthropicConfig {
             reasoning_model: None,
             reasoning_policy: None,
             send_sampling_params: false,
-            idle_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
-            connect_timeout: Duration::from_secs(30),
+            idle_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().idle_watchdog(),
+            open_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().open,
+            connect_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().connect,
             retry: RetryPolicy::default(),
             user_agent: None,
             skip_tls_verify: false,
@@ -370,23 +370,17 @@ async fn open_stream(
         }
         // TTFB watchdog for THIS attempt (mirrors openai_compat): bounds only the
         // silent-gateway wait, never a slow streaming body.
-        let send = match tokio::time::timeout(open_timeout, req.send()).await {
-            Ok(r) => r,
-            Err(_elapsed) => {
+        let send = match retry::send_with_ttfb(req, open_timeout).await {
+            retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
                 }
-                return Err(ProviderError {
-                    retryable: true,
-                    message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
-                        open_timeout.as_secs()
-                    ),
-                    ..Default::default()
-                });
+                return Err(retry::ttfb_timeout_error(open_timeout));
             }
+            retry::OpenSend::Transport(e) => Err(e),
+            retry::OpenSend::Response(resp) => Ok(resp),
         };
         match send {
             Ok(resp) => {

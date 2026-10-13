@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo, SidebarProjects } from '../api';
 import { mergeSessionRow, onGlobalEvent, removeSessionRows } from '../lib/globalEvents';
 import { deleteSessionCache } from '../lib/sessionCache';
 import { bakedAppVersion, formatAppVersionLabel, normalizeAppVersion } from '../lib/appVersion';
@@ -607,23 +607,23 @@ export function Sidebar({
     });
   }, [projectHash, expandedProjects]);
 
-  const loadSidebar = useCallback(() => {
-    getSidebarProjects()
-      .then((view) => {
-        const hidden = new Set(view.hidden);
-        for (const hash of pendingHideRef.current) {
-          if (hidden.has(hash)) pendingHideRef.current.delete(hash);
-          else hidden.add(hash);
-        }
-        for (const hash of pendingRevealRef.current) {
-          if (!hidden.has(hash)) pendingRevealRef.current.delete(hash);
-          else hidden.delete(hash);
-        }
-        setHiddenProjectHashes(hidden);
-        setPinnedProjects(view.pinned ?? []);
-      })
-      .catch(() => {});
+  const applySidebarView = useCallback((view: SidebarProjects) => {
+    const hidden = new Set(view.hidden);
+    for (const hash of pendingHideRef.current) {
+      if (hidden.has(hash)) pendingHideRef.current.delete(hash);
+      else hidden.add(hash);
+    }
+    for (const hash of pendingRevealRef.current) {
+      if (!hidden.has(hash)) pendingRevealRef.current.delete(hash);
+      else hidden.delete(hash);
+    }
+    setHiddenProjectHashes(hidden);
+    setPinnedProjects(view.pinned ?? []);
   }, []);
+
+  const loadSidebar = useCallback(() => {
+    getSidebarProjects().then(applySidebarView).catch(() => {});
+  }, [applySidebarView]);
 
   // ── 纯事件驱动侧栏刷新机制（彻底拔除 5s 无脑定时轮询，释放 CPU 与网络 IO）──
   // 冷启动单次拉取项目与折叠状态；之后仅在 reloadKey 变更（新建/删除/回合完成/切目录）
@@ -633,6 +633,7 @@ export function Sidebar({
       if (document.hidden) return;
       loadSessions(true);
       refreshProjectSessions();
+      loadSidebar();
       getActiveChatSessions()
         .then(setActiveIds)
         .catch(() => {});
@@ -650,7 +651,7 @@ export function Sidebar({
       document.removeEventListener('visibilitychange', onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadKey, refreshProjectSessions]);
+  }, [reloadKey, refreshProjectSessions, loadSidebar]);
 
   // ── 跨实例增量订阅（无轮询、无整表重拉）──
   // 服务端只推“变了什么”（带 payload），这里按 id 就地 upsert/删行并同步失效缓存；
@@ -702,9 +703,20 @@ export function Sidebar({
           if (!event.running && has) return cur.filter((id) => id !== event.session_id);
           return cur;
         });
+        return;
+      }
+      if (event.type === 'sync') {
+        loadSidebar();
+        return;
+      }
+      if (event.type === 'sidebar_projects') {
+        applySidebarView({
+          hidden: Array.isArray(event.hidden) ? event.hidden : [],
+          pinned: event.pinned ?? [],
+        });
       }
     });
-  }, []);
+  }, [applySidebarView, loadSidebar]);
 
   useEffect(() => {
     if (activeSessionId !== previousActiveSessionIdRef.current) {
@@ -868,6 +880,7 @@ export function Sidebar({
   }, []);
 
   useEffect(() => {
+    loadSidebar();
     const onRefresh = () => loadSidebar();
     window.addEventListener('jeikcode:sidebar_projects', onRefresh);
     let channel: BroadcastChannel | null = null;
@@ -941,6 +954,10 @@ export function Sidebar({
         });
         openProjectInSidebar(hash);
         revealSidebarProject(hash)
+          .then((view) => {
+            pendingRevealRef.current.delete(hash);
+            applySidebarView(view);
+          })
           .catch(() => {})
           .finally(() => revealingRef.current.delete(hash));
       }
@@ -948,7 +965,7 @@ export function Sidebar({
     return () => {
       cancelled = true;
     };
-  }, [activeIds, extraRunningIds, sessions, projectSessionsMap, allOptimistic, hiddenProjectHashes]);
+  }, [activeIds, extraRunningIds, sessions, projectSessionsMap, allOptimistic, hiddenProjectHashes, applySidebarView]);
 
   // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
   // close it on outside click, scroll, or resize since it won't track anchors.
@@ -2353,7 +2370,19 @@ export function Sidebar({
               next.add(hash);
               return next;
             });
-            await hideSidebarProject(hash);
+            try {
+              const view = await hideSidebarProject(hash);
+              pendingHideRef.current.delete(hash);
+              applySidebarView(view);
+            } catch (err) {
+              pendingHideRef.current.delete(hash);
+              setHiddenProjectHashes((prev) => {
+                const next = new Set(prev);
+                next.delete(hash);
+                return next;
+              });
+              throw err;
+            }
           }}
         />,
         document.body,

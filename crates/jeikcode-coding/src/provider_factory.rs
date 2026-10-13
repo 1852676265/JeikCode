@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use jeikcode_capabilities::provider::{
-    AnthropicConfig, AnthropicProvider, GeminiConfig, GeminiProvider, OllamaConfig, OllamaProvider,
-    OpenAiCompatConfig, OpenAiCompatProvider, ReasoningPolicy, RequestSigner, ResponsesConfig,
-    ResponsesProvider,
+    AnthropicConfig, AnthropicProvider, ApplyTimeouts, GeminiConfig, GeminiProvider, OllamaConfig,
+    OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider, ReasoningPolicy, RequestSigner,
+    ResponsesConfig, ResponsesProvider,
 };
 use jeikcode_kernel::provider::LlmProvider;
 
@@ -89,7 +89,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             "responses" | "openai-responses" => {
                 let mut rc = ResponsesConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 rc.context_window = cfg.context_window;
-                rc.idle_timeout = cfg.stream_timeout;
+                rc.apply_timeouts(&cfg.timeouts);
                 rc.max_tokens = Some(cfg.chat_options.max_tokens.unwrap_or(65536));
                 rc.supports_vision = cfg.supports_vision;
                 rc.reasoning_model = cfg.reasoning_model;
@@ -120,7 +120,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             "claude" | "anthropic" => {
                 let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 ac.context_window = cfg.context_window;
-                ac.idle_timeout = cfg.stream_timeout;
+                ac.apply_timeouts(&cfg.timeouts);
                 ac.max_tokens = cfg.chat_options.max_tokens.unwrap_or(65536);
                 ac.thinking_enabled = cfg.thinking_enabled;
                 ac.thinking = cfg
@@ -152,7 +152,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 let mut oc = OllamaConfig::new(&cfg.base_url, &cfg.model);
                 oc.api_key = cfg.api_key.clone();
                 oc.context_window = cfg.context_window;
-                oc.idle_timeout = cfg.stream_timeout;
+                oc.apply_timeouts(&cfg.timeouts);
                 oc.max_tokens = Some(cfg.chat_options.max_tokens.unwrap_or(65536));
                 oc.think = cfg
                     .thinking_enabled
@@ -166,7 +166,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             "gemini" | "google-gemini" | "gemini-compatible" => {
                 let mut gc = GeminiConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 gc.context_window = cfg.context_window;
-                gc.idle_timeout = cfg.stream_timeout;
+                gc.apply_timeouts(&cfg.timeouts);
                 gc.max_tokens = Some(cfg.chat_options.max_tokens.unwrap_or(65536));
                 gc.thinking_enabled = cfg.thinking_enabled;
                 if cfg.chat_options.reasoning_effort.as_ref().is_some_and(|e| {
@@ -191,7 +191,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             _ => {
                 let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 pc.context_window = cfg.context_window;
-                pc.idle_timeout = cfg.stream_timeout;
+                pc.apply_timeouts(&cfg.timeouts);
                 // Config/protocol flag — not a model-name whitelist. OpenAI
                 // and Anthropic wire formats accept base64 when this is true.
                 pc.supports_vision = cfg.supports_vision;

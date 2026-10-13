@@ -57,10 +57,22 @@ pub fn platform_rules() -> &'static str {
 #[serde(default)]
 pub struct CodingConfig {
     pub max_rounds: u32,
-    /// Liveness: max wall-clock seconds to wait for the FIRST model token of a
-    /// round (high latency / silent hidden reasoning). `0` disables the arm.
-    /// Env `JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS` overrides. Default 60.
-    pub first_token_timeout_secs: u64,
+    /// TCP/TLS connect budget. Env `JEIKCODE_CONNECT_TIMEOUT_SECS`. Default 10.
+    pub connect_timeout_secs: u64,
+    /// Wait for HTTP response headers (TTFB). Env `JEIKCODE_OPEN_TIMEOUT_SECS`.
+    /// Default 180. Does not cap a streaming body.
+    pub open_timeout_secs: u64,
+    /// First business token (thinking / text / tool). `0` disables the arm.
+    /// Env `JEIKCODE_TTFT_SECS` / `JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS`.
+    /// TOML alias `first_token_timeout_secs`. Default 180.
+    #[serde(alias = "first_token_timeout_secs")]
+    pub ttft_secs: u64,
+    /// After thinking, wait for the first text/tool token.
+    /// Env `JEIKCODE_TRANSITION_SECS`. Default 180.
+    pub transition_secs: u64,
+    /// Sliding window between adjacent business tokens.
+    /// Env `JEIKCODE_STREAMING_SECS` / `JEIKCODE_STREAM_TIMEOUT_SECS`. Default 120.
+    pub streaming_sliding_secs: u64,
     /// How many times the round is re-issued after a first-token timeout.
     /// Env `JEIKCODE_FIRST_TOKEN_RETRIES` overrides. Default 3.
     pub first_token_timeout_retries: u32,
@@ -445,7 +457,11 @@ impl Default for CodingConfig {
     fn default() -> Self {
         Self {
             max_rounds: 200,
-            first_token_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            open_timeout_secs: 180,
+            ttft_secs: 180,
+            transition_secs: 180,
+            streaming_sliding_secs: 120,
             first_token_timeout_retries: 3,
         }
     }
@@ -2918,6 +2934,20 @@ model = "missing-type"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn coding_timeouts_accept_legacy_first_token_alias() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [coding]
+            first_token_timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.coding.ttft_secs, 60);
+        assert_eq!(cfg.coding.streaming_sliding_secs, 120);
+        assert_eq!(cfg.coding.connect_timeout_secs, 10);
     }
 
     #[test]
