@@ -858,6 +858,8 @@ fn vietnamese_dictionary_preserves_interpolation_contract() {
         Msg::CliAboutUpgrade,
         Msg::CliHelpUpgradeForce,
         Msg::CliHelpUpgradeYes,
+        Msg::CliHelpUpgradeBeta,
+        Msg::CliHelpUpgradeMain,
         Msg::CliAboutRollback,
         Msg::CliAboutMcp,
         Msg::CliAboutDaemon,

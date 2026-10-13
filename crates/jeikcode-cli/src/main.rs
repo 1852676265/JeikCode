@@ -767,6 +767,8 @@ fn build_i18n_command() -> clap::Command {
                     a.help(t(Msg::CliHelpUpgradeForce).into_owned())
                 })
                 .mut_arg("yes", |a| a.help(t(Msg::CliHelpUpgradeYes).into_owned()))
+                .mut_arg("beta", |a| a.help(t(Msg::CliHelpUpgradeBeta).into_owned()))
+                .mut_arg("main", |a| a.help(t(Msg::CliHelpUpgradeMain).into_owned()))
         })
         .mut_subcommand("rollback", |s| {
             s.about(t(Msg::CliAboutRollback).into_owned())
@@ -1006,6 +1008,12 @@ enum UpgradeAction {
     Reset,
     /// Roll back to the previous version (.bak on disk)
     Rollback,
+    /// Latest beta prerelease (`jeikcode upgrade beta -y`)
+    Beta,
+    /// Latest stable release; same as omitting the channel (`--main`)
+    Main,
+    /// Alias of `main`
+    Stable,
 }
 
 #[derive(Subcommand)]
@@ -1016,12 +1024,19 @@ enum Commands {
     #[command(alias = "update", alias = "updat")]
     Upgrade {
         /// Reinstall even when already on the latest version
-        #[arg(short = 'f', long)]
+        #[arg(short = 'f', long, global = true)]
         force: bool,
         /// Automatically apply default config changes without interactive prompts
-        #[arg(short = 'y', long = "yes")]
+        #[arg(short = 'y', long = "yes", global = true)]
         yes: bool,
+        /// Upgrade from the beta (prerelease) channel
+        #[arg(long, conflicts_with = "main")]
+        beta: bool,
+        /// Upgrade from the stable/main channel (default)
+        #[arg(long, conflicts_with = "beta")]
+        main: bool,
         /// Subcommand for update source configuration (e.g. set <URL>, get, reset, rollback)
+        /// or channel `beta` / `main` / `stable`.
         #[command(subcommand)]
         action: Option<UpgradeAction>,
     },
@@ -3355,25 +3370,32 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
             }
             Ok(())
         }
-        Commands::Upgrade { force, yes, action } => {
-            if let Some(action) = action {
-                match action {
-                    UpgradeAction::Set { target } => {
-                        handle_upgrade_set(target)?;
-                    }
-                    UpgradeAction::Get => {
-                        handle_upgrade_get();
-                    }
-                    UpgradeAction::Reset => {
-                        handle_upgrade_reset()?;
-                    }
-                    UpgradeAction::Rollback => {
-                        return run_rollback_cli();
-                    }
+        Commands::Upgrade {
+            force,
+            yes,
+            beta,
+            main,
+            action,
+        } => {
+            let channel = match &action {
+                Some(UpgradeAction::Beta) => jeikcode_updater::UpdateChannel::Beta,
+                _ if beta => jeikcode_updater::UpdateChannel::Beta,
+                _ => jeikcode_updater::UpdateChannel::Stable,
+            };
+            let _ = main;
+            match action {
+                Some(UpgradeAction::Set { target }) => handle_upgrade_set(target),
+                Some(UpgradeAction::Get) => {
+                    handle_upgrade_get();
+                    Ok(())
                 }
-                return Ok(());
+                Some(UpgradeAction::Reset) => handle_upgrade_reset(),
+                Some(UpgradeAction::Rollback) => run_rollback_cli(),
+                Some(UpgradeAction::Beta)
+                | Some(UpgradeAction::Main)
+                | Some(UpgradeAction::Stable)
+                | None => run_upgrade_cli(force, yes, channel).await,
             }
-            run_upgrade_cli(force, yes).await
         }
         Commands::Rollback => run_rollback_cli(),
         Commands::Ghimg { status } => handle_ghimg(status),
@@ -4170,15 +4192,28 @@ fn handle_ghimg(status: Option<String>) -> Result<()> {
 
 /// CLI (non-TUI) upgrade driver — prints progress to stdout and
 /// success/error messages the same way `install.sh` does.
-async fn run_upgrade_cli(force: bool, yes: bool) -> Result<()> {
+async fn run_upgrade_cli(
+    force: bool,
+    yes: bool,
+    channel: jeikcode_updater::UpdateChannel,
+) -> Result<()> {
     use jeikcode_updater::{self as self_update, UpgradeEvent, ALREADY_LATEST};
 
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
 
+    if channel == jeikcode_updater::UpdateChannel::Beta {
+        println!("==> Channel: beta");
+    }
+
     // Spawn the driver; consume events on the main task so stdout
     // writes don't interleave unpredictably with the upgrade work.
-    let driver = tokio::spawn(self_update::run_upgrade(current.clone(), force, tx));
+    let driver = tokio::spawn(self_update::run_upgrade_for_channel(
+        channel,
+        current.clone(),
+        force,
+        tx,
+    ));
 
     let mut last_pct: i32 = -1;
     while let Some(ev) = rx.recv().await {
@@ -5100,9 +5135,17 @@ mod tests {
         // 1. jeikcode update
         let cli = Cli::try_parse_from(["jeikcode", "update"]).unwrap();
         match cli.command {
-            Some(Commands::Upgrade { force, yes, action }) => {
+            Some(Commands::Upgrade {
+                force,
+                yes,
+                beta,
+                main,
+                action,
+            }) => {
                 assert!(!force);
                 assert!(!yes);
+                assert!(!beta);
+                assert!(!main);
                 assert!(action.is_none());
             }
             _ => panic!("Expected Commands::Upgrade"),
@@ -5111,9 +5154,17 @@ mod tests {
         // 2. jeikcode upgrade -y --force
         let cli = Cli::try_parse_from(["jeikcode", "upgrade", "-y", "--force"]).unwrap();
         match cli.command {
-            Some(Commands::Upgrade { force, yes, action }) => {
+            Some(Commands::Upgrade {
+                force,
+                yes,
+                beta,
+                main,
+                action,
+            }) => {
                 assert!(force);
                 assert!(yes);
+                assert!(!beta);
+                assert!(!main);
                 assert!(action.is_none());
             }
             _ => panic!("Expected Commands::Upgrade"),
@@ -5173,6 +5224,69 @@ mod tests {
                 ..
             }) => {}
             _ => panic!("Expected UpgradeAction::Rollback"),
+        }
+
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "beta", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                beta,
+                action: Some(UpgradeAction::Beta),
+                ..
+            }) => {
+                assert!(yes);
+                assert!(!beta);
+            }
+            _ => panic!("Expected UpgradeAction::Beta"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "--beta", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes, beta, action, ..
+            }) => {
+                assert!(yes);
+                assert!(beta);
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected --beta"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "--main"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                main, beta, action, ..
+            }) => {
+                assert!(main);
+                assert!(!beta);
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected --main"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "--main", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                main,
+                beta,
+                action,
+                ..
+            }) => {
+                assert!(yes);
+                assert!(main);
+                assert!(!beta);
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected --main -y"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "main", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                action: Some(UpgradeAction::Main),
+                ..
+            }) => {
+                assert!(yes);
+            }
+            _ => panic!("Expected UpgradeAction::Main"),
         }
     }
 }

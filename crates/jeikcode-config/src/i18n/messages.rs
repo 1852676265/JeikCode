@@ -1562,6 +1562,8 @@ pub enum Msg<'a> {
     CliAboutUpgrade,
     CliHelpUpgradeForce,
     CliHelpUpgradeYes,
+    CliHelpUpgradeBeta,
+    CliHelpUpgradeMain,
     CliAboutRollback,
     CliAboutMcp,
     CliAboutDaemon,

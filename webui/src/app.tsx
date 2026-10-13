@@ -520,7 +520,8 @@ export function App() {
   const handleManualCheckUpdate = async () => {
     setIsCheckingUpdate(true);
     try {
-      const res = await checkUpdate();
+      const savedChannel = localStorage.getItem('jeikcode_update_channel') || undefined;
+      const res = await checkUpdate(savedChannel);
       setUpdateInfo(res);
       if (res.has_update) {
         setShowUpdateDialog(true);

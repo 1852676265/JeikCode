@@ -30,7 +30,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const [updating, setUpdating] = useState(false);
   const [status, setStatus] = useState<UpdateStatus | null>(null);
 
-  const isDesktop = info?.is_desktop ?? false;
+  const isDesktop = false;
   const isMounted = useRef(true);
 
   useEffect(() => {
@@ -76,9 +76,19 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     doCheckUpdate(channel);
   }, []);
 
-  // 轮询更新进度
+  // 轮询更新进度。服务就地替换后会重启，异地可能收不到最终 done，
+  // 进度已经进入安装阶段后请求失败也视为完成并刷新。
   useEffect(() => {
     let timer: any = null;
+    let reloadTimer: any = null;
+    const scheduleReload = () => {
+      if (reloadTimer) return;
+      reloadTimer = window.setTimeout(() => {
+        try {
+          window.location.reload();
+        } catch {}
+      }, 2500);
+    };
     if (updating) {
       timer = setInterval(async () => {
         try {
@@ -88,16 +98,27 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
             if (s.status === 'done' || s.status === 'error') {
               if (timer) clearInterval(timer);
             }
+            if (s.status === 'done') {
+              scheduleReload();
+            }
           }
         } catch {
-          // ignore transient poll error
+          const progressed =
+            status?.status === 'installing' ||
+            status?.status === 'done' ||
+            (status?.status === 'downloading' && (status?.progress ?? 0) >= 90);
+          if (progressed) {
+            if (timer) clearInterval(timer);
+            scheduleReload();
+          }
         }
       }, 500);
     }
     return () => {
       if (timer) clearInterval(timer);
+      if (reloadTimer) clearTimeout(reloadTimer);
     };
-  }, [updating]);
+  }, [updating, status?.status, status?.progress]);
 
   const handleStartUpdate = async () => {
     if (isChecking) return;

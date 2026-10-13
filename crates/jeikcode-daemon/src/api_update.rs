@@ -216,9 +216,11 @@ fn find_highest_release(
     let mut highest: Option<&GitHubRelease> = None;
 
     for r in releases {
-        // 如果是正式版通道，则排除预发布版
-        if channel == UpdateChannel::Stable && r.prerelease {
-            continue;
+        let is_pre = r.prerelease || r.tag_name.contains('-');
+        match channel {
+            UpdateChannel::Stable if is_pre => continue,
+            UpdateChannel::Beta if !is_pre => continue,
+            _ => {}
         }
 
         match highest {
@@ -512,7 +514,6 @@ pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl
         }));
     }
 
-    let is_desktop = is_desktop_environment();
     let req = payload.map(|Json(p)| p).unwrap_or_default();
 
     tokio::spawn(async move {
@@ -524,30 +525,18 @@ pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl
             error: None,
         });
 
-        if is_desktop {
-            // 桌面端流程：下载 Setup 安装包并执行重启安装
-            if let Err(e) = run_desktop_update(req.download_url, req.version).await {
-                set_update_status(UpdateStatus {
-                    status: "error".to_string(),
-                    progress: 0,
-                    bytes: 0,
-                    total: 0,
-                    error: Some(format!("下载或启动桌面安装包失败: {e}")),
-                });
-                IS_UPDATING.store(false, Ordering::SeqCst);
-            }
-        } else {
-            // 纯 WebUI / CLI 模式：就地更新二进制
-            if let Err(e) = run_cli_update(req.version, req.download_url).await {
-                set_update_status(UpdateStatus {
-                    status: "error".to_string(),
-                    progress: 0,
-                    bytes: 0,
-                    total: 0,
-                    error: Some(format!("更新二进制失败: {e}")),
-                });
-                IS_UPDATING.store(false, Ordering::SeqCst);
-            }
+        // WebUI is embedded in this binary. Remote browsers and the desktop
+        // shell all hit this process — never open a host-side installer wizard.
+        // Swap the running jeikcode in place, then restart so the new UI is served.
+        if let Err(e) = run_cli_update(req.version, req.channel, req.download_url).await {
+            set_update_status(UpdateStatus {
+                status: "error".to_string(),
+                progress: 0,
+                bytes: 0,
+                total: 0,
+                error: Some(format!("更新二进制失败: {e}")),
+            });
+            IS_UPDATING.store(false, Ordering::SeqCst);
         }
     });
 
@@ -557,6 +546,7 @@ pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl
     }))
 }
 
+#[allow(dead_code)]
 async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<String>) -> Result<()> {
     let manifest_opt = if direct_url.is_none() {
         jeikcode_updater::fetch_manifest().await.ok()
@@ -642,6 +632,7 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
     set_update_status(UpdateStatus {
         status: "installing".to_string(),
@@ -692,9 +683,17 @@ async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn run_cli_update(version_opt: Option<String>, _direct_url: Option<String>) -> Result<()> {
+async fn run_cli_update(
+    version_opt: Option<String>,
+    channel_opt: Option<String>,
+    _direct_url: Option<String>,
+) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
+    let channel = match channel_opt.as_deref() {
+        Some("beta") => jeikcode_updater::UpdateChannel::Beta,
+        _ => jeikcode_updater::UpdateChannel::Stable,
+    };
 
     let driver = if let Some(ver) = version_opt.filter(|v| !v.trim().is_empty()) {
         let tag = if ver.starts_with('v') || ver.starts_with('V') {
@@ -711,10 +710,20 @@ async fn run_cli_update(version_opt: Option<String>, _direct_url: Option<String>
                 true,
                 tx,
             )),
-            Err(_) => tokio::spawn(jeikcode_updater::run_upgrade(current_version, false, tx)),
+            Err(_) => tokio::spawn(jeikcode_updater::run_upgrade_for_channel(
+                channel,
+                current_version,
+                false,
+                tx,
+            )),
         }
     } else {
-        tokio::spawn(jeikcode_updater::run_upgrade(current_version, false, tx))
+        tokio::spawn(jeikcode_updater::run_upgrade_for_channel(
+            channel,
+            current_version,
+            false,
+            tx,
+        ))
     };
 
     while let Some(ev) = rx.recv().await {
@@ -743,13 +752,19 @@ async fn run_cli_update(version_opt: Option<String>, _direct_url: Option<String>
                     error: None,
                 });
             }
-            jeikcode_updater::UpgradeEvent::Done { .. } => {
+            jeikcode_updater::UpgradeEvent::Done { exe, .. } => {
                 set_update_status(UpdateStatus {
                     status: "done".to_string(),
                     progress: 100,
                     bytes: 0,
                     total: 0,
                     error: None,
+                });
+                // File is already swapped in place. Restart so remote WebUI /
+                // serve picks up the new image (Unix exec; Windows delayed spawn).
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let _ = jeikcode_updater::restart_replaced_process(&exe);
                 });
             }
             jeikcode_updater::UpgradeEvent::Failed(err) => {
@@ -940,5 +955,39 @@ mod tests {
         // 2. Stable 通道：应当排除预发布版，准确挑出最高的正式版 v7.1.52
         let highest_stable = find_highest_release(&releases, UpdateChannel::Stable);
         assert_eq!(highest_stable.unwrap().tag_name, "v7.1.52");
+    }
+
+    #[test]
+    fn test_find_highest_release_beta_ignores_newer_stable() {
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "v7.2.4".to_string(),
+                html_url: "".to_string(),
+                body: None,
+                published_at: None,
+                prerelease: false,
+                assets: vec![],
+            },
+            GitHubRelease {
+                tag_name: "v7.2.4-beta.5".to_string(),
+                html_url: "".to_string(),
+                body: None,
+                published_at: None,
+                prerelease: true,
+                assets: vec![],
+            },
+            GitHubRelease {
+                tag_name: "v7.2.4-beta.4".to_string(),
+                html_url: "".to_string(),
+                body: None,
+                published_at: None,
+                prerelease: true,
+                assets: vec![],
+            },
+        ];
+        let highest_beta = find_highest_release(&releases, UpdateChannel::Beta);
+        assert_eq!(highest_beta.unwrap().tag_name, "v7.2.4-beta.5");
+        let highest_stable = find_highest_release(&releases, UpdateChannel::Stable);
+        assert_eq!(highest_stable.unwrap().tag_name, "v7.2.4");
     }
 }

@@ -711,7 +711,7 @@ const zh = {
   'update.downloadingSetup': '正在下载安装包 ({percent}%)…',
   'update.downloadingCli': '正在更新版本 ({percent}%)…',
   'update.readyDesktop': '下载完成，即将启动安装程序并退出应用…',
-  'update.readyCli': '更新已完成，请重启服务生效',
+  'update.readyCli': '更新已完成，正在重启服务…',
   'update.failed': '更新失败: {error}',
 
   // Config Sync
@@ -1455,7 +1455,7 @@ export const en: Record<MsgKey, string> = {
   'update.downloadingSetup': 'Downloading installer ({percent}%)…',
   'update.downloadingCli': 'Updating binary ({percent}%)…',
   'update.readyDesktop': 'Download complete. Launching installer and exiting…',
-  'update.readyCli': 'Update completed. Please restart the service.',
+  'update.readyCli': 'Update completed. Restarting the service…',
   'update.failed': 'Update failed: {error}',
 
   // Config Sync

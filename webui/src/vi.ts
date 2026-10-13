@@ -646,7 +646,7 @@ export const vi: Record<keyof typeof en, string> = {
   'update.downloadingSetup': 'Đang tải bộ cài ({percent}%)…',
   'update.downloadingCli': 'Đang cập nhật tệp thực thi ({percent}%)…',
   'update.readyDesktop': 'Đã tải xong. Đang mở bộ cài và thoát…',
-  'update.readyCli': 'Đã cập nhật. Vui lòng khởi động lại dịch vụ.',
+  'update.readyCli': 'Đã cập nhật. Đang khởi động lại dịch vụ…',
   'update.failed': 'Cập nhật thất bại: {error}',
   'configSync.dialogTitle': 'Cập nhật cấu hình mặc định',
   'configSync.dialogDesc': 'Phát hiện cập nhật cấu hình mặc định (mô hình và tài khoản tùy chỉnh vẫn được giữ lại). Chọn các mục cần ghi đè:',

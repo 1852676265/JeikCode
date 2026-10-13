@@ -300,6 +300,218 @@ pub async fn fetch_manifest() -> Result<Manifest> {
     fetch_manifest_from_url(manifest_url()).await
 }
 
+/// Release channel for in-place upgrades. `Stable` is GitHub `releases/latest`
+/// (`--main` / omitting the channel). `Beta` is the highest prerelease tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateChannel {
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "beta" | "preview" => Self::Beta,
+            _ => Self::Stable,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseTag {
+    tag_name: String,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+fn tag_is_prerelease(tag: &str, flagged: bool) -> bool {
+    flagged || tag.contains('-')
+}
+
+/// SemVer compare that keeps pre-release ordinals (`7.2.4-beta.5` > `7.2.4-beta.4`).
+/// Stable without a pre-release tag ranks above the same core with a pre tag.
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> (Vec<u64>, Option<(String, u64)>) {
+        let clean = v.trim().trim_start_matches('v').trim_start_matches('V');
+        if let Some((main_part, pre_part)) = clean.split_once('-') {
+            let nums: Vec<u64> = main_part
+                .split('.')
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            let pre_info = if let Some((tag, num_str)) = pre_part.split_once('.') {
+                Some((tag.to_lowercase(), num_str.parse::<u64>().unwrap_or(0)))
+            } else {
+                Some((pre_part.to_lowercase(), 0))
+            };
+            (nums, pre_info)
+        } else {
+            let nums: Vec<u64> = clean
+                .split('.')
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            (nums, None)
+        }
+    };
+    let (latest_nums, latest_pre) = parse(latest);
+    let (current_nums, current_pre) = parse(current);
+    let max_len = latest_nums.len().max(current_nums.len());
+    for i in 0..max_len {
+        let l = latest_nums.get(i).copied().unwrap_or(0);
+        let c = current_nums.get(i).copied().unwrap_or(0);
+        if l > c {
+            return true;
+        }
+        if l < c {
+            return false;
+        }
+    }
+    match (latest_pre, current_pre) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some((l_tag, l_num)), Some((c_tag, c_num))) => {
+            if l_tag != c_tag {
+                l_tag > c_tag
+            } else {
+                l_num > c_num
+            }
+        }
+        (None, None) => false,
+    }
+}
+
+async fn list_release_tags(client: &reqwest::Client) -> Result<Vec<ReleaseTag>> {
+    let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
+    if let Ok(resp) = client.get(&primary).send().await {
+        if resp.status().is_success() {
+            if let Ok(list) = resp.json::<Vec<ReleaseTag>>().await {
+                if !list.is_empty() {
+                    return Ok(list);
+                }
+            }
+        }
+    }
+    let gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=30";
+    let resp = client
+        .get(gh)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET {gh}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "listing releases from {} returned HTTP {}",
+            gh,
+            resp.status()
+        ));
+    }
+    resp.json::<Vec<ReleaseTag>>()
+        .await
+        .context("parsing GitHub releases list")
+}
+
+/// Latest `latest.json` for the chosen channel. Stable uses GitHub
+/// `releases/latest`; beta picks the highest prerelease tag and loads that
+/// tag's `latest.json` (prereleases are never `/releases/latest`).
+pub async fn fetch_manifest_for_channel(channel: UpdateChannel) -> Result<Manifest> {
+    match channel {
+        UpdateChannel::Stable => fetch_manifest().await,
+        UpdateChannel::Beta => {
+            let client = apply_proxy_policy(reqwest::Client::builder())
+                .timeout(std::time::Duration::from_secs(30))
+                .user_agent(JEIKCODE_USER_AGENT)
+                .build()?;
+            let tags = list_release_tags(&client).await?;
+            let mut best: Option<String> = None;
+            for r in tags {
+                if !tag_is_prerelease(&r.tag_name, r.prerelease) {
+                    continue;
+                }
+                match &best {
+                    None => best = Some(r.tag_name),
+                    Some(cur) if version_is_newer(&r.tag_name, cur) => best = Some(r.tag_name),
+                    _ => {}
+                }
+            }
+            let tag = best.ok_or_else(|| anyhow!("no beta (prerelease) tag found"))?;
+            let url = format!(
+                "{}/{}/latest.json",
+                download_base().trim_end_matches('/'),
+                tag
+            );
+            fetch_manifest_from_url(&url).await
+        }
+    }
+}
+
+/// Same as [`run_upgrade`] but reads the stable or beta manifest.
+pub async fn run_upgrade_for_channel(
+    channel: UpdateChannel,
+    current_version: String,
+    force: bool,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
+    let manifest = fetch_manifest_for_channel(channel).await?;
+    run_upgrade_with_manifest(manifest, current_version, force, tx).await
+}
+
+/// After an in-place swap, start the new binary with the current argv.
+///
+/// Unix: `execv` (same PID). Windows: spawn the new exe and exit the parent
+/// without waiting so a running `serve`/`webui` can rebind the port once
+/// this process releases it.
+pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> {
+    #[cfg(unix)]
+    {
+        return re_exec_self(Some(exe));
+    }
+    #[cfg(windows)]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        // Delay via `cmd` so this process can exit and drop the listen port
+        // before the replacement binary binds it again.
+        let exe_s = exe.display().to_string();
+        let mut tail = String::from("ping 127.0.0.1 -n 3 >nul & ");
+        tail.push('"');
+        tail.push_str(&exe_s);
+        tail.push('"');
+        for a in &args {
+            tail.push(' ');
+            let s = a.to_string_lossy();
+            if s.chars().any(|c| c.is_whitespace()) {
+                tail.push('"');
+                tail.push_str(&s);
+                tail.push('"');
+            } else {
+                tail.push_str(&s);
+            }
+        }
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", &tail])
+            .spawn();
+        std::process::exit(0);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = exe;
+        Err(anyhow!(
+            "restart after in-place replace is not supported on this OS"
+        ))
+    }
+}
+
 /// Fetch and parse `Manifest` from a specific manifest URL.
 pub async fn fetch_manifest_from_url(url: &str) -> Result<Manifest> {
     let client = apply_proxy_policy(reqwest::Client::builder())
@@ -743,7 +955,7 @@ pub async fn run_upgrade_with_manifest(
         version: manifest.version.clone(),
     });
 
-    if !force && !is_newer(&manifest.version, current_version) {
+    if !force && !version_is_newer(&manifest.version, current_version) {
         return Err(anyhow!(
             "{}: already on {} (latest is {}). Pass --force to reinstall.",
             ALREADY_LATEST,
@@ -1467,6 +1679,15 @@ mod tests {
         assert!(!is_newer("v4.25.0-beta.1", "v4.25.0"));
         // But still newer than older versions
         assert!(is_newer("v4.25.0-beta.1", "v4.24.99"));
+    }
+
+    #[test]
+    fn version_is_newer_keeps_beta_ordinals() {
+        assert!(version_is_newer("v7.2.4-beta.5", "v7.2.4-beta.4"));
+        assert!(!version_is_newer("v7.2.4-beta.4", "v7.2.4-beta.5"));
+        assert!(version_is_newer("v7.2.4", "v7.2.4-beta.5"));
+        assert!(!version_is_newer("v7.2.4-beta.5", "v7.2.4"));
+        assert!(version_is_newer("v7.2.4-beta.1", "v7.2.3"));
     }
 
     #[test]
