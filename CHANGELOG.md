@@ -21,63 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
-## v7.2.4-beta.3 (2026-10-13)
+## v7.2.3 (2026-10-13)
 
-- **[Task List Lifecycle & Workspace Stability] Fix premature checklist clearing and synchronize persona rules**:
-  - Fixed premature clearing of active in-progress checklists in `apply_actions_batch` when appending multiple new tasks alongside existing status updates.
-  - Aligned checklist auto-clearing lifecycle to trigger strictly upon terminal turn completion via `LifecycleHooks::turn_complete` when all tasks are finished.
-  - Streamlined `<todo_rules>` persona guidelines with concise terminal-clearing timing and "Do not proactively remove or clear task items" guard.
-  - Fixed missing `github_logo` field in `Config` test initializer, ensuring 100% green `--workspace --all-targets` pipeline compilation.
-
----
-
-- **[任务清单生命周期与全目标编译修复] 修复待办列表早熟清空缺陷、精简提示词与 CI 编译全绿**:
-  - 彻底修复 `apply_actions_batch` 在向进行中清单追加多个新任务时因 `add_count >= 2` 误判导致列表被暴力清空的重大缺陷，保持任务 ID 连续性。
-  - 将任务清单自动清空时机严格绑定至终态回复完成（`LifecycleHooks::turn_complete`），仅在所有任务全部完成时才自动归档清空。
-  - 精简 `<todo_rules>` 人设提示词，去除冗余修饰，严格对齐终态清空与“不主动删除任务项”安全法则。
-  - 修复 `jeikcode-config` 单元测试初始化中遗漏 `github_logo` 字段的编译问题，确保 CI 全目标编译 100% 全绿。
-
-## v7.2.4-beta.2 (2026-10-13)
-
-- **[WebUI Modern Modals, Toast System & Git Controls] Modern theme-adaptive dialogs, VSCode-style discard all, and page zoom**:
-  - Replaced all legacy browser dialogs (`window.confirm`, `window.alert`, `window.prompt`) featuring `127.0.0.1:port` popups with beautiful, theme-adaptive modals and floating toast capsules matching light and dark themes.
-  - Added a dedicated "Discard All Changes" (`↺`) action in GitPanel unstaged changes header with secondary confirmation and full i18n support matching VSCode workflow.
-  - Replaced file discard, branch deletion, merge, revert, and cherry-pick native popups with responsive modern confirm modals.
-  - Replaced prompt popups (creating branches, creating tags, renaming branches) with modern styled input dialogs.
-  - Replaced raw configuration overwrite and clipboard copy alerts with elegant non-blocking toasts that auto-dismiss.
-  - Configuration sync dialog now silently closes without annoying toasts when 0 files are selected upon clicking confirm.
-  - Implemented Chrome-like `Ctrl + Mouse Wheel` (and `Ctrl + +/-/0`) page zoom scaling with persistent zoom levels in `localStorage` and a floating percentage indicator pill.
-  - Optimized responsive layouts for small screens and mobile devices so confirmation cards center neatly and toasts adapt to viewport widths without horizontal overflow.
-- **[CI & Daemon Test Fixes] Synchronize unit test signatures**:
-  - Fixed `project_agent` method invocations across 7 unit test sites in `jeikcode-daemon` to supply the required `session_id` argument, resolving the `Rust quality` pipeline compilation failure.
-
----
-
-- **[WebUI 现代主题提示框、全局 Toast 与 Git 撤销控制] 告别老旧浏览器原生弹窗、VSCode 风格放弃全部更改与滚轮缩放**:
-  - 全面替换所有带有 `127.0.0.1:port` 的老旧浏览器原生弹窗（`window.confirm`、`window.alert`、`window.prompt`），升级为完美适配亮色与暗色模式的现代卡片式 `ConfirmDialog` 与磨砂胶囊 `Toast`。
-  - 在 GitPanel 代码更改标题栏新增 VSCode 风格的“放弃所有更改”（`↺` 拐弯撤销图标）按钮，配备二次确认保护弹窗与全套多语言适配。
-  - 将单文件修改放弃、分支删除、分支合并、提交回滚（Revert）与拣选（Cherry-pick）全部接入现代确认弹窗。
-  - 将创建分支、创建标签与重命名分支的原生输入框升级为圆角输入对话框，支持回车提交与 Esc 取消。
-  - 将开局配置更新覆盖与剪贴板复制提示替换为右上角优雅悬浮的无阻碍 Toast 气泡，3 秒自动平滑淡出。
-  - 优化默认配置同步交互：当选中 0 个文件点击确定时直接静默完成，不再弹出多余提示。
-  - 引入仿 Google Chrome 的 `Ctrl + 鼠标滚轮`（以及 `Ctrl + +/-/0`）页面缩放能力，支持 50%~300% 步进调节、`localStorage` 持久化记忆与右上角实时百分比气泡展示。
-  - 深度优化移动端与窄窗口自适应布局，确保弹窗自适应视口宽度、居中展示且无任何横向溢出。
-- **[CI 流水线与 Daemon 单元测试修复] 对齐测试用例签名参数**:
-  - 修复 `jeikcode-daemon` 内部 7 处单元测试中 `project_agent` 未传入 `session_id` 的签名失配缺陷，彻底解决 `Rust quality` 流水线编译失败问题。
-
-## v7.2.4-beta.1 (2026-10-13)
-
-- **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and contradictory edit banners**:
+- **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and sequential reasoning display**:
   - Fixed an issue where repeated URLs, common domain prefixes (`https://github.com`), or repeated code identifiers were erroneously truncated during live LLM streaming.
   - Substring deduplication is now strictly isolated to replay frames, with real-time stream deltas appended reliably via monotonic sequence cursors.
   - Fixed missing Markdown code blocks and Mermaid diagrams when switching back to a session that completed in the background by properly buffering `artifact_*` events in the background session cache.
   - Resolved steer card state desync, stuck queues, and ghost duplicate bubbles during cross-session switching by folding steered inputs into target session caches.
-  - Fixed an issue where successive reasoning / thinking blocks were improperly backfilled and coalesced into the first block across tool boundaries; subsequent thinking blocks now render cleanly in sequential order.
+  - Fixed an issue where successive reasoning / thinking blocks across tool boundaries were improperly coalesced into the initial block; subsequent thinking blocks now render cleanly in sequential order.
   - Introduced live `Compacting...` shimmer placeholder synchronized across all tabs and instances when background context compaction is underway.
   - Restored context compaction notices (`format_compaction_mark`) in the native live architecture, rendering amber advisories in-stream as ordered notice parts.
   - Added official GitHub badge to the sidebar footer with `config.toml` toggle and `jeikcode ghimg [on|off]` live hot-reloading CLI.
   - Refined ambiguous match error messages in the edit tool from Rust range syntax to clear 1-based index instructions (`1 to N`).
   - Eliminated contradictory "not applied" diff banner on successfully completed file edits.
+- **[Task List Lifecycle & Workspace Stability] Fix premature checklist clearing and synchronize persona rules**:
+  - Fixed premature clearing of active in-progress checklists in `apply_actions_batch` when appending multiple new tasks alongside existing status updates.
+  - Aligned checklist auto-clearing lifecycle to trigger strictly upon terminal turn completion via `LifecycleHooks::turn_complete` when all tasks are finished.
+  - Streamlined `<todo_rules>` persona guidelines with concise terminal-clearing timing and "Do not proactively remove or clear task items" guard.
+- **[WebUI Modern Modals, Toast System & Git Controls] Modern theme-adaptive dialogs, VSCode-style discard all, and page zoom**:
+  - Replaced all legacy browser dialogs (`window.confirm`, `window.alert`, `window.prompt`) featuring `127.0.0.1:port` popups with beautiful, theme-adaptive modals and floating toast capsules matching light and dark themes.
+  - Added a dedicated "Discard All Changes" (`↺`) action in GitPanel unstaged changes header with secondary confirmation and full i18n support matching VSCode workflow.
+  - Replaced file discard, branch deletion, merge, revert, and cherry-pick native popups with responsive modern confirm modals.
+  - Implemented Chrome-like `Ctrl + Mouse Wheel` (and `Ctrl + +/-/0`) page zoom scaling with persistent zoom levels in `localStorage` and a floating percentage indicator pill.
 - **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay and streamlined release matrices**:
   - Deployed an official Cloudflare Pages edge function (`/api/releases`) with Atom feed parsing and 70s edge caching, eliminating GitHub API 60 req/hr rate limits for overseas VPN and proxy users.
   - Release installer links now connect directly to downloadable binaries (Windows `.exe`, macOS `.dmg`, Linux `.deb`/`.AppImage`), completely removing obsolete `.rpm` references.
@@ -99,6 +64,16 @@
   - 在侧栏底部新增官方 GitHub 仓库徽章，支持 `config.toml` 配置与 `jeikcode ghimg [on|off]` 命令行实时免重启热重载切换。
   - 优化 edit 工具多处歧义匹配时的报错指引，由 Rust 区间语法改为通俗清晰的 1-based 序号提示（`1 to N`）。
   - 消除文件编辑成功（已完成）时因行数截断误报“预期替换（未写入，仅供参考）”的语义矛盾。
+- **[任务清单生命周期与全目标编译修复] 修复待办列表早熟清空缺陷、精简提示词与 CI 编译全绿**:
+  - 彻底修复 `apply_actions_batch` 在向进行中清单追加多个新任务时因 `add_count >= 2` 误判导致列表被暴力清空的重大缺陷，保持任务 ID 连续性。
+  - 将任务清单自动清空时机严格绑定至终态回复完成（`LifecycleHooks::turn_complete`），仅在所有任务全部完成时才自动归档清空。
+  - 精简 `<todo_rules>` 人设提示词，去除冗余修饰，严格对齐终态清空与“不主动删除任务项”安全法则。
+- **[WebUI 现代主题提示框、全局 Toast 与 Git 撤销控制] 告别老旧浏览器原生弹窗、VSCode 风格放弃全部更改与滚轮缩放**:
+  - 全面替换所有带有 `127.0.0.1:port` 的老旧浏览器原生弹窗（`window.confirm`、`window.alert`、`window.prompt`），升级为完美适配亮色与暗色模式的现代卡片式 `ConfirmDialog` 与磨砂胶囊 `Toast`。
+  - 在 GitPanel 代码更改标题栏新增 VSCode 风格的“放弃所有更改”（`↺` 拐弯撤销图标）按钮，配备二次确认保护弹窗与全套多语言适配。
+  - 将单文件修改放弃、分支删除、分支合并、提交回滚（Revert）与拣选（Cherry-pick）全部接入现代确认弹窗。
+  - 引入仿 Google Chrome 的 `Ctrl + 鼠标滚轮`（以及 `Ctrl + +/-/0`）页面缩放能力，支持 50%~300% 步进调节、`localStorage` 持久化记忆与右上角实时百分比气泡展示。
+  - 深度优化移动端与窄窗口自适应布局，确保弹窗自适应视口宽度、居中展示且无任何横向溢出。
 - **[更新中继与发布工程基建] Cloudflare 边缘零限流发布中继与发布矩阵瘦身**:
   - 部署官方 Cloudflare Pages 边缘服务（`/api/releases`），通过 Atom 订阅流拉取元数据并执行 70 秒全球 CDN 缓存，彻底终结 GitHub API 60次/小时导致的海外 VPN 与代理出口 IP 限流。
   - Release 说明下载表格直接提供 Windows `.exe`、macOS `.dmg`、Linux `.deb`/`.AppImage` 安装包直链下载，并彻底移除无用的 `.rpm` 格式。
@@ -106,36 +81,6 @@
 - **[文档中心与门户体验] 官网首页双版本指示器与精简上手指南**:
   - 官网首页并排展示独立的正式版（Stable）与测试版（Beta）版本胶囊，支持动态数据获取与 bump 脚本双兜底同步。
   - 全面精简中英双语 README，收揽统一为“快速上手与官方文档”，核心教程与高级指南统一收拢至官方文档站点（`jeikcode.top`）。
-
-## v7.2.3-beta.1 (2026-10-12)
-
-- **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay, streamlined desktop matrix, and dual-channel docs indicators**:
-  - **Zero-Rate-Limit Release Relay**: Deployed a Cloudflare Pages Function (`/api/releases`) caching GitHub releases on the edge CDN for 70 seconds with full CORS support. Parses GitHub's public Atom feed (`releases.atom`) to eliminate unauthenticated GitHub REST API 60 req/hr rate limits for overseas VPN and proxy users. Updated daemon update checker (`api_update.rs`) to query the edge relay first with graceful fallbacks.
-  - **Updater Self-Defense Gate**: Fixed `run_upgrade` to refuse self-modification immediately when `is_package_managed()` is true without making speculative network requests to fetch the remote manifest, ensuring deterministic packaging tests in CI.
-  - **Streamlined Desktop & Portability Matrix**: Removed redundant Linux ARM64 desktop packaging and dropped the redundant `.rpm` bundle format, retaining universal `.deb` and `.AppImage` for x86_64 Linux desktop while keeping 100% of headless CLI builds across x86_64 and ARM64. Pruned cross-OS feature-subset redundancy in `portability.yml` down from 9 jobs to 5 fast jobs.
-  - **Dual-Version Docs Indicators**: Upgraded documentation hero section with side-by-side Stable (`v7.2.2`) and Beta (`v7.2.3-beta.1`) badges with live edge fetching and synchronized bump scripting.
-
----
-
-- **[更新中继与发布工程基建] Cloudflare 边缘零限流发布中继、桌面打包矩阵瘦身与文档站双通道版本指示器**:
-  - **零限流官方发布中继**: 在 Cloudflare Pages 部署边缘微服务 (`/api/releases`) 并设置 70 秒全球 CDN 缓存。优先解析 GitHub 官方公开的 `releases.atom` 订阅源，彻底终结未授权 GitHub REST API 60次/小时导致的海外 VPN 与代理出口 IP 限流问题；更新守护进程探测逻辑，优先请求边缘中继并保留多级优雅回退。
-  - **包管理器升级门禁自愈**: 修复 `run_upgrade`，在包管理器分发构建中无需发起任何外部网络请求即可即时返回 `PACKAGE_MANAGED` 拒绝自升级，彻底杜绝 CI 门禁因网络抖动偶发失败。
-  - **桌面打包与测试矩阵深度精简**: 剔除冗余的 Linux ARM64 桌面端 GUI 壳与多余的 `.rpm` 格式（保留通用的 `.deb` 与 `.AppImage`），并 100% 保留 x86_64 与 ARM64 无头设备 CLI 核心产物；将 `portability.yml` 特性子集测试精简为仅在 Ubuntu 运行，作业数从 9 个压缩至 5 个。
-  - **文档站双版本展示与 Bump 同步**: 升级官网首页呈现并排的正式版与测试版双徽章，从边缘接口实时动态获取两类最新版本号，并联动版本 bump 脚本自动更新两个兜底值。
-
-## v7.2.3-beta.0 (2026-10-12)
-
-- **[WebUI Live Stream Projection / Dedup] Eliminate substring-inclusion checks from live streams and rely strictly on transport sequence cursors**:
-  - **Technical Root Cause / Detail**: `mergeTextIntoParts` and `mergeReasoningIntoParts` erroneously applied substring deduplication (`existing.includes(content)`) outside the `if (replay)` check. Because the LLM streams tokens incrementally, any token chunk whose text happened to appear earlier in the message (such as repeated URLs, common domain prefixes like `https://github.com`, or repeated identifiers) was erroneously dropped as duplicate replay data, severely corrupting URLs and repeated phrases on screen.
-  - **Implementation Mechanism**: Confined all substring and prefix deduplication strictly to replay frames (`replay === true`). For live stream deltas (`replay === false`), chunks are unconditionally appended in place to active parts, fully trusting the authoritative transport-layer monotonic sequence cursor (`AtomicU64 seq`) and part identities to prevent duplicate deliveries.
-  - **Verification & Testing**: 474 WebUI unit tests pass (`node --test`), including regression tests verifying that consecutive identical URLs and phrases stream cleanly without character loss; TypeScript checks clean (`tsc --noEmit`); production build succeeds (`npm run build`).
-
----
-
-- **[WebUI 实时流式投影与去重] 彻底移除非重放流式子串检查，全权依归传输层单调游标**:
-  - **技术机理 / 现象溯源**: `mergeTextIntoParts` 与 `mergeReasoningIntoParts` 将子串包含去重检查（`existing.includes(content)`）写在了 `if (replay)` 守卫外部。大模型实时推流逐 token 到达时，任何恰好包含在先前正文中的 token 片段（例如连续相同的 URL、域名公共前缀 `https://github.com`、重复代码标识符）均被误判为重放数据而被静默丢弃，导致画布上重复链接和重复词句严重碎裂残缺。
-  - **实现防线 / 核心改动**: 将所有子串及前缀去重逻辑严格隔离在重放帧（`replay === true`）分支之内。对实时直播流（`replay === false`）无条件原汁原味就地追加，全权依托传输层权威的单调递增游标（`AtomicU64 seq`）与部件身份（`partId`）保障不重复、不漏帧。
-  - **验证与交付**: WebUI 474 项单元测试全绿（新增连续相同 URL 与重复文本流式追加回归用例）；TypeScript 0 错误（`tsc --noEmit`）；生产构建成功（`npm run build`）。
 
 ## v7.2.2 (2026-10-12)
 
