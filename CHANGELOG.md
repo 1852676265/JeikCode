@@ -21,6 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.6 (2026-10-13)
+
+- **[Updates] Beta channel and remote in-place upgrades**:
+  - `jeikcode upgrade beta -y` and `--beta` install the latest prerelease. `--main` and omitting the channel stay on stable. `-y` still auto-applies config diffs.
+  - The WebUI update button (including remote browsers) replaces the running `jeikcode` binary in place and restarts the service. It no longer opens a host-side installer wizard. The page reloads after the swap.
+
+---
+
+- **[更新] Beta 通道与异地就地升级**:
+  - `jeikcode upgrade beta -y` 与 `--beta` 安装最新预发布版。`--main` 和不填通道仍走正式版。`-y` 仍自动应用配置差异。
+  - WebUI 更新按钮（含异地浏览器）就地替换正在运行的 `jeikcode` 并重启服务，不再在宿主机上打开安装向导。替换完成后页面自动刷新。
+
 ## v7.2.4-beta.5 (2026-10-13)
 
 - **[Agent Shell] Silent delay tasks finish; git log -p is allowed**:
