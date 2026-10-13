@@ -1146,10 +1146,6 @@ mod tests {
             "gateway cache-affinity header must be forwarded: {head}"
         );
         assert!(
-            !head.contains("x-atomcode-session-id"),
-            "legacy atomcode session header must not be sent: {head}"
-        );
-        assert!(
             head.contains("user-agent: jeikcode/9.9.9"),
             "product UA must be sent: {head}"
         );

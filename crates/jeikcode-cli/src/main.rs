@@ -878,7 +878,7 @@ fn invoked_cli_name() -> &'static str {
                 p.file_stem()
                     .map(|s| s.to_string_lossy().to_ascii_lowercase())
             })
-            .filter(|s| s == "jeikcode" || s == "atomcode")
+            .filter(|s| s == "jeikcode")
             .unwrap_or_else(|| "jeikcode".into())
     })
     .as_str()
@@ -1646,7 +1646,9 @@ async fn async_main() {
             );
         }
     }
-    if !is_backup && !dev_mode && auto_update_cfg && !source_build {
+    let skip_pending = std::env::var("JEIKCODE_SKIP_PENDING_UPGRADE").is_ok()
+        || std::env::args().any(|a| a == "__sync_config" || a == "upgrade" || a == "update");
+    if !is_backup && !dev_mode && auto_update_cfg && !source_build && !skip_pending {
         let stage_start = std::time::Instant::now();
         // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
         let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -4259,15 +4261,21 @@ async fn run_upgrade_cli(
                     version,
                     backup.display()
                 );
-                println!("  Run `jeikcode` (or `atomcode`) to start the new version.");
+                println!("  Run `jeikcode` to start the new version.");
 
-                // 🔍 由替换后的新版本二进制拉起差异扫描与交互多选（加载新二进制的内置资产）
+                // 由替换后的新版本二进制拉起差异扫描。跳过 pending 套用，避免
+                // 后台自动更新把刚装上的文件再盖回旧包。
+                #[cfg(windows)]
+                std::thread::sleep(std::time::Duration::from_millis(300));
                 let mut sync_cmd = std::process::Command::new(&exe);
-                sync_cmd.arg("__sync_config");
+                sync_cmd
+                    .arg("__sync_config")
+                    .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
                 if yes {
                     sync_cmd.arg("--auto");
                 }
                 let spawned = sync_cmd.status();
+                jeikcode_updater::clear_pending_pointer();
 
                 if spawned.is_err() {
                     // Fallback to in-process sync if spawning new binary fails
@@ -4351,7 +4359,7 @@ fn run_rollback_cli() -> Result<()> {
         summary.exe.display(),
         summary.backup.display()
     );
-    println!("  Run `jeikcode` (or `atomcode`) to start the rolled-back version.");
+    println!("  Run `jeikcode` to start the rolled-back version.");
     Ok(())
 }
 

@@ -159,10 +159,10 @@ fn set_env_keys(keys: &[&str], value: &Option<String>) {
 }
 
 fn config_path() -> PathBuf {
-    // Single source of truth: `config_dir()` handles the env override, the legacy
-    // `~/.atomcode` migration and the resolved-once memo; `default_path()` is
-    // exactly `<home>/config.toml`. A local copy here could read a DIFFERENT
-    // config file than the rest of the process.
+    // Single source of truth: `config_dir()` handles the env override and the
+    // resolved-once memo; `default_path()` is exactly `<home>/config.toml`.
+    // A local copy here could read a DIFFERENT config file than the rest of
+    // the process.
     crate::Config::default_path()
 }
 

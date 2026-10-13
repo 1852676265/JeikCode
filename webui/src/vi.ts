@@ -641,6 +641,8 @@ export const vi: Record<keyof typeof en, string> = {
   'update.currentVersion': 'Phiên bản hiện tại',
   'update.latestVersion': 'Phiên bản mới nhất',
   'update.btnUpdate': 'Cập nhật ngay',
+  'update.btnForce': 'Cập nhật bắt buộc',
+  'update.dialogDescForce': 'Bạn đang dùng {version}. Tải lại và thay tệp thực thi?',
   'update.btnCancel': 'Để sau',
   'update.downloading': 'Đang tải bản cập nhật…',
   'update.downloadingSetup': 'Đang tải bộ cài ({percent}%)…',

@@ -1981,27 +1981,12 @@ impl Config {
 
     /// Resolve the config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(
-        env_jeikcode_home: Option<String>,
-        env_atomcode_home: Option<String>,
-        home: Option<PathBuf>,
-    ) -> PathBuf {
+    fn resolve_config_dir(env_jeikcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
         if let Some(p) = env_jeikcode_home.filter(|s| !s.is_empty()) {
             return PathBuf::from(p);
         }
-        if let Some(p) = env_atomcode_home.filter(|s| !s.is_empty()) {
-            return PathBuf::from(p);
-        }
         let home_dir = home.unwrap_or_else(|| PathBuf::from("."));
-        let jeik_dir = home_dir.join(".jeikcode");
-        if jeik_dir.exists() {
-            return jeik_dir;
-        }
-        let legacy_dir = home_dir.join(".atomcode");
-        if legacy_dir.exists() {
-            return legacy_dir;
-        }
-        jeik_dir
+        home_dir.join(".jeikcode")
     }
 
     pub fn config_dir() -> PathBuf {
@@ -2022,9 +2007,6 @@ impl Config {
             .get_or_init(|| {
                 Self::resolve_config_dir(
                     std::env::var("JEIKCODE_HOME")
-                        .ok()
-                        .filter(|s| !s.is_empty()),
-                    std::env::var("ATOMCODE_HOME")
                         .ok()
                         .filter(|s| !s.is_empty()),
                     crate::util::real_home_dir(),
@@ -2485,28 +2467,20 @@ model = "missing-type"
     fn test_resolve_config_dir_uses_env_when_set() {
         let result = Config::resolve_config_dir(
             Some("/tmp/custom-jeikcode-home".to_string()),
-            None,
             Some(PathBuf::from("/Users/foo")),
         );
         assert_eq!(result, PathBuf::from("/tmp/custom-jeikcode-home"));
-
-        let result_legacy = Config::resolve_config_dir(
-            None,
-            Some("/tmp/custom-jeikcode-home".to_string()),
-            Some(PathBuf::from("/Users/foo")),
-        );
-        assert_eq!(result_legacy, PathBuf::from("/tmp/custom-jeikcode-home"));
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
-        let result = Config::resolve_config_dir(None, None, Some(PathBuf::from("/Users/foo")));
+        let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
         assert_eq!(result, PathBuf::from("/Users/foo/.jeikcode"));
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_dot_when_no_home() {
-        let result = Config::resolve_config_dir(None, None, None);
+        let result = Config::resolve_config_dir(None, None);
         assert_eq!(result, PathBuf::from("./.jeikcode"));
     }
 

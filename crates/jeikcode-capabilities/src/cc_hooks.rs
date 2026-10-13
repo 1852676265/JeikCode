@@ -181,7 +181,7 @@ fn load_hooks_file(path: &Path) -> Vec<HookConfig> {
         .collect()
 }
 
-/// Resolve `$JEIKCODE_HOME` / `$ATOMCODE_HOME` (fallback `~/.jeikcode` / `~/.atomcode`).
+/// Resolve `$JEIKCODE_HOME` (fallback `~/.jeikcode`).
 ///
 /// NOTE: deliberately NOT `Config::config_dir()` — this module needs the *raw*
 /// env/home rule so `sudo`-without-`$JEIKCODE_HOME` keeps its documented behaviour.
@@ -197,21 +197,8 @@ fn jeikcode_home() -> Option<PathBuf> {
             return Some(PathBuf::from(h));
         }
     }
-    if let Ok(h) = std::env::var("ATOMCODE_HOME") {
-        if !h.is_empty() {
-            return Some(PathBuf::from(h));
-        }
-    }
     let home = dirs::home_dir()?;
-    let jeik = home.join(".jeikcode");
-    if jeik.exists() {
-        return Some(jeik);
-    }
-    let legacy_dir = home.join(".atomcode");
-    if legacy_dir.exists() {
-        return Some(legacy_dir);
-    }
-    Some(jeik)
+    Some(home.join(".jeikcode"))
 }
 
 /// The GLOBAL hooks file `load_hooks_config` reads

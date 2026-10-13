@@ -59,14 +59,12 @@ test('code fence inside list ending with backslash closes properly without swall
     '  ```',
     '- **进程白名单**：',
     '  - `jeikcode.exe`',
-    '  - `atomcode.exe`',
     '',
     '#### 2. Linux 服务器环境',
     '',
     '- **二进制目录与文件**：',
     '  ```text',
     '  /usr/local/bin/jeikcode',
-    '  /usr/local/bin/atomcode',
     '  ```',
   ].join('\n');
   const out = markdownToHtml(content);

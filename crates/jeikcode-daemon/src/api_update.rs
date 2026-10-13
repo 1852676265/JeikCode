@@ -59,6 +59,9 @@ pub struct ExecuteUpdateRequest {
     pub version: Option<String>,
     #[serde(default)]
     pub download_url: Option<String>,
+    /// Reinstall even when current already matches latest (stability testing).
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -528,7 +531,14 @@ pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl
         // WebUI is embedded in this binary. Remote browsers and the desktop
         // shell all hit this process — never open a host-side installer wizard.
         // Swap the running jeikcode in place, then restart so the new UI is served.
-        if let Err(e) = run_cli_update(req.version, req.channel, req.download_url).await {
+        if let Err(e) = run_cli_update(
+            req.version,
+            req.channel,
+            req.download_url,
+            req.force.unwrap_or(false),
+        )
+        .await
+        {
             set_update_status(UpdateStatus {
                 status: "error".to_string(),
                 progress: 0,
@@ -687,6 +697,7 @@ async fn run_cli_update(
     version_opt: Option<String>,
     channel_opt: Option<String>,
     _direct_url: Option<String>,
+    force: bool,
 ) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
@@ -707,13 +718,13 @@ async fn run_cli_update(
             Ok(manifest) => tokio::spawn(jeikcode_updater::run_upgrade_with_manifest(
                 manifest,
                 current_version,
-                true,
+                force,
                 tx,
             )),
             Err(_) => tokio::spawn(jeikcode_updater::run_upgrade_for_channel(
                 channel,
                 current_version,
-                false,
+                force,
                 tx,
             )),
         }
@@ -721,7 +732,7 @@ async fn run_cli_update(
         tokio::spawn(jeikcode_updater::run_upgrade_for_channel(
             channel,
             current_version,
-            false,
+            force,
             tx,
         ))
     };

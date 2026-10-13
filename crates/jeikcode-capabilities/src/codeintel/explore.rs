@@ -488,14 +488,9 @@ impl Tool for CodeExploreTool {
             }),
         );
 
-        // Load project-specific thesaurus from `.jeikcode/thesaurus` or `.atomcode/thesaurus`
+        // Load project-specific thesaurus from `.jeikcode/thesaurus`
         {
-            let jeik_dir = root.join(".jeikcode").join("thesaurus");
-            let project_thesaurus_dir = if jeik_dir.is_dir() {
-                jeik_dir
-            } else {
-                root.join(".atomcode").join("thesaurus")
-            };
+            let project_thesaurus_dir = root.join(".jeikcode").join("thesaurus");
             if project_thesaurus_dir.is_dir() {
                 if let Ok(mut th) = self.thesaurus.write() {
                     th.load_from_dir(&project_thesaurus_dir);

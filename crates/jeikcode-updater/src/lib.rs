@@ -238,6 +238,125 @@ pub fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("could not resolve current executable path")
 }
 
+fn same_exe(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn looks_like_jeikcode_binary(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "jeikcode" || lower == "jeikcode.exe"
+}
+
+fn looks_like_desktop_cli_payload(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("cli-bin"))
+}
+
+fn desktop_cli_bin_candidates() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        dirs.push(local.join("JeikCode Desktop"));
+        dirs.push(local.join("Programs").join("JeikCode Desktop"));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)", "PROGRAMFILES"] {
+        if let Some(pf) = std::env::var_os(key) {
+            dirs.push(PathBuf::from(pf).join("JeikCode Desktop"));
+        }
+    }
+    if let Some(home) = jeikcode_config::util::real_home_dir() {
+        dirs.push(
+            home.join("Applications")
+                .join("JeikCode Desktop.app")
+                .join("Contents")
+                .join("Resources"),
+        );
+        dirs.push(home.join(".local").join("share").join("jeikcode-desktop"));
+    }
+    dirs.push(PathBuf::from(
+        "/Applications/JeikCode Desktop.app/Contents/Resources",
+    ));
+    dirs.push(PathBuf::from("/usr/lib/jeikcode-desktop"));
+    dirs.push(PathBuf::from("/usr/lib/JeikCode Desktop"));
+    dirs.push(PathBuf::from("/opt/JeikCode Desktop"));
+
+    let mut out = Vec::new();
+    for dir in dirs {
+        out.push(dir.join("cli-bin"));
+        out.push(dir.join("resources").join("cli-bin"));
+    }
+    out
+}
+
+/// Every CLI image we should overwrite: the running process, `~/.local/bin`,
+/// PATH copies, and the desktop installer's bundled `cli-bin`. Desktop copies
+/// `cli-bin` into `~/.local/bin` on launch; replacing only one side leaves
+/// either PATH or the next desktop start on the old build.
+pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf, allow_payload: bool| {
+        if !(looks_like_jeikcode_binary(&p)
+            || (allow_payload && looks_like_desktop_cli_payload(&p)))
+        {
+            return;
+        }
+        if out.iter().any(|e| same_exe(e, &p)) {
+            return;
+        }
+        if p.exists() || same_exe(&p, running) {
+            out.push(p);
+        }
+    };
+    push(running.to_path_buf(), true);
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            push(dir.join("jeikcode"), false);
+            #[cfg(windows)]
+            push(dir.join("jeikcode.exe"), false);
+        }
+    }
+    if let Some(home) = jeikcode_config::util::real_home_dir() {
+        push(home.join(".local/bin/jeikcode"), false);
+        #[cfg(windows)]
+        push(home.join(".local/bin/jeikcode.exe"), false);
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        push(
+            PathBuf::from(local).join("JeikCode").join("jeikcode.exe"),
+            false,
+        );
+    }
+    for candidate in ["/usr/local/bin/jeikcode", "/usr/bin/jeikcode"] {
+        push(PathBuf::from(candidate), false);
+    }
+    if let Some(p) = std::env::var_os("JEIKCODE_DESKTOP_CLI_BIN") {
+        push(PathBuf::from(p), true);
+    }
+    for p in desktop_cli_bin_candidates() {
+        push(p, true);
+    }
+    out
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher).context("hashing file")?;
+    Ok(hex_encode(&hasher.finalize()))
+}
+
 /// Sibling path used to stash the previous binary.
 ///
 /// Unix: `jeikcode` → `jeikcode.bak`.
@@ -908,31 +1027,6 @@ fn copy_across_devices(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Keep `jeikcode` and `atomcode` as the same binary. After replacing one,
-/// atomically replace the sibling name in the same directory (best-effort).
-/// Uses `atomic_copy_replace` so that if the sibling alias is currently
-/// running as a background service/process, it won't fail with ETXTBSY.
-fn sync_cli_alias(exe: &Path) {
-    let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) else {
-        return;
-    };
-    let other = if stem.eq_ignore_ascii_case("atomcode") {
-        "jeikcode"
-    } else if stem.eq_ignore_ascii_case("jeikcode") {
-        "atomcode"
-    } else {
-        return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    let mut dest = dir.join(other);
-    if let Some(ext) = exe.extension() {
-        dest.set_extension(ext);
-    }
-    let _ = atomic_copy_replace(exe, &dest);
-}
-
 fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1023,6 +1117,9 @@ pub async fn run_upgrade_with_manifest(
     })?;
     let exe = current_exe_path()?;
     ensure_writable(&exe)?;
+    // Drop a leftover auto-update stage so `__sync_config` / the next
+    // launch cannot paste an older package over this install.
+    clear_pending_pointer();
 
     let _ = tx.send(UpgradeEvent::ManifestFetched {
         version: manifest.version.clone(),
@@ -1050,7 +1147,34 @@ pub async fn run_upgrade_with_manifest(
 
     let _ = tx.send(UpgradeEvent::Replacing);
     replace_binary(&download, &exe)?;
-    sync_cli_alias(&exe);
+    let expected_sha = entry.sha256.as_str();
+    let got = file_sha256_hex(&exe)?;
+    if !got.eq_ignore_ascii_case(expected_sha) {
+        return Err(anyhow!(
+            "replaced {} but sha256 is {got}, expected {expected_sha}",
+            exe.display()
+        ));
+    }
+    for extra in discover_install_exes(&exe)
+        .into_iter()
+        .filter(|p| !same_exe(p, &exe))
+    {
+        if ensure_writable(&extra).is_err() {
+            eprintln!(
+                "Note: skipped extra install copy {} (not writable). PATH may still hit the old binary.",
+                extra.display()
+            );
+            continue;
+        }
+        if let Err(e) = atomic_copy_replace(&exe, &extra) {
+            eprintln!(
+                "Note: could not update extra install copy {}: {e}",
+                extra.display()
+            );
+            continue;
+        }
+        eprintln!("    also updated {}", extra.display());
+    }
 
     // Manual `/upgrade` just installed whatever the current manifest
     // advertises. Any staged upgrade sitting in `staged_dir()` is now
@@ -1064,7 +1188,7 @@ pub async fn run_upgrade_with_manifest(
             let p = e.path();
             if p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("jeikcode-") || n.starts_with("atomcode-"))
+                .is_some_and(|n| n.starts_with("jeikcode-"))
             {
                 let _ = std::fs::remove_file(&p);
             }
@@ -1265,7 +1389,7 @@ fn write_pending(pending: &PendingUpgrade) -> Result<()> {
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-fn clear_pending_pointer() {
+pub fn clear_pending_pointer() {
     let _ = std::fs::remove_file(pending_json_path());
 }
 
@@ -1440,7 +1564,6 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
     let exe = current_exe_path()?;
     ensure_writable(&exe)?;
     replace_binary(&pending.staged_path, &exe)?;
-    sync_cli_alias(&exe);
 
     // Success — pointer is done, file moved into place by replace_binary.
     clear_pending_pointer();
@@ -1764,6 +1887,28 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_jeikcode_binary_accepts_product_name() {
+        assert!(looks_like_jeikcode_binary(Path::new("jeikcode")));
+        assert!(looks_like_jeikcode_binary(Path::new("jeikcode.exe")));
+        assert!(!looks_like_jeikcode_binary(Path::new("jeikcode.cmd")));
+        assert!(!looks_like_jeikcode_binary(Path::new("other.exe")));
+        assert!(looks_like_desktop_cli_payload(Path::new("cli-bin")));
+        assert!(looks_like_desktop_cli_payload(Path::new(
+            "C:/app/resources/cli-bin"
+        )));
+        assert!(!looks_like_desktop_cli_payload(Path::new("jeikcode.exe")));
+    }
+
+    #[test]
+    fn discover_install_exes_includes_running_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let running = tmp.path().join("jeikcode");
+        std::fs::write(&running, b"x").unwrap();
+        let found = discover_install_exes(&running);
+        assert!(found.iter().any(|p| same_exe(p, &running)));
+    }
+
+    #[test]
     fn manifest_parses_minimal_shape() {
         let json = r#"{
             "version": "v4.19.0",
@@ -2011,23 +2156,6 @@ mod tests {
 
         assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
         assert_eq!(std::fs::read(&bak).unwrap(), b"NEW");
-    }
-
-    #[test]
-    fn sync_cli_alias_synchronizes_bidirectionally() {
-        let tmp = tempfile::tempdir().unwrap();
-        let jeikcode = tmp.path().join("jeikcode");
-        let atomcode = tmp.path().join("atomcode");
-
-        // When upgrading jeikcode, atomcode alias should be created/synced
-        std::fs::write(&jeikcode, b"VERSION_NEW").unwrap();
-        sync_cli_alias(&jeikcode);
-        assert_eq!(std::fs::read(&atomcode).unwrap(), b"VERSION_NEW");
-
-        // When upgrading atomcode, jeikcode alias should be created/synced
-        std::fs::write(&atomcode, b"VERSION_NEXT").unwrap();
-        sync_cli_alias(&atomcode);
-        assert_eq!(std::fs::read(&jeikcode).unwrap(), b"VERSION_NEXT");
     }
 
     #[test]

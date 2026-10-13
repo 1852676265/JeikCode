@@ -1147,7 +1147,6 @@ fn load_codegraph_ignore(root: &Path) -> ignore::gitignore::Gitignore {
         root.join(".codegraphignore.graph"),
         root.join(".codegraignore.graph"),
         root.join(".jeikcode").join(".codegraphignore"),
-        root.join(".atomcode").join(".codegraphignore"),
         root.join(".jeikcode").join(".codegraphignore.graph"),
         cfg.join(".codegraphignore"),
         cfg.join(".codegraignore"),
@@ -1489,14 +1488,10 @@ fn collect_files_fallback(root: &Path) -> Vec<Walked> {
         builder.add_ignore(global_ignore2);
     }
 
-    // Also check .jeikcode/.codegraphignore and legacy .atomcode/.codegraphignore inside project root
+    // Also check .jeikcode/.codegraphignore inside project root
     let project_jeikcode_ignore = root.join(".jeikcode").join(".codegraphignore");
     if project_jeikcode_ignore.is_file() {
         builder.add_ignore(project_jeikcode_ignore);
-    }
-    let project_atomcode_ignore = root.join(".atomcode").join(".codegraphignore");
-    if project_atomcode_ignore.is_file() {
-        builder.add_ignore(project_atomcode_ignore);
     }
 
     for entry in builder

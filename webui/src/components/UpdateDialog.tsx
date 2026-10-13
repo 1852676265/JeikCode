@@ -120,6 +120,14 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     };
   }, [updating, status?.status, status?.progress]);
 
+  const sameVersion = (a?: string, b?: string) => {
+    const n = (v?: string) => (v || '').trim().replace(/^v/i, '').toLowerCase();
+    const x = n(a);
+    const y = n(b);
+    return x.length > 0 && x === y;
+  };
+  const forceReinstall = sameVersion(info?.current_version, info?.latest_version);
+
   const handleStartUpdate = async () => {
     if (isChecking) return;
     setUpdating(true);
@@ -128,6 +136,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         channel,
         version: info?.latest_version,
         download_url: info?.download_url ?? undefined,
+        force: forceReinstall,
       });
     } catch (err: any) {
       setStatus({
@@ -141,6 +150,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   };
 
   const hasUpdate = info?.has_update ?? false;
+  const canInstall = hasUpdate || (!!info?.latest_version && forceReinstall);
 
   return (
     <div
@@ -225,6 +235,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                   <span class="update-status-sparkle">✨</span>
                   <span>{t('update.dialogDesc', { version: info?.latest_version || '' })}</span>
                 </div>
+              ) : forceReinstall ? (
+                <div class="update-status-row has-update">
+                  <span class="update-status-sparkle">🔁</span>
+                  <span>{t('update.dialogDescForce', { version: info?.latest_version || '' })}</span>
+                </div>
               ) : (
                 <div class="update-status-row latest">
                   <span class="update-status-check-icon">✓</span>
@@ -267,7 +282,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         <div class="modal-footer update-dialog-footer">
           {!updating ? (
             <>
-              {hasUpdate ? (
+              {canInstall ? (
                 <>
                   <button
                     type="button"
@@ -281,7 +296,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                     class="btn btn-primary update-confirm-btn"
                     onClick={handleStartUpdate}
                   >
-                    {t('update.btnUpdate')}
+                    {forceReinstall ? t('update.btnForce') : t('update.btnUpdate')}
                   </button>
                 </>
               ) : (

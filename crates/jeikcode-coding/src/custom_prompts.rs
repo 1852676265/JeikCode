@@ -143,25 +143,15 @@ pub fn invalidate_cache_for_test() {
 
 /// Resolve the user prompts dir.
 ///
-/// Deliberately keeps the RAW rule — env (`JEIKCODE_HOME` → `ATOMCODE_HOME`) first, then
-/// the real home (`~/.jeikcode/prompts` → legacy `~/.atomcode/prompts`). It is NOT routed
-/// through `Config::config_dir()`: the converged version silently dropped the real-home
-/// fallback and removed the `<environment>` block from the assembled session context
-/// (proved by an isolation bisect — the sibling commit message has the details).
+/// Env (`JEIKCODE_HOME`) first, then `~/.jeikcode/prompts`. Not routed through
+/// `Config::config_dir()` so sudo-without-home keeps the documented raw rule.
 /// `cc_hooks` keeps the same shape for the same reason.
 fn resolve_prompts_dir() -> Option<PathBuf> {
-    // 线程级测试覆盖优先（isolated_home），其次保持原始规则：env → 真实 home。
-    // 两者都必须保留：只留覆盖会丢掉真实 home 回退（曾导致会话上下文里
-    // `<environment>` 整块消失）；只留 env 则会让用覆盖的测试读不到自己的 prompts。
+    // 线程级测试覆盖优先（isolated_home），其次 env → 真实 home。
     if let Some(home) = jeikcode_config::test_util::overridden_home() {
         return Some(home.join("prompts"));
     }
     if let Ok(p) = std::env::var("JEIKCODE_HOME") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p).join("prompts"));
-        }
-    }
-    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
         if !p.is_empty() {
             return Some(PathBuf::from(p).join("prompts"));
         }
@@ -175,15 +165,7 @@ fn resolve_prompts_dir() -> Option<PathBuf> {
     #[cfg(not(test))]
     {
         let home = dirs::home_dir()?;
-        let jeik = home.join(".jeikcode").join("prompts");
-        if jeik.exists() {
-            return Some(jeik);
-        }
-        let legacy_dir = home.join(".atomcode").join("prompts");
-        if legacy_dir.exists() {
-            return Some(legacy_dir);
-        }
-        Some(jeik)
+        Some(home.join(".jeikcode").join("prompts"))
     }
 }
 

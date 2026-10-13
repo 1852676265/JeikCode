@@ -2,7 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! 薄桌面壳：拉起同一个 `jeikcode webui`，窗口只打开它。
-//! 不另写 Agent。CLI 从安装包资源拷到 `~/.local/bin`，TUI 和 WebUI 用这一份。
+//! 不另写 Agent。CLI 从安装包资源拷到 `~/.local/bin`（仅当该处没有更新的副本）。
+//! `jeikcode upgrade` 写过的 `~/.local/bin` 不能被安装包里的旧 `cli-bin` 盖掉。
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -315,8 +316,11 @@ fn start_webui(app: &tauri::AppHandle) -> Result<(String, std::process::Child), 
     if let Some(token) = token {
         cmd.arg("--token").arg(token);
     }
-    cmd.env("JEIKCODE_DESKTOP", "1")
-        .current_dir(&home)
+    cmd.env("JEIKCODE_DESKTOP", "1");
+    if let Some(ref bundled) = bundled {
+        cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
+    }
+    cmd.current_dir(&home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -415,10 +419,12 @@ fn publish_cli(bundled: Option<&Path>) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(cli_file_name());
     if let Some(src) = bundled.filter(|p| looks_like_binary(p)) {
-        let same = dest.is_file()
-            && std::fs::metadata(src).ok().map(|m| m.len())
-                == std::fs::metadata(&dest).ok().map(|m| m.len());
-        if !same {
+        // Size-only compare used to copy bundled over a CLI-upgraded dest
+        // whenever the installer on D: was older. Keep dest when it is newer.
+        let should_copy = !dest.is_file()
+            || !looks_like_binary(&dest)
+            || bundled_is_newer(src, &dest);
+        if should_copy {
             let _ = std::fs::copy(src, &dest);
         }
         set_executable(&dest);
@@ -431,6 +437,20 @@ fn publish_cli(bundled: Option<&Path>) -> std::io::Result<PathBuf> {
         return Ok(dest);
     }
     Ok(PathBuf::from(cli_file_name()))
+}
+
+fn bundled_is_newer(bundled: &Path, dest: &Path) -> bool {
+    let bundled_mtime = std::fs::metadata(bundled)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    let dest_mtime = std::fs::metadata(dest)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    match (bundled_mtime, dest_mtime) {
+        (Some(bundled), Some(dest)) => bundled > dest,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn cli_dest_dir() -> PathBuf {
@@ -585,13 +605,29 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        external_browser_url, extract_webui_url, host_window_away, navigation_action,
-        new_window_action, parse_webui_listen, remember_webui_origin, window_url, LinkAction,
-        WebuiOrigin,
+        bundled_is_newer, external_browser_url, extract_webui_url, host_window_away,
+        navigation_action, new_window_action, parse_webui_listen, remember_webui_origin,
+        window_url, LinkAction, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
         raw.parse().unwrap()
+    }
+
+    #[test]
+    fn bundled_cli_does_not_replace_a_newer_dest() {
+        let dir = std::env::temp_dir().join(format!("jeik-cli-mtime-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("dest");
+        let bundled = dir.join("bundled");
+        std::fs::write(&bundled, b"old-installer").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&dest, b"cli-upgraded").unwrap();
+        assert!(
+            !bundled_is_newer(&bundled, &dest),
+            "CLI-upgraded dest must win over an older desktop installer copy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn origin(host: &str, port: u16) -> WebuiOrigin {

@@ -2539,6 +2539,7 @@ export async function executeUpdate(payload?: {
   channel?: string;
   version?: string;
   download_url?: string;
+  force?: boolean;
 }): Promise<{ success: boolean; message: string }> {
   const resp = await apiFetch('/api/update/execute', {
     method: 'POST',

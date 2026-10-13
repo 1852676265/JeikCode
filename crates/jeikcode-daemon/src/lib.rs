@@ -515,7 +515,7 @@ mod env_write_guard_tests {
     /// 运行期禁止改写“会影响路径解析”的进程级环境变量。
     ///
     /// 契约：`Config::config_dir()` 在进程内只解析一次（`OnceLock`），因此任何
-    /// 运行期 `set_var` 这 5 个键的代码都会让“写”与“读”落到不同根目录 —— 这正是
+    /// 运行期 `set_var` 这 4 个键的代码都会让“写”与“读”落到不同根目录 —— 这正是
     /// 并行测试偶发的根因（scoped-home 测试改 env，另一个测试正好横跨读写窗口）。
     ///
     /// 正确做法：测试用 `jeikcode_config::test_util::isolated_home()`（线程级注入，
@@ -523,7 +523,7 @@ mod env_write_guard_tests {
     /// （仅启动期一次）。
     ///
     /// 白名单**只减不增**，且只允许“每测试进程/每进程恰好一次”的启动期写入。
-    const GUARDED_KEYS: [&str; 5] = ["JEIKCODE_HOME", "ATOMCODE_HOME", "TMPDIR", "TMP", "TEMP"];
+    const GUARDED_KEYS: [&str; 4] = ["JEIKCODE_HOME", "TMPDIR", "TMP", "TEMP"];
 
     const ALLOWED: [(&str, &str); 3] = [
         (

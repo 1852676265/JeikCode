@@ -435,12 +435,12 @@
 
 - **[Single Home-Root Derivation & Thread-Local Test Home Seam]**:
   - **Technical Root Cause / Detail**: every path layer re-implemented the home rule (env → legacy → real home); tests repointed the process-wide environment, so one test's `update_config` rewrote the file another test was asserting on (observed: a provider key resolved to "").
-  - **Implementation Mechanism**: `capabilities::paths::config_dir` delegates to `Config::resolve_config_dir`; `Config::config_dir` memoizes production resolution in a `OnceLock`; all 91 `set_var` sites on `JEIKCODE_HOME`/`ATOMCODE_HOME`/`TMPDIR`/`TMP`/`TEMP` across 22 files move to a thread-local home override (`IsolatedHome::at`); kernel `isolate_home` resolves through the POSIX-normalized resolver; a source-scanning guard fails the build for new `set_var` sites outside the two sanctioned startup points (backlog now empty).
+  - **Implementation Mechanism**: `capabilities::paths::config_dir` delegates to `Config::resolve_config_dir`; `Config::config_dir` memoizes production resolution in a `OnceLock`; all 91 `set_var` sites on `JEIKCODE_HOME`/`TMPDIR`/`TMP`/`TEMP` across 22 files move to a thread-local home override (`IsolatedHome::at`); kernel `isolate_home` resolves through the POSIX-normalized resolver; a source-scanning guard fails the build for new `set_var` sites outside the two sanctioned startup points (backlog now empty).
   - **Verification & Testing**: capabilities lib 927/927, coding lib 364/364, daemon lib 396/396 (x3), env guard green, workspace `--all-targets` clean.
 
 - **[Prompt/Persona Baseline Resolution (coding)]**:
   - **Technical Root Cause / Detail**: an existing-but-empty prompts dir was treated as the whole persona set (silently dropping the embedded baseline — PROHIBITIONS vanished); routing resolution solely through `Config::config_dir()` dropped the real-home fallback and removed the `<environment>` block.
-  - **Implementation Mechanism**: an absent dir yields `None` while the interim `exists()` gate is reverted (a not-yet-existing dir is the normal state — persona assembly seeds it from embedded defaults); resolution order keeps the thread-local test override, then env → `~/.jeikcode/prompts` → legacy `~/.atomcode/prompts`; init prompts fall back to the embedded baseline; the prompt cache gains `invalidate_cache_for_test()`; `system_context` asserts design-independent invariants.
+  - **Implementation Mechanism**: an absent dir yields `None` while the interim `exists()` gate is reverted (a not-yet-existing dir is the normal state — persona assembly seeds it from embedded defaults); resolution order keeps the thread-local test override, then env → `~/.jeikcode/prompts`; init prompts fall back to the embedded baseline; the prompt cache gains `invalidate_cache_for_test()`; `system_context` asserts design-independent invariants.
   - **Verification & Testing**: `system_context` 2/2, coding suite green.
 
 - **[Tool-Name & Alias Convergence Across the Stack]**:
@@ -505,7 +505,7 @@
 
 - **[提示词/persona 基线解析（coding）]**:
   - **技术机理 / 现象溯源**: 「目录存在但为空」被当成完整 persona 集，静默丢掉内嵌基线（PROHIBITIONS 消失）；只走 `Config::config_dir()` 丢掉真实 home 回退，`<environment>` 块整体消失。
-  - **实现防线 / 核心改动**: 目录不存在返回 `None`，期间引入的 `exists()` 门回滚（目录尚不存在是正常态——组装会从内嵌默认 seed）；解析顺序保留线程级覆盖，再 env → `~/.jeikcode/prompts` → 旧 `~/.atomcode/prompts`；init 提示词回退内嵌基线；提示词缓存新增 `invalidate_cache_for_test()`；`system_context` 改断言与设计无关的不变量。
+  - **实现防线 / 核心改动**: 目录不存在返回 `None`，期间引入的 `exists()` 门回滚（目录尚不存在是正常态——组装会从内嵌默认 seed）；解析顺序保留线程级覆盖，再 env → `~/.jeikcode/prompts`；init 提示词回退内嵌基线；提示词缓存新增 `invalidate_cache_for_test()`；`system_context` 改断言与设计无关的不变量。
   - **验证与交付**: `system_context` 2/2，coding 套件全绿。
 
 - **[全栈工具名与别名收敛]**:
@@ -1200,8 +1200,8 @@
 ## v7.2.0-beta.2 (2026-10-07)
 
 - **[Capabilities & Tools / Shell Hardening & Precision Reading] Fix Windows WSL bash hijacking in `run_command`, enhance `read` with anchor matching, and modernize notification audio**:
-  - **Technical Root Cause / Detail**: On Windows environments with WSL enabled, running scripts with `#!/usr/bin/env bash` shebangs (such as Node.js `npm`/`npx` wrappers) through `run_command` previously triggered exit code 127 (`No such file or directory`) because Windows `System32\bash.exe` shadowed Git Bash's `/usr/bin/bash` in `PATH` and failed to resolve MSYS2 drive paths (`/d/...`). Furthermore, inspecting symbols in large files previously required reading entire pages or manual offset guessing, OS desktop toasts suffered from unstackable popup spam, and legacy `.atomcode` database paths lingered in `index_db.rs`.
-  - **Implementation Mechanism**: Hardened Windows shell execution in `crates/jeikcode-capabilities/src/tools/bash.rs` by prepending a dedicated `/tmp/.jeikcode_shims` directory containing Git Bash `bash`/`sh` symlinks to `PATH`, completely eliminating WSL binary shadowing while preserving native Windows compiler precedence. Upgraded `read` tool with `key_string`, `upward`, `downward`, and `max_matches` arguments supporting 4-tier fuzzy matching and centered inspection windows with line numbers. Replaced OS popup toasts with pure platform alert sounds (`MessageBeep`, `afplay`, `paplay`) protected by an 800ms atomic debounce lock in `notify.rs`. Purged legacy `.atomcode` fallback in `index_db.rs`.
+  - **Technical Root Cause / Detail**: On Windows environments with WSL enabled, running scripts with `#!/usr/bin/env bash` shebangs (such as Node.js `npm`/`npx` wrappers) through `run_command` previously triggered exit code 127 (`No such file or directory`) because Windows `System32\bash.exe` shadowed Git Bash's `/usr/bin/bash` in `PATH` and failed to resolve MSYS2 drive paths (`/d/...`). Furthermore, inspecting symbols in large files previously required reading entire pages or manual offset guessing, OS desktop toasts suffered from unstackable popup spam, and leftover database paths lingered in `index_db.rs`.
+  - **Implementation Mechanism**: Hardened Windows shell execution in `crates/jeikcode-capabilities/src/tools/bash.rs` by prepending a dedicated `/tmp/.jeikcode_shims` directory containing Git Bash `bash`/`sh` symlinks to `PATH`, completely eliminating WSL binary shadowing while preserving native Windows compiler precedence. Upgraded `read` tool with `key_string`, `upward`, `downward`, and `max_matches` arguments supporting 4-tier fuzzy matching and centered inspection windows with line numbers. Replaced OS popup toasts with pure platform alert sounds (`MessageBeep`, `afplay`, `paplay`) protected by an 800ms atomic debounce lock in `notify.rs`. Purged a leftover path fallback in `index_db.rs`.
   - **Verification & Testing**: Passed all 34 read tool unit tests in `jeikcode-capabilities`, verified `npm` execution via the new shim mechanism, and passed `cargo check --lib -p jeikcode-daemon`.
 
 - **[WebUI & Chat Interface / Stream Integrity & Multi-Repo Navigation] Shield active streaming against watch stream tearing, eliminate scroll jitter, and add multi-repo Git switching**:
@@ -1213,7 +1213,7 @@
 
 - **[能力层与工具系统 / Shell 加固与精准阅读] 根治 Windows WSL bash 路径劫持、强化 `read` 锚点定位并升级轻量系统通知音**:
   - **技术机理 / 现象溯源**: 在启用了 WSL 的 Windows 机器上，`run_command` 执行带 `#!/usr/bin/env bash` Shebang 的脚本（如 Node.js 自带的 `npm`/`npx` 包装器）时，因系统 `System32\bash.exe` 在 PATH 中先于 Git Bash 被 `env` 检索，导致 WSL 的 Linux bash 被误唤起并因无法识别 MSYS2 盘符路径（如 `/d/...`）报出 127 错误；同时大文件符号检视缺乏精准锚点窗口支持、系统级 Toast 弹窗存在无法堆叠的弹窗轰炸问题，且 `index_db.rs` 存在历史遗留路径。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/bash.rs` 的 Windows bash 初始化逻辑中，注入最高优先级的 `/tmp/.jeikcode_shims` 目录并建立指向当前 Git Bash `bash`/`sh` 的软链接，彻底杜绝 WSL `System32\bash.exe` 劫持 `env bash`，同时严密保护宿主原生编译工具链（Cargo/MSVC/Python）的优先级；为 `read` 工具引入 `key_string`、`upward`、`downward` 与 `max_matches`，支持四级容错匹配、居中行窗口与精确定位；在 `notify.rs` 中全面移除 OS 弹窗，改为纯系统提示音（`MessageBeep`/`afplay`/`paplay`）并配合 800ms 原子防抖锁；清理 `index_db.rs` 中已废弃的 `.atomcode` 路径。
+  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/bash.rs` 的 Windows bash 初始化逻辑中，注入最高优先级的 `/tmp/.jeikcode_shims` 目录并建立指向当前 Git Bash `bash`/`sh` 的软链接，彻底杜绝 WSL `System32\bash.exe` 劫持 `env bash`，同时严密保护宿主原生编译工具链（Cargo/MSVC/Python）的优先级；为 `read` 工具引入 `key_string`、`upward`、`downward` 与 `max_matches`，支持四级容错匹配、居中行窗口与精确定位；在 `notify.rs` 中全面移除 OS 弹窗，改为纯系统提示音（`MessageBeep`/`afplay`/`paplay`）并配合 800ms 原子防抖锁；清理 `index_db.rs` 中已废弃的路径。
   - **验证与交付**: `jeikcode-capabilities` 的 34 项 read 工具单测全绿通过，实测 Git Bash 下 `npm` 顺利执行，`cargo check --lib -p jeikcode-daemon` 编译校验通过。
 
 - **[WebUI 与交互界面 / 流式防撕裂与多仓库支持] 阻断流式会话被重放撕裂、消除滚动锚定抖动并支持多仓 Git 切换**:
