@@ -103,15 +103,14 @@ pub enum IdleAction {
 }
 
 /// Idle expiry: bytes already decided there was no new output.
-/// CPU decides whether that silence is work. Disk/network IO is NOT busy:
-/// those go through first+second idle and then the model decides.
+/// CPU-busy work is promoted. Resident servers are killed. Everything else
+/// (including platforms that cannot sample CPU, e.g. macOS) is a wait
+/// recheck in the driver unless an interactive fingerprint is present.
 pub fn classify_idle(has_output: bool, busy: BusyKind, resident: bool) -> IdleAction {
     match busy {
         BusyKind::Yes => IdleAction::AutoPromote,
         BusyKind::No if resident && has_output => IdleAction::KillResident,
-        BusyKind::No => IdleAction::KillStuck,
-        BusyKind::Unknown if has_output => IdleAction::AwaitDecision,
-        BusyKind::Unknown => IdleAction::KillStuck,
+        BusyKind::No | BusyKind::Unknown => IdleAction::KillStuck,
     }
 }
 
@@ -728,7 +727,7 @@ mod tests {
         assert_eq!(classify_idle(true, No, false), KillStuck);
         assert_eq!(classify_idle(true, No, true), KillResident);
         assert_eq!(classify_idle(false, No, true), KillStuck);
-        assert_eq!(classify_idle(true, Unknown, false), AwaitDecision);
+        assert_eq!(classify_idle(true, Unknown, false), KillStuck);
         assert_eq!(classify_idle(false, Unknown, false), KillStuck);
     }
 
