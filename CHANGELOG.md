@@ -21,6 +21,16 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.7 (2026-10-14)
+
+- **[Agent Shell] Quiet waits finish on macOS**:
+  - After output, a silent `sleep` or delay script keeps running until it exits. macOS cannot sample CPU, so those waits no longer pause for a model decision.
+
+---
+
+- **[Agent 终端] macOS 上安静等待可以跑完**:
+  - 已有输出后的 `sleep` 或延迟脚本会一直跑到自己结束。macOS 无法采样 CPU，这类等待不再弹出要模型决定是否停掉的提示。
+
 ## v7.2.4-beta.6 (2026-10-13)
 
 - **[Updates] Beta channel and remote in-place upgrades**:
