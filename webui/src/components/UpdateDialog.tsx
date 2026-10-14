@@ -2,6 +2,7 @@ import DOMPurify from 'dompurify';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus, UpdateVersionEntry } from '../api';
 import { copyTextToClipboard } from '../lib/clipboard';
+import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
 import { Markdown } from './Markdown';
 import { useT } from '../settings';
 
@@ -104,8 +105,8 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     doCheckUpdate(channel);
   }, []);
 
-  // 轮询更新进度。进度变化不能拆掉这次轮询，否则「完成」的刷新会被取消，
-  // 页面留在旧进程上。安装已经开始后，服务重启或状态回到 idle，都等新进程起来再刷新。
+  // 轮询更新进度。进度变化不能拆掉这次轮询。
+  // 安装开始后，状态变为完成或服务重启，都走和「完成」按钮同一条刷新。
   useEffect(() => {
     if (!updating) return;
     let stopped = false;
@@ -165,15 +166,16 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const forceReinstall = isLatestPick && sameVersion(info?.current_version, targetVersion);
   targetVersionRef.current = targetVersion;
   currentVersionRef.current = info?.current_version || '';
+  // 点「完成」和进度到完成后的自动等待是同一次刷新：确认 /health 已是目标版本再重载。
+  // 旧进程退出前仍会应答，不能在那一次应答上把页面刷回去。
   reloadAfterRestartRef.current = () => {
     if (reloadStarted.current) return;
     reloadStarted.current = true;
-    const want = (targetVersionRef.current || '').trim().replace(/^v/i, '').toLowerCase();
-    const from = (currentVersionRef.current || '').trim().replace(/^v/i, '').toLowerCase();
-    const sameTarget = want.length > 0 && want === from;
+    const want = targetVersionRef.current;
+    const from = currentVersionRef.current;
     void (async () => {
-      let sawDown = false;
-      const deadline = Date.now() + 30000;
+      let misses = 0;
+      const deadline = Date.now() + 60000;
       while (Date.now() < deadline) {
         try {
           const resp = await fetch('/health', {
@@ -182,23 +184,18 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
           });
           if (!resp.ok) throw new Error(String(resp.status));
           const body = await resp.json();
-          const got = String(body?.version ?? '').trim().replace(/^v/i, '').toLowerCase();
-          if (sawDown && got) {
+          const got = String(body?.version ?? '');
+          if (shouldReloadUpgradedPage({ want, from, got, consecutiveMisses: misses })) {
             window.location.reload();
             return;
           }
-          if (!sameTarget && want && got === want) {
-            window.location.reload();
-            return;
-          }
+          misses = 0;
         } catch {
-          sawDown = true;
+          misses += 1;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 400));
       }
-      try {
-        window.location.reload();
-      } catch {}
+      reloadStarted.current = false;
     })();
   };
 

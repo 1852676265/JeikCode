@@ -631,7 +631,8 @@ pub(crate) fn chat_runtime_config(
         // responder is registered; otherwise run_chat_turn_v2 applies the mode-specific,
         // fail-closed fallback. Keep the runtime round-trip enabled here.
         dangerously_skip_permissions: false,
-        // Keep the fail-closed approval timeout for the daemon (current behavior).
+        // Interactive cards park with no deadline once a responder is registered.
+        // Headless turns never enter that wait.
         interactive: false,
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
@@ -965,12 +966,13 @@ pub(crate) async fn steer_into_running_turn(
 fn configure_chat_runtime_interactivity(
     runtime_cfg: &mut jeikcode_coding::CodingRuntimeConfig,
     has_interactive_driver: bool,
-) -> Option<std::time::Duration> {
-    let driver_request_timeout = runtime_cfg.agent_config().request_timeout;
+) {
+    // A shown approval or question card waits until the user answers or the
+    // turn is cancelled. The 300s request timeout must not expire the card,
+    // auto-deny the tool, or tell the model that no answer was provided.
     if has_interactive_driver {
         runtime_cfg.interactive = true;
     }
-    driver_request_timeout
 }
 
 pub(crate) async fn run_chat_turn_v2(
@@ -988,11 +990,8 @@ pub(crate) async fn run_chat_turn_v2(
     use jeikcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use jeikcode_coding::TurnCompletion;
 
-    // When this daemon has a real interactive response route, the daemon owns
-    // cancellation/liveness at the transport seam. Disable the kernel's second,
-    // equal request timeout so it cannot expire the RequestCtx first and then
-    // race a later HTTP decision that the daemon still considers pending.
-    let driver_request_timeout = configure_chat_runtime_interactivity(
+    // Shown cards wait without a deadline. Cancellation still unblocks the turn.
+    configure_chat_runtime_interactivity(
         &mut runtime_cfg,
         permission_responders.is_some() || user_input_responders.is_some(),
     );
@@ -1229,8 +1228,7 @@ pub(crate) async fn run_chat_turn_v2(
                             );
                             (PermissionDecision::Deny, false)
                         } else {
-                            let response =
-                                await_chat_permission_response(rx, driver_request_timeout);
+                            let response = await_chat_permission_response(rx, None);
                             tokio::pin!(response);
                             loop {
                                 match next_chat_permission_driver_event(
@@ -1363,7 +1361,7 @@ pub(crate) async fn run_chat_turn_v2(
                 // Register before publishing the SSE event so a very fast browser answer
                 // cannot race the response route and be rejected as stale.
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
-                let answer = await_chat_user_input_response(rx, driver_request_timeout);
+                let answer = await_chat_user_input_response(rx, None);
                 tokio::pin!(answer);
                 let value = tokio::select! {
                     _ = cancel.cancelled(), if !cancelled => {
@@ -4401,11 +4399,8 @@ mod tests {
             false,
             false,
         );
-        let configured_timeout = runtime_cfg.agent_config().request_timeout;
-        assert!(configured_timeout.is_some());
-        let driver_request_timeout = configure_chat_runtime_interactivity(&mut runtime_cfg, true);
-        assert_eq!(driver_request_timeout, configured_timeout);
-        assert!(driver_request_timeout.is_some());
+        assert!(runtime_cfg.agent_config().request_timeout.is_some());
+        configure_chat_runtime_interactivity(&mut runtime_cfg, true);
         assert!(runtime_cfg.agent_config().request_timeout.is_none());
     }
 
