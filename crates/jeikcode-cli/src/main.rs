@@ -1590,7 +1590,79 @@ fn merge_startup_notices(
     }
 }
 
+struct DesktopWebuiLaunch {
+    host: String,
+    port: u16,
+    no_open: bool,
+    token: Option<String>,
+}
+
+/// Desktop sets `JEIKCODE_DESKTOP=1` and a fixed argv. Skip clap, telemetry,
+/// and the pending-upgrade scan so the listen address can be printed immediately.
+fn desktop_webui_fast_launch() -> Option<DesktopWebuiLaunch> {
+    if std::env::var_os("JEIKCODE_DESKTOP").is_none() {
+        return None;
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_desktop_webui_args(&args)
+}
+
+fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
+    if args.first().map(String::as_str) != Some("webui") {
+        return None;
+    }
+    let mut host = "127.0.0.1".to_string();
+    let mut port = jeikcode_daemon::WEBUI_DEFAULT_PORT;
+    let mut no_open = false;
+    let mut token = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--host" => {
+                index += 1;
+                host = args.get(index)?.clone();
+            }
+            "--port" => {
+                index += 1;
+                port = args.get(index)?.parse().ok()?;
+            }
+            "--no-open" => no_open = true,
+            "--token" => {
+                index += 1;
+                let value = args.get(index)?.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                token = Some(value.to_string());
+            }
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some(DesktopWebuiLaunch {
+        host,
+        port,
+        no_open,
+        token,
+    })
+}
+
 async fn async_main() {
+    if let Some(launch) = desktop_webui_fast_launch() {
+        let msg = jeikcode_daemon::ensure_webui(
+            &launch.host,
+            launch.port,
+            !launch.no_open,
+            launch.token.as_deref(),
+            None,
+        )
+        .await;
+        eprintln!("{msg}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        wait_until_webui_stopped().await;
+        std::process::exit(0);
+    }
+
     let process_start = std::time::Instant::now();
     // Wire `tracing::` diagnostics to `<config_dir>/logs/jeikcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
@@ -4635,13 +4707,33 @@ mod tests {
         format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, interactive_provider_bootstrap,
         is_completion_invocation, jeikcode_log_path, merge_startup_notices, normalize_attach_base,
-        print_shell_completion, resolve_working_dir, runtime_config_from,
+        parse_desktop_webui_args, print_shell_completion, resolve_working_dir, runtime_config_from,
         should_fork_busy_continue, token_from_url, truncate_log_line, Cli, Commands,
         DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
     use std::path::PathBuf;
+
+    #[test]
+    fn desktop_webui_args_skip_the_full_cli_parser() {
+        let launch = parse_desktop_webui_args(&[
+            "webui".into(),
+            "--host".into(),
+            "0.0.0.0".into(),
+            "--port".into(),
+            "13457".into(),
+            "--no-open".into(),
+            "--token".into(),
+            "desk-token".into(),
+        ])
+        .expect("desktop argv");
+        assert_eq!(launch.host, "0.0.0.0");
+        assert_eq!(launch.port, 13457);
+        assert!(launch.no_open);
+        assert_eq!(launch.token.as_deref(), Some("desk-token"));
+        assert!(parse_desktop_webui_args(&["webui".into(), "--beta".into()]).is_none());
+    }
 
     #[test]
     fn completion_subcommand_defaults_to_bash_and_accepts_all_supported_shells() {

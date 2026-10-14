@@ -2,14 +2,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! 薄桌面壳：拉起同一个 `jeikcode webui`，窗口只打开它。
-//! 不另写 Agent。CLI 从安装包资源拷到 `~/.local/bin`（仅当该处没有更新的副本）。
-//! `jeikcode upgrade` 写过的 `~/.local/bin` 不能被安装包里的旧 `cli-bin` 盖掉。
+//! 已安装的 `~/.local/bin` 直接启动。安装包里的 `cli-bin` 只在缺失或更新时后台复制，
+//! 不挡这次打开。`jeikcode upgrade` 写过的较新副本不会被安装包盖掉。
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::Manager;
 
@@ -305,17 +306,17 @@ fn start_webui(app: &tauri::AppHandle) -> Result<(String, std::process::Child), 
     let bundled = bundled_cli(app);
     let bin = publish_cli(bundled.as_deref()).map_err(|e| format!("安装命令行失败：{e}"))?;
     let home = home_dir();
-    let (port, token) = saved_webui_listen();
+    let (port, saved_token) = saved_webui_listen();
+    let token = saved_token.unwrap_or_else(|| mint_desktop_token(port));
     let mut cmd = Command::new(&bin);
     cmd.arg("webui")
         .arg("--host")
         .arg("0.0.0.0")
         .arg("--port")
         .arg(port.to_string())
-        .arg("--no-open");
-    if let Some(token) = token {
-        cmd.arg("--token").arg(token);
-    }
+        .arg("--no-open")
+        .arg("--token")
+        .arg(&token);
     cmd.env("JEIKCODE_DESKTOP", "1");
     if let Some(ref bundled) = bundled {
         cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
@@ -341,6 +342,15 @@ fn start_webui(app: &tauri::AppHandle) -> Result<(String, std::process::Child), 
     // The process listens on 0.0.0.0. This window is on this computer, so it
     // opens 127.0.0.1. Other devices use the LAN addresses in the panel.
     url = window_url(&url);
+    let probe_port = url
+        .parse::<tauri::Url>()
+        .ok()
+        .and_then(|parsed| parsed.port())
+        .unwrap_or(port);
+    let ready_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < ready_deadline && !health_ready(probe_port) {
+        std::thread::sleep(Duration::from_millis(40));
+    }
     Ok((url, child))
 }
 
@@ -414,24 +424,66 @@ pub fn extract_webui_url(text: &str) -> Option<String> {
     url.contains("token=").then(|| url.to_string())
 }
 
+fn health_ready(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 80];
+    let Ok(n) = stream.read(&mut buf) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
+fn mint_desktop_token(port: u16) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let token = format!("sk-{:x}-{:x}", std::process::id(), nanos);
+    let dir = jeikcode_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let body = format!("{{\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
+    let _ = std::fs::write(dir.join("webui-listen.json"), body);
+    token
+}
+
 fn publish_cli(bundled: Option<&Path>) -> std::io::Result<PathBuf> {
     let dest_dir = cli_dest_dir();
-    std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(cli_file_name());
-    if let Some(src) = bundled.filter(|p| looks_like_binary(p)) {
-        // Size-only compare used to copy bundled over a CLI-upgraded dest
-        // whenever the installer on D: was older. Keep dest when it is newer.
-        let should_copy = !dest.is_file()
-            || !looks_like_binary(&dest)
-            || bundled_is_newer(src, &dest);
-        if should_copy {
-            let _ = std::fs::copy(src, &dest);
+    let bundled = bundled.filter(|path| looks_like_binary(path));
+    let dest_ready = dest.is_file() && looks_like_binary(&dest);
+    // 安装包更新，或本机还没有副本：先直接跑安装包里的文件，复制放到后台。
+    let launch_bundled = bundled.is_some_and(|src| !dest_ready || bundled_is_newer(src, &dest));
+    if launch_bundled {
+        if let Some(src) = bundled {
+            let src_owned = src.to_path_buf();
+            let dest_owned = dest.clone();
+            let dest_dir_owned = dest_dir.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::create_dir_all(&dest_dir_owned);
+                let _ = std::fs::copy(&src_owned, &dest_owned);
+                set_executable(&dest_owned);
+                ensure_on_path(&dest_dir_owned);
+            });
+            set_executable(src);
+            return Ok(src.to_path_buf());
         }
-        set_executable(&dest);
-        ensure_on_path(&dest_dir);
-        if dest.is_file() {
-            return Ok(dest);
-        }
+    }
+    if dest_ready {
+        let dest_dir_owned = dest_dir.clone();
+        std::thread::spawn(move || ensure_on_path(&dest_dir_owned));
+        return Ok(dest);
     }
     if dest.is_file() {
         return Ok(dest);
@@ -443,9 +495,7 @@ fn bundled_is_newer(bundled: &Path, dest: &Path) -> bool {
     let bundled_mtime = std::fs::metadata(bundled)
         .ok()
         .and_then(|m| m.modified().ok());
-    let dest_mtime = std::fs::metadata(dest)
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let dest_mtime = std::fs::metadata(dest).ok().and_then(|m| m.modified().ok());
     match (bundled_mtime, dest_mtime) {
         (Some(bundled), Some(dest)) => bundled > dest,
         (Some(_), None) => true,

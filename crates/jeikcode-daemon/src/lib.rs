@@ -10585,8 +10585,21 @@ pub async fn ensure_webui(
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
     //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
     let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::" || bound_host == "[::]";
+    // 桌面窗口只用 127.0.0.1。先把这条地址刷出 stderr，再去做局域网探测，
+    // 避免第一次启动时 UDP 选路或防火墙提示把启动页卡住。
+    if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
+        let mut early = format!("http://127.0.0.1:{actual_port}/?token={token}");
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let short: String = id.chars().take(8).collect();
+            early.push_str("&session=");
+            early.push_str(&short);
+        }
+        eprintln!("webui 已启动：{early}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
     // 通配绑定（用户意在暴露到网络）时探测本机局域网/公网 IP（优先 IPv4，回退 IPv6）。
-    let lan_ip = if is_wildcard {
+    // 桌面壳自己改写到 127.0.0.1，探测只增加启动等待，第一次还可能弹出防火墙提示。
+    let lan_ip = if is_wildcard && std::env::var_os("JEIKCODE_DESKTOP").is_none() {
         primary_lan_ipv4().or_else(primary_lan_ipv6)
     } else {
         None

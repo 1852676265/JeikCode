@@ -642,7 +642,6 @@ export const vi: Record<keyof typeof en, string> = {
   'update.latestVersion': 'Phiên bản mới nhất',
   'update.targetVersion': 'Phiên bản đích',
   'update.historyLabel': 'Lịch sử',
-  'update.historyLatest': 'mới nhất',
   'update.notesBtn': 'Nội dung cập nhật',
   'update.notesTitle': 'Nội dung cập nhật',
   'update.notesEmpty': 'Bản phát hành này không có ghi chú.',

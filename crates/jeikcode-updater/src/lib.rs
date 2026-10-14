@@ -534,16 +534,18 @@ fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
     None
 }
 
+fn notes_missing(body: &Option<String>) -> bool {
+    body.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
+}
+
 fn merge_listed_releases(into: &mut Vec<ListedRelease>, extra: Vec<ListedRelease>) {
     for rel in extra {
         if rel.tag_name.trim().is_empty() {
             continue;
         }
         if let Some(existing) = into.iter_mut().find(|r| r.tag_name == rel.tag_name) {
-            if existing.body.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                if rel.body.as_ref().is_some_and(|s| !s.is_empty()) {
-                    existing.body = rel.body;
-                }
+            if notes_missing(&existing.body) && !notes_missing(&rel.body) {
+                existing.body = rel.body;
             }
             if existing.published_at.is_none() {
                 existing.published_at = rel.published_at;
@@ -599,9 +601,9 @@ async fn fetch_release_pages(
 
 /// Releases from the edge cache at `jeikcode.top/api/releases`.
 ///
-/// That payload already includes each tag and its announcement `body`.
-/// GitHub's REST API is only used when the edge returns nothing, because
-/// unauthenticated calls share a 60 request/hour limit.
+/// GitHub's REST API is used when the edge returns nothing, or when it
+/// returns tags whose announcement `body` is still empty. A payload that
+/// already includes notes does not call GitHub.
 pub async fn list_releases() -> Result<Vec<ListedRelease>> {
     let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(30))
@@ -619,7 +621,8 @@ pub async fn list_releases() -> Result<Vec<ListedRelease>> {
             }
         }
     }
-    if all.is_empty() {
+    let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
+    if all.is_empty() || !edge_has_notes {
         let gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100";
         if let Ok(pages) = fetch_release_pages(&client, gh).await {
             merge_listed_releases(&mut all, pages);
@@ -802,6 +805,9 @@ fn supervised_by_service_manager() -> bool {
 /// If the successor cannot be started, returns `Err` and the caller MUST keep
 /// serving so a remote browser is not left with a dead port.
 pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> {
+    // The binary on disk is already the selected release. A staged
+    // pending.json must not replace it again on the next start.
+    std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
     #[cfg(unix)]
     if supervised_by_service_manager() {
         return re_exec_self(Some(exe));
@@ -811,6 +817,7 @@ pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> 
     let mut cmd = std::process::Command::new(exe);
     cmd.args(&args)
         .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
+        .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

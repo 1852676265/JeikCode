@@ -53,6 +53,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
 
   const isDesktop = false;
   const isMounted = useRef(true);
+  const reloadStarted = useRef(false);
+  const sawInstallProgress = useRef(false);
+  const targetVersionRef = useRef('');
+  const currentVersionRef = useRef('');
+  const reloadAfterRestartRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     isMounted.current = true;
@@ -99,49 +104,44 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     doCheckUpdate(channel);
   }, []);
 
-  // 轮询更新进度。服务就地替换后会重启，异地可能收不到最终 done，
-  // 进度已经进入安装阶段后请求失败也视为完成并刷新。
+  // 轮询更新进度。进度变化不能拆掉这次轮询，否则「完成」的刷新会被取消，
+  // 页面留在旧进程上。安装已经开始后，服务重启或状态回到 idle，都等新进程起来再刷新。
   useEffect(() => {
-    let timer: any = null;
-    let reloadTimer: any = null;
-    const scheduleReload = () => {
-      if (reloadTimer) return;
-      reloadTimer = window.setTimeout(() => {
-        try {
-          window.location.reload();
-        } catch {}
-      }, 4000);
-    };
-    if (updating) {
-      timer = setInterval(async () => {
-        try {
-          const s = await getUpdateStatus();
-          if (isMounted.current) {
-            setStatus(s);
-            if (s.status === 'done' || s.status === 'error') {
-              if (timer) clearInterval(timer);
-            }
-            if (s.status === 'done') {
-              scheduleReload();
-            }
-          }
-        } catch {
-          const progressed =
-            status?.status === 'installing' ||
-            status?.status === 'done' ||
-            (status?.status === 'downloading' && (status?.progress ?? 0) >= 90);
-          if (progressed) {
-            if (timer) clearInterval(timer);
-            scheduleReload();
-          }
-        }
-      }, 500);
-    }
+    if (!updating) return;
+    let stopped = false;
+    let misses = 0;
+    const timer = window.setInterval(async () => {
+      if (stopped || reloadStarted.current) return;
+      try {
+        const s = await getUpdateStatus();
+        if (!isMounted.current || stopped) return;
+        misses = 0;
+        setStatus(s);
+        const progressed =
+          s.status === 'installing' ||
+          s.status === 'done' ||
+          (s.status === 'downloading' && (s.progress ?? 0) >= 90);
+        if (progressed) sawInstallProgress.current = true;
+        const restarted =
+          s.status === 'done' ||
+          (sawInstallProgress.current && (s.status === 'idle' || s.status === 'ready'));
+        if (!restarted) return;
+        stopped = true;
+        window.clearInterval(timer);
+        reloadAfterRestartRef.current();
+      } catch {
+        misses += 1;
+        if (!sawInstallProgress.current || misses < 3 || stopped) return;
+        stopped = true;
+        window.clearInterval(timer);
+        reloadAfterRestartRef.current();
+      }
+    }, 500);
     return () => {
-      if (timer) clearInterval(timer);
-      if (reloadTimer) clearTimeout(reloadTimer);
+      stopped = true;
+      window.clearInterval(timer);
     };
-  }, [updating, status?.status, status?.progress]);
+  }, [updating]);
 
   const sameVersion = (a?: string, b?: string) => {
     const n = (v?: string) => (v || '').trim().replace(/^v/i, '').toLowerCase();
@@ -163,9 +163,49 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const selectedEntry = versionEntries.find((entry) => sameVersion(entry.version, targetVersion));
   const isLatestPick = !targetVersion || sameVersion(targetVersion, info?.latest_version || versionOptions[0]);
   const forceReinstall = isLatestPick && sameVersion(info?.current_version, targetVersion);
+  targetVersionRef.current = targetVersion;
+  currentVersionRef.current = info?.current_version || '';
+  reloadAfterRestartRef.current = () => {
+    if (reloadStarted.current) return;
+    reloadStarted.current = true;
+    const want = (targetVersionRef.current || '').trim().replace(/^v/i, '').toLowerCase();
+    const from = (currentVersionRef.current || '').trim().replace(/^v/i, '').toLowerCase();
+    const sameTarget = want.length > 0 && want === from;
+    void (async () => {
+      let sawDown = false;
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        try {
+          const resp = await fetch('/health', {
+            credentials: 'include',
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!resp.ok) throw new Error(String(resp.status));
+          const body = await resp.json();
+          const got = String(body?.version ?? '').trim().replace(/^v/i, '').toLowerCase();
+          if (sawDown && got) {
+            window.location.reload();
+            return;
+          }
+          if (!sameTarget && want && got === want) {
+            window.location.reload();
+            return;
+          }
+        } catch {
+          sawDown = true;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 400));
+      }
+      try {
+        window.location.reload();
+      } catch {}
+    })();
+  };
 
   const handleStartUpdate = async () => {
     if (isChecking || !targetVersion) return;
+    reloadStarted.current = false;
+    sawInstallProgress.current = false;
     setUpdating(true);
     try {
       await executeUpdate({
@@ -368,9 +408,9 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
               disabled={updating || isChecking || versionOptions.length === 0}
               onChange={(e) => setSelectedVersion((e.target as HTMLSelectElement).value)}
             >
-              {versionOptions.map((version, index) => (
+              {versionOptions.map((version) => (
                 <option key={version} value={version}>
-                  {index === 0 ? `${version} (${t('update.historyLatest')})` : version}
+                  {version}
                 </option>
               ))}
             </select>
@@ -444,7 +484,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
             <button
               type="button"
               class="btn btn-primary"
-              onClick={onClose}
+              onClick={() => reloadAfterRestartRef.current()}
             >
               {t('update.btnDone')}
             </button>
