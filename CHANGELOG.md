@@ -21,6 +21,65 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4 (2026-10-14)
+
+- **[Updates] Desktop, a remote browser, and a headless CLI share one update flow**:
+  - All three can install another version or roll back. In the desktop app or WebUI, use the update control at the top right. When the update finishes, the page reloads onto the new version. Clicking Finish and waiting do the same thing.
+  - Release notes open for the selected version. The history lists every version on that channel, newest first. Force Update stays only when the running build is already that latest version.
+  - An in-place upgrade replaces the running program and restarts the same service, including the access token. If the new process cannot start, the old one keeps serving.
+  - The desktop window opens sooner. The service still listens on 0.0.0.0, so other devices can reach it with the same port and token.
+
+- **[CLI] List, install, and roll back a version**:
+  - `jeikcode list` and `jeikcode list main` show stable history. `jeikcode list beta` shows beta history.
+  - `up`, `update`, and `upgrade` install a newer build. `up main` and `up beta` choose the channel, and a version after them installs that release. `down main` and `down beta` install a specific or older release. `rollback` returns to the previous program kept on disk. `-y` applies configuration changes without a prompt, including on a headless server.
+  - Tutorial: https://jeikcode.top/guide/updates.html
+
+- **[Uninstall] A guided removal, or a prompt-free removal for scripts**:
+  - `jeikcode uninstall` asks whether to keep user configuration. The program and its PATH entry are always removed.
+  - `jeikcode uninstall simple` removes only the program and keeps configuration. `jeikcode uninstall all` removes both. Neither command asks a question.
+  - Prompts follow Simplified Chinese, English, or Vietnamese. Windows, macOS, Linux, and HarmonyOS PC use the same commands.
+  - Tutorial: https://jeikcode.top/guide/updates.html
+
+- **[Long tasks] Five-stage waits, shell commands, and cards that stay open**:
+  - A long model reply is watched in five stages: connecting, waiting for the response to begin, waiting for the first token, waiting for text or a tool after thinking, and gaps between later tokens.
+  - When the model returns only thinking, with no reply text and no tool call, the first retry is immediate. Later retries wait, up to five times.
+  - Quiet shell waits such as `sleep` run until they finish or reach the 30-minute cap. On macOS those waits are no longer stopped for a model decision.
+  - `git log`, `git show`, `git diff`, and similar output commands are allowed, including `-p` and `-i`. Truly interactive git commands such as `git add -p` and `git rebase -i` stay blocked.
+  - An approval card and a question card stay until you answer or stop the turn.
+
+- **[API] Conversations stay in the directory where the server started**:
+  - OpenAI and Anthropic endpoints keep using the directory where `jeikcode serve` was started. Switching projects in the sidebar no longer moves those sessions.
+  - New Chat creates a session in the current workspace. Hiding or showing a project stays in sync across tabs and desktop windows.
+
+---
+
+- **[更新] 桌面版、异地浏览器和无头命令行共用一套更新**:
+  - 这三种环境都可以安装其他版本或回退。桌面版和 WebUI 点击右上角更新。更新完成后页面自动刷新到新版本。点「完成」和继续等待是同一行为。
+  - 可以打开所选版本的更新说明。历史列表按通道列出全部版本，最新在前。仅当正在运行的版本已是该最新版时，才显示「强制更新」。
+  - 就地升级会替换正在运行的程序并重启同一服务，访问 token 保持不变。新进程无法启动时，旧进程继续提供服务。
+  - 桌面窗口打开更快。服务仍监听 0.0.0.0，其他设备仍可用同一端口和 token 访问。
+
+- **[命令行] 查看、安装和回退版本**:
+  - 更新命令更加完善：`jeikcode list` 与 `jeikcode list main` 列出正式版，`jeikcode list beta` 列出测试版。`up`、`update`、`upgrade` 安装较新版本。`up main` 与 `up beta` 选择通道，后面可跟版本号。`down main` 与 `down beta` 安装指定或更旧的版本。`rollback` 回到磁盘上的上一版。`-y` 不询问直接应用配置变更，无头服务器同样可用。
+  - 详细教程：https://jeikcode.top/zh/guide/updates.html
+
+- **[卸载] 交互引导，或给脚本用的无提问卸载**:
+  - `jeikcode uninstall` 询问是否保留用户配置。程序和 PATH 项一定会移除。
+  - `jeikcode uninstall simple` 只删除程序并保留配置。`jeikcode uninstall all` 两者都删除。这两条命令都不提问。
+  - 提示跟随简体中文、英文或越南文。Windows、macOS、Linux、HarmonyOS PC 使用同一套命令。
+  - 详细教程：https://jeikcode.top/zh/guide/updates.html
+
+- **[长任务] 五阶段等待、终端命令，以及一直留着的卡片**:
+  - 较长的模型回复按五个阶段观察：建立连接、等待响应开始、等待第一个 token、思考之后等待正文或工具，以及后续 token 之间的间隔。
+  - 模型只返回思考、没有正文也没有工具时，第一次立即重试。之后的重试才等待，最多 5 次。
+  - `sleep` 这类安静等待会一直跑到结束，或达到 30 分钟上限。在 macOS 上，这类等待不再交给模型决定是否停掉。
+  - `git log`、`git show`、`git diff` 以及同类输出命令可以运行，包括 `-p` 和 `-i`。`git add -p`、`git rebase -i` 这类真正的交互命令仍然拦截。
+  - 审批卡和提问卡会留到你作答或停止这一回合。
+
+- **[API] 对话留在服务启动时的目录**:
+  - OpenAI 与 Anthropic 端点继续使用 `jeikcode serve` 启动时所在目录。侧栏切换项目不再把这些会话送走。
+  - 「新建对话」在当前工作区创建会话。项目的隐藏和显示会在多个标签页和桌面窗口之间保持同步。
+
 ## v7.2.4-beta.13 (2026-10-14)
 
 - **[Updates] Desktop, a remote browser, and a headless CLI share one update flow**:
