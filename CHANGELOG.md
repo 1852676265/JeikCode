@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.10 (2026-10-14)
+
+- **[Updates] Channel history and release notes**:
+  - The update dialog lists every version on the selected channel, newest first. Force Update stays only when that latest matches the running version. Choosing another version installs it with Update Now.
+  - Release notes for the selected version open in a dialog, with copy, on desktop and phone, in light and dark.
+  - `jeikcode list` shows stable history. `jeikcode list beta` shows beta history. `update` and `up` work like `upgrade`. `jeikcode up main|beta [version]` and `jeikcode down main|beta <version>` install a specific version. `-y` still auto-applies config diffs.
+  - Version lists and notes come from jeikcode.top. A check does not call the GitHub API when that edge list is already available.
+
+---
+
+- **[更新] 通道历史版本与更新说明**:
+  - 更新对话框按所选通道列出全部历史版本，最新在前。仅当该最新版等于当前版本时仍显示「强制更新」。选择其他版本则按「立即更新」安装。
+  - 所选版本的更新说明在弹窗中打开，支持复制，手机和电脑、亮色和暗色都可用。
+  - `jeikcode list` 显示正式版历史。`jeikcode list beta` 显示测试版历史。`update` 与 `up` 和 `upgrade` 相同。`jeikcode up main|beta [version]` 与 `jeikcode down main|beta <version>` 安装指定版本。`-y` 仍自动应用配置差异。
+  - 版本列表和更新说明来自 jeikcode.top。边缘列表已经返回时，检查更新不会再请求 GitHub API。
+
 ## v7.2.4-beta.9 (2026-10-14)
 
 - **[Updates] Force reinstall and dual-copy CLI swap**:
