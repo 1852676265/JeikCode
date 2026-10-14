@@ -65,6 +65,15 @@ pub struct ExecuteUpdateRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateVersionEntry {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpdateCheckResponse {
     pub current_version: String,
     pub latest_version: String,
@@ -74,6 +83,9 @@ pub struct UpdateCheckResponse {
     pub download_url: Option<String>,
     pub released_at: Option<String>,
     pub channel: String,
+    /// Channel history, newest first. `versions[0]` is `latest_version`.
+    #[serde(default)]
+    pub versions: Vec<UpdateVersionEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,19 +183,17 @@ pub fn is_desktop_environment() -> bool {
     std::env::var("JEIKCODE_DESKTOP").is_ok()
 }
 
-/// 官方 Cloudflare Pages 全球边缘免限流发布源（经边缘缓存 70 秒，不受 GitHub API 60次/小时限流影响）
-const DEFAULT_PRIMARY_RELEASES_API_URL: &str = "https://jeikcode.top/api/releases";
-const FALLBACK_GITHUB_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=30";
 const GITHUB_LATEST_API_URL: &str = "https://api.github.com/repos/jeikl/JeikCode/releases/latest";
 
 #[derive(Debug, Deserialize, Clone)]
 struct GitHubRelease {
     tag_name: String,
+    #[allow(dead_code)]
     html_url: String,
     body: Option<String>,
     published_at: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     prerelease: bool,
     #[serde(default)]
     assets: Vec<GitHubReleaseAsset>,
@@ -212,6 +222,7 @@ fn create_update_client() -> Option<reqwest::Client> {
 }
 
 /// 根据指定的更新通道，在 Release 列表中寻找语义化版本号最大的目标 Release，支持跨版本直升最高版
+#[cfg(test)]
 fn find_highest_release(
     releases: &[GitHubRelease],
     channel: UpdateChannel,
@@ -404,53 +415,50 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     let mut release_notes = None;
     let mut released_at = None;
     let mut download_url = None;
+    let mut versions: Vec<UpdateVersionEntry> = Vec::new();
 
-    // 优先从官方 Cloudflare 边缘缓存源获取所有最新发布（支持 Beta 与 Stable，且全球免限流），
-    // 失败时优雅回退到 GitHub 官方 API 接口
-    let mut fetched_release: Option<GitHubRelease> = None;
-    if let Some(ref c) = client {
-        let primary_url = std::env::var("JEIKCODE_RELEASES_API_URL")
-            .ok()
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_PRIMARY_RELEASES_API_URL.to_string());
+    let updater_channel = match channel {
+        UpdateChannel::Beta => jeikcode_updater::UpdateChannel::Beta,
+        UpdateChannel::Stable => jeikcode_updater::UpdateChannel::Stable,
+    };
 
-        // 1. 尝试 Cloudflare 边缘免限流源
-        if let Ok(resp) = c.get(&primary_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(releases) = resp.json::<Vec<GitHubRelease>>().await {
-                    fetched_release = find_highest_release(&releases, channel);
-                }
-            }
-        }
-
-        // 2. 边缘源若未就绪或受阻，回退至 GitHub 官方 API
-        if fetched_release.is_none() {
-            if let Ok(resp) = c.get(FALLBACK_GITHUB_RELEASES_API_URL).send().await {
-                if resp.status().is_success() {
-                    if let Ok(releases) = resp.json::<Vec<GitHubRelease>>().await {
-                        fetched_release = find_highest_release(&releases, channel);
-                    }
-                }
+    // 边缘缓存与 GitHub 分页合并后，按通道倒序给出全部历史版本。
+    if let Ok(releases) = jeikcode_updater::list_releases().await {
+        let matched = jeikcode_updater::filter_channel_releases(&releases, updater_channel);
+        versions = matched
+            .iter()
+            .map(|r| UpdateVersionEntry {
+                version: r.tag_name.clone(),
+                notes: r.body.clone().filter(|s| !s.trim().is_empty()),
+                released_at: r.published_at.clone(),
+            })
+            .collect();
+        if let Some(rel) = matched.first() {
+            latest_version = rel.tag_name.clone();
+            release_notes = rel.body.clone();
+            released_at = rel.published_at.clone();
+            let assets: Vec<GitHubReleaseAsset> = rel
+                .assets
+                .iter()
+                .map(|a| GitHubReleaseAsset {
+                    name: a.name.clone(),
+                    browser_download_url: a.browser_download_url.clone(),
+                })
+                .collect();
+            if is_desktop {
+                download_url = find_desktop_installer_url_in_assets(&assets)
+                    .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
+            } else {
+                download_url = find_cli_asset_url(&assets, &latest_version).or_else(|| {
+                    jeikcode_updater::detect_target()
+                        .map(|target| jeikcode_updater::binary_url(&latest_version, target))
+                });
             }
         }
     }
 
-    if let Some(rel) = fetched_release {
-        latest_version = rel.tag_name.clone();
-        release_notes = rel.body;
-        released_at = rel.published_at;
-
-        if is_desktop {
-            download_url = find_desktop_installer_url_in_assets(&rel.assets)
-                .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
-        } else {
-            download_url = find_cli_asset_url(&rel.assets, &latest_version).or_else(|| {
-                jeikcode_updater::detect_target()
-                    .map(|target| jeikcode_updater::binary_url(&latest_version, target))
-            });
-        }
-    } else {
-        // 后备方案（GitHub API 限流或网络不通时退回从官方 latest.json 探测）
+    if latest_version.is_empty() {
+        // 后备方案（发布列表不可用时退回从官方 latest.json 探测）
         if let Ok(m) = jeikcode_updater::fetch_manifest().await {
             latest_version = m.version;
             released_at = m.released_at;
@@ -483,6 +491,13 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                 }
             }
         }
+        if !latest_version.is_empty() {
+            versions = vec![UpdateVersionEntry {
+                version: latest_version.clone(),
+                notes: release_notes.clone().filter(|s| !s.trim().is_empty()),
+                released_at: released_at.clone(),
+            }];
+        }
     }
 
     let has_update =
@@ -497,6 +512,7 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         download_url,
         released_at,
         channel: channel.as_str().to_string(),
+        versions,
     })
 }
 

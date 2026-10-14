@@ -2478,6 +2478,12 @@ export async function gitAction(options: {
 
 // --- Update & Config Sync API ---
 
+export interface UpdateVersionEntry {
+  version: string;
+  notes?: string | null;
+  released_at?: string | null;
+}
+
 export interface UpdateCheckResponse {
   current_version: string;
   latest_version: string;
@@ -2487,6 +2493,8 @@ export interface UpdateCheckResponse {
   download_url?: string | null;
   released_at?: string | null;
   channel?: 'stable' | 'beta';
+  /** Channel history, newest first. */
+  versions?: UpdateVersionEntry[];
 }
 
 export interface UpdateStatus {

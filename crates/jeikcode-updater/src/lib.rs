@@ -443,11 +443,24 @@ impl UpdateChannel {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ReleaseTag {
-    tag_name: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
+/// One GitHub (or edge-cache) release row used by version listing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedRelease {
+    pub tag_name: String,
     #[serde(default)]
-    prerelease: bool,
+    pub prerelease: bool,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub assets: Vec<ListedAsset>,
 }
 
 fn tag_is_prerelease(tag: &str, flagged: bool) -> bool {
@@ -505,37 +518,179 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-async fn list_release_tags(client: &reqwest::Client) -> Result<Vec<ReleaseTag>> {
+fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in raw.split(',') {
+        let part = part.trim();
+        if !part.contains("rel=\"next\"") {
+            continue;
+        }
+        let start = part.find('<')? + 1;
+        let end = part.find('>')?;
+        if start < end {
+            return Some(part[start..end].to_string());
+        }
+    }
+    None
+}
+
+fn merge_listed_releases(into: &mut Vec<ListedRelease>, extra: Vec<ListedRelease>) {
+    for rel in extra {
+        if rel.tag_name.trim().is_empty() {
+            continue;
+        }
+        if let Some(existing) = into.iter_mut().find(|r| r.tag_name == rel.tag_name) {
+            if existing.body.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                if rel.body.as_ref().is_some_and(|s| !s.is_empty()) {
+                    existing.body = rel.body;
+                }
+            }
+            if existing.published_at.is_none() {
+                existing.published_at = rel.published_at;
+            }
+            if existing.assets.is_empty() {
+                existing.assets = rel.assets;
+            }
+            existing.prerelease = existing.prerelease || rel.prerelease;
+        } else {
+            into.push(rel);
+        }
+    }
+}
+
+async fn fetch_release_pages(
+    client: &reqwest::Client,
+    first_url: &str,
+) -> Result<Vec<ListedRelease>> {
+    let mut url = first_url.to_string();
+    let mut all = Vec::new();
+    for _ in 0..20 {
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            if all.is_empty() {
+                return Err(anyhow!(
+                    "listing releases from {url} returned HTTP {}",
+                    resp.status()
+                ));
+            }
+            break;
+        }
+        let next = next_page_url(resp.headers());
+        let page = resp
+            .json::<Vec<ListedRelease>>()
+            .await
+            .context("parsing releases page")?;
+        if page.is_empty() {
+            break;
+        }
+        all.extend(page);
+        match next {
+            Some(next_url) => url = next_url,
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+/// Releases from the edge cache at `jeikcode.top/api/releases`.
+///
+/// That payload already includes each tag and its announcement `body`.
+/// GitHub's REST API is only used when the edge returns nothing, because
+/// unauthenticated calls share a 60 request/hour limit.
+pub async fn list_releases() -> Result<Vec<ListedRelease>> {
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()?;
+    let mut all = Vec::new();
     let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
         .ok()
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
     if let Ok(resp) = client.get(&primary).send().await {
         if resp.status().is_success() {
-            if let Ok(list) = resp.json::<Vec<ReleaseTag>>().await {
-                if !list.is_empty() {
-                    return Ok(list);
-                }
+            if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
+                merge_listed_releases(&mut all, list);
             }
         }
     }
-    let gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=30";
-    let resp = client
-        .get(gh)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("GET {gh}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!(
-            "listing releases from {} returned HTTP {}",
-            gh,
-            resp.status()
-        ));
+    if all.is_empty() {
+        let gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100";
+        if let Ok(pages) = fetch_release_pages(&client, gh).await {
+            merge_listed_releases(&mut all, pages);
+        }
     }
-    resp.json::<Vec<ReleaseTag>>()
-        .await
-        .context("parsing GitHub releases list")
+    if all.is_empty() {
+        return Err(anyhow!("no releases found"));
+    }
+    Ok(all)
+}
+
+/// Channel releases, newest first. Stable drops prereleases; beta keeps them.
+pub fn filter_channel_releases(
+    releases: &[ListedRelease],
+    channel: UpdateChannel,
+) -> Vec<ListedRelease> {
+    let mut matched: Vec<ListedRelease> = releases
+        .iter()
+        .filter(|r| !r.tag_name.trim().is_empty())
+        .filter(|r| match channel {
+            UpdateChannel::Stable => !tag_is_prerelease(&r.tag_name, r.prerelease),
+            UpdateChannel::Beta => tag_is_prerelease(&r.tag_name, r.prerelease),
+        })
+        .cloned()
+        .collect();
+    matched.sort_by(|a, b| {
+        if version_is_newer(&a.tag_name, &b.tag_name) {
+            std::cmp::Ordering::Less
+        } else if version_is_newer(&b.tag_name, &a.tag_name) {
+            std::cmp::Ordering::Greater
+        } else {
+            a.tag_name.cmp(&b.tag_name)
+        }
+    });
+    matched.dedup_by(|a, b| a.tag_name == b.tag_name);
+    matched
+}
+
+/// `7.2.4` and `v7.2.4` both become `v7.2.4`.
+pub fn normalize_version_tag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let bare = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    format!("v{bare}")
+}
+
+/// Stable tags have no prerelease suffix. Anything with `-` is beta.
+pub fn channel_for_tag(tag: &str) -> UpdateChannel {
+    if tag_is_prerelease(tag, false) {
+        UpdateChannel::Beta
+    } else {
+        UpdateChannel::Stable
+    }
+}
+
+/// `latest.json` published next to one tag's binaries.
+pub async fn fetch_manifest_for_tag(version: &str) -> Result<Manifest> {
+    let tag = normalize_version_tag(version);
+    if tag == "v" {
+        return Err(anyhow!("missing version"));
+    }
+    let url = format!(
+        "{}/{tag}/latest.json",
+        download_base().trim_end_matches('/')
+    );
+    fetch_manifest_from_url(&url).await
 }
 
 /// Latest `latest.json` for the chosen channel. Stable uses GitHub
@@ -545,29 +700,13 @@ pub async fn fetch_manifest_for_channel(channel: UpdateChannel) -> Result<Manife
     match channel {
         UpdateChannel::Stable => fetch_manifest().await,
         UpdateChannel::Beta => {
-            let client = apply_proxy_policy(reqwest::Client::builder())
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent(JEIKCODE_USER_AGENT)
-                .build()?;
-            let tags = list_release_tags(&client).await?;
-            let mut best: Option<String> = None;
-            for r in tags {
-                if !tag_is_prerelease(&r.tag_name, r.prerelease) {
-                    continue;
-                }
-                match &best {
-                    None => best = Some(r.tag_name),
-                    Some(cur) if version_is_newer(&r.tag_name, cur) => best = Some(r.tag_name),
-                    _ => {}
-                }
-            }
-            let tag = best.ok_or_else(|| anyhow!("no beta (prerelease) tag found"))?;
-            let url = format!(
-                "{}/{}/latest.json",
-                download_base().trim_end_matches('/'),
-                tag
-            );
-            fetch_manifest_from_url(&url).await
+            let tags = list_releases().await?;
+            let matched = filter_channel_releases(&tags, UpdateChannel::Beta);
+            let tag = matched
+                .first()
+                .map(|r| r.tag_name.clone())
+                .ok_or_else(|| anyhow!("no beta (prerelease) tag found"))?;
+            fetch_manifest_for_tag(&tag).await
         }
     }
 }
@@ -1884,6 +2023,64 @@ mod tests {
         assert!(version_is_newer("v7.2.4", "v7.2.4-beta.5"));
         assert!(!version_is_newer("v7.2.4-beta.5", "v7.2.4"));
         assert!(version_is_newer("v7.2.4-beta.1", "v7.2.3"));
+    }
+
+    fn sample_release(tag: &str, prerelease: bool) -> ListedRelease {
+        ListedRelease {
+            tag_name: tag.to_string(),
+            prerelease,
+            body: None,
+            published_at: None,
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filter_channel_releases_sorts_newest_first() {
+        let releases = vec![
+            sample_release("v7.2.4-beta.4", true),
+            sample_release("v7.2.3", false),
+            sample_release("v7.2.4-beta.9", true),
+            sample_release("v7.2.4", false),
+            sample_release("v7.2.4-beta.9", true),
+        ];
+        let beta = filter_channel_releases(&releases, UpdateChannel::Beta);
+        assert_eq!(
+            beta.iter().map(|r| r.tag_name.as_str()).collect::<Vec<_>>(),
+            vec!["v7.2.4-beta.9", "v7.2.4-beta.4"]
+        );
+        let stable = filter_channel_releases(&releases, UpdateChannel::Stable);
+        assert_eq!(
+            stable
+                .iter()
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v7.2.4", "v7.2.3"]
+        );
+    }
+
+    #[test]
+    fn normalize_version_tag_adds_v_prefix() {
+        assert_eq!(normalize_version_tag("7.2.4"), "v7.2.4");
+        assert_eq!(normalize_version_tag("v7.2.4-beta.9"), "v7.2.4-beta.9");
+        assert_eq!(normalize_version_tag(" V7.2.4 "), "v7.2.4");
+        assert_eq!(channel_for_tag("v7.2.4"), UpdateChannel::Stable);
+        assert_eq!(channel_for_tag("v7.2.4-beta.9"), UpdateChannel::Beta);
+    }
+
+    #[test]
+    fn next_page_url_reads_rel_next() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            reqwest::header::HeaderValue::from_static(
+                "<https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2>; rel=\"next\", <https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=4>; rel=\"last\"",
+            ),
+        );
+        assert_eq!(
+            next_page_url(&headers).as_deref(),
+            Some("https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2")
+        );
     }
 
     #[test]

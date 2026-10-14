@@ -770,6 +770,22 @@ fn build_i18n_command() -> clap::Command {
                 .mut_arg("beta", |a| a.help(t(Msg::CliHelpUpgradeBeta).into_owned()))
                 .mut_arg("main", |a| a.help(t(Msg::CliHelpUpgradeMain).into_owned()))
         })
+        .mut_subcommand("list", |s| {
+            s.about(t(Msg::CliAboutList).into_owned())
+                .mut_arg("channel", |a| {
+                    a.help(t(Msg::CliHelpListChannel).into_owned())
+                })
+        })
+        .mut_subcommand("down", |s| {
+            s.about(t(Msg::CliAboutDown).into_owned())
+                .mut_arg("channel", |a| {
+                    a.help(t(Msg::CliHelpDownChannel).into_owned())
+                })
+                .mut_arg("version", |a| {
+                    a.help(t(Msg::CliHelpDownVersion).into_owned())
+                })
+                .mut_arg("yes", |a| a.help(t(Msg::CliHelpUpgradeYes).into_owned()))
+        })
         .mut_subcommand("rollback", |s| {
             s.about(t(Msg::CliAboutRollback).into_owned())
         })
@@ -1008,20 +1024,35 @@ enum UpgradeAction {
     Reset,
     /// Roll back to the previous version (.bak on disk)
     Rollback,
-    /// Latest beta prerelease (`jeikcode upgrade beta -y`)
-    Beta,
-    /// Latest stable release; same as omitting the channel (`--main`)
-    Main,
+    /// Latest beta, or one beta version (`jeikcode up beta [VERSION]`)
+    Beta {
+        /// Version to install (`v7.2.4-beta.9` or `7.2.4-beta.9`). Omit for the latest beta.
+        version: Option<String>,
+    },
+    /// Latest stable release, or one stable version (`jeikcode up main [VERSION]`)
+    Main {
+        /// Version to install (`v7.2.4` or `7.2.4`). Omit for the latest stable release.
+        version: Option<String>,
+    },
     /// Alias of `main`
-    Stable,
+    Stable {
+        /// Version to install (`v7.2.4` or `7.2.4`). Omit for the latest stable release.
+        version: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Show current provider / leftover-auth status
     Status,
-    /// Upgrade jeikcode in-place to the latest released version (aliases: update, updat)
-    #[command(alias = "update", alias = "updat")]
+    /// List historical versions (`jeikcode list`, `jeikcode list main`, `jeikcode list beta`)
+    List {
+        /// Channel: main (default, stable) or beta
+        #[arg(default_value = "main")]
+        channel: String,
+    },
+    /// Upgrade jeikcode in-place (aliases: update, updat, up)
+    #[command(alias = "update", alias = "updat", alias = "up")]
     Upgrade {
         /// Reinstall even when already on the latest version
         #[arg(short = 'f', long, global = true)]
@@ -1036,9 +1067,21 @@ enum Commands {
         #[arg(long, conflicts_with = "beta")]
         main: bool,
         /// Subcommand for update source configuration (e.g. set <URL>, get, reset, rollback)
-        /// or channel `beta` / `main` / `stable`.
+        /// or channel `beta` / `main` / `stable`, optionally followed by a version.
         #[command(subcommand)]
         action: Option<UpgradeAction>,
+    },
+    /// Install a specific release, including an older one
+    /// (`jeikcode down main v7.2.3`, `jeikcode down beta v7.2.4-beta.8`)
+    #[command(alias = "downgrade")]
+    Down {
+        /// Channel: main or beta
+        channel: String,
+        /// Version to install (`v7.2.3` or `7.2.4-beta.8`)
+        version: String,
+        /// Automatically apply default config changes without interactive prompts
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
     /// Configure or toggle the GitHub logo visibility in WebUI (`jeikcode ghimg [on|off]`)
     #[command(alias = "ghlogo", alias = "github-logo")]
@@ -3376,6 +3419,7 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
             }
             Ok(())
         }
+        Commands::List { channel } => run_list_cli(channel).await,
         Commands::Upgrade {
             force,
             yes,
@@ -3383,10 +3427,15 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
             main,
             action,
         } => {
-            let channel = match &action {
-                Some(UpgradeAction::Beta) => jeikcode_updater::UpdateChannel::Beta,
-                _ if beta => jeikcode_updater::UpdateChannel::Beta,
-                _ => jeikcode_updater::UpdateChannel::Stable,
+            let (channel, version) = match &action {
+                Some(UpgradeAction::Beta { version }) => {
+                    (jeikcode_updater::UpdateChannel::Beta, version.clone())
+                }
+                Some(UpgradeAction::Main { version } | UpgradeAction::Stable { version }) => {
+                    (jeikcode_updater::UpdateChannel::Stable, version.clone())
+                }
+                _ if beta => (jeikcode_updater::UpdateChannel::Beta, None),
+                _ => (jeikcode_updater::UpdateChannel::Stable, None),
             };
             let _ = main;
             match action {
@@ -3397,11 +3446,21 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
                 }
                 Some(UpgradeAction::Reset) => handle_upgrade_reset(),
                 Some(UpgradeAction::Rollback) => run_rollback_cli(),
-                Some(UpgradeAction::Beta)
-                | Some(UpgradeAction::Main)
-                | Some(UpgradeAction::Stable)
-                | None => run_upgrade_cli(force, yes, channel).await,
+                Some(
+                    UpgradeAction::Beta { .. }
+                    | UpgradeAction::Main { .. }
+                    | UpgradeAction::Stable { .. },
+                )
+                | None => run_upgrade_cli(force, yes, channel, version).await,
             }
+        }
+        Commands::Down {
+            channel,
+            version,
+            yes,
+        } => {
+            let channel = parse_cli_channel(&channel)?;
+            run_upgrade_cli(true, yes, channel, Some(version)).await
         }
         Commands::Rollback => run_rollback_cli(),
         Commands::Ghimg { status } => handle_ghimg(status),
@@ -4196,36 +4255,124 @@ fn handle_ghimg(status: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn parse_cli_channel(raw: &str) -> Result<jeikcode_updater::UpdateChannel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "main" | "stable" => Ok(jeikcode_updater::UpdateChannel::Stable),
+        "beta" => Ok(jeikcode_updater::UpdateChannel::Beta),
+        other => anyhow::bail!("unknown channel `{other}`; use main or beta"),
+    }
+}
+
+fn channel_label(channel: jeikcode_updater::UpdateChannel) -> &'static str {
+    match channel {
+        jeikcode_updater::UpdateChannel::Stable => "main",
+        jeikcode_updater::UpdateChannel::Beta => "beta",
+    }
+}
+
+async fn run_list_cli(channel_raw: String) -> Result<()> {
+    let channel = parse_cli_channel(&channel_raw)?;
+    let label = channel_label(channel);
+    let releases = jeikcode_updater::list_releases().await?;
+    let matched = jeikcode_updater::filter_channel_releases(&releases, channel);
+    if matched.is_empty() {
+        println!("no {label} releases found");
+        return Ok(());
+    }
+    let current =
+        jeikcode_updater::normalize_version_tag(&format!("v{}", env!("CARGO_PKG_VERSION")));
+    println!("{label}");
+    for (idx, rel) in matched.iter().enumerate() {
+        let tag = jeikcode_updater::normalize_version_tag(&rel.tag_name);
+        let mut marks = Vec::new();
+        if idx == 0 {
+            marks.push("latest");
+        }
+        if tag == current {
+            marks.push("current");
+        }
+        if marks.is_empty() {
+            println!("{}", rel.tag_name);
+        } else {
+            println!("{}  ({})", rel.tag_name, marks.join(", "));
+        }
+    }
+    Ok(())
+}
+
 /// CLI (non-TUI) upgrade driver — prints progress to stdout and
 /// success/error messages the same way `install.sh` does.
+///
+/// `version` installs that tag instead of the channel's latest release.
+/// Pass `force` to reinstall the current version or move to an older one
+/// (`jeikcode down` always sets it).
 async fn run_upgrade_cli(
     force: bool,
     yes: bool,
     channel: jeikcode_updater::UpdateChannel,
+    version: Option<String>,
 ) -> Result<()> {
     use jeikcode_updater::{self as self_update, UpgradeEvent, ALREADY_LATEST};
 
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+    let label = channel_label(channel);
+    let target_version = version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(self_update::normalize_version_tag)
+        .filter(|s| s != "v");
+
+    if let Some(tag) = &target_version {
+        let tag_channel = self_update::channel_for_tag(tag);
+        if tag_channel != channel {
+            let got = channel_label(tag_channel);
+            anyhow::bail!(
+                "{tag} belongs to the {got} channel. Use `jeikcode up {got} {tag}` or `jeikcode down {got} {tag}`."
+            );
+        }
+        if !force && !self_update::version_is_newer(tag, &current) {
+            println!(
+                "  {tag} is not newer than {current}. To install it, run: jeikcode down {label} {tag}"
+            );
+            return Ok(());
+        }
+    }
 
     if channel == jeikcode_updater::UpdateChannel::Beta {
         println!("==> Channel: beta");
+    } else if target_version.is_some() {
+        println!("==> Channel: main");
     }
 
+    let pinned = target_version.is_some();
     // Spawn the driver; consume events on the main task so stdout
     // writes don't interleave unpredictably with the upgrade work.
-    let driver = tokio::spawn(self_update::run_upgrade_for_channel(
-        channel,
-        current.clone(),
-        force,
-        tx,
-    ));
+    let driver = if let Some(tag) = target_version.clone() {
+        let current_for_task = current.clone();
+        tokio::spawn(async move {
+            let manifest = self_update::fetch_manifest_for_tag(&tag).await?;
+            self_update::run_upgrade_with_manifest(manifest, current_for_task, force, tx).await
+        })
+    } else {
+        tokio::spawn(self_update::run_upgrade_for_channel(
+            channel,
+            current.clone(),
+            force,
+            tx,
+        ))
+    };
 
     let mut last_pct: i32 = -1;
     while let Some(ev) = rx.recv().await {
         match ev {
             UpgradeEvent::ManifestFetched { version } => {
-                println!("==> Latest: {}", version);
+                if pinned {
+                    println!("==> Target: {}", version);
+                } else {
+                    println!("==> Latest: {}", version);
+                }
             }
             UpgradeEvent::Downloading { bytes, total } => {
                 // Debounce to whole percents so we don't spam stdout —
@@ -5243,11 +5390,12 @@ mod tests {
             Some(Commands::Upgrade {
                 yes,
                 beta,
-                action: Some(UpgradeAction::Beta),
+                action: Some(UpgradeAction::Beta { version }),
                 ..
             }) => {
                 assert!(yes);
                 assert!(!beta);
+                assert!(version.is_none());
             }
             _ => panic!("Expected UpgradeAction::Beta"),
         }
@@ -5293,12 +5441,77 @@ mod tests {
         match cli.command {
             Some(Commands::Upgrade {
                 yes,
-                action: Some(UpgradeAction::Main),
+                action: Some(UpgradeAction::Main { version }),
                 ..
             }) => {
                 assert!(yes);
+                assert!(version.is_none());
             }
             _ => panic!("Expected UpgradeAction::Main"),
         }
+
+        let cli = Cli::try_parse_from(["jeikcode", "up", "main", "v7.2.4", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                action: Some(UpgradeAction::Main { version }),
+                ..
+            }) => {
+                assert!(yes);
+                assert_eq!(version.as_deref(), Some("v7.2.4"));
+            }
+            _ => panic!("Expected up main <version>"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "update", "beta", "7.2.4-beta.9"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                action: Some(UpgradeAction::Beta { version }),
+                ..
+            }) => {
+                assert_eq!(version.as_deref(), Some("7.2.4-beta.9"));
+            }
+            _ => panic!("Expected update beta <version>"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::List { channel }) => assert_eq!(channel, "main"),
+            _ => panic!("Expected list main by default"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "list", "beta"]).unwrap();
+        match cli.command {
+            Some(Commands::List { channel }) => assert_eq!(channel, "beta"),
+            _ => panic!("Expected list beta"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "down", "main", "v7.2.3", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Down {
+                channel,
+                version,
+                yes,
+            }) => {
+                assert_eq!(channel, "main");
+                assert_eq!(version, "v7.2.3");
+                assert!(yes);
+            }
+            _ => panic!("Expected down main <version>"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "downgrade", "beta", "v7.2.4-beta.8"]).unwrap();
+        match cli.command {
+            Some(Commands::Down {
+                channel, version, ..
+            }) => {
+                assert_eq!(channel, "beta");
+                assert_eq!(version, "v7.2.4-beta.8");
+            }
+            _ => panic!("Expected downgrade alias"),
+        }
+    }
+
+    #[test]
+    fn i18n_help_includes_list_and_down() {
+        let cmd = super::build_i18n_command();
+        assert!(cmd.find_subcommand("list").is_some());
+        assert!(cmd.find_subcommand("down").is_some());
+        assert!(cmd.find_subcommand("upgrade").is_some());
     }
 }

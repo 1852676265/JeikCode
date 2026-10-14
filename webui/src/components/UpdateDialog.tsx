@@ -1,6 +1,24 @@
+import DOMPurify from 'dompurify';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus } from '../api';
+import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus, UpdateVersionEntry } from '../api';
+import { copyTextToClipboard } from '../lib/clipboard';
+import { Markdown } from './Markdown';
 import { useT } from '../settings';
+
+/** 边缘 Atom 的公告是 HTML；GitHub REST 兜底时仍是 Markdown。 */
+function looksLikeHtml(text: string): boolean {
+  return /<\/?[a-z][^>]*>/i.test(text);
+}
+
+function sanitizeNotesHtml(text: string): string {
+  return DOMPurify.sanitize(text, { ADD_ATTR: ['target', 'rel'] });
+}
+
+function notesPlainText(text: string): string {
+  if (!looksLikeHtml(text)) return text;
+  const doc = new DOMParser().parseFromString(sanitizeNotesHtml(text), 'text/html');
+  return (doc.body.textContent || text).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 const STORAGE_KEY_CHANNEL = 'jeikcode_update_channel';
 
@@ -24,6 +42,9 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
 
   const [channel, setChannel] = useState<'stable' | 'beta'>(getInitialChannel);
   const [info, setInfo] = useState<UpdateCheckResponse | null>(initialInfo);
+  const [selectedVersion, setSelectedVersion] = useState('');
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [notesCopied, setNotesCopied] = useState<'idle' | 'ok' | 'fail'>('idle');
   const [isChecking, setIsChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
 
@@ -48,6 +69,8 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
       const res = await checkUpdate(targetChannel);
       if (isMounted.current) {
         setInfo(res);
+        setSelectedVersion('');
+        setNotesOpen(false);
         if (onUpdateInfoChange) {
           onUpdateInfoChange(res);
         }
@@ -126,17 +149,30 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     const y = n(b);
     return x.length > 0 && x === y;
   };
-  const forceReinstall = sameVersion(info?.current_version, info?.latest_version);
+  const versionEntries: UpdateVersionEntry[] =
+    info?.versions && info.versions.length > 0
+      ? info.versions
+      : info?.latest_version
+        ? [{ version: info.latest_version, notes: info.release_notes, released_at: info.released_at }]
+        : [];
+  const versionOptions = versionEntries.map((entry) => entry.version);
+  const targetVersion =
+    selectedVersion && versionOptions.some((v) => sameVersion(v, selectedVersion))
+      ? versionOptions.find((v) => sameVersion(v, selectedVersion)) || versionOptions[0] || ''
+      : versionOptions[0] || '';
+  const selectedEntry = versionEntries.find((entry) => sameVersion(entry.version, targetVersion));
+  const isLatestPick = !targetVersion || sameVersion(targetVersion, info?.latest_version || versionOptions[0]);
+  const forceReinstall = isLatestPick && sameVersion(info?.current_version, targetVersion);
 
   const handleStartUpdate = async () => {
-    if (isChecking) return;
+    if (isChecking || !targetVersion) return;
     setUpdating(true);
     try {
       await executeUpdate({
         channel,
-        version: info?.latest_version,
-        download_url: info?.download_url ?? undefined,
-        force: forceReinstall,
+        version: targetVersion,
+        download_url: isLatestPick ? info?.download_url ?? undefined : undefined,
+        force: forceReinstall || !isLatestPick,
       });
     } catch (err: any) {
       setStatus({
@@ -149,10 +185,46 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     }
   };
 
+  useEffect(() => {
+    if (!notesOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        setNotesOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [notesOpen]);
+
+  useEffect(() => {
+    setNotesCopied('idle');
+  }, [targetVersion, notesOpen]);
+
+  const notesText = (selectedEntry?.notes || '').trim();
+  const notesReleasedAt = (() => {
+    const raw = selectedEntry?.released_at;
+    if (!raw) return '';
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return raw;
+    return date.toLocaleString();
+  })();
+
+  const handleCopyNotes = async () => {
+    if (!notesText) return;
+    const ok = await copyTextToClipboard(notesPlainText(notesText));
+    setNotesCopied(ok ? 'ok' : 'fail');
+  };
+
   const hasUpdate = info?.has_update ?? false;
-  const canInstall = hasUpdate || (!!info?.latest_version && forceReinstall);
+  const canInstall =
+    !isChecking &&
+    !checkError &&
+    !!targetVersion &&
+    (!isLatestPick || hasUpdate || forceReinstall);
 
   return (
+    <>
     <div
       class="modal-overlay"
       onClick={(e) => {
@@ -210,9 +282,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
             </div>
             <div class="update-version-arrow">➔</div>
             <div class="update-version-row">
-              <span class="update-version-label">{t('update.latestVersion')}</span>
-              <span class={`update-version-val ${hasUpdate ? 'latest' : 'current'}`}>
-                {isChecking ? '...' : (info?.latest_version || info?.current_version || '...')}
+              <span class="update-version-label">
+                {isLatestPick ? t('update.latestVersion') : t('update.targetVersion')}
+              </span>
+              <span class={`update-version-val ${hasUpdate || !isLatestPick ? 'latest' : 'current'}`}>
+                {isChecking ? '...' : (targetVersion || info?.latest_version || '...')}
               </span>
             </div>
           </div>
@@ -229,6 +303,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                 <div class="update-status-row error">
                   <span class="update-status-error-icon">⚠️</span>
                   <span>{t('update.failed', { error: checkError })}</span>
+                </div>
+              ) : !isLatestPick && targetVersion ? (
+                <div class="update-status-row has-update">
+                  <span class="update-status-sparkle">✨</span>
+                  <span>{t('update.dialogDescTarget', { version: targetVersion })}</span>
                 </div>
               ) : hasUpdate ? (
                 <div class="update-status-row has-update">
@@ -280,6 +359,31 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         </div>
 
         <div class="modal-footer update-dialog-footer">
+          <label class="update-version-picker">
+            <span class="update-version-picker-label">{t('update.historyLabel')}</span>
+            <select
+              class="update-version-select"
+              aria-label={t('update.historyLabel')}
+              value={targetVersion}
+              disabled={updating || isChecking || versionOptions.length === 0}
+              onChange={(e) => setSelectedVersion((e.target as HTMLSelectElement).value)}
+            >
+              {versionOptions.map((version, index) => (
+                <option key={version} value={version}>
+                  {index === 0 ? `${version} (${t('update.historyLatest')})` : version}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            class="update-notes-btn"
+            disabled={updating || isChecking || !targetVersion}
+            onClick={() => setNotesOpen(true)}
+          >
+            {t('update.notesBtn')}
+          </button>
+          <div class="update-footer-actions">
           {!updating ? (
             <>
               {canInstall ? (
@@ -353,8 +457,68 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
               {isDesktop ? t('update.preparing') : t('update.installing')}
             </button>
           )}
+          </div>
         </div>
       </div>
     </div>
+    {notesOpen && (
+      <div
+        class="release-notes-overlay"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) setNotesOpen(false);
+        }}
+      >
+        <div
+          class="release-notes-card"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="release-notes-title"
+        >
+          <div class="release-notes-accent" />
+          <div class="release-notes-header">
+            <div class="release-notes-heading">
+              <span class="release-notes-kicker">{t('update.notesTitle')}</span>
+              <h3 id="release-notes-title">{targetVersion}</h3>
+              {notesReleasedAt && <time class="release-notes-time">{notesReleasedAt}</time>}
+            </div>
+            <div class="release-notes-header-actions">
+              <button
+                type="button"
+                class="release-notes-copy"
+                onClick={handleCopyNotes}
+                disabled={!notesText}
+              >
+                {notesCopied === 'ok'
+                  ? t('update.notesCopied')
+                  : notesCopied === 'fail'
+                    ? t('update.notesCopyFailed')
+                    : t('update.notesCopy')}
+              </button>
+              <button
+                type="button"
+                class="ghost-btn modal-close"
+                onClick={() => setNotesOpen(false)}
+                aria-label={t('update.btnClose')}
+              >
+                ×
+              </button>
+            </div>
+          </div>
+          <div class="release-notes-body">
+            {notesText && looksLikeHtml(notesText) ? (
+              <div
+                class="markdown-root assistant-message-content"
+                dangerouslySetInnerHTML={{ __html: sanitizeNotesHtml(notesText) }}
+              />
+            ) : notesText ? (
+              <Markdown content={notesText} />
+            ) : (
+              <p class="release-notes-empty">{t('update.notesEmpty')}</p>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }
