@@ -110,6 +110,8 @@ jeikcode -p "Investigate and fix OAuth callback 404 issue"
 jeikcode update
 ```
 
+Update, rollback, and uninstall commands: https://jeikcode.top/guide/updates.html
+
 ### 2. Full Documentation & Tutorials
 
 > 💡 **Tutorials & Guides**: Please visit the official documentation portal 👉 **[https://jeikcode.top](https://jeikcode.top)**
@@ -118,6 +120,7 @@ For comprehensive tutorials, architectural specifications, and ecosystem integra
 
 - 📖 **Official Documentation Site**: [https://jeikcode.top](https://jeikcode.top)
 - 🚀 [Installation & Quickstart Guide](https://jeikcode.top/guide/getting-started)
+- 🔄 [Updates, Rollback & Uninstall](https://jeikcode.top/guide/updates.html)
 - ⚙️ [Model Provider Configuration](https://jeikcode.top/guide/login)
 - 🔌 [Model Context Protocol (MCP) Integration](https://jeikcode.top/advanced/mcp)
 - 🧩 [Agent Skills System](https://jeikcode.top/advanced/skills)

@@ -800,6 +800,12 @@ fn build_i18n_command() -> clap::Command {
         .mut_subcommand("plugin", |s| s.about(t(Msg::CliAboutPlugin).into_owned()))
         .mut_subcommand("uninstall", |s| {
             s.about(t(Msg::CliAboutUninstall).into_owned())
+                .mut_subcommand("simple", |c| {
+                    c.about(t(Msg::CliAboutUninstallSimple).into_owned())
+                })
+                .mut_subcommand("all", |c| {
+                    c.about(t(Msg::CliAboutUninstallAll).into_owned())
+                })
         })
         .mut_subcommand("hooks", |s| s.about(t(Msg::CliAboutHooks).into_owned()));
 
@@ -1041,6 +1047,14 @@ enum UpgradeAction {
     },
 }
 
+#[derive(Subcommand, Debug, Clone)]
+enum UninstallPreset {
+    /// Remove only the program and PATH entry. Keep user configuration. No prompts.
+    Simple,
+    /// Remove the program, PATH entry, and all user configuration. No prompts.
+    All,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Show current provider / leftover-auth status
@@ -1192,22 +1206,25 @@ enum Commands {
     /// slash command — anything installed via either path is visible to both.
     #[command(subcommand)]
     Plugin(PluginCli),
-    /// Uninstall JeikCode: remove the binary, PATH edit, and (interactively)
-    /// data under ~/.jeikcode/. With no flags, runs interactively and asks
-    /// per-group; pass --yes / --purge / --keep-data for non-interactive use.
+    /// Uninstall JeikCode. With no arguments, ask whether to keep user
+    /// configuration. `simple` removes only the program. `all` removes
+    /// the program and user configuration without prompts.
     Uninstall {
+        /// `simple` keeps user configuration. `all` removes it. Both are non-interactive.
+        #[command(subcommand)]
+        preset: Option<UninstallPreset>,
         /// Skip prompts; use per-group default decisions
         /// (binary=yes, credentials=no, state=yes).
-        #[arg(long)]
+        #[arg(long, global = true)]
         yes: bool,
         /// Wipe ~/.jeikcode/ entirely.
-        #[arg(long, conflicts_with = "keep_data")]
+        #[arg(long, global = true, conflicts_with = "keep_data")]
         purge: bool,
         /// Keep ~/.jeikcode/ entirely (only remove binary + PATH edit).
-        #[arg(long)]
+        #[arg(long, global = true)]
         keep_data: bool,
         /// Print the plan; do nothing.
-        #[arg(long)]
+        #[arg(long, global = true)]
         dry_run: bool,
     },
     /// Build (or refresh) the workspace code graph index and save it under
@@ -3537,16 +3554,25 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
         Commands::Rollback => run_rollback_cli(),
         Commands::Ghimg { status } => handle_ghimg(status),
         Commands::Uninstall {
+            preset,
             yes,
             purge,
             keep_data,
             dry_run,
-        } => uninstall::run(uninstall::Args {
-            yes,
-            purge,
-            keep_data,
-            dry_run,
-        }),
+        } => {
+            let preset = match preset {
+                Some(UninstallPreset::Simple) => uninstall::Preset::Simple,
+                Some(UninstallPreset::All) => uninstall::Preset::All,
+                None => uninstall::Preset::Interactive,
+            };
+            uninstall::run(uninstall::Args {
+                preset,
+                yes,
+                purge,
+                keep_data,
+                dry_run,
+            })
+        }
         Commands::SyncConfig { .. } => {
             unreachable!("SyncConfig is handled inline in run() before handle_command")
         }

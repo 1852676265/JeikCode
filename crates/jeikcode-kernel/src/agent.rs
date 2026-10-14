@@ -484,6 +484,24 @@ fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+/// Seconds to wait before resending an empty completion.
+///
+/// Empty and malformed responses use 1,1,2,2,3. A thinking-only completion (reasoning
+/// streamed, no text and no tool call) retries the first time immediately; the same
+/// sequence starts on the following attempt.
+fn empty_retry_wait_secs(thinking_only: bool, empty_retries: u32) -> u64 {
+    let n = if thinking_only {
+        empty_retries.saturating_sub(1)
+    } else {
+        empty_retries
+    };
+    if n == 0 {
+        0
+    } else {
+        (((n + 1) / 2).min(3)) as u64
+    }
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -3215,14 +3233,15 @@ impl RunningAgent {
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
-                    // Front-loaded short backoff: 1,1,2,2,3s (~9s for all 5) — matches
-                    // v1. The empty body returns instantly, so the generic 3/6/9s tier
-                    // would be pure wasted latency. A VISIBLE Warning tells the user a
-                    // retry is underway (a silent re-open reads as "nothing happened").
-                    let wait = (((empty_retries + 1) / 2).min(3)) as u64;
+                    // Front-loaded short backoff (see `empty_retry_wait_secs`). The empty
+                    // body returns instantly, so the generic 3/6/9s tier would be pure
+                    // wasted latency. A VISIBLE Warning tells the user a retry is underway.
+                    let wait = empty_retry_wait_secs(thinking_only, empty_retries);
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
                     // from a truly EMPTY one — different upstream faults, different wording.
-                    let notice = if thinking_only {
+                    let notice = if thinking_only && wait == 0 {
+                        format!("模型只返回了思考，正在重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    } else if thinking_only {
                         format!("模型只返回了思考，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
                     } else if saw_malformed {
                         format!("响应格式异常，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
@@ -4712,6 +4731,31 @@ mod effective_retry_after_tests {
         let mut rpm = err("requests per minute exceeded; retry later", None);
         rpm.code = Some("rate_limit_exceeded".into());
         assert!(!is_terminal_rate_limit(&rpm));
+    }
+}
+
+#[cfg(test)]
+mod empty_retry_wait_tests {
+    use super::empty_retry_wait_secs;
+
+    #[test]
+    fn thinking_only_retries_immediately_then_backs_off() {
+        assert_eq!(
+            (1..=5)
+                .map(|n| empty_retry_wait_secs(true, n))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 1, 2, 2]
+        );
+    }
+
+    #[test]
+    fn empty_and_malformed_keep_the_short_backoff() {
+        assert_eq!(
+            (1..=5)
+                .map(|n| empty_retry_wait_secs(false, n))
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 2, 3]
+        );
     }
 }
 

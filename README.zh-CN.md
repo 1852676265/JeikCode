@@ -110,6 +110,8 @@ jeikcode -p "排查并修复 OAuth 回调 404 错误"
 jeikcode update
 ```
 
+更新、回退与卸载的命令说明：https://jeikcode.top/zh/guide/updates.html
+
 ### 2. 官方文档与高级指南
 
 > 💡 **教程请访问官方文档**：👉 **[https://jeikcode.top](https://jeikcode.top)**
@@ -118,6 +120,7 @@ JeikCode 拥有完备的官方在线文档库，覆盖深度架构、模型配�
 
 - 📖 **官方文档站点**：[https://jeikcode.top](https://jeikcode.top)
 - 🚀 [快速安装与起步指南](https://jeikcode.top/zh/guide/getting-started)
+- 🔄 [更新、回退与卸载](https://jeikcode.top/zh/guide/updates.html)
 - ⚙️ [模型接入与配置指南](https://jeikcode.top/zh/guide/login)
 - 🔌 [Model Context Protocol (MCP) 集成](https://jeikcode.top/zh/advanced/mcp)
 - 🧩 [Agent Skills 技能系统](https://jeikcode.top/zh/advanced/skills)
