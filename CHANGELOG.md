@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.11 (2026-10-14)
+
+- **[Updates] Notes, restart, and desktop startup**:
+  - Release notes still show when the edge list has versions but empty text. The history dropdown no longer adds a latest suffix; the first row is the latest.
+  - After an update restarts, Finish opens the new version. Waiting for the restart no longer leaves the page loading as if it were signed out, or stuck on Updating.
+  - The desktop splash shows Jeikcode, a spinning mark, and Starting.
+  - The desktop window opens sooner. The service still listens on 0.0.0.0, so other devices can reach it with the same port and token.
+
+---
+
+- **[更新] 更新说明、重启后的页面和桌面启动**:
+  - 边缘列表有版本但正文为空时，更新说明仍会显示。历史下拉不再附加「最新」，第一项就是最新版。
+  - 更新重启后，点「完成」进入新版本。不等待完成时，页面不再像未登录一样停在加载中，也不会卡在「正在更新」。
+  - 桌面启动页显示 Jeikcode、转圈图标和 Starting。
+  - 桌面窗口打开更快。服务仍监听 0.0.0.0，其他设备仍可用同一端口和 token 访问。
+
 ## v7.2.4-beta.10 (2026-10-14)
 
 - **[Updates] Channel history and release notes**:
