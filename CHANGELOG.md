@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.4-beta.12 (2026-10-14)
+
+- **[Updates] Finish lands on the new version**:
+  - Clicking Finish and waiting after an update both reload the page once the new build is serving. The version in the sidebar updates with that reload.
+
+- **[Prompts] Approval and question cards wait**:
+  - An approval card and a question card stay until you answer or stop the turn. Leaving them open no longer auto-denies the tool, picks an answer, or tells the model that no answer was provided.
+
+---
+
+- **[更新] 完成后进入新版本**:
+  - 更新结束后，点「完成」和继续等待都会在新版本已经可访问时刷新页面。侧栏版本号随这次刷新更新。
+
+- **[提问] 审批卡和提问卡一直等待**:
+  - 审批卡和提问卡会留到你作答或停止这一回合。放着不点不再自动拒绝、自动选一项，也不会告诉模型没有答案。
+
 ## v7.2.4-beta.11 (2026-10-14)
 
 - **[Updates] Notes, restart, and desktop startup**:
