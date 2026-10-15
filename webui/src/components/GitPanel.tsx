@@ -453,6 +453,7 @@ export function GitPanel({
   const [commitMessage, setCommitMessage] = useState('');
   const [isCommitting, setIsCommitting] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isFetching, setIsFetching] = useState(false);
   const [actionLoadingPath, setActionLoadingPath] = useState<string | null>(null);
 
   // 统一调度 Git 状态刷新（经由单例 gitStore 的 Single-flight 原子锁与防抖控制）
@@ -465,6 +466,33 @@ export function GitPanel({
   const loadGitData = useCallback(async (isSilent = false) => {
     refresh(!isSilent, !isSilent);
   }, [refresh]);
+
+  // 手动获取全部远程分支与代码 (Fetch All)
+  const handleFetch = useCallback(async (silent = false) => {
+    if (isFetching) return;
+    setIsFetching(true);
+    if (!silent) setPanelError(null);
+    try {
+      const ok = await gitStore.triggerAutoFetch(cwd, { force: !silent });
+      if (!silent) {
+        showToast(t('git.fetchSuccess'), ok ? 'success' : 'info');
+      }
+    } catch (err: any) {
+      if (!silent) {
+        const msg = err?.message || t('git.fetchFailed');
+        setError(msg);
+        showToast(msg, 'error');
+      }
+    } finally {
+      setIsFetching(false);
+    }
+  }, [cwd, isFetching, t]);
+
+  // 综合刷新（本地状态 + 获取全部远程代码）
+  const handleFullRefresh = useCallback(async () => {
+    loadGitData(false);
+    await handleFetch(false);
+  }, [loadGitData, handleFetch]);
 
   // Initial load 与外部 refreshTrigger 联动
   const seenRefreshRef = useRef<number | null>(null);
@@ -483,13 +511,25 @@ export function GitPanel({
   useEffect(() => {
     const refreshIfIdle = () => {
       if (document.visibilityState !== 'visible') return;
+      // 1. 本地快速瞬时刷新
       gitStore.scheduleRefresh(cwd, { immediate: false, filterBranch });
+      // 2. 聚焦补偿 (Focus Catch-up)：后台静默发起节流 Fetch (60s 防抖)
+      void gitStore.triggerAutoFetch(cwd);
     };
     document.addEventListener('visibilitychange', refreshIfIdle);
     window.addEventListener('focus', refreshIfIdle);
+
+    // 3. 前台激活时，每 180s 周期性执行静默 Fetch（对齐 VS Code 黄金周期）
+    const intervalTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void gitStore.triggerAutoFetch(cwd);
+      }
+    }, 180_000);
+
     return () => {
       document.removeEventListener('visibilitychange', refreshIfIdle);
       window.removeEventListener('focus', refreshIfIdle);
+      window.clearInterval(intervalTimer);
     };
   }, [cwd, filterBranch]);
 
@@ -718,7 +758,8 @@ export function GitPanel({
     );
   }
 
-  if (branches && !branches.is_repo) {
+  // 只有在确定没有任何可用子仓库，且当前分支信息确实判定为非 repo 时，才展示空占位
+  if (branches && !branches.is_repo && repos.length === 0) {
     return (
       <div class="git-panel-empty">
         <svg width="24" height="24" viewBox="0 0 16 16" fill="currentColor" class="git-empty-icon" aria-hidden="true">
@@ -780,9 +821,9 @@ export function GitPanel({
 
         <button
           type="button"
-          class={'git-refresh-btn' + (loading ? ' spinning' : '')}
-          onClick={() => loadGitData(false)}
-          title={t('git.refresh')}
+          class={'git-refresh-btn' + (loading || isFetching ? ' spinning' : '')}
+          onClick={handleFullRefresh}
+          title={isZh ? '刷新本地状态并拉取远程代码 (Refresh & Fetch All)' : 'Refresh local & fetch all remote branches'}
           aria-label={t('git.refresh')}
         >
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -1133,16 +1174,38 @@ export function GitPanel({
           </div>
 
           {/* Remote Branches Section */}
+          <div class="git-section-header" style={{ marginTop: '16px' }}>
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M4 6l4 4 4-4" />
+            </svg>
+            <span class="git-section-title">{t('git.remote')}</span>
+            <span class="git-badge-counter">{branches?.remote.length ?? 0}</span>
+            <button
+              type="button"
+              class={'git-fetch-mini-btn' + (isFetching ? ' spinning' : '')}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleFetch(false);
+              }}
+              title={t('git.fetch')}
+              style={{
+                marginLeft: 'auto',
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                padding: '2px 6px',
+                display: 'inline-flex',
+                alignItems: 'center',
+                color: 'var(--text-secondary, #8b949e)',
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                <path d="M13.65 2.35A8 8 0 1 0 16 8h-2a6 6 0 1 1-1.76-4.24l-2.24 2.24H16V2l-2.35.35z" />
+              </svg>
+            </button>
+          </div>
           {branches && branches.remote.length > 0 && (
-            <>
-              <div class="git-section-header" style={{ marginTop: '16px' }}>
-                <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M4 6l4 4 4-4" />
-                </svg>
-                <span class="git-section-title">{t('git.remote')}</span>
-                <span class="git-badge-counter">{branches.remote.length}</span>
-              </div>
-              <div class="git-branch-list">
+            <div class="git-branch-list">
                 {branches.remote.map((rb) => {
                   const isPending = switching === rb;
                   const isSelected = rb === selectedBranch;
@@ -1178,7 +1241,6 @@ export function GitPanel({
                   );
                 })}
               </div>
-            </>
           )}
         </div>
       )}

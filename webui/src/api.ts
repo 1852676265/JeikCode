@@ -2434,6 +2434,21 @@ export async function gitPull(options?: { branch?: string; remote?: string; cwd?
   return resp.json();
 }
 
+export async function gitFetch(options?: { remote?: string; prune?: boolean; cwd?: string }): Promise<{ success: boolean; message: string; has_remote?: boolean }> {
+  const resp = await apiFetch('/git/fetch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(options || {}),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export const fetchGitFetch = gitFetch;
+
 export async function fetchGitWorkingDiff(path: string, staged?: boolean, cwd?: string): Promise<GitFileDiffResponse> {
   const params = new URLSearchParams({ path });
   if (staged) params.set('staged', 'true');

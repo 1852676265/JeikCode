@@ -541,6 +541,9 @@ pub async fn get_git_repos(
 
         // 3. Scan subdirectories up to depth 3 for nested git repos
         scan_for_git_repos(root_p, root_p, 1, 3, &mut repos, &mut visited_roots);
+    } else {
+        // Base directory is not a git repo itself, but may contain nested git repos (e.g. monorepo / multi-root workspace)
+        scan_for_git_repos(&base_dir, &base_dir, 1, 3, &mut repos, &mut visited_roots);
     }
 
     if let Ok(mut cache) = get_repos_cache().lock() {
@@ -1259,6 +1262,15 @@ pub struct GitPullReq {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct GitFetchReq {
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub prune: Option<bool>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct GitWorkingDiffQuery {
     pub path: String,
     pub staged: Option<bool>,
@@ -1731,6 +1743,95 @@ pub async fn git_pull(
         Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to pull: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+/// POST /git/fetch
+pub async fn git_fetch(
+    State(_state): State<AppState>,
+    Json(req): Json<GitFetchReq>,
+) -> impl IntoResponse {
+    let dir = resolve_target_dir(req.cwd.as_deref());
+    if !is_git_repo(&dir) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Target directory is not a Git repository",
+        )
+        .into_response();
+    }
+
+    // 检查是否有配置 remote。若无 remote（如纯本地 repo），直接返回 success，避免报错
+    let remote_check = git_cmd(&dir).args(["remote"]).output();
+    let has_remote = match remote_check {
+        Ok(ref out) => {
+            out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        }
+        Err(_) => false,
+    };
+    if !has_remote {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "No remotes configured",
+            "has_remote": false,
+        }))
+        .into_response();
+    }
+
+    let mut args = vec!["fetch".to_string()];
+    if let Some(r) = req.remote {
+        let trimmed = r.trim().to_string();
+        if !trimmed.is_empty() {
+            args.push(trimmed);
+        } else {
+            args.push("--all".to_string());
+        }
+    } else {
+        args.push("--all".to_string());
+    }
+
+    if req.prune.unwrap_or(true) {
+        args.push("--prune".to_string());
+    }
+    args.push("--tags".to_string());
+
+    // 异步执行并加上 20 秒超时控制，避免弱网、鉴权卡死
+    let dir_clone = dir.clone();
+    let fetch_task = tokio::task::spawn_blocking(move || git_cmd(&dir_clone).args(&args).output());
+
+    match tokio::time::timeout(Duration::from_secs(20), fetch_task).await {
+        Ok(Ok(Ok(out))) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let combined = if stdout.is_empty() { stderr } else { stdout };
+
+            if out.status.success() {
+                // Fetch 成功后，主动失效后端的 Graph 缓存和 Meta 缓存，确保后续请求能拿到最新上游提交
+                invalidate_git_cache(&dir);
+                Json(serde_json::json!({
+                    "success": true,
+                    "message": combined.trim().to_string(),
+                    "has_remote": true,
+                }))
+                .into_response()
+            } else {
+                json_error(StatusCode::BAD_REQUEST, combined.trim().to_string()).into_response()
+            }
+        }
+        Ok(Ok(Err(e))) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to execute fetch: {e}"),
+        )
+        .into_response(),
+        Ok(Err(join_err)) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Fetch task failed: {join_err}"),
+        )
+        .into_response(),
+        Err(_) => json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Git fetch timed out after 20 seconds",
         )
         .into_response(),
     }

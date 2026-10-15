@@ -11961,6 +11961,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/git/commit", post(api_git::git_commit))
         .route("/git/push", post(api_git::git_push))
         .route("/git/pull", post(api_git::git_pull))
+        .route("/git/fetch", post(api_git::git_fetch))
         .route("/git/action", post(api_git::git_action))
         .route("/git/working-diff", get(api_git::get_git_working_diff))
         // MCP API

@@ -3,6 +3,7 @@ import {
   fetchGitGraph,
   fetchGitStatus,
   fetchGitRepos,
+  gitFetch,
   type GitBranchesResponse,
   type GitCommitItem,
   type GitStatusResponse,
@@ -38,6 +39,8 @@ class ProjectGitManager {
   private listeners = new Map<string, Set<(state: GitProjectState) => void>>();
   private inflights = new Map<string, InflightControl>();
   private pendingVersions = new Map<string, number>();
+  private lastFetchTimes = new Map<string, number>();
+  private fetchInflight = new Map<string, boolean>();
 
   private normalizeKey(cwd?: string): string {
     return cwd ? cwd.trim() : '';
@@ -319,6 +322,7 @@ class ProjectGitManager {
           nextActive = rootRepo ? rootRepo.root : null;
         }
       }
+      const switchedRepo = nextActive !== cur.activeRepoRoot;
       const updated: GitProjectState = {
         ...cur,
         repos: res.repos,
@@ -327,9 +331,77 @@ class ProjectGitManager {
       this.states.set(key, updated);
       this.saveToStorage(key, updated);
       this.notify(key);
+
+      // 如果当前 activeRepoRoot 发生有效切换，或者根目录此前判定为非 repo 但实际上发现了子 repo
+      if (switchedRepo || (cur.branches && !cur.branches.is_repo && res.repos.length > 0)) {
+        this.scheduleRefresh(key, { immediate: true, forceAll: true, reason: 'repo_activated' });
+      }
     } catch {
       // 忽略多仓库探测失败
     }
+  }
+
+  /**
+   * 智能节流触发上游 Fetch：
+   * - 60s 节流控制（避免切屏/Alt-Tab 频繁碰撞）
+   * - Single-flight 并发锁（同一仓库同一时刻最多 1 个 Fetch 在跑）
+   * - 可见性守卫（后台隐藏标签页绝不偷跑网络请求）
+   * - Fetch 成功后自动级联 scheduleRefresh(forceAll: true) 刷新全部远端分支与提交图
+   */
+  public async triggerAutoFetch(
+    cwd: string | undefined,
+    options: {
+      force?: boolean;
+      prune?: boolean;
+    } = {},
+  ): Promise<boolean> {
+    const key = this.normalizeKey(cwd);
+    const now = Date.now();
+    const last = this.lastFetchTimes.get(key) || 0;
+
+    // 1. 节流：非强制时，距上次成功未满 60 秒直接跳过
+    if (!options.force && now - last < 60_000) {
+      return false;
+    }
+
+    // 2. 避免后台未激活标签偷跑
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+      return false;
+    }
+
+    // 3. 避免并发碰撞
+    if (this.fetchInflight.get(key)) {
+      return false;
+    }
+
+    const cur = this.getState(key);
+    const targetDir = cur.activeRepoRoot || key;
+
+    this.fetchInflight.set(key, true);
+    try {
+      const res = await gitFetch({ cwd: targetDir, prune: options.prune ?? true });
+      this.lastFetchTimes.set(key, Date.now());
+
+      // Fetch 成功后，远程引用 (refs/remotes/*) 和 FETCH_HEAD 已经更新，
+      // 级联拉取最新的 status 与完整的 graph，更新 UI 和 sessionStorage
+      this.scheduleRefresh(key, {
+        immediate: true,
+        forceAll: true,
+        reason: 'autofetch_complete',
+      });
+      return res.success;
+    } catch (err) {
+      // 静默处理网络错误/超时，不污染主界面
+      console.debug('[GitStore] Silent fetch skipped or failed:', err);
+      return false;
+    } finally {
+      this.fetchInflight.set(key, false);
+    }
+  }
+
+  public isFetching(cwd?: string): boolean {
+    const key = this.normalizeKey(cwd);
+    return Boolean(this.fetchInflight.get(key));
   }
 
   public setActiveRepoRoot(cwd: string | undefined, repoRoot: string | null): void {
