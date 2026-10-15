@@ -321,6 +321,65 @@ test('inline code with backticks does not get falsely split by glued-fence detec
   assert.match(out, /<code>`嵌套`<\/code>/);
 });
 
+test('code fence inside blockquote or with quoted close does not swallow subsequent headings and prose', () => {
+  const md = [
+    '> **修改方式**：可以直接在平台网页自带的编辑器里改，或者在终端运行一行命令自动改好：',
+    '> ',
+    '```bash',
+    '> sed -i \'s/"device": "cpu"/"device": "cuda"/g\' config.py',
+    '> sed -i \'s/BATCH_CONCURRENCY = 3/BATCH_CONCURRENCY = 6/g\' config.py',
+    '> ```',
+    '',
+    '---',
+    '',
+    '### 第二步：为什么把并发定在 `6 ~ 8` 能完美对齐你们线下的 4060Ti？',
+    '',
+    '你可能会问：*“我租的卡有 48GB 显存，为什么不直接拉到 20 或 30 并发，而是定在 6~8 ？”*',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+  assert.match(out, /<code class="language-bash">/);
+  // 确认 bash 代码块正常闭合，后置分割线与 ### 第二步 没有被吞入 pre code 中
+  assert.match(out, /<hr>/);
+  assert.match(out, /<h3[^>]*>第二步：为什么把并发定在/);
+  assert.match(out, /<p>你可能会问/);
+  assert.doesNotMatch(out, /<code class="language-bash">[\s\S]*### 第二步/);
+});
+
+test('standard blockquote containing code fence is completely contained without leaking outer headings', () => {
+  const md = [
+    '> 提示信息：',
+    '> ```bash',
+    '> echo 1',
+    '> ```',
+    '',
+    '### 第二步：后续步骤',
+    '正文内容',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+  assert.match(out, /<blockquote>[\s\S]*<code class="language-bash">[\s\S]*<\/blockquote>/);
+  assert.match(out, /<h3[^>]*>第二步：后续步骤<\/h3>/);
+  assert.match(out, /<p>正文内容<\/p>/);
+});
+
+test('unclosed bash code block triggers structural terminator on clear Chinese document headings', () => {
+  const md = [
+    '```bash',
+    'echo 1',
+    '',
+    '### 第二步：为什么把并发定在 6 ~ 8 能完美对齐你们线下的 4060Ti？',
+    '这是第二步的说明文本',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+  assert.match(out, /<code class="language-bash">echo 1\n<\/code>/);
+  assert.match(out, /<h3[^>]*>第二步：为什么把并发定在 6 ~ 8 能完美对齐你们线下的 4060Ti？<\/h3>/);
+  assert.match(out, /<p>这是第二步的说明文本<\/p>/);
+  assert.doesNotMatch(out, /<code class="language-bash">[\s\S]*?这是第二步的说明文本[\s\S]*?<\/code>/);
+});
+
+
 
 
 

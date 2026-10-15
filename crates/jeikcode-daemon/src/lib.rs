@@ -6923,6 +6923,7 @@ enum ArtifactDetectorState {
     /// Inside a code block
     InCodeBlock {
         id: String,
+        artifact_type: String,
         fence_len: usize,
         depth: usize,
     },
@@ -7006,7 +7007,7 @@ impl ArtifactDetector {
                         let id = self.next_id();
                         events.push(ChatEvent::ArtifactStart {
                             id: id.clone(),
-                            artifact_type,
+                            artifact_type: artifact_type.clone(),
                             language: if language.is_empty() {
                                 None
                             } else {
@@ -7018,6 +7019,7 @@ impl ArtifactDetector {
 
                         self.state = ArtifactDetectorState::InCodeBlock {
                             id,
+                            artifact_type,
                             fence_len,
                             depth: 1,
                         };
@@ -7077,6 +7079,7 @@ impl ArtifactDetector {
                 }
                 ArtifactDetectorState::InCodeBlock {
                     id,
+                    artifact_type,
                     fence_len,
                     mut depth,
                 } => match Self::find_next_fence_in_block(remaining, fence_len, depth) {
@@ -7102,6 +7105,7 @@ impl ArtifactDetector {
                         depth += 1;
                         self.state = ArtifactDetectorState::InCodeBlock {
                             id,
+                            artifact_type,
                             fence_len,
                             depth,
                         };
@@ -7115,18 +7119,36 @@ impl ArtifactDetector {
                         depth = depth.saturating_sub(1);
                         self.state = ArtifactDetectorState::InCodeBlock {
                             id,
+                            artifact_type,
                             fence_len,
                             depth,
                         };
                         remaining = &remaining[after_fence_line..];
                     }
                     None => {
+                        // 结构性终结自愈：如果当前非 markdown 代码块内部遇到了明确的顶层大纲结构（如 `\n### 第二步`）
+                        if artifact_type != "markdown" {
+                            if let Some(term_pos) = Self::find_structural_terminator(remaining) {
+                                if term_pos > 0 {
+                                    events.push(ChatEvent::ArtifactContent {
+                                        id: id.clone(),
+                                        content: remaining[..term_pos].to_string(),
+                                    });
+                                }
+                                events.push(ChatEvent::ArtifactEnd { id });
+                                self.state = ArtifactDetectorState::Normal;
+                                remaining = &remaining[term_pos..];
+                                continue;
+                            }
+                        }
+
                         events.push(ChatEvent::ArtifactContent {
                             id: id.clone(),
                             content: remaining.to_string(),
                         });
                         self.state = ArtifactDetectorState::InCodeBlock {
                             id,
+                            artifact_type,
                             fence_len,
                             depth,
                         };
@@ -7185,6 +7207,16 @@ impl ArtifactDetector {
         events
     }
 
+    fn is_valid_fence_indentation(indentation: &str) -> bool {
+        let trimmed = indentation.trim();
+        if trimmed.is_empty() {
+            indentation.len() <= 8
+        } else {
+            // 允许前导可选的 blockquote 引用标记（例如 ">", "> ", ">> ", "> > "）
+            trimmed.chars().all(|ch| ch == '>' || ch.is_whitespace())
+        }
+    }
+
     fn find_code_fence_start(text: &str) -> Option<(usize, usize, usize, String)> {
         let mut search_start = 0;
         while let Some(relative_marker_start) = text[search_start..].find("```") {
@@ -7194,7 +7226,7 @@ impl ArtifactDetector {
                 .map_or(0, |index| index + 1);
             let indentation = &text[line_start..marker_start];
 
-            if indentation.len() <= 3 && indentation.chars().all(|ch| ch == ' ') {
+            if Self::is_valid_fence_indentation(indentation) {
                 let fence_len = text[marker_start..]
                     .chars()
                     .take_while(|&ch| ch == '`')
@@ -7233,7 +7265,7 @@ impl ArtifactDetector {
                 .map_or(0, |index| index + 1);
             let indentation = &text[line_start..marker_start];
 
-            if indentation.len() <= 3 && indentation.chars().all(|ch| ch == ' ') {
+            if Self::is_valid_fence_indentation(indentation) {
                 let cur_fence_len = text[marker_start..]
                     .chars()
                     .take_while(|&ch| ch == '`')
@@ -7270,6 +7302,73 @@ impl ArtifactDetector {
         }
 
         None
+    }
+
+    fn find_structural_terminator(text: &str) -> Option<usize> {
+        let mut search_start = 0;
+        while let Some(rel_newline) = text[search_start..].find('\n') {
+            let line_start = search_start + rel_newline + 1;
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |idx| line_start + idx);
+            let line = text[line_start..line_end].trim();
+            if Self::is_structural_heading(line) {
+                return Some(line_start);
+            }
+            search_start = line_start;
+        }
+        None
+    }
+
+    fn is_structural_heading(line: &str) -> bool {
+        let trimmed = line.trim();
+        let heading = trimmed.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
+        if !heading.starts_with('#') {
+            return false;
+        }
+        let hashes = heading.chars().take_while(|&c| c == '#').count();
+        if hashes < 1 || hashes > 6 {
+            return false;
+        }
+        let after_hashes = &heading[hashes..];
+        if !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t') {
+            return false;
+        }
+        let title = after_hashes.trim();
+        if title.is_empty() {
+            return false;
+        }
+
+        let is_doc_keyword = title.starts_with("第一")
+            || title.starts_with("第二")
+            || title.starts_with("第三")
+            || title.starts_with("第四")
+            || title.starts_with("第五")
+            || title.starts_with("第六")
+            || title.starts_with("第七")
+            || title.starts_with("第八")
+            || title.starts_with("第九")
+            || title.starts_with("第十")
+            || title.starts_with("步骤")
+            || title.starts_with("总结")
+            || title.starts_with("结论")
+            || title.starts_with("注意事项")
+            || title.starts_with("核心结论")
+            || title.starts_with("为什么")
+            || title.starts_with("如何");
+
+        let has_cjk = title
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fa5}').contains(&c));
+        let has_cjk_punct = title.contains('？')
+            || title.contains('！')
+            || title.contains('：')
+            || title.contains('（')
+            || title.contains('）')
+            || title.contains('?')
+            || title.contains('!');
+
+        is_doc_keyword || (has_cjk && has_cjk_punct)
     }
 
     fn is_html_start(&self, text: &str) -> bool {
@@ -14939,6 +15038,46 @@ mod tests {
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
         assert!(
             matches!(&events[4], ChatEvent::TextDelta { content, .. } if content == "后续正文")
+        );
+    }
+
+    #[test]
+    fn artifact_detector_recognizes_quoted_fence_closure() {
+        let mut detector = ArtifactDetector::new();
+        let input = "修改方式：\n```bash\nsed -i 's/cpu/cuda/g' config.py\n> ```\n\n---\n\n### 第二步：为什么把并发定在 6~8？\n正文";
+        let events = detector.process(input);
+
+        // 验证：文本必须切分为 前导文本 -> 开启 -> 代码内容 -> 闭合 -> 后续文本
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "修改方式：\n")
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&events[2], ChatEvent::ArtifactContent { content, .. } if content.contains("sed -i"))
+        );
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
+        );
+    }
+
+    #[test]
+    fn artifact_detector_structural_terminator_heals_unclosed_code_block() {
+        let mut detector = ArtifactDetector::new();
+        let input = "```bash\necho 1\n\n### 第二步：为什么把并发定在 6~8？\n正文";
+        let events = detector.process(input);
+
+        assert!(
+            matches!(&events[0], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactContent { content, .. } if content.contains("echo 1"))
+        );
+        assert!(matches!(&events[2], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[3], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
         );
     }
 
