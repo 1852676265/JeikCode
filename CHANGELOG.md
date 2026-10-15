@@ -21,6 +21,24 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.1 (2026-10-15)
+
+- **[Rendering] Prevent blockquote code blocks and quoted closures from swallowing document headings**:
+  - Code fences inside Markdown blockquotes and code blocks closed with quote prefixes (such as `> ``` `) now close accurately across both streaming responses and static message renders.
+  - Subsequent headings, horizontal rules, and document sections are no longer swallowed into open code blocks.
+  - Streaming unclosed code blocks automatically heal when encountering distinct document outline headings.
+- **[Capabilities] Isolate shell environment detection from terminal foreground process group**:
+  - Login shell environment probe now safely preserves terminal process group ownership, preventing CLI input hangs.
+
+---
+
+- **[渲染] 修复引用块内代码块及带引用闭合标记吞噬后续大纲标题与正文的问题**:
+  - Markdown 引用块内部的代码块以及带有引用前缀（如 `> ``` `）的闭合标记，无论在实时流式推送还是静态消息渲染中均能精准识别并正常闭合。
+  - 代码块后的分割线、大纲标题与正文内容不再被反向吞入代码块。
+  - 遇到模型漏关代码块并输出明确文档大纲标题时，自动触发结构性终结自愈。
+- **[运行时] 修复登录 shell 环境探测篡夺终端前台进程组导致输入卡死的问题**:
+  - 探测用户登录 shell 环境变量时安全保留终端前台进程组所有权，彻底避免命令行交互卡死。
+
 ## v7.2.4 (2026-10-14)
 
 - **[Updates] Desktop, a remote browser, and a headless CLI share one update flow**:
