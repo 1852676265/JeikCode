@@ -95,11 +95,12 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 /// 读取指定 session 的审批模式；若未单独指定则回退到全局默认模式。
 pub(crate) fn live_session_approval_mode(session_id: Option<&str>) -> ApprovalMode {
     if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        if let Ok(guard) = SESSION_APPROVAL_MODES.lock() {
-            if let Some(map) = guard.as_ref() {
-                if let Some(mode) = map.get(sid.trim()) {
-                    return *mode;
-                }
+        let guard = SESSION_APPROVAL_MODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = guard.as_ref() {
+            if let Some(mode) = map.get(sid.trim()) {
+                return *mode;
             }
         }
     }
@@ -114,11 +115,26 @@ pub(crate) fn live_set_approval_mode(mode: ApprovalMode) {
 /// 设置指定 session 的审批模式；若 session_id 为 None 则更新全局默认模式。
 pub(crate) fn live_set_session_approval_mode(session_id: Option<&str>, mode: ApprovalMode) {
     if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        let mut guard = SESSION_APPROVAL_MODES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = SESSION_APPROVAL_MODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
         map.insert(sid.trim().to_string(), mode);
     } else {
         *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+}
+
+/// 清除指定 session 的隔离审批模式记录（在会话删除时释放内存）。
+pub(crate) fn live_clear_session_approval_mode(session_id: &str) {
+    let sid = session_id.trim();
+    if !sid.is_empty() {
+        let mut guard = SESSION_APPROVAL_MODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = guard.as_mut() {
+            map.remove(sid);
+        }
     }
 }
 
@@ -4144,9 +4160,11 @@ mod tests {
         let body_default = axum::body::to_bytes(resp_default.into_body(), usize::MAX)
             .await
             .expect("read response body");
-        let val_default: serde_json::Value =
-            serde_json::from_slice(&body_default).expect("json");
-        assert_eq!(val_default, serde_json::json!({ "ok": true, "mode": "build" }));
+        let val_default: serde_json::Value = serde_json::from_slice(&body_default).expect("json");
+        assert_eq!(
+            val_default,
+            serde_json::json!({ "ok": true, "mode": "build" })
+        );
 
         // Scoped query for session-alpha returns isolated Plan mode.
         let resp_alpha = approval_mode_get(axum::extract::Query(ApprovalModeQuery {
@@ -4157,8 +4175,7 @@ mod tests {
         let body_alpha = axum::body::to_bytes(resp_alpha.into_body(), usize::MAX)
             .await
             .expect("read response body");
-        let val_alpha: serde_json::Value =
-            serde_json::from_slice(&body_alpha).expect("json");
+        let val_alpha: serde_json::Value = serde_json::from_slice(&body_alpha).expect("json");
         assert_eq!(val_alpha, serde_json::json!({ "ok": true, "mode": "plan" }));
 
         // Other session without explicit override falls back to global Build mode.
@@ -4170,9 +4187,24 @@ mod tests {
         let body_beta = axum::body::to_bytes(resp_beta.into_body(), usize::MAX)
             .await
             .expect("read response body");
-        let val_beta: serde_json::Value =
-            serde_json::from_slice(&body_beta).expect("json");
+        let val_beta: serde_json::Value = serde_json::from_slice(&body_beta).expect("json");
         assert_eq!(val_beta, serde_json::json!({ "ok": true, "mode": "build" }));
+
+        // Clearing session-alpha restores fallback to default mode.
+        live_clear_session_approval_mode("session-alpha");
+        let resp_cleared = approval_mode_get(axum::extract::Query(ApprovalModeQuery {
+            session_id: Some("session-alpha".to_string()),
+        }))
+        .await
+        .into_response();
+        let body_cleared = axum::body::to_bytes(resp_cleared.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let val_cleared: serde_json::Value = serde_json::from_slice(&body_cleared).expect("json");
+        assert_eq!(
+            val_cleared,
+            serde_json::json!({ "ok": true, "mode": "build" })
+        );
     }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the

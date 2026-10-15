@@ -4379,9 +4379,7 @@ async fn get_session_detail(
 }
 
 /// GET /projects/:hash/sessions/:id/lineage - Get conversation fork lineage and child branches
-async fn get_session_lineage(
-    Path((hash, id)): Path<(String, String)>,
-) -> impl IntoResponse {
+async fn get_session_lineage(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     if !valid_project_bucket(&hash) {
         return (
             StatusCode::BAD_REQUEST,
@@ -5199,6 +5197,9 @@ async fn delete_session(
 
                     // Delete all ephemeral log files matching jeikcode-back-{session_id}-*.log
                     jeikcode_capabilities::tools::cleanup_session_logs(&id_for_cleanup).await;
+
+                    // Release session-scoped approval mode override
+                    crate::live_api::live_clear_session_approval_mode(&id_for_cleanup);
                 });
                 state_clone.telemetry.track(Event::UseCommand {
                     type_: "delete_session".into(),
@@ -5962,24 +5963,25 @@ async fn fork_session(
 
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = jeikcode_capabilities::session::now_ms();
-        let (mut forked, _lease) = match manager.fork_native_session_at(
-            &source_id,
-            &new_id,
-            target_message_count,
-            now,
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-                )
-                    .into_response();
-            }
-        };
+        let (mut forked, _lease) =
+            match manager.fork_native_session_at(&source_id, &new_id, target_message_count, now) {
+                Ok(res) => res,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
 
         forked.meta.updated_at = now.saturating_add(1);
-        if let Some(title) = req.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(title) = req
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             forked.meta.name = title.to_string();
             forked.meta.user_renamed = true;
         }
@@ -12075,10 +12077,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/projects/:hash/sessions/:id/truncate",
             post(truncate_session),
         )
-        .route(
-            "/projects/:hash/sessions/:id/fork",
-            post(fork_session),
-        )
+        .route("/projects/:hash/sessions/:id/fork", post(fork_session))
         .route("/sessions/:id/fork", post(fork_session_by_id))
         // Model API
         .route("/models", get(get_models))
@@ -12981,10 +12980,12 @@ mod tests {
             .into_response();
         assert_eq!(invalid_resp.status(), StatusCode::BAD_REQUEST);
 
-        let not_found_resp =
-            get_session_lineage(Path(("0123456789abcdef".into(), "nonexistent_session".into())))
-                .await
-                .into_response();
+        let not_found_resp = get_session_lineage(Path((
+            "0123456789abcdef".into(),
+            "nonexistent_session".into(),
+        )))
+        .await
+        .into_response();
         assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
     }
 

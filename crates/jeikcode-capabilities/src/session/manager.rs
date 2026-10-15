@@ -2040,8 +2040,9 @@ impl SessionManager {
         if let Some(count) = target_message_count {
             let keep = count.min(source.snapshot.messages.len());
             source.snapshot.messages.truncate(keep);
-            let (turn_c, req_c) =
-                jeikcode_kernel::message::SessionSnapshot::derive_counters(&source.snapshot.messages);
+            let (turn_c, req_c) = jeikcode_kernel::message::SessionSnapshot::derive_counters(
+                &source.snapshot.messages,
+            );
             source.snapshot.turn_counter = turn_c;
             source.snapshot.request_counter = req_c;
             source.snapshot.cache_epoch = source.snapshot.cache_epoch.saturating_add(1);
@@ -3055,11 +3056,7 @@ impl SessionManager {
 
         for session in &all_sessions {
             let is_in_lineage = session.id == root_id
-                || session
-                    .fork_info
-                    .as_ref()
-                    .map(|f| f.root_id.as_str())
-                    == Some(root_id.as_str());
+                || session.fork_info.as_ref().map(|f| f.root_id.as_str()) == Some(root_id.as_str());
             if is_in_lineage {
                 lineage_size += 1;
             }
@@ -5354,7 +5351,10 @@ mod tests {
         .unwrap();
 
         // 5. Query root lineage: should find 2 children, lineage_size = 3
-        let root_lineage = mgr.session_lineage("session-root").unwrap().expect("root lineage");
+        let root_lineage = mgr
+            .session_lineage("session-root")
+            .unwrap()
+            .expect("root lineage");
         assert_eq!(root_lineage.session_id, "session-root");
         assert_eq!(root_lineage.root_id, "session-root");
         assert_eq!(root_lineage.parent_id, None);
@@ -5368,7 +5368,10 @@ mod tests {
         assert_eq!(root_lineage.children[1].forked_at_ms, 150);
 
         // 6. Query fork-1 lineage: should reflect root and parent pointing to root
-        let fork1_lineage = mgr.session_lineage("session-fork-1").unwrap().expect("fork1 lineage");
+        let fork1_lineage = mgr
+            .session_lineage("session-fork-1")
+            .unwrap()
+            .expect("fork1 lineage");
         assert_eq!(fork1_lineage.session_id, "session-fork-1");
         assert_eq!(fork1_lineage.root_id, "session-root");
         assert_eq!(fork1_lineage.parent_id, Some("session-root".into()));

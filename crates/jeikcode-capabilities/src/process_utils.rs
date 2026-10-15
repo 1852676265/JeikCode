@@ -1777,7 +1777,10 @@ mod tests {
         let env_opt = capture_login_shell_env();
         assert!(env_opt.is_some(), "capture_login_shell_env must succeed");
         let env = env_opt.unwrap();
-        assert!(env.contains_key("PATH"), "PATH must be captured from login shell");
+        assert!(
+            env.contains_key("PATH"),
+            "PATH must be captured from login shell"
+        );
 
         // Verify that executing capture_login_shell_env did NOT steal the terminal foreground process group
         if unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {

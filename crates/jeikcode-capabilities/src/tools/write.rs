@@ -49,28 +49,25 @@ impl Tool for WriteFileTool {
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let t0 = std::time::Instant::now();
-        let a: Args = match parse_tool_args(
-            "write",
-            args,
-            r#"{"path":"<path>","content":"<text>"}"#,
-        )
-        .or_else(|_| {
-            parse_tool_args(
-                "write_file",
-                args,
-                r#"{"path":"<path>","content":"<text>"}"#,
-            )
-        })
-        .or_else(|_| {
-            parse_tool_args(
-                "create_file",
-                args,
-                r#"{"path":"<path>","content":"<text>"}"#,
-            )
-        }) {
-            Ok(a) => a,
-            Err(e) => return e.into_tool_result(),
-        };
+        let a: Args =
+            match parse_tool_args("write", args, r#"{"path":"<path>","content":"<text>"}"#)
+                .or_else(|_| {
+                    parse_tool_args(
+                        "write_file",
+                        args,
+                        r#"{"path":"<path>","content":"<text>"}"#,
+                    )
+                })
+                .or_else(|_| {
+                    parse_tool_args(
+                        "create_file",
+                        args,
+                        r#"{"path":"<path>","content":"<text>"}"#,
+                    )
+                }) {
+                Ok(a) => a,
+                Err(e) => return e.into_tool_result(),
+            };
         let path = resolve_path(&a.path, &ctx.working_dir);
         let disp = crate::pathnorm::to_display(&path);
 
