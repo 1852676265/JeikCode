@@ -21,6 +21,58 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.2 (2026-10-16)
+
+- **[Subagents] Compact worker action receipt ledger and tamper-proof execution evidence**:
+  - Worker subagents now prepend an authoritative, compact action receipt (`[Worker touched: ..., ran: ...]`) to task blocks, providing tamper-proof physical execution evidence and preventing hallucinations without context bloat (~15-25 tokens).
+  - Touched files and commands are deduplicated, normalized, and overflow-folded (capped at 6 files and 5 commands). Early stops (such as reaching max turn rounds) preserve touched file evidence. Read-only explore subtasks remain clean.
+- **[Conversations] Conversation branching, session forking, and lineage tree API**:
+  - Non-destructive conversation branching now supports forking at arbitrary message boundaries with counter re-derivation and cache-epoch isolation.
+  - New REST endpoints (`POST /projects/:hash/sessions/:id/fork` and `GET .../lineage`) enable client and WebUI session tree visualization and lineage inspection.
+- **[Daemon] Session-isolated live approval mode with automatic resource cleanup**:
+  - Live approval modes (Build, Plan, Bypass) are now isolated per session ID with seamless global fallback, preventing concurrent tabs from hijacking each other's plan mode gates.
+  - Session deletion pipeline automatically prunes session approval overrides alongside background processes and temporary logs.
+- **[Capabilities] Canonical create_file alias and unified mutation security gates**:
+  - Registered `create_file` as a canonical alias for the `write` tool, eliminating unknown tool errors across OpenAI-compatible and multi-protocol clients.
+  - Single-sourced file mutation predicates into `WriteApprovalGate` and `WorkerScopeGate`, ensuring consistent directory-level approval and sensitive path protection across all aliases.
+  - `BashWorkspaceGate` now natively recognizes Windows drive-letter (`C:/`, `C:\`), UNC network shares (`\\server\share`), and tilde variants for static directory independence.
+- **[Kernel] Watermark budget calibration and thinking-only exhaustion diagnosis**:
+  - Calibrated context exhaustion detection against `input_watermark_budget`, accounting for the 20K output buffer reserve.
+  - Differentiated thinking-only token exhaustion under high context pressure, providing actionable `/compact` guidance for reasoning models.
+- **[Todo] Actionable tool alignment, incremental batch folding, and completion lifecycle**:
+  - Aligned `TodoHook` actionable tool detection with subagent task delegations and all execution aliases.
+  - Fixed transcript folding to incrementally fold mid-turn batch additions without clearing in-progress task lists.
+  - Prevented completed checklists from resurrecting across turns after `turn_complete` archival.
+- **[Daemon & TUI] Consolidated event fanout and resilient AST-aware diff review fallback**:
+  - Merged shadowed `Done` and `Stopped` event arms in daemon event fanout, resolving compiler warnings and ensuring session ID backfill.
+  - TUI `/review` command now provides dual guidance: calling `code_review` if mounted, or guiding direct AST and git diff inspection when unmounted.
+
+---
+
+- **[子代理] Worker 紧凑型动作收据记账器与防伪造执行凭据**:
+  - Worker 子代理在任务块头部新增权威紧凑的动作收据（`[Worker touched: ..., ran: ...]`），在完全杜绝上下文膨胀（仅消耗 ~15-25 tokens）的前提下提供防篡改的物理执行证据，防止模型产生虚假执行幻觉。
+  - 文件路径与指令自动去重、规范化并施加超量折叠保护（6 个文件/5 条命令折叠）。子任务因达到最大轮数等原因提前截断时，依然如实保留已修改文件证据，只读 `explore` 任务保持纯净。
+- **[会话] 对话分支派生、会话分叉与谱系树查询 API**:
+  - 支持在任意历史消息节点发起无损对话分叉，自动重推导回合与请求计数并隔离缓存代际。
+  - 新增 REST 路由（`POST /projects/:hash/sessions/:id/fork` 与 `GET .../lineage`），支持客户端与 WebUI 渲染完整会话分支树与谱系关系。
+- **[守护进程] 会话级隔离 Live 审批模式与生命周期资源回收**:
+  - 审批模式（Build、Plan、Bypass）支持按 session ID 进行精确隔离与全局默认平滑回退，防止多标签页并发时互相影响。
+  - 会话删除管线中增加隔离审批模式自动清理，与后台子进程和临时日志同步回收。
+- **[能力层] 规范 create_file 工具别名与单一真源安全门禁**:
+  - 将 `create_file` 注册为 `write` 工具的标准别名，消除模型与多协议客户端调用时的未识别错误。
+  - 在 `WriteApprovalGate` 与 `WorkerScopeGate` 中统一切入单一真源文件变异谓词，确保所有别名均严格遵循目录授权与敏感文件拦截。
+  - `BashWorkspaceGate` 原生支持 Windows 盘符路径（`C:/`、`C:\`）、UNC 共享路径与波浪号主目录，消除误判弹窗。
+- **[内核] 水位基准统一与思考模型上下文耗尽智能诊断**:
+  - 将空响应判定基准对齐至扣除 20K 输出预留后的 `input_watermark_budget`。
+  - 精准识别高上下文压力导致的思考模型输出中断，告别盲目重试，提供明确的 `/compact` 与精简输入指引。
+- **[任务清单] 闭环动作工具对齐、增量折叠与生命周期管理**:
+  - `TodoHook` 动作检测对齐子代理派发与各类变异工具别名，确保未结待办在任何实质动作后均正常触发闭环提示。
+  - 修复中途批量追加任务时的增量折叠基准，彻底消除进行中任务被误清空的缺陷。
+  - 任务清单全完成并在回合末尾归档清空后，下一回合不再错误复活历史任务。
+- **[守护进程与TUI] 事件扇出分支合并与双轨代码审查指引**:
+  - 合并 daemon 事件扇出中被遮蔽的 `Done` 与 `Stopped` 分支，彻底消除编译器警告并确保会话 ID 正常回填。
+  - TUI `/review` 命令接入双轨引导机制：未挂载 `code_review` 工具时平滑降级至直接执行 `git diff` 并结合 AST 语法树输出结构化报告。
+
 ## v7.2.5-beta.1 (2026-10-15)
 
 - **[Rendering] Prevent blockquote code blocks and quoted closures from swallowing document headings**:
