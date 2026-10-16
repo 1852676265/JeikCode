@@ -158,10 +158,12 @@ import {
 import { gitStore } from '../lib/gitStore';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
+  deserializeQueuedCard,
   loadQueuedFromStorage,
   mergeQueuedIntoDraft,
   queueAfterSessionActiveCheck,
   saveQueuedToStorage,
+  serializeQueuedCard,
   stashSessionQueued,
   restoreSessionQueued,
 } from '../lib/queuedDraft';
@@ -1117,7 +1119,7 @@ export function Chat({
     }
     saveQueuedToStorage(queuedBySessionRef.current);
     // 跨设备后端队列同步持久化：换别的手机打开或刷新卡片永不丢失
-    void saveChatQueue(sid, next as unknown as QueuedMessageApiItem[]);
+    void saveChatQueue(sid, next.map(serializeQueuedCard) as QueuedMessageApiItem[]);
   }
 
   /**
@@ -2565,7 +2567,7 @@ export function Chat({
           if (activeIdRef.current === sessionId && serverItems && serverItems.length > 0) {
             setQueued((current) => {
               // 排除已经在正文消息流中出现的已发送提问，杜绝已被消费的卡片复活
-              const validServerItems = (serverItems as unknown as QueuedMessage[]).filter(
+              const validServerItems = (serverItems.map(deserializeQueuedCard) as unknown as QueuedMessage[]).filter(
                 (item) => !queuedItemOnCanvas(item),
               );
               if (validServerItems.length === 0) return current;
@@ -6582,7 +6584,7 @@ export function Chat({
         queuedBySessionRef.current.delete(targetSid);
       }
       saveQueuedToStorage(queuedBySessionRef.current);
-      void saveChatQueue(targetSid, updatedList as unknown as QueuedMessageApiItem[]);
+      void saveChatQueue(targetSid, updatedList.map(serializeQueuedCard) as QueuedMessageApiItem[]);
     }
 
     if (q.text) {
