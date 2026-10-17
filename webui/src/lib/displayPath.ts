@@ -134,3 +134,36 @@ export function pathBasename(path: string): string {
   const parts = p.split(/[/\\]/);
   return parts[parts.length - 1] || p;
 }
+
+/**
+ * 计算文件相对于项目工作目录的完整相对路径。
+ * 支持单仓库、多 Git 仓库（子仓位于项目子目录）与跨平台盘符标准化。
+ */
+export function getRelativePathToProject(filePath: string, repoRoot?: string, projectCwd?: string): string {
+  const cleanFile = stripExtendedPathPrefix(filePath || '').trim().replace(/\\/g, '/');
+  if (!cleanFile) return '';
+  if (!repoRoot || !projectCwd) return cleanFile.replace(/^\.?\/+/, '');
+
+  const normRepo = stripExtendedPathPrefix(repoRoot).trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  const normProject = stripExtendedPathPrefix(projectCwd).trim().replace(/\\/g, '/').replace(/\/+$/, '');
+
+  // 1. 如果 cleanFile 本身是绝对路径
+  if (/^[a-zA-Z]:\//.test(cleanFile) || cleanFile.startsWith('/')) {
+    if (cleanFile.toLowerCase().startsWith(normProject.toLowerCase())) {
+      const rest = cleanFile.slice(normProject.length).replace(/^\/+/, '');
+      return rest || pathBasename(cleanFile);
+    }
+    return cleanFile;
+  }
+
+  // 2. 如果 repoRoot 是 projectCwd 的子目录 (多仓场景，如 project/crates/foo)
+  if (normRepo.toLowerCase().startsWith(normProject.toLowerCase())) {
+    const subRepo = normRepo.slice(normProject.length).replace(/^\/+/, '');
+    if (subRepo) {
+      return `${subRepo}/${cleanFile.replace(/^\.?\/+/, '')}`;
+    }
+    return cleanFile.replace(/^\.?\/+/, '');
+  }
+
+  return cleanFile.replace(/^\.?\/+/, '');
+}

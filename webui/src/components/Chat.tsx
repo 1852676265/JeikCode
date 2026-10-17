@@ -161,7 +161,7 @@ import {
   todoCounts,
   type TodoItem,
 } from '../lib/todos';
-import { displayPath, pathBasename } from '../lib/displayPath';
+import { displayPath, pathBasename, getRelativePathToProject } from '../lib/displayPath';
 import { toolTouchesWorktree } from '../lib/gitRefresh';
 import {
   getSessionCache,
@@ -4230,7 +4230,9 @@ export function Chat({
   const setActiveMainTabId = externalSetActiveMainTabId ?? setInternalActiveMainTabId;
 
   const handleOpenFileDiff = async (commit: GitCommitItem, file: GitCommitFile, repoRoot?: string) => {
-    const tabId = `${commit.short_hash}:${file.path}`;
+    const projectRoot = effectiveWorkingDir || cwd || '';
+    const fullRelativePath = getRelativePathToProject(file.path, repoRoot, projectRoot);
+    const tabId = `${commit.short_hash}:${fullRelativePath}`;
     const targetCwd = repoRoot || cwd;
     const existing = diffTabs.find((t) => t.id === tabId);
     if (existing) {
@@ -4244,7 +4246,7 @@ export function Chat({
       commitHash: commit.hash,
       commitShortHash: commit.short_hash,
       commitMessage: commit.message,
-      filePath: file.path,
+      filePath: fullRelativePath,
       fileName,
       fileStatus: file.status,
       diffText: '',
@@ -4269,7 +4271,9 @@ export function Chat({
   };
 
   const handleOpenWorkingDiff = async (file: GitStatusItem, staged: boolean, repoRoot?: string) => {
-    const tabId = `working:${staged ? 'staged' : 'unstaged'}:${file.path}`;
+    const projectRoot = effectiveWorkingDir || cwd || '';
+    const fullRelativePath = getRelativePathToProject(file.path, repoRoot, projectRoot);
+    const tabId = `working:${staged ? 'staged' : 'unstaged'}:${fullRelativePath}`;
     const targetCwd = repoRoot || cwd;
     const existing = diffTabs.find((t) => t.id === tabId);
     if (existing) {
@@ -4282,8 +4286,8 @@ export function Chat({
       id: tabId,
       commitHash: staged ? 'STAGED' : 'WORKING',
       commitShortHash: staged ? 'Staged' : 'Working Tree',
-      commitMessage: `${staged ? t('git.stagedChanges') : t('git.workingTree')}: ${file.path}`,
-      filePath: file.path,
+      commitMessage: staged ? t('git.stagedChanges') : t('git.workingTree'),
+      filePath: fullRelativePath,
       fileName,
       fileStatus: file.status === '?' ? 'U' : file.status,
       diffText: '',
