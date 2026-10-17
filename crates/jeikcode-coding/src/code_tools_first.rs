@@ -33,7 +33,7 @@ const OPENING_BODY_ZH: &str = "\
 还有，在回答前请充分探索代码库。使用 `code_explore` 加快代码逻辑检索速度以便快速获得全貌。当工具调用之间无依赖时，优先并发发起调用。如果你没在运行探索任务，请忽略此句即可。";
 
 const OPENING_BODY_EN: &str = "\
-Also, explore the codebase generously before answering. Use `code_explore` to accelerate code logic retrieval and quickly gain a complete overview. Fire concurrent calls when there is no dependency between them. If you are not running an exploration task, please ignore this sentence.";
+Explore the codebase generously before answering. Use `code_explore` to accelerate code logic retrieval and quickly gain a complete overview. Fire concurrent calls when there is no dependency between them. If you are not running an exploration task, please ignore this sentence.";
 
 const OPENING_BODY_VI: &str = "\
 Ngoài ra, hãy khám phá kỹ lưỡng cơ sở mã trước khi trả lời. Sử dụng `code_explore` để tăng tốc độ truy xuất logic mã nhằm nhanh chóng nắm bắt bức tranh toàn cảnh. Kích hoạt các lệnh gọi đồng thời khi không có sự phụ thuộc lẫn nhau. Nếu bạn không thực hiện nhiệm vụ khám phá, vui lòng bỏ qua câu này.";

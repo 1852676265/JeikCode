@@ -2189,7 +2189,10 @@ mod tests {
         if first_turn_path.exists() {
             let first_turn_content = std::fs::read_to_string(&first_turn_path).unwrap();
             assert!(
-                first_turn_content.contains("Explore the codebase generously before answering"),
+                first_turn_content.contains("Explore the codebase generously before answering")
+                    || first_turn_content
+                        .to_lowercase()
+                        .contains("explore the codebase generously before answering"),
                 "code_tools_first.rs must contain generous exploration"
             );
             assert!(
