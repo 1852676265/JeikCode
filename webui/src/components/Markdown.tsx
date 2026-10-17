@@ -76,10 +76,54 @@ const ALL_FILE_EXTS = 'kt|kts|java|c|cpp|cc|cxx|h|hpp|hxx|cs|swift|m|mm|scala|cl
 const EXT_REGEX = new RegExp(`\\.(${ALL_FILE_EXTS})$`, 'i');
 const ROOT_DIRS_REGEX = /^(crates|src|webui|packages|desktop|docs|scripts|extensions|functions|plans|tests|assets|public|internal|cmd|api|lib)\/[\w.\-\\/]+$/i;
 
+const CLI_COMMAND_STARTS = new Set([
+  'npm', 'npx', 'pnpm', 'yarn', 'bun', 'node', 'deno',
+  'cargo', 'rustc', 'rustup',
+  'git', 'gh', 'svn', 'hg',
+  'python', 'python3', 'py', 'pip', 'pip3', 'pytest',
+  'go', 'gofmt',
+  'docker', 'docker-compose', 'podman', 'kubectl', 'helm',
+  'bash', 'sh', 'zsh', 'fish', 'source', 'export',
+  'cat', 'grep', 'find', 'awk', 'sed', 'cd', 'ls', 'dir',
+  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown',
+  'curl', 'wget', 'ssh', 'scp', 'tar', 'zip', 'unzip',
+  'make', 'cmake', 'ninja', 'mvn', 'gradle',
+  'vite', 'tsc', 'eslint', 'prettier', 'jest', 'vitest',
+]);
+
+/**
+ * 智能识别一段文本是否是 CLI 终端命令行，防止命令代码被误当成文件路径
+ */
+export function isCommandSnippet(text: string): boolean {
+  const t = (text || '').trim().replace(/^['"`]|['"`]$/g, '');
+  if (!t) return false;
+
+  // 1. 包含命令行连接符、管道符、分号或重定向符
+  if (/(\s+&&\s+|\s+\|\|\s+|\s+\|\s+|\s+>>?\s+|\s+<<?\s+|;\s*)/.test(t)) return true;
+
+  // 2. 包含典型的命令行参数标志 (如 --test, -v, -p, --save-dev, -rf)
+  if (/\s+--?[a-zA-Z0-9]/.test(t)) return true;
+
+  // 3. 以常见 CLI 命令关键字开头且附带参数 (如 npm run, git status, node --test)
+  const firstWord = t.split(/[\s/\\:]/)[0]?.toLowerCase();
+  if (firstWord && CLI_COMMAND_STARTS.has(firstWord) && /\s+/.test(t)) {
+    return true;
+  }
+
+  // 4. 包含空格且含常见命令行动词 (run build, test, install 等)
+  if (/\s+(?:run|build|test|start|install|add|commit|checkout|push|pull|revert|fetch|merge|diff|status|serve|watch)\b/i.test(t)) {
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * 智能识别一段文本是否是项目源码/资源文件路径（支持健壮提取附带的行号与行范围）
  */
 export function isFilePathSnippet(text: string): boolean {
+  if (isCommandSnippet(text)) return false;
+
   const { filePath } = parseFilePathAndLines(text);
   const t = filePath.trim().replace(/^['"`]|['"`]$/g, '');
   if (t.length < 2 || t.length > 350) return false;
