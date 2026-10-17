@@ -350,8 +350,7 @@ fn start_webui(app: &tauri::AppHandle) -> Result<(String, std::process::Child), 
     if probe_port != port {
         let dir = jeikcode_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let token_val = saved_token.as_deref().unwrap_or(&token);
-        let body = format!("{{\n  \"port\": {probe_port},\n  \"token\": \"{token_val}\"\n}}\n");
+        let body = format!("{{\n  \"port\": {probe_port},\n  \"token\": \"{token}\"\n}}\n");
         let _ = std::fs::write(dir.join("webui-listen.json"), body);
     }
     let ready_deadline = Instant::now() + Duration::from_secs(20);
