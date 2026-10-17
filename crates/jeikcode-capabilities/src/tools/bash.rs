@@ -5725,11 +5725,7 @@ pub async fn run_shell(
             .kill_on_drop(true);
         crate::process_utils::suppress_console_window(&mut cmd);
         match cmd.spawn() {
-            Ok(c) => {
-                #[cfg(target_os = "windows")]
-                let _job = crate::process_utils::assign_child_to_kill_on_close_job(&c);
-                c
-            }
+            Ok(c) => c,
             Err(e) => {
                 return ShellOutcome {
                     stdout: String::new(),

@@ -1970,7 +1970,7 @@ mod tests {
         };
         let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
         assert_eq!(mc, 1, "max_concurrent is still floored to one");
-        assert_eq!(rounds, 200);
+        assert_eq!(rounds, 230);
     }
 
     #[test]
@@ -1979,7 +1979,7 @@ mod tests {
         use jeikcode_config::config::SubAgentConfig;
         let (mc, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
         assert_eq!(mc, 3, "default max_concurrent unchanged");
-        assert_eq!(rounds, 200, "default child round high-water unchanged");
+        assert_eq!(rounds, 230, "default child round high-water unchanged");
     }
 
     #[test]
