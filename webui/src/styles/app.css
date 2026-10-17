@@ -15424,9 +15424,16 @@ body {
 
 .git-footer-toast {
   font-size: 12px;
-  color: #10b981;
   font-weight: 500;
   animation: fadeIn 0.15s ease;
+}
+
+.git-footer-toast.success {
+  color: #10b981;
+}
+
+.git-footer-toast.error {
+  color: #f87171;
 }
 
 .git-cancel-btn {

@@ -343,16 +343,37 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
 }
 
 export function saveProjectGitConfig(projectHash: string, config: GitAdapterConfig): void {
+  const cleanPayload = config.webhook?.payloadUrl
+    ? normalizeWebhookHost(config.webhook.payloadUrl).replace(/\/+$/, '')
+    : '';
+  const normalizedConfig = {
+    ...config,
+    project_hash: projectHash,
+    projectHash,
+    repo_identifier: config.repoIdentifier,
+    repoIdentifier: config.repoIdentifier,
+    access_token: config.accessToken,
+    accessToken: config.accessToken,
+    custom_api_base: config.customApiBase,
+    customApiBase: config.customApiBase,
+    sync_mode: config.syncMode,
+    syncMode: config.syncMode,
+    webhook: {
+      ...config.webhook,
+      payloadUrl: cleanPayload,
+      payload_url: cleanPayload,
+    },
+  };
   try {
-    localStorage.setItem(`jeikcode_git_binding_${projectHash}`, JSON.stringify(config));
-    if (config.webhook?.payloadUrl) {
-      setLastWebhookHost(config.webhook.payloadUrl);
+    localStorage.setItem(`jeikcode_git_binding_${projectHash}`, JSON.stringify(normalizedConfig));
+    if (cleanPayload) {
+      setLastWebhookHost(cleanPayload);
     }
   } catch {
     // ignore
   }
   // 异步同步到后端持久化文件 (~/.jeikcode/git-bindings.json)
-  saveGitBinding({ ...config, project_hash: projectHash }).catch(() => {});
+  saveGitBinding(normalizedConfig).catch(() => {});
 }
 
 interface GitWebhookDialogProps {
@@ -367,7 +388,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   const [config, setConfig] = useState<GitAdapterConfig>(() => getProjectGitConfig(project.hash, lang));
   const [showToken, setShowToken] = useState(false);
   const [copyStatus, setCopyStatus] = useState<Record<string, string>>({});
-  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
 
   // 动态响应页面/浏览器缩放与视口尺寸变动，自适应计算弹窗最大高度与居中边界，彻底防止大比例缩放下被遮挡
   const [modalAdaptiveStyle, setModalAdaptiveStyle] = useState<{ maxHeight?: string; width?: string }>({});
@@ -471,9 +492,9 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  const showToast = (msg: string) => {
-    setToastMsg(msg);
-    setTimeout(() => setToastMsg(null), 3000);
+  const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3500);
   };
 
   const copyToClipboard = (text: string, fieldKey: string) => {
@@ -517,24 +538,38 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
 
   const handleTestOrTrigger = async () => {
     if (!config.repoIdentifier.trim()) {
-      showToast(t('gitWebhook.repoPlaceholder') || 'Please specify repository');
+      showToast(t('gitWebhook.repoPlaceholder') || 'Please specify repository', 'error');
       return;
     }
     setTesting(true);
     try {
-      const res = await testGitBinding(config);
+      const payload = {
+        ...config,
+        project_hash: project.hash,
+        projectHash: project.hash,
+        repo_identifier: config.repoIdentifier.trim(),
+        repoIdentifier: config.repoIdentifier.trim(),
+        access_token: config.accessToken.trim(),
+        accessToken: config.accessToken.trim(),
+        custom_api_base: config.customApiBase.trim(),
+        customApiBase: config.customApiBase.trim(),
+        sync_mode: config.syncMode,
+        syncMode: config.syncMode,
+      };
+      const res = await testGitBinding(payload);
       if (res.success) {
         showToast(
           res.message ||
             (config.syncMode === 'webhook'
               ? t('gitWebhook.testSuccess')
-              : t('gitWebhook.pollingSimSuccess'))
+              : t('gitWebhook.pollingSimSuccess')),
+          'success'
         );
       } else {
-        showToast(res.error || 'Connection failed');
+        showToast(res.error || 'Connection failed', 'error');
       }
     } catch (e: any) {
-      showToast(e.message || 'Connection test failed');
+      showToast(e.message || 'Connection test failed', 'error');
     } finally {
       setTesting(false);
     }
@@ -1076,7 +1111,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                 ? t('gitWebhook.testBtn')
                 : t('gitWebhook.pollingManualCheck')}
             </button>
-            {toastMsg && <span class="git-footer-toast">{toastMsg}</span>}
+            {toast && <span class={`git-footer-toast ${toast.type}`}>{toast.msg}</span>}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>

@@ -161,10 +161,11 @@ impl NormalizedGitEvent {
 
 /// 订阅事件开关集合
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SubscribedEvents {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "pull_request")]
     pub pull_request: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "issue_comment")]
     pub issue_comment: bool,
     #[serde(default)]
     pub push: bool,
@@ -186,8 +187,9 @@ fn default_true() -> bool {
 
 /// Webhook 专用配置
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WebhookConfig {
-    #[serde(default)]
+    #[serde(default, alias = "payload_url")]
     pub payload_url: String,
     #[serde(default)]
     pub secret: String,
@@ -195,10 +197,11 @@ pub struct WebhookConfig {
 
 /// 轮询专用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PollingConfig {
-    #[serde(default = "default_interval")]
+    #[serde(default = "default_interval", alias = "interval_seconds")]
     pub interval_seconds: u32,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "only_active_pr")]
     pub only_active_pr: bool,
 }
 
@@ -217,24 +220,25 @@ fn default_interval() -> u32 {
 
 /// 项目绑定的 Git 平台适配器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitAdapterConfig {
-    #[serde(default)]
+    #[serde(default, alias = "project_hash")]
     pub project_hash: String,
     /// 是否开启此项目的自动化代码审查与联动（默认关闭）
     #[serde(default)]
     pub enabled: bool,
     /// 记录项目被移除前最后一次手动勾选的启用状态，供下次重新添加回列表时自动恢复
-    #[serde(default)]
+    #[serde(default, alias = "last_enabled_state")]
     pub last_enabled_state: bool,
     #[serde(default)]
     pub channel: String,
-    #[serde(default)]
+    #[serde(default, alias = "sync_mode")]
     pub sync_mode: GitSyncMode,
-    #[serde(default)]
+    #[serde(default, alias = "repo_identifier", alias = "repoFullName")]
     pub repo_identifier: String,
-    #[serde(default)]
+    #[serde(default, alias = "access_token", alias = "githubPat")]
     pub access_token: String,
-    #[serde(default)]
+    #[serde(default, alias = "custom_api_base")]
     pub custom_api_base: String,
     #[serde(default)]
     pub webhook: WebhookConfig,
@@ -242,17 +246,17 @@ pub struct GitAdapterConfig {
     pub polling: PollingConfig,
     #[serde(default)]
     pub events: SubscribedEvents,
-    #[serde(default = "default_keyword")]
+    #[serde(default = "default_keyword", alias = "trigger_keyword")]
     pub trigger_keyword: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "auto_review_new_pr")]
     pub auto_review_new_pr: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "update_existing_comment")]
     pub update_existing_comment: bool,
-    #[serde(default)]
+    #[serde(default, alias = "review_prompt_template")]
     pub review_prompt_template: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "review_model")]
     pub review_model: Option<String>,
 }
 
