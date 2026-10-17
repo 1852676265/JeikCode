@@ -169,9 +169,9 @@ export function AttachMenu({ onInsert, onAddImages, onAddFiles }: AttachMenuProp
                   onClick={() => pickSkill(s.name)}
                   title={s.description}
                 >
-                  <span class="attach-skill-name">/{bareSkillName(s.name)}</span>
+                  <span class="attach-skill-name notranslate" translate={false}>/{bareSkillName(s.name)}</span>
                   {s.description && (
-                    <span class="attach-skill-desc">{s.description}</span>
+                    <span class="attach-skill-desc notranslate" translate={false}>{s.description}</span>
                   )}
                 </button>
               ))}

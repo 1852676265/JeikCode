@@ -1635,8 +1635,8 @@ export function Sidebar({
               onClick={() => chooseSkill(s.name)}
               title={s.description || ''}
             >
-              <span class="skills-menu-name">/{s.name}</span>
-              {s.description && <span class="skills-menu-desc">{s.description}</span>}
+              <span class="skills-menu-name notranslate" translate={false}>/{s.name}</span>
+              {s.description && <span class="skills-menu-desc notranslate" translate={false}>{s.description}</span>}
             </button>
             {s.dir && (
               <button
@@ -1718,7 +1718,7 @@ export function Sidebar({
               title={s.error || ''}
             >
               <div class="cap-row-main">
-                <span class="mcp-menu-name">{s.name}</span>
+                <span class="mcp-menu-name notranslate" translate={false}>{s.name}</span>
                 <span class="mcp-menu-meta">
                   {!s.effective_disabled && <span class={statusClass} />}
                   {!s.effective_disabled && <span class="mcp-menu-status-text">{statusLabel}</span>}

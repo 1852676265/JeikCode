@@ -8110,8 +8110,12 @@ export function Chat({
               type="button"
               title={item.description || ''}
             >
-              <span class="slash-name">/{item.name}</span>
-              {item.description && <span class="slash-desc">{item.description}</span>}
+              <span class={'slash-name' + (item.kind === 'skill' ? ' notranslate' : '')} translate={item.kind === 'skill' ? false : undefined}>/{item.name}</span>
+              {item.description && (
+                <span class={'slash-desc' + (item.kind === 'skill' ? ' notranslate' : '')} translate={item.kind === 'skill' ? false : undefined}>
+                  {item.description}
+                </span>
+              )}
             </button>
           ))}
         </div>
@@ -10154,7 +10158,7 @@ function UserMessageView({
           title={t('chat.skillExpand')}
         >
           <span class="skill-badge-icon" aria-hidden="true">⚡</span>
-          <span class="skill-badge-label">{skillTitle}</span>
+          <span class="skill-badge-label notranslate" translate={false}>{skillTitle}</span>
           <span class="skill-badge-hint">{t('chat.skillExpand')}</span>
         </button>
         {timeLabel && <div class="msg-time msg-time-user" title={timeFull}>{timeLabel}</div>}
@@ -10449,7 +10453,7 @@ function ToolRowView({
         }}
       >
         <span class="tool-glyph" aria-hidden="true">{glyph}</span>
-        <span class="tool-name">{displayToolName(tool.name)}</span>
+        <span class="tool-name notranslate" translate={false}>{displayToolName(tool.name)}</span>
         <ToolArgPreview text={headerDetail} />
         {diffStats && (
           <DiffStatBadge additions={diffStats.additions} deletions={diffStats.deletions} />

@@ -83,7 +83,7 @@ export function PermissionCard({ req, onDone, onDecide, dock, center }: Permissi
             </svg>
           </span>
           <h3 class="permission-title">{t('perm.title')}</h3>
-          <span class="modal-tag permission-tag">{req.tool_name}</span>
+          <span class="modal-tag permission-tag notranslate" translate={false}>{req.tool_name}</span>
         </div>
 
         <div class="modal-body">
