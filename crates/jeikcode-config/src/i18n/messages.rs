@@ -381,6 +381,7 @@ pub enum Msg<'a> {
     SessionRenameEditing {
         buffer: &'a str,
     },
+    SessionBranch,
 
     // ── Dir picker ──
     DirPickerTitle {

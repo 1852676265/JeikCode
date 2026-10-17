@@ -560,7 +560,8 @@ fn build_menu_payload(
         });
         let mut metadata = format!("{} · {}", msgs, humanize_age(s.updated_at));
         if s.fork_root_id.is_some() {
-            metadata.push_str(" · branch");
+            metadata.push_str(" · ");
+            metadata.push_str(&crate::i18n::t(crate::i18n::Msg::SessionBranch));
         }
         if current_session
             .is_some_and(|(id, project_bucket)| s.id == id && s.project_bucket == project_bucket)
@@ -1815,6 +1816,7 @@ mod tests {
         }
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
+        session.name = "accounting-test".into();
         session.messages = vec![
             Message::user("q1"),
             Message::assistant("a1", vec![]),
@@ -1961,10 +1963,11 @@ mod tests {
         // Row 4 = root session
         // Row 5 = child branch session
         assert_eq!(payload.items[4].0, "feature-login");
-        assert!(!payload.items[4].1.contains("branch"));
+        let branch_label = crate::i18n::t(crate::i18n::Msg::SessionBranch);
+        assert!(!payload.items[4].1.contains(branch_label.as_ref()));
 
         assert_eq!(payload.items[5].0, "↳ feature-login-retry");
-        assert!(payload.items[5].1.contains("· branch"));
+        assert!(payload.items[5].1.contains(&format!("· {branch_label}")));
     }
 }
 #[tokio::test]

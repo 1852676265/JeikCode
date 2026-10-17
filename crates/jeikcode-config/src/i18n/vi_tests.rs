@@ -213,6 +213,7 @@ fn vietnamese_dictionary_preserves_interpolation_contract() {
         Msg::SessionPickerEmptyFilter,
         Msg::SessionPickerEmptyFilterQuery { query: "THAM_SO" },
         Msg::SessionRenameEditing { buffer: "THAM_SO" },
+        Msg::SessionBranch,
         Msg::DirPickerTitle { n: 37, total: 37 },
         Msg::DirPickerHint,
         Msg::DirPickerEmptyPath { query: "THAM_SO" },

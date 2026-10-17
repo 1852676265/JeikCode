@@ -362,6 +362,7 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Không xóa được phiên: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: xác nhận, Esc: hủy]").into(),
+        Msg::SessionBranch => "nhánh".into(),
 
         Msg::DirPickerTitle { n, total } =>
             format!("Đổi thư mục làm việc ({n}/{total})").into(),

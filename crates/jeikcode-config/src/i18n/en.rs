@@ -372,6 +372,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Failed to delete session: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
+        Msg::SessionBranch => "branch".into(),
 
         // ── Dir picker ──
         Msg::DirPickerTitle { n, total } =>

@@ -361,6 +361,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("删除会话失败：{error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
+        Msg::SessionBranch => "分支".into(),
 
         // ── 目录选择器 ──
         Msg::DirPickerTitle { n, total } =>
