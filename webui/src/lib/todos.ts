@@ -510,7 +510,7 @@ export interface StickyTodoMessage {
   role: string;
   parts?: Array<{
     kind: string;
-    tool?: { id?: string; name: string; args: string };
+    tool?: { id?: string; name: string; args: string; output?: string };
     items?: TodoItem[];
   }>;
 }
