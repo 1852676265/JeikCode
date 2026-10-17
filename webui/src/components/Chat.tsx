@@ -112,6 +112,7 @@ import {
   collectClipboardFiles,
   copyTextAndImages,
   copyTextToClipboard,
+  buildCopyHtml,
 } from '../lib/clipboard';
 import {
   applyAtMentionSelection,
@@ -7829,6 +7830,29 @@ export function Chat({
     if (pastedText) insertAtCursor(pastedText);
   }
 
+  // 输入框文字全选复制时，自动协同打包全部多媒体附件与文本，下次粘贴无缝还原多图+文本
+  function handleInputCopy(e: ClipboardEvent) {
+    const ta = textareaRef.current || (e.target as HTMLTextAreaElement);
+    if (!ta) return;
+    const start = ta.selectionStart ?? 0;
+    const end = ta.selectionEnd ?? 0;
+    const val = ta.value ?? '';
+    const isAllSelected = (val.length > 0 && start === 0 && end >= val.length) || (val.length === 0);
+
+    const attachedImages = pendingImageData(pendingAttach);
+    if (isAllSelected && attachedImages.length > 0) {
+      e.preventDefault();
+      const dataUrls = attachedImages.map((img) => `data:${img.media_type};base64,${img.data}`);
+      const html = buildCopyHtml(dataUrls, val);
+      if (e.clipboardData) {
+        e.clipboardData.setData('text/plain', val);
+        e.clipboardData.setData('text/html', html);
+      }
+      void copyTextAndImages(val, attachedImages);
+      showToast(t('copy.copiedWithMedia'), 'info');
+    }
+  }
+
   function handleDragOver(e: DragEvent) {
     if (![...Array.from(e.dataTransfer?.types ?? [])].includes('Files')) return;
     e.preventDefault();
@@ -8102,6 +8126,7 @@ export function Chat({
         onInput={handleInput}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
+        onCopy={handleInputCopy}
       />
 
       {/* 底部功能栏：左侧上传附件，右侧紧凑元数据 + 模式选择 + 发送控制 */}
@@ -10049,6 +10074,26 @@ function UserMessageView({
     });
   }
 
+  // 气泡内全选文本快捷键/右键复制时，连同多图附件一块打包入剪贴板
+  function handleBubbleCopy(e: ClipboardEvent) {
+    if (!msg.images || msg.images.length === 0) return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return;
+    const selText = sel.toString().trim();
+    const fullText = text.trim();
+    if (selText && (selText === fullText || selText.length >= fullText.length)) {
+      e.preventDefault();
+      const dataUrls = msg.images.map((img) => `data:${img.media_type};base64,${img.data}`);
+      const html = buildCopyHtml(dataUrls, text);
+      if (e.clipboardData) {
+        e.clipboardData.setData('text/plain', text);
+        e.clipboardData.setData('text/html', html);
+      }
+      void copyUserMessage(text, msg.images);
+      showToast(t('copy.copiedWithMedia'), 'info');
+    }
+  }
+
   const images = msg.images && msg.images.length > 0 && (
     <div class="msg-images">
       {msg.images.map((img, i) => (
@@ -10117,7 +10162,10 @@ function UserMessageView({
 
   return (
     <div class={wrapperClass} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={searchRef}>
-      <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
+      <div
+        class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}
+        onCopy={handleBubbleCopy}
+      >
         {images}
         {skillTitle && (
           <button class="skill-collapse" onClick={() => setExpanded(false)}>

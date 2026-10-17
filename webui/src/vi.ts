@@ -585,6 +585,7 @@ export const vi: Record<keyof typeof en, string> = {
   'copy.copied': 'Đã sao chép',
   'copy.copiedLast': 'Đã sao chép câu trả lời cuối',
   'copy.copiedAll': 'Đã sao chép tất cả',
+  'copy.copiedWithMedia': 'Đã sao chép tất cả văn bản và tệp đính kèm đa phương tiện',
   'copy.failed': 'Sao chép thất bại (trình duyệt hạn chế bộ nhớ tạm). Chọn văn bản thủ công hoặc dùng HTTPS / localhost.',
   // Message actions & Bubble edit
   'chat.editMessage': 'Chỉnh sửa tin nhắn',

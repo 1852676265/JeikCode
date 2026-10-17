@@ -643,6 +643,7 @@ const zh = {
   'copy.copied': '已复制',
   'copy.copiedLast': '已复制最后回答',
   'copy.copiedAll': '已复制全部正文',
+  'copy.copiedWithMedia': '已复制全部文字与多媒体附件',
   'copy.failed': '复制失败（浏览器权限受限）。请手动选择文本，或改用 HTTPS / localhost。',
 
   // Message actions & Bubble edit
@@ -1596,6 +1597,7 @@ export const en: Record<MsgKey, string> = {
   'copy.copied': 'Copied',
   'copy.copiedLast': 'Copied final response',
   'copy.copiedAll': 'Copied all',
+  'copy.copiedWithMedia': 'Copied all text and media attachments',
   'copy.failed': 'Copy failed (browser clipboard restricted). Select text manually, or use HTTPS / localhost.',
 
   // Message actions & Bubble edit

@@ -9,7 +9,8 @@ import {
   type PendingAttach,
   type PendingImage,
 } from '../lib/attachments';
-import { collectClipboardFiles } from '../lib/clipboard';
+import { collectClipboardFiles, buildCopyHtml, copyTextAndImages } from '../lib/clipboard';
+import { showToast } from './Toast';
 
 export interface InlineBubbleEditorProps {
   initialText: string;
@@ -175,14 +176,53 @@ export function InlineBubbleEditor({
   }
 
   function handlePaste(e: ClipboardEvent) {
-    if (!e.clipboardData) return;
-    const files = collectClipboardFiles(e.clipboardData);
+    const dt = e.clipboardData;
+    if (!dt) return;
+    const files = collectClipboardFiles(dt);
     if (files.length > 0) {
       const imageFiles = files.filter(isImageFile);
       if (imageFiles.length > 0) {
         e.preventDefault();
         void handleAddFiles(imageFiles);
+        const pastedText = dt.getData('text/plain');
+        if (pastedText) {
+          const ta = textareaRef.current;
+          if (ta) {
+            const start = ta.selectionStart ?? 0;
+            const end = ta.selectionEnd ?? 0;
+            const val = ta.value ?? '';
+            const next = val.slice(0, start) + pastedText + val.slice(end);
+            setText(next);
+            requestAnimationFrame(() => {
+              ta.selectionStart = ta.selectionEnd = start + pastedText.length;
+            });
+          } else {
+            setText((prev) => (prev ? `${prev}\n${pastedText}` : pastedText));
+          }
+        }
       }
+    }
+  }
+
+  function handleCopy(e: ClipboardEvent) {
+    const ta = textareaRef.current || (e.target as HTMLTextAreaElement);
+    if (!ta) return;
+    const start = ta.selectionStart ?? 0;
+    const end = ta.selectionEnd ?? 0;
+    const val = ta.value ?? '';
+    const isAllSelected = (val.length > 0 && start === 0 && end >= val.length) || (val.length === 0);
+
+    const attachedImages = pendingToImageData(pendingAttach);
+    if (isAllSelected && attachedImages.length > 0) {
+      e.preventDefault();
+      const dataUrls = attachedImages.map((img) => `data:${img.media_type};base64,${img.data}`);
+      const html = buildCopyHtml(dataUrls, val);
+      if (e.clipboardData) {
+        e.clipboardData.setData('text/plain', val);
+        e.clipboardData.setData('text/html', html);
+      }
+      void copyTextAndImages(val, attachedImages);
+      showToast(t('copy.copiedWithMedia'), 'info');
     }
   }
 
@@ -254,6 +294,7 @@ export function InlineBubbleEditor({
           value={text}
           onInput={(e) => setText((e.target as HTMLTextAreaElement).value)}
           onPaste={handlePaste}
+          onCopy={handleCopy}
           onKeyDown={(e) => {
             // Shift + Enter 为多行换行，不拦截；普通 Enter（桌面端非输入法中）与 Ctrl+Enter 均触发回溯并提交
             if (e.key === 'Enter' && !e.shiftKey) {
