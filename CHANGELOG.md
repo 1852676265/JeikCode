@@ -21,6 +21,54 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.5 (2026-10-17)
+
+- **[Git & Webhook] End-to-end review execution, remote connectivity testing, and project automation toggle**:
+  - Wired up the Git webhook auto-review engine to execute real review turns through the chat pipeline and stream markdown reports directly to PR comments.
+  - Added the `POST /api/git/test` remote verification endpoint, enabling one-click repository connectivity and permission verification within the Webhook dialog.
+  - Introduced a project-level Git automation toggle, automatically preserving the last-enabled state when removing projects and restoring it when re-added.
+  - Supported cross-project inheritance of configured webhook domains while preserving independent per-project editability.
+  - Expanded review prompt templates across Chinese, English, and Vietnamese with rigorous baseline alignment and existing solution verification rules.
+- **[WebUI & Interaction] Embedded commits panel, full relative diff paths, rich copying, and authoritative todo state**:
+  - Embedded the Git Commits panel into the Changes view with a resizable split layout for desktop and web environments.
+  - Standardized DiffViewer to display full project-relative file paths and streamlined file metadata headers.
+  - Enhanced file and link badges with hover float preview cards and integrated the code editor into the preview panel.
+  - Supported rich copying of formatted text and media attachments on full chat transcript selection.
+  - Bound live and restored todo state directly to authoritative backend tool output, eliminating duplicate replay stacking and stashed baseline pollution.
+  - Prevented automatic translation of developer-defined MCP server and skill metadata across internationalized interfaces.
+- **[Terminal & Daemon] Process lifecycle hardening, recursive filesystem location, and CLI security warnings**:
+  - Pre-populated persistent terminal buffers with active workspace greetings to eliminate black-screen startup hangs.
+  - Cascaded process tree termination via `taskkill` on Windows and `kill -9` on POSIX upon terminal closure to eliminate zombie process leaks.
+  - Introduced a real recursive directory walk for `fs locate`, replacing mock responses and significantly improving file search accuracy.
+  - Added critical security warnings in the CLI when starting unauthenticated network servers exposed to external interfaces.
+- **[Knowledge Base & i18n] Full English teaches knowledge base and catalog harmonization**:
+  - Provided a complete English Teaches knowledge base covering all nine core topics, with locale-aware guide loading in `jeikcode_config`.
+  - Harmonized Chinese, English, and Vietnamese i18n catalogs for terminal guidance, remote access copy, and webhook badges.
+
+---
+
+- **[Git 与 Webhook] 真实自动审查驱动串联、远端连通性测试与项目联动总开关**:
+  - 将 Git Webhook 自动审查引擎与对话管线深度串联，实时执行真实模型审查轮次并将 Markdown 报告直接回写至 PR 评论。
+  - 新增 `POST /api/git/test` 远端连通性核验端点，支持在 Webhook 配置对话框中一键测试目标仓库访问权限与网络可达性。
+  - 引入项目级 Git 自动化联动总开关，在侧边栏移除项目时自动记住勾选状态，重新添加时智能恢复。
+  - Webhook 访问域名支持跨项目全局继承并保持单项目独立可编辑性。
+  - 扩展中文、英文、越南文全语言审查提示词模板，内嵌严格的代码基线对齐与现有方案验证规范。
+- **[WebUI 前端与交互] 变更区内嵌提交面板、完整相对路径 Diff、富文本复制与权威 Todo 状态绑定**:
+  - 在变更视图（Changes View）中原生内嵌 Git 提交历史卡片（Commits Panel），支持桌面与网页端自由拖拽分栏比例。
+  - 规范化 Diff 差异对比器展示完整项目相对路径，剔除冗余路径标签与元数据干扰。
+  - 文件与链接标签全面支持悬停浮层预览，并在预览面板中内嵌代码编辑器。
+  - 对话流全文选中时支持格式化文本与多媒体附件的富文本复制（Rich Copying）。
+  - 将任务列表实时与恢复状态与后端权威工具输出直接绑定，根除重放叠加与状态残留漏洞。
+  - 杜绝多语言系统对开发者自定义 MCP 服务器与技能元数据的过度翻译。
+- **[终端与守护进程] 终端进程生命周期加固、递归文件定位端点与 CLI 网络安全告警**:
+  - WebUI 持久化终端在进程生成时预填工作区就绪问候，彻底根除启动黑屏卡死隐患。
+  - 在终端关闭时通过 Windows (`taskkill`) 与 POSIX (`kill -9`) 级联终止完整子进程树，杜绝僵尸进程残留泄漏。
+  - 引入真实的递归目录扫描端点 `fs locate`，替代模拟数据并显著提升模糊文件匹配与排序精度。
+  - CLI 针对未启用鉴权却绑定公网或局域网网卡的启动行为增加醒目的安全风险告警。
+- **[知识库与国际化] 全套英文 Teaches 知识库与全语言文案规范化**:
+  - 新增覆盖全部 9 大核心主题的完整英文 Teaches 知识库资产，并在配置指南中支持基于当前语言自适应加载。
+  - 规范并纯正化中文、英文、越南文语言字典，统一终端引导、远程访问与 Webhook 相关文案。
+
 ## v7.2.5-beta.4 (2026-10-17)
 
 - **[Git & Webhook] Modular Git adapter architecture, GitHub webhook receiver, and automated project binding**:
