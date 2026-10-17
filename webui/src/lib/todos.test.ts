@@ -6,6 +6,7 @@ import {
   foldTodoToolCall,
   isTodoTool,
   parseTodoPlan,
+  parseTodosFromOutput,
   reduceTodosFromCalls,
   restoreStickyTodos,
   stickyFromDiskCatchUp,
@@ -898,6 +899,56 @@ test('reduceTodosFromCalls ignores stashed fallback when calls define add action
   assert.equal(folded[3]?.content, 'Bug 4: 排查');
   assert.equal(folded[4]?.content, '系统测试');
 });
+
+test('parseTodosFromOutput extracts authoritative numbered list across various glyphs', () => {
+  const sample = `#4 -> completed
+#5 -> completed
+
+[ ] 1. 任务一：待办事项
+[~] 2. 任务二：正在进行
+[•] 3. 任务三：符号进行
+[√] 4. 任务四：打钩完成
+[x] 5. 任务五：字母完成
+[v] 6. 任务六：小写完成`;
+
+  const parsed = parseTodosFromOutput(sample);
+  assert.equal(parsed?.length, 6);
+  assert.equal(parsed?.[0]?.status, 'pending');
+  assert.equal(parsed?.[0]?.content, '任务一：待办事项');
+  assert.equal(parsed?.[1]?.status, 'in_progress');
+  assert.equal(parsed?.[2]?.status, 'in_progress');
+  assert.equal(parsed?.[3]?.status, 'completed');
+  assert.equal(parsed?.[4]?.status, 'completed');
+  assert.equal(parsed?.[5]?.status, 'completed');
+});
+
+test('restoreStickyTodos adopts authoritative list directly from latest tool output', () => {
+  const messages = [
+    {
+      role: 'assistant',
+      parts: [
+        {
+          kind: 'tool',
+          tool: {
+            id: 'call_1',
+            name: 'todo_write',
+            args: JSON.stringify({ actions: [{ action: 'add', content: '旧规划' }] }),
+            output: `[ ] 1. 真实后端清单 A
+[~] 2. 真实后端清单 B`,
+          },
+        },
+      ],
+    },
+  ];
+
+  const restored = restoreStickyTodos({ messages });
+  assert.equal(restored?.length, 2);
+  assert.equal(restored?.[0]?.content, '真实后端清单 A');
+  assert.equal(restored?.[0]?.status, 'pending');
+  assert.equal(restored?.[1]?.content, '真实后端清单 B');
+  assert.equal(restored?.[1]?.status, 'in_progress');
+});
+
 
 
 

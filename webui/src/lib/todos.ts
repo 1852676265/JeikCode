@@ -169,6 +169,32 @@ function resolveUpdateId(
   return id <= newLen ? id : null;
 }
 
+/**
+ * 从后端 todo_write 执行返回的文本中提取权威任务清单。
+ * 后端 TodoTool 执行完毕后始终会打印出权威的编号清单（`render_todos_numbered`）：
+ * 如 `[ ] 1. xxx`（pending）、`[~] 2. xxx`（in_progress）、`[√] 3. xxx`（completed）。
+ * 直接解析这一真源，能彻底杜绝前端因本地折叠逻辑与后端分歧导致的任何状态错位与数量偏差。
+ */
+export function parseTodosFromOutput(output?: string | null): TodoItem[] | null {
+  if (!output || typeof output !== 'string') return null;
+  const lines = output.split('\n');
+  const items: TodoItem[] = [];
+  const regex = /^\s*\[([ ~•√xXvV])\]\s*(\d+)\.\s*(.+)$/;
+  for (const line of lines) {
+    const match = line.match(regex);
+    if (match) {
+      const glyph = match[1];
+      const content = normalizeTodoContent(match[3]!);
+      if (!content) continue;
+      let status: TodoStatus = 'pending';
+      if (glyph === '~' || glyph === '•') status = 'in_progress';
+      else if (glyph === '√' || glyph === 'x' || glyph === 'X' || glyph === 'v' || glyph === 'V') status = 'completed';
+      items.push({ content, status });
+    }
+  }
+  return items.length > 0 ? items : null;
+}
+
 /** Full-list plan shape. Returns null when args are not a valid plan. */
 export function parseTodoPlan(args: string): TodoItem[] | null {
   let value: unknown;
@@ -540,6 +566,20 @@ export function restoreStickyTodos(input: {
     // 关键防线：当服务端权威清单已给出时（包含权威空数组 [] 即全部完成归档），
     // 坚决采纳服务端权威真源，严禁因为权威列表为空而绕过真源去回退 stashed 招魂复活！
     return unfinishedTodos(input.authoritativeTodos);
+  }
+  // 关键真源优先：优先从最近的已完成 todo 工具输出中提取后端权威编号清单（治本之策：消除本地折叠漂移）
+  for (let i = input.messages.length - 1; i >= 0; i--) {
+    const parts = input.messages[i]?.parts;
+    if (!parts) continue;
+    for (let j = parts.length - 1; j >= 0; j--) {
+      const p = parts[j];
+      if (p && p.kind === 'tool' && p.tool && isTodoTool(p.tool.name) && p.tool.output) {
+        const fromOutput = parseTodosFromOutput(p.tool.output);
+        if (fromOutput && fromOutput.length > 0) {
+          return unfinishedTodos(fromOutput);
+        }
+      }
+    }
   }
   const calls = collectTodoCalls(input.messages);
   if (calls.length > 0) {

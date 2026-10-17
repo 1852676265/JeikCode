@@ -156,6 +156,7 @@ import {
   isTodoTool,
   isTodoPlanCall,
   parseTodoPlan,
+  parseTodosFromOutput,
   todoCallIdsFromMessages,
   todoCounts,
   type TodoItem,
@@ -1868,6 +1869,20 @@ export function Chat({
       viewedProjectHashRef.current ||
       projectHashBySessionRef.current.get(loadId) ||
       '';
+
+    // 活跃会话切回对账：异步向后端校验一次权威待办清单，一旦发现本地活跃缓存与后端不一致，
+    // 立即以服务端真源（Rust TodoTool）就地自愈对齐，彻底清除未刷新的脏内存缓存。
+    if (effectiveProjectHash) {
+      getSession(effectiveProjectHash, loadId, { tail: HISTORY_PAGE }).then((detail) => {
+        if (
+          activeIdRef.current === loadId &&
+          sessionGenerationRef.current === loadGeneration &&
+          Array.isArray(detail?.todos)
+        ) {
+          applySessionStickyTodos(loadId, detail.todos);
+        }
+      }).catch(() => {});
+    }
     // 本端是否已收到终态；决定流正常关闭后要不要补一次磁盘对账。
     let terminalSeen = false;
 
@@ -3759,6 +3774,13 @@ export function Chat({
           (msg.content && msg.content.length > 0 ? msg.content : null) ??
           result.summary ??
           '';
+        // 关键对齐：如果这是 todo 工具的返回，直接提取其权威清单，对齐本轮对话的 sessionTodoList！
+        const authoritative = parseTodosFromOutput(output);
+        if (authoritative && authoritative.length > 0) {
+          sessionTodoList = authoritative;
+          turnHadTodoCalls = true;
+          turnSawFullPlan = true;
+        }
         outer: for (let i = loaded.length - 1; i >= 0; i--) {
           const m = loaded[i];
           if (m.role !== 'assistant') continue;
@@ -3961,6 +3983,26 @@ export function Chat({
       const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
       if (data?.filePath) {
         window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', { detail: data }));
+      }
+    } catch {}
+  };
+
+  // 中间主区域拖拽文件支持（彻底杜绝桌面端与浏览器拖动时鼠标出现禁止/被Ban警告）
+  const handleMainStageDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  };
+  const handleMainStageDrop = (e: DragEvent) => {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    try {
+      const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+      const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+      const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+      if (targetPath && typeof targetPath === 'string' && targetPath.trim()) {
+        window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: targetPath.trim() } }));
       }
     } catch {}
   };
@@ -5273,42 +5315,35 @@ export function Chat({
       })));
       return;
     }
-    if (event.type === 'tool_start' || event.type === 'tool_result') {
-      if (isTodoTool(event.name)) {
-        const rawArgs = event.type === 'tool_start' ? event.arguments : undefined;
-        let argsStr = formatArgs(rawArgs);
-        if (event.type === 'tool_result' && !argsStr && event.id) {
-          // tool_result 的 event.output 是工具执行结果的文本摘要（含 [x] 列表或 status 汇报），
-          // 绝不是工具的 JSON 入参！若入参为空，从已有消息树中提取该工具原先记录的 args！
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            const m = msgs[i];
-            if (m.role === 'assistant' && m.parts) {
-              const tp = m.parts.find((p) => p.kind === 'tool' && 'tool' in p && p.tool?.id === event.id);
-              if (tp && 'tool' in tp && tp.tool?.args) {
-                argsStr = tp.tool.args;
-                break;
-              }
-            }
-          }
+    if (event.type === 'tool_result' && isTodoTool(event.name)) {
+      // 真正的治本真源：后台流优先直接采纳后端 TodoTool 执行的权威产物（render_todos_numbered），彻底消除本地模拟折叠导致的状态漂移！
+      const fromOutput = parseTodosFromOutput(event.output);
+      if (fromOutput && fromOutput.length > 0) {
+        if (fromOutput.every((t) => t.status === 'completed')) {
+          activeTodosBySessionRef.current.delete(targetSid);
+        } else {
+          activeTodosBySessionRef.current.set(targetSid, fromOutput);
         }
-        if (argsStr) {
-          const appliedIds = appliedTodoIdsFor(targetSid);
-          const curTodos = activeTodosBySessionRef.current.get(targetSid) ?? null;
-          const nextTodos = foldLiveTodo({
-            state: curTodos,
-            remembered: curTodos,
-            name: event.name,
-            args: argsStr,
-            callId: event.id,
-            appliedIds,
-          });
-          // 后台会话的折叠同样要落盘幂等键（跨会话重放也不能把清单打回旧状态）。
-          persistAppliedTodoIds();
-          if (nextTodos && nextTodos.length > 0 && nextTodos.some((t) => t.status !== 'completed')) {
-            activeTodosBySessionRef.current.set(targetSid, nextTodos);
-          } else {
-            activeTodosBySessionRef.current.delete(targetSid);
-          }
+      }
+    } else if (event.type === 'tool_start' && isTodoTool(event.name)) {
+      const argsStr = formatArgs(event.arguments);
+      if (argsStr) {
+        const appliedIds = appliedTodoIdsFor(targetSid);
+        const curTodos = activeTodosBySessionRef.current.get(targetSid) ?? null;
+        const nextTodos = foldLiveTodo({
+          state: curTodos,
+          remembered: curTodos,
+          name: event.name,
+          args: argsStr,
+          callId: event.id,
+          appliedIds,
+        });
+        // 后台会话的折叠同样要落盘幂等键（跨会话重放也不能把清单打回旧状态）。
+        persistAppliedTodoIds();
+        if (nextTodos && nextTodos.length > 0 && nextTodos.some((t) => t.status !== 'completed')) {
+          activeTodosBySessionRef.current.set(targetSid, nextTodos);
+        } else {
+          activeTodosBySessionRef.current.delete(targetSid);
         }
       }
     }
@@ -5786,42 +5821,49 @@ export function Chat({
           progress: undefined,
         });
         if (isTodoTool(event.name)) {
-          // 确保 tool_result 到达后，最新的待办列表得到立即校准，不留任何延迟缝隙
-          let foundToolPart: ToolRow | undefined;
-          for (let i = messagesRef.current.length - 1; i >= 0; i--) {
-            const m = messagesRef.current[i];
-            if (m.role === 'assistant' && m.parts) {
-              const tp = m.parts.find((p) => p.kind === 'tool' && 'tool' in p && p.tool?.id === event.id);
-              if (tp && 'tool' in tp && tp.tool) {
-                foundToolPart = tp.tool;
-                break;
-              }
-            }
-          }
-          if (foundToolPart?.args) {
-            const toolArgs = foundToolPart.args;
-            const appliedIds = appliedTodoIdsFor(activeIdRef.current);
-            setActiveTodos((cur) => {
-              const next = foldLiveTodo({
-                state: cur,
-                remembered: activeTodosRef.current,
-                name: event.name,
-                args: toolArgs,
-                callId: event.id,
-                appliedIds,
-              });
-              // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
-              persistAppliedTodoIds();
-              if (activeIdRef.current) {
-                if (next && next.length > 0 && next.some((t) => t.status !== 'completed')) {
-                  activeTodosBySessionRef.current.set(activeIdRef.current, next);
-                } else {
-                  activeTodosBySessionRef.current.delete(activeIdRef.current);
+          // 真正的治本真源：后端 TodoTool 执行完毕后始终会返回权威的编号清单（[ ] 1. / [~] 2. / [√] 3.），
+          // 优先直接采纳后端的执行真实产物，彻底消除前端本地模拟折叠导致的状态漂移！
+          const authoritativeFromOutput = parseTodosFromOutput(event.output);
+          if (authoritativeFromOutput && authoritativeFromOutput.length > 0) {
+            applySessionStickyTodos(activeIdRef.current, authoritativeFromOutput);
+          } else {
+            // 兜底回退：若输出中没有标准清单格式，再使用本地折叠
+            let foundToolPart: ToolRow | undefined;
+            for (let i = messagesRef.current.length - 1; i >= 0; i--) {
+              const m = messagesRef.current[i];
+              if (m.role === 'assistant' && m.parts) {
+                const tp = m.parts.find((p) => p.kind === 'tool' && 'tool' in p && p.tool?.id === event.id);
+                if (tp && 'tool' in tp && tp.tool) {
+                  foundToolPart = tp.tool;
+                  break;
                 }
               }
-              activeTodosRef.current = next;
-              return next;
-            });
+            }
+            if (foundToolPart?.args) {
+              const toolArgs = foundToolPart.args;
+              const appliedIds = appliedTodoIdsFor(activeIdRef.current);
+              setActiveTodos((cur) => {
+                const next = foldLiveTodo({
+                  state: cur,
+                  remembered: activeTodosRef.current,
+                  name: event.name,
+                  args: toolArgs,
+                  callId: event.id,
+                  appliedIds,
+                });
+                // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
+                persistAppliedTodoIds();
+                if (activeIdRef.current) {
+                  if (next && next.length > 0 && next.some((t) => t.status !== 'completed')) {
+                    activeTodosBySessionRef.current.set(activeIdRef.current, next);
+                  } else {
+                    activeTodosBySessionRef.current.delete(activeIdRef.current);
+                  }
+                }
+                activeTodosRef.current = next;
+                return next;
+              });
+            }
           }
         }
         // 改文件或跑 shell（含 git add / commit）结束后立刻刷新 Git 面板与资源管理器，
@@ -8355,6 +8397,8 @@ export function Chat({
           ref={stageRef}
           class={'chat-stage' + (isRightPanelVisible ? ' has-right-panel' : '')}
           style={isRightPanelVisible ? ({ '--right-panel-width': `${rightPanelWidth}px` } as any) : undefined}
+          onDragOver={handleMainStageDragOver as any}
+          onDrop={handleMainStageDrop as any}
         >
           <div class="chat-main-column">
             <div class="chat-landing">
@@ -8676,6 +8720,8 @@ export function Chat({
         ref={stageRef}
         class={'chat-stage' + (isRightPanelVisible ? ' has-right-panel' : '') + (activeMainTabId !== 'chat' ? ' is-editor-mode' : '')}
         style={isRightPanelVisible ? ({ '--right-panel-width': `${rightPanelWidth}px` } as any) : undefined}
+        onDragOver={handleMainStageDragOver as any}
+        onDrop={handleMainStageDrop as any}
       >
       {/* Main chat / editor stage column */}
       <div class="chat-main-column">
