@@ -21,6 +21,36 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.6 (2026-10-18)
+
+- **[Git & Webhook] Webhook host resilience, connectivity feedback, and browser-friendly status page**:
+  - Removed trailing-slash stripping while typing in the webhook host field, restoring the ability to manually type colons and slashes; full-width Chinese punctuation is now normalized to standard half-width characters automatically.
+  - Added field-alias compatibility (camelCase and snake_case) across Git adapter configuration models, fixing connectivity tests that reported a missing repository identifier.
+  - Distinguished connectivity feedback with green success and red failure states in the Webhook dialog footer.
+  - Served a friendly HTTP 200 status page when the webhook endpoint is opened directly in a browser, replacing the bare 405 response.
+  - Preserved user-configured domains (including loopback and LAN hosts) instead of discarding them during configuration loading.
+- **[Terminal & Session] Terminal session extraction, stop-alias hardening, and unpersisted tail recovery**:
+  - Extracted terminal session management into a dedicated daemon module with cascaded process-tree cleanup.
+  - Hardened "stop current turn" handling to deliver both request and session aliases, eliminating `session_busy` collisions when immediately sending the next message.
+  - Restored canvas-side user turns that were issued before disk persistence, preventing reconciliation from dropping just-sent messages.
+- **[WebUI & Preview] Terminal command exclusion in file path preview detection**:
+  - Excluded shell command fragments from markdown file-path detection so terminal-style snippets are no longer mistaken for clickable file previews.
+
+---
+
+- **[Git 与 Webhook] 回调主机地址容错、连通反馈与浏览器友好状态页**:
+  - 解除 Webhook 主机地址输入框对冒号与斜杠的实时截断限制，恢复手动输入 `http(s)://` 的能力，并自动将中文全角标点规范化半角。
+  - 为 Git 适配器配置模型补齐驼峰与下划线双向字段别名，修复连通性测试误报 "Missing repository identifier" 的问题。
+  - Webhook 弹窗底部反馈区分成功绿色与失败红色状态提示。
+  - 浏览器直接打开 Webhook 端点时返回友好的 HTTP 200 状态页面，替代生硬的 405 响应。
+  - 载入配置时完整保留用户已配置的访问域名（含本机与局域网地址），不再被自动清空。
+- **[终端与会话] 终端会话模块化抽取、停止别名加固与未落盘尾巴恢复**:
+  - 将终端会话管理抽取为独立的守护进程模块，并支持级联终止完整进程树。
+  - 加固「停止当前回合」投递逻辑，同时投递请求别名与会话别名，根除「立即发送」撞上 `session_busy` 的问题。
+  - 磁盘对账时恢复画布上尚未落盘的最新用户回合，避免刚发送的消息被抹除。
+- **[WebUI 与预览] 文件路径预览检测排除终端命令片段**:
+  - Markdown 文件路径识别排除 Shell 命令片段，终端风格内容不再被误判为可点击的文件预览。
+
 ## v7.2.5-beta.5 (2026-10-17)
 
 - **[Git & Webhook] End-to-end review execution, remote connectivity testing, and project automation toggle**:
