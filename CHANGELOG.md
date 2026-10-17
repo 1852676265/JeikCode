@@ -21,6 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.4 (2026-10-17)
+
+- **[Git & Webhook] Modular Git adapter architecture, GitHub webhook receiver, and automated project binding**:
+  - Introduced a modular Git adapter infrastructure supporting multiple repository hosting platforms (built-in GitHub adapter with HMAC-SHA256 signature verification).
+  - Added project-level webhook dispatch endpoints (`POST /api/webhooks/git` and `/api/webhooks/github`) supporting automated push and pull request event normalization and review turn dispatches.
+  - Provided project repository binding endpoints (`GET /api/git/binding` and `POST /api/git/binding`) for configuring repository URLs, secret tokens, and automated trigger behaviors.
+- **[WebUI] Full-featured Git Webhook configuration dialog and session cache enhancements**:
+  - Added a dedicated Git Webhook Dialog in the WebUI with complete multi-language localization (English, Chinese, Vietnamese), allowing users to easily configure and inspect repository webhooks.
+  - Enhanced cross-tab session state caching and multi-client broadcast consistency in `sessionCache.ts`.
+  - Optimized update notification dialog flows and responsive terminal layouts across window resizes.
+
+---
+
+- **[Git 与 Webhook] 模块化 Git 平台适配器架构、GitHub Webhook 接收端点与项目绑定**:
+  - 引入模块化 Git 适配器基础设施，支持主流代码托管平台接入（内置基于 HMAC-SHA256 签名验证的 GitHub 适配器）。
+  - 新增项目级 Webhook 分发端点（`POST /api/webhooks/git` 与 `/api/webhooks/github`），支持 Push 与 Pull Request 事件标准化解析与自动化代码审查任务调度。
+  - 提供项目仓库绑定接口（`GET /api/git/binding` 与 `POST /api/git/binding`），支持配置仓库链接、密钥与自动化触发策略。
+- **[WebUI 前端] 全功能 Git Webhook 配置对话框与会话缓存增强**:
+  - 在 WebUI 中引入专属的 Git Webhook 配置对话框，提供完整的英文、中文、越南文多语言支持，方便用户可视化管理与调试 Webhook 绑定。
+  - 深度优化 `sessionCache.ts` 跨标签页会话状态缓存与多客户端广播一致性。
+  - 优化版本更新弹窗交互流以及不同窗口尺寸下的终端自适应响应式布局。
+
 ## v7.2.5-beta.3 (2026-10-17)
 
 - **[WebUI] Full-featured persistent terminal, file explorer, preview panel, and editor enhancements**:
