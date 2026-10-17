@@ -63,6 +63,8 @@
   - 在接收到 `steer` 指令时重置当前轮次计数与轮次上限，确保转向后的任务拥有全新的回合预算，杜绝因前期轮次耗尽而被异常截断。
   - 优化跨平台子进程调度：Windows 平台配置 `BELOW_NORMAL_PRIORITY_CLASS` 作业对象，POSIX 平台施加 `nice` 与 I/O 调度节流，防止繁重编译或脚本执行耗尽系统资源导致界面和网络假死。
 
+## v7.2.5-beta.2 (2026-10-16)
+
 - **[Subagents] Compact worker action receipt ledger and tamper-proof execution evidence**:
   - Worker subagents now prepend an authoritative, compact action receipt (`[Worker touched: ..., ran: ...]`) to task blocks, providing tamper-proof physical execution evidence and preventing hallucinations without context bloat (~15-25 tokens).
   - Touched files and commands are deduplicated, normalized, and overflow-folded (capped at 6 files and 5 commands). Early stops (such as reaching max turn rounds) preserve touched file evidence. Read-only explore subtasks remain clean.
