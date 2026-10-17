@@ -231,7 +231,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       {
         id,
         name: `${DEFAULT_SHELL} 1`,
-        cwd: cwd || 'E:/code/jeikcode',
+        cwd: cwd || '.',
         shell: DEFAULT_SHELL,
         timestamp: 0,
       },
@@ -577,7 +577,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
           setTimeout(() => {
             if (!receivedAnyData && (!record.ws || record.ws.readyState !== WebSocket.OPEN)) {
               const promptChar = tabShell.includes('powershell') ? 'PS ' : tabShell.includes('cmd') ? '' : '$ ';
-              const cwdDisplay = (cwd || 'E:/code/jeikcode').replace(/\\/g, '/');
+              const cwdDisplay = (cwd || '.').replace(/\\/g, '/');
               record.term.write(`\r\n\x1b[32m[JeikCode Terminal - ${tabShell}]\x1b[0m\r\n${promptChar}${cwdDisplay}> `);
             }
           }, 800);
@@ -867,7 +867,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
           const newTab: TerminalTab = {
             id: newId,
             name: `${preferredShell} 1`,
-            cwd: cwd || 'E:/code/jeikcode',
+            cwd: cwd || '.',
             shell: preferredShell,
             timestamp: Date.now(),
           };
@@ -951,7 +951,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         const fallbackTab: TerminalTab = {
           id: mockId,
           name: `${shellName} ${tabs.length + 1}`,
-          cwd: cwd || 'E:/code/jeikcode',
+          cwd: cwd || '.',
           shell: shellName,
           timestamp: Date.now(),
         };
@@ -1069,7 +1069,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     const newTab: TerminalTab = {
       id: newId,
       name: `${preferredShell} 1`,
-      cwd: cwd || 'E:/code/jeikcode',
+      cwd: cwd || '.',
       shell: preferredShell,
       timestamp: Date.now(),
     };
