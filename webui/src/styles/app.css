@@ -13371,6 +13371,7 @@ body {
   position: relative;
 }
 .editor-line-numbers {
+  position: relative;
   width: 48px;
   padding: 8px 6px 8px 0;
   text-align: right;
@@ -13382,6 +13383,37 @@ body {
   line-height: var(--app-editor-line-height, 20px);
   overflow: hidden;
   flex-shrink: 0;
+}
+
+.editor-target-gutter-band {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: rgba(59, 130, 246, 0.28);
+  border-right: 2px solid #3b82f6;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.editor-target-lines-band {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: rgba(59, 130, 246, 0.14);
+  border-left: 3px solid #3b82f6;
+  pointer-events: none;
+  z-index: 0;
+  box-shadow: 0 0 16px rgba(59, 130, 246, 0.08);
+}
+
+:root[data-theme='light'] .editor-target-gutter-band {
+  background: rgba(37, 99, 235, 0.18);
+  border-right: 2px solid #2563eb;
+}
+
+:root[data-theme='light'] .editor-target-lines-band {
+  background: rgba(37, 99, 235, 0.08);
+  border-left: 3px solid #2563eb;
 }
 .line-num {
   height: var(--app-editor-line-height, 20px);
@@ -14806,77 +14838,180 @@ body {
   gap: 4px;
 }
 
-/* 总启用开关卡片横幅 */
-.git-enable-switch-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
-  background: var(--app-card-background, rgba(255, 255, 255, 0.03));
-  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
-  border-radius: 8px;
-  gap: 12px;
-  transition: all 0.15s ease;
+/* 现代工业设计风格的总启用横幅（高质感红绿双态氛围） */
+.git-enable-hero-banner {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  min-height: 58px !important;
+  padding: 12px 18px !important;
+  border-radius: 10px !important;
+  gap: 16px !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  box-sizing: border-box !important;
+  position: relative !important;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1) !important;
 }
 
-.git-enable-switch-banner:hover {
-  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.05));
-  border-color: rgba(255, 255, 255, 0.15);
+/* 处于 Disabled 关闭状态：深邃内敛的暗红氛围，微光发散，质感高级 */
+.git-enable-hero-banner.is-disabled {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.08) 0%, rgba(24, 24, 27, 0.95) 75%) !important;
+  border: 1px solid rgba(239, 68, 68, 0.38) !important;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35), 0 0 16px rgba(239, 68, 68, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
 }
 
-.git-enable-switch-label {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  cursor: pointer;
-  flex: 1;
+.git-enable-hero-banner.is-disabled:hover {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.12) 0%, rgba(24, 24, 27, 0.95) 75%) !important;
+  border-color: rgba(239, 68, 68, 0.58) !important;
+  box-shadow: 0 4px 22px rgba(239, 68, 68, 0.16) !important;
 }
 
-.git-enable-switch-label input[type='checkbox'] {
-  margin-top: 3px;
-  accent-color: #10b981;
-  width: 16px;
-  height: 16px;
-  cursor: pointer;
+/* 处于 Enabled 开启状态：充满活力的科技绿氛围，华丽通电微光 */
+.git-enable-hero-banner.is-enabled {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.12) 0%, rgba(24, 24, 27, 0.95) 75%) !important;
+  border: 1px solid rgba(16, 185, 129, 0.48) !important;
+  box-shadow: 0 2px 18px rgba(16, 185, 129, 0.15), 0 0 20px rgba(16, 185, 129, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.07) !important;
 }
 
-.git-enable-switch-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+.git-enable-hero-banner.is-enabled:hover {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.16) 0%, rgba(24, 24, 27, 0.95) 75%) !important;
+  border-color: rgba(16, 185, 129, 0.75) !important;
+  box-shadow: 0 4px 26px rgba(16, 185, 129, 0.25) !important;
 }
 
-.git-enable-switch-text strong {
-  font-size: 13px;
-  color: var(--app-primary-foreground, #f4f4f5);
-  font-weight: 600;
+.git-enable-hero-left {
+  display: flex !important;
+  align-items: center !important;
+  gap: 14px !important;
+  flex: 1 !important;
+  min-width: 0 !important;
 }
 
-.git-enable-switch-text span {
-  font-size: 11px;
-  color: var(--app-secondary-foreground, #a1a1aa);
-  line-height: 1.4;
+/* 现代 Figma 风格滑动切换开关 (Toggle Core) */
+.git-enable-toggle-core {
+  width: 44px !important;
+  height: 24px !important;
+  border-radius: 24px !important;
+  background: rgba(239, 68, 68, 0.25) !important;
+  border: 1px solid rgba(239, 68, 68, 0.45) !important;
+  position: relative !important;
+  flex-shrink: 0 !important;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  box-sizing: border-box !important;
 }
 
-.git-enable-status-badge {
-  font-size: 11px;
-  padding: 3px 8px;
-  border-radius: 6px;
-  font-weight: 600;
-  white-space: nowrap;
-  flex-shrink: 0;
+.git-enable-toggle-core.active {
+  background: #10b981 !important;
+  border-color: #059669 !important;
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.5) !important;
 }
 
-.git-enable-status-badge.active {
-  background: color-mix(in srgb, #10b981 18%, transparent);
-  color: #34d399;
-  border: 1px solid color-mix(in srgb, #10b981 30%, transparent);
+.git-enable-toggle-thumb {
+  position: absolute !important;
+  top: 2px !important;
+  left: 2px !important;
+  width: 18px !important;
+  height: 18px !important;
+  border-radius: 50% !important;
+  background: #ffffff !important;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.4) !important;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1) !important;
 }
 
-.git-enable-status-badge.inactive {
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--app-secondary-foreground, #71717a);
-  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+.git-enable-toggle-core.active .git-enable-toggle-thumb {
+  transform: translateX(20px) !important;
+}
+
+.git-enable-hero-text {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 4px !important;
+  min-width: 0 !important;
+  justify-content: center !important;
+}
+
+.git-enable-hero-title {
+  margin: 0 !important;
+  padding: 0 !important;
+  line-height: 1.4 !important;
+}
+
+.git-enable-hero-title strong {
+  display: block !important;
+  font-size: 13.5px !important;
+  color: var(--app-primary-foreground, #f4f4f5) !important;
+  font-weight: 600 !important;
+  line-height: 1.4 !important;
+}
+
+.git-enable-hero-desc {
+  display: block !important;
+  font-size: 11.5px !important;
+  color: var(--app-secondary-foreground, #a1a1aa) !important;
+  line-height: 1.45 !important;
+}
+
+/* 状态芯片：严格水平单行，图标在左、文字在右，绝对不折行 */
+.git-enable-status-chip {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 8px !important;
+  height: 28px !important;
+  padding: 0 14px !important;
+  border-radius: 20px !important;
+  font-size: 11.5px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.04em !important;
+  text-transform: uppercase !important;
+  white-space: nowrap !important;
+  flex-shrink: 0 !important;
+  user-select: none !important;
+  box-sizing: border-box !important;
+  transition: all 0.2s ease !important;
+}
+
+/* 红色发光氛围感 (未开启) */
+.git-enable-status-chip.disabled {
+  background: rgba(239, 68, 68, 0.16) !important;
+  color: #f87171 !important;
+  border: 1px solid rgba(239, 68, 68, 0.48) !important;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.28), inset 0 0 8px rgba(239, 68, 68, 0.12) !important;
+}
+
+.git-enable-status-chip.disabled .git-status-dot {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 50% !important;
+  background: #ef4444 !important;
+  box-shadow: 0 0 8px #ef4444 !important;
+  flex-shrink: 0 !important;
+}
+
+/* 绿色通电微光氛围感 (已开启) */
+.git-enable-status-chip.active {
+  background: rgba(16, 185, 129, 0.18) !important;
+  color: #34d399 !important;
+  border: 1px solid rgba(16, 185, 129, 0.5) !important;
+  box-shadow: 0 0 16px rgba(16, 185, 129, 0.38), inset 0 0 8px rgba(16, 185, 129, 0.15) !important;
+}
+
+.git-enable-status-chip.active .git-status-dot {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 50% !important;
+  background: #10b981 !important;
+  box-shadow: 0 0 10px #10b981 !important;
+  animation: pulseGreen 2s infinite ease-in-out !important;
+  flex-shrink: 0 !important;
+}
+
+@keyframes pulseGreen {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.85); }
 }
 
 .git-banner-row {
@@ -14972,6 +15107,33 @@ body {
   background: rgba(255, 255, 255, 0.1);
   color: var(--app-secondary-foreground, #a1a1aa);
   margin-left: auto;
+}
+
+/* 渠道生产状态徽章 (GitHub 专属绿色 Active，其他渠道黄色 Beta) */
+.git-channel-status-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 1.3;
+  margin-left: auto;
+  text-transform: uppercase;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
+.git-channel-status-badge.active {
+  background: color-mix(in srgb, #10b981 18%, transparent);
+  color: #34d399;
+  border: 1px solid color-mix(in srgb, #10b981 35%, transparent);
+}
+
+.git-channel-status-badge.beta {
+  background: color-mix(in srgb, #eab308 18%, transparent);
+  color: #facc15;
+  border: 1px solid color-mix(in srgb, #eab308 35%, transparent);
 }
 
 .git-channel-sub {
@@ -15336,8 +15498,20 @@ body {
 }
 
 .git-adapter-select .custom-select-option {
-  padding: 10px 14px;
+  position: relative !important;
+  padding: 10px 36px 10px 14px !important;
   border-bottom: 1px solid var(--app-border, rgba(255, 255, 255, 0.05));
+  display: flex !important;
+  align-items: flex-start !important;
+}
+
+.git-adapter-select .custom-select-check {
+  position: absolute !important;
+  right: 12px !important;
+  top: 14px !important;
+  margin: 0 !important;
+  flex-shrink: 0 !important;
+  color: #38bdf8 !important;
 }
 
 .git-adapter-select .custom-select-option:last-child {
@@ -15356,25 +15530,31 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
 }
 
 .git-select-rich-title {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
   color: var(--app-primary-foreground, #f4f4f5);
 }
 
 .git-select-rich-desc {
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--app-secondary-foreground, #a1a1aa);
-  line-height: 1.4;
+  line-height: 1.45;
 }
 
 .git-select-rich-sample {
-  font-family: var(--app-monospace-font-family, monospace);
-  font-size: 10.5px;
-  color: #60a5fa;
-  opacity: 0.85;
+  font-family: var(--app-monospace-font-family, monospace) !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: #38bdf8 !important;
+  opacity: 1 !important;
+  line-height: 1.5 !important;
+  letter-spacing: 0.01em !important;
+  margin-top: 3px !important;
+  word-break: break-all;
 }
 
 /* 审查专用模型选择器与唤醒关键词单行精致排布 (模型 ➔ 思考强度 ➔ 唤醒词胶囊) */

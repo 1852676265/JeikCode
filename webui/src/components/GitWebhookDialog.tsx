@@ -16,7 +16,8 @@ export interface GitChannelMeta {
   id: GitPlatformChannel;
   nameKey: string;
   descKey: string;
-  badge?: string;
+  statusType: 'active' | 'beta';
+  statusBadgeKey: string;
   defaultApiBase?: string;
   supportsSelfHosted: boolean;
   tokenNameKey: string;
@@ -32,6 +33,8 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     id: 'github',
     nameKey: 'gitWebhook.chGithub',
     descKey: 'gitWebhook.chGithubDesc',
+    statusType: 'active',
+    statusBadgeKey: 'gitWebhook.badgeActive',
     supportsSelfHosted: false,
     tokenNameKey: 'gitWebhook.tokenGithub',
     tokenPlaceholder: 'ghp_xxxxxxxxxxxxxxxxxxxx',
@@ -44,7 +47,8 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     id: 'gitlab',
     nameKey: 'gitWebhook.chGitlab',
     descKey: 'gitWebhook.chGitlabDesc',
-    badge: 'Self-hosted & Cloud',
+    statusType: 'beta',
+    statusBadgeKey: 'gitWebhook.badgeBeta',
     supportsSelfHosted: true,
     defaultApiBase: 'https://gitlab.com/api/v4',
     tokenNameKey: 'gitWebhook.tokenGitlab',
@@ -58,6 +62,8 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     id: 'gitee',
     nameKey: 'gitWebhook.chGitee',
     descKey: 'gitWebhook.chGiteeDesc',
+    statusType: 'beta',
+    statusBadgeKey: 'gitWebhook.badgeBeta',
     supportsSelfHosted: false,
     tokenNameKey: 'gitWebhook.tokenGitee',
     tokenPlaceholder: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
@@ -70,7 +76,8 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     id: 'gitea',
     nameKey: 'gitWebhook.chGitea',
     descKey: 'gitWebhook.chGiteaDesc',
-    badge: 'Self-hosted',
+    statusType: 'beta',
+    statusBadgeKey: 'gitWebhook.badgeBeta',
     supportsSelfHosted: true,
     defaultApiBase: 'https://gitea.example.com/api/v1',
     tokenNameKey: 'gitWebhook.tokenGitea',
@@ -84,7 +91,8 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     id: 'custom_git',
     nameKey: 'gitWebhook.chCustom',
     descKey: 'gitWebhook.chCustomDesc',
-    badge: 'Generic / CLI',
+    statusType: 'beta',
+    statusBadgeKey: 'gitWebhook.badgeBeta',
     supportsSelfHosted: true,
     tokenNameKey: 'gitWebhook.tokenCustom',
     tokenPlaceholder: 'Token / Password / Key',
@@ -410,20 +418,20 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     }
   };
 
-  // 下拉框 1：托管平台渠道选项（展示加粗名称、徽章、协议说明和格式示例）
+  // 下拉框 1：托管平台渠道选项（展示加粗名称、Active/Beta 状态徽章、协议说明和格式示例）
   const channelOptions: SelectOption<GitPlatformChannel>[] = GIT_CHANNELS.map((ch) => ({
     value: ch.id,
     selectedLabel: (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%' }}>
         <strong style={{ color: 'var(--app-primary-foreground)' }}>{t(ch.nameKey as any) || ch.id}</strong>
-        {ch.badge && <span class="git-channel-badge">{ch.badge}</span>}
+        <span class={`git-channel-status-badge ${ch.statusType}`}>{t(ch.statusBadgeKey as any)}</span>
       </div>
     ),
     label: (
       <div class="git-select-rich-option">
         <div class="git-select-rich-top">
           <span class="git-select-rich-title">{t(ch.nameKey as any) || ch.id}</span>
-          {ch.badge && <span class="git-channel-badge">{ch.badge}</span>}
+          <span class={`git-channel-status-badge ${ch.statusType}`}>{t(ch.statusBadgeKey as any)}</span>
         </div>
         <span class="git-select-rich-desc">{t(ch.descKey as any)}</span>
         <span class="git-select-rich-sample">{t(ch.repoSampleKey as any)}</span>
@@ -507,29 +515,36 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
             </div>
           </div>
 
-          {/* 总启用开关：默认关闭，开启持久化记住，项目移除自动停用，重新添加自动恢复 */}
-          <div class="git-enable-switch-banner">
-            <label class="git-enable-switch-label">
-              <input
-                type="checkbox"
-                checked={config.enabled}
-                onChange={(e) => {
-                  const checked = (e.target as HTMLInputElement).checked;
-                  setConfig({
-                    ...config,
-                    enabled: checked,
-                    lastEnabledState: checked,
-                  });
-                }}
-              />
-              <div class="git-enable-switch-text">
-                <strong>{t('gitWebhook.enableSwitchLabel')}</strong>
-                <span>{t('gitWebhook.enableSwitchHint')}</span>
+          {/* 总启用开关横幅：现代工业美学设计（关闭红色氛围，开启绿色氛围） */}
+          <div
+            class={`git-enable-hero-banner ${config.enabled ? 'is-enabled' : 'is-disabled'}`}
+            onClick={() => {
+              const next = !config.enabled;
+              setConfig({
+                ...config,
+                enabled: next,
+                lastEnabledState: next,
+              });
+            }}
+          >
+            <div class="git-enable-hero-left">
+              <div class={`git-enable-toggle-core ${config.enabled ? 'active' : ''}`} aria-hidden="true">
+                <span class="git-enable-toggle-thumb" />
               </div>
-            </label>
-            <span class={`git-enable-status-badge ${config.enabled ? 'active' : 'inactive'}`}>
-              {config.enabled ? t('gitWebhook.statusActive') : t('gitWebhook.statusInactive')}
-            </span>
+              <div class="git-enable-hero-text">
+                <div class="git-enable-hero-title">
+                  <strong>{t('gitWebhook.enableSwitchLabel')}</strong>
+                </div>
+                <span class="git-enable-hero-desc">{t('gitWebhook.enableSwitchHint')}</span>
+              </div>
+            </div>
+
+            <div class={`git-enable-status-chip ${config.enabled ? 'active' : 'disabled'}`}>
+              <span class="git-status-dot" />
+              <span class="git-status-text">
+                {config.enabled ? t('gitWebhook.statusActive') : t('gitWebhook.statusInactive')}
+              </span>
+            </div>
           </div>
 
           {/* 适配器核心配置区：双下拉框（渠道选择 + 模式选择） */}
@@ -619,7 +634,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                         const host = config.webhook.payloadUrl.trim() || `http(s)://yourdomain:${livePort}`;
                         copyToClipboard(`${stripWebhookSuffix(host)}/api/webhooks/git`, 'url');
                       }}
-                      title="一键复制完整 Webhook 线上地址"
+                      title={t('gitWebhook.copyFullUrlHint')}
                     >
                       {copyStatus['url'] || t('gitWebhook.copy')}
                     </button>
@@ -746,7 +761,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                     type="button"
                     class="git-aux-btn"
                     onClick={() => setShowToken(!showToken)}
-                    title={showToken ? 'Hide' : 'Show'}
+                    title={showToken ? t('gitWebhook.hideToken') : t('gitWebhook.showToken')}
                   >
                     {showToken ? '🙈' : '👁️'}
                   </button>
@@ -890,7 +905,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                 type="button"
                 class="git-text-action-btn"
                 onClick={handleResetPrompt}
-                title="Reset to default template"
+                title={t('gitWebhook.resetPrompt')}
               >
                 {t('gitWebhook.resetPrompt')}
               </button>

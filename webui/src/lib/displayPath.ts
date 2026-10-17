@@ -167,3 +167,41 @@ export function getRelativePathToProject(filePath: string, repoRoot?: string, pr
 
   return cleanFile.replace(/^\.?\/+/, '');
 }
+
+export interface ParsedFilePathWithLine {
+  filePath: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+/**
+ * 健壮解析文件路径及其附属行号标记。
+ * 支持半角冒号与全角冒号（:、：）、斜杠（/）、井号（#L），
+ * 以及范围号（~、-、～、—、..）与单行号（:3000、：3000、:3000:15）。
+ */
+export function parseFilePathAndLines(raw: string): ParsedFilePathWithLine {
+  let cleaned = (raw || '').trim().replace(/^['"`]|['"`]$/g, '');
+  let startLine: number | undefined;
+  let endLine: number | undefined;
+
+  // 1. 匹配多行范围：如 :3000~10000, :L3000-10000, ：L3000～10000, /3000-10000, #L3000-L10000, L3000-10000, :3000..10000
+  const rangeMatch = cleaned.match(/([:：#/]|\s+)(?:L)?(\d+)\s*(?:[~\-～—–至]|(?:\.\.)|(?:-L))\s*(?:L)?(\d+)$/i);
+  if (rangeMatch && rangeMatch.index !== undefined) {
+    startLine = parseInt(rangeMatch[2], 10);
+    endLine = parseInt(rangeMatch[3], 10);
+    cleaned = cleaned.slice(0, rangeMatch.index);
+  } else {
+    // 2. 匹配单行号或行列号：如 :3000, ：3000, :L3000, ：L3000, /3000, #L3000, L3000, :3000:10, ：3000：10
+    const singleMatch = cleaned.match(/([:：#/]|\s+)(?:L)?(\d+)(?:[:：]\d+)?$/i);
+    if (singleMatch && singleMatch.index !== undefined) {
+      startLine = parseInt(singleMatch[2], 10);
+      cleaned = cleaned.slice(0, singleMatch.index);
+    }
+  }
+
+  return {
+    filePath: cleaned.trim(),
+    startLine: Number.isFinite(startLine) && startLine! > 0 ? startLine : undefined,
+    endLine: Number.isFinite(endLine) && endLine! > 0 ? endLine : undefined,
+  };
+}

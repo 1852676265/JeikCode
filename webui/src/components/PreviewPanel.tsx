@@ -4,12 +4,15 @@ import { fetchFsRead } from '../api';
 import { Markdown } from './Markdown';
 import { CodeEditorTab } from './CodeEditorTab';
 import { showToast } from './Toast';
+import { parseFilePathAndLines } from '../lib/displayPath';
 
 export interface PreviewTab {
   id: string;
   filePath: string;
   fileName: string;
   fileStatus?: string;
+  startLine?: number;
+  endLine?: number;
 }
 
 export interface PreviewPanelProps {
@@ -162,45 +165,76 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
   }, [activeTab?.filePath, refreshTrigger, isImage]);
 
   // 打开或追加一个标签页
-  const openTab = useCallback((info: { filePath: string; fileName?: string; fileStatus?: string }, insertIndex?: number) => {
-    const rawPath = info.filePath;
-    const absPath = normalizeToAbsolute(rawPath, cwd);
-    const fileName = info.fileName || absPath.split(/[\\/]/).pop() || absPath;
-    const tabId = `preview_${absPath}`;
+  const openTab = useCallback(
+    (
+      info: {
+        filePath: string;
+        fileName?: string;
+        fileStatus?: string;
+        startLine?: number;
+        endLine?: number;
+      },
+      insertIndex?: number,
+    ) => {
+      const rawPath = info.filePath;
+      const { filePath: cleanRaw, startLine: parsedStart, endLine: parsedEnd } = parseFilePathAndLines(rawPath);
+      const startLine = info.startLine ?? parsedStart;
+      const endLine = info.endLine ?? parsedEnd;
+      const absPath = normalizeToAbsolute(cleanRaw, cwd);
+      const fileName = info.fileName || absPath.split(/[\\/]/).pop() || absPath;
+      const tabId = `preview_${absPath}`;
 
-    setTabs((prev) => {
-      const existingIdx = prev.findIndex((t) => t.id === tabId || t.filePath === absPath);
-      if (existingIdx !== -1) {
-        // 如果已经存在，并且指定了新插入位置，则移动到该位置
-        if (insertIndex !== undefined && insertIndex !== existingIdx) {
+      setTabs((prev) => {
+        const existingIdx = prev.findIndex((t) => t.id === tabId || t.filePath === absPath);
+        if (existingIdx !== -1) {
           const next = [...prev];
-          const [item] = next.splice(existingIdx, 1);
-          const targetSlot = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
-          next.splice(targetSlot, 0, item);
+          const existingItem = next[existingIdx];
+          if (existingItem) {
+            next[existingIdx] = {
+              ...existingItem,
+              startLine,
+              endLine,
+            };
+          }
+          if (insertIndex !== undefined && insertIndex !== existingIdx) {
+            const [item] = next.splice(existingIdx, 1);
+            const targetSlot = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
+            next.splice(targetSlot, 0, item);
+          }
           return next;
         }
-        return prev;
-      }
-      const newTab: PreviewTab = {
-        id: tabId,
-        filePath: absPath,
-        fileName,
-        fileStatus: info.fileStatus || (fileName.split('.').pop() || 'FILE').slice(0, 3).toUpperCase(),
-      };
-      if (insertIndex !== undefined && insertIndex >= 0 && insertIndex <= prev.length) {
-        const next = [...prev];
-        next.splice(insertIndex, 0, newTab);
-        return next;
-      }
-      return [...prev, newTab];
-    });
+        const newTab: PreviewTab = {
+          id: tabId,
+          filePath: absPath,
+          fileName,
+          fileStatus: info.fileStatus || (fileName.split('.').pop() || 'FILE').slice(0, 3).toUpperCase(),
+          startLine,
+          endLine,
+        };
+        if (insertIndex !== undefined && insertIndex >= 0 && insertIndex <= prev.length) {
+          const next = [...prev];
+          next.splice(insertIndex, 0, newTab);
+          return next;
+        }
+        return [...prev, newTab];
+      });
 
-    setActiveTabId(tabId);
-  }, [cwd]);
+      setActiveTabId(tabId);
+    },
+    [cwd],
+  );
 
   // 监听全局打开预览事件
   useEffect(() => {
-    const handleOpenFileEvent = (e: CustomEvent<{ filePath: string; fileName?: string; fileStatus?: string }>) => {
+    const handleOpenFileEvent = (
+      e: CustomEvent<{
+        filePath: string;
+        fileName?: string;
+        fileStatus?: string;
+        startLine?: number;
+        endLine?: number;
+      }>,
+    ) => {
       if (e.detail?.filePath) {
         openTab(e.detail);
       }
@@ -531,9 +565,11 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
           </div>
         ) : (
           <CodeEditorTab
-            key={`${activeTab.filePath}_${activeTab.id}_${refreshTrigger}`}
+            key={`${activeTab.filePath}_${activeTab.id}_${activeTab.startLine || 0}_${activeTab.endLine || 0}_${refreshTrigger}`}
             filePath={activeTab.filePath}
             cwd={cwd}
+            startLine={activeTab.startLine}
+            endLine={activeTab.endLine}
             defaultViewMode="preview"
             onViewModeChange={(m) => setActiveViewMode(m)}
             hideHeaderToolbar={true}

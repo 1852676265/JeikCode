@@ -20,6 +20,8 @@ export interface CodeEditorTabProps {
   defaultViewMode?: 'edit' | 'preview';
   onViewModeChange?: (mode: 'edit' | 'preview') => void;
   hideHeaderToolbar?: boolean;
+  startLine?: number;
+  endLine?: number;
 }
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
@@ -38,6 +40,8 @@ export function CodeEditorTab({
   defaultViewMode,
   onViewModeChange,
   hideHeaderToolbar = false,
+  startLine,
+  endLine,
 }: CodeEditorTabProps) {
   const t = useT();
   const ext = useMemo(() => (filePath.split('.').pop() || '').toLowerCase(), [filePath]);
@@ -604,6 +608,77 @@ export function CodeEditorTab({
     showToast(t('editor.replaceAllSuccess', { n: String(parts.length - 1) }), 'success');
   };
 
+  // 计算行号范围高亮带 (支持单行号及多行范围)
+  const targetLineBand = useMemo(() => {
+    if (!startLine || startLine <= 0 || !content) return null;
+    const lines = content.split('\n');
+    const start = Math.min(lines.length, startLine);
+    const end = endLine && endLine >= start ? Math.min(lines.length, endLine) : start;
+    const lineCount = end - start + 1;
+    return {
+      top: `${(start - 1) * 20 + 8}px`,
+      height: `${lineCount * 20}px`,
+    };
+  }, [startLine, endLine, content]);
+
+  // 平滑滚动并高亮选中目标行号范围
+  const scrollToTargetLine = useCallback(
+    (targetStart?: number, targetEnd?: number) => {
+      if (!targetStart || targetStart <= 0 || !content) return;
+      const lines = content.split('\n');
+      const startIdx = Math.min(lines.length, Math.max(1, targetStart));
+      const endIdx = targetEnd && targetEnd >= startIdx ? Math.min(lines.length, targetEnd) : startIdx;
+
+      let charStart = 0;
+      for (let i = 0; i < startIdx - 1; i++) {
+        charStart += lines[i].length + 1;
+      }
+      let charEnd = charStart;
+      for (let i = startIdx - 1; i < endIdx; i++) {
+        charEnd += lines[i].length + (i < lines.length - 1 ? 1 : 0);
+      }
+
+      const ta = textareaRef.current;
+      if (ta) {
+        try {
+          ta.focus();
+          ta.setSelectionRange(charStart, charEnd);
+        } catch {}
+        const totalLines = Math.max(1, lines.length);
+        const approxLineHeight = ta.scrollHeight / totalLines || 20;
+        const targetScrollTop = Math.max(0, (startIdx - 4) * approxLineHeight);
+        ta.scrollTop = targetScrollTop;
+        if (preRef.current) preRef.current.scrollTop = targetScrollTop;
+        if (lineNumbersRef.current) lineNumbersRef.current.scrollTop = targetScrollTop;
+      }
+
+      if (viewMode === 'preview' && previewContainerRef.current) {
+        const container = previewContainerRef.current;
+        const targetScrollTop = Math.max(0, ((startIdx - 4) / Math.max(1, lines.length)) * container.scrollHeight);
+        container.scrollTop = targetScrollTop;
+      }
+    },
+    [content, viewMode],
+  );
+
+  useEffect(() => {
+    if (startLine && content) {
+      requestAnimationFrame(() => {
+        scrollToTargetLine(startLine, endLine);
+      });
+      const t1 = setTimeout(() => {
+        scrollToTargetLine(startLine, endLine);
+      }, 80);
+      const t2 = setTimeout(() => {
+        scrollToTargetLine(startLine, endLine);
+      }, 240);
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
+    }
+  }, [startLine, endLine, content, scrollToTargetLine]);
+
   // 计算行号列表与行号纯文本（将原本上万个 DOM 节点精简为单个 pre 文本节点，大文件缩放性能提升 100 倍！）
   const lines = useMemo(() => content.split('\n'), [content]);
   const lineNumbersText = useMemo(() => {
@@ -1106,10 +1181,16 @@ export function CodeEditorTab({
           <div class="editor-code-container">
             {/* 行号侧栏 (单个 pre 极速渲染，大文件缩放与滚动零延迟) */}
             <div class="editor-line-numbers" ref={lineNumbersRef} aria-hidden="true">
+              {targetLineBand && (
+                <div class="editor-target-gutter-band" style={targetLineBand} aria-hidden="true" />
+              )}
               <pre class="line-numbers-pre">{lineNumbersText}</pre>
             </div>
             {/* 代码主体包装器 (双层叠加：高亮预览底层 + 原生透明编辑上层) */}
             <div class="editor-code-wrapper">
+              {targetLineBand && (
+                <div class="editor-target-lines-band" style={targetLineBand} aria-hidden="true" />
+              )}
               <pre ref={preRef} class="editor-syntax-highlight" aria-hidden="true">
                 <code dangerouslySetInnerHTML={{ __html: highlightedHtml + '\n' }} />
               </pre>

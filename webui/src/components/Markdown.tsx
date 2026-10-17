@@ -6,6 +6,7 @@ import { markdownToHtml } from '../lib/markdownRender';
 import { MermaidDiagram } from './MermaidDiagram';
 import { useSettings } from '../settings';
 import { showToast } from './Toast';
+import { parseFilePathAndLines } from '../lib/displayPath';
 
 export { preprocessMarkdown, markdownToHtml } from '../lib/markdownRender';
 
@@ -72,16 +73,16 @@ function normalizePath(rawPath: string): string {
 }
 
 const ALL_FILE_EXTS = 'kt|kts|java|c|cpp|cc|cxx|h|hpp|hxx|cs|swift|m|mm|scala|clj|cljs|rs|go|py|pyw|rb|php|pl|pm|lua|r|dart|ts|tsx|js|jsx|mjs|cjs|json|json5|jsonc|toml|yaml|yml|xml|html|htm|xhtml|css|scss|sass|less|styl|sh|bash|zsh|fish|ps1|psm1|bat|cmd|sql|prisma|proto|graphql|gql|vue|svelte|astro|md|markdown|mdx|txt|text|log|diff|patch|env|properties|ini|conf|cfg|lock|svg|png|jpg|jpeg|gif|webp|ico|bmp|avif|gradle|cmake|dockerfile|containerfile|nix';
-const EXT_REGEX = new RegExp(`\\.(${ALL_FILE_EXTS})(:\\d+)?$`, 'i');
+const EXT_REGEX = new RegExp(`\\.(${ALL_FILE_EXTS})$`, 'i');
 const ROOT_DIRS_REGEX = /^(crates|src|webui|packages|desktop|docs|scripts|extensions|functions|plans|tests|assets|public|internal|cmd|api|lib)\/[\w.\-\\/]+$/i;
 
 /**
- * 智能识别一段文本是否是项目源码/资源文件路径
+ * 智能识别一段文本是否是项目源码/资源文件路径（支持健壮提取附带的行号与行范围）
  */
 export function isFilePathSnippet(text: string): boolean {
-  const t = text.trim().replace(/^['"`]|['"`]$/g, '');
+  const { filePath } = parseFilePathAndLines(text);
+  const t = filePath.trim().replace(/^['"`]|['"`]$/g, '');
   if (t.length < 2 || t.length > 350) return false;
-  if (t.includes(' ') || t.includes('\n') || t.includes('\t')) return false;
   if (/^(https?:|\/\/)/i.test(t) || /^www\./i.test(t)) return false;
 
   // 1. 标准扩展名匹配 (全语言源码、脚本、配置、文本及资源)
@@ -379,13 +380,14 @@ export function Markdown({
         e.preventDefault();
         e.stopPropagation();
 
-        const resolved = resolveTargetFile(href, basePath, cwd);
+        const { filePath: cleanHref, startLine, endLine } = parseFilePathAndLines(href);
+        const resolved = resolveTargetFile(cleanHref, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
 
         if (e.ctrlKey || e.metaKey || e.altKey) {
-          // 按住 Ctrl / Cmd / Alt 点击：直接在中间主编辑区打开！
+          // 按住 Ctrl / Cmd / Alt 点击：直接在中间主编辑区打开并定位行号！
           window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
-            detail: { path: resolved }
+            detail: { path: resolved, startLine, endLine }
           }));
           return;
         }
@@ -393,17 +395,17 @@ export function Markdown({
         if (targetContext === 'right') {
           // 右侧预览区点击：在右侧标签区打开，绝不跳去中间主舞台，互不干扰！
           window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
-            detail: { filePath: resolved, fileName }
+            detail: { filePath: resolved, fileName, startLine, endLine }
           }));
         } else if (targetContext === 'main') {
           // 中间主预览区点击：在中间主标签区打开，绝不跳去右侧，互不干扰！
           window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
-            detail: { path: resolved }
+            detail: { path: resolved, startLine, endLine }
           }));
         } else {
           // AI 对话主画布中点击：默认在右侧区域预览出来，复用异地浏览文件能力，不遮盖AI对话！
           window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
-            detail: { filePath: resolved, fileName }
+            detail: { filePath: resolved, fileName, startLine, endLine }
           }));
           window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
             detail: 'preview'
@@ -466,6 +468,8 @@ export function Markdown({
     y: number;
     filePath: string;
     fileName: string;
+    startLine?: number;
+    endLine?: number;
   } | null>(null);
 
   useEffect(() => {
@@ -498,13 +502,16 @@ export function Markdown({
       if (href && !href.startsWith('#') && !/^(https?:|\/\/)/i.test(href)) {
         e.preventDefault();
         e.stopPropagation();
-        const resolved = resolveTargetFile(href, basePath, cwd);
+        const { filePath: cleanHref, startLine, endLine } = parseFilePathAndLines(href);
+        const resolved = resolveTargetFile(cleanHref, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
         setFileBadgeMenu({
           x: e.clientX,
           y: e.clientY,
           filePath: resolved,
           fileName,
+          startLine,
+          endLine,
         });
       }
     }
@@ -531,7 +538,12 @@ export function Markdown({
             class="context-menu-btn"
             onClick={() => {
               window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
-                detail: { filePath: fileBadgeMenu.filePath, fileName: fileBadgeMenu.fileName }
+                detail: {
+                  filePath: fileBadgeMenu.filePath,
+                  fileName: fileBadgeMenu.fileName,
+                  startLine: fileBadgeMenu.startLine,
+                  endLine: fileBadgeMenu.endLine,
+                }
               }));
               window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
                 detail: 'preview'
@@ -546,7 +558,11 @@ export function Markdown({
             class="context-menu-btn"
             onClick={() => {
               window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
-                detail: { path: fileBadgeMenu.filePath }
+                detail: {
+                  path: fileBadgeMenu.filePath,
+                  startLine: fileBadgeMenu.startLine,
+                  endLine: fileBadgeMenu.endLine,
+                }
               }));
               setFileBadgeMenu(null);
             }}

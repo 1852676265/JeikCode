@@ -14,6 +14,7 @@ import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
 import { ConfirmModalHost } from './components/ConfirmDialog';
+import { parseFilePathAndLines } from './lib/displayPath';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销
 const ThemeDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ThemeDialog })));
@@ -320,8 +321,16 @@ export function App() {
   const [mainTabDragIdx, setMainTabDragIdx] = useState<number | null>(null);
   const [mainTabOverIdx, setMainTabOverIdx] = useState<number | null>(null);
 
-  const handleOpenFile = (filePath: string, insertIndex?: number) => {
-    let normPath = (filePath || '').trim().replace(/\\/g, '/');
+  const handleOpenFile = (
+    filePath: string,
+    insertIndex?: number,
+    targetStartLine?: number,
+    targetEndLine?: number,
+  ) => {
+    const { filePath: cleanRaw, startLine: parsedStart, endLine: parsedEnd } = parseFilePathAndLines(filePath);
+    const startLine = targetStartLine ?? parsedStart;
+    const endLine = targetEndLine ?? parsedEnd;
+    let normPath = (cleanRaw || '').trim().replace(/\\/g, '/');
     if (!/^[a-zA-Z]:\//.test(normPath) && !normPath.startsWith('/') && cwd) {
       const base = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
       normPath = `${base}/${normPath.replace(/^\.?\/+/, '')}`;
@@ -329,16 +338,19 @@ export function App() {
     const tabId = `editor_${normPath}`;
     const existingIdx = diffTabs.findIndex((t) => t.id === tabId || t.filePath === normPath);
     if (existingIdx !== -1) {
-      if (insertIndex !== undefined && insertIndex !== existingIdx) {
-        setDiffTabs((prev) => {
-          const next = [...prev];
+      const next = [...diffTabs];
+      if (next[existingIdx]) {
+        next[existingIdx] = {
+          ...next[existingIdx],
+          startLine,
+          endLine,
+        };
+        if (insertIndex !== undefined && insertIndex !== existingIdx) {
           const [item] = next.splice(existingIdx, 1);
-          if (item) {
-            const targetSlot = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
-            next.splice(targetSlot, 0, item);
-          }
-          return next;
-        });
+          const targetSlot = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
+          next.splice(targetSlot, 0, item);
+        }
+        setDiffTabs(next);
       }
       setActiveMainTabId(tabId);
       return;
@@ -351,6 +363,8 @@ export function App() {
       fileName,
       filePath: normPath,
       fileStatus: ext.slice(0, 3).toUpperCase(),
+      startLine,
+      endLine,
     };
     setDiffTabs((prev) => {
       if (insertIndex !== undefined && insertIndex >= 0 && insertIndex <= prev.length) {
@@ -368,12 +382,12 @@ export function App() {
     const onOpenFileEvent = (e: any) => {
       const p = e.detail?.path;
       if (p) {
-        handleOpenFile(p);
+        handleOpenFile(p, undefined, e.detail?.startLine, e.detail?.endLine);
       }
     };
     window.addEventListener('jeikcode:open_file', onOpenFileEvent);
     return () => window.removeEventListener('jeikcode:open_file', onOpenFileEvent);
-  }, [diffTabs]);
+  }, [diffTabs, cwd]);
 
   // 监听全局主视图切换广播 (例如从侧边栏快捷回到对话主舞台)
   useEffect(() => {

@@ -9121,9 +9121,11 @@ export function Chat({
           return (
             <div class="vscode-diff-view-stage">
               <CodeEditorTab
-                key={currentDiffTab.id}
+                key={`${currentDiffTab.id}_${currentDiffTab.startLine || 0}_${currentDiffTab.endLine || 0}`}
                 filePath={currentDiffTab.filePath}
                 cwd={cwd}
+                startLine={currentDiffTab.startLine}
+                endLine={currentDiffTab.endLine}
                 onClose={() => handleCloseDiffTab?.(currentDiffTab.id)}
               />
             </div>

@@ -980,6 +980,11 @@ const zh = {
   'gitWebhook.patHintGitee': '需勾选 projects 与 pull_requests 权限范围',
   'gitWebhook.patHintGitea': '具备 repo 访问权限用于读取 diff 与发表评论',
   'gitWebhook.patHintCustom': '用于与远程仓库或自定义接口通信的身份凭据',
+  'gitWebhook.badgeActive': 'Active',
+  'gitWebhook.badgeBeta': 'Beta',
+  'gitWebhook.copyFullUrlHint': '一键复制完整 Webhook 线上地址',
+  'gitWebhook.showToken': '显示令牌',
+  'gitWebhook.hideToken': '隐藏令牌',
 } as const;
 
 export type MsgKey = keyof typeof zh;
@@ -1933,6 +1938,11 @@ export const en: Record<MsgKey, string> = {
   'gitWebhook.patHintGitee': 'Requires projects and pull_requests scope',
   'gitWebhook.patHintGitea': 'Requires repo scope for inspecting diffs and posting comments',
   'gitWebhook.patHintCustom': 'Authentication credential for remote repository or custom API',
+  'gitWebhook.badgeActive': 'Active',
+  'gitWebhook.badgeBeta': 'Beta',
+  'gitWebhook.copyFullUrlHint': 'Copy full Webhook endpoint URL',
+  'gitWebhook.showToken': 'Show token',
+  'gitWebhook.hideToken': 'Hide token',
 };
 
 export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en, vi };

@@ -7,6 +7,7 @@ import {
   isLoopbackHost,
   joinFsChild,
   getRelativePathToProject,
+  parseFilePathAndLines,
   pathBasename,
   stripExtendedPathPrefix,
 } from './displayPath.ts';
@@ -119,4 +120,77 @@ test('getRelativePathToProject computes full project-relative path across root a
 
   // 4. Windows 大小写不敏感对齐
   assert.equal(getRelativePathToProject('src/main.rs', 'e:/code/jeikcode/sub', 'E:/Code/JeikCode'), 'sub/src/main.rs');
+});
+
+test('parseFilePathAndLines robustly extracts file paths and single/range line numbers', () => {
+  // 1. 半角/全角冒号及各种范围号 (:, ：, ~, -, ～, #L, L3000-10000)
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx:3000~10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx:3000-10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx：3000~10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx：3000～10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx：L3000-10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx#L3000-L10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx L3000-10000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: 10000,
+  });
+
+  // 2. 单行号格式 (:3000, ：3000, #L3000, L3000, :3000:15)
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx:3000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: undefined,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx：3000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: undefined,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx#L3000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: undefined,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx：L3000'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: undefined,
+  });
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx:3000:15'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: 3000,
+    endLine: undefined,
+  });
+
+  // 3. 普通文件路径无行号
+  assert.deepEqual(parseFilePathAndLines('webui/src/components/Chat.tsx'), {
+    filePath: 'webui/src/components/Chat.tsx',
+    startLine: undefined,
+    endLine: undefined,
+  });
 });

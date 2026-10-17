@@ -913,4 +913,9 @@ export const vi: Record<keyof typeof en, string> = {
   'gitWebhook.patHintGitee': 'Yêu cầu các phạm vi quyền projects và pull_requests',
   'gitWebhook.patHintGitea': 'Yêu cầu quyền repo để kiểm tra diff và gửi bình luận',
   'gitWebhook.patHintCustom': 'Thông tin xác thực danh tính để giao tiếp với kho từ xa hoặc API tùy chỉnh',
+  'gitWebhook.badgeActive': 'Active',
+  'gitWebhook.badgeBeta': 'Beta',
+  'gitWebhook.copyFullUrlHint': 'Sao chép URL điểm cuối Webhook đầy đủ',
+  'gitWebhook.showToken': 'Hiện mã thông báo',
+  'gitWebhook.hideToken': 'Ẩn mã thông báo',
 };
