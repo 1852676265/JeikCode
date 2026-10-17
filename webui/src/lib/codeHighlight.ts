@@ -75,7 +75,8 @@ export function highlightCode(code: string, fileName: string): string {
   const lowerName = fileName.toLowerCase();
   const ext = lowerName.split('.').pop() || '';
   const isLockFile = lowerName.endsWith('.lock') || lowerName.includes('cargo.lock') || lowerName.includes('package-lock.json') || lowerName.includes('yarn.lock') || lowerName.includes('pnpm-lock.yaml');
-  const isPlainText = isLockFile || PLAIN_TEXT_EXTS.has(ext);
+  const isCodeExample = (ext === 'example' || ext === 'sample') && (lowerName.includes('.json') || lowerName.includes('.js') || lowerName.includes('.ts') || lowerName.includes('.rs') || lowerName.includes('.py'));
+  const isPlainText = !isCodeExample && (isLockFile || PLAIN_TEXT_EXTS.has(ext));
 
   // 纯文本/清单/Lock 文件直接纯净转义，杜绝伪代码关键字和彩虹括号干扰！
   if (isPlainText) {
