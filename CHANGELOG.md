@@ -21,7 +21,47 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
-## v7.2.5-beta.2 (2026-10-16)
+## v7.2.5-beta.3 (2026-10-17)
+
+- **[WebUI] Full-featured persistent terminal, file explorer, preview panel, and editor enhancements**:
+  - Integrated a full-featured terminal emulator powered by XTerm.js and node-pty WebSocket streaming, supporting multi-tab management, independent capture zoom isolation, persistent shells across browser refreshes, and dynamic viewport fitting.
+  - Added an intuitive File Explorer tab with breadcrumb path navigation, quick file manipulation menus (create, rename, delete, open in OS), and seamless switching between conversations and workspace files.
+  - Introduced a tabbed Code Editor with syntax highlighting, indentation formatting, rainbow bracket matching, and compound extension support (such as `.json.example`).
+  - Added a dedicated Rich Media & Markdown Preview Panel supporting side-by-side document browsing, relative link resolution, and media rendering (images, PDF, audio, video).
+  - Enhanced Chat interactions with immediate send actions for queued and steer cards, automatic suppression of manual stop notifications during steer preemption, and persistent composer draft restoration.
+- **[Built-in Tools] Diagnostic enhancements for edit, robust bash loop prevention, and todo glyph standardization**:
+  - Enhanced the `edit` tool with aggregated error reporting across multi-hunk batches, pinpointed missing-line discrepancy hints, and topological disambiguation for duplicate code patterns.
+  - Hardened the `bash` tool against hang hazards: enforced a 32MB stream capture buffer limit to prevent OOM disk thrashing, added a 2-second timeout to drain pipe reader loops, and auto-harvested idle blocking commands waiting on stdin unless exempt under the network download allowlist.
+  - Scoped foreground live bash cancellation strictly to target session IDs, eliminating accidental termination of background commands across other sessions.
+  - Standardized `todo` completion glyphs to `[√]`, updated default turn and subagent `max_rounds` from 200 to 230 across configurations, and ensured `jeikcode init` automatically records `.jeikcode/codegraph/` in `.gitignore`.
+- **[Daemon & Sessions] Event channel expansion, empty session filtering, and filesystem endpoints**:
+  - Expanded the active chat event broadcast channel capacity from 512 to 4096, preventing `Lagged` event drops and ensuring reliable turn completion and final message delivery in concurrent multi-agent workflows.
+  - Aligned project `session_count` metrics by filtering orphaned historical empty sessions and collapsing fork lineages.
+  - Added asynchronous backend routes for file manipulation, raw media streaming with MIME detection, and cross-client terminal synchronization, while synchronizing WebUI port preferences on conflict increments.
+- **[Kernel] Steer turn budget renewal and child process priority optimization**:
+  - Reset turn round counters and round limits upon receiving `steer` commands, providing a renewed turn budget for redirected execution without premature termination.
+  - Optimized cross-platform process priority: lowered Windows child process priority via `BELOW_NORMAL_PRIORITY_CLASS` Job Objects, and applied `nice` / I/O scheduling throttling on POSIX systems to prevent heavy computational or build workloads from starving system services.
+
+---
+
+- **[WebUI 前端] 全功能持久化终端、资源管理器、文件预览与代码编辑器重大增强**:
+  - 深度集成基于 XTerm.js 与 node-pty 全双工 WebSocket 流式连接的终端系统，支持多标签管理、独立捕获缩放隔离、跨刷新保持持久 Shell 会话与视口无缝自适应。
+  - 新增原生体验的文件资源管理器，支持面包屑导航、文件树展开与快捷操作菜单（新建、重命名、删除、系统打开），侧边栏支持双胶囊一键切换对话与资源管理。
+  - 引入集成语法高亮、缩进格式化、彩虹括号的多标签代码编辑器，支持复合后缀（如 `.json.example`）高亮与快捷文件跳转。
+  - 新增富媒体与 Markdown 预览面板，支持分屏对照查阅、相对路径解析与图片/PDF/音频/视频原生渲染。
+  - 对话流体验优化：为排队与 Steer 卡片新增“立即发送”动作并自动抑制通知弹窗，支持输入框与气泡草稿跨会话及刷新记忆恢复。
+- **[内置工具] Edit 工具提示增强、Bash 防死循环与僵死防护、Todo 状态规范化**:
+  - 增强 `edit` 工具：支持多 hunk 批量失败诊断聚合汇总、核心匹配区间缺失行的精准指引，以及多匹配点的拓扑上下文消歧。
+  - 强化 `bash` 工具多重防线：设立单流 32MB 内存缓冲区截断以规避 OOM 磁盘置换风暴，引入 2 秒管道排空超时防止孙进程泄漏导致无限挂死，并在非网络下载白名单场景下当屏幕静默且 CPU 归零时自动收网结束等待态进程。
+  - 将前台 Bash 取消约束为精准会话范围，杜绝切换标签页或并发操作时全局误杀其他会话任务。
+  - 规范统一 `todo` 状态字符为 `[√]`，将默认 `max_rounds` 统一提升至 230，并在 `jeikcode init` 期间自动确保 `.gitignore` 包含 `.jeikcode/codegraph/`。
+- **[守护进程] 事件广播通道扩容、空会话过滤与文件系统后端接口**:
+  - 将广播总线容量由 512 扩展至 4096，并在前端协同检测未结工具状态，彻底根除并发多 Agent 结束时最终消息偶发丢失的问题。
+  - 在项目统计中过滤掉未产生消息的遗弃空会话并折叠分叉谱系，使项目卡片 `session_count` 与实际列表长度绝对一致。
+  - 新增异步文件操作与带 MIME 识别的媒体流后台路由，支持终端状态跨设备同步，并在端口冲突自动递增后同步持久化偏好设置。
+- **[内核调度] Steer 转向轮次预算重置与子进程调度降级**:
+  - 在接收到 `steer` 指令时重置当前轮次计数与轮次上限，确保转向后的任务拥有全新的回合预算，杜绝因前期轮次耗尽而被异常截断。
+  - 优化跨平台子进程调度：Windows 平台配置 `BELOW_NORMAL_PRIORITY_CLASS` 作业对象，POSIX 平台施加 `nice` 与 I/O 调度节流，防止繁重编译或脚本执行耗尽系统资源导致界面和网络假死。
 
 - **[Subagents] Compact worker action receipt ledger and tamper-proof execution evidence**:
   - Worker subagents now prepend an authoritative, compact action receipt (`[Worker touched: ..., ran: ...]`) to task blocks, providing tamper-proof physical execution evidence and preventing hallucinations without context bloat (~15-25 tokens).
