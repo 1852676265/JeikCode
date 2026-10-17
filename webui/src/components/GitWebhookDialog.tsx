@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'preact/hooks';
-import { ProjectInfo, saveGitBinding, getGitBinding } from '../api';
+import { ProjectInfo, saveGitBinding, getGitBinding, getRemoteAccess } from '../api';
 import { useT, useSettings } from '../settings';
 import { Select, SelectOption } from './Select';
 import { ModelSelector } from './ModelSelector';
+import { getPageZoom } from '../lib/pageZoom';
 
 /** 支持的 Git 托管平台渠道类型 */
 export type GitPlatformChannel = 'github' | 'gitlab' | 'gitee' | 'gitea' | 'custom_git';
@@ -18,11 +19,11 @@ export interface GitChannelMeta {
   badge?: string;
   defaultApiBase?: string;
   supportsSelfHosted: boolean;
-  tokenName: string;
+  tokenNameKey: string;
   tokenPlaceholder: string;
   tokenHintKey: string;
   repoLabelKey: string;
-  repoPlaceholder: string;
+  repoSampleKey: string;
   repoHintKey: string;
 }
 
@@ -32,11 +33,11 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     nameKey: 'gitWebhook.chGithub',
     descKey: 'gitWebhook.chGithubDesc',
     supportsSelfHosted: false,
-    tokenName: 'GitHub Personal Access Token (PAT)',
+    tokenNameKey: 'gitWebhook.tokenGithub',
     tokenPlaceholder: 'ghp_xxxxxxxxxxxxxxxxxxxx',
     tokenHintKey: 'gitWebhook.patHintGithub',
     repoLabelKey: 'gitWebhook.repoLabelGithub',
-    repoPlaceholder: 'owner/repo (例如: jeikl/JeikCode)',
+    repoSampleKey: 'gitWebhook.sampleGithub',
     repoHintKey: 'gitWebhook.repoHintGithub',
   },
   {
@@ -46,11 +47,11 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     badge: 'Self-hosted & Cloud',
     supportsSelfHosted: true,
     defaultApiBase: 'https://gitlab.com/api/v4',
-    tokenName: 'GitLab Personal Access Token',
+    tokenNameKey: 'gitWebhook.tokenGitlab',
     tokenPlaceholder: 'glpat-xxxxxxxxxxxxxxxxxxxx',
     tokenHintKey: 'gitWebhook.patHintGitlab',
     repoLabelKey: 'gitWebhook.repoLabelGitlab',
-    repoPlaceholder: 'group/subgroup/project (例如: my-team/backend-svc)',
+    repoSampleKey: 'gitWebhook.sampleGitlab',
     repoHintKey: 'gitWebhook.repoHintGitlab',
   },
   {
@@ -58,11 +59,11 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     nameKey: 'gitWebhook.chGitee',
     descKey: 'gitWebhook.chGiteeDesc',
     supportsSelfHosted: false,
-    tokenName: 'Gitee 私人令牌 (Private Token)',
+    tokenNameKey: 'gitWebhook.tokenGitee',
     tokenPlaceholder: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     tokenHintKey: 'gitWebhook.patHintGitee',
     repoLabelKey: 'gitWebhook.repoLabelGitee',
-    repoPlaceholder: 'owner/repo (例如: myorg/myrepo)',
+    repoSampleKey: 'gitWebhook.sampleGitee',
     repoHintKey: 'gitWebhook.repoHintGitee',
   },
   {
@@ -72,11 +73,11 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     badge: 'Self-hosted',
     supportsSelfHosted: true,
     defaultApiBase: 'https://gitea.example.com/api/v1',
-    tokenName: 'Gitea Access Token',
+    tokenNameKey: 'gitWebhook.tokenGitea',
     tokenPlaceholder: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     tokenHintKey: 'gitWebhook.patHintGitea',
     repoLabelKey: 'gitWebhook.repoLabelGitea',
-    repoPlaceholder: 'owner/repo (例如: org/repo)',
+    repoSampleKey: 'gitWebhook.sampleGitea',
     repoHintKey: 'gitWebhook.repoHintGitea',
   },
   {
@@ -85,11 +86,11 @@ export const GIT_CHANNELS: GitChannelMeta[] = [
     descKey: 'gitWebhook.chCustomDesc',
     badge: 'Generic / CLI',
     supportsSelfHosted: true,
-    tokenName: 'Git HTTP/SSH Auth Token / Key',
+    tokenNameKey: 'gitWebhook.tokenCustom',
     tokenPlaceholder: 'Token / Password / Key',
     tokenHintKey: 'gitWebhook.patHintCustom',
     repoLabelKey: 'gitWebhook.repoLabelCustom',
-    repoPlaceholder: 'https://git.internal.corp/repo.git',
+    repoSampleKey: 'gitWebhook.sampleCustom',
     repoHintKey: 'gitWebhook.repoHintCustom',
   },
 ];
@@ -108,6 +109,8 @@ export interface PollingConfig {
 
 /** 统一的 Git 平台适配器配置结构 */
 export interface GitAdapterConfig {
+  enabled: boolean;
+  lastEnabledState?: boolean;
   channel: GitPlatformChannel;
   syncMode: GitSyncMode;
   repoIdentifier: string;
@@ -132,7 +135,7 @@ const DEFAULT_REVIEW_PROMPT_ZH = `你是一名专业且严谨的高级代码审�
 你将收到来自本项目的 Pull Request / Merge Request / Issue，并结合目标分支的最新代码进行深度审查。
 
 【审查原则与核心关注点】
-1. 代码与版本对齐：拉取 PR、Issue 对应仓库分支最新远程提交及 PR 最新提交到本地。基于最新版本代码与 PR/Issue 基于的仓库版本进行严谨比对审查。对于 PR 请认真审查修复方案的合理性，排查是否存在死代码、硬编码、补丁式修补等违背当前系统设计原则和 BUG 修复原则的问题。
+1. 代码与版本对齐（工作区零检出与并发保护）：拉取 PR、Issue 对应仓库分支最新远程提交及 PR 最新提交到本地。严禁在本地工作区执行 git checkout 或 git switch 切换分支！比对差异请使用：git diff origin/main...refs/remotes/pr/<id>（分支只是示例）或 GitHub API Diff；查看具体文件使用 git show <ref>:<path>。基于最新版本代码与 PR/Issue 基于的仓库版本进行严谨比对审查。对于 PR 请认真审查修复方案的合理性，排查是否存在死代码、硬编码、补丁式修补等违背当前系统设计原则和 BUG 修复原则的问题。
 2. 现有方案与修复状态核验：比对并核实该问题或解决方案是否已在目标分支最新方案中得到完全修复与解决（例如是否已采纳了更高级的架构模式、策略抽象或同类解法）。清晰罗列出：所有已修复的问题、对应版本号、提交哈希（Commit Hash），以及当前依旧未修复遗留的问题。
 3. PR 审查与合并建议：理性评估给出是否建议合并、是否有必须修改的地方、是否有与当前仓库架构冲突之处。保持客观公正（切勿钻牛角尖硬找错；设计合理即予肯定，存在缺陷则明确指出改进方向），并按修改意见严重程度给出 P 级排序（P0 阻塞 / P1 严重 / P2 一般 / P3 建议）与改进建议。若建议合并，请清晰总结该修复方案的架构特点，并阐明建议合并的充分理由。
 4. Issue 答疑与进度指引：针对 Issue，根据上述核验结论诚恳解答用户疑问，提供基于最新代码库的分析；明确说明哪些修复已经在开发主干/测试分支中推进但尚未发布，预计将在测试版还是正式版推出；对于真实存在的新缺陷，给出专业判断、复现分析与最小可行修复建议。
@@ -143,7 +146,7 @@ const DEFAULT_REVIEW_PROMPT_EN = `You are a senior, rigorous code review expert 
 You will receive Pull Requests / Merge Requests / Issues from this project, conducting in-depth reviews in conjunction with the latest codebase of the target branch.
 
 [Review Principles & Core Focus]
-1. Code & Baseline Alignment: Pull the latest commits from the target remote branch and the PR branch locally. Review against both the latest branch state and the base revision the PR/Issue was branched from. For PRs, thoroughly evaluate fix reasonableness, identifying dead code, brittle hardcoding, or superficial patches that violate architectural design and bug-fixing principles.
+1. Code & Baseline Alignment (Workspace Protection & Zero Checkout): Pull the latest commits from the target remote branch and the PR branch locally. Strictly prohibit executing git checkout or git switch in the local workspace! To compare diffs, use: git diff origin/main...refs/remotes/pr/<id> (branches are illustrative examples) or GitHub API Diff; use git show <ref>:<path> to view files, ensuring a pristine workspace and robust multi-PR concurrency. Review against both the latest branch state and the base revision the PR/Issue was branched from. For PRs, thoroughly evaluate fix reasonableness, identifying dead code, brittle hardcoding, or superficial patches that violate architectural design and bug-fixing principles.
 2. Verification Against Existing Solutions: Verify whether the issue or proposed solution is already fully addressed in the latest codebase (e.g., via higher-level design patterns or alternative architectural fixes). Itemize: all resolved issues, corresponding version tags, commit hashes, and any remaining unaddressed defects.
 3. PR Evaluation & Merge Recommendation: Objectively evaluate whether to recommend merging, required revisions, and potential architectural conflicts. Remain constructive and fair (do not nitpick unnecessarily; acknowledge sound designs and give actionable guidance for defects). Sort review feedback by priority (P0 Blocker / P1 Critical / P2 Normal / P3 Suggestion). If recommending merge, summarize the architectural highlights and provide concrete merge justification.
 4. Issue Inquiry & Release Tracking: For Issues, provide sincere, well-reasoned answers grounded in the current codebase based on the verification above. Clarify which fixes are in progress or in active branches awaiting release, and specify upcoming delivery targets (beta vs. stable release). For confirmed defects, provide impact analysis and concrete fix guidance.
@@ -159,14 +162,26 @@ function generateRandomSecret(): string {
   return result;
 }
 
+export function stripWebhookSuffix(url: string): string {
+  return url
+    .replace(/\/api\/webhooks\/(git|github)\/?$/i, '')
+    .replace(/\/+$/, '');
+}
+
+export function getFullWebhookUrl(hostOrUrl: string): string {
+  const clean = stripWebhookSuffix(hostOrUrl.trim());
+  if (!clean) return '';
+  return `${clean}/api/webhooks/git`;
+}
+
 export function getProjectGitConfig(projectHash: string, lang?: string): GitAdapterConfig {
-  const defaultUrl = typeof window !== 'undefined'
-    ? `${window.location.origin}/api/webhooks/git`
-    : 'http://localhost:3000/api/webhooks/git';
+  const defaultUrl = '';
 
   const defaultPrompt = lang === 'zh' ? DEFAULT_REVIEW_PROMPT_ZH : DEFAULT_REVIEW_PROMPT_EN;
 
   const defaultConfig: GitAdapterConfig = {
+    enabled: false,
+    lastEnabledState: false,
     channel: 'github',
     syncMode: 'webhook',
     repoIdentifier: '',
@@ -196,15 +211,23 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
     const raw = localStorage.getItem(`jeikcode_git_binding_${projectHash}`);
     if (raw) {
       const parsed = JSON.parse(raw);
-      // 向后平滑兼容原有单一 GitHub 格式
+      // 向后平滑兼容原有单一 GitHub 格式，若之前存的是默认 localhost/127.0.0.1 则重置为空
       const repoId = parsed.repoIdentifier || parsed.repoFullName || '';
       const pat = parsed.accessToken || parsed.githubPat || '';
       const secret = parsed.webhook?.secret || parsed.secret || generateRandomSecret();
-      const payloadUrl = parsed.webhook?.payloadUrl || parsed.webhookUrl || defaultUrl;
+      let payloadUrl = parsed.webhook?.payloadUrl || parsed.webhookUrl || '';
+      if (payloadUrl.includes('127.0.0.1') || payloadUrl.includes('localhost')) {
+        payloadUrl = '';
+      }
+
+      const isEnabled = parsed.enabled ?? false;
+      const lastEnabled = parsed.lastEnabledState ?? parsed.last_enabled_state ?? isEnabled;
 
       return {
         ...defaultConfig,
         ...parsed,
+        enabled: isEnabled,
+        lastEnabledState: lastEnabled,
         repoIdentifier: repoId,
         accessToken: pat,
         reviewModel: parsed.reviewModel || parsed.review_model || '',
@@ -252,6 +275,65 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   const [showToken, setShowToken] = useState(false);
   const [copyStatus, setCopyStatus] = useState<Record<string, string>>({});
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+
+  // 动态响应页面/浏览器缩放与视口尺寸变动，自适应计算弹窗最大高度与居中边界，彻底防止大比例缩放下被遮挡
+  const [modalAdaptiveStyle, setModalAdaptiveStyle] = useState<{ maxHeight?: string; width?: string }>({});
+
+  useEffect(() => {
+    function computeAdaptiveBounds() {
+      if (typeof window === 'undefined') return;
+      const zoom = getPageZoom() || 1.0;
+      const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+      const vw = window.visualViewport ? window.visualViewport.width : window.innerWidth;
+
+      // 缩放校正后的有效可用视口高度与宽度
+      const effectiveVh = vh / zoom;
+      const effectiveVw = vw / zoom;
+
+      // 上下各预留 24px、左右各预留 20px 安全边距，让弹窗无论如何缩放均居中保持完整可见
+      const safeMaxHeight = Math.max(340, Math.floor(effectiveVh - 48));
+      const safeWidth = Math.min(860, Math.max(320, Math.floor(effectiveVw - 40)));
+
+      setModalAdaptiveStyle({
+        maxHeight: `${safeMaxHeight}px`,
+        width: `${safeWidth}px`,
+      });
+    }
+
+    computeAdaptiveBounds();
+    window.addEventListener('resize', computeAdaptiveBounds);
+    window.addEventListener('jeikcode:zoom_change', computeAdaptiveBounds);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', computeAdaptiveBounds);
+      window.visualViewport.addEventListener('scroll', computeAdaptiveBounds);
+    }
+    return () => {
+      window.removeEventListener('resize', computeAdaptiveBounds);
+      window.removeEventListener('jeikcode:zoom_change', computeAdaptiveBounds);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', computeAdaptiveBounds);
+        window.visualViewport.removeEventListener('scroll', computeAdaptiveBounds);
+      }
+    };
+  }, []);
+
+  // 动态同步右上角实际监听端口（默认 13460）
+  const [livePort, setLivePort] = useState<string>(() => {
+    if (typeof window !== 'undefined' && window.location.port) {
+      return window.location.port;
+    }
+    return '13460';
+  });
+
+  useEffect(() => {
+    getRemoteAccess()
+      .then((st) => {
+        if (st && st.port) {
+          setLivePort(String(st.port));
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const activeChannelMeta = GIT_CHANNELS.find((c) => c.id === config.channel) || GIT_CHANNELS[0];
 
@@ -344,7 +426,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
           {ch.badge && <span class="git-channel-badge">{ch.badge}</span>}
         </div>
         <span class="git-select-rich-desc">{t(ch.descKey as any)}</span>
-        <span class="git-select-rich-sample">{ch.repoPlaceholder}</span>
+        <span class="git-select-rich-sample">{t(ch.repoSampleKey as any)}</span>
       </div>
     ),
   }));
@@ -385,6 +467,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     <div class="modal-overlay git-webhook-modal-overlay" onClick={onClose}>
       <div
         class="modal-card modal-card-lg git-webhook-modal-card"
+        style={modalAdaptiveStyle}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-labelledby="git-adapter-title"
@@ -409,8 +492,8 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
           </button>
         </div>
 
-        {/* 弹窗内容主体 */}
-        <div class="modal-body git-webhook-body" style={{ maxHeight: '74vh', overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: '18px' }}>
+        {/* 弹窗内容主体：弹性伸缩，内部自动滚动，底部操作栏绝不被遮蔽 */}
+        <div class="modal-body git-webhook-body">
           
           {/* 项目元信息卡片 */}
           <div class="git-project-info-banner">
@@ -424,10 +507,35 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
             </div>
           </div>
 
+          {/* 总启用开关：默认关闭，开启持久化记住，项目移除自动停用，重新添加自动恢复 */}
+          <div class="git-enable-switch-banner">
+            <label class="git-enable-switch-label">
+              <input
+                type="checkbox"
+                checked={config.enabled}
+                onChange={(e) => {
+                  const checked = (e.target as HTMLInputElement).checked;
+                  setConfig({
+                    ...config,
+                    enabled: checked,
+                    lastEnabledState: checked,
+                  });
+                }}
+              />
+              <div class="git-enable-switch-text">
+                <strong>{t('gitWebhook.enableSwitchLabel')}</strong>
+                <span>{t('gitWebhook.enableSwitchHint')}</span>
+              </div>
+            </label>
+            <span class={`git-enable-status-badge ${config.enabled ? 'active' : 'inactive'}`}>
+              {config.enabled ? t('gitWebhook.statusActive') : t('gitWebhook.statusInactive')}
+            </span>
+          </div>
+
           {/* 适配器核心配置区：双下拉框（渠道选择 + 模式选择） */}
           <div class="git-form-section">
             <div class="git-section-title">
-              <span>1. 适配器策略配置 (渠道与工作模式)</span>
+              <span>1. {t('gitWebhook.secStrategyTitle')}</span>
             </div>
             
             <div class="git-form-grid">
@@ -479,24 +587,39 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
           {/* 适配器第 2 区：模式专属接入参数 (Webhook 或 轮询) */}
           <div class="git-form-section">
             <div class="git-section-title">
-              <span>2. {config.syncMode === 'webhook' ? 'Webhook 回调对接参数' : '轮询检测策略参数'}</span>
+              <span>2. {config.syncMode === 'webhook' ? t('gitWebhook.secParamWebhook') : t('gitWebhook.secParamPolling')}</span>
             </div>
 
             {config.syncMode === 'webhook' ? (
               <div class="git-form-grid">
                 <div class="git-form-item">
                   <label class="git-form-label">{t('gitWebhook.payloadUrlLabel')}</label>
-                  <div class="git-input-with-actions">
+                  <div class="git-webhook-input-group">
                     <input
                       type="text"
-                      class="git-input git-readonly-input"
-                      value={config.webhook.payloadUrl}
-                      readOnly
+                      class="git-group-input"
+                      value={stripWebhookSuffix(config.webhook.payloadUrl || '')}
+                      placeholder={`http(s)://yourdomain:${livePort}`}
+                      onInput={(e) => {
+                        const val = (e.target as HTMLInputElement).value.trim();
+                        setConfig({
+                          ...config,
+                          webhook: {
+                            ...config.webhook,
+                            payloadUrl: stripWebhookSuffix(val),
+                          },
+                        });
+                      }}
                     />
+                    <span class="git-group-addon">/api/webhooks/git</span>
                     <button
                       type="button"
-                      class="git-aux-btn"
-                      onClick={() => copyToClipboard(config.webhook.payloadUrl, 'url')}
+                      class="git-group-btn"
+                      onClick={() => {
+                        const host = config.webhook.payloadUrl.trim() || `http(s)://yourdomain:${livePort}`;
+                        copyToClipboard(`${stripWebhookSuffix(host)}/api/webhooks/git`, 'url');
+                      }}
+                      title="一键复制完整 Webhook 线上地址"
                     >
                       {copyStatus['url'] || t('gitWebhook.copy')}
                     </button>
@@ -578,7 +701,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                     <span>{t('gitWebhook.pollingOnlyActive')}</span>
                   </label>
                   <span class="git-input-hint" style={{ marginTop: '4px' }}>
-                    避免扫描已合并或已关闭的历史记录，显著降低远端 API 消耗
+                    {t('gitWebhook.pollingFilterHint')}
                   </span>
                 </div>
               </div>
@@ -588,7 +711,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
           {/* 适配器第 3 区：动态绑定的仓库标识与平台认证凭据 */}
           <div class="git-form-section">
             <div class="git-section-title">
-              <span>3. 仓库标识与访问认证（由选定渠道动态驱动）</span>
+              <span>3. {t('gitWebhook.secAuthTitle')}</span>
             </div>
             <div class="git-form-grid">
               {/* 动态 Label、Placeholder 与 Hint */}
@@ -599,7 +722,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                 <input
                   type="text"
                   class="git-input"
-                  placeholder={activeChannelMeta.repoPlaceholder}
+                  placeholder={t(activeChannelMeta.repoSampleKey as any)}
                   value={config.repoIdentifier}
                   onInput={(e) => setConfig({ ...config, repoIdentifier: (e.target as HTMLInputElement).value.trim() })}
                 />
@@ -609,7 +732,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
               {/* 动态 Token Name、Placeholder 与 Hint */}
               <div class="git-form-item">
                 <label class="git-form-label">
-                  {activeChannelMeta.tokenName} <span style={{ color: '#ef4444' }}>*</span>
+                  {t(activeChannelMeta.tokenNameKey as any)} <span style={{ color: '#ef4444' }}>*</span>
                 </label>
                 <div class="git-input-with-actions">
                   <input

@@ -128,6 +128,8 @@ export const vi: Record<keyof typeof en, string> = {
   'git.local': 'Nhánh cục bộ',
   'git.remote': 'Nhánh từ xa',
   'git.graph': 'Commit',
+  'git.graphView': 'Biểu đồ',
+  'git.commits': 'Lịch sử cam kết',
   'git.allBranches': 'Tất cả nhánh',
   'git.currentBranch': 'Nhánh hiện tại',
   'git.refresh': 'Làm mới trạng thái Git',

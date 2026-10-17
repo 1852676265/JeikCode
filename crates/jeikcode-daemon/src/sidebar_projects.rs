@@ -121,6 +121,7 @@ fn pin_dir(state: &mut SidebarFile, dir: &std::path::Path) -> PinnedProject {
         .unwrap_or_else(|| dir.to_string_lossy().into_owned());
     let now = now_secs();
     state.hidden.remove(&hash);
+    crate::git_adapter::restore_binding_for_project(&hash);
     if let Some(existing) = state.pinned.iter_mut().find(|p| p.hash == hash) {
         existing.working_dir = dir.to_string_lossy().into_owned();
         existing.name = name;
@@ -173,6 +174,9 @@ pub fn snapshot() -> SidebarView {
 
 pub fn hide_hash(hash: &str) -> SidebarView {
     let hash = hash.trim().to_string();
+    if !hash.is_empty() {
+        crate::git_adapter::disable_binding_for_project(&hash);
+    }
     with_state(|state| {
         if !hash.is_empty() {
             state.hidden.insert(hash);
@@ -183,6 +187,9 @@ pub fn hide_hash(hash: &str) -> SidebarView {
 
 pub fn reveal_hash(hash: &str) -> SidebarView {
     let hash = hash.trim().to_string();
+    if !hash.is_empty() {
+        crate::git_adapter::restore_binding_for_project(&hash);
+    }
     with_state(|state| {
         if !hash.is_empty() {
             state.hidden.remove(&hash);

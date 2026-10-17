@@ -2389,6 +2389,126 @@ body {
    Right Inspector Multi-Tab Panel & Git Panel
    ============================================================================ */
 
+/* Combined VS Code-style Git View (Changes + Commits Split) */
+.git-combined-view {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.git-combined-changes-pane {
+  min-height: 60px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.git-combined-changes-pane .git-source-control-container {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.git-split-resizer {
+  height: 6px;
+  min-height: 6px;
+  background: var(--app-primary-border-color);
+  cursor: row-resize;
+  position: relative;
+  z-index: 5;
+  transition: background-color 0.15s ease;
+  user-select: none;
+}
+
+.git-split-resizer:hover,
+.git-split-resizer:active {
+  background: var(--app-brand, #3b82f6);
+}
+
+.git-combined-commits-pane {
+  min-height: 32px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid var(--app-primary-border-color);
+}
+
+.git-commits-section-header {
+  height: 28px;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  background: var(--app-secondary-background);
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--app-primary-foreground);
+  border-bottom: 1px solid var(--app-primary-border-color);
+  flex-shrink: 0;
+}
+
+.git-commits-section-header:hover {
+  background: var(--app-list-hover-background);
+}
+
+.git-commits-section-header .git-section-caret {
+  font-size: 9px;
+  opacity: 0.7;
+  width: 12px;
+  display: inline-block;
+}
+
+.git-commits-section-header .git-section-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-commits-section-header .git-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.git-commits-section-header .git-section-action-btn {
+  background: transparent;
+  border: none;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.git-commits-section-header .git-section-action-btn:hover {
+  color: var(--app-primary-foreground);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.git-combined-commits-body {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.git-combined-commits-body .git-graph-container {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+}
+
 /* Source Control */
 .git-source-control-container {
   flex: 1 1 0%;

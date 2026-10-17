@@ -2516,6 +2516,20 @@ export function Sidebar({
           onClose={() => setRemoveProjectTarget(null)}
           onConfirm={async () => {
             const hash = removeProjectTarget.hash;
+            // 自动停用该项目的 Git 联动并记住最后一次开启状态
+            try {
+              const raw = localStorage.getItem(`jeikcode_git_binding_${hash}`);
+              if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed.enabled) {
+                  localStorage.setItem(`jeikcode_git_binding_${hash}`, JSON.stringify({
+                    ...parsed,
+                    enabled: false,
+                    lastEnabledState: true,
+                  }));
+                }
+              }
+            } catch {}
             pendingHideRef.current.add(hash);
             pendingRevealRef.current.delete(hash);
             setHiddenProjectHashes((prev) => {

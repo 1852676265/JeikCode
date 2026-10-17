@@ -22,13 +22,18 @@
 ## 3. Commit & PR Discipline
 
 - **Git Commit Standards**: Follow Conventional Commits (`feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, etc.). Provide clear commit bodies describing the final effective state and rationale. Avoid fragmented 1–3 file micro-commits, except during iterative CI fix loops; consolidate repetitive CI fix commits into a single unified commit once green.
-- **Bilingual Commit Bodies**: Commit titles stay English-only. Bodies must be written in two complete passes, in this exact order: (1) the full English version first; (2) a standalone `---` separator line; (3) the full Chinese version. Inside the Chinese section, keep code identifiers, file paths, commands, API/field names, and other technical terms in their original English form at the appropriate places — do not translate them. The co-authorship trailer remains its own final paragraph, separated by a blank line.
+- **Bilingual Contract Across Commits, PRs & Issues**:
+  - **Commit Bodies**: Commit titles stay English-only (`feat(...)`, `fix(...)`). Bodies must be written in two complete passes in exact order: (1) full English version first; (2) standalone `---` line; (3) full Chinese version. Inside Chinese sections, technical identifiers (paths, symbols, commands, APIs) remain in original English without translation.
+  - **PR & Issue Submissions**: PR titles follow English Conventional Commits. PR descriptions (filling `.github/PULL_REQUEST_TEMPLATE.md`) and Issue bodies must provide dual-pass bilingual content (or bilingual-mirrored headings and sections) so global collaborators can audit without friction. When initiated by Chinese-speaking contributors, Chinese precedes `---` and English follows; for non-Chinese contributors, English precedes and Chinese follows.
+  - **PR & Issue Comment Interactions**:
+    - If the user/author communicates in Chinese: respond in full Chinese first, a standalone `---` divider line, followed by the full English translation at the bottom.
+    - If the user/author communicates in non-Chinese (e.g., English): respond in full non-Chinese (e.g., English) first, a standalone `---` divider line, followed by the full Chinese translation at the bottom.
 - **Issue & PR Traceability**: When referencing or addressing specific PRs or issues, explicitly state in both the commit title and body what was fixed, added, or changed regarding the target and the resulting outcome.
 - **PR Scope & Quality**:
   - **Single Responsibility**: Each PR must address exactly one category of change. Never bundle unrelated edits.
   - **Atomic & Reversible**: Commits within a PR must be self-contained and independently revertible.
   - **Local Convergence**: Audit and squash exploratory trial commits before merging; preserve only the final effective state and reason.
-  - **Template Alignment**: Strictly fill out `.github/PULL_REQUEST_TEMPLATE.md`. For Chinese-speaking users, use the PR template in Chinese. For non-Chinese users, the PR template (including headings and content) may be translated into English, but the template structure must remain strictly intact.
+  - **Template Alignment**: Strictly fill out `.github/PULL_REQUEST_TEMPLATE.md` with bilingual integrity. The template structure, headings, and checklist anchors must remain intact.
 - **Contributor Respect**: Prefer squash-merging contributors' original PRs; state modification costs upfront; provide file-by-file explanations and actionable next steps when rejecting a PR.
 
 ---
@@ -96,3 +101,5 @@ The release process strictly adheres to [`docs/release-tutorial.md`](./docs/rele
 - **Human-Agent Boundary Isolation**:
   - **Localization Scope**: Confined strictly to human-facing interfaces and onboarding (TUI `/` command guides, WebUI, desktop shell, CLI host service output links, update/sync notifications, asset docs).
   - **Agent Core Purity**: System prompts, built-in tool definitions and schemas, execution traces, and raw tool outputs must strictly remain in native English without localization or translation pollution.
+- **Component & CLI Localization Coverage**: Every newly added frontend component label, button, placeholder, tooltip, modal notice, and CLI configuration prompt must fully integrate into the i18n catalogs (`zh`, `en`, `vi`). Hardcoded user-facing strings are strictly prohibited.
+- **Catalog Purity & Anti-Hybridization**: Maintain single-language purity across all language catalogs. Never pollute monolingual entries with hybrid constructs such as `Chinese (Non-Chinese)` or mixed parenthetical dual-language aliases (except universally recognized protocol acronyms such as `PAT`, `HMAC`, `API`, `URL`, `SSH`). Each locale must express meaning cleanly in its native wording.

@@ -220,6 +220,12 @@ fn default_interval() -> u32 {
 pub struct GitAdapterConfig {
     #[serde(default)]
     pub project_hash: String,
+    /// 是否开启此项目的自动化代码审查与联动（默认关闭）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 记录项目被移除前最后一次手动勾选的启用状态，供下次重新添加回列表时自动恢复
+    #[serde(default)]
+    pub last_enabled_state: bool,
     #[serde(default)]
     pub channel: String,
     #[serde(default)]
@@ -417,5 +423,30 @@ pub fn save_binding(config: GitAdapterConfig) {
     if let Ok(mut lock) = get_cache().lock() {
         lock.insert(config.project_hash.clone(), config);
         save_to_disk(&lock);
+    }
+}
+
+/// 当项目从侧边栏列表中移除时调用：自动将启用状态设为 false，但记住 last_enabled_state
+pub fn disable_binding_for_project(project_hash: &str) {
+    if let Ok(mut lock) = get_cache().lock() {
+        if let Some(cfg) = lock.get_mut(project_hash) {
+            if cfg.enabled {
+                cfg.last_enabled_state = true;
+                cfg.enabled = false;
+                save_to_disk(&lock);
+            }
+        }
+    }
+}
+
+/// 当项目重新添加回侧边栏时调用：自动恢复项目上次自动关闭前的最后一次勾选状态
+pub fn restore_binding_for_project(project_hash: &str) {
+    if let Ok(mut lock) = get_cache().lock() {
+        if let Some(cfg) = lock.get_mut(project_hash) {
+            if cfg.last_enabled_state && !cfg.enabled {
+                cfg.enabled = true;
+                save_to_disk(&lock);
+            }
+        }
     }
 }
