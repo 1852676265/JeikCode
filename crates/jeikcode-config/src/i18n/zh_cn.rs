@@ -1272,5 +1272,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
              换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"
                 .into(),
+        Msg::ServeNoTokenSecurityWarning =>
+            "【严重安全警告】检测到你未配置访问令牌 (Token)！\n如果你当前未设置对应防火墙，请向 JeikCode 的 AI 询问让其帮忙设立防火墙和白名单 IP，否则你的服务器很容易被黑客入侵！".into(),
     }
 }

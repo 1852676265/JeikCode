@@ -1296,5 +1296,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
              and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."
                 .into(),
+        Msg::ServeNoTokenSecurityWarning =>
+            "[CRITICAL SECURITY WARNING] No access token configured!\nIf you have not set up a corresponding firewall, please ask JeikCode AI to help establish firewall rules and whitelist IPs; otherwise, your server can easily be compromised by hackers!".into(),
     }
 }

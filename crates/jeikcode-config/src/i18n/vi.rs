@@ -1229,5 +1229,7 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         Msg::ConhostScrollHint =>
             "Mẹo: console Windows cổ điển có giới hạn — không cuộn lại được khi tác vụ đang chạy, ký tự và linh vật hiển thị kém. \x1b[1;96mWindows Terminal\x1b[0m mang lại trải nghiệm đầy đủ."
                 .into(),
+        Msg::ServeNoTokenSecurityWarning =>
+            "[CẢNH BÁO AN NINH NGHIÊM TRỌNG] Phát hiện bạn chưa sử dụng mã truy cập (Token)!\nNếu hiện tại chưa thiết lập tường lửa tương ứng, vui lòng nhờ AI của JeikCode hỗ trợ thiết lập tường lửa và danh sách IP trắng, nếu không máy chủ của bạn rất dễ bị hacker xâm nhập!".into(),
     }
 }

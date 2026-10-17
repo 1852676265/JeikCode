@@ -1711,4 +1711,6 @@ pub enum Msg<'a> {
     /// user that scrolling resumes when the task finishes, and that Windows
     /// Terminal has no such limitation.
     ConhostScrollHint,
+    /// Critical security warning shown in serve banner when bound to 0.0.0.0 without token.
+    ServeNoTokenSecurityWarning,
 }

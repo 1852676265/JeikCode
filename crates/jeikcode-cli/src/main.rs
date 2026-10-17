@@ -211,7 +211,19 @@ fn format_serve_banner(
             "  ⚠ Bound for network access. Prefer a trusted LAN / VPN / SSH tunnel."
         );
         if no_token {
-            let _ = writeln!(out, "  ⚠ --no-token: API has no access token (INSECURE).");
+            let warn =
+                jeikcode_config::i18n::t(jeikcode_config::i18n::Msg::ServeNoTokenSecurityWarning);
+            let _ = writeln!(
+                out,
+                "  ┌── 🚨 ──────────────────────────────────────────────────────────────"
+            );
+            for line in warn.lines() {
+                let _ = writeln!(out, "  │  {line}");
+            }
+            let _ = writeln!(
+                out,
+                "  └────────────────────────────────────────────────────────────────────"
+            );
         } else {
             let _ = writeln!(
                 out,
