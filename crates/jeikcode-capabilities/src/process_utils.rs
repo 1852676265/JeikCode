@@ -129,8 +129,9 @@ pub fn assign_child_to_job(
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
     };
+    use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
 
     let proc_handle = child.raw_handle()? as HANDLE;
     unsafe {
@@ -139,9 +140,13 @@ pub fn assign_child_to_job(
             return None;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let mut limit_flags = JOB_OBJECT_LIMIT_PRIORITY_CLASS;
         if kill_on_close {
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            limit_flags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         }
+        info.BasicLimitInformation.LimitFlags = limit_flags;
+        // 降低作业对象进程优先级，防止重度编译或高耗能脚本抢占 Windows 核心资源导致系统界面和网络通信卡死
+        info.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
         let set_ok = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,

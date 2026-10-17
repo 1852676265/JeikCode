@@ -3246,7 +3246,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let filled_glyph = if unicode { "\u{25a0}" } else { "[#]" };
         // U+2713 (light check) not U+2714 (heavy) — the heavy one triggers emoji
         // presentation on many terminals (renders green + width-2, leaking a stray cell).
-        let done_glyph = if unicode { "\u{2713}" } else { "[x]" };
+        let done_glyph = if unicode { "\u{2713}" } else { "[√]" };
         let ellipsis = if unicode { "\u{2026}" } else { "..." };
 
         // An indented item line: `  <glyph> <content>` (content width-fitted).

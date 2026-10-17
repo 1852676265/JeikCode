@@ -2305,7 +2305,7 @@ impl RunningAgent {
             let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
             // Live context pressure from the last response (0s before any response).
             let (ctx_window, used_tokens, _util) = convo.last_pressure();
-            let turn_ctx = TurnCtx {
+            let mut turn_ctx = TurnCtx {
                 session_id: self.session_id.clone(),
                 turn_id,
                 request_id,
@@ -2401,6 +2401,10 @@ impl RunningAgent {
                 last_echo_sig = None;
                 echo_rounds = 0;
                 echo_nudged = false;
+                // 用户成功转换 steer 转向状态：刷新重置轮次计数与上限，开启全新轮次预算！
+                round = 1;
+                round_cap = self.max_rounds;
+                turn_ctx.round = 1;
                 let n = steered.len();
                 let mut inputs = Vec::with_capacity(n);
                 for input in steered {
@@ -5842,6 +5846,72 @@ mod steer_buffer_tests {
         assert!(
             round2.iter().any(|(_, text)| text.contains("STEER-ME")),
             "the steered prompt must be folded into the same turn's next request; got {round2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_resets_round_counter_and_cap() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c2".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            1, // inject steer on first model call
+            "STEER-RESET-ROUNDS",
+            deferred_tx_clone,
+        ));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .max_rounds(2) // 限制 max_rounds 为 2
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+
+        let mut stop_reason = None;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnComplete { reason, .. } => {
+                    stop_reason = Some(reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            stop_reason,
+            Some(StopReason::Stopped),
+            "steer 必须重置 round 计数，使得总轮次超过 2 时仍能因 steer 重置预算而成功完成"
         );
     }
 
