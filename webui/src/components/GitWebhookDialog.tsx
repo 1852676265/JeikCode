@@ -170,10 +170,59 @@ function generateRandomSecret(): string {
   return result;
 }
 
+const GLOBAL_LAST_WEBHOOK_HOST_KEY = 'jeikcode:last_webhook_host';
+
 export function stripWebhookSuffix(url: string): string {
   return url
     .replace(/\/api\/webhooks\/(git|github)\/?$/i, '')
     .replace(/\/+$/, '');
+}
+
+/**
+ * 获取全局记住的 Webhook 域名/主机（单实例跨项目继承，避免重复配置）
+ */
+export function getLastWebhookHost(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const saved = localStorage.getItem(GLOBAL_LAST_WEBHOOK_HOST_KEY);
+    if (saved && !saved.includes('127.0.0.1') && !saved.includes('localhost')) {
+      return saved;
+    }
+    // 自动扫描已有的其他项目配置，发现并自动提取已配置过的域名作为种子
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('jeikcode_git_binding_')) {
+        const item = localStorage.getItem(key);
+        if (item) {
+          const parsed = JSON.parse(item);
+          const url = parsed.webhook?.payloadUrl || parsed.webhookUrl || '';
+          const clean = stripWebhookSuffix(url);
+          if (clean && !clean.includes('127.0.0.1') && !clean.includes('localhost')) {
+            localStorage.setItem(GLOBAL_LAST_WEBHOOK_HOST_KEY, clean);
+            return clean;
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return '';
+}
+
+/**
+ * 记忆最新配置的 Webhook 域名/主机
+ */
+export function setLastWebhookHost(host: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const clean = stripWebhookSuffix(host.trim());
+    if (clean && !clean.includes('127.0.0.1') && !clean.includes('localhost')) {
+      localStorage.setItem(GLOBAL_LAST_WEBHOOK_HOST_KEY, clean);
+    }
+  } catch {
+    // ignore
+  }
 }
 
 export function getFullWebhookUrl(hostOrUrl: string): string {
@@ -183,7 +232,8 @@ export function getFullWebhookUrl(hostOrUrl: string): string {
 }
 
 export function getProjectGitConfig(projectHash: string, lang?: string): GitAdapterConfig {
-  const defaultUrl = '';
+  // 默认继承全局记住的 Webhook 域名，保持项目独立且可随时编辑
+  const defaultUrl = getLastWebhookHost();
 
   const defaultPrompt = lang === 'zh' ? DEFAULT_REVIEW_PROMPT_ZH : DEFAULT_REVIEW_PROMPT_EN;
 
@@ -227,6 +277,10 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
       if (payloadUrl.includes('127.0.0.1') || payloadUrl.includes('localhost')) {
         payloadUrl = '';
       }
+      // 若本项目未单独保存过域名，自动继承全局最近配置的通用 Webhook 域名
+      if (!payloadUrl) {
+        payloadUrl = getLastWebhookHost();
+      }
 
       const isEnabled = parsed.enabled ?? false;
       const lastEnabled = parsed.lastEnabledState ?? parsed.last_enabled_state ?? isEnabled;
@@ -263,6 +317,9 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
 export function saveProjectGitConfig(projectHash: string, config: GitAdapterConfig): void {
   try {
     localStorage.setItem(`jeikcode_git_binding_${projectHash}`, JSON.stringify(config));
+    if (config.webhook?.payloadUrl) {
+      setLastWebhookHost(config.webhook.payloadUrl);
+    }
   } catch {
     // ignore
   }
@@ -349,14 +406,28 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     // 从后端拉取最新持久化配置（支持跨浏览器/清除缓存后恢复）
     getGitBinding(project.hash).then((remote) => {
       if (remote && remote.channel) {
-        setConfig((prev) => ({
-          ...prev,
-          ...remote,
-          events: {
-            ...prev.events,
-            ...(remote.events || {}),
-          },
-        }));
+        setConfig((prev) => {
+          let remotePayload = remote.webhook?.payload_url || remote.webhook?.payloadUrl || '';
+          if (remotePayload.includes('127.0.0.1') || remotePayload.includes('localhost')) {
+            remotePayload = '';
+          }
+          // 若远端没有保存过独立域名，则自动继承全局记忆域名或当前状态已继承的域名
+          const effectivePayload = remotePayload || prev.webhook.payloadUrl || getLastWebhookHost();
+
+          return {
+            ...prev,
+            ...remote,
+            webhook: {
+              ...prev.webhook,
+              ...(remote.webhook || {}),
+              payloadUrl: effectivePayload,
+            },
+            events: {
+              ...prev.events,
+              ...(remote.events || {}),
+            },
+          };
+        });
       }
     }).catch(() => {});
   }, [project.hash]);
@@ -617,13 +688,18 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                       placeholder={`http(s)://yourdomain:${livePort}`}
                       onInput={(e) => {
                         const val = (e.target as HTMLInputElement).value.trim();
+                        const stripped = stripWebhookSuffix(val);
                         setConfig({
                           ...config,
                           webhook: {
                             ...config.webhook,
-                            payloadUrl: stripWebhookSuffix(val),
+                            payloadUrl: stripped,
                           },
                         });
+                        // 用户编辑后，实时同步为全局默认继承项
+                        if (stripped) {
+                          setLastWebhookHost(stripped);
+                        }
                       }}
                     />
                     <span class="git-group-addon">/api/webhooks/git</span>

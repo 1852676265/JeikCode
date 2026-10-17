@@ -824,7 +824,7 @@ export const vi: Record<keyof typeof en, string> = {
   'gitWebhook.patHint': 'Cần thiết để Bot đăng nhận xét trên PR/Issue; yêu cầu quyền repo',
   'gitWebhook.sec2Title': '2. Thông tin Webhook GitHub (Sao chép vào GitHub Repo Settings -> Webhooks)',
   'gitWebhook.payloadUrlLabel': 'Địa chỉ máy chủ Webhook (Server Host / Domain)',
-  'gitWebhook.payloadUrlHint': 'Nhập tên miền máy chủ công khai hoặc đường hầm (sẽ tự động nối thêm điểm cuối /api/webhooks/git khi sao chép)',
+  'gitWebhook.payloadUrlHint': 'Nhập tên miền máy chủ công khai hoặc đường hầm (mặc định kế thừa giữa các dự án, sẽ tự động nối thêm điểm cuối /api/webhooks/git khi sao chép)',
   'gitWebhook.secretLabel': 'Webhook Secret (Khóa chữ ký HMAC)',
   'gitWebhook.secretHint': 'GitHub gửi X-Hub-Signature-256 để xác thực yêu cầu, chống giả mạo',
   'gitWebhook.random': '🎲 Ngẫu nhiên',
