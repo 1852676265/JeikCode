@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'preact/hooks'
 import { useT, useSettings } from '../settings';
 import { fetchFsRead } from '../api';
 import { Markdown } from './Markdown';
+import { CodeEditorTab } from './CodeEditorTab';
 import { showToast } from './Toast';
 
 export interface PreviewTab {
@@ -59,6 +60,13 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     } catch {}
     return '';
   });
+
+  // 右侧面板当前激活标签的模式：默认从各处点进来的均为预览模式 ('preview')
+  const [activeViewMode, setActiveViewMode] = useState<'preview' | 'edit'>('preview');
+
+  useEffect(() => {
+    setActiveViewMode('preview');
+  }, [activeTabId]);
 
   // 当项目/工作目录切换时，自动同步对应项目的独立预览标签列表，彻底杜绝跨项目同名文件混淆
   useEffect(() => {
@@ -454,15 +462,21 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
             </button>
           )}
 
-          {activeTab && onOpenInMainEditor && (
+          {activeTab && (
             <button
               type="button"
-              class="preview-action-btn"
-              onClick={() => onOpenInMainEditor(activeTab.filePath)}
-              title={t('preview.openInEditor') || '在主编辑区打开'}
-              aria-label="Open in main editor"
+              class={'preview-action-btn' + (activeViewMode === 'edit' ? ' active' : '')}
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent(`jeikcode:editor:toggle_mode:${activeTab.filePath}`));
+              }}
+              title={
+                activeViewMode === 'edit'
+                  ? `${t('editor.switchToPreview')} (Ctrl+Shift+V)`
+                  : `${t('editor.switchToEdit')} (Ctrl+Shift+V)`
+              }
+              aria-label="Toggle editor/preview mode"
             >
-              📑
+              {activeViewMode === 'edit' ? '📖' : '✏️'}
             </button>
           )}
 
@@ -485,7 +499,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
         </div>
       </div>
 
-      {/* 主体预览舞台 (与文件预览区共用同一套高保真渲染引擎) */}
+      {/* 主体预览/编辑舞台 (由 CodeEditorTab 驱动，满血具备撤销、黄色搜索高亮与替换功能) */}
       <div
         class="preview-viewport-stage"
         onDragOver={(e) => {
@@ -503,7 +517,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
           } catch {}
         }}
       >
-        {tabs.length === 0 ? (
+        {tabs.length === 0 || !activeTab ? (
           <div class="preview-empty-stage">
             <div class="preview-empty-box">
               <div class="preview-empty-icon">👁️</div>
@@ -515,43 +529,15 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
               </div>
             </div>
           </div>
-        ) : loading ? (
-          <div class="preview-loading-stage">
-            <div class="git-spinner" />
-            <span>{t('git.loading') || '加载中...'}</span>
-          </div>
-        ) : loadError ? (
-          <div class="preview-error-stage">
-            <div class="preview-error-icon">⚠️</div>
-            <div class="preview-error-text">{loadError}</div>
-            <button
-              type="button"
-              class="preview-retry-btn"
-              onClick={() => setRefreshTrigger((n) => n + 1)}
-            >
-              {t('common.retry') || '重试'}
-            </button>
-          </div>
-        ) : isImage ? (
-          <div class="preview-image-stage">
-            <img
-              src={`/fs/raw?path=${encodeURIComponent(activeTab!.filePath)}`}
-              alt={activeTab!.fileName}
-              class="preview-img-element"
-            />
-          </div>
-        ) : isMarkdown ? (
-          <div class="preview-markdown-stage">
-            <Markdown content={content} basePath={activeTab!.filePath} targetContext="right" />
-          </div>
         ) : (
-          <div class="preview-code-stage">
-            <Markdown
-              content={`\`\`\`${activeExt || 'text'}\n${content}\n\`\`\``}
-              basePath={activeTab!.filePath}
-              targetContext="right"
-            />
-          </div>
+          <CodeEditorTab
+            key={`${activeTab.filePath}_${activeTab.id}_${refreshTrigger}`}
+            filePath={activeTab.filePath}
+            cwd={cwd}
+            defaultViewMode="preview"
+            onViewModeChange={(m) => setActiveViewMode(m)}
+            hideHeaderToolbar={true}
+          />
         )}
       </div>
     </div>

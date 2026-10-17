@@ -69,6 +69,21 @@ function normalizePath(rawPath: string): string {
   return (hasDrive ? '' : lineCleaned.startsWith('/') ? '/' : '') + stack.join('/');
 }
 
+/**
+ * 智能识别一段文本是否是项目源码/资源文件路径
+ */
+export function isFilePathSnippet(text: string): boolean {
+  const t = text.trim();
+  if (t.length < 3 || t.length > 260) return false;
+  if (t.includes(' ') || t.includes('\n') || t.includes('\t')) return false;
+  return (
+    /^[\w.\-\\/]+?\.(md|markdown|rs|ts|tsx|js|jsx|json|toml|yaml|yml|py|go|html|css|sh|bash|txt|lock|svg|png|jpg|jpeg)(:\d+)?$/i.test(t) ||
+    /^[a-zA-Z]:[\\/][\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t) ||
+    /^\/[\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t) ||
+    /^(crates|src|webui|packages|desktop|docs|scripts)\/[\w.\-\\/]+$/i.test(t)
+  );
+}
+
 // 解析目标文件路径 (全面支持 Windows/POSIX 绝对路径与基于 basePath / cwd 的相对路径)
 function resolveTargetFile(href: string, basePath?: string, cwd?: string): string {
   const clean = href.trim().replace(/^['"`]|['"`]$/g, '').replace(/\\/g, '/');
@@ -203,6 +218,79 @@ export function Markdown({
     };
   }, [renderedHtml, isDark, lang, basePath]);
 
+  // 智能扫描并标记画布上的文件引用胶囊徽章与 Web 链接，赋予高级胶囊动效、手形与无障碍聚焦
+  useEffect(() => {
+    if (!rootRef.current) return;
+    const codes = rootRef.current.querySelectorAll<HTMLElement>(':not(pre) > code');
+    codes.forEach((code) => {
+      const text = (code.textContent || '').trim();
+      if (/^(https?:|\/\/)/i.test(text) || /^www\./i.test(text)) {
+        code.classList.add('file-path-badge', 'web-link-badge');
+        code.setAttribute('title', `${text} (${t('preview.clickToOpenExternal')})`);
+        code.setAttribute('tabindex', '0');
+        code.setAttribute('role', 'link');
+      } else if (isFilePathSnippet(text)) {
+        code.classList.add('file-path-badge');
+        code.setAttribute('title', `${text} (${t('preview.clickToPreview')})`);
+        code.setAttribute('tabindex', '0');
+        code.setAttribute('role', 'button');
+      }
+    });
+
+    const links = rootRef.current.querySelectorAll<HTMLElement>('a[href]');
+    links.forEach((a) => {
+      a.classList.add('markdown-link-pill');
+    });
+  }, [renderedHtml]);
+
+  // 监听鼠标长按拖拽划词事件：拖选文字时光标自适应切换为点击形 (text)，松开即恢复
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    let isMouseDown = false;
+    let downX = 0;
+    let downY = 0;
+    let activeBadge: HTMLElement | null = null;
+
+    const handleMouseDown = (e: MouseEvent) => {
+      const badge = (e.target as HTMLElement)?.closest('.file-path-badge, a[href]') as HTMLElement | null;
+      if (badge) {
+        isMouseDown = true;
+        downX = e.clientX;
+        downY = e.clientY;
+        activeBadge = badge;
+      }
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isMouseDown || !activeBadge) return;
+      const dx = Math.abs(e.clientX - downX);
+      const dy = Math.abs(e.clientY - downY);
+      if (dx > 3 || dy > 3) {
+        activeBadge.classList.add('is-selecting');
+      }
+    };
+
+    const handleMouseUp = () => {
+      isMouseDown = false;
+      if (activeBadge) {
+        activeBadge.classList.remove('is-selecting');
+        activeBadge = null;
+      }
+    };
+
+    root.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      root.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [renderedHtml]);
+
   function onClick(e: MouseEvent) {
     const targetEl = e.target as HTMLElement;
 
@@ -230,22 +318,51 @@ export function Markdown({
       return;
     }
 
-    // 2. 拦截文件引用链接、Markdown超链接与行内代码路径识别
+    // 2. 拦截文件引用链接、Markdown超链接与行内代码路径/链接识别
     const clickable = targetEl?.closest('a[href], .file-preview-link, code') as HTMLElement | null;
     if (clickable) {
       let href = clickable.getAttribute('href') || clickable.dataset.filePath || '';
-      // 如果点击的是行内 code 标签，智能检测其内容是否是文件路径
+      // 如果点击的是行内 code 标签，智能检测其内容是否是 Web 链接或文件路径
       if (!href && clickable.tagName?.toLowerCase() === 'code') {
         const text = (clickable.textContent || '').trim();
-        const isPath = /^[\w.\-\\/]+?\.(md|markdown|rs|ts|tsx|js|jsx|json|toml|yaml|yml|py|go|html|css|sh|bash|txt|lock|svg|png|jpg|jpeg)(:\d+)?$/i.test(text) ||
-          /^[a-zA-Z]:[\\/][\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(text) ||
-          /^\/[\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(text);
-        if (isPath) {
+        if (/^(https?:|\/\/)/i.test(text) || /^www\./i.test(text)) {
+          href = text;
+        } else if (isFilePathSnippet(text)) {
           href = text;
         }
       }
 
+      // (A) 外部 Web 链接：在系统默认原始浏览器中弹出打开 (Tauri 桌面壳自动由 on_new_window 接管)
+      if (href && (/^(https?:|\/\/)/i.test(href) || /^www\./i.test(href))) {
+        const sel = window.getSelection()?.toString().trim();
+        if (sel && sel.length > 0) {
+          return;
+        }
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        let targetUrl = href.trim();
+        if (targetUrl.startsWith('//')) {
+          targetUrl = 'https:' + targetUrl;
+        } else if (/^www\./i.test(targetUrl)) {
+          targetUrl = 'https://' + targetUrl;
+        }
+
+        try {
+          window.open(targetUrl, '_blank', 'noopener,noreferrer');
+        } catch {}
+        return;
+      }
+
+      // (B) 本地文件路径引用：在预览或主编辑区打开
       if (href && !href.startsWith('#') && !/^(https?:|mailto:|\/\/)/i.test(href)) {
+        // 如果用户正在划词选择复制文字，或者刚刚拖选了文字，绝不触发打开文件，保护复制体验
+        const sel = window.getSelection()?.toString().trim();
+        if (sel && sel.length > 0) {
+          return;
+        }
+
         e.preventDefault();
         e.stopPropagation();
 
@@ -314,11 +431,21 @@ export function Markdown({
     }
   }
 
+  function onKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      const targetEl = e.target as HTMLElement;
+      if (targetEl?.classList.contains('file-path-badge')) {
+        targetEl.click();
+      }
+    }
+  }
+
   return (
     <div
       ref={rootRef}
       class="markdown-root assistant-message-content"
       onClick={onClick}
+      onKeyDown={onKeyDown}
       dangerouslySetInnerHTML={{ __html: renderedHtml }}
     />
   );

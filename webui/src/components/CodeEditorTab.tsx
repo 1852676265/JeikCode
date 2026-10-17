@@ -17,6 +17,9 @@ export interface CodeEditorTabProps {
   filePath: string;
   onClose?: () => void;
   cwd?: string;
+  defaultViewMode?: 'edit' | 'preview';
+  onViewModeChange?: (mode: 'edit' | 'preview') => void;
+  hideHeaderToolbar?: boolean;
 }
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
@@ -28,7 +31,14 @@ const BINARY_EXTS = new Set([
   'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
 ]);
 
-export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
+export function CodeEditorTab({
+  filePath,
+  onClose,
+  cwd,
+  defaultViewMode,
+  onViewModeChange,
+  hideHeaderToolbar = false,
+}: CodeEditorTabProps) {
   const t = useT();
   const ext = useMemo(() => (filePath.split('.').pop() || '').toLowerCase(), [filePath]);
   const isImage = useMemo(() => IMAGE_EXTS.has(ext), [ext]);
@@ -107,27 +117,61 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
     return /\.md$/i.test(filePath) || /\.markdown$/i.test(filePath);
   }, [filePath]);
 
-  const [viewMode, setViewMode] = useState<'edit' | 'preview' | 'image' | 'binary'>(() => {
+  const [viewMode, setViewModeState] = useState<'edit' | 'preview' | 'image' | 'binary'>(() => {
     if (isImage && !isSvg) return 'image';
     if (isSvg) return 'image';
     if (isBinary) return 'binary';
-    return 'edit';
+    return defaultViewMode || (isMarkdown ? 'preview' : 'edit');
   });
 
   // 图片预览与缩放状态
   const [imgScale, setImgScale] = useState<number>(1.0);
   const [imgDimensions, setImgDimensions] = useState<{ w: number; h: number } | null>(null);
 
-  // 当 filePath 切换时，重置所有视图模式与图片状态，彻底杜绝模式污染！
+  const setViewMode = useCallback(
+    (updater: 'edit' | 'preview' | 'image' | 'binary' | ((prev: 'edit' | 'preview' | 'image' | 'binary') => 'edit' | 'preview' | 'image' | 'binary')) => {
+      setViewModeState((prev) => {
+        const next = typeof updater === 'function' ? updater(prev) : updater;
+        if (next === 'edit' || next === 'preview') {
+          onViewModeChange?.(next);
+        }
+        return next;
+      });
+    },
+    [onViewModeChange],
+  );
+
+  // 当 filePath 切换时，重置视图模式与图片缩放，优先使用外部传入的 defaultViewMode
   useEffect(() => {
-    if (isImage && !isSvg) setViewMode('image');
-    else if (isSvg) setViewMode('image');
-    else if (isBinary) setViewMode('binary');
-    else if (isMarkdown) setViewMode('preview');
-    else setViewMode('edit');
+    if (isImage && !isSvg) setViewModeState('image');
+    else if (isSvg) setViewModeState('image');
+    else if (isBinary) setViewModeState('binary');
+    else if (defaultViewMode) {
+      setViewModeState(defaultViewMode);
+      onViewModeChange?.(defaultViewMode);
+    } else if (isMarkdown) {
+      setViewModeState('preview');
+      onViewModeChange?.('preview');
+    } else {
+      setViewModeState('edit');
+      onViewModeChange?.('edit');
+    }
     setImgScale(1.0);
     setImgDimensions(null);
-  }, [filePath, isImage, isSvg, isBinary, isMarkdown]);
+  }, [filePath, isImage, isSvg, isBinary, isMarkdown, defaultViewMode, onViewModeChange]);
+
+  // 监听外部触发的视图切换广播 (例如右侧面板顶栏铅笔图标点击)
+  useEffect(() => {
+    const handleToggle = () => {
+      const next = viewMode === 'edit' ? 'preview' : 'edit';
+      setViewMode(next);
+      showToast(next === 'preview' ? t('editor.switchToPreview') : t('editor.switchToEdit'), 'info');
+    };
+    window.addEventListener(`jeikcode:editor:toggle_mode:${filePath}`, handleToggle);
+    return () => {
+      window.removeEventListener(`jeikcode:editor:toggle_mode:${filePath}`, handleToggle);
+    };
+  }, [viewMode, filePath, setViewMode]);
 
   // 图片预览模式下 Ctrl + 鼠标滚轮缩放图片
   const handleImageWheel = (e: WheelEvent) => {
@@ -495,13 +539,12 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
         handleFormat();
         return;
       }
-      // Ctrl+Shift+V (切换 Markdown 预览/代码模式)
+      // Ctrl+Shift+V (切换预览/代码编辑模式，对齐主面板与右侧面板)
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'v') {
-        if (isMarkdown) {
-          e.preventDefault();
-          setViewMode((m) => (m === 'edit' ? 'preview' : 'edit'));
-          showToast(viewMode === 'edit' ? '切换为 Markdown 预览模式' : '切换为代码编辑模式', 'info');
-        }
+        e.preventDefault();
+        const next = viewMode === 'edit' ? 'preview' : 'edit';
+        setViewMode(next);
+        showToast(next === 'preview' ? t('editor.switchToPreview') : t('editor.switchToEdit'), 'info');
         return;
       }
       // Ctrl+F
@@ -624,7 +667,8 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
       }}
     >
       {/* 顶部工具栏 */}
-      <div class="code-editor-toolbar">
+      {!hideHeaderToolbar && (
+        <div class="code-editor-toolbar">
         <div class="editor-file-info">
           <span class="editor-file-badge">{fileName.split('.').pop()?.toUpperCase() || 'FILE'}</span>
           <span class="editor-file-name">{fileName}</span>
@@ -828,6 +872,7 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
           )}
         </div>
       </div>
+      )}
 
       {/* 搜索与替换浮动条 (标准上下双行 VS Code 经典排版) */}
       {findOpen && (
@@ -1070,8 +1115,9 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
               </pre>
               <textarea
                 ref={textareaRef}
-                class="editor-textarea"
+                class={'editor-textarea' + (viewMode === 'preview' ? ' is-preview-readonly' : '')}
                 value={content}
+                readOnly={viewMode === 'preview'}
                 onDragOver={(e) => {
                   e.preventDefault();
                   if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';

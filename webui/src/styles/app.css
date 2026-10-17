@@ -4645,6 +4645,62 @@ body {
   background: rgba(255, 255, 255, 0.09) !important;
   color: #f3f4f6 !important;
   border: none !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+/* 引用文件路径与超链接胶囊：高级微浮动动效、手形光标与划选自适应 */
+.markdown-root :not(pre) > code.file-path-badge,
+.markdown-root a[href] {
+  display: inline-block;
+  vertical-align: baseline;
+  cursor: pointer;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              background 0.18s ease,
+              color 0.18s ease;
+  will-change: transform, box-shadow;
+}
+
+.markdown-root a[href] {
+  color: var(--app-link-color, #58a6ff);
+  text-decoration: none !important;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+
+.markdown-root :not(pre) > code.file-path-badge:hover,
+.markdown-root :not(pre) > code.file-path-badge:focus,
+.markdown-root :not(pre) > code.file-path-badge:focus-visible {
+  outline: none;
+  transform: translateY(-1.5px);
+  background: rgba(255, 255, 255, 0.16) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(255, 255, 255, 0.18);
+}
+
+.markdown-root a[href]:hover,
+.markdown-root a[href]:focus,
+.markdown-root a[href]:focus-visible {
+  outline: none;
+  transform: translateY(-1.5px);
+  text-decoration: none !important;
+  background: rgba(56, 139, 253, 0.15) !important;
+  color: #79c0ff !important;
+  box-shadow: 0 4px 10px rgba(56, 139, 253, 0.2), 0 0 0 1px rgba(56, 139, 253, 0.3);
+}
+
+.markdown-root :not(pre) > code.file-path-badge:active,
+.markdown-root a[href]:active {
+  transform: translateY(0.5px) scale(0.985);
+  cursor: text;
+}
+
+/* 长按拖动选中文字复制时光标变回点击形 (text)，不影响复制 */
+.markdown-root :not(pre) > code.file-path-badge.is-selecting,
+.markdown-root a[href].is-selecting,
+.markdown-root :not(pre) > code.file-path-badge::selection,
+.markdown-root a[href]::selection {
+  cursor: text !important;
 }
 .markdown-root pre,
 .markdown-root pre code,
@@ -14019,6 +14075,21 @@ body {
   border: none !important;
   font-weight: 600;
 }
+
+:root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge:hover,
+:root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge:focus,
+:root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge:focus-visible {
+  background: rgba(15, 23, 42, 0.13) !important;
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.09), 0 0 0 1px rgba(15, 23, 42, 0.15);
+}
+
+:root[data-theme='light'] .markdown-root a[href]:hover,
+:root[data-theme='light'] .markdown-root a[href]:focus,
+:root[data-theme='light'] .markdown-root a[href]:focus-visible {
+  background: rgba(37, 99, 235, 0.1) !important;
+  color: #1d4ed8 !important;
+  box-shadow: 0 4px 10px rgba(37, 99, 235, 0.15), 0 0 0 1px rgba(37, 99, 235, 0.25);
+}
 :root[data-theme='light'] .markdown-root blockquote {
   background: #f0f7ff !important;
   border-left-color: #2563eb !important;
@@ -14492,13 +14563,36 @@ body {
 /* ============================================================================
    GitHub Webhook & Auto Review Modal Styling
    ============================================================================ */
+.git-webhook-modal-overlay {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 16px !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+}
+
 .git-webhook-modal-card {
-  width: min(840px, 96vw) !important;
-  max-height: 88vh !important;
+  width: min(860px, 96vw) !important;
+  max-height: min(880px, calc(100dvh - 32px)) !important;
+  display: flex !important;
+  flex-direction: column !important;
   background: var(--app-menu-background, #18181b);
   border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.12));
   border-radius: 12px;
   box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+  overflow: hidden !important;
+  box-sizing: border-box !important;
+}
+
+.git-webhook-body {
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  padding: 16px 20px !important;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .git-badge-tag {
@@ -14519,6 +14613,79 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* 总启用开关卡片横幅 */
+.git-enable-switch-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  background: var(--app-card-background, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  gap: 12px;
+  transition: all 0.15s ease;
+}
+
+.git-enable-switch-banner:hover {
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.05));
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.git-enable-switch-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+  flex: 1;
+}
+
+.git-enable-switch-label input[type='checkbox'] {
+  margin-top: 3px;
+  accent-color: #10b981;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.git-enable-switch-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-enable-switch-text strong {
+  font-size: 13px;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-weight: 600;
+}
+
+.git-enable-switch-text span {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #a1a1aa);
+  line-height: 1.4;
+}
+
+.git-enable-status-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.git-enable-status-badge.active {
+  background: color-mix(in srgb, #10b981 18%, transparent);
+  color: #34d399;
+  border: 1px solid color-mix(in srgb, #10b981 30%, transparent);
+}
+
+.git-enable-status-badge.inactive {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--app-secondary-foreground, #71717a);
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
 }
 
 .git-banner-row {
@@ -15130,6 +15297,84 @@ body {
   border-color: #3b82f6;
   background: rgba(59, 130, 246, 0.12);
   box-shadow: 0 0 0 1px #3b82f6;
+}
+
+/* 连体单行 Webhook 地址输入组 (输入框 + 固定 /api/webhooks/git 徽章 + 复制按钮) */
+.git-webhook-input-group {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  align-items: stretch !important;
+  width: 100% !important;
+  height: 34px !important;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.git-webhook-input-group:focus-within {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.git-group-input {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  width: 0 !important;
+  height: 100% !important;
+  padding: 0 10px !important;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-family: var(--app-monospace-font-family, monospace);
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+.git-group-input::placeholder {
+  color: var(--app-secondary-foreground, #71717a);
+  font-family: var(--app-monospace-font-family, monospace);
+  font-size: 11.5px;
+}
+
+.git-group-addon {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0 10px !important;
+  background: var(--app-card-background, rgba(255, 255, 255, 0.05));
+  border-left: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-right: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  color: #60a5fa;
+  font-family: var(--app-monospace-font-family, monospace);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap !important;
+  user-select: none;
+  flex-shrink: 0 !important;
+}
+
+.git-group-btn {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0 12px !important;
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.08));
+  border: none !important;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap !important;
+  flex-shrink: 0 !important;
+  transition: all 0.15s ease;
+}
+
+.git-group-btn:hover {
+  background: var(--app-hover-bg, rgba(255, 255, 255, 0.15));
+  color: #38bdf8;
 }
 
 
