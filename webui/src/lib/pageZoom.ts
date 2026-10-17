@@ -32,12 +32,18 @@ export function setPageZoom(newZoom: number, showFeedback = true) {
   // 夹在最小 50% 和最大 300% 之间
   const clamped = Math.max(0.5, Math.min(3.0, Math.round(newZoom * 100) / 100));
   currentZoom = clamped;
+  const inv = 1 / clamped;
+  document.documentElement.style.setProperty('--app-zoom', String(clamped));
+  document.documentElement.style.setProperty('--app-zoom-inv', String(inv));
   (document.documentElement.style as any).zoom = String(clamped);
   try {
     localStorage.setItem(ZOOM_STORAGE_KEY, String(clamped));
   } catch {}
   if (showFeedback) {
     showZoomIndicator(clamped);
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('jeikcode:zoom_change', { detail: clamped }));
   }
 }
 
@@ -59,6 +65,36 @@ export function resetZoom() {
   setPageZoom(1.0);
 }
 
+const EDITOR_FONT_STORAGE_KEY = 'jeikcode:editor_fontsize';
+
+export function getEditorFontSize(): number {
+  try {
+    const saved = localStorage.getItem(EDITOR_FONT_STORAGE_KEY);
+    if (saved) {
+      const sz = parseInt(saved, 10);
+      if (!isNaN(sz) && sz >= 10 && sz <= 32) return sz;
+    }
+  } catch {}
+  return 13;
+}
+
+export function changeEditorFontSize(delta: number): number {
+  const current = getEditorFontSize();
+  const next = Math.max(10, Math.min(32, current + delta));
+  try {
+    localStorage.setItem(EDITOR_FONT_STORAGE_KEY, String(next));
+  } catch {}
+  document.documentElement.style.setProperty('--app-editor-font-size', `${next}px`);
+  document.documentElement.style.setProperty('--app-editor-line-height', `${Math.round(next * 1.54)}px`);
+  return next;
+}
+
+export function initEditorFontSize() {
+  const sz = getEditorFontSize();
+  document.documentElement.style.setProperty('--app-editor-font-size', `${sz}px`);
+  document.documentElement.style.setProperty('--app-editor-line-height', `${Math.round(sz * 1.54)}px`);
+}
+
 /**
  * 初始化全局缩放监听：
  * 1. Ctrl + 鼠标滚轮 -> 步进缩放
@@ -67,7 +103,6 @@ export function resetZoom() {
  * 4. Ctrl + '0' -> 重置为 100%
  */
 export function initPageZoom() {
-  // 读取已保存的缩放比例
   try {
     const saved = localStorage.getItem(ZOOM_STORAGE_KEY);
     if (saved) {
@@ -78,11 +113,15 @@ export function initPageZoom() {
     }
   } catch {}
 
-  // 1. Ctrl + 鼠标滚轮
+  // 1. Ctrl + 鼠标滚轮 (终端内部独立缩放，跳过全局网页缩放)
   window.addEventListener(
     'wheel',
     (e: WheelEvent) => {
       if (e.ctrlKey || e.metaKey) {
+        const target = e.target as HTMLElement | null;
+        if (target && target.closest('.terminal-panel-root, .terminal-screen, .xterm, .code-editor-root, .editor-code-container, .vscode-diff-view-stage')) {
+          return;
+        }
         e.preventDefault();
         if (e.deltaY < 0) {
           zoomIn();

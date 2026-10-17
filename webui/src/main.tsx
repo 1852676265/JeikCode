@@ -2,7 +2,7 @@ import { render } from 'preact';
 import { App } from './app';
 import { SettingsProvider } from './settings';
 import { ensureRandomUUIDPolyfill } from './lib/randomId';
-import { initPageZoom } from './lib/pageZoom';
+import { initPageZoom, initEditorFontSize } from './lib/pageZoom';
 // Bundled serif for the landing greeting (close to claude.ai's display serif).
 import '@fontsource/source-serif-4/400.css';
 import '@fontsource/source-serif-4/500.css';
@@ -29,6 +29,8 @@ ensureRandomUUIDPolyfill();
 
 // 初始化类似 Chrome 的页面缩放（Ctrl + 滚轮 / 快捷键）
 initPageZoom();
+// 初始化代码编辑/预览全局字号
+initEditorFontSize();
 
 render(
   <SettingsProvider>

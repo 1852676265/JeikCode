@@ -37,6 +37,7 @@ export interface SlashHandlers {
   execServerCommand(command: string, arg: string): void | Promise<void>;
   mcpCommand(arg: string): void | Promise<void>;
   t(key: string, params?: Record<string, string | number>): string;
+  initProject?(): void | Promise<void>;
 }
 
 export interface SlashCommandDef {
@@ -51,6 +52,7 @@ export interface SlashCommandDef {
 export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'plan', descKey: 'cmd.plan.desc', run: (_a, h) => h.setMode('plan') },
   { name: 'build', descKey: 'cmd.build.desc', run: (_a, h) => h.setMode('build') },
+  { name: 'init', descKey: 'cmd.init.desc', run: (_a, h) => h.initProject?.() },
   {
     name: 'model',
     descKey: 'cmd.model.desc',

@@ -730,5 +730,84 @@ test('a replayed plan call never reverts a completed list once its call id is ap
   assert.deepEqual(replayedUpdate, completed, '整轮重放后状态一字不变（幂等）');
 });
 
+test('applyTodoAction preserves in-progress list when batch adds multiple items', () => {
+  const initialList: TodoItem[] = [
+    { content: 'task-1', status: 'completed' },
+    { content: 'task-2', status: 'completed' },
+    { content: 'task-3', status: 'in_progress' },
+  ];
+
+  const followUpArgs = JSON.stringify({
+    actions: [
+      { action: 'update', id: 3, status: 'completed' },
+      { action: 'add', content: 'task-4' },
+      { action: 'add', content: 'task-5' },
+      { action: 'add', content: 'task-6' },
+    ],
+  });
+
+  const next = applyTodoAction(initialList, followUpArgs);
+  assert.equal(next.length, 6, '进行中的任务列表在追加多个任务时绝不能被清空');
+  assert.equal(next[0]?.content, 'task-1');
+  assert.equal(next[2]?.content, 'task-3');
+  assert.equal(next[2]?.status, 'completed');
+  assert.equal(next[3]?.content, 'task-4');
+  assert.equal(next[5]?.content, 'task-6');
+});
+
+test('reduceTodosFromCalls preserves in-progress list across mid-turn multi-add batches', () => {
+  const calls = [
+    {
+      name: 'todo_write',
+      args: JSON.stringify({
+        actions: [
+          { action: 'add', content: 'task-1', status: 'completed' },
+          { action: 'add', content: 'task-2', status: 'completed' },
+          { action: 'add', content: 'task-3', status: 'in_progress' },
+        ],
+      }),
+    },
+    {
+      name: 'todo_write',
+      args: JSON.stringify({
+        actions: [
+          { action: 'update', id: 3, status: 'completed' },
+          { action: 'add', content: 'task-4' },
+          { action: 'add', content: 'task-5' },
+          { action: 'add', content: 'task-6' },
+        ],
+      }),
+    },
+  ];
+
+  const reduced = reduceTodosFromCalls(calls);
+  assert.equal(reduced.length, 6, 'reduceTodosFromCalls 遇到多项追加批次不得作为 baseline 抹除既有任务');
+  assert.equal(reduced[0]?.content, 'task-1');
+  assert.equal(reduced[2]?.content, 'task-3');
+  assert.equal(reduced[2]?.status, 'completed');
+  assert.equal(reduced[3]?.content, 'task-4');
+  assert.equal(reduced[5]?.content, 'task-6');
+});
+
+test('applyTodoAction auto-clears completed list when new batch adds multiple items', () => {
+  const finishedList: TodoItem[] = [
+    { content: 'old-1', status: 'completed' },
+    { content: 'old-2', status: 'completed' },
+  ];
+
+  const newPlanArgs = JSON.stringify({
+    actions: [
+      { action: 'add', content: 'new-1' },
+      { action: 'add', content: 'new-2' },
+    ],
+  });
+
+  const next = applyTodoAction(finishedList, newPlanArgs);
+  assert.equal(next.length, 2, '全部已完成的旧列表在开启新批量任务时应自动清除');
+  assert.equal(next[0]?.content, 'new-1');
+  assert.equal(next[1]?.content, 'new-2');
+});
+
+
 
 

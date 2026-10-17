@@ -34,30 +34,76 @@ export function ConfirmDialog({
   body,
   confirmLabel = '确定',
   cancelLabel = '取消',
-  icon = '🗑',
+  icon,
   danger = true,
   alertOnly = false,
   input,
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
+  const displayIcon = icon ?? (danger ? '🗑' : '💡');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [inputValue, setInputValue] = useState(input?.defaultValue ?? '');
   const inputRef = useRef<HTMLInputElement>(null);
+  const cancelBtnRef = useRef<HTMLButtonElement>(null);
+  const confirmBtnRef = useRef<HTMLButtonElement>(null);
+  const [selectedOption, setSelectedOption] = useState<'cancel' | 'confirm'>('confirm');
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape' && !busy) onClose();
+      if (busy) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      // 如果焦点在输入框中，左右键由文本框自行移动光标
+      if (input && document.activeElement === inputRef.current) {
+        return;
+      }
+      // 支持方向键左右切换选项
+      if (!alertOnly) {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          setSelectedOption('cancel');
+          cancelBtnRef.current?.focus();
+          return;
+        }
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          setSelectedOption('confirm');
+          confirmBtnRef.current?.focus();
+          return;
+        }
+      }
+      // 回车确认当前选中的选项
+      if (e.key === 'Enter') {
+        if (
+          document.activeElement === cancelBtnRef.current ||
+          (!alertOnly && selectedOption === 'cancel' && document.activeElement !== confirmBtnRef.current)
+        ) {
+          e.preventDefault();
+          onClose();
+        } else {
+          e.preventDefault();
+          void handleConfirm();
+        }
+      }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [busy, onClose]);
+  }, [busy, onClose, alertOnly, selectedOption, input]);
 
   useEffect(() => {
-    if (input && inputRef.current) {
-      inputRef.current.focus();
-      inputRef.current.select();
+    if (input) {
+      if (inputRef.current) {
+        inputRef.current.focus();
+        inputRef.current.select();
+      }
+    } else {
+      // 默认聚焦在确认按钮上，用户可直接回车确认或用方向键切换到取消
+      confirmBtnRef.current?.focus();
     }
   }, [input]);
 
@@ -83,7 +129,7 @@ export function ConfirmDialog({
     >
       <div class="modal-card modal-card-sm" role="dialog" aria-modal="true">
         <div class="modal-header">
-          <span style="font-size: 16px;">{icon}</span>
+          <span style="font-size: 16px;">{displayIcon}</span>
           <h3>{title}</h3>
           <button class="ghost-btn modal-close" onClick={onClose} aria-label={cancelLabel}>
             ×
@@ -114,14 +160,24 @@ export function ConfirmDialog({
         </div>
         <div class="modal-footer">
           {!alertOnly && (
-            <button class="btn btn-secondary" onClick={onClose} disabled={busy}>
+            <button
+              ref={cancelBtnRef}
+              class={`btn btn-secondary ${selectedOption === 'cancel' ? 'modal-btn-selected' : ''}`}
+              onClick={onClose}
+              onFocus={() => setSelectedOption('cancel')}
+              disabled={busy}
+              style={selectedOption === 'cancel' ? { outline: '2px solid var(--app-primary, #3b82f6)', outlineOffset: '2px' } : undefined}
+            >
               {cancelLabel}
             </button>
           )}
           <button
-            class={'btn ' + (danger ? 'btn-danger' : 'btn-primary')}
+            ref={confirmBtnRef}
+            class={`btn ${danger ? 'btn-danger' : 'btn-primary'} ${selectedOption === 'confirm' ? 'modal-btn-selected' : ''}`}
             onClick={handleConfirm}
+            onFocus={() => setSelectedOption('confirm')}
             disabled={busy}
+            style={selectedOption === 'confirm' ? { outline: '2px solid var(--app-primary, #3b82f6)', outlineOffset: '2px' } : undefined}
           >
             {confirmLabel}
           </button>

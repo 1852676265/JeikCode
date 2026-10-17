@@ -182,7 +182,7 @@ class ProjectGitManager {
       forceAll?: boolean;
       filterBranch?: string;
     } = {},
-  ): void {
+  ): Promise<void> {
     const key = this.normalizeKey(cwd);
     let inflight = this.inflights.get(key);
     if (!inflight) {
@@ -298,12 +298,15 @@ class ProjectGitManager {
     };
 
     if (options.immediate) {
-      void run();
+      return run();
     } else {
-      inflight.debounceTimer = window.setTimeout(() => {
-        if (inflight) inflight.debounceTimer = null;
-        void run();
-      }, 500); // 500ms 纯事件驱动防抖
+      return new Promise<void>((resolve) => {
+        inflight.debounceTimer = window.setTimeout(async () => {
+          if (inflight) inflight.debounceTimer = null;
+          await run();
+          resolve();
+        }, 500); // 500ms 纯事件驱动防抖
+      });
     }
   }
 
@@ -418,23 +421,23 @@ class ProjectGitManager {
   }
 
   /**
-   * 接收来自 /live SSE 广播的增量事件（支持异地多设备协同）
+   * 接收来自 /events SSE 广播的增量事件（支持异地多设备协同）
    */
   public handleRemoteUpdate(data: { cwd?: string; version?: number; force?: boolean }): void {
     const key = this.normalizeKey(data.cwd);
     const remoteVer = data.version ?? 0;
     const cur = this.getState(key);
 
-    if (remoteVer <= cur.version && !data.force) {
+    if (remoteVer > 0 && remoteVer <= cur.version && !data.force) {
       return;
     }
 
     if (this.hasSubscribers(key)) {
-      // 当前设备正打开着 Git 面板，平滑防抖刷新
-      this.scheduleRefresh(key, { immediate: Boolean(data.force), reason: 'remote_broadcast' });
+      // 当前设备正打开着 Git 面板，立即强制刷新
+      void this.scheduleRefresh(key, { immediate: true, forceAll: true, reason: 'remote_broadcast' });
     } else {
       // 当前设备处于折叠状态，仅记下版本号，0次网络开销，等用户点开时才拉取
-      this.pendingVersions.set(key, remoteVer);
+      this.pendingVersions.set(key, remoteVer || cur.version + 1);
     }
   }
 }

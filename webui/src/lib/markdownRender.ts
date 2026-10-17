@@ -6,6 +6,7 @@ import {
   stripLanguageSentinel,
 } from './markdownPrep.ts';
 import { extractMath, restoreMath } from './markdownMath.ts';
+import { highlightCode } from './codeHighlight.ts';
 
 export { preprocessMarkdown } from './markdownPrep.ts';
 
@@ -75,7 +76,7 @@ renderer.blockquote = function (quote: string) {
   );
 };
 
-renderer.code = function (code: string, infostring?: string) {
+function renderCodeBlock(code: string, infostring?: string, enableHighlight = false): string {
   let text = code ?? '';
   if (!text.trim()) return '';
   const rawLang = (infostring ?? '').split(/\s+/)[0]?.toLowerCase() ?? '';
@@ -92,7 +93,11 @@ renderer.code = function (code: string, infostring?: string) {
     return `<div class="mermaid-diagram-mount" data-mermaid-code="${encoded}"></div>\n`;
   }
 
-  const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // 对真实编程语言代码块注入语法高亮
+  const isPlainDoc = lang === 'markdown' || lang === 'md' || lang === 'txt' || lang === 'text' || lang === 'mermaid' || !lang;
+  const highlighted = (enableHighlight && !isPlainDoc)
+    ? highlightCode(text, `snippet.${lang}`)
+    : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const showLang = shouldShowCodeLanguage(lang);
   const langLabel = showLang
     ? `<span class="code-block-lang">${lang.replace(/[<>&"]/g, '')}</span>`
@@ -102,9 +107,19 @@ renderer.code = function (code: string, infostring?: string) {
     `<div class="code-block-toolbar">${langLabel}` +
     `<button class="copy-button" type="button" data-copy="${encodeURIComponent(text)}">Copy</button>` +
     `</div>` +
-    `<pre><code class="${normalizedLang ? `language-${normalizedLang}` : ''}">${esc}</code></pre>` +
+    `<pre><code class="${normalizedLang ? `language-${normalizedLang}` : ''}">${highlighted}</code></pre>` +
     `</div>`
   );
+}
+
+renderer.code = function (code: string, infostring?: string) {
+  return renderCodeBlock(code, infostring, false);
+};
+
+const highlightRenderer = new marked.Renderer();
+Object.assign(highlightRenderer, renderer);
+highlightRenderer.code = function (code: string, infostring?: string) {
+  return renderCodeBlock(code, infostring, true);
 };
 
 renderer.link = function (href: string, title: string | null | undefined, text: string) {
@@ -116,9 +131,10 @@ renderer.link = function (href: string, title: string | null | undefined, text: 
   return `<a href="${cleanHref}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}</a>`;
 };
 
-export function markdownToHtml(content: string): string {
+export function markdownToHtml(content: string, options?: { highlight?: boolean }): string {
   const extracted = extractMath(content ?? '');
   const preprocessed = preprocessMarkdown(extracted.text);
-  const html = marked.parse(preprocessed, { renderer }) as string;
+  const activeRenderer = options?.highlight ? highlightRenderer : renderer;
+  const html = marked.parse(preprocessed, { renderer: activeRenderer }) as string;
   return restoreMath(html, extracted.slots);
 }

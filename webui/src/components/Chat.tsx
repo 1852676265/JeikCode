@@ -45,6 +45,15 @@ import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
 import { showToast } from './Toast';
 import {
+  loadComposerDraft,
+  saveComposerDraft,
+  clearComposerDraft,
+  loadBubbleEditDraft,
+  saveBubbleEditDraft,
+  clearBubbleEditDraft,
+  type BubbleEditDraft,
+} from '../lib/composerDraft';
+import {
   parseSlashCommand,
   buildCommandMap,
   dispatchSlashCommand,
@@ -68,10 +77,14 @@ import { createPortal, lazy, Suspense } from 'preact/compat';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
+import { getPageZoom } from '../lib/pageZoom';
 
 // 动态懒加载非首屏必需的重型 Git / Diff 面板，削减初始 JS 主包体积，加速桌面端冷启动与弱网访问
 const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })));
 const DiffViewer = lazy(() => import('./DiffViewer').then((m) => ({ default: m.DiffViewer })));
+import { CodeEditorTab } from './CodeEditorTab';
+import { TerminalPanel } from './TerminalPanel';
+import { PreviewPanel } from './PreviewPanel';
 import {
   fetchGitFileDiff,
   fetchGitWorkingDiff,
@@ -948,7 +961,10 @@ export function Chat({
 }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
+  const initialDraft = loadComposerDraft(sessionId);
+  const [input, setInput] = useState(() => initialDraft?.text ?? '');
+  const inputRef = useRef(input);
+  inputRef.current = input;
   const [busy, setBusy] = useState(false);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
@@ -1481,13 +1497,22 @@ export function Chat({
   const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
   const nativeModeRef = useRef<ApprovalMode>('build');
   const protocolSessionRef = useRef(false);
-  const [pendingAttach, setPendingAttach] = useState<PendingAttach[]>([]);
+  const [pendingAttach, setPendingAttach] = useState<PendingAttach[]>(() =>
+    initialDraft?.images ? imagesToPending(initialDraft.images) : [],
+  );
+  const pendingAttachRef = useRef(pendingAttach);
+  pendingAttachRef.current = pendingAttach;
+  const initialBubbleDraft = sessionId ? loadBubbleEditDraft(sessionId) : null;
+  const [editingSourceIndex, setEditingSourceIndex] = useState<number | null>(() =>
+    initialBubbleDraft?.sourceIndex ?? null,
+  );
+  const [bubbleEditDraft, setBubbleEditDraft] = useState<BubbleEditDraft | null>(() => initialBubbleDraft);
+  const isFirstMountRef = useRef(true);
   const nativeFileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [attachError, setAttachError] = useState<string | null>(null);
-  const [editingSourceIndex, setEditingSourceIndex] = useState<number | null>(null);
   const [confirmModal, setConfirmModal] = useState<{
     open: boolean;
     title: string;
@@ -1495,6 +1520,7 @@ export function Chat({
     danger?: boolean;
     confirmLabel?: string;
     cancelLabel?: string;
+    icon?: string;
     onConfirm: () => Promise<void> | void;
   }>({
     open: false,
@@ -1592,6 +1618,25 @@ export function Chat({
     ta.style.height = 'auto';
     ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
   }, [input, historyContext]);
+
+  // 首次挂载时如果恢复了草稿，自适应调整 textarea 高度
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (ta && input) {
+      ta.style.height = 'auto';
+      ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
+    }
+  }, []);
+
+  // 实时持久化当前活动会话的输入框草稿（文字与图片附件），确保刷新或重启页面后不丢失
+  useEffect(() => {
+    if (activeIdRef.current === sessionId) {
+      saveComposerDraft(sessionId, {
+        text: input,
+        images: pendingImageData(pendingAttach),
+      });
+    }
+  }, [input, pendingAttach, sessionId]);
   const slashRef = useRef<HTMLDivElement>(null);
   const atRef = useRef<HTMLDivElement>(null);
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
@@ -1824,100 +1869,132 @@ export function Chat({
     // 本端是否已收到终态；决定流正常关闭后要不要补一次磁盘对账。
     let terminalSeen = false;
 
-    // 断点续传：有游标就续传（收到的全是新的）；新会话带 -1 让服务器跳过补发；
-    // 只有「无游标但画布有历史」（换设备/清缓存）才请求全量补发，并按身份幂等收敛。
-    const attachCursor = readStreamCursor(loadId);
-    const attachAfterSeq = resolveAfterSeq(attachCursor, messagesRef.current.length === 0);
-    const attachNeedsDedup = attachAfterSeq === undefined;
-    void watchChatSession(
-      loadId,
-      (event) => {
-        // 游标推进：回放帧带 seq，握手帧带 cursor。
-        if (typeof event.seq === 'number') writeStreamCursor(loadId, event.seq);
-        if (event.type === 'session_start') {
-          writeStreamCursor(loadId, event.cursor);
-          return;
-        }
-        // Ignore synthetic done events from clean idle/watch disconnects.
+    // 带游标自愈推流循环 (Self-Healing Stream with Cursor)：
+    // 彻底解决网络颠簸、TCP假死超时或无报错静默断流导致的“推流停止卡住”顽疾。
+    const runStreamWithAutoRecovery = async () => {
+      let retryCount = 0;
+      const maxRetries = 5;
+
+      while (!terminalSeen && !watchAbort.signal.aborted) {
         if (
-          event.type === 'done' &&
-          ((event as { stop_reason?: string }).stop_reason === 'not_active' ||
-            (event as { stop_reason?: string }).stop_reason === 'watch_closed')
+          sessionGenerationRef.current !== loadGeneration &&
+          !backgroundRunningSessionsRef.current.has(loadId)
         ) {
-          return;
+          break;
         }
 
-        const isCurrentView = activeIdRef.current === loadId;
-        if (isCurrentView) {
-          if (event.type === 'text' || event.type === 'reasoning') {
-            ensureAssistantBubbleForWatch();
-          }
-          // Reattach after refresh / sidebar switch. Server replay includes
-          // permission_request / user_input_request for every non-Auto mode that
-          // parks (Build / AcceptEdits / Plan). Must restore those modals or the
-          // turn deadlocks in WaitingApproval with a blinking cursor.
-          // 帧语义由「这次连接请求了什么」决定：续传/新会话收到的都是新内容，
-          // 直接画；只有主动请求全量补发时才按身份收敛去重。
-          handleEvent(event, {
-            requireReplayDedup: attachNeedsDedup,
-            repeatUserAfterSettled: false,
-          });
-          timelineFollow.changed();
-          if (
-            event.type === 'done' ||
-            event.type === 'stopped' ||
-            event.type === 'error'
-          ) {
-            terminalSeen = true;
-            // 游标是会话级的（跨回合严格递增），回合结束**不能**清 —— 清掉就丢掉了
-            // 断线期间的续传能力。只有会话变更（删/改/截断）才作废它。
-            sessionWatchersRef.current.delete(loadId);
-            localActiveStreamsBySessionRef.current.delete(loadId);
-            settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
-          }
-        } else {
-          // 对标 opencode 多会话后台推送体系：
-          // 当用户切至其他会话时，后台会话流实时将事件写入专属缓存 messageCacheRef！
-          applyEventToSessionCache(loadId, event);
-          if (
-            event.type === 'done' ||
-            event.type === 'stopped' ||
-            event.type === 'error'
-          ) {
-            sessionWatchersRef.current.delete(loadId);
-            localActiveStreamsBySessionRef.current.delete(loadId);
-            backgroundRunningSessionsRef.current.delete(loadId);
-            localTurnSessionsRef.current.delete(loadId);
-            onLiveRunningChange?.(loadId, false);
-          }
+        const attachCursor = readStreamCursor(loadId);
+        const attachAfterSeq = resolveAfterSeq(attachCursor, messagesRef.current.length === 0);
+        const attachNeedsDedup = attachAfterSeq === undefined;
+
+        try {
+          await watchChatSession(
+            loadId,
+            (event) => {
+              retryCount = 0; // 成功收到有效事件立即重置重试计数器
+              // 游标推进：回放帧带 seq，握手帧带 cursor。
+              if (typeof event.seq === 'number') writeStreamCursor(loadId, event.seq);
+              if (event.type === 'session_start') {
+                writeStreamCursor(loadId, event.cursor);
+                return;
+              }
+              // Ignore synthetic done events from clean idle/watch disconnects.
+              if (
+                event.type === 'done' &&
+                ((event as { stop_reason?: string }).stop_reason === 'not_active' ||
+                  (event as { stop_reason?: string }).stop_reason === 'watch_closed')
+              ) {
+                return;
+              }
+
+              const isCurrentView = activeIdRef.current === loadId;
+              if (isCurrentView) {
+                if (event.type === 'text' || event.type === 'reasoning') {
+                  ensureAssistantBubbleForWatch();
+                }
+                // Reattach after refresh / sidebar switch. Server replay includes
+                // permission_request / user_input_request for every non-Auto mode that
+                // parks (Build / AcceptEdits / Plan). Must restore those modals or the
+                // turn deadlocks in WaitingApproval with a blinking cursor.
+                handleEvent(event, {
+                  requireReplayDedup: attachNeedsDedup,
+                  repeatUserAfterSettled: false,
+                });
+                timelineFollow.changed();
+                if (
+                  event.type === 'done' ||
+                  event.type === 'stopped' ||
+                  event.type === 'error'
+                ) {
+                  terminalSeen = true;
+                  sessionWatchersRef.current.delete(loadId);
+                  localActiveStreamsBySessionRef.current.delete(loadId);
+                  settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
+                }
+              } else {
+                // 对标 opencode 多会话后台推送体系：
+                // 当用户切至其他会话时，后台会话流实时将事件写入专属缓存 messageCacheRef！
+                applyEventToSessionCache(loadId, event);
+                if (
+                  event.type === 'done' ||
+                  event.type === 'stopped' ||
+                  event.type === 'error'
+                ) {
+                  terminalSeen = true;
+                  sessionWatchersRef.current.delete(loadId);
+                  localActiveStreamsBySessionRef.current.delete(loadId);
+                  backgroundRunningSessionsRef.current.delete(loadId);
+                  localTurnSessionsRef.current.delete(loadId);
+                  onLiveRunningChange?.(loadId, false);
+                }
+              }
+            },
+            watchAbort.signal,
+            { afterSeq: attachAfterSeq },
+          );
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || watchAbort.signal.aborted) break;
         }
-      },
-      watchAbort.signal,
-      { afterSeq: attachAfterSeq },
-    ).then(() => {
-      // 流被服务端正常关闭却从未送达终态（终态帧丢失/竞态/服务端重启）：本端不会再收到推送，
-      // 立刻做一次磁盘对账并挂上兜底 tick，杜绝“通知响了、正文却要刷新/失焦才出现”。
-      if (terminalSeen || watchAbort.signal.aborted) return;
-      settleDiskCatchUp(effectiveProjectHash, loadId);
-      if (effectiveProjectHash) {
-        startDetachedTick(effectiveProjectHash, loadId, loadGeneration);
+
+        // 终态达成或被主动终止：正常退出自愈循环
+        if (terminalSeen || watchAbort.signal.aborted) break;
+
+        // 走到这里说明推流意外中断（未收终态 EOF、假死超时被看门狗中断或网络抖动）
+        // 快速探针：检查后端该会话是否仍在运行
+        try {
+          const actives = await getActiveChatSessions();
+          if (!actives.includes(loadId)) {
+            // 后端该回合已收尾（说明是在最终完成阶段断开），退出循环走磁盘对账
+            break;
+          }
+        } catch {
+          // 探针网络异常，继续尝试重连
+        }
+
+        if (watchAbort.signal.aborted) break;
+
+        retryCount += 1;
+        if (retryCount > maxRetries) {
+          break; // 超过重试上限，降级到磁盘对账
+        }
+
+        // 指数退避：第一次 100ms 极速自愈，后续 300ms, 600ms, 1200ms...
+        const delay = Math.min(100 * Math.pow(2, retryCount - 1), 2000);
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-    }).catch((err) => {
-      if (err?.name === 'AbortError') return;
-      sessionWatchersRef.current.delete(loadId);
-      localActiveStreamsBySessionRef.current.delete(loadId);
-      // Fall through to poll-only mode when watch stream fails
-      restorePendingInteractive(loadId, loadGeneration);
-      const resolvedHash =
-        projectHash ||
-        activeSession?.project_hash ||
-        viewedProjectHashRef.current ||
-        projectHashBySessionRef.current.get(loadId) ||
-        '';
-      if (resolvedHash) {
-        startDetachedTick(resolvedHash, loadId, loadGeneration);
+
+      // 无论何种非正常退出（重试耗尽或后端收尾中断），若尚未送达终态，立刻做权威磁盘历史对账兜底
+      if (!terminalSeen && !watchAbort.signal.aborted) {
+        sessionWatchersRef.current.delete(loadId);
+        localActiveStreamsBySessionRef.current.delete(loadId);
+        settleDiskCatchUp(effectiveProjectHash, loadId);
+        if (effectiveProjectHash) {
+          startDetachedTick(effectiveProjectHash, loadId, loadGeneration);
+        }
       }
-    });
+    };
+
+    void runStreamWithAutoRecovery();
   }
   // ── Detached tick ── 2s 兜底:watch 实时流连着时只 append-only 补帧 (不抹
   // 流式增量),watch 断开时整体替换;同时监测 stillActive 终结回合。供
@@ -1990,15 +2067,59 @@ export function Chat({
    * 或终态送到，而画布路径此前从不回读磁盘。磁盘是回合结算后的权威，这里强制拉取一次
    * （仍在运行时按 800ms 重试至多 3 次），把尾段正文与 busy/看门狗状态一次性对齐。
    */
+  /**
+   * 磁盘历史增量对账：直接拉取磁盘权威 transcript 并更新会话内存缓存与持久化缓存。
+   * 如果该会话正好在屏幕上呈现，同步平滑更新画布、大纲与状态，彻底杜绝“通知响了/会话切回却卡在旧命令转圈”的断层。
+   */
+  const syncSessionCacheFromDisk = useCallback(async (hash: string, sid: string): Promise<boolean> => {
+    if (!hash || !sid) return false;
+    try {
+      const detail = await getSession(hash, sid, { tail: HISTORY_PAGE });
+      if (!detail || !Array.isArray(detail.messages)) return false;
+      const loaded = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0);
+      messageCacheRef.current.set(sid, loaded);
+      void saveSessionCache(
+        hash,
+        sid,
+        loaded,
+        detail.todos,
+        undefined,
+        detail.turns,
+        detail.token_usage,
+      );
+      if (activeIdRef.current === sid) {
+        messagesRef.current = loaded;
+        setMessages(loaded);
+        if (detail.turns && detail.turns.length > 0) {
+          turnOutlineBySessionRef.current.set(sid, detail.turns);
+          setTurnOutline(detail.turns);
+        }
+        if (detail.token_usage) {
+          applySessionTokens(sid, loaded, detail.token_usage);
+        }
+        setBusyAndClock(false);
+        busyRef.current = false;
+        applySessionStickyTodos(sid, null);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
   function settleDiskCatchUp(projectHash: string, sid: string) {
     if (!projectHash || !sid) return;
     const attempt = (delay: number, triesLeft: number) => {
       window.setTimeout(() => {
-        if (activeIdRef.current !== sid) return;
-        void catchUpFromDisk(projectHash, sid, { force: true }).then((running) => {
-          // false = 已确认空闲且完成对账；null/true 表示仍不确定（后端还在收尾）→ 重试。
-          if (running !== false && triesLeft > 0) attempt(800, triesLeft - 1);
-        });
+        if (activeIdRef.current === sid) {
+          void catchUpFromDisk(projectHash, sid, { force: true }).then((running) => {
+            // false = 已确认空闲且完成对账；null/true 表示仍不确定（后端还在收尾）→ 重试。
+            if (running !== false && triesLeft > 0) attempt(800, triesLeft - 1);
+          });
+        } else {
+          // 后台会话：即使不在前台展示，流异常关闭后也必须同步磁盘并更新内存缓存
+          void syncSessionCacheFromDisk(projectHash, sid);
+        }
       }, delay);
     };
     attempt(0, 3);
@@ -2018,7 +2139,7 @@ export function Chat({
         activeIdRef.current !== loadId ||
         sessionGenerationRef.current !== loadGeneration
       ) {
-        stopDetachedHistoryPoll();
+        stopDetachedHistoryPoll(loadId);
         return;
       }
       try {
@@ -2027,7 +2148,7 @@ export function Chat({
           activeIdRef.current !== loadId ||
           sessionGenerationRef.current !== loadGeneration
         ) {
-          stopDetachedHistoryPoll();
+          stopDetachedHistoryPoll(loadId);
           return;
         }
         if (stillActive === null || stillActive) return;
@@ -2297,6 +2418,7 @@ export function Chat({
     });
   }, [onLiveReview, sessionId, livePending, userInputReq]);
   // 跨实例增量：待交互卡在别处被解决时，同步清掉本画布的待批准/待回答状态；同步压缩状态。
+  // 同时监听全局 activity 终态：当后台会话结束时，即时在后台同步磁盘最新历史并刷新该会话缓存。
   useEffect(
     () =>
       onGlobalEvent((event) => {
@@ -2304,6 +2426,24 @@ export function Chat({
           const sid = activeIdRef.current;
           if (sid && event.session_id === sid) {
             setIsCompacting(event.status === 'compacting');
+          }
+          if (!event.running || event.terminal) {
+            const targetSid = event.session_id;
+            backgroundRunningSessionsRef.current.delete(targetSid);
+            localTurnSessionsRef.current.delete(targetSid);
+            onLiveRunningChange?.(targetSid, false);
+            sessionWatchersRef.current.get(targetSid)?.abort();
+            sessionWatchersRef.current.delete(targetSid);
+            localActiveStreamsBySessionRef.current.delete(targetSid);
+
+            const ph =
+              projectHashBySessionRef.current.get(targetSid) ||
+              viewedProjectHashRef.current ||
+              activeSession?.project_hash ||
+              '';
+            if (ph) {
+              void syncSessionCacheFromDisk(ph, targetSid);
+            }
           }
         }
         if (event.type !== 'review_resolved' || event.request_id == null) return;
@@ -2314,7 +2454,7 @@ export function Chat({
           cur && cur.request_id === event.request_id ? null : cur,
         );
       }),
-    [],
+    [activeSession?.project_hash, onLiveRunningChange, syncSessionCacheFromDisk],
   );
   /** Project hash for the session on screen, including before App metadata arrives. */
   const viewedProjectHashRef = useRef<string | null>(activeSession?.project_hash ?? null);
@@ -2365,6 +2505,14 @@ export function Chat({
     if (sessionId !== activeIdRef.current) {
       blockQueueDrainRef.current = true;
       const prevId = activeIdRef.current;
+      if (!isFirstMountRef.current) {
+        saveComposerDraft(prevId, {
+          text: inputRef.current,
+          images: pendingImageData(pendingAttachRef.current),
+        });
+      } else {
+        isFirstMountRef.current = false;
+      }
       if (prevId && provider) {
         providerCacheRef.current.set(prevId, provider);
       }
@@ -2457,6 +2605,26 @@ export function Chat({
       }
       activeIdRef.current = sessionId;
       restoreProviderForSession(sessionId);
+
+      // 恢复新会话的输入框草稿
+      const nextDraft = loadComposerDraft(sessionId);
+      setInput(nextDraft?.text ?? '');
+      setPendingAttach(nextDraft?.images ? imagesToPending(nextDraft.images) : []);
+      if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto';
+        if (nextDraft?.text) {
+          window.requestAnimationFrame(() => {
+            if (textareaRef.current) {
+              textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`;
+            }
+          });
+        }
+      }
+
+      // 恢复新会话的气泡编辑草稿
+      const nextBubbleDraft = sessionId ? loadBubbleEditDraft(sessionId) : null;
+      setBubbleEditDraft(nextBubbleDraft);
+      setEditingSourceIndex(nextBubbleDraft?.sourceIndex ?? null);
       const stashedSteers = sessionId
         ? (pendingSteersBySessionRef.current.get(sessionId) || getStoredSteers(sessionId))
         : undefined;
@@ -2720,6 +2888,55 @@ export function Chat({
         // 空闲会话的待办已完全沉淀归档至气泡尾部，输入框上方彻底清空，绝不挂载历史脏状态
         applySessionStickyTodos(sessionId, null);
         startIdleWatch(effectiveHash, sessionId, sessionGenerationRef.current);
+        // SWR (Stale-While-Revalidate)：会话切回且处于空闲态时，0ms 呈现已有缓存的同时在后台静默核验磁盘权威转录，
+        // 纠偏可能遗留的未结工具状态（如 run_command 转圈卡死）与最终回答，彻底免除手动刷新。
+        if (effectiveHash) {
+          const switchGen = sessionGenerationRef.current;
+          void getSession(effectiveHash, sessionId, { tail: HISTORY_PAGE }).then((res) => {
+            if (
+              activeIdRef.current !== sessionId ||
+              sessionGenerationRef.current !== switchGen
+            ) {
+              return;
+            }
+            if (res && Array.isArray(res.messages)) {
+              const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0);
+              const lastCur = messagesRef.current[messagesRef.current.length - 1];
+              const lastLoaded = loaded[loaded.length - 1];
+              const hasUnfinishedTool = lastCur?.parts?.some(
+                (p) => p.kind === 'tool' && p.tool?.status === 'pending'
+              );
+              const shouldUpdate =
+                loaded.length !== messagesRef.current.length ||
+                hasUnfinishedTool ||
+                JSON.stringify(lastLoaded?.parts) !== JSON.stringify(lastCur?.parts);
+              if (shouldUpdate) {
+                messageCacheRef.current.set(sessionId, loaded);
+                messagesRef.current = loaded;
+                setMessages(loaded);
+                if (res.turns && res.turns.length > 0) {
+                  turnOutlineBySessionRef.current.set(sessionId, res.turns);
+                  setTurnOutline(res.turns);
+                }
+                if (res.token_usage) {
+                  applySessionTokens(sessionId, loaded, res.token_usage);
+                }
+                void saveSessionCache(
+                  effectiveHash,
+                  sessionId,
+                  loaded,
+                  res.todos,
+                  undefined,
+                  res.turns,
+                  res.token_usage,
+                );
+                if (scrollRef.current && atBottomRef.current) {
+                  scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+                }
+              }
+            }
+          }).catch(() => {});
+        }
       }
       return;
     }
@@ -3696,18 +3913,48 @@ export function Chat({
     };
   }, [effectiveWorkingDir]);
 
-  // Right Inspector Panel: Multi-tab ('questions' | 'git'), resizable, collapsible
-  const [rightPanelTab, setRightPanelTabState] = useState<'questions' | 'git'>(() => {
+  // Right Inspector Panel: Multi-tab ('questions' | 'git' | 'terminal' | 'preview'), resizable, collapsible
+  const [rightPanelTab, setRightPanelTabState] = useState<'questions' | 'git' | 'terminal' | 'preview'>(() => {
     try {
       const saved = localStorage.getItem('jeikcode:right-panel-tab');
-      if (saved === 'git' || saved === 'questions') return saved;
+      if (saved === 'git' || saved === 'questions' || saved === 'terminal' || saved === 'preview') return saved;
     } catch {}
     return 'questions';
   });
-  const setRightPanelTab = (tab: 'questions' | 'git') => {
+  const setRightPanelTab = (tab: 'questions' | 'git' | 'terminal' | 'preview') => {
     setRightPanelTabState(tab);
     try {
       localStorage.setItem('jeikcode:right-panel-tab', tab);
+    } catch {}
+  };
+
+  // 游标眼睛按钮悬停拖拽自动选中与打开
+  const [eyeDragOver, setEyeDragOver] = useState(false);
+  const handleEyeDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'copy';
+    }
+    setEyeDragOver(true);
+    if (rightPanelTab !== 'preview' || rightPanelCollapsed) {
+      setRightPanelTab('preview');
+      setRightPanelCollapsed(false);
+    }
+  };
+  const handleEyeDragLeave = () => {
+    setEyeDragOver(false);
+  };
+  const handleEyeDrop = (e: DragEvent) => {
+    e.preventDefault();
+    setEyeDragOver(false);
+    setRightPanelTab('preview');
+    setRightPanelCollapsed(false);
+    try {
+      const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+      const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+      if (data?.filePath) {
+        window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', { detail: data }));
+      }
     } catch {}
   };
 
@@ -3727,15 +3974,28 @@ export function Chat({
     } catch {}
   };
 
+  // 监听全局切右侧面板 Tab 事件 (如 AI 画布点击文件链接自动切至 preview 眼睛标签并展开)
+  useEffect(() => {
+    const handleSwitchRightTab = (e: CustomEvent<string>) => {
+      const tab = e.detail;
+      if (tab === 'preview' || tab === 'terminal' || tab === 'git' || tab === 'questions') {
+        setRightPanelTab(tab as any);
+        setRightPanelCollapsed(false);
+      }
+    };
+    window.addEventListener('jeikcode:switch_right_tab', handleSwitchRightTab as EventListener);
+    return () => window.removeEventListener('jeikcode:switch_right_tab', handleSwitchRightTab as EventListener);
+  }, []);
+
   const [rightPanelWidth, setRightPanelWidthState] = useState<number>(() => {
     try {
       const saved = localStorage.getItem('jeikcode:right-panel-width');
       if (saved) {
         const parsed = parseInt(saved, 10);
-        if (parsed >= 200 && parsed <= 700) return parsed;
+        if (parsed >= 200 && parsed <= 1200) return parsed;
       }
     } catch {}
-    return 260;
+    return 480;
   });
   const rightPanelWidthRef = useRef(rightPanelWidth);
   rightPanelWidthRef.current = rightPanelWidth;
@@ -3754,12 +4014,14 @@ export function Chat({
       if (legacyTop) {
         const top = parseInt(legacyTop, 10);
         if (Number.isFinite(top)) {
-          const left = typeof window !== 'undefined' ? Math.max(8, window.innerWidth - 52) : 8;
+          const zoom = getPageZoom() || 1.0;
+          const left = typeof window !== 'undefined' ? Math.max(8, Math.round(window.innerWidth / zoom) - 52) : 8;
           return { left, top };
         }
       }
     } catch {}
-    const left = typeof window !== 'undefined' ? Math.max(8, window.innerWidth - 52) : 8;
+    const zoom = getPageZoom() || 1.0;
+    const left = typeof window !== 'undefined' ? Math.max(8, Math.round(window.innerWidth / zoom) - 52) : 8;
     return { left, top: 130 };
   });
   const widgetPosRef = useRef(widgetPos);
@@ -3780,10 +4042,11 @@ export function Chat({
     const onMove = (moveEv: MouseEvent | TouchEvent) => {
       const cur = 'touches' in moveEv ? (moveEv as TouchEvent).touches[0] : (moveEv as MouseEvent);
       if (!cur) return;
-      const maxLeft = Math.max(8, window.innerWidth - railW - 8);
-      const maxTop = Math.max(48, window.innerHeight - railH - 8);
-      const left = Math.max(8, Math.min(maxLeft, start.left + (cur.clientX - startX)));
-      const top = Math.max(48, Math.min(maxTop, start.top + (cur.clientY - startY)));
+      const zoom = getPageZoom() || 1.0;
+      const maxLeft = Math.max(8, Math.round(window.innerWidth / zoom) - railW - 8);
+      const maxTop = Math.max(48, Math.round(window.innerHeight / zoom) - railH - 8);
+      const left = Math.max(8, Math.min(maxLeft, start.left + (cur.clientX - startX) / zoom));
+      const top = Math.max(48, Math.min(maxTop, start.top + (cur.clientY - startY) / zoom));
       setWidgetPos({ left, top });
     };
 
@@ -3809,9 +4072,10 @@ export function Chat({
     const clamp = () => {
       const railW = 40;
       const railH = 96;
+      const zoom = getPageZoom() || 1.0;
       setWidgetPos((p) => {
-        const maxLeft = Math.max(8, window.innerWidth - railW - 8);
-        const maxTop = Math.max(48, window.innerHeight - railH - 8);
+        const maxLeft = Math.max(8, Math.round(window.innerWidth / zoom) - railW - 8);
+        const maxTop = Math.max(48, Math.round(window.innerHeight / zoom) - railH - 8);
         const left = Math.max(8, Math.min(maxLeft, p.left));
         const top = Math.max(48, Math.min(maxTop, p.top));
         if (left === p.left && top === p.top) return p;
@@ -3819,12 +4083,16 @@ export function Chat({
       });
     };
     window.addEventListener('resize', clamp);
+    window.addEventListener('jeikcode:zoom_change', clamp);
     clamp();
-    return () => window.removeEventListener('resize', clamp);
+    return () => {
+      window.removeEventListener('resize', clamp);
+      window.removeEventListener('jeikcode:zoom_change', clamp);
+    };
   }, []);
 
   const setRightPanelWidth = (w: number) => {
-    const clamped = Math.max(200, Math.min(700, Math.round(w)));
+    const clamped = Math.max(200, Math.min(1200, Math.round(w)));
     setRightPanelWidthState(clamped);
     rightPanelWidthRef.current = clamped;
   };
@@ -4752,13 +5020,37 @@ export function Chat({
           if (res.kind === 'cost') { pushCommandNotice(t('cmd.cost.body', { tokens: res.total_tokens, turns: res.turn_count })); return; }
           if (res.kind === 'todo') {
             if (!res.items.length) { pushCommandNotice(t('cmd.todo.empty')); return; }
-            const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[~]' : '[ ]');
+            const mark = (s: string) => (s === 'completed' ? '[√]' : s === 'in_progress' ? '[~]' : '[ ]');
             pushCommandNotice(`${t('cmd.todo.header')}\n${res.items.map((i) => `${mark(i.status)} ${i.content}`).join('\n')}`);
             return;
           }
         } finally {
           if (isCompact) compactingRef.current = false;
         }
+      },
+      initProject: () => {
+        setConfirmModal({
+          open: true,
+          title: t('confirm.initTitle'),
+          body: t('confirm.initBody'),
+          icon: '🗺️',
+          danger: false,
+          confirmLabel: t('confirm.confirmedBtn'),
+          cancelLabel: t('common.cancel'),
+          onConfirm: async () => {
+            setRightPanelCollapsed(false);
+            setRightPanelTab('terminal');
+            requestAnimationFrame(() => {
+              window.dispatchEvent(
+                new CustomEvent('jeikcode:terminal:run_command', {
+                  detail: {
+                    command: 'jeikcode init --force',
+                  },
+                })
+              );
+            });
+          },
+        });
       },
       t,
     }),
@@ -5142,6 +5434,10 @@ export function Chat({
           next = freezeTodosIntoLastAssistant(next, currentTodos);
         }
         messageCacheRef.current.set(targetSid, next);
+        const ph = projectHashBySessionRef.current.get(targetSid) || viewedProjectHashRef.current || activeSession?.project_hash || '';
+        if (ph) {
+          void syncSessionCacheFromDisk(ph, targetSid);
+        }
         const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((p) => p.length > 0).pop() ?? '';
         const sessionName = activeSession?.name || folder || 'JeikCode';
         const previewText = event.type === 'error' ? (event.message || 'Error occurred') : 'Task completed';
@@ -5504,10 +5800,13 @@ export function Chat({
             });
           }
         }
-        // 改文件或跑 shell（含 git add / commit）结束后立刻刷新 Git 面板，
+        // 改文件或跑 shell（含 git add / commit）结束后立刻刷新 Git 面板与资源管理器，
         // 不等整轮对话结束。连续工具合并成一次请求。
         if (toolTouchesWorktree(event.name)) {
           scheduleGitRefresh();
+          try {
+            window.dispatchEvent(new CustomEvent('jeikcode:worktree_touch'));
+          } catch {}
         }
         // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
         onPermissionResolved?.(event.id);
@@ -6151,14 +6450,18 @@ export function Chat({
     }
 
     // ── Normal path ──
-    stopDetachedHistoryPoll();
+    const turnOwnerSid = sessionId ?? activeIdRef.current;
+    if (turnOwnerSid) {
+      stopDetachedHistoryPoll(turnOwnerSid);
+    } else {
+      stopDetachedHistoryPoll();
+    }
     stopIdleWatch();
     // 新回合已进入投递：程序化停止（立即发送）的抑制标记到此为止，绝不能影响后续真实的用户停止。
     programmaticStopMarkRef.current = null;
     const now = Date.now();
     setBusyAndClock(true, now);
     busyRef.current = true;
-    const turnOwnerSid = sessionId ?? activeIdRef.current;
     if (turnOwnerSid) {
       localTurnSessionsRef.current.add(turnOwnerSid);
       onLiveRunningChange?.(turnOwnerSid, true);
@@ -6349,18 +6652,19 @@ export function Chat({
     }
   }
 
-  async function sendMessage() {
+  async function sendMessage(explicitText?: string | Event) {
+    const rawText = typeof explicitText === 'string' ? explicitText : input;
     const currentTargetSid = sessionId ?? activeIdRef.current;
     if (currentTargetSid) {
       clearManualStopGuard(currentTargetSid);
     }
-    const originalInput = input;
+    const originalInput = rawText;
     const submittedContext = historyContext;
     const recordAcceptedInput = (acceptedSessionId?: string) => inputHistoryRef.current.record(
       !sessionId && acceptedSessionId ? inputHistoryKey(historyProject, acceptedSessionId) : submittedContext,
       originalInput,
     );
-    const text = input.trim();
+    const text = rawText.trim();
     const attach = pendingAttach;
     const images = pendingImageData(attach);
     const files = attach.filter((item): item is PendingFile => item.kind === 'file');
@@ -6374,6 +6678,9 @@ export function Chat({
       const parsed = parseSlashCommand(text);
       if (parsed && slashCommandMap.has(parsed.name)) {
         setInput('');
+        setPendingAttach([]);
+        clearComposerDraft(activeIdRef.current || sessionId);
+        clearComposerDraft(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         setSlashOpen(false);
         setHistoryHint(null);
@@ -6405,6 +6712,8 @@ export function Chat({
       setAttachError(null);
       setInput('');
       setPendingAttach([]);
+      clearComposerDraft(activeIdRef.current || sessionId);
+      clearComposerDraft(null);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
       setUploading(true);
       try {
@@ -6432,6 +6741,8 @@ export function Chat({
       // 清空输入框（无论立即发送还是排队）。有文件时已在上传开始时清过，避免覆盖用户新输入。
       setInput('');
       setPendingAttach([]);
+      clearComposerDraft(activeIdRef.current || sessionId);
+      clearComposerDraft(null);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
     }
     setHistoryHint(null);
@@ -6523,6 +6834,10 @@ export function Chat({
 
     const next = queuedRef.current.find((item) => item.kind === 'queue');
     if (!next) return;
+    if (hasTextInMessages(next.text)) {
+      setQueued((current) => current.filter((item) => item.id !== next.id));
+      return;
+    }
     dispatchQueuedCard(next);
     // deliver 为组件内函数声明，闭包始终取最新渲染值；仅以 busy/queued 触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6686,6 +7001,19 @@ export function Chat({
   async function handleSendImmediately(q: QueuedMessage) {
     const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
 
+    // 0. 严格抑制右下角通知：无论卡片是 steer 还是普通排队，用户触发立即发送属于程序化换发新回合，
+    //    物理触发的停止事件严禁向用户弹出右下角「已停止」通知或系统通知。
+    const targetIds = [currentSid, sessionId, liveSessionIdRef.current, activeIdRef.current, requestIdRef.current].filter(Boolean) as string[];
+    for (const sid of targetIds) {
+      recordUserManualStop(sid);
+      recordUserSteer(sid);
+    }
+
+    // 如果该卡片此前已作为 steer 排队，主动尝试清理后端的 steer 缓冲区
+    if (currentSid && (q.kind === 'steer' || q.kind === 'steering')) {
+      void cancelChatSteer(currentSid, q.text);
+    }
+
     // 1. 该卡片跃升为队首（其余卡片保持原序）：立即发送后它就是下一条正文。
     updateQueuedForSession(currentSid, (items) => {
       const target = items.find((item) => item.id === q.id);
@@ -6708,6 +7036,34 @@ export function Chat({
     if (!released) return;
     const latest = queuedRef.current.find((item) => item.id === q.id);
     if (latest) dispatchQueuedCard(latest);
+  }
+
+  function handleBubbleDraftChange(
+    sourceIndex: number,
+    text: string,
+    images: ImageData[],
+    selectedModel?: string,
+  ) {
+    if (
+      bubbleEditDraft &&
+      bubbleEditDraft.sourceIndex === sourceIndex &&
+      bubbleEditDraft.text === text &&
+      bubbleEditDraft.selectedModel === selectedModel &&
+      (bubbleEditDraft.images?.length ?? 0) === (images?.length ?? 0)
+    ) {
+      return;
+    }
+    const draft: BubbleEditDraft = {
+      sourceIndex,
+      text,
+      images,
+      selectedModel,
+    };
+    setBubbleEditDraft(draft);
+    const sid = activeIdRef.current || sessionId || activeSession?.id;
+    if (sid) {
+      saveBubbleEditDraft(sid, draft);
+    }
   }
 
   async function handleSaveRewrite(sourceIndex: number, newText: string, newImages: ImageData[]) {
@@ -6750,6 +7106,8 @@ export function Chat({
       const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
       void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
       setEditingSourceIndex(null);
+      setBubbleEditDraft(null);
+      clearBubbleEditDraft(sid);
     } catch (e) {
       showToast(t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)), 'error');
     }
@@ -6766,8 +7124,8 @@ export function Chat({
       projectHashBySessionRef.current.get(sid || '') ||
       viewedProjectHashRef.current ||
       activeSession?.project_hash ||
-      '';
-    if (!sid || !effectiveHash) return;
+      'default';
+    if (!sid) return;
 
     const targetMsg = messagesRef.current.find((m) => m.sourceIndex === sourceIndex);
     const expectedText = targetMsg ? messageText(targetMsg) : undefined;
@@ -6806,6 +7164,8 @@ export function Chat({
         setTurnOutline(filteredTurns);
         void saveSessionCache(effectiveHash, sid, truncated, activeTodosRef.current, undefined, filteredTurns, tokensAuthoritativeRef.current);
         setEditingSourceIndex(null);
+        setBubbleEditDraft(null);
+        clearBubbleEditDraft(sid);
         // Deliver the updated prompt
         window.setTimeout(() => {
           void deliver(newText, newImages, modeState.confirmedMode, undefined, tempModel);
@@ -6865,6 +7225,11 @@ export function Chat({
         turnOutlineBySessionRef.current.set(sid, currentOutline);
         setTurnOutline(currentOutline);
         void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+        if (editingSourceIndex === sourceIndex) {
+          setEditingSourceIndex(null);
+          setBubbleEditDraft(null);
+          clearBubbleEditDraft(sid);
+        }
       },
     });
   }
@@ -7004,7 +7369,16 @@ export function Chat({
       }
       if (e.key === 'Enter' && mergedItems.length > 0) {
         e.preventDefault();
-        insertSkill(mergedItems[slashIndex].name);
+        const selected = mergedItems[slashIndex];
+        const cmdDef = selected.kind === 'command' ? FRONTEND_COMMANDS.find((c) => c.name === selected.name) : undefined;
+        // 如果是无必选参数的命令（如 /init, /plan, /build, /new, /clear 等），按下回车直接执行
+        if (selected.kind === 'command' && cmdDef && !cmdDef.argHint) {
+          setSlashOpen(false);
+          setInput('');
+          void sendMessage(`/${selected.name}`);
+          return;
+        }
+        insertSkill(selected.name);
         return;
       }
       if (e.key === 'Escape') {
@@ -7445,6 +7819,9 @@ export function Chat({
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === 'f') {
+        if (activeMainTabId !== 'chat') return;
+        const target = e.target as HTMLElement | null;
+        if (target && target.closest('.code-editor-root, .file-explorer-root, .terminal-panel-root, .xterm')) return;
         if (messages.length === 0) return;
         e.preventDefault();
         setSearchOpen(true);
@@ -7458,13 +7835,13 @@ export function Chat({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchOpen, messages.length]);
+  }, [searchOpen, messages.length, activeMainTabId]);
 
   // 落地态：对话为空就用 claude.ai 风格的居中落地页（无论是否已有 session id —
   // 新建会话、空的同步会话、空的历史会话都适用）。
   // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
   // 已有 historyHint（无法加载、提示去 TUI/磁盘续聊）。
-  const landing = messages.length === 0 && !historyHint && !restoring && !loading;
+  const landing = messages.length === 0 && !historyHint && !restoring && !loading && activeMainTabId === 'chat';
 
   // 上报落地态给 App（决定是否显示会话标题头）。
   useEffect(() => {
@@ -7950,7 +8327,11 @@ export function Chat({
   if (landing) {
     return (
       <>
-        <div class="chat-stage">
+        <div
+          ref={stageRef}
+          class={'chat-stage' + (isRightPanelVisible ? ' has-right-panel' : '')}
+          style={isRightPanelVisible ? ({ '--right-panel-width': `${rightPanelWidth}px` } as any) : undefined}
+        >
           <div class="chat-main-column">
             <div class="chat-landing">
               <div class="landing-inner">
@@ -7960,7 +8341,10 @@ export function Chat({
                 <div class="landing-tagline">{t('chat.greeting')}</div>
                 {cwd && (
                   <div class="landing-cwd" title={cwd}>
-                    {t('chat.sessionCwd', { path: cwd })}
+                    <span class="landing-cwd-label">
+                      {t('chat.sessionCwd', { path: '' }).trim()}
+                    </span>
+                    <span class="landing-cwd-path">{cwd}</span>
                   </div>
                 )}
                 <div class="landing-input">
@@ -7976,8 +8360,285 @@ export function Chat({
               </div>
             </div>
           </div>
+
+          {/* Right Inspector Multi-Tab Panel (Landing 页保活常驻) */}
+          {isRightPanelVisible && (
+            <div
+              class="right-inspector-backdrop"
+              onClick={() => setRightPanelCollapsed(true)}
+              aria-hidden="true"
+            />
+          )}
+          <aside
+            class={'right-inspector-panel' + (rightPanelCollapsed ? ' is-collapsed-hidden' : '')}
+            style={{ display: rightPanelCollapsed ? 'none' : 'flex' }}
+            aria-label={rightPanelTab === 'questions' ? t('panel.questions') : t('panel.git')}
+          >
+            {/* Draggable Resizer on left edge */}
+            <div
+              class="right-panel-resizer"
+              onMouseDown={handleResizerMouseDown as any}
+              title="Drag to resize panel"
+            />
+
+            {/* Header Tab Bar */}
+            <div class="right-panel-header">
+              <div class="right-panel-tabs">
+                <button
+                  type="button"
+                  class={'right-panel-tab-btn' + (rightPanelTab === 'git' ? ' active' : '')}
+                  onClick={() => setRightPanelTab('git')}
+                  title={t('panel.git')}
+                  aria-label={t('panel.git')}
+                >
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
+                  </svg>
+                </button>
+
+                <button
+                  type="button"
+                  class={'right-panel-tab-btn' + (rightPanelTab === 'terminal' ? ' active' : '')}
+                  onClick={() => setRightPanelTab('terminal')}
+                  title={t('panel.terminal') || '终端'}
+                  aria-label={t('panel.terminal') || '终端'}
+                >
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 5l4 3-4 3m6 0h4" />
+                  </svg>
+                </button>
+
+                <button
+                  type="button"
+                  class={'right-panel-tab-btn' + (rightPanelTab === 'preview' ? ' active' : '') + (eyeDragOver ? ' is-drag-over-eye' : '')}
+                  onClick={() => setRightPanelTab('preview')}
+                  onDragEnter={handleEyeDragOver as any}
+                  onDragOver={handleEyeDragOver as any}
+                  onDragLeave={handleEyeDragLeave as any}
+                  onDrop={handleEyeDrop as any}
+                  title={t('panel.preview') || '预览'}
+                  aria-label={t('panel.preview') || '预览'}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                </button>
+
+                <button
+                  type="button"
+                  class={'right-panel-tab-btn' + (rightPanelTab === 'questions' ? ' active' : '')}
+                  onClick={() => setRightPanelTab('questions')}
+                  title={t('panel.questions')}
+                  aria-label={t('panel.questions')}
+                >
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                    <circle cx="8" cy="8" r="6.2" />
+                    <path d="M6 6.5a2 2 0 0 1 3.8.8c0 1.2-1.8 1.5-1.8 2.5" />
+                    <circle cx="8" cy="12.2" r="0.7" fill="currentColor" />
+                  </svg>
+                  {turnNavItems.length > 0 && <span class="tab-badge">{turnNavItems.length}</span>}
+                </button>
+              </div>
+
+              <span class="right-panel-title">
+                {rightPanelTab === 'questions' ? t('turnNav.title') : rightPanelTab === 'git' ? t('git.title') : rightPanelTab === 'terminal' ? (t('panel.terminal') || '终端') : (t('panel.preview') || '预览')}
+              </span>
+
+              <button
+                type="button"
+                class="right-panel-collapse-btn"
+                onClick={() => setRightPanelCollapsed(true)}
+                title={t('panel.collapse')}
+                aria-label={t('panel.collapse')}
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                  <path d="M6 4l4 4-4 4" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Body */}
+            <div class="right-panel-body">
+              <div style={{ display: rightPanelTab === 'questions' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+                <nav class="turn-nav" aria-label={t('turnNav.title')}>
+                  <div class="turn-nav-header">
+                    <input
+                      class="turn-nav-search"
+                      type="text"
+                      value={turnNavQuery}
+                      placeholder={t('turnNav.searchPlaceholder')}
+                      aria-label={t('turnNav.searchPlaceholder')}
+                      onInput={(e) => setTurnNavQuery((e.target as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="turn-nav-list">
+                    {filteredTurnNavItems.length === 0 ? (
+                      <div class="turn-nav-empty">
+                        {turnNavItems.length === 0 ? t('turnNav.empty') : t('turnNav.noMatch')}
+                      </div>
+                    ) : (
+                      filteredTurnNavItems.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          class={'turn-nav-item' + (item.id === activeTurnId ? ' active' : '')}
+                          title={item.text}
+                          onClick={() => jumpToTurn(item.id)}
+                        >
+                          {item.label}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </nav>
+              </div>
+
+              <div style={{ display: rightPanelTab === 'git' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+                <Suspense
+                  fallback={
+                    <div class="git-empty-state">
+                      <div class="git-spinner" />
+                      <span>{t('git.loading')}</span>
+                    </div>
+                  }
+                >
+                  <GitPanel
+                    cwd={effectiveWorkingDir}
+                    refreshTrigger={gitRefreshTrigger}
+                    onBranchChanged={(newB) => {
+                      setGitRefreshTrigger((n) => n + 1);
+                      onCwdChanged?.(effectiveWorkingDir || '');
+                    }}
+                    onOpenFileDiff={handleOpenFileDiff}
+                    onOpenWorkingDiff={handleOpenWorkingDiff}
+                  />
+                </Suspense>
+              </div>
+
+              <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+                <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
+              </div>
+
+              <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+                <PreviewPanel
+                  cwd={effectiveWorkingDir || cwd}
+                  onOpenInMainEditor={(filePath) => {
+                    window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
+                  }}
+                />
+              </div>
+            </div>
+          </aside>
         </div>
+
+        {/* 落地页常驻折叠悬浮游标 */}
+        {rightPanelCollapsed && (
+          <div
+            class="right-panel-collapsed-rail draggable-floating-widget"
+            role="toolbar"
+            aria-label={t('chat.inspectorTabs')}
+            style={{ top: `${widgetPos.top}px`, left: `${widgetPos.left}px`, right: 'auto' }}
+          >
+            <div
+              class="widget-drag-handle"
+              onMouseDown={handleWidgetMouseDown as any}
+              onTouchStart={handleWidgetMouseDown as any}
+              title={t('common.drag')}
+              aria-label={t('common.dragHandle')}
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <circle cx="5" cy="4" r="1.5" />
+                <circle cx="11" cy="4" r="1.5" />
+                <circle cx="5" cy="8" r="1.5" />
+                <circle cx="11" cy="8" r="1.5" />
+                <circle cx="5" cy="12" r="1.5" />
+                <circle cx="11" cy="12" r="1.5" />
+              </svg>
+            </div>
+            <button
+              type="button"
+              class="right-panel-tab-btn"
+              onClick={() => {
+                setRightPanelTab('git');
+                setRightPanelCollapsed(false);
+              }}
+              title={t('panel.git')}
+              aria-label={t('panel.git')}
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
+              </svg>
+              <span class="rail-tab-text">Git</span>
+            </button>
+            <button
+              type="button"
+              class="right-panel-tab-btn"
+              onClick={() => {
+                setRightPanelTab('terminal');
+                setRightPanelCollapsed(false);
+              }}
+              title={t('panel.terminal') || '终端'}
+              aria-label={t('panel.terminal') || '终端'}
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 5l4 3-4 3m6 0h4" />
+              </svg>
+              <span class="rail-tab-text">{t('panel.terminal') || '终端'}</span>
+            </button>
+            <button
+              type="button"
+              class={'right-panel-tab-btn' + (eyeDragOver ? ' is-drag-over-eye' : '')}
+              onClick={() => {
+                setRightPanelTab('preview');
+                setRightPanelCollapsed(false);
+              }}
+              onDragEnter={handleEyeDragOver as any}
+              onDragOver={handleEyeDragOver as any}
+              onDragLeave={handleEyeDragLeave as any}
+              onDrop={handleEyeDrop as any}
+              title={t('panel.preview') || '预览'}
+              aria-label={t('panel.preview') || '预览'}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
+            </button>
+            <button
+              type="button"
+              class="right-panel-tab-btn"
+              onClick={() => {
+                setRightPanelTab('questions');
+                setRightPanelCollapsed(false);
+              }}
+              title={t('panel.questions')}
+              aria-label={t('panel.questions')}
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.2" />
+                <path d="M6 6.5a2 2 0 0 1 3.8.8c0 1.2-1.8 1.5-1.8 2.5" />
+                <circle cx="8" cy="12.2" r="0.7" fill="currentColor" />
+              </svg>
+              <span class="rail-tab-text">{t('turnNav.title')}</span>
+              {turnNavItems.length > 0 && <span class="tab-badge">{turnNavItems.length}</span>}
+            </button>
+          </div>
+        )}
         {topModelChrome}
+        {confirmModal.open && (
+          <ConfirmDialog
+            title={confirmModal.title}
+            body={confirmModal.body}
+            confirmLabel={confirmModal.confirmLabel ?? t('confirm.confirmBtn')}
+            cancelLabel={confirmModal.cancelLabel ?? t('common.cancel')}
+            danger={confirmModal.danger ?? true}
+            icon={confirmModal.icon}
+            onConfirm={confirmModal.onConfirm}
+            onClose={() => setConfirmModal((prev) => ({ ...prev, open: false }))}
+          />
+        )}
       </>
     );
   }
@@ -7989,7 +8650,7 @@ export function Chat({
     <>
       <div
         ref={stageRef}
-        class={'chat-stage' + (isRightPanelVisible ? ' has-right-panel' : '')}
+        class={'chat-stage' + (isRightPanelVisible ? ' has-right-panel' : '') + (activeMainTabId !== 'chat' ? ' is-editor-mode' : '')}
         style={isRightPanelVisible ? ({ '--right-panel-width': `${rightPanelWidth}px` } as any) : undefined}
       >
       {/* Main chat / editor stage column */}
@@ -8115,6 +8776,8 @@ export function Chat({
                 ? turnNavByOrdinal.get(msg.turnNavOrdinal)
                 : turnNavByIndex.get(turnIndex);
               const anchorId = turnItem?.id ?? turnNavId(msg.turnNavOrdinal ?? origIdx);
+              const isEditing = editingSourceIndex === turnIndex;
+              const hasActiveDraft = isEditing && bubbleEditDraft?.sourceIndex === turnIndex;
               return (
                 <UserMessageView
                   key={anchorId ?? turnIndex}
@@ -8126,15 +8789,38 @@ export function Chat({
                   timeFull={timeFull}
                   search={search}
                   isActiveSearchMatch={isActiveSearchMatch}
-                  isEditing={editingSourceIndex === turnIndex}
-                  onStartEdit={() => setEditingSourceIndex(turnIndex)}
-                  onCancelEdit={() => setEditingSourceIndex(null)}
+                  isEditing={isEditing}
+                  draftText={hasActiveDraft ? bubbleEditDraft.text : undefined}
+                  draftImages={hasActiveDraft ? bubbleEditDraft.images : undefined}
+                  draftModel={hasActiveDraft ? bubbleEditDraft.selectedModel : undefined}
+                  onDraftChange={(draftText, draftImages, draftModel) => {
+                    handleBubbleDraftChange(turnIndex, draftText, draftImages, draftModel);
+                  }}
+                  onStartEdit={() => {
+                    const initDraft: BubbleEditDraft = {
+                      sourceIndex: turnIndex,
+                      text: messageText(msg),
+                      images: msg.images || [],
+                      selectedModel: provider || defaultProviderName() || undefined,
+                    };
+                    setEditingSourceIndex(turnIndex);
+                    setBubbleEditDraft(initDraft);
+                    const sid = activeIdRef.current || sessionId || activeSession?.id;
+                    if (sid) saveBubbleEditDraft(sid, initDraft);
+                  }}
+                  onCancelEdit={() => {
+                    setEditingSourceIndex(null);
+                    setBubbleEditDraft(null);
+                    const sid = activeIdRef.current || sessionId || activeSession?.id;
+                    if (sid) clearBubbleEditDraft(sid);
+                  }}
                   onSaveRewrite={(newText, newImages) => void handleSaveRewrite(turnIndex, newText, newImages)}
                   onRollbackSubmit={(newText, newImages, tempModel) => void handleRollbackSubmit(turnIndex, newText, newImages, tempModel)}
                   onDelete={() => void handleDeleteUserMessage(turnIndex, messageText(msg))}
                   models={modelCatalog}
                   currentModel={provider || defaultProviderName() || ''}
                   disabled={busy}
+                  cwd={effectiveWorkingDir || cwd}
                 />
               );
             }
@@ -8190,6 +8876,7 @@ export function Chat({
                 isActiveSearchMatch={isActiveSearchMatch}
                 onRegenerate={isLastInTurn && !busy ? () => void handleRegenerateAssistant(msg.sourceIndex ?? origIdx, origIdx) : undefined}
                 onDelete={isLastInTurn && !busy ? () => void handleDeleteAssistantMessage(msg.sourceIndex ?? origIdx, origIdx) : undefined}
+                cwd={effectiveWorkingDir || cwd}
               />
             );
           });
@@ -8235,7 +8922,7 @@ export function Chat({
                   </button>
                 )}
 
-                {q.kind === 'queue' && (
+                {(q.kind === 'queue' || q.kind === 'steer') && (
                   <button
                     type="button"
                     class="queued-action-btn queued-btn-send-now"
@@ -8281,10 +8968,22 @@ export function Chat({
         </div>
       </div>
 
-      {/* VSCode Diff Viewer Stage */}
+      {/* VSCode Diff Viewer or Code Editor Stage */}
       {activeMainTabId !== 'chat' && (() => {
         const currentDiffTab = diffTabs.find((t) => t.id === activeMainTabId);
         if (!currentDiffTab) return null;
+        if (currentDiffTab.type === 'editor') {
+          return (
+            <div class="vscode-diff-view-stage">
+              <CodeEditorTab
+                key={currentDiffTab.id}
+                filePath={currentDiffTab.filePath}
+                cwd={cwd}
+                onClose={() => handleCloseDiffTab?.(currentDiffTab.id)}
+              />
+            </div>
+          );
+        }
         return (
           <div class="vscode-diff-view-stage">
             {currentDiffTab.loading ? (
@@ -8363,10 +9062,39 @@ export function Chat({
                 <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
               </svg>
             </button>
+
+            <button
+              type="button"
+              class={'right-panel-tab-btn' + (rightPanelTab === 'terminal' ? ' active' : '')}
+              onClick={() => setRightPanelTab('terminal')}
+              title={t('panel.terminal') || '终端'}
+              aria-label={t('panel.terminal') || '终端'}
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 5l4 3-4 3m6 0h4" />
+              </svg>
+            </button>
+
+            <button
+              type="button"
+              class={'right-panel-tab-btn' + (rightPanelTab === 'preview' ? ' active' : '') + (eyeDragOver ? ' is-drag-over-eye' : '')}
+              onClick={() => setRightPanelTab('preview')}
+              onDragEnter={handleEyeDragOver as any}
+              onDragOver={handleEyeDragOver as any}
+              onDragLeave={handleEyeDragLeave as any}
+              onDrop={handleEyeDrop as any}
+              title={t('panel.preview') || '预览'}
+              aria-label={t('panel.preview') || '预览'}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </button>
           </div>
 
           <span class="right-panel-title">
-            {rightPanelTab === 'questions' ? t('turnNav.title') : t('git.title')}
+            {rightPanelTab === 'questions' ? t('turnNav.title') : rightPanelTab === 'git' ? t('git.title') : rightPanelTab === 'terminal' ? (t('panel.terminal') || '终端') : (t('panel.preview') || '预览')}
           </span>
 
           <button
@@ -8439,6 +9167,19 @@ export function Chat({
               />
             </Suspense>
           </div>
+
+          <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+            <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
+          </div>
+
+          <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+            <PreviewPanel
+              cwd={effectiveWorkingDir || cwd}
+              onOpenInMainEditor={(filePath) => {
+                window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
+              }}
+            />
+          </div>
         </div>
       </aside>
 
@@ -8480,6 +9221,41 @@ export function Chat({
               <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
             </svg>
             <span class="rail-tab-text">Git</span>
+          </button>
+          <button
+            type="button"
+            class="right-panel-tab-btn"
+            onClick={() => {
+              setRightPanelTab('terminal');
+              setRightPanelCollapsed(false);
+            }}
+            title={t('panel.terminal') || '终端'}
+            aria-label={t('panel.terminal') || '终端'}
+          >
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 5l4 3-4 3m6 0h4" />
+            </svg>
+            <span class="rail-tab-text">{t('panel.terminal') || '终端'}</span>
+          </button>
+          <button
+            type="button"
+            class={'right-panel-tab-btn' + (eyeDragOver ? ' is-drag-over-eye' : '')}
+            onClick={() => {
+              setRightPanelTab('preview');
+              setRightPanelCollapsed(false);
+            }}
+            onDragEnter={handleEyeDragOver as any}
+            onDragOver={handleEyeDragOver as any}
+            onDragLeave={handleEyeDragLeave as any}
+            onDrop={handleEyeDrop as any}
+            title={t('panel.preview') || '预览'}
+            aria-label={t('panel.preview') || '预览'}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
           </button>
           <button
             type="button"
@@ -8623,12 +9399,14 @@ export function Chat({
           </button>
         </div>
       )}
-      <div class="input-container">
-        <div class="input-wrap">
-          {stickyTodoPanel}
-          {inputBox}
+      {activeMainTabId === 'chat' && (
+        <div class="input-container">
+          <div class="input-wrap">
+            {stickyTodoPanel}
+            {inputBox}
+          </div>
         </div>
-      </div>
+      )}
       </div>
       {topModelChrome}
       {confirmModal.open && (
@@ -8638,6 +9416,7 @@ export function Chat({
           confirmLabel={confirmModal.confirmLabel ?? t('confirm.confirmBtn')}
           cancelLabel={confirmModal.cancelLabel ?? t('common.cancel')}
           danger={confirmModal.danger ?? true}
+          icon={confirmModal.icon}
           onConfirm={confirmModal.onConfirm}
           onClose={() => setConfirmModal((prev) => ({ ...prev, open: false }))}
         />
@@ -8668,6 +9447,7 @@ function AssistantMessageView({
   isActiveSearchMatch,
   onRegenerate,
   onDelete,
+  cwd,
 }: {
   msg: Message;
   isLast: boolean;
@@ -8687,6 +9467,7 @@ function AssistantMessageView({
   isActiveSearchMatch: boolean;
   onRegenerate?: () => void;
   onDelete?: () => void;
+  cwd?: string;
 }) {
   const t = useT();
   const text = messageText(msg);
@@ -8836,7 +9617,7 @@ function AssistantMessageView({
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts, search)}
+          {renderAssistantParts(msg.parts, search, cwd)}
           {streaming && !hasContent && (
             <span class="codex-shimmer-status" aria-live="polite">
               {isCompacting ? 'Compacting...' : 'Working...'}
@@ -8881,7 +9662,7 @@ function AssistantMessageView({
   );
 }
 
-function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string, cwd?: string): VNode[] {
   const out: VNode[] = [];
   let trailingTodos: { kind: 'todo_list'; items: TodoItem[] } | null = null;
   let i = 0;
@@ -8929,7 +9710,7 @@ function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
       );
       i++;
     } else if (p.kind === 'text') {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} />);
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} cwd={cwd} targetContext="chat" />);
       i++;
     } else {
       i++;
@@ -9044,7 +9825,7 @@ function SessionTodoPanel({
           {items.map((item, i) => (
             <div class={'session-todo-row status-' + item.status} key={i}>
               <span class="session-todo-glyph" aria-hidden="true">
-                {item.status === 'completed' ? '✓' : item.status === 'in_progress' ? '•' : '○'}
+                {item.status === 'completed' ? '√' : item.status === 'in_progress' ? '•' : '○'}
               </span>
               <span class="session-todo-content">{item.content}</span>
             </div>
@@ -9093,6 +9874,10 @@ function UserMessageView({
   search,
   isActiveSearchMatch,
   isEditing,
+  draftText,
+  draftImages,
+  draftModel,
+  onDraftChange,
   onStartEdit,
   onCancelEdit,
   onSaveRewrite,
@@ -9101,6 +9886,7 @@ function UserMessageView({
   models,
   currentModel,
   disabled,
+  cwd,
 }: {
   msg: Message;
   anchorId?: string;
@@ -9111,6 +9897,10 @@ function UserMessageView({
   search: string;
   isActiveSearchMatch: boolean;
   isEditing?: boolean;
+  draftText?: string;
+  draftImages?: ImageData[];
+  draftModel?: string;
+  onDraftChange?: (text: string, images: ImageData[], selectedModel?: string) => void;
   onStartEdit?: () => void;
   onCancelEdit?: () => void;
   onSaveRewrite?: (text: string, images: ImageData[]) => void;
@@ -9119,6 +9909,7 @@ function UserMessageView({
   models?: ModelInfo[];
   currentModel?: string;
   disabled?: boolean;
+  cwd?: string;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
@@ -9172,13 +9963,14 @@ function UserMessageView({
     return (
       <div class={wrapperClass + ' is-editing'} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={searchRef}>
         <InlineBubbleEditor
-          initialText={text}
-          initialImages={msg.images}
+          initialText={draftText ?? text}
+          initialImages={draftImages ?? msg.images}
           models={models ?? []}
-          currentModel={currentModel ?? ''}
+          currentModel={draftModel ?? currentModel ?? ''}
           onSaveRewrite={onSaveRewrite}
           onRollbackSubmit={onRollbackSubmit}
           onCancel={onCancelEdit}
+          onDraftChange={onDraftChange}
           disabled={disabled}
         />
       </div>
@@ -9214,7 +10006,7 @@ function UserMessageView({
         )}
         {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
             普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
-        {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
+        {skillTitle ? <Markdown content={text} search={search} cwd={cwd} targetContext="chat" /> : highlightText(text, search)}
       </div>
       <div class="msg-footer-row user-footer-row">
         {timeLabel && <span class="msg-time msg-time-user" title={timeFull}>{timeLabel}</span>}

@@ -11,14 +11,15 @@ export function RemoteAccessControl() {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [host, setHost] = useState('0.0.0.0');
-  const [port, setPort] = useState('13457');
+  const currentUrlPort = (typeof window !== 'undefined' && window.location.port) ? window.location.port : '13457';
+  const [port, setPort] = useState(currentUrlPort);
   const [token, setToken] = useState('');
   const [noToken, setNoToken] = useState(false);
   const [applying, setApplying] = useState(false);
   const [note, setNote] = useState('');
   const [links, setLinks] = useState<string[]>([]);
   const [listenHost, setListenHost] = useState('0.0.0.0');
-  const [listenPort, setListenPort] = useState('13457');
+  const [listenPort, setListenPort] = useState(currentUrlPort);
   const [firewall, setFirewall] = useState('');
   const [copied, setCopied] = useState(false);
   const [active, setActive] = useState(false);
@@ -27,23 +28,26 @@ export function RemoteAccessControl() {
   const revision = useRef(0);
 
   function showStatus(status: RemoteAccessStatus) {
-    const livePort = String(status.port || 13457);
+    const livePort = String(status.port || ((typeof window !== 'undefined' && window.location.port) ? window.location.port : 13457));
     const pending = status.next_port && status.next_port !== status.port ? status.next_port : 0;
+    // 若 pending 端口小于当前实际监听端口，属于开局端口冲突自动累加造成的旧配置，输入框直接同步为当前实际端口
+    const isAutoIncremented = pending > 0 && pending < Number(livePort);
+    const effectivePending = isAutoIncremented ? 0 : pending;
     setActive(status.active);
     setHost(status.host || '0.0.0.0');
     setListenHost(status.host || '0.0.0.0');
     setListenPort(livePort);
     setNoToken(!!status.no_token);
-    setSavedPort(pending);
+    setSavedPort(effectivePending);
     if (status.token) setToken(status.token);
-    setPort(pending ? String(pending) : livePort);
+    setPort(effectivePending ? String(effectivePending) : livePort);
     const urls = (status.urls && status.urls.length > 0 ? status.urls : status.url ? [status.url] : [])
       .filter((item): item is string => !!item);
     setLinks(status.active ? urls : []);
     setFirewall(status.firewall === 'prompt' ? status.firewall : '');
     const notes: string[] = [];
-    if (pending) {
-      notes.push(t('remote.portNext', { port: String(pending), listenPort: livePort }));
+    if (effectivePending) {
+      notes.push(t('remote.portNext', { port: String(effectivePending), listenPort: livePort }));
     }
     if (status.no_token) {
       notes.push(t('remote.noTokenSession'));

@@ -18,6 +18,8 @@ import { mergeOptimisticSession, mergeOptimisticSessions } from '../lib/sessionL
 import { mcpAutoTrustSignature, mcpEnableNeedsTrust } from '../lib/mcpTrust';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, stripExtendedPathPrefix } from '../lib/displayPath';
+import { FileExplorer } from './FileExplorer';
+import { getPageZoom } from '../lib/pageZoom';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -61,6 +63,9 @@ interface SidebarProps {
   onSwitchProject?: (workingDir: string) => void;
   /** Live / `--host` 正在跑的 session，立刻转圈，不必等 5s 的 /chat/active。 */
   extraRunningIds?: string[];
+  /** 从资源管理器打开文件 */
+  onOpenFile?: (filePath: string) => void;
+  activeFilePath?: string | null;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -112,6 +117,24 @@ function PanelIcon() {
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2" />
       <line x1="6" y1="2.5" x2="6" y2="13.5" stroke="currentColor" stroke-width="1.2" />
+    </svg>
+  );
+}
+
+/** Cloud glyph for returning to the most recent AI conversation. */
+function CloudIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+    </svg>
+  );
+}
+
+/** Folder glyph for opening/switching to the file explorer state. */
+function FolderRailIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 8 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
     </svg>
   );
 }
@@ -398,6 +421,8 @@ export function Sidebar({
   onOpenCwd,
   onSwitchProject,
   extraRunningIds,
+  onOpenFile,
+  activeFilePath,
 }: SidebarProps) {
   const [isMobile, setIsMobile] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
@@ -411,6 +436,21 @@ export function Sidebar({
   }, []);
   const t = useT();
   const { theme, setTheme, lang, setLang, githubLogo } = useSettings();
+  const SIDEBAR_TAB_STORAGE_KEY = 'jeikcode:sidebar_tab';
+  // Sidebar View Tab: 'chats' (会话与项目) vs 'files' (资源管理器)，刷新自动记忆最后选择
+  const [sidebarTab, setSidebarTabState] = useState<'chats' | 'files'>(() => {
+    try {
+      const saved = localStorage.getItem(SIDEBAR_TAB_STORAGE_KEY);
+      if (saved === 'chats' || saved === 'files') return saved;
+    } catch {}
+    return 'chats';
+  });
+  const setSidebarTab = (tab: 'chats' | 'files') => {
+    setSidebarTabState(tab);
+    try {
+      localStorage.setItem(SIDEBAR_TAB_STORAGE_KEY, tab);
+    } catch {}
+  };
   const [appVersion, setAppVersion] = useState(bakedAppVersion());
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
@@ -681,6 +721,13 @@ export function Sidebar({
           }
           return changed ? next : prev;
         });
+        setProjects((prev) =>
+          prev.map((proj) =>
+            proj.hash === event.project_hash
+              ? { ...proj, session_count: Math.max(0, proj.session_count - 1) }
+              : proj
+          )
+        );
         setSelectedIds((cur) => {
           if (!cur.has(event.session_id)) return cur;
           const next = new Set(cur);
@@ -992,21 +1039,22 @@ export function Sidebar({
   function openItemMenu(e: MouseEvent, id: string) {
     e.preventDefault();
     e.stopPropagation();
+    const zoom = getPageZoom() || 1.0;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     if (menuFor === id) {
       setMenuFor(null);
       return;
     }
-    const right = window.innerWidth - rect.right;
+    const right = (window.innerWidth - rect.right) / zoom;
     // 3 rows (rename + export + delete); estimate generously so we flip up a touch
     // early rather than let the last item clip off the bottom edge.
     const MENU_EST_HEIGHT = 144;
-    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceBelow = (window.innerHeight - rect.bottom) / zoom;
     if (spaceBelow < MENU_EST_HEIGHT + 8) {
       // Not enough room below → open upward, anchored above the kebab.
-      setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
+      setMenuPos({ bottom: (window.innerHeight - rect.top + 4) / zoom, right });
     } else {
-      setMenuPos({ top: rect.bottom + 4, right });
+      setMenuPos({ top: (rect.bottom + 4) / zoom, right });
     }
     setMenuFor(id);
   }
@@ -1032,6 +1080,26 @@ export function Sidebar({
     loadEpochRef.current += 1;
     setLoading(false);
     const removed = new Set(ids);
+
+    // 统计各项目被删除的会话数，用于精准同步扣减 project.session_count
+    const deletedCountByProject: Record<string, number> = {};
+    for (const id of ids) {
+      let foundHash: string | undefined;
+      for (const [hash, list] of Object.entries(projectSessionsMap)) {
+        if (list.some((s) => s.id === id)) {
+          foundHash = hash;
+          break;
+        }
+      }
+      if (!foundHash) {
+        const s = sessions.find((item) => item.id === id);
+        if (s?.project_hash) foundHash = s.project_hash;
+      }
+      if (foundHash) {
+        deletedCountByProject[foundHash] = (deletedCountByProject[foundHash] || 0) + 1;
+      }
+    }
+
     setSessions((current) => current.filter((session) => !removed.has(session.id)));
     setProjectSessionsMap((prev) => {
       const next = { ...prev };
@@ -1040,6 +1108,14 @@ export function Sidebar({
       }
       return next;
     });
+    setProjects((prev) =>
+      prev.map((proj) => {
+        const count = deletedCountByProject[proj.hash] || 0;
+        return count > 0
+          ? { ...proj, session_count: Math.max(0, proj.session_count - count) }
+          : proj;
+      })
+    );
     setSelectedIds((current) => {
       const next = new Set(current);
       for (const id of ids) next.delete(id);
@@ -1132,9 +1208,10 @@ export function Sidebar({
       setSettingsMenuOpen(false);
       return;
     }
+    const zoom = getPageZoom() || 1.0;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     // Anchor the menu's bottom just above the button (it opens upward).
-    setSettingsMenuPos({ left: rect.left, bottom: window.innerHeight - rect.top + 4 });
+    setSettingsMenuPos({ left: rect.left / zoom, bottom: (window.innerHeight - rect.top + 4) / zoom });
     setSettingsSub(null);
     setSettingsMenuOpen(true);
   }
@@ -1291,8 +1368,9 @@ export function Sidebar({
       return;
     }
     ensureCapabilities();
+    const zoom = getPageZoom() || 1.0;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    setSkillsMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
+    setSkillsMenuPos({ top: (rect.bottom + 4) / zoom, left: rect.left / zoom, width: rect.width / zoom });
     setSkillsMenuOpen(true);
   }
 
@@ -1389,8 +1467,9 @@ export function Sidebar({
     // panel that was empty during the connect window picks up newly-ready servers.
     mcpPollAttemptsRef.current = 0;
     refreshCapabilities();
+    const zoom = getPageZoom() || 1.0;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    setMcpMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
+    setMcpMenuPos({ top: (rect.bottom + 4) / zoom, left: rect.left / zoom, width: rect.width / zoom });
     setMcpMenuOpen(true);
   }
 
@@ -1829,29 +1908,38 @@ export function Sidebar({
           >
             <PanelIcon />
           </button>
+          {/* 回到最近的一次 AI 会话 */}
           <button
-            class="rail-btn"
-            onClick={() => onNew()}
-            title={t('sidebar.newChat')}
-            aria-label={t('sidebar.newChat')}
+            class={'rail-btn' + (sidebarTab === 'chats' ? ' active' : '')}
+            onClick={() => {
+              setSidebarTab('chats');
+              window.dispatchEvent(new CustomEvent('jeikcode:switch_main_tab', { detail: 'chat' }));
+              const recent = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
+              if (recent) {
+                onSelect(recent);
+              }
+              if (collapsed && onToggleCollapse) {
+                onToggleCollapse();
+              }
+            }}
+            title={t('sidebar.recentChat')}
+            aria-label={t('sidebar.recentChat')}
           >
-            <PlusIcon />
+            <CloudIcon />
           </button>
+          {/* 回到最近的一次资源管理器状态 */}
           <button
-            class="rail-btn"
-            onClick={onToggleCollapse}
-            title={t('sidebar.skills')}
-            aria-label={t('sidebar.skills')}
+            class={'rail-btn' + (sidebarTab === 'files' ? ' active' : '')}
+            onClick={() => {
+              setSidebarTab('files');
+              if (collapsed && onToggleCollapse) {
+                onToggleCollapse();
+              }
+            }}
+            title={t('sidebar.recentFiles')}
+            aria-label={t('sidebar.recentFiles')}
           >
-            <SparklesIcon />
-          </button>
-          <button
-            class="rail-btn"
-            onClick={onToggleCollapse}
-            title={t('sidebar.mcp')}
-            aria-label={t('sidebar.mcp')}
-          >
-            <McpIcon />
+            <FolderRailIcon />
           </button>
         </nav>
         <div class="sidebar-rail-bottom">
@@ -1904,18 +1992,6 @@ export function Sidebar({
         </span>
         <span class="sidebar-brand-btns">
           <button
-            class="sidebar-search-btn"
-            onClick={() => {
-              onCloseDrawer?.();
-              setSearchOpen(true);
-              setSearchQuery('');
-            }}
-            title={t('sidebar.search')}
-            aria-label={t('sidebar.search')}
-          >
-            <SearchIcon />
-          </button>
-          <button
             class="sidebar-collapse-btn"
             onClick={() => {
               if (open && onCloseDrawer) {
@@ -1932,38 +2008,69 @@ export function Sidebar({
         </span>
       </div>
 
-      <div class="sidebar-actions">
-        <button class="sidebar-action" onClick={() => { exitSelectMode(); onNew(); }}>
-          <span class="sidebar-action-icon"><PlusIcon /></span>
-          <span class="sidebar-action-label">{t('sidebar.newChat')}</span>
+      {/* 顶部双子胶囊切页：对话与项目 vs 资源管理器 (解决多项目会话与文件树拥挤痛点) */}
+      <div class="sidebar-segment-tabs">
+        <button
+          type="button"
+          class={'sidebar-segment-btn' + (sidebarTab === 'chats' ? ' active' : '')}
+          onClick={() => {
+            setSidebarTab('chats');
+            window.dispatchEvent(new CustomEvent('jeikcode:switch_main_tab', { detail: 'chat' }));
+            const recent = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
+            if (recent) {
+              onSelect(recent);
+            }
+          }}
+        >
+          <span>💬</span>
+          <span>{t('sidebar.chats') || '对话'}</span>
         </button>
         <button
-          ref={skillsBtnRef}
-          class={'sidebar-action' + (skillsMenuOpen ? ' open' : '')}
-          onClick={(e) => toggleSkillsMenu(e as unknown as MouseEvent)}
-          aria-haspopup="menu"
-          aria-expanded={skillsMenuOpen}
+          type="button"
+          class={'sidebar-segment-btn' + (sidebarTab === 'files' ? ' active' : '')}
+          onClick={() => setSidebarTab('files')}
         >
-          <span class="sidebar-action-icon"><SparklesIcon /></span>
-          <span class="sidebar-action-label">{t('sidebar.skills')}</span>
-          {skillCount > 0 && <span class="sidebar-action-badge">{skillCount}</span>}
-          <span class="sidebar-action-caret"><ChevronDownIcon /></span>
-        </button>
-        <button
-          ref={mcpBtnRef}
-          class={'sidebar-action' + (mcpMenuOpen ? ' open' : '')}
-          onClick={(e) => toggleMcpMenu(e as unknown as MouseEvent)}
-          aria-haspopup="menu"
-          aria-expanded={mcpMenuOpen}
-        >
-          <span class="sidebar-action-icon"><McpIcon /></span>
-          <span class="sidebar-action-label">{t('sidebar.mcp')}</span>
-          {mcpCount > 0 && <span class="sidebar-action-badge">{mcpCount}</span>}
-          <span class="sidebar-action-caret"><ChevronDownIcon /></span>
+          <span>📁</span>
+          <span>{t('sidebar.files') || '资源管理'}</span>
         </button>
       </div>
 
-      <div class="session-group-header">
+      {sidebarTab === 'files' ? (
+        <FileExplorer cwd={cwd} onOpenFile={onOpenFile} activeFilePath={activeFilePath} />
+      ) : (
+        <>
+          <div class="sidebar-actions">
+            <button class="sidebar-action" onClick={() => { exitSelectMode(); onNew(); }}>
+              <span class="sidebar-action-icon"><PlusIcon /></span>
+              <span class="sidebar-action-label">{t('sidebar.newChat')}</span>
+            </button>
+            <button
+              ref={skillsBtnRef}
+              class={'sidebar-action' + (skillsMenuOpen ? ' open' : '')}
+              onClick={(e) => toggleSkillsMenu(e as unknown as MouseEvent)}
+              aria-haspopup="menu"
+              aria-expanded={skillsMenuOpen}
+            >
+              <span class="sidebar-action-icon"><SparklesIcon /></span>
+              <span class="sidebar-action-label">{t('sidebar.skills')}</span>
+              {skillCount > 0 && <span class="sidebar-action-badge">{skillCount}</span>}
+              <span class="sidebar-action-caret"><ChevronDownIcon /></span>
+            </button>
+            <button
+              ref={mcpBtnRef}
+              class={'sidebar-action' + (mcpMenuOpen ? ' open' : '')}
+              onClick={(e) => toggleMcpMenu(e as unknown as MouseEvent)}
+              aria-haspopup="menu"
+              aria-expanded={mcpMenuOpen}
+            >
+              <span class="sidebar-action-icon"><McpIcon /></span>
+              <span class="sidebar-action-label">{t('sidebar.mcp')}</span>
+              {mcpCount > 0 && <span class="sidebar-action-badge">{mcpCount}</span>}
+              <span class="sidebar-action-caret"><ChevronDownIcon /></span>
+            </button>
+          </div>
+
+          <div class="session-group-header">
         <span class="session-group-label">
           {selectMode ? t('sidebar.selectedCount', { n: selectedIds.size }) : t('sidebar.recent')}
         </span>
@@ -2068,21 +2175,44 @@ export function Sidebar({
           <>
             <div class="sidebar-section-header">
               <span class="sidebar-section-title">{t('sidebar.projects')}</span>
-              <button
-                type="button"
-                class="sidebar-section-action-btn"
-                onClick={handleOpenNativeDirectory}
-                title={isLoopbackHost(window.location.hostname) ? t('sidebar.addProjectFolder') : t('sidebar.addProjectFolderRemote')}
-                aria-label={isLoopbackHost(window.location.hostname) ? t('sidebar.addProjectFolder') : t('sidebar.addProjectFolderRemote')}
-              >
-                <PlusIcon />
-              </button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                <button
+                  type="button"
+                  class="sidebar-section-action-btn"
+                  onClick={() => {
+                    onCloseDrawer?.();
+                    setSearchOpen(true);
+                    setSearchQuery('');
+                  }}
+                  title={t('sidebar.search')}
+                  aria-label={t('sidebar.search')}
+                >
+                  <SearchIcon />
+                </button>
+                <button
+                  type="button"
+                  class="sidebar-section-action-btn"
+                  onClick={handleOpenNativeDirectory}
+                  title={isLoopbackHost(window.location.hostname) ? t('sidebar.addProjectFolder') : t('sidebar.addProjectFolderRemote')}
+                  aria-label={isLoopbackHost(window.location.hostname) ? t('sidebar.addProjectFolder') : t('sidebar.addProjectFolderRemote')}
+                >
+                  <PlusIcon />
+                </button>
+              </div>
             </div>
 
             {visibleProjects.map((p) => {
               const isExpanded = expandedProjects.has(p.hash);
               const isShowAll = showAllProjects.has(p.hash);
-              const baseSessions = projectSessionsMap[p.hash] ?? sessions.filter((s) => s.project_hash === p.hash);
+
+              // 过滤掉尚未发出第一条消息的空白会话（等于没创会话，且不计入项目会话数）
+              const isNonEmptySession = (s: SessionMetaWithProject) => {
+                if (allOptimistic.some((opt) => opt.id === s.id)) return true;
+                return (s.message_count ?? 0) > 0;
+              };
+
+              const rawBase = projectSessionsMap[p.hash] ?? sessions.filter((s) => s.project_hash === p.hash);
+              const baseSessions = rawBase.filter(isNonEmptySession);
               const projectOptimistics = allOptimistic.filter(
                 (opt) =>
                   opt.project_hash === p.hash ||
@@ -2101,12 +2231,12 @@ export function Sidebar({
                 const top5 = sorted.slice(0, 5);
                 if (activeSessionId && !top5.some((s) => s.id === activeSessionId)) {
                   const activeItem = sorted.find((s) => s.id === activeSessionId);
-                  displayList = activeItem ? [...top5, activeItem] : top5;
+                  displayList = activeItem && isNonEmptySession(activeItem) ? [...top5, activeItem] : top5;
                 } else {
                   displayList = top5;
                 }
               }
-              const count = Math.max(p.session_count, pSessions.length);
+              const count = pSessions.length;
 
               return (
                 <div key={p.hash} class="project-group">
@@ -2205,6 +2335,8 @@ export function Sidebar({
           </>
         )}
       </div>
+    </>
+  )}
 
       <div class="sidebar-bottom">
         {githubLogo !== false && (

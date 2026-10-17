@@ -1,7 +1,9 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useSettings } from '../settings';
 import { modalConfirm, modalPrompt } from './ConfirmDialog';
 import { showToast } from './Toast';
+import { getPageZoom } from '../lib/pageZoom';
 import {
   fetchGitBranches,
   fetchGitGraph,
@@ -337,11 +339,21 @@ export function GitPanel({
     };
   }, [branchContextMenu]);
 
+  const calcGitContextMenuPos = (e: MouseEvent, menuWidth = 200, menuHeight = 280) => {
+    const zoom = getPageZoom() || 1.0;
+    const rawX = Math.round(e.clientX / zoom);
+    const rawY = Math.round(e.clientY / zoom);
+    const viewportWidth = window.innerWidth / zoom;
+    const viewportHeight = window.innerHeight / zoom;
+    const x = rawX + menuWidth > viewportWidth ? Math.max(10, rawX - menuWidth) : rawX;
+    const y = rawY + menuHeight > viewportHeight ? Math.max(10, rawY - menuHeight) : rawY;
+    return { x, y };
+  };
+
   const handleBranchContextMenu = (e: MouseEvent, branch: string, isRemote: boolean) => {
     e.preventDefault();
     e.stopPropagation();
-    const x = Math.min(e.clientX, window.innerWidth - 220);
-    const y = Math.min(e.clientY, window.innerHeight - 320);
+    const { x, y } = calcGitContextMenuPos(e, 200, 320);
     setBranchContextMenu({ x, y, branch, isRemote });
   };
 
@@ -475,7 +487,11 @@ export function GitPanel({
     try {
       const ok = await gitStore.triggerAutoFetch(cwd, { force: !silent });
       if (!silent) {
-        showToast(t('git.fetchSuccess'), ok ? 'success' : 'info');
+        if (ok) {
+          showToast(t('git.fetchSuccess'), 'success');
+        } else {
+          showToast(t('git.fetchFailed'), 'error');
+        }
       }
     } catch (err: any) {
       if (!silent) {
@@ -558,7 +574,7 @@ export function GitPanel({
     setError(null);
     try {
       await gitStage({ path, all, cwd: effectiveCwd });
-      await loadGitData(true);
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } catch (err: any) {
       setError(err?.message || 'Stage failed');
     } finally {
@@ -572,7 +588,7 @@ export function GitPanel({
     setError(null);
     try {
       await gitUnstage({ path, all, cwd: effectiveCwd });
-      await loadGitData(true);
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } catch (err: any) {
       setError(err?.message || 'Unstage failed');
     } finally {
@@ -593,11 +609,27 @@ export function GitPanel({
     if (!ok) return;
     setActionLoadingPath(file.path);
     setError(null);
+
+    // 0ms 瞬间乐观更新：立刻在前端移除该文件，绝不产生滞留视觉
+    setStoreState((prev) => {
+      if (!prev || !prev.gitStatus) return prev;
+      return {
+        ...prev,
+        gitStatus: {
+          ...prev.gitStatus,
+          unstaged: prev.gitStatus.unstaged.filter((f) => f.path !== file.path),
+          untracked: prev.gitStatus.untracked.filter((f) => f.path !== file.path),
+          staged: prev.gitStatus.staged.filter((f) => f.path !== file.path),
+        },
+      };
+    });
+
     try {
       await gitDiscard({ path: file.path, isUntracked: file.status === '?', cwd: effectiveCwd });
-      await loadGitData(true);
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } catch (err: any) {
       setError(err?.message || 'Discard failed');
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
     }
@@ -618,14 +650,29 @@ export function GitPanel({
 
     setActionLoadingPath('all');
     setError(null);
+
+    // 0ms 瞬间乐观清空
+    setStoreState((prev) => {
+      if (!prev || !prev.gitStatus) return prev;
+      return {
+        ...prev,
+        gitStatus: {
+          ...prev.gitStatus,
+          unstaged: [],
+          untracked: [],
+        },
+      };
+    });
+
     try {
       for (const file of unstagedItems) {
         await gitDiscard({ path: file.path, isUntracked: file.status === '?', cwd: effectiveCwd });
       }
       showToast(t('git.discardAll') + ` (${unstagedItems.length})`, 'info');
-      await loadGitData(true);
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } catch (err: any) {
       setError(err?.message || 'Discard all failed');
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
     }
@@ -1301,8 +1348,7 @@ export function GitPanel({
                       onContextMenu={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        const x = Math.min(e.clientX, window.innerWidth - 220);
-                        const y = Math.min(e.clientY, window.innerHeight - 320);
+                        const { x, y } = calcGitContextMenuPos(e, 200, 320);
                         setContextMenu({ x, y, commit: c });
                       }}
                     >
@@ -1769,8 +1815,8 @@ export function GitPanel({
         </div>
       )}
 
-      {/* VSCode Context Menu */}
-      {contextMenu && (
+      {/* VSCode Context Menu (Portal 到 document.body 防缩放漂移) */}
+      {contextMenu && typeof document !== 'undefined' && createPortal(
         <div
           class="git-context-menu"
           style={{ top: `${contextMenu.y}px`, left: `${contextMenu.x}px` }}
@@ -1878,11 +1924,12 @@ export function GitPanel({
           >
             <span>{t('git.ctxRevert')}</span>
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
 
-      {/* VSCode Branch Context Menu */}
-      {branchContextMenu && (
+      {/* VSCode Branch Context Menu (Portal 到 document.body 防缩放漂移) */}
+      {branchContextMenu && typeof document !== 'undefined' && createPortal(
         <div
           class="git-context-menu"
           style={{ top: `${branchContextMenu.y}px`, left: `${branchContextMenu.x}px` }}
@@ -1988,7 +2035,8 @@ export function GitPanel({
                 : t('git.ctxDeleteBranch')}
             </span>
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

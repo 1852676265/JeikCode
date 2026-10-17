@@ -130,6 +130,12 @@ export function userTextsMatch(a: string, b: string): boolean {
   const right = visibleUserText(b);
   if (left === right) return true;
   if (!left || !right) return left === right;
+
+  // 深度归一化比对 (去除所有连续空白和换行差异)
+  const normLeft = left.replace(/\s+/g, ' ').trim().toLowerCase();
+  const normRight = right.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (normLeft === normRight) return true;
+
   // Disk history is stripped; live/watch echo may still carry the caption.
   if (left.startsWith(right) || right.startsWith(left)) {
     const longer = left.length >= right.length ? left : right;
@@ -137,6 +143,12 @@ export function userTextsMatch(a: string, b: string): boolean {
     const rest = longer.slice(shorter.length);
     if (rest.trim() === '') return true;
     return VISION_ANNOTATION_MARKERS.some((m) => rest.includes(m.replace(/^\n\n/, '')));
+  }
+  // 互相包含或者前 40 字符一致（针对长提问后带不同系统注入提示词或标记的情况，杜绝误判重放）
+  if (normLeft.length >= 20 && normRight.length >= 20) {
+    if (normLeft.startsWith(normRight.slice(0, 40)) || normRight.startsWith(normLeft.slice(0, 40))) {
+      return true;
+    }
   }
   return false;
 }
@@ -435,11 +447,21 @@ export function reconcileRunningTranscript<T extends ReconcileMessage>(canvas: T
       }
       nextC++;
     }
-    // 合并当前匹配的 (d, c) 轮次
+    // 合并当前匹配的 (d, c) 轮次 (保留引用并在需要时安全保留本地画布中的多模态图片)
     const diskTurn = diskTurns[d]!;
     const canvasTurn = canvasTurns[c]!;
+    const diskUser = diskTurn.user;
+    const canvasUser = canvasTurn.user as any;
+    const canvasImages = canvasUser.images && canvasUser.images.length > 0 ? canvasUser.images : undefined;
+    const mergedUser = (canvasImages && !(diskUser as any).images) || (canvasUser.id && !diskUser.id)
+      ? {
+          ...diskUser,
+          ...(canvasImages ? { images: canvasImages } : {}),
+          ...(canvasUser.id && !diskUser.id ? { id: canvasUser.id } : {}),
+        }
+      : diskUser;
     outTurns.push({
-      user: diskTurn.user,
+      user: mergedUser,
       rest: mergeTurnRest(diskTurn.rest, canvasTurn.rest),
     });
     nextD = d + 1;
@@ -459,7 +481,12 @@ export function reconcileRunningTranscript<T extends ReconcileMessage>(canvas: T
     const cTurn = canvasTurns[nextC]!;
     nextC++;
     const text = reconcileUserText(cTurn.user);
-    const targetTurn = outTurns.find((rt) => userTextsMatch(reconcileUserText(rt.user), text));
+    const cId = (cTurn.user as any).id || (cTurn.user as any).pendingSteerId;
+    const targetTurn = outTurns.find((rt) => {
+      const rId = (rt.user as any).id || (rt.user as any).pendingSteerId;
+      if (cId && rId && cId === rId) return true;
+      return userTextsMatch(reconcileUserText(rt.user), text);
+    });
     if (targetTurn) {
       // 绝对防重放防线：只要该提问已经在输出中存在，坚决禁止作为新轮次追加到末尾！
       // 只能将未落盘的增量内容合入对应的 targetTurn.rest

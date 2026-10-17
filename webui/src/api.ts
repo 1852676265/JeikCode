@@ -79,7 +79,26 @@ function currentWebuiToken(): string {
     persistWebuiToken(fromUrl);
     return fromUrl;
   }
-  return storedWebuiToken();
+  const stored = storedWebuiToken();
+  if (stored) return stored;
+
+  // 兜底从 document.cookie 读取（解决某些异地浏览器或非隐身页面存储孤岛问题）
+  try {
+    if (typeof document !== 'undefined' && document.cookie) {
+      for (const pair of document.cookie.split(';')) {
+        const trimmed = pair.trim();
+        if (trimmed.startsWith('token=') || trimmed.includes('_token=')) {
+          const val = trimmed.split('=')[1]?.trim();
+          if (val) {
+            persistWebuiToken(val);
+            return val;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return '';
 }
 
 function authHeaders(): Record<string, string> {
@@ -95,13 +114,29 @@ function authHeaders(): Record<string, string> {
  * Same-origin fetch that always includes cookies (HttpOnly token handoff)
  * and merges auth headers. Remote LAN clients need both cookie + Bearer.
  */
-function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   const auth = authHeaders();
   for (const [k, v] of Object.entries(auth)) {
     if (!headers.has(k)) headers.set(k, v);
   }
-  return fetch(input, { ...init, credentials: 'include', headers });
+  try {
+    const resp = await fetch(input, { ...init, credentials: 'include', headers });
+    if (resp.status === 401) {
+      console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', input);
+    }
+    return resp;
+  } catch (err: any) {
+    const isNetworkErr = err instanceof TypeError && (
+      err.message.includes('fetch') ||
+      err.message.includes('network') ||
+      err.message.includes('Failed')
+    );
+    if (isNetworkErr) {
+      throw new Error('连接宿主机后端失败 (Failed to fetch)，请检查网络连接或宿主机服务状态');
+    }
+    throw err;
+  }
 }
 
 /** Current session token (URL bootstrap or session/localStorage). */
@@ -405,6 +440,18 @@ export async function revealInFileExplorer(path: string): Promise<void> {
   }).catch(() => {});
 }
 
+export async function openFileWithOs(path: string): Promise<void> {
+  await apiFetch('/fs/open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ path }),
+  }).catch(() => {});
+}
+
+export function getFsRawUrl(filePath: string): string {
+  return `/fs/raw?path=${encodeURIComponent(filePath)}`;
+}
+
 export interface QueuedMessageApiItem {
   id: number | string;
   text: string;
@@ -547,71 +594,93 @@ export async function watchChatSession(
   const params = new URLSearchParams({ session_id: sessionId });
   if (opts?.standbyOnly) params.set('standby', 'true');
   if (opts?.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
-  const resp = await apiFetch(
-    `/chat/watch?${params.toString()}`,
-    { headers: authHeaders(), signal },
-  );
-  if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  const streamAbort = new AbortController();
+  const onParentAbort = () => streamAbort.abort();
+  if (signal) {
+    if (signal.aborted) streamAbort.abort();
+    else signal.addEventListener('abort', onParentAbort, { once: true });
   }
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let terminalSeen = false;
 
-  const emit = (event: SSEEvent) => {
-    if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
-      terminalSeen = true;
+  let lastActivity = Date.now();
+  // 活性看门狗：后端每 15 秒发送一次 ping 心跳。
+  // 若超过 25 秒没有任何网络数据（含 15s keepalive ping），判定连接底层假死，主动 abort 中断当前 reader。
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastActivity > 25000) {
+      streamAbort.abort();
     }
-    onEvent(event);
-  };
+  }, 4000);
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
-      if (!dataLine) continue;
-      const jsonStr = dataLine.slice('data:'.length).trim();
-      if (!jsonStr) continue;
-      try {
-        emit(JSON.parse(jsonStr) as SSEEvent);
-      } catch {
-        /* keep-alive */
+  try {
+    const resp = await apiFetch(
+      `/chat/watch?${params.toString()}`,
+      { headers: authHeaders(), signal: streamAbort.signal },
+    );
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    }
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let terminalSeen = false;
+
+    const emit = (event: SSEEvent) => {
+      if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
+        terminalSeen = true;
       }
-    }
-  }
+      onEvent(event);
+    };
 
-  if (buffer.trim()) {
-    const dataLine = buffer.split('\n').find((line) => line.startsWith('data:'));
-    if (dataLine) {
-      const jsonStr = dataLine.slice('data:'.length).trim();
-      if (jsonStr) {
+    while (true) {
+      const { done, value } = await reader.read();
+      lastActivity = Date.now();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
+        if (!dataLine) continue;
+        const jsonStr = dataLine.slice('data:'.length).trim();
+        if (!jsonStr) continue;
         try {
           emit(JSON.parse(jsonStr) as SSEEvent);
         } catch {
-          /* ignore */
+          /* keep-alive */
         }
       }
     }
-  }
 
-  if (signal?.aborted) {
-    const error = new Error('chat watch aborted');
-    error.name = 'AbortError';
-    throw error;
-  }
-  if (!terminalSeen) {
-    onEvent({
-      type: 'done',
-      tokens: 0,
-      tool_calls: 0,
-      session_id: sessionId,
-      stop_reason: 'watch_closed',
-    } as SSEEvent);
+    if (buffer.trim()) {
+      const dataLine = buffer.split('\n').find((line) => line.startsWith('data:'));
+      if (dataLine) {
+        const jsonStr = dataLine.slice('data:'.length).trim();
+        if (jsonStr) {
+          try {
+            emit(JSON.parse(jsonStr) as SSEEvent);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+
+    if (signal?.aborted) {
+      const error = new Error('chat watch aborted');
+      error.name = 'AbortError';
+      throw error;
+    }
+    if (!terminalSeen) {
+      onEvent({
+        type: 'done',
+        tokens: 0,
+        tool_calls: 0,
+        session_id: sessionId,
+        stop_reason: 'watch_closed',
+      } as SSEEvent);
+    }
+  } finally {
+    clearInterval(watchdog);
+    if (signal) signal.removeEventListener('abort', onParentAbort);
   }
 }
 
@@ -1786,7 +1855,11 @@ export type GlobalWireEvent =
   /** 全局配置热重载信号（如 CLI 执行 jeikcode ghimg 或后台配置更新）。 */
   | { type: 'config_reloaded' }
   /** 侧栏项目可见性（隐藏/钉住/运行中自动恢复），跨实例就地对齐。 */
-  | { type: 'sidebar_projects'; hidden: string[]; pinned?: ProjectInfo[] };
+  | { type: 'sidebar_projects'; hidden: string[]; pinned?: ProjectInfo[] }
+  /** Git 仓库变更（discard / stage / commit / pull / fetch 等），跨实例全量广播 */
+  | { type: 'git_updated'; cwd: string }
+  /** 终端会话变更（创建 / 关闭 / 清空），跨实例项目级全量广播 */
+  | { type: 'terminal_updated'; cwd: string };
 
 /** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
 export async function streamGlobalEvents(
@@ -2608,6 +2681,164 @@ export async function dismissUpgradeDiffs(): Promise<{ success: boolean }> {
   const resp = await apiFetch('/api/config/dismiss-diffs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+// ==========================================
+// Explorer & Terminal API
+// ==========================================
+
+export interface FsEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size?: number;
+  is_ignored?: boolean;
+}
+
+export interface FsTreeResponse {
+  path: string;
+  entries: FsEntry[];
+  dirs: string[];
+  files: string[];
+}
+
+export async function fetchFsTree(path?: string): Promise<FsTreeResponse> {
+  const params = new URLSearchParams();
+  if (path) params.set('path', path);
+  const q = params.toString() ? `?${params.toString()}` : '';
+  const resp = await apiFetch(`/fs/tree${q}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function fetchFsRead(path: string): Promise<{ path: string; content: string; success: boolean }> {
+  const params = new URLSearchParams({ path });
+  const resp = await apiFetch(`/fs/read?${params.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function fetchFsWrite(path: string, content: string): Promise<{ success: boolean; message?: string }> {
+  const resp = await apiFetch('/fs/write', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ path, content }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function fetchFsAction(
+  action: 'create_file' | 'create_dir' | 'rename' | 'delete',
+  options: { path: string; new_name?: string; content?: string },
+): Promise<{ success: boolean; message?: string }> {
+  const resp = await apiFetch('/fs/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ action, ...options }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export interface FsSearchResult {
+  file: string;
+  line: number;
+  content: string;
+  matches?: [number, number][];
+}
+
+export async function fetchFsSearch(q: string, path?: string): Promise<{ query: string; results: FsSearchResult[] }> {
+  const params = new URLSearchParams({ q });
+  if (path) params.set('path', path);
+  const resp = await apiFetch(`/fs/search?${params.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function createTerminalSession(options: { shell?: string; cwd?: string } = {}): Promise<{
+  success: boolean;
+  terminal_id: string;
+  name: string;
+  cwd: string;
+}> {
+  const resp = await apiFetch('/terminal/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(options),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function fetchTerminalList(cwd?: string): Promise<{
+  success: boolean;
+  terminals: Array<{
+    id: string;
+    name: string;
+    cwd: string;
+    shell: string;
+    history: string[];
+    timestamp: number;
+  }>;
+  platform?: 'windows' | 'macos' | 'linux';
+}> {
+  const q = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
+  const resp = await apiFetch(`/terminal/list${q}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) return { success: false, terminals: [] };
+  return resp.json();
+}
+
+export async function closeTerminalSession(terminalId: string): Promise<{ success: boolean }> {
+  const resp = await apiFetch('/terminal/close', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ terminal_id: terminalId }),
+  });
+  if (!resp.ok) return { success: false };
+  return resp.json();
+}
+
+export async function sendTerminalInput(
+  terminalId: string,
+  input: string,
+): Promise<{ success: boolean; output: string }> {
+  const resp = await apiFetch('/terminal/input', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ terminal_id: terminalId, input }),
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));

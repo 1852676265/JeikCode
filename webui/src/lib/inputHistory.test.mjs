@@ -172,8 +172,8 @@ test('actual stream acceptance callback records only successful HTTP acceptance'
 test('successful submit wiring excludes validation and failed transports', async () => {
   const chat = await readFile(new URL('../components/Chat.tsx', import.meta.url), 'utf8');
   const api = await readFile(new URL('../api.ts', import.meta.url), 'utf8');
-  const submit = chat.slice(chat.indexOf('  async function sendMessage()'), chat.indexOf('  // 当前回合结束'));
-  assert.match(submit, /const originalInput = input;/);
+  const submit = chat.slice(chat.indexOf('  async function sendMessage('), chat.indexOf('  // 当前回合结束'));
+  assert.match(submit, /const originalInput = (?:input|rawText);/);
   assert.match(submit, /await dispatchSlashCommand[\s\S]*?if \(result.handled\) recordAcceptedInput\(\);[\s\S]*?catch/);
   assert.match(submit, /await deliver\(messageText, images, modeState.confirmedMode, recordAcceptedInput\)/);
   assert.ok(submit.indexOf('if (uploading) return') < submit.indexOf('recordAcceptedInput();'));

@@ -286,11 +286,11 @@ function applyBatch(list: TodoItem[], actions: Record<string, unknown>[]): TodoI
   const addLandings: number[] = [];
   const addActions = actions.filter((action) => actionKind(action) === 'add');
   if (addActions.length > 0) {
-    // 关键防线：当一个批次包含 2 个或更多个 add 操作时，代表 Agent 正在从零规划一套全新任务清单，
-    // 或者当旧清单已全部完成时，必须清空旧清单重新开始，绝不把新计划强行追加在旧清单后面！
-    if (addActions.length >= 2) {
-      next = [];
-    } else {
+    // 关键对齐：绝不能仅仅因为 add 数量 >= 2 就把还在进行中的任务列表暴力清空！
+    // 只有当已有列表此前已经全部完成（全是 completed）时，才允许清除已闭环的旧计划；
+    // 若列表中仍有 pending 或 in_progress 的任务，100% 严格追加，绝不清空！
+    const isUnfinished = next.some((t) => t.status !== 'completed');
+    if (!isUnfinished) {
       next = maybeAutoClearFinished(next);
     }
     for (const action of addActions) {
@@ -405,7 +405,7 @@ export function reduceTodosFromCalls(
   let baselineIdx = -1;
   for (let i = filtered.length - 1; i >= 0; i--) {
     const args = filtered[i]!.args;
-    if (parseTodoPlan(args) || isClearActionCall(args) || isBatchPlanEstablishment(args)) {
+    if (parseTodoPlan(args) || isClearActionCall(args)) {
       baselineIdx = i;
       break;
     }
@@ -418,7 +418,7 @@ export function reduceTodosFromCalls(
     if (fullPlan) {
       list = fullPlan;
     } else {
-      // It's a clear-action call or batch-add establishment: apply it to an empty list
+      // It's a clear-action call: apply it to an empty list
       list = applyTodoAction([], baselineArgs);
     }
     start = baselineIdx + 1;

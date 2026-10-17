@@ -18,7 +18,7 @@
   /* Table cell border */
   --app-table-border:rgba(255, 255, 255, 0.1);
   /* Shared max-width for the centered message + input columns */
-  --app-content-max-width:min(1100px, 100%);
+  --app-content-max-width:min(1440px, 94%);
   --app-list-hover-background:rgba(255, 255, 255, 0.05); --app-list-active-background:rgba(255, 255, 255, 0.09); --app-list-active-foreground:#ffffff;
   --app-menu-background:#1e1f20; --app-menu-border:rgba(255, 255, 255, 0.1); --app-menu-foreground:#e3e3e3; --app-menu-selection-background:rgba(255, 255, 255, 0.08);
   --app-command-menu-hover-background:rgba(255, 255, 255, 0.06); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 12%,transparent); --app-command-menu-active-accent:#3b82f6;
@@ -28,7 +28,10 @@
   --app-diff-deletion-foreground:#f87171; --app-diff-addition-foreground:#34d399;
   --app-diff-addition-bg:color-mix(in srgb, var(--app-diff-addition-foreground) 16%, transparent);
   --app-diff-deletion-bg:color-mix(in srgb, var(--app-diff-deletion-foreground) 16%, transparent);
-  --app-terminal-bg:#0e0e10; --app-terminal-fg:#e3e3e3; --app-tool-name-color:#60a5fa;
+  --app-terminal-bg:#0d1117; --app-terminal-fg:#c9d1d9; --app-tool-name-color:#60a5fa;
+  --ansi-black:#282c34; --ansi-red:#f87171; --ansi-green:#4ade80; --ansi-yellow:#fbbf24;
+  --ansi-blue:#60a5fa; --ansi-magenta:#c084fc; --ansi-cyan:#38bdf8; --ansi-white:#f3f4f6;
+  --ansi-bright-black:#6b7280;
   --app-json-key:#60a5fa; --app-json-string:#34d399; --app-json-number:#f59e0b; --app-json-boolean:#a78bfa; --app-json-null:#9ca3af; --app-json-punct:#6b7280;
   --app-spacing-small:4px; --app-spacing-medium:8px; --app-spacing-large:12px; --app-spacing-xlarge:16px;
   --corner-radius-small:6px; --corner-radius-medium:10px; --corner-radius-large:14px;
@@ -64,7 +67,10 @@
   --app-diff-addition-foreground:#15803d;
   --app-diff-addition-bg:#dcfce7;
   --app-diff-deletion-bg:#fee2e2;
-  --app-terminal-bg:#1e293b; --app-terminal-fg:#f8fafc; --app-tool-name-color:#1d4ed8;
+  --app-terminal-bg:#0d1117; --app-terminal-fg:#c9d1d9; --app-tool-name-color:#60a5fa;
+  --ansi-black:#282c34; --ansi-red:#f87171; --ansi-green:#4ade80; --ansi-yellow:#fbbf24;
+  --ansi-blue:#60a5fa; --ansi-magenta:#c084fc; --ansi-cyan:#38bdf8; --ansi-white:#f3f4f6;
+  --ansi-bright-black:#6b7280;
   --app-json-key:#1d4ed8; --app-json-string:#15803d; --app-json-number:#b45309; --app-json-boolean:#6d28d9; --app-json-null:#475569; --app-json-punct:#64748b;
 }
 @media (prefers-color-scheme: light) {
@@ -92,7 +98,10 @@
     --app-diff-addition-foreground:#15803d;
     --app-diff-addition-bg:#dcfce7;
     --app-diff-deletion-bg:#fee2e2;
-    --app-terminal-bg:#1e293b; --app-terminal-fg:#f8fafc; --app-tool-name-color:#1d4ed8;
+    --app-terminal-bg:#0d1117; --app-terminal-fg:#c9d1d9; --app-tool-name-color:#60a5fa;
+    --ansi-black:#282c34; --ansi-red:#f87171; --ansi-green:#4ade80; --ansi-yellow:#fbbf24;
+    --ansi-blue:#60a5fa; --ansi-magenta:#c084fc; --ansi-cyan:#38bdf8; --ansi-white:#f3f4f6;
+    --ansi-bright-black:#6b7280;
     --app-json-key:#1d4ed8; --app-json-string:#15803d; --app-json-number:#b45309; --app-json-boolean:#6d28d9; --app-json-null:#475569; --app-json-punct:#64748b;
   }
 }
@@ -123,3 +132,22 @@
   background: color-mix(in srgb, var(--app-secondary-foreground) 75%, transparent);
 }
 ::-webkit-scrollbar-corner { background: transparent; }
+
+/* Wide-screen & adaptive content expansion */
+@media (min-width: 1440px) {
+  :root {
+    --app-content-max-width: min(1560px, 92%);
+  }
+}
+@media (min-width: 1800px) {
+  :root {
+    --app-content-max-width: min(1760px, 90%);
+  }
+}
+@media (min-width: 2200px) {
+  :root {
+    --app-content-max-width: min(2000px, 88%);
+  }
+}
+
+

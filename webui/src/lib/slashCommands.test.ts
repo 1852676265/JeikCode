@@ -237,6 +237,15 @@ test('/mcp dispatches to mcpCommand with subcommand arg', async () => {
 
 import { formatMcpStatusText } from './slashCommands.ts';
 
+test('/init dispatches to initProject handler', async () => {
+  const { h, calls } = fakeHandlers();
+  h.initProject = () => { calls.push('initProject'); };
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  const r = await dispatchSlashCommand('/init', map, h);
+  assert.deepEqual(r, { handled: true });
+  assert.deepEqual(calls, ['initProject']);
+});
+
 test('formatMcpStatusText lists servers and blocked count', () => {
   const t = (k: string, p?: Record<string, string | number>) =>
     p ? `${k}:${JSON.stringify(p)}` : k;

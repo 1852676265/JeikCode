@@ -137,6 +137,21 @@ export function App() {
   const [topNavMoreOpen, setTopNavMoreOpen] = useState(false);
   const topNavMoreRef = useRef<HTMLDivElement | null>(null);
 
+  // 顶栏电脑端语言切换下拉框状态
+  const [langMenuOpen, setLangMenuOpen] = useState(false);
+  const langMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!langMenuOpen) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (langMenuRef.current && !langMenuRef.current.contains(e.target as Node)) {
+        setLangMenuOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [langMenuOpen]);
+
   // 顶栏自适应收纳：监听 header 实际宽度，桌面窗口缩窄时及时收纳到三个点
   const [headerWidth, setHeaderWidth] = useState<number>(
     typeof window !== 'undefined' ? window.innerWidth : 1200
@@ -213,44 +228,32 @@ export function App() {
   // VSCode-style open diff tabs in the session header
   const [diffTabs, setDiffTabs] = useState<any[]>([]);
   const [activeMainTabId, setActiveMainTabId] = useState<string>('chat');
+  const tabsContainerRef = useRef<HTMLDivElement>(null);
+
+  // 顶部主标签栏滚轮水平滑动与激活标签自动居中 (在 activeMainTabId 声明之后定义，避免 TDZ 报错)
+  const handleTabsWheel = (e: WheelEvent) => {
+    if (tabsContainerRef.current) {
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        tabsContainerRef.current.scrollLeft += e.deltaY;
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!tabsContainerRef.current || activeMainTabId === 'chat') return;
+    const activeEl = tabsContainerRef.current.querySelector('.header-editor-tab.active');
+    if (activeEl) {
+      activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    }
+  }, [activeMainTabId]);
 
   // 移动端顶部会话与Diff标签下拉收纳状态
   const [mobileTabsDropdownOpen, setMobileTabsDropdownOpen] = useState(false);
   const mobileTabsDropdownRef = useRef<HTMLDivElement>(null);
 
-  // 桌面端 Diff 标签自适应收纳与溢出下拉菜单状态
-  const [tabsOverflowOpen, setTabsOverflowOpen] = useState(false);
-  const tabsContainerRef = useRef<HTMLDivElement>(null);
-  const tabsOverflowRef = useRef<HTMLDivElement>(null);
-  // 默认尽量全部外显，触碰右侧边界才收纳
-  const [maxVisibleTabs, setMaxVisibleTabs] = useState<number>(20);
-
-  // 动态测量 tabsContainer 可容纳的标签数（横拉缩放窗口快触碰右侧按钮边界时才收起）
+  // 点击外部自动关闭移动端收纳下拉菜单
   useEffect(() => {
-    if (!tabsContainerRef.current) return;
-    const calculateTabs = () => {
-      if (!tabsContainerRef.current) return;
-      const width = tabsContainerRef.current.clientWidth;
-      // 预留向下箭头按钮 36px，每个标签舒适宽度约 120px；只有放不下时才收纳
-      const count = Math.max(1, Math.floor((width - 36) / 120));
-      setMaxVisibleTabs(count);
-    };
-    calculateTabs();
-    let ro: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== 'undefined') {
-      ro = new ResizeObserver(calculateTabs);
-      ro.observe(tabsContainerRef.current);
-    }
-    window.addEventListener('resize', calculateTabs);
-    return () => {
-      if (ro) ro.disconnect();
-      window.removeEventListener('resize', calculateTabs);
-    };
-  }, [diffTabs.length]);
-
-  // 点击外部自动关闭收纳下拉菜单
-  useEffect(() => {
-    if (!mobileTabsDropdownOpen && !tabsOverflowOpen) return;
+    if (!mobileTabsDropdownOpen) return;
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as Node;
       if (
@@ -260,19 +263,12 @@ export function App() {
       ) {
         setMobileTabsDropdownOpen(false);
       }
-      if (
-        tabsOverflowOpen &&
-        tabsOverflowRef.current &&
-        !tabsOverflowRef.current.contains(target)
-      ) {
-        setTabsOverflowOpen(false);
-      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [mobileTabsDropdownOpen, tabsOverflowOpen]);
+  }, [mobileTabsDropdownOpen]);
 
   // 右侧检视面板（提问记录 / Git面板）折叠与宽度布局状态，用于自适应避让右上角快捷工具栏
   const [rightPanelLayout, setRightPanelLayout] = useState<{ collapsed: boolean; width: number }>(() => {
@@ -318,6 +314,73 @@ export function App() {
       return next;
     });
   };
+
+  // 顶部主标签栏拖拽与排序状态
+  const [isMainTabsDragOver, setIsMainTabsDragOver] = useState(false);
+  const [mainTabDragIdx, setMainTabDragIdx] = useState<number | null>(null);
+  const [mainTabOverIdx, setMainTabOverIdx] = useState<number | null>(null);
+
+  const handleOpenFile = (filePath: string, insertIndex?: number) => {
+    const tabId = `editor_${filePath}`;
+    const existingIdx = diffTabs.findIndex((t) => t.id === tabId);
+    if (existingIdx !== -1) {
+      if (insertIndex !== undefined && insertIndex !== existingIdx) {
+        setDiffTabs((prev) => {
+          const next = [...prev];
+          const [item] = next.splice(existingIdx, 1);
+          if (item) {
+            const targetSlot = insertIndex > existingIdx ? insertIndex - 1 : insertIndex;
+            next.splice(targetSlot, 0, item);
+          }
+          return next;
+        });
+      }
+      setActiveMainTabId(tabId);
+      return;
+    }
+    const fileName = filePath.split(/[\\/]/).pop() || filePath;
+    const ext = fileName.split('.').pop() || 'FILE';
+    const newTab = {
+      id: tabId,
+      type: 'editor',
+      fileName,
+      filePath,
+      fileStatus: ext.slice(0, 3).toUpperCase(),
+    };
+    setDiffTabs((prev) => {
+      if (insertIndex !== undefined && insertIndex >= 0 && insertIndex <= prev.length) {
+        const next = [...prev];
+        next.splice(insertIndex, 0, newTab);
+        return next;
+      }
+      return [...prev, newTab];
+    });
+    setActiveMainTabId(tabId);
+  };
+
+  // 全局文件打开事件广播监听 (例如 Markdown 相对链接点击、文件树定位等)
+  useEffect(() => {
+    const onOpenFileEvent = (e: any) => {
+      const p = e.detail?.path;
+      if (p) {
+        handleOpenFile(p);
+      }
+    };
+    window.addEventListener('jeikcode:open_file', onOpenFileEvent);
+    return () => window.removeEventListener('jeikcode:open_file', onOpenFileEvent);
+  }, [diffTabs]);
+
+  // 监听全局主视图切换广播 (例如从侧边栏快捷回到对话主舞台)
+  useEffect(() => {
+    const onSwitchTab = (e: any) => {
+      const tab = e.detail;
+      if (typeof tab === 'string') {
+        setActiveMainTabId(tab);
+      }
+    };
+    window.addEventListener('jeikcode:switch_main_tab', onSwitchTab);
+    return () => window.removeEventListener('jeikcode:switch_main_tab', onSwitchTab);
+  }, []);
   // Chat reports whether it is showing the centered landing (empty) state, so the
   // session-title header can hide on landing (matching the design's full-bleed hero).
   const [isLanding, setIsLanding] = useState(true);
@@ -620,42 +683,19 @@ export function App() {
     };
   }, [sessionId]);
 
-  // 在指定目录下创建一个新会话并切过去（首条用户消息前不写盘）。
-  // 先重置画布回落地页给即时反馈，再异步建会话；失败则停在落地页。
+  // 在指定目录下开启一个新建会话视图（草稿态，首条用户消息前绝不调用后端预创建，不占位不写盘）。
   function openNewSession(targetCwd: string | undefined) {
-    const currentSeq = ++navSeqRef.current;
+    navSeqRef.current++;
     setSessionId(null);
     setActiveSession(null);
     if (targetCwd && targetCwd !== '~') {
       setCwd(targetCwd);
     }
-    createSession(targetCwd || undefined)
-      .then((data) => {
-        // 如果网络往返期间用户切换了会话或发起了新导航，该响应已失效，坚决丢弃，防止穿透和目录污染
-        if (currentSeq !== navSeqRef.current) return;
-        if (data.working_dir) setCwd(data.working_dir);
-        if (data.project_hash) setProjectHash(data.project_hash);
-        setSessionId(data.id);
-        setActiveSession({
-          id: data.id,
-          name: data.name,
-          working_dir: data.working_dir,
-          project_hash: data.project_hash,
-          created_at: data.created_at,
-          updated_at: data.created_at,
-          message_count: 0,
-        });
-        setSessionListVersion((v) => v + 1);
-      })
-      .catch((err) => {
-        if (currentSeq !== navSeqRef.current) return;
-        // 创建失败时已在前端落地页，仅打印日志
-        console.warn('[newSession] create session failed:', err);
-      });
   }
 
   function handleNewSession(targetDir?: string) {
     setSidebarOpen(false);
+    setActiveMainTabId('chat');
     // Top-level 「新建对话」 stays in the current/serve workspace.
     openNewSession(targetDir || cwd || undefined);
   }
@@ -664,6 +704,7 @@ export function App() {
     navSeqRef.current++;
     setSessionId(session.id);
     setActiveSession(session);
+    setActiveMainTabId('chat');
     if (session.working_dir) {
       setCwd(session.working_dir);
     }
@@ -795,6 +836,8 @@ export function App() {
         onOpenCwd={() => setShowCwd(true)}
         onSwitchProject={handlePickCwd}
         extraRunningIds={Array.from(liveRunningIds)}
+        onOpenFile={handleOpenFile}
+        activeFilePath={diffTabs.find((t) => t.id === activeMainTabId)?.filePath}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -811,6 +854,18 @@ export function App() {
             (isHeaderUltraCompact ? ' is-ultra-compact' : '')
           }
           ref={headerMenuRef}
+          onDragOver={(e) => {
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+          }}
+          onDrop={(e) => {
+            const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+            const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+            if (data?.filePath && diffTabs.length === 0) {
+              e.preventDefault();
+              handleOpenFile(data.filePath);
+            }
+          }}
         >
           {/* Mobile-only menu button */}
           <button
@@ -932,8 +987,8 @@ export function App() {
                 </div>
               )}
             </div>
-          ) : activeSession?.name && !isLanding ? (
-            /* 桌面端会话标题：去除下拉三菜单，直接点击切回对话 */
+          ) : activeSession?.name && (activeSession.message_count ?? 0) > 0 ? (
+            /* 桌面端会话标题：只有当该会话真实拥有消息时才展示其标题 */
             <button
               type="button"
               class={
@@ -952,133 +1007,169 @@ export function App() {
                 />
               )}
             </button>
-          ) : null}
+          ) : (
+            /* 桌面端常驻小云朵标签：当处于新建会话或无活跃会话时，常驻展示云朵标签，点击直接新建/切回对话 */
+            <button
+              type="button"
+              class={
+                'session-title-btn session-new-cloud-btn' +
+                (activeMainTabId === 'chat' ? ' active' : ' clickable-nav')
+              }
+              title={t('sidebar.newChat') || '新建对话'}
+              aria-label={t('sidebar.newChat') || '新建对话'}
+              onClick={() => {
+                setActiveMainTabId('chat');
+                handleNewSession();
+              }}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+              </svg>
+              <span class="session-title-text">{t('sidebar.newChat') || '新建对话'}</span>
+            </button>
+          )}
 
-          {/* 桌面端 VSCode Editor Tabs：横拉缩放自适应收纳/散开，且去除冗余 chat 标签 */}
+          {/* 桌面端 VSCode Editor Tabs：全标签平铺横滑，支持微高度横向滚动条，彻底消除 +20 按钮遮挡 */}
           {!isHeaderCompact && diffTabs.length > 0 && (
             <div
-              class="header-editor-tabs-bar"
+              class={'header-editor-tabs-bar' + (isMainTabsDragOver ? ' is-drag-over-main' : '')}
               ref={tabsContainerRef}
+              onWheel={handleTabsWheel}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+                setIsMainTabsDragOver(true);
+              }}
+              onDragLeave={(e) => {
+                if (!tabsContainerRef.current?.contains(e.relatedTarget as Node)) {
+                  setIsMainTabsDragOver(false);
+                  setMainTabOverIdx(null);
+                }
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsMainTabsDragOver(false);
+                setMainTabOverIdx(null);
+                if (mainTabDragIdx !== null) {
+                  setDiffTabs((prev) => {
+                    const next = [...prev];
+                    const [moved] = next.splice(mainTabDragIdx, 1);
+                    if (moved) next.push(moved);
+                    return next;
+                  });
+                  setMainTabDragIdx(null);
+                  return;
+                }
+                try {
+                  const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+                  const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+                  if (data?.filePath) {
+                    handleOpenFile(data.filePath);
+                  }
+                } catch {}
+              }}
               role="tablist"
             >
-              {(() => {
-                const canFitAll = diffTabs.length <= maxVisibleTabs;
-                const visibleTabs = canFitAll
-                  ? diffTabs
-                  : diffTabs.slice(0, Math.max(1, maxVisibleTabs - 1));
-                const overflowTabs = canFitAll
-                  ? []
-                  : diffTabs.slice(Math.max(1, maxVisibleTabs - 1));
-                const isOverflowActive = overflowTabs.some((t) => t.id === activeMainTabId);
-
+              {diffTabs.map((tab, idx) => {
+                const isActive = activeMainTabId === tab.id;
+                const isOver = mainTabOverIdx === idx;
+                const isDragging = mainTabDragIdx === idx;
                 return (
-                  <>
-                    {visibleTabs.map((tab) => (
-                      <div
-                        key={tab.id}
-                        class={'header-editor-tab' + (activeMainTabId === tab.id ? ' active' : '')}
-                        onClick={() => setActiveMainTabId(tab.id)}
-                        title={`${tab.filePath} (${tab.commitShortHash})`}
-                      >
-                        <span class={'vscode-tab-badge status-' + tab.fileStatus.toLowerCase()}>
-                          {tab.fileStatus}
-                        </span>
-                        <span class="tab-filename">{tab.fileName}</span>
-                        <button
-                          type="button"
-                          class="vscode-tab-close"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleCloseDiffTab(tab.id);
-                          }}
-                          title="Close tab"
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
+                  <div
+                    key={tab.id}
+                    class={
+                      'header-editor-tab' +
+                      (isActive ? ' active' : '') +
+                      (isOver ? ' is-drag-over-tab' : '') +
+                      (isDragging ? ' is-dragging-tab' : '')
+                    }
+                    onClick={() => setActiveMainTabId(tab.id)}
+                    onDblClick={(e) => {
+                      e.stopPropagation();
+                      handleCloseDiffTab(tab.id);
+                    }}
+                    title={`${tab.filePath}${tab.commitShortHash ? ` (${tab.commitShortHash})` : ''} (双击关闭标签)`}
+                    draggable={true}
+                    onDragStart={(e) => {
+                      setMainTabDragIdx(idx);
+                      const data = {
+                        id: tab.id,
+                        filePath: tab.filePath,
+                        fileName: tab.fileName,
+                        fileStatus: tab.fileStatus,
+                      };
+                      (window as any).__jeikcode_dragged_tab = data;
+                      e.dataTransfer?.setData('application/jeikcode-tab', JSON.stringify(data));
+                      e.dataTransfer?.setData('application/jeikcode-main-tab-index', String(idx));
+                      e.dataTransfer?.setData('text/plain', tab.filePath);
+                      if (e.dataTransfer) {
+                        e.dataTransfer.effectAllowed = 'copyMove';
+                      }
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.dataTransfer) {
+                        e.dataTransfer.dropEffect = mainTabDragIdx !== null ? 'move' : 'copy';
+                      }
+                      if (mainTabOverIdx !== idx) {
+                        setMainTabOverIdx(idx);
+                      }
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setMainTabOverIdx(null);
+                      setIsMainTabsDragOver(false);
 
-                    {/* 最右侧向下箭头：触碰右侧边界放不下时，点击展开剩余未显示的标签页 */}
-                    {overflowTabs.length > 0 && (
-                      <div class="header-tabs-overflow-wrap" ref={tabsOverflowRef}>
-                        <button
-                          type="button"
-                          class={
-                            'header-tabs-overflow-btn' +
-                            (isOverflowActive ? ' active' : '') +
-                            (tabsOverflowOpen ? ' open' : '')
-                          }
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setTabsOverflowOpen((v) => !v);
-                          }}
-                          title={t('header.remainingTabs')}
-                          aria-label={t('header.remainingTabs')}
-                        >
-                          <span class="overflow-count">+{overflowTabs.length}</span>
-                          <svg
-                            class="overflow-chevron"
-                            width="12"
-                            height="12"
-                            viewBox="0 0 16 16"
-                            fill="none"
-                            aria-hidden="true"
-                          >
-                            <path
-                              d="M4 6l4 4 4-4"
-                              stroke="currentColor"
-                              stroke-width="1.8"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                            />
-                          </svg>
-                        </button>
+                      const fromIndexStr = e.dataTransfer?.getData('application/jeikcode-main-tab-index');
+                      if (fromIndexStr !== undefined && fromIndexStr !== '') {
+                        const fromIdx = parseInt(fromIndexStr, 10);
+                        if (!Number.isNaN(fromIdx) && fromIdx !== idx) {
+                          setDiffTabs((prev) => {
+                            const next = [...prev];
+                            const [moved] = next.splice(fromIdx, 1);
+                            if (moved) next.splice(idx, 0, moved);
+                            return next;
+                          });
+                          setMainTabDragIdx(null);
+                          return;
+                        }
+                      }
 
-                        {tabsOverflowOpen && (
-                          <div
-                            class="header-tabs-overflow-menu"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <div class="overflow-menu-title">
-                              {t('header.hiddenTabs', { n: overflowTabs.length })}
-                            </div>
-                            {overflowTabs.map((tab) => (
-                              <div
-                                key={tab.id}
-                                class={
-                                  'header-tabs-overflow-row' +
-                                  (activeMainTabId === tab.id ? ' active' : '')
-                                }
-                                onClick={() => {
-                                  setActiveMainTabId(tab.id);
-                                  setTabsOverflowOpen(false);
-                                }}
-                                title={tab.filePath}
-                              >
-                                <span class={'vscode-tab-badge status-' + tab.fileStatus.toLowerCase()}>
-                                  {tab.fileStatus}
-                                </span>
-                                <span class="tab-filename">{tab.fileName}</span>
-                                <button
-                                  type="button"
-                                  class="vscode-tab-close"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleCloseDiffTab(tab.id);
-                                  }}
-                                  title="Close tab"
-                                >
-                                  ×
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </>
+                      try {
+                        const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+                        const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+                        if (data?.filePath) {
+                          handleOpenFile(data.filePath, idx);
+                        }
+                      } catch {}
+                      setMainTabDragIdx(null);
+                    }}
+                    onDragEnd={() => {
+                      (window as any).__jeikcode_dragged_tab = null;
+                      setMainTabDragIdx(null);
+                      setMainTabOverIdx(null);
+                    }}
+                  >
+                    <span class={'vscode-tab-badge status-' + (tab.fileStatus || 'M').toLowerCase()}>
+                      {tab.fileStatus || 'M'}
+                    </span>
+                    <span class="tab-filename">{tab.fileName}</span>
+                    <button
+                      type="button"
+                      class="vscode-tab-close"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleCloseDiffTab(tab.id);
+                      }}
+                      title="Close tab"
+                    >
+                      ×
+                    </button>
+                  </div>
                 );
-              })()}
+              })}
             </div>
           )}
 
@@ -1160,16 +1251,66 @@ export function App() {
               )}
             </button>
 
-            {/* 常驻语言切换（桌面外显，极窄或手机收纳） */}
-            <button
-              type="button"
-              class="top-nav-btn top-nav-lang-btn"
-              onClick={() => setSettingsSection('language')}
-              title={t('settings.menuLang')}
-              aria-label={t('settings.menuLang')}
-            >
-              <span>{lang === 'zh' ? '简' : lang === 'vi' ? 'VI' : 'EN'}</span>
-            </button>
+            {/* 常驻语言切换（电脑版轻量现代下拉框，手机版保持居中弹窗） */}
+            <div class="top-nav-lang-wrap" ref={langMenuRef}>
+              <button
+                type="button"
+                class={'top-nav-btn top-nav-lang-btn' + (langMenuOpen ? ' active' : '')}
+                onClick={() => {
+                  const isMobile = typeof window !== 'undefined'
+                    ? (window.innerWidth <= 768 || ('ontouchstart' in window && window.innerWidth <= 1024))
+                    : false;
+                  if (isMobile) {
+                    setSettingsSection('language');
+                  } else {
+                    setLangMenuOpen((o) => !o);
+                  }
+                }}
+                title={t('settings.menuLang')}
+                aria-label={t('settings.menuLang')}
+                aria-expanded={langMenuOpen}
+              >
+                <span>{lang === 'zh' ? '简' : lang === 'vi' ? 'VI' : 'EN'}</span>
+              </button>
+
+              {langMenuOpen && (
+                <div class="top-nav-lang-menu" role="menu">
+                  <button
+                    type="button"
+                    class={'lang-menu-item' + (lang === 'zh' ? ' active' : '')}
+                    onClick={() => {
+                      setLang('zh');
+                      setLangMenuOpen(false);
+                    }}
+                  >
+                    <span class="lang-item-name">简体中文</span>
+                    {lang === 'zh' && <span class="lang-item-check">✓</span>}
+                  </button>
+                  <button
+                    type="button"
+                    class={'lang-menu-item' + (lang === 'en' ? ' active' : '')}
+                    onClick={() => {
+                      setLang('en');
+                      setLangMenuOpen(false);
+                    }}
+                  >
+                    <span class="lang-item-name">English</span>
+                    {lang === 'en' && <span class="lang-item-check">✓</span>}
+                  </button>
+                  <button
+                    type="button"
+                    class={'lang-menu-item' + (lang === 'vi' ? ' active' : '')}
+                    onClick={() => {
+                      setLang('vi');
+                      setLangMenuOpen(false);
+                    }}
+                  >
+                    <span class="lang-item-name">Tiếng Việt</span>
+                    {lang === 'vi' && <span class="lang-item-check">✓</span>}
+                  </button>
+                </div>
+              )}
+            </div>
 
             {/* 模型选择控件插槽（核心操作，内含思考档位与模型胶囊，齿轮已内置） */}
             <div ref={setTopModelSlot} class="top-nav-model-slot" id="top-nav-model-slot" />
@@ -1284,7 +1425,27 @@ export function App() {
           </div>
         </header>
 
-        <div class="session-body app-sidebar">
+        <div
+          class="session-body app-sidebar"
+          onDragOver={(e) => {
+            e.preventDefault();
+            if (e.dataTransfer) {
+              e.dataTransfer.dropEffect = 'copy';
+            }
+          }}
+          onDrop={(e) => {
+            if (e.defaultPrevented) return;
+            e.preventDefault();
+            try {
+              const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+              const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+              const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+              if (targetPath && typeof targetPath === 'string' && targetPath.trim()) {
+                handleOpenFile(targetPath.trim());
+              }
+            } catch {}
+          }}
+        >
           <Chat
             sessionId={sessionId}
             onSessionId={handleSessionAssigned}

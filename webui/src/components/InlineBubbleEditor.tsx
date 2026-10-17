@@ -19,6 +19,7 @@ export interface InlineBubbleEditorProps {
   onSaveRewrite: (text: string, images: ImageData[]) => void;
   onRollbackSubmit: (text: string, images: ImageData[], tempModel?: string) => void;
   onCancel: () => void;
+  onDraftChange?: (text: string, images: ImageData[], selectedModel?: string) => void;
   disabled?: boolean;
 }
 
@@ -44,6 +45,7 @@ export function InlineBubbleEditor({
   onSaveRewrite,
   onRollbackSubmit,
   onCancel,
+  onDraftChange,
   disabled = false,
 }: InlineBubbleEditorProps) {
   const t = useT();
@@ -54,6 +56,32 @@ export function InlineBubbleEditor({
   const [selectedModel, setSelectedModel] = useState<string>(currentModel);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+
+  const onDraftChangeRef = useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+  const lastSyncedRef = useRef<{ text: string; attachLen: number; model: string }>({
+    text: initialText,
+    attachLen: initialImages.length,
+    model: currentModel,
+  });
+
+  // 实时通知外部草稿变更，确保刷新页面或会话切换时保留编辑状态。
+  // 严格比对新旧变更，杜绝无意义重复通知引发的父子组件无限重渲染死循环。
+  useEffect(() => {
+    if (
+      text === lastSyncedRef.current.text &&
+      pendingAttach.length === lastSyncedRef.current.attachLen &&
+      selectedModel === lastSyncedRef.current.model
+    ) {
+      return;
+    }
+    lastSyncedRef.current = {
+      text,
+      attachLen: pendingAttach.length,
+      model: selectedModel,
+    };
+    onDraftChangeRef.current?.(text, pendingToImageData(pendingAttach), selectedModel);
+  }, [text, pendingAttach, selectedModel]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -227,9 +255,17 @@ export function InlineBubbleEditor({
           onInput={(e) => setText((e.target as HTMLTextAreaElement).value)}
           onPaste={handlePaste}
           onKeyDown={(e) => {
+            // Shift + Enter 为多行换行，不拦截；普通 Enter（桌面端非输入法中）与 Ctrl+Enter 均触发回溯并提交
+            if (e.key === 'Enter' && !e.shiftKey) {
+              if (e.isComposing || e.keyCode === 229) return;
+              e.preventDefault();
+              handleRollback();
+              return;
+            }
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();
               handleRollback();
+              return;
             }
           }}
           placeholder={t('chat.editPlaceholder')}
