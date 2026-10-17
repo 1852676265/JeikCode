@@ -1,11 +1,60 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  deserializeQueuedCard,
   mergeQueuedIntoDraft,
   queueAfterSessionActiveCheck,
+  serializeQueuedCard,
   stashSessionQueued,
   restoreSessionQueued,
 } from './queuedDraft.ts';
+
+test('queued card wire serialization preserves the selected approval mode and images', () => {
+  const card = {
+    id: 42,
+    text: 'continue',
+    images: [{ media_type: 'image/png', data: 'image-a' }],
+    kind: 'queue' as const,
+    approvalMode: 'plan' as const,
+    clientInputId: 'local-only-correlation',
+  };
+  const wire = serializeQueuedCard(card);
+  assert.deepEqual(wire, {
+    id: 42,
+    text: 'continue',
+    images: card.images,
+    kind: 'queue',
+    approval_mode: 'plan',
+  });
+  const restored = deserializeQueuedCard(wire);
+  assert.equal(restored.approvalMode, 'plan');
+  assert.deepEqual(restored.images, card.images);
+  assert.equal(restored.id, card.id);
+  assert.equal('clientInputId' in restored, false);
+});
+
+test('all established approval modes survive the wire contract, while legacy missing mode stays missing', () => {
+  for (const approvalMode of ['build', 'plan', 'bypass', 'accept_edits'] as const) {
+    const wire = serializeQueuedCard({ id: 'wire-id', kind: 'steer' as const, text: 'same', approvalMode });
+    assert.equal(wire.approval_mode, approvalMode);
+    assert.equal(deserializeQueuedCard(wire).approvalMode, approvalMode);
+  }
+  const legacy = deserializeQueuedCard({ id: 1, text: 'legacy', kind: 'queue' as const });
+  assert.equal('approvalMode' in legacy, false);
+});
+
+test('invalid or malformed approval modes cannot override the current dispatch mode', () => {
+  for (const invalid of ['Build', 'auto', '', 42, null, {}, true]) {
+    const loaded = deserializeQueuedCard({
+      id: 9, text: 'retry', kind: 'queue' as const, approval_mode: invalid as any,
+    });
+    assert.equal('approvalMode' in loaded, false, `invalid: ${String(invalid)}`);
+    const wire = serializeQueuedCard({
+      id: 9, text: 'retry', kind: 'queue' as const, approvalMode: invalid as any,
+    });
+    assert.equal('approval_mode' in wire, false);
+  }
+});
 
 test('mergeQueuedIntoDraft keeps queue order ahead of the current draft', () => {
   const merged = mergeQueuedIntoDraft(
@@ -97,5 +146,4 @@ test('loadQueuedFromStorage and saveQueuedToStorage round-trip across simulated 
     (globalThis as any).window = original;
   }
 });
-
 

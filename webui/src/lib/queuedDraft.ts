@@ -1,8 +1,28 @@
-import type { ImageData } from '../api';
+import type { ApprovalMode, ImageData } from '../api';
 
 export interface QueuedDraftItem {
   text: string;
   images?: ImageData[];
+}
+
+function isApprovalMode(value: unknown): value is ApprovalMode {
+  return value === 'build' || value === 'plan' || value === 'bypass' || value === 'accept_edits';
+}
+
+/** Map the UI approval mode to the daemon queue's existing wire property. */
+export function serializeQueuedCard<T extends { approvalMode?: ApprovalMode; clientInputId?: string }>(
+  item: T,
+): Omit<T, 'approvalMode' | 'clientInputId'> & { approval_mode?: ApprovalMode } {
+  const { approvalMode, clientInputId: _localOnlyId, ...rest } = item;
+  return isApprovalMode(approvalMode) ? { ...rest, approval_mode: approvalMode } : rest;
+}
+
+/** Restore a daemon queue card without trusting malformed persisted modes. */
+export function deserializeQueuedCard<T extends { approval_mode?: ApprovalMode }>(
+  item: T,
+): Omit<T, 'approval_mode'> & { approvalMode?: ApprovalMode } {
+  const { approval_mode, ...rest } = item;
+  return isApprovalMode(approval_mode) ? { ...rest, approvalMode: approval_mode } : rest;
 }
 
 export const STORAGE_KEY_QUEUED_MESSAGES = 'jeikcode_queued_messages_v2';
