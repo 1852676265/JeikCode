@@ -182,7 +182,7 @@ import {
   stashSessionQueued,
   restoreSessionQueued,
 } from '../lib/queuedDraft';
-import { consumesProgrammaticStopMark, runningTurnStopAliases, type ProgrammaticStopMark } from '../lib/turnStop';
+import { consumesProgrammaticStopMark, runningTurnStopAliases, stopAliasAllowsNextTurn, type ProgrammaticStopMark } from '../lib/turnStop';
 import { loadAppliedTodoCallIds, saveAppliedTodoCallIds } from '../lib/todoAppliedIds';
 import {
   chatRecoveryPolicy,
@@ -195,6 +195,7 @@ import {
   toolResultClearsUserInput,
   transcriptLatestUserInputIsResolved,
   transcriptToolCallIsResolved,
+  mergeDiskWithUnpersistedTail,
   shouldAdoptDiskTranscript,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
@@ -341,6 +342,11 @@ interface QueuedMessage {
   /** 客户端关联键（= 发送给 /chat/steer 或 /live/message 的 client_input_id）。
    *  刷新后据此与内核已接受的 steer 对账，不再依赖文本匹配。 */
   clientInputId?: string;
+  /**
+   * 立即发送已经把用户气泡画上，但当时槽位还忙、投递被退回。
+   * drain 必须照发，不能因为文本已经在画布上就把卡片丢掉。
+   */
+  forceSend?: boolean;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, search, etc.). */
@@ -2095,28 +2101,37 @@ export function Chat({
       const detail = await getSession(hash, sid, { tail: HISTORY_PAGE });
       if (!detail || !Array.isArray(detail.messages)) return false;
       const loaded = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0);
-      messageCacheRef.current.set(sid, loaded);
+      const canvas = activeIdRef.current === sid
+        ? messagesRef.current
+        : (messageCacheRef.current.get(sid) ?? []);
+      // 立即发送会先把用户气泡画上。停止触发的这次对账往往早于落盘，
+      // 直接覆盖会把气泡抹掉，直到刷新才从磁盘重新出现。
+      const merged = mergeDiskWithUnpersistedTail(loaded, canvas);
+      const keptUnpersistedTail = merged.length !== loaded.length;
+      messageCacheRef.current.set(sid, merged);
       void saveSessionCache(
         hash,
         sid,
-        loaded,
+        merged,
         detail.todos,
         undefined,
         detail.turns,
         detail.token_usage,
       );
       if (activeIdRef.current === sid) {
-        messagesRef.current = loaded;
-        setMessages(loaded);
+        messagesRef.current = merged;
+        setMessages(merged);
         if (detail.turns && detail.turns.length > 0) {
           turnOutlineBySessionRef.current.set(sid, detail.turns);
           setTurnOutline(detail.turns);
         }
         if (detail.token_usage) {
-          applySessionTokens(sid, loaded, detail.token_usage);
+          applySessionTokens(sid, merged, detail.token_usage);
         }
-        setBusyAndClock(false);
-        busyRef.current = false;
+        if (!keptUnpersistedTail) {
+          setBusyAndClock(false);
+          busyRef.current = false;
+        }
         applySessionStickyTodos(sid, null);
       }
       return true;
@@ -5015,7 +5030,7 @@ export function Chat({
           ]);
           return;
         }
-        return deliver(text, [], modeState.confirmedMode);
+        return deliver(text, [], modeState.confirmedMode).then(() => undefined);
       },
       execServerCommand: async (command, arg) => {
         const SESSION_MUTATING = new Set(['undo', 'compact']);
@@ -6415,14 +6430,15 @@ export function Chat({
     approvalMode: ApprovalMode = modeState.confirmedMode,
     onAccepted?: (acceptedSessionId?: string) => void,
     overrideProvider?: string,
-  ) {
+    opts?: { alreadyOnCanvas?: boolean; preserveCanvasOnBusy?: boolean },
+  ): Promise<'ok' | 'busy' | 'error'> {
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(
         chatRecoveryRef.current === 'detached_active'
           ? t('chat.detachedSendBlocked')
           : t('chat.recoveryBlocked'),
       );
-      return;
+      return 'error';
     }
     // Next user turn: freeze sticky todos under prior assistant, clear sticky.
     commitActiveTodosIntoLastAssistant();
@@ -6466,7 +6482,9 @@ export function Chat({
       //    only arrives after VL preprocessing, so waiting for it leaves the
       //    sender stuck on the empty page). Our own echo is deduped in the `user`
       //    case via `pendingSelfEchoRef`.
-      const steering = busyRef.current;
+      // 立即发送已经画好用户气泡。此时 busy 往往还没落下，不能再登记成 pending steer，
+      // 否则停止收尾会把这条气泡撤掉，只剩刷新后的磁盘副本。
+      const steering = busyRef.current && opts?.alreadyOnCanvas !== true;
       const sid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
       if (steering && sid) {
         recordUserSteer(sid);
@@ -6485,6 +6503,7 @@ export function Chat({
       pendingSelfEchoRef.current.push({ id: pendingSteer.id, text });
       const turnIndex = nextTurnNavIndex();
       const turnOrdinal = nextTurnNavOrdinal();
+      if (!opts?.alreadyOnCanvas) {
       rememberTurnOutline(text, turnIndex, turnOrdinal);
       setMessages((prev) => {
         const next = [
@@ -6515,6 +6534,7 @@ export function Chat({
       // Register before the HTTP round-trip. A very fast round boundary can
       // emit `steered` on SSE before the submit response reaches this tab.
       setPendingSteers((pending) => [...pending, pendingSteer]);
+      }
       try {
         const receipt = await postLiveMessage(
           text,
@@ -6546,6 +6566,10 @@ export function Chat({
           }
         }
       } catch (error) {
+        if (opts?.alreadyOnCanvas) {
+          setHistoryHint(t('chat.connError', { msg: String(error) }));
+          return 'error';
+        }
         // Roll back the optimistic append — the send never reached the server.
         const echoIndex = pendingSelfEchoRef.current.findIndex(
           (pending) => pending.id === pendingSteer.id,
@@ -6561,9 +6585,9 @@ export function Chat({
         }
         setQueued([]);
         setHistoryHint(t('chat.connError', { msg: String(error) }));
-        return;
+        return 'error';
       }
-      return;
+      return 'ok';
     }
 
     // ── Normal path ──
@@ -6575,7 +6599,10 @@ export function Chat({
     }
     stopIdleWatch();
     // 新回合已进入投递：程序化停止（立即发送）的抑制标记到此为止，绝不能影响后续真实的用户停止。
-    programmaticStopMarkRef.current = null;
+    // 立即发送要等 stopped 先吃掉标记；这里提前清掉会让终态把其余排队卡片回吐到输入框。
+    if (!opts?.alreadyOnCanvas) {
+      programmaticStopMarkRef.current = null;
+    }
     const now = Date.now();
     setBusyAndClock(true, now);
     busyRef.current = true;
@@ -6584,16 +6611,26 @@ export function Chat({
       onLiveRunningChange?.(turnOwnerSid, true);
     }
 
-    // Push user message + empty assistant placeholder
+    // Push user message + empty assistant placeholder.
+    // 立即发送在点击时已经画过用户气泡：这里只补一个空的 assistant，避免再叠一条。
     const turnIndex = nextTurnNavIndex();
     const turnOrdinal = nextTurnNavOrdinal();
-    rememberTurnOutline(text, turnIndex, turnOrdinal);
+    const paintedAlready = opts?.alreadyOnCanvas === true && messagesRef.current.some((m) => (
+      m.role === 'user' && m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', text))
+    ));
+    if (!paintedAlready) rememberTurnOutline(text, turnIndex, turnOrdinal);
     setMessages((prev) => {
-      const next: Message[] = [
-        ...prev,
-        { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, sourceIndex: turnIndex, turnNavOrdinal: turnOrdinal },
-        { role: 'assistant', parts: [], sourceIndex: turnIndex + 1 },
-      ];
+      let next: Message[] = prev;
+      if (!paintedAlready) {
+        next = [
+          ...prev,
+          { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, sourceIndex: turnIndex, turnNavOrdinal: turnOrdinal },
+          { role: 'assistant', parts: [], sourceIndex: turnIndex + 1 },
+        ];
+      } else if (prev[prev.length - 1]?.role !== 'assistant') {
+        next = [...prev, { role: 'assistant', parts: [], sourceIndex: nextTurnNavIndex(prev) }];
+      }
+      if (next === prev) return prev;
       messagesRef.current = next;
       const targetSid = sessionId ?? activeIdRef.current;
       if (targetSid) {
@@ -6687,6 +6724,18 @@ export function Chat({
         msg.includes('Conflict') ||
         msg.includes('session_busy') ||
         msg.includes('already has an active chat operation');
+      if (!aborted && stillCurrent && isConflict && opts?.preserveCanvasOnBusy) {
+        // 气泡已经在画布上。撤回再退回队列会让它消失，直到刷新才从磁盘回来。
+        keepStopAlias = true;
+        blockQueueDrainRef.current = true;
+        setBusyAndClock(true);
+        busyRef.current = true;
+        if (turnOwnerSid) {
+          backgroundRunningSessionsRef.current.add(turnOwnerSid);
+          onLiveRunningChange?.(turnOwnerSid, true);
+        }
+        return 'busy';
+      }
       if (!aborted && stillCurrent) {
         keepStopAlias = true;
         transitionChatRecovery({ type: 'transport_lost' });
@@ -6767,6 +6816,7 @@ export function Chat({
         !keepStopAlias
       ) requestIdRef.current = null;
     }
+    return 'ok';
   }
 
   async function sendMessage(explicitText?: string | Event) {
@@ -6943,15 +6993,16 @@ export function Chat({
       });
     };
 
-    const alreadyDelivered = queued.filter((item) => hasTextInMessages(item.text));
+    const alreadyDelivered = queued.filter((item) => !item.forceSend && hasTextInMessages(item.text));
     if (alreadyDelivered.length > 0) {
-      setQueued((current) => current.filter((item) => !hasTextInMessages(item.text)));
+      setQueued((current) => current.filter((item) => item.forceSend || !hasTextInMessages(item.text)));
       return;
     }
 
-    const next = queuedRef.current.find((item) => item.kind === 'queue');
+    const next = queuedRef.current.find((item) => item.kind === 'queue' && item.forceSend)
+      ?? queuedRef.current.find((item) => item.kind === 'queue');
     if (!next) return;
-    if (hasTextInMessages(next.text)) {
+    if (!next.forceSend && hasTextInMessages(next.text)) {
       setQueued((current) => current.filter((item) => item.id !== next.id));
       return;
     }
@@ -7087,7 +7138,7 @@ export function Chat({
     const stopPromises: Promise<boolean>[] = runningTurnStopAliases({
       requestAlias,
       sessionId: currentSid,
-    }).map((alias) => stopChat(alias).then((result) => result.released, () => false));
+    }).map((alias) => stopChat(alias).then((result) => stopAliasAllowsNextTurn(result), () => false));
     // 运行时（native live）回合由 /live 停止兜底，与「停止」按钮的历史行为保持一致。
     if (currentSid && (attachedToLiveRuntime() || liveSessionIdRef.current)) {
       stopPromises.push(postLiveStop(currentSid).then(() => true, () => false));
@@ -7105,54 +7156,108 @@ export function Chat({
     // 以 ref 为准做去重：两个投递入口可能在同一批渲染里竞争同一张卡片。
     if (!queuedRef.current.some((entry) => entry.id === item.id)) return;
     setQueued((current) => current.filter((entry) => entry.id !== item.id));
-    void deliver(item.text, item.images ?? [], item.approvalMode ?? modeState.confirmedMode);
+    const opts = item.forceSend
+      ? { alreadyOnCanvas: true, preserveCanvasOnBusy: true as const }
+      : undefined;
+    void deliver(item.text, item.images ?? [], item.approvalMode ?? modeState.confirmedMode, undefined, undefined, opts)
+      .then((outcome) => {
+        if (outcome !== 'busy' || !item.forceSend) return;
+        blockQueueDrainRef.current = true;
+        setQueued((current) => (
+          current.some((entry) => entry.id === item.id) ? current : [item, ...current]
+        ));
+      });
+  }
+
+  /** 立即发送：点击当下就把卡片画成用户气泡，不等停止和投递的网络往返。 */
+  function paintSendNowUserBubble(text: string, images: ImageData[]) {
+    const clean = visibleUserText(text).trim();
+    if (clean && messagesRef.current.some((m) => (
+      m.role === 'user'
+      && m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', clean))
+    ))) {
+      return;
+    }
+    const now = Date.now();
+    const turnIndex = nextTurnNavIndex();
+    const turnOrdinal = nextTurnNavOrdinal();
+    rememberTurnOutline(text, turnIndex, turnOrdinal);
+    const next: Message[] = [
+      ...messagesRef.current,
+      {
+        role: 'user',
+        parts: [{ kind: 'text', text }],
+        images: images.length ? images : undefined,
+        ts: now,
+        sourceIndex: turnIndex,
+        turnNavOrdinal: turnOrdinal,
+      },
+    ];
+    messagesRef.current = next;
+    const sid = activeIdRef.current ?? sessionId;
+    if (sid) messageCacheRef.current.set(sid, next);
+    setMessages(next);
+    timelineFollow.jump();
   }
 
   /**
-   * 立即发送排队中的消息 = 触发「停止」控件 + 把该卡片投递为新回合。
-   *
-   * 卡片生命周期与「转向」完全对齐：只有真正成为正文（出队并画出用户气泡）才销毁，
-   * 期间始终留在队列里（内存 / localStorage / 后端三处一致），绝不提前移除造成闪烁或丢卡。
-   * 停止释放未获确认时不做无谓投递：卡片留在队首，旧回合终态一到即由 drain 自动补发。
+   * 立即发送 = 卡片立刻变成用户气泡，停掉当前回合，再把这条消息作为新回合发出。
+   * 右下角「已停止」通知仍被抑制。槽位一时没松开就短重试；气泡不再等到刷新才出现。
    */
   async function handleSendImmediately(q: QueuedMessage) {
-    const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
+    const viewSid = activeIdRef.current ?? sessionId ?? null;
+    const currentSid = liveSessionIdRef.current ?? viewSid;
 
-    // 0. 严格抑制右下角通知：无论卡片是 steer 还是普通排队，用户触发立即发送属于程序化换发新回合，
-    //    物理触发的停止事件严禁向用户弹出右下角「已停止」通知或系统通知。
     const targetIds = [currentSid, sessionId, liveSessionIdRef.current, activeIdRef.current, requestIdRef.current].filter(Boolean) as string[];
     for (const sid of targetIds) {
       recordUserManualStop(sid);
       recordUserSteer(sid);
     }
 
-    // 如果该卡片此前已作为 steer 排队，主动尝试清理后端的 steer 缓冲区
-    if (currentSid && (q.kind === 'steer' || q.kind === 'steering')) {
-      void cancelChatSteer(currentSid, q.text);
+    if (queuedRef.current.some((item) => item.id === q.id)) {
+      setQueued((items) => items.filter((item) => item.id !== q.id));
+    } else if (currentSid) {
+      updateQueuedForSession(currentSid, (items) => items.filter((item) => item.id !== q.id));
     }
+    paintSendNowUserBubble(q.text, q.images ?? []);
 
-    // 1. 该卡片跃升为队首（其余卡片保持原序）：立即发送后它就是下一条正文。
-    updateQueuedForSession(currentSid, (items) => {
-      const target = items.find((item) => item.id === q.id);
-      if (!target) return items;
-      return [target, ...items.filter((item) => item.id !== q.id)];
-    });
-
-    // 2. 打上程序化停止标记（旧回合的 stopped 终态不得把队列回吐到输入框）并停止。
-    //    会话在此刻前后持续处于占用态，故不做 busy 抖动复位，直到新回合由 deliver 接管。
-    if (currentSid) {
+    // 标记必须用 stopped 处理器比对的那个会话 id，否则终态会把队列回吐到输入框。
+    if (viewSid) {
       programmaticStopMarkRef.current = {
-        sessionId: currentSid,
+        sessionId: viewSid,
         expiresAt: Date.now() + PROGRAMMATIC_STOP_MARK_TTL_MS,
       };
     }
-    const released = await stopRunningTurn(currentSid, requestIdRef.current);
     abortRef.current?.abort();
 
-    // 3. 后端已确认槽位释放（正常路径下与「秒停」同步完成）→ 立刻出队并投递。
-    if (!released) return;
-    const latest = queuedRef.current.find((item) => item.id === q.id);
-    if (latest) dispatchQueuedCard(latest);
+    if (currentSid && (q.kind === 'steer' || q.kind === 'steering')) {
+      try {
+        await cancelChatSteer(currentSid, q.text);
+      } catch {
+        // 取消失败不阻断：下面仍会停掉旧回合，再作为新回合发出。
+      }
+    }
+
+    const text = q.text;
+    const images = q.images ?? [];
+    const mode = q.approvalMode ?? modeState.confirmedMode;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const released = await stopRunningTurn(currentSid, requestIdRef.current);
+      if (!released) {
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+        continue;
+      }
+      const outcome = await deliver(text, images, mode, undefined, undefined, {
+        alreadyOnCanvas: true,
+        preserveCanvasOnBusy: true,
+      });
+      if (outcome !== 'busy') return;
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+    const card: QueuedMessage = { ...q, kind: 'queue', forceSend: true };
+    setQueued((current) => (
+      current.some((entry) => entry.id === card.id) ? current : [...current, card]
+    ));
   }
 
   function handleBubbleDraftChange(

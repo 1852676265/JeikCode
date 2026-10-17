@@ -203,16 +203,29 @@ export function stripWebhookSuffix(url: string): string {
 }
 
 /**
+ * 校验 Webhook Host / Domain 是否为有效输入（排除单纯残留的 https:、http: 协议残缺文本）
+ */
+export function isValidWebhookHost(host: string): boolean {
+  if (!host) return false;
+  const h = host.trim().toLowerCase();
+  if (h === 'http:' || h === 'https:' || h === 'http:/' || h === 'https:/' || h === 'http://' || h === 'https://') {
+    return false;
+  }
+  const withoutProto = h.replace(/^https?:\/\//i, '').trim();
+  return Boolean(withoutProto);
+}
+
+/**
  * 获取全局记住的 Webhook 域名/主机（单实例跨项目继承，避免重复配置）
  */
 export function getLastWebhookHost(): string {
   if (typeof window === 'undefined') return '';
   try {
     const saved = localStorage.getItem(GLOBAL_LAST_WEBHOOK_HOST_KEY);
-    if (saved && !saved.includes('127.0.0.1') && !saved.includes('localhost')) {
+    if (saved && isValidWebhookHost(saved)) {
       return saved;
     }
-    // 自动扫描已有的其他项目配置，发现并自动提取已配置过的域名作为种子
+    // 自动扫描已有的其他项目配置，发现并自动提取已配置过的合法域名作为种子
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
       if (key && key.startsWith('jeikcode_git_binding_')) {
@@ -221,7 +234,7 @@ export function getLastWebhookHost(): string {
           const parsed = JSON.parse(item);
           const url = parsed.webhook?.payloadUrl || parsed.webhookUrl || '';
           const clean = normalizeWebhookHost(url).replace(/\/+$/, '');
-          if (clean && !clean.includes('127.0.0.1') && !clean.includes('localhost')) {
+          if (clean && isValidWebhookHost(clean)) {
             localStorage.setItem(GLOBAL_LAST_WEBHOOK_HOST_KEY, clean);
             return clean;
           }
@@ -241,8 +254,10 @@ export function setLastWebhookHost(host: string): void {
   if (typeof window === 'undefined') return;
   try {
     const clean = normalizeWebhookHost(host.trim()).replace(/\/+$/, '');
-    if (clean && !clean.includes('127.0.0.1') && !clean.includes('localhost')) {
+    if (clean && isValidWebhookHost(clean)) {
       localStorage.setItem(GLOBAL_LAST_WEBHOOK_HOST_KEY, clean);
+    } else if (!clean || !isValidWebhookHost(clean)) {
+      localStorage.removeItem(GLOBAL_LAST_WEBHOOK_HOST_KEY);
     }
   } catch {
     // ignore
@@ -302,11 +317,8 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
       const pat = parsed.accessToken || parsed.githubPat || '';
       const secret = parsed.webhook?.secret || parsed.secret || generateRandomSecret();
       let payloadUrl = parsed.webhook?.payloadUrl || parsed.webhookUrl || '';
-      if (payloadUrl.includes('127.0.0.1') || payloadUrl.includes('localhost')) {
-        payloadUrl = '';
-      }
-      // 若本项目未单独保存过域名，自动继承全局最近配置的通用 Webhook 域名
-      if (!payloadUrl) {
+      // 只要是有效输入（包含 127.0.0.1、localhost、反代公网域名），均完整保留
+      if (!isValidWebhookHost(payloadUrl)) {
         payloadUrl = getLastWebhookHost();
       }
 
@@ -456,12 +468,11 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     getGitBinding(project.hash).then((remote) => {
       if (remote && remote.channel) {
         setConfig((prev) => {
-          let remotePayload = remote.webhook?.payload_url || remote.webhook?.payloadUrl || '';
-          if (remotePayload.includes('127.0.0.1') || remotePayload.includes('localhost')) {
-            remotePayload = '';
-          }
-          // 若远端没有保存过独立域名，则自动继承全局记忆域名或当前状态已继承的域名
-          const effectivePayload = remotePayload || prev.webhook.payloadUrl || getLastWebhookHost();
+          const rawRemotePayload = remote.webhook?.payload_url || remote.webhook?.payloadUrl || '';
+          const cleanRemotePayload = normalizeWebhookHost(rawRemotePayload).replace(/\/+$/, '');
+          const effectivePayload = isValidWebhookHost(cleanRemotePayload)
+            ? cleanRemotePayload
+            : (isValidWebhookHost(prev.webhook.payloadUrl) ? prev.webhook.payloadUrl : getLastWebhookHost());
 
           return {
             ...prev,

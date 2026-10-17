@@ -48,3 +48,19 @@ export function consumesProgrammaticStopMark(
   if (!sid || sid !== mark.sessionId) return false;
   return now <= mark.expiresAt;
 }
+
+/**
+ * 这一条停止别名是否允许紧接着投递下一回合。
+ *
+ * `released: true` 是权威结论。`was not running` 是幂等空操作（别名本来就没占槽），
+ * 不能拿它否决同一次停止里真正停掉的那条别名——否则「立即发送」会整段跳过投递，
+ * 消息只留在磁盘上，刷新才出现。
+ * 仍在运行（`released: false` 且文案不是 was not running）必须继续等待。
+ */
+export function stopAliasAllowsNextTurn(result: {
+  released?: boolean;
+  message?: string | null;
+}): boolean {
+  if (result.released !== false) return true;
+  return /was not running/i.test(result.message ?? '');
+}

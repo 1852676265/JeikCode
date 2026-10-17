@@ -256,7 +256,11 @@ pub struct GitAdapterConfig {
     pub review_prompt_template: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "review_model")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "review_model"
+    )]
     pub review_model: Option<String>,
 }
 

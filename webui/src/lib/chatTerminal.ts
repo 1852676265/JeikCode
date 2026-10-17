@@ -53,6 +53,45 @@ export function shouldAdoptDiskTranscript(input: {
   return input.diskHasUser && input.diskText > input.canvasText;
 }
 
+type TailPart = { kind: string; text?: string };
+type TailMessage = { role: string; parts: TailPart[] };
+
+function tailPlain(message: TailMessage | undefined): string {
+  if (!message) return '';
+  return message.parts
+    .filter((part) => part.kind === 'text')
+    .map((part) => part.text || '')
+    .join('');
+}
+
+function lastTailUser(messages: TailMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') return tailPlain(messages[i]);
+  }
+  return '';
+}
+
+/**
+ * 磁盘对账不能抹掉「立即发送」刚画上、尚未落盘的用户回合。
+ * 磁盘末条用户与画布末条用户还对不上时，把画布从该用户气泡起的尾巴接回去。
+ * 已经落盘（刷新能看见）时原样采用磁盘，避免乐观气泡和权威历史各画一条。
+ */
+export function mergeDiskWithUnpersistedTail<T extends TailMessage>(disk: T[], canvas: T[]): T[] {
+  const canvasUser = visibleUserText(lastTailUser(canvas));
+  if (!canvasUser) return disk;
+  const diskUser = visibleUserText(lastTailUser(disk));
+  if (diskUser === canvasUser || userTextsMatch(diskUser, canvasUser)) return disk;
+  let lastUser = -1;
+  for (let i = canvas.length - 1; i >= 0; i--) {
+    if (canvas[i]?.role === 'user') {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) return disk;
+  return [...disk, ...canvas.slice(lastUser)];
+}
+
 /** Keep the existing `/live` SSE when returning to the execution session.
  * Reconnecting would snapshot-replace the canvas (dropping in-flight bash
  * output) and replay trailing text/user events on top of the restored cache. */

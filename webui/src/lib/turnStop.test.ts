@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   consumesProgrammaticStopMark,
   runningTurnStopAliases,
+  stopAliasAllowsNextTurn,
 } from './turnStop.ts';
 
 test('runningTurnStopAliases falls back to the session id after requestIdRef was cleared', () => {
@@ -42,4 +43,18 @@ test('consumesProgrammaticStopMark only matches the same session inside the wind
   assert.equal(consumesProgrammaticStopMark(mark, 'session-2', 500), false);
   assert.equal(consumesProgrammaticStopMark(mark, null, 500), false);
   assert.equal(consumesProgrammaticStopMark(null, 'session-1', 500), false);
+});
+
+test('stopAliasAllowsNextTurn treats an idle alias as free and a live turn as busy', () => {
+  assert.equal(stopAliasAllowsNextTurn({ released: true, message: 'stopped' }), true);
+  assert.equal(stopAliasAllowsNextTurn({ released: true }), true);
+  assert.equal(
+    stopAliasAllowsNextTurn({ released: false, message: 'Chat session req-1 was not running' }),
+    true,
+  );
+  assert.equal(
+    stopAliasAllowsNextTurn({ released: false, message: 'Chat session s1 stopped' }),
+    false,
+  );
+  assert.equal(stopAliasAllowsNextTurn({ released: false }), false);
 });

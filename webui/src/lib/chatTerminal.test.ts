@@ -23,6 +23,7 @@ import {
   visibleUserText,
   reconcileRunningTranscript,
   unpaintedReplaySuffix,
+  mergeDiskWithUnpersistedTail,
   shouldAdoptDiskTranscript,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
@@ -86,6 +87,22 @@ test('unknown explicit stop reasons fail closed instead of being reported as suc
 
 
 
+
+test('disk catch-up keeps a send-now user bubble that is not on disk yet', () => {
+  const disk = [
+    { role: 'user', parts: [{ kind: 'text', text: '上一句' }] },
+    { role: 'assistant', parts: [{ kind: 'text', text: '已停' }] },
+  ];
+  const canvas = [
+    ...disk,
+    { role: 'user', parts: [{ kind: 'text', text: '立刻发出去' }] },
+    { role: 'assistant', parts: [] },
+  ];
+  const merged = mergeDiskWithUnpersistedTail(disk, canvas);
+  assert.equal(merged.length, 4);
+  assert.equal(merged[2]?.parts[0]?.text, '立刻发出去');
+  assert.equal(mergeDiskWithUnpersistedTail(canvas, canvas).length, canvas.length);
+});
 
 test('user echo already on canvas is not appended again', () => {
   const user = { role: 'user', parts: [{ kind: 'text', text: '你好啊' }] };

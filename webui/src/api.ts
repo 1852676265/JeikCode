@@ -352,6 +352,8 @@ export interface StopChatResult {
    * 旧版 daemon 缺该字段时按 true 兼容处理（保持旧行为）。
    */
   released: boolean;
+  /** Daemon 原文。`was not running` 表示这条别名本来就没占槽。 */
+  message?: string;
 }
 
 /**
@@ -370,7 +372,11 @@ export async function stopChat(requestId: string): Promise<StopChatResult> {
   if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
   try {
     const body = (await resp.json()) as Partial<StopChatResult>;
-    return { success: body.success !== false, released: body.released !== false };
+    return {
+      success: body.success !== false,
+      released: body.released !== false,
+      message: typeof body.message === 'string' ? body.message : '',
+    };
   } catch {
     // Older daemons answered without a body field set; keep the optimistic
     // contract so a stale binary cannot wedge send-now into never delivering.

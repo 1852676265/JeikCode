@@ -63,6 +63,7 @@ pub use live_api::live_switch_session;
 pub mod auth_token;
 pub mod permission_bridge;
 mod telemetry_scope;
+mod terminal_session;
 pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
@@ -9493,14 +9494,15 @@ async fn stop_chat(
                 &req.session_id,
             );
         }
-        // 调用方（WebUI「立即发送」）能否安全紧接一个新回合的权威结论：
-        // compat 槽位已确认释放，且该会话（或它绑定的 canonical id）没有任何
-        // native runtime 回合仍在占用——后者只能异步取消，不能在此处宣称已释放。
-        let released = stopped_alias
-            && !crate::native_live::live_turn_running(&req.session_id)
-            && resolved_session_id.as_deref().map_or(true, |sid| {
-                sid == req.session_id || !crate::native_live::live_turn_running(sid)
+        // 调用方（WebUI「立即发送」）能否安全紧接一个新回合的权威结论。
+        // stop_and_wait 返回时 compat 槽位已经空闲：别名「本来就没在跑」同样是空闲，
+        // 不能再把 released 写成 false，否则前端会整段跳过投递。
+        // 唯一仍要拒绝的是 native runtime 回合还占着会话（取消是异步的）。
+        let live_busy = crate::native_live::live_turn_running(&req.session_id)
+            || resolved_session_id.as_deref().map_or(false, |sid| {
+                sid != req.session_id.as_str() && crate::native_live::live_turn_running(sid)
             });
+        let released = !live_busy;
         if stopped_alias || stopped_reg {
             state_clone.telemetry.track(Event::UseCommand {
                 type_: "stop".into(),
@@ -10383,301 +10385,12 @@ async fn fs_locate(
     }))
 }
 
-struct LiveTerminalProcess {
-    id: String,
-    cwd: String,
-    shell: String,
-    stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
-    child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
-    buffer: Arc<tokio::sync::Mutex<String>>,
-    broadcast: tokio::sync::broadcast::Sender<String>,
-}
-
-fn live_terminal_processes() -> &'static std::sync::Mutex<HashMap<String, Arc<LiveTerminalProcess>>>
-{
-    static PROCESSES: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, Arc<LiveTerminalProcess>>>,
-    > = std::sync::OnceLock::new();
-    PROCESSES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-#[cfg(windows)]
-fn resolve_git_bash_path() -> String {
-    let username = std::env::var("USERNAME").unwrap_or_default();
-    let candidates = [
-        r"C:\Program Files\Git\bin\bash.exe".to_string(),
-        r"C:\Program Files\Git\usr\bin\bash.exe".to_string(),
-        r"C:\Program Files (x86)\Git\bin\bash.exe".to_string(),
-        format!(r"C:\Users\{username}\AppData\Local\Programs\Git\bin\bash.exe"),
-    ];
-    for p in &candidates {
-        if std::path::Path::new(p).exists() {
-            return p.clone();
-        }
-    }
-    if let Ok(out) = std::process::Command::new("where").arg("bash").output() {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                let lower = trimmed.to_lowercase();
-                if !lower.contains("system32")
-                    && !lower.contains("windowsapps")
-                    && std::path::Path::new(trimmed).exists()
-                {
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-    "bash.exe".to_string()
-}
-
-async fn get_or_spawn_terminal_process(
-    term_id: &str,
-    cwd: &str,
-    shell_name: &str,
-) -> anyhow::Result<Arc<LiveTerminalProcess>> {
-    let existing = {
-        let guard = live_terminal_processes()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.get(term_id).cloned()
-    };
-    if let Some(proc) = existing {
-        let mut child_guard = proc.child.lock().await;
-        if let Ok(None) = child_guard.try_wait() {
-            return Ok(proc.clone());
-        }
-    }
-
-    let target_cwd = if cwd.is_empty() || cwd == "." {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .to_string_lossy()
-            .to_string()
-    } else {
-        cwd.to_string()
-    };
-
-    let shell = shell_name.to_lowercase();
-    #[cfg(windows)]
-    let (bin, args, envs): (String, Vec<String>, Vec<(String, String)>) = if shell.contains("cmd") {
-        ("cmd.exe".to_string(), vec!["/K".to_string()], vec![])
-    } else if shell.contains("git")
-        || shell.contains("gitbash")
-        || (shell.contains("bash") && !shell.contains("wsl"))
-    {
-        (
-            resolve_git_bash_path(),
-            vec!["--login".to_string(), "-i".to_string()],
-            vec![
-                ("MSYSTEM".to_string(), "MINGW64".to_string()),
-                ("CHERE_INVOKING".to_string(), "1".to_string()),
-            ],
-        )
-    } else if shell.contains("wsl") {
-        (
-            "wsl.exe".to_string(),
-            vec![
-                "--cd".to_string(),
-                target_cwd.clone(),
-                "bash".to_string(),
-                "-i".to_string(),
-            ],
-            vec![],
-        )
-    } else {
-        (
-            "powershell.exe".to_string(),
-            vec!["-NoLogo".to_string(), "-NoExit".to_string()],
-            vec![],
-        )
-    };
-
-    #[cfg(not(windows))]
-    let (bin, args, envs): (String, Vec<String>, Vec<(String, String)>) = if shell.contains("zsh") {
-        (
-            "zsh".to_string(),
-            vec!["-l".to_string(), "-i".to_string()],
-            vec![],
-        )
-    } else if shell.contains("sh") && !shell.contains("bash") {
-        ("sh".to_string(), vec!["-i".to_string()], vec![])
-    } else {
-        (
-            "bash".to_string(),
-            vec!["-l".to_string(), "-i".to_string()],
-            vec![],
-        )
-    };
-
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(&args);
-    cmd.current_dir(&target_cwd);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = cmd.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing stdin"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing stderr"))?;
-
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(512);
-    let initial_greeting = format!(
-        "\x1b[32m[JeikCode Terminal: {} ({})]\x1b[0m\r\nActive workspace: {}\r\nReady.\r\n\r\n",
-        term_id, shell_name, target_cwd
-    );
-    let buffer = Arc::new(tokio::sync::Mutex::new(initial_greeting));
-    let child_arc = Arc::new(tokio::sync::Mutex::new(child));
-    let stdin_arc = Arc::new(tokio::sync::Mutex::new(stdin));
-
-    let proc = Arc::new(LiveTerminalProcess {
-        id: term_id.to_string(),
-        cwd: target_cwd.clone(),
-        shell: shell_name.to_string(),
-        stdin: stdin_arc.clone(),
-        child: child_arc.clone(),
-        buffer: buffer.clone(),
-        broadcast: broadcast_tx.clone(),
-    });
-
-    // 初始向 stdin 发送一次换行以促使交互式 shell 打印初始提示符与就绪信息
-    let stdin_init = stdin_arc.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        let mut g = stdin_init.lock().await;
-        use tokio::io::AsyncWriteExt;
-        let _ = g.write_all(b"\r\n").await;
-        let _ = g.flush().await;
-    });
-
-    let tx_out = broadcast_tx.clone();
-    let buf_out = buffer.clone();
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut chunk = [0u8; 4096];
-        loop {
-            match stdout.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let text = String::from_utf8_lossy(&chunk[..n]).to_string();
-                    {
-                        let mut g = buf_out.lock().await;
-                        if g.len() > 256 * 1024 {
-                            let excess = g.len() - 128 * 1024;
-                            g.drain(..excess);
-                        }
-                        g.push_str(&text);
-                    }
-                    let _ = tx_out.send(text);
-                }
-            }
-        }
-    });
-
-    let tx_err = broadcast_tx.clone();
-    let buf_err = buffer.clone();
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut chunk = [0u8; 4096];
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let text = String::from_utf8_lossy(&chunk[..n]).to_string();
-                    {
-                        let mut g = buf_err.lock().await;
-                        if g.len() > 256 * 1024 {
-                            let excess = g.len() - 128 * 1024;
-                            g.drain(..excess);
-                        }
-                        g.push_str(&text);
-                    }
-                    let _ = tx_err.send(text);
-                }
-            }
-        }
-    });
-
-    {
-        let mut guard = live_terminal_processes()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.insert(term_id.to_string(), proc.clone());
-    }
-
-    let child_wait = child_arc.clone();
-    let term_id_reap = term_id.to_string();
-    let cwd_reap = target_cwd.clone();
-    tokio::spawn(async move {
-        let mut child_guard = child_wait.lock().await;
-        let _ = child_guard.wait().await;
-        drop(child_guard);
-        {
-            let mut guard = live_terminal_processes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            guard.remove(&term_id_reap);
-        }
-        {
-            let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
-            guard.remove(&term_id_reap);
-        }
-        publish_global(GlobalWireEvent::TerminalUpdated { cwd: cwd_reap });
-    });
-
-    // 同步登记至 daemon_terminals 以供 /terminal/list 查询
-    {
-        let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
-        let count = guard.len() + 1;
-        let name = format!("{shell_name} {count}");
-        guard.insert(
-            term_id.to_string(),
-            DaemonTerminalItem {
-                id: term_id.to_string(),
-                name,
-                cwd: target_cwd.clone(),
-                shell: shell_name.to_string(),
-                history: vec![],
-                timestamp: now_unix_ms(),
-            },
-        );
-    }
-
-    Ok(proc)
-}
-
 #[derive(Debug, Deserialize)]
 struct TerminalWsQuery {
     id: Option<String>,
     cwd: Option<String>,
     shell: Option<String>,
-    #[allow(dead_code)]
     cols: Option<u16>,
-    #[allow(dead_code)]
     rows: Option<u16>,
 }
 
@@ -10695,7 +10408,6 @@ async fn handle_terminal_socket(
     state: AppState,
 ) {
     use futures::{SinkExt, StreamExt};
-    use tokio::io::AsyncWriteExt;
 
     let term_id = q.id.unwrap_or_else(|| {
         let now = std::time::SystemTime::now()
@@ -10714,28 +10426,35 @@ async fn handle_terminal_socket(
         }
     });
 
-    let proc = match get_or_spawn_terminal_process(&term_id, &cwd, &shell).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("failed to spawn terminal: {e}");
-            return;
-        }
-    };
+    let cols = q.cols.unwrap_or(80);
+    let rows = q.rows.unwrap_or(24);
+    let proc =
+        match terminal_session::get_or_spawn_terminal_process(&term_id, &cwd, &shell, cols, rows)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("failed to spawn terminal: {e}");
+                let (mut sender, _) = socket.split();
+                let _ = sender
+                    .send(Message::Text(format!(
+                        "\r\n\x1b[31m[JeikCode] failed to start terminal: {e}\x1b[0m\r\n"
+                    )))
+                    .await;
+                return;
+            }
+        };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // 1. 发送该会话累计的历史输出（重连/刷新恢复）
-    let history = {
-        let g = proc.buffer.lock().await;
-        g.clone()
-    };
+    // 先取已有输出再订阅，避免把历史再播一遍；中间没有 await，窗口极短。
+    let history = terminal_session::output_snapshot(&proc);
+    let mut rx = terminal_session::subscribe(&proc);
     if !history.is_empty() {
         if ws_sender.send(Message::Text(history)).await.is_err() {
             return;
         }
     }
-
-    let mut rx = proc.broadcast.subscribe();
 
     let mut send_task = tokio::spawn(async move {
         while let Ok(text) = rx.recv().await {
@@ -10745,22 +10464,19 @@ async fn handle_terminal_socket(
         }
     });
 
-    let stdin_clone = proc.stdin.clone();
+    let proc_input = proc.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    if text.starts_with("{\"resize\":") {
+                    if let Some((cols, rows)) = terminal_session::parse_resize_message(&text) {
+                        terminal_session::resize_terminal(&proc_input, cols, rows);
                         continue;
                     }
-                    let mut g = stdin_clone.lock().await;
-                    let _ = g.write_all(text.as_bytes()).await;
-                    let _ = g.flush().await;
+                    terminal_session::write_terminal_bytes(&proc_input, text.as_bytes());
                 }
                 Message::Binary(bin) => {
-                    let mut g = stdin_clone.lock().await;
-                    let _ = g.write_all(&bin).await;
-                    let _ = g.flush().await;
+                    terminal_session::write_terminal_bytes(&proc_input, &bin);
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -10888,30 +10604,10 @@ async fn terminal_close(Json(req): Json<TerminalClosePayload>) -> impl IntoRespo
         .map(|item| item.cwd)
         .unwrap_or_else(|| ".".to_string());
     publish_global(GlobalWireEvent::TerminalUpdated { cwd });
-    {
-        let mut proc_guard = live_terminal_processes()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(proc) = proc_guard.remove(&req.terminal_id) {
-            tokio::spawn(async move {
-                let mut child = proc.child.lock().await;
-                if let Some(pid) = child.id() {
-                    #[cfg(windows)]
-                    {
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/F", "/T", "/PID", &pid.to_string()])
-                            .output();
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .output();
-                    }
-                }
-                let _ = child.kill().await;
-            });
-        }
+    if let Some(proc) = terminal_session::take_live_terminal(&req.terminal_id) {
+        tokio::task::spawn_blocking(move || {
+            terminal_session::kill_terminal_process(&proc);
+        });
     }
     Json(serde_json::json!({ "success": true }))
 }
@@ -10923,34 +10619,21 @@ struct TerminalInputPayload {
 }
 
 async fn terminal_input(Json(req): Json<TerminalInputPayload>) -> impl IntoResponse {
-    use tokio::io::AsyncWriteExt;
     let input = req.input.trim().to_string();
-    if input.is_empty() || input == "\x03" {
-        let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = guard.get_mut(&req.terminal_id) {
-            t.history.push("^C".to_string());
+    if input.is_empty() {
+        return Json(serde_json::json!({ "success": true, "output": "" }));
+    }
+    if input == "\x03" {
+        if let Some(proc) = terminal_session::lookup_live_terminal(&req.terminal_id) {
+            terminal_session::write_terminal_bytes(&proc, b"\x03");
         }
         return Json(serde_json::json!({ "success": true, "output": "^C\r\n" }));
     }
 
-    // 优先向常驻存活的 PTY 子进程 stdin 写入
-    {
-        let proc = {
-            let guard = live_terminal_processes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            guard.get(&req.terminal_id).cloned()
-        };
-        if let Some(proc) = proc {
-            let mut stdin = proc.stdin.lock().await;
-            let mut formatted = input.clone();
-            if !formatted.ends_with('\n') {
-                formatted.push('\n');
-            }
-            let _ = stdin.write_all(formatted.as_bytes()).await;
-            let _ = stdin.flush().await;
-            return Json(serde_json::json!({ "success": true, "output": "" }));
-        }
+    // 交互式 PTY 用 `\r` 提交；不要再追加 `\n`，否则 bash 会连着执行两次。
+    if let Some(proc) = terminal_session::lookup_live_terminal(&req.terminal_id) {
+        terminal_session::write_terminal_command(&proc, &input);
+        return Json(serde_json::json!({ "success": true, "output": "" }));
     }
 
     let cwd = {
