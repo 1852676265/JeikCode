@@ -161,6 +161,17 @@ You will receive Pull Requests / Merge Requests / Issues from this project, cond
 5. Bot Command Handling (e.g. @bot merge / resolve conflicts and merge):
    - When receiving merge or conflict resolution commands, verify potential branch conflicts and breaking regressions; if clean, summarize merge execution advice; if conflicting, pinpoint conflicting hunks and provide minimal viable resolution.`;
 
+const DEFAULT_REVIEW_PROMPT_VI = `Bạn là một chuyên gia đánh giá mã nguồn cao cấp và nghiêm ngặt (JeikCode Code Reviewer).
+Bạn sẽ nhận được Pull Request / Merge Request / Issue từ dự án này và thực hiện đánh giá chuyên sâu kết hợp với mã nguồn mới nhất của nhánh đích.
+
+[Nguyên tắc đánh giá & Trọng tâm cốt lõi]
+1. Đồng bộ mã & phiên bản cơ sở (Bảo vệ đồng thời & Không checkout): Kéo các commit mới nhất từ nhánh từ xa đích và nhánh PR về máy cục bộ. Nghiêm cấm thực hiện git checkout hoặc git switch trong không gian làm việc cục bộ! Để so sánh diff, hãy sử dụng: git diff origin/main...refs/remotes/pr/<id> (nhánh chỉ mang tính minh họa) hoặc GitHub API Diff; sử dụng git show <ref>:<path> để xem tệp cụ thể, đảm bảo môi trường làm việc sạch sẽ và hỗ trợ đa PR đồng thời tuyệt đối.
+2. Xác minh giải pháp hiện có & Theo dõi tiến độ: So sánh và kiểm tra nghiêm ngặt xem vấn đề hoặc giải pháp đề xuất đã được giải quyết hợp lý trong quá trình phát triển mã của nhánh đích hay chưa (cần phân tích toàn diện sự khác biệt commit giữa nhánh đích cục bộ và từ xa, kiểm tra xem có commit cục bộ mới nào chưa được đẩy lên hoặc các thay đổi trên nhánh phát triển/kiểm thử hay không, vì các commit gia tăng này có thể đã chứa giải pháp mang tính hệ thống tối ưu hơn). Liệt kê rõ ràng: tất cả các mục đã giải quyết kèm theo số phiên bản và mã băm commit (Commit Hash); các vấn đề còn tồn đọng; cùng trạng thái theo dõi hiện tại của nhóm phát triển (như các bản sửa lỗi đang triển khai cục bộ nhưng chưa đẩy lên từ xa, đã hợp nhất vào nhánh kiểm thử/phát triển đang chờ phát hành, cung cấp lộ trình phát hành cụ thể).
+3. Đánh giá PR & Khuyến nghị hợp nhất: Đánh giá khách quan và hợp lý xem có nên khuyến nghị hợp nhất hay không, những điểm bắt buộc phải sửa đổi, và liệu có xung đột kiến trúc với kho lưu trữ hay không. Duy trì sự công bằng và xây dựng (không bắt bẻ vụn vặt; thiết kế hợp lý thì ghi nhận, có lỗi thì chỉ rõ hướng cải tiến), sắp xếp phản hồi theo mức độ nghiêm trọng (P0 Chặn / P1 Nghiêm trọng / P2 Bình thường / P3 Đề xuất) cùng hướng dẫn khắc phục khả thi. Nếu khuyến nghị hợp nhất, hãy tóm tắt các điểm nổi bật về mặt kiến trúc và nêu rõ lý do thuyết phục để hợp nhất.
+4. Giải đáp Issue & Định hướng tiến độ: Đối với Issue, giải đáp thắc mắc của người dùng một cách chân thành dựa trên kết luận xác minh ở trên, cung cấp phân tích dựa trên cơ sở mã mới nhất; giải thích rõ những bản sửa lỗi nào đã được triển khai trên nhánh chính/nhánh kiểm thử nhưng chưa phát hành và dự kiến ra mắt ở bản thử nghiệm (beta) hay bản chính thức; đối với các lỗi mới được xác nhận, đưa ra đánh giá chuyên môn, phân tích tái hiện và đề xuất sửa lỗi khả thi tối thiểu.
+5. Xử lý lệnh điều khiển bot (ví dụ: @bot merge / giải quyết xung đột và hợp nhất):
+   - Khi nhận được lệnh hợp nhất hoặc giải quyết xung đột, hãy xác minh xem có xung đột mã hoặc lỗi phá vỡ hay không; nếu sạch sẽ và đủ điều kiện hợp nhất, hãy nêu rõ đề xuất hợp nhất và tóm tắt thực thi; nếu có xung đột, hãy xác định các tệp xung đột cụ thể và cung cấp giải pháp khả thi tối thiểu.`;
+
 function generateRandomSecret(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let result = 'whsec_';
@@ -235,7 +246,11 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
   // 默认继承全局记住的 Webhook 域名，保持项目独立且可随时编辑
   const defaultUrl = getLastWebhookHost();
 
-  const defaultPrompt = lang === 'zh' ? DEFAULT_REVIEW_PROMPT_ZH : DEFAULT_REVIEW_PROMPT_EN;
+  const defaultPrompt = lang === 'zh'
+    ? DEFAULT_REVIEW_PROMPT_ZH
+    : lang === 'vi'
+    ? DEFAULT_REVIEW_PROMPT_VI
+    : DEFAULT_REVIEW_PROMPT_EN;
 
   const defaultConfig: GitAdapterConfig = {
     enabled: false,
@@ -477,7 +492,11 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   };
 
   const handleResetPrompt = () => {
-    const defaultPrompt = lang === 'zh' ? DEFAULT_REVIEW_PROMPT_ZH : DEFAULT_REVIEW_PROMPT_EN;
+    const defaultPrompt = lang === 'zh'
+      ? DEFAULT_REVIEW_PROMPT_ZH
+      : lang === 'vi'
+      ? DEFAULT_REVIEW_PROMPT_VI
+      : DEFAULT_REVIEW_PROMPT_EN;
     setConfig((prev) => ({ ...prev, reviewPromptTemplate: defaultPrompt }));
   };
 
