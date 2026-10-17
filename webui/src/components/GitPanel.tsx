@@ -116,6 +116,80 @@ export function GitPanel({
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
   const [actionDropdownHash, setActionDropdownHash] = useState<string | null>(null);
 
+  // 移动端/桌面端视口感知：手机版依旧保持 commits 在顶层独立标签，桌面端双容器联动
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)');
+    const apply = () => setIsMobile(mq.matches);
+    apply();
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
+
+  // 桌面端 VSCode 风格上下双容器（Changes + Commits）高度分割比例与折叠状态持久化
+  const [splitRatio, setSplitRatio] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('jeikcode:git_panel_split_ratio');
+      if (saved) {
+        const val = parseFloat(saved);
+        if (val >= 0.15 && val <= 0.85) return val;
+      }
+    } catch {}
+    return 0.5;
+  });
+
+  const [commitsCollapsed, setCommitsCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('jeikcode:git_panel_commits_collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleCommitsCollapse = () => {
+    setCommitsCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('jeikcode:git_panel_commits_collapsed', String(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const isResizingRef = useRef(false);
+  const combinedViewRef = useRef<HTMLDivElement>(null);
+
+  const handleResizerMouseDown = (e: MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingRef.current || !combinedViewRef.current) return;
+      const rect = combinedViewRef.current.getBoundingClientRect();
+      const offsetY = moveEvent.clientY - rect.top;
+      const newRatio = Math.max(0.15, Math.min(0.85, offsetY / rect.height));
+      setSplitRatio(newRatio);
+    };
+
+    const onMouseUp = () => {
+      isResizingRef.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      try {
+        localStorage.setItem('jeikcode:git_panel_split_ratio', String(splitRatio));
+      } catch {}
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
   // Expanded commit state for modified files
   const [expandedCommitHash, setExpandedCommitHash] = useState<string | null>(null);
   const [commitFiles, setCommitFiles] = useState<Record<string, GitCommitFile[]>>({});
@@ -822,124 +896,9 @@ export function GitPanel({
   const unstagedItems = [...(gitStatus?.unstaged || []), ...(gitStatus?.untracked || [])];
   const totalChangedCount = stagedItems.length + unstagedItems.length;
 
-  return (
-    <div class="git-panel-root">
-      {/* Top Toolbar */}
-      <div class="git-panel-toolbar">
-        <div class="git-panel-subtabs">
-          <button
-            type="button"
-            class={'git-subtab-btn' + (subView === 'changes' ? ' active' : '')}
-            onClick={() => setSubView('changes')}
-            title={t('git.changes')}
-          >
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M14.5 2h-13a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5zm-12 1h11v9h-11V3zm2 2h7v1h-7V5zm0 3h7v1h-7V8z" />
-            </svg>
-            <span>{t('git.changes')}</span>
-            {totalChangedCount > 0 && (
-              <span class="git-badge-counter badge-highlight">{totalChangedCount}</span>
-            )}
-          </button>
-          <button
-            type="button"
-            class={'git-subtab-btn' + (subView === 'graph' ? ' active' : '')}
-            onClick={() => setSubView('graph')}
-            title={t('git.graph')}
-          >
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M10.5 8a2.5 2.5 0 0 1-5 0H1v-1h4.5a2.5 2.5 0 0 1 5 0H15v1h-4.5z" />
-            </svg>
-            <span>{t('git.graph')}</span>
-          </button>
-          <button
-            type="button"
-            class={'git-subtab-btn' + (subView === 'branches' ? ' active' : '')}
-            onClick={() => setSubView('branches')}
-            title={t('git.branches')}
-          >
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
-            </svg>
-            <span>{t('git.branches')}</span>
-            <span class="git-badge-counter">{branches?.local.length ?? 0}</span>
-          </button>
-        </div>
 
-        <button
-          type="button"
-          class={'git-refresh-btn' + (loading || isFetching ? ' spinning' : '')}
-          onClick={handleFullRefresh}
-          title={isZh ? '刷新本地状态并拉取远程代码 (Refresh & Fetch All)' : 'Refresh local & fetch all remote branches'}
-          aria-label={t('git.refresh')}
-        >
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-            <path d="M13.65 2.35A8 8 0 1 0 16 8h-2a6 6 0 1 1-1.76-4.24l-2.24 2.24H16V2l-2.35.35z" />
-          </svg>
-        </button>
-      </div>
-
-      {/* Multi-Repo Switcher Bar (VSCode style) */}
-      {repos.length > 0 && (
-        <div class="git-repo-bar">
-          <span class="git-repo-label" title={t('git.switchRepo')}>
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M1.75 2.5h3.61a1.5 1.5 0 0 1 1.06.44l1.08 1.06h6.75A1.75 1.75 0 0 1 16 5.75v7.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V4.25C0 3.28.78 2.5 1.75 2.5z" />
-            </svg>
-          </span>
-          <select
-            class="git-repo-select"
-            value={effectiveCwd}
-            onChange={(e) => {
-              const newRoot = (e.target as HTMLSelectElement).value;
-              gitStore.setActiveRepoRoot(cwd, newRoot);
-              setSelectedBranch(null);
-            }}
-            title={effectiveCwd}
-          >
-            {repos.map((r) => (
-              <option key={r.root} value={r.root}>
-                {r.name} {r.current_branch ? `(${r.current_branch})` : ''} {r.is_root ? `· ${t('git.rootRepo')}` : `· ${r.relative_path}`}
-              </option>
-            ))}
-          </select>
-          {repos.length > 1 && (
-            <span class="git-badge-counter">{t('git.repoCount', { count: repos.length })}</span>
-          )}
-        </div>
-      )}
-
-      {/* Alert / Notifications */}
-      {error && (
-        <div class="git-alert-banner git-alert-error" role="alert">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1, minWidth: 0 }}>
-            <span>{error}</span>
-            {error.includes('overwritten by checkout') && (
-              <div style={{ marginTop: '4px' }}>
-                <button
-                  type="button"
-                  class="git-checkout-btn"
-                  style={{ display: 'inline-block', width: 'auto', padding: '2px 8px', fontSize: '11px' }}
-                  onClick={() => setSubView('changes')}
-                >
-                  {isZh ? '前往“更改”标签提交或暂存' : 'Go to "Changes" to commit or stash'}
-                </button>
-              </div>
-            )}
-          </div>
-          <button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button>
-        </div>
-      )}
-      {successMsg && (
-        <div class="git-alert-banner git-alert-success" role="status">
-          <span>{successMsg}</span>
-          <button type="button" onClick={() => setSuccessMsg(null)} aria-label="Dismiss">×</button>
-        </div>
-      )}
-
-      {/* VIEW: SOURCE CONTROL (CHANGES & COMMIT & SYNC) */}
-      {subView === 'changes' && (
-        <div class="git-source-control-container">
+  const renderChangesContent = () => (
+    <div class="git-source-control-container">
           {/* Branch & Sync Bar */}
           <div class="git-sync-bar">
             <div class="git-sync-branch-label" title={currentBranch}>
@@ -1153,12 +1112,11 @@ export function GitPanel({
               </div>
             )}
           </div>
-        </div>
-      )}
+    </div>
+  );
 
-      {/* VIEW: BRANCHES TREE */}
-      {subView === 'branches' && (
-        <div class="git-branches-container">
+  const renderBranchesContent = () => (
+    <div class="git-branches-container">
           {/* Local Branches Section */}
           <div class="git-section-header">
             <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -1289,12 +1247,11 @@ export function GitPanel({
                 })}
               </div>
           )}
-        </div>
-      )}
+    </div>
+  );
 
-      {/* VIEW: GRAPH (走线图谱) */}
-      {subView === 'graph' && (
-        <div class="git-graph-container">
+  const renderGraphContent = () => (
+    <div class="git-graph-container">
           {/* Branch filter picker */}
           <div class="git-graph-filter-row">
             <span class="git-filter-label">{t('git.branches')}:</span>
@@ -1812,10 +1769,217 @@ export function GitPanel({
               })}
             </div>
           )}
+    </div>
+  );
+
+  return (
+    <div class="git-panel-root">
+      {/* Top Toolbar */}
+      <div class="git-panel-toolbar">
+        <div class="git-panel-subtabs">
+          {!isMobile ? (
+            <>
+              <button
+                type="button"
+                class={'git-subtab-btn' + (subView === 'changes' || subView === 'graph' ? ' active' : '')}
+                onClick={() => setSubView('changes')}
+                title={t('git.graphView')}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path d="M14.5 2h-13a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5zm-12 1h11v9h-11V3zm2 2h7v1h-7V5zm0 3h7v1h-7V8z" />
+                </svg>
+                <span>{t('git.graphView') || 'Graph'}</span>
+                {totalChangedCount > 0 && (
+                  <span class="git-badge-counter badge-highlight">{totalChangedCount}</span>
+                )}
+              </button>
+              <button
+                type="button"
+                class={'git-subtab-btn' + (subView === 'branches' ? ' active' : '')}
+                onClick={() => setSubView('branches')}
+                title={t('git.branches')}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
+                </svg>
+                <span>{t('git.branches')}</span>
+                <span class="git-badge-counter">{branches?.local.length ?? 0}</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                class={'git-subtab-btn' + (subView === 'changes' ? ' active' : '')}
+                onClick={() => setSubView('changes')}
+                title={t('git.changes')}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path d="M14.5 2h-13a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5zm-12 1h11v9h-11V3zm2 2h7v1h-7V5zm0 3h7v1h-7V8z" />
+                </svg>
+                <span>{t('git.changes')}</span>
+                {totalChangedCount > 0 && (
+                  <span class="git-badge-counter badge-highlight">{totalChangedCount}</span>
+                )}
+              </button>
+              <button
+                type="button"
+                class={'git-subtab-btn' + (subView === 'graph' ? ' active' : '')}
+                onClick={() => setSubView('graph')}
+                title={t('git.commits')}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path d="M10.5 8a2.5 2.5 0 0 1-5 0H1v-1h4.5a2.5 2.5 0 0 1 5 0H15v1h-4.5z" />
+                </svg>
+                <span>{t('git.commits') || 'Commits'}</span>
+              </button>
+              <button
+                type="button"
+                class={'git-subtab-btn' + (subView === 'branches' ? ' active' : '')}
+                onClick={() => setSubView('branches')}
+                title={t('git.branches')}
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
+                </svg>
+                <span>{t('git.branches')}</span>
+                <span class="git-badge-counter">{branches?.local.length ?? 0}</span>
+              </button>
+            </>
+          )}
+        </div>
+
+        <button
+          type="button"
+          class={'git-refresh-btn' + (loading || isFetching ? ' spinning' : '')}
+          onClick={handleFullRefresh}
+          title={isZh ? '刷新本地状态并拉取远程代码 (Refresh & Fetch All)' : 'Refresh local & fetch all remote branches'}
+          aria-label={t('git.refresh')}
+        >
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <path d="M13.65 2.35A8 8 0 1 0 16 8h-2a6 6 0 1 1-1.76-4.24l-2.24 2.24H16V2l-2.35.35z" />
+          </svg>
+        </button>
+      </div>
+
+      {/* Multi-Repo Switcher Bar (VSCode style) */}
+      {repos.length > 0 && (
+        <div class="git-repo-bar">
+          <span class="git-repo-label" title={t('git.switchRepo')}>
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M1.75 2.5h3.61a1.5 1.5 0 0 1 1.06.44l1.08 1.06h6.75A1.75 1.75 0 0 1 16 5.75v7.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V4.25C0 3.28.78 2.5 1.75 2.5z" />
+            </svg>
+          </span>
+          <select
+            class="git-repo-select"
+            value={effectiveCwd}
+            onChange={(e) => {
+              const newRoot = (e.target as HTMLSelectElement).value;
+              gitStore.setActiveRepoRoot(cwd, newRoot);
+              setSelectedBranch(null);
+            }}
+            title={effectiveCwd}
+          >
+            {repos.map((r) => (
+              <option key={r.root} value={r.root}>
+                {r.name} {r.current_branch ? `(${r.current_branch})` : ''} {r.is_root ? `· ${t('git.rootRepo')}` : `· ${r.relative_path}`}
+              </option>
+            ))}
+          </select>
+          {repos.length > 1 && (
+            <span class="git-badge-counter">{t('git.repoCount', { count: repos.length })}</span>
+          )}
         </div>
       )}
 
-      {/* VSCode Context Menu (Portal 到 document.body 防缩放漂移) */}
+      {/* Alert / Notifications */}
+      {error && (
+        <div class="git-alert-banner git-alert-error" role="alert">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1, minWidth: 0 }}>
+            <span>{error}</span>
+            {error.includes('overwritten by checkout') && (
+              <div style={{ marginTop: '4px' }}>
+                <button
+                  type="button"
+                  class="git-checkout-btn"
+                  style={{ display: 'inline-block', width: 'auto', padding: '2px 8px', fontSize: '11px' }}
+                  onClick={() => setSubView('changes')}
+                >
+                  {isZh ? '前往“更改”标签提交或暂存' : 'Go to "Changes" to commit or stash'}
+                </button>
+              </div>
+            )}
+          </div>
+          <button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button>
+        </div>
+      )}
+      {successMsg && (
+        <div class="git-alert-banner git-alert-success" role="status">
+          <span>{successMsg}</span>
+          <button type="button" onClick={() => setSuccessMsg(null)} aria-label="Dismiss">×</button>
+        </div>
+      )}
+
+      {/* VIEW: SOURCE CONTROL (CHANGES & COMMIT & SYNC) */}
+  
+      {/* VIEW MAIN BODY: BRANCHES OR COMBINED/STANDALONE */}
+      {subView === "branches" ? (
+        renderBranchesContent()
+      ) : !isMobile ? (
+        <div class="git-combined-view" ref={combinedViewRef}>
+          <div
+            class="git-combined-changes-pane"
+            style={{
+              height: commitsCollapsed ? "calc(100% - 32px)" : `${Math.round(splitRatio * 100)}%`,
+            }}
+          >
+            {renderChangesContent()}
+          </div>
+
+          {!commitsCollapsed && (
+            <div
+              class="git-split-resizer"
+              onMouseDown={handleResizerMouseDown}
+              title={t("common.drag") || "上下拖拽调整大小"}
+            />
+          )}
+
+          <div
+            class="git-combined-commits-pane"
+            style={{
+              height: commitsCollapsed ? "32px" : `${100 - Math.round(splitRatio * 100)}%`,
+            }}
+          >
+            <div class="git-commits-section-header" onClick={toggleCommitsCollapse}>
+              <span class="git-section-caret">{commitsCollapsed ? "▶" : "▼"}</span>
+              <span class="git-section-title">{t("git.commits") || "Commits"}</span>
+              <span class="git-badge-counter">{graphRows.length}</span>
+              <div class="git-section-actions" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  class={"git-section-action-btn" + (loading || isFetching ? " spinning" : "")}
+                  onClick={handleFullRefresh}
+                  title={t("git.refresh")}
+                >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                    <path d="M13.65 2.35A8 8 0 1 0 16 8h-2a6 6 0 1 1-1.76-4.24l-2.24 2.24H16V2l-2.35.35z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            {!commitsCollapsed && (
+              <div class="git-combined-commits-body">
+                {renderGraphContent()}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : subView === "changes" ? (
+        renderChangesContent()
+      ) : (
+        renderGraphContent()
+      )}
+
       {contextMenu && typeof document !== 'undefined' && createPortal(
         <div
           class="git-context-menu"
