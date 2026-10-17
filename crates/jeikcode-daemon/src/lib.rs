@@ -13571,11 +13571,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // 外部 Git Webhook 入口：GitHub/GitLab 服务器推送回调（无法携带 WebUI Bearer/Cookie，由内部 HMAC 签名验签）
         .route(
             "/api/webhooks/git",
-            post(api_git_webhook::handle_git_webhook_api),
+            post(api_git_webhook::handle_git_webhook_api)
+                .get(api_git_webhook::get_git_webhook_info_api),
         )
         .route(
             "/api/webhooks/github",
-            post(api_git_webhook::handle_git_webhook_api),
+            post(api_git_webhook::handle_git_webhook_api)
+                .get(api_git_webhook::get_git_webhook_info_api),
         )
         // WebUI static assets + SPA fallback (Task 3/4). The `/` route
         // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the

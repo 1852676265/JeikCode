@@ -87,6 +87,26 @@ pub async fn test_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl 
     }
 }
 
+/// GET /api/webhooks/git & GET /api/webhooks/github
+/// 当用户或浏览器直接以 GET 方式访问该链接时，返回友好的就绪状态提示（替代冰冷的 HTTP 405 Method Not Allowed）
+pub async fn get_git_webhook_info_api() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>JeikCode Git Webhook</title>\
+        <style>body{font-family:system-ui,-apple-system,sans-serif;background:#121214;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}\
+        .box{background:#1c1c1f;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:32px 40px;text-align:center;max-width:480px;box-shadow:0 8px 30px rgba(0,0,0,0.5);}\
+        h2{color:#10b981;margin-top:0;display:flex;align-items:center;justify-content:center;gap:8px;}\
+        p{color:#a1a1aa;line-height:1.6;font-size:14px;}\
+        code{background:rgba(255,255,255,0.08);color:#38bdf8;padding:2px 6px;border-radius:4px;font-family:monospace;}</style></head>\
+        <body><div class='box'><h2><span>✓</span> Webhook 正常运行中</h2>\
+        <p>JeikCode 自动化代码审查 Webhook 接收端点已成功监听！</p>\
+        <p>此端点专用于接收来自 GitHub / GitLab 的 <code>HTTP POST</code> 事件推送。<br>请将此完整 URL 填入你的 GitHub 仓库 Webhook 设置中。</p>\
+        </div></body></html>",
+    )
+        .into_response()
+}
+
 /// POST /api/webhooks/git & POST /api/webhooks/github
 pub async fn handle_git_webhook_api(
     State(state): State<AppState>,
