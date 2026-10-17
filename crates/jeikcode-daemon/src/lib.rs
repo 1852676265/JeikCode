@@ -1306,8 +1306,8 @@ impl ActiveChatRegistry {
             .as_deref()
             .and_then(|sid| index.session_seq.get(sid).copied())
             .unwrap_or(0);
-        // Capacity: lagging watchers drop oldest; primary SSE is separate.
-        let (event_bus, _) = tokio::sync::broadcast::channel(512);
+        // Capacity: expanded to 4096 to prevent Lagged event drops during heavy tool outputs / streaming.
+        let (event_bus, _) = tokio::sync::broadcast::channel(4096);
         // Clone for waking standby watchers (the original moves into the operation).
         let bus_for_drain = event_bus.clone();
         let mut aliases = Vec::with_capacity(3);
@@ -1769,12 +1769,16 @@ impl ActiveChatRegistry {
     }
 
     async fn stop_operation(&self, operation_id: &str) -> bool {
-        let (cancellation, stop_gate) = {
+        let (cancellation, stop_gate, op_session_id) = {
             let index = self.inner.read().await;
             let Some(operation) = index.operations.get(operation_id) else {
                 return false;
             };
-            (operation.cancellation.clone(), operation.stop_gate.clone())
+            (
+                operation.cancellation.clone(),
+                operation.stop_gate.clone(),
+                operation.session_id.clone(),
+            )
         };
 
         // This is the stop/approval linearization point. If an approval already
@@ -1792,7 +1796,13 @@ impl ActiveChatRegistry {
             }
         }
         cancellation.cancel();
-        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
+        if let Some(ref sid) = op_session_id {
+            jeikcode_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(
+                sid,
+            );
+        } else {
+            jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
+        }
         true
     }
 
@@ -2159,6 +2169,12 @@ pub(crate) enum GlobalWireEvent {
     /// 全局配置热重载（如 CLI 执行 jeikcode ghimg 或后台变更）。
     #[serde(rename = "config_reloaded")]
     ConfigReloaded,
+    /// Git 仓库状态变更（discard / stage / commit / pull / fetch / checkout 等），跨设备全量广播
+    #[serde(rename = "git_updated")]
+    GitUpdated { cwd: String },
+    /// 终端会话状态变更（创建 / 关闭 / 清空），项目级跨设备全局广播
+    #[serde(rename = "terminal_updated")]
+    TerminalUpdated { cwd: String },
 }
 
 /// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
@@ -3643,34 +3659,73 @@ fn is_system_temp_dir(path: &std::path::Path) -> bool {
 
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
-    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
-    let mut by_project = std::collections::BTreeMap::<String, ProjectInfo>::new();
+    let sessions_root = NativeSessionManager::sessions_root();
+    let scan = catalog_scan_in_root(&sessions_root)?;
+    let active = active_catalog_location(&scan.entries);
+    list_projects_in_root(&sessions_root, active.as_ref())
+}
+
+fn list_projects_in_root(
+    sessions_root: &std::path::Path,
+    active: Option<&jeikcode_capabilities::session::CatalogLocation>,
+) -> std::io::Result<Vec<ProjectInfo>> {
+    let scan = catalog_scan_in_root(sessions_root)?;
+    let mut by_project_entries = std::collections::BTreeMap::<
+        String,
+        Vec<jeikcode_capabilities::session::CatalogEntry>,
+    >::new();
     for entry in scan.entries {
         if is_system_temp_dir(&entry.working_dir) {
             continue;
         }
-        let created_at = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
-        let updated_at = u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000;
-        let project = by_project
+        if !catalog_entry_is_visible(sessions_root, &entry, active) {
+            continue;
+        }
+        by_project_entries
             .entry(entry.project_bucket.clone())
-            .or_insert_with(|| ProjectInfo {
-                hash: entry.project_bucket.clone(),
-                name: entry
+            .or_default()
+            .push(entry);
+    }
+    let mut projects = Vec::new();
+    for (bucket, mut entries) in by_project_entries {
+        NativeSessionManager::collapse_fork_lineages(&mut entries);
+        if entries.is_empty() {
+            continue;
+        }
+        let session_count = entries.len();
+        let mut created_at = u64::MAX;
+        let mut last_updated = 0;
+        let mut name = String::new();
+        let mut working_dir = PathBuf::new();
+
+        for entry in &entries {
+            let c = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
+            let u = u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000;
+            created_at = created_at.min(c);
+            if u >= last_updated {
+                last_updated = u;
+                working_dir = entry.working_dir.clone();
+                name = entry
                     .working_dir
                     .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".into()),
-                working_dir: entry.working_dir.clone(),
-                description: None,
-                session_count: 0,
-                created_at,
-                last_updated: updated_at,
-            });
-        project.session_count += 1;
-        project.created_at = project.created_at.min(created_at);
-        project.last_updated = project.last_updated.max(updated_at);
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into());
+            }
+        }
+        if created_at == u64::MAX {
+            created_at = last_updated;
+        }
+
+        projects.push(ProjectInfo {
+            hash: bucket,
+            name,
+            working_dir,
+            description: None,
+            session_count,
+            created_at,
+            last_updated,
+        });
     }
-    let mut projects: Vec<_> = by_project.into_values().collect();
     projects.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
     Ok(projects)
 }
@@ -9352,8 +9407,14 @@ async fn stop_chat(
             if sid != &req.session_id {
                 stopped_reg = crate::native_live::cancel_via_registry(sid).is_ok() || stopped_reg;
             }
+            jeikcode_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(
+                sid,
+            );
+        } else {
+            jeikcode_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(
+                &req.session_id,
+            );
         }
-        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
         // 调用方（WebUI「立即发送」）能否安全紧接一个新回合的权威结论：
         // compat 槽位已确认释放，且该会话（或它绑定的 canonical id）没有任何
         // native runtime 回合仍在占用——后者只能异步取消，不能在此处宣称已释放。
@@ -9517,19 +9578,366 @@ async fn reveal_file_or_folder(Json(req): Json<RevealPathRequest>) -> impl IntoR
             Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
         );
     }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer").arg(&p).spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(&p).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
-    }
+    // 异步后台线程拉起系统文件管理器，无桌面环境或异地请求时静默忽略，杜绝挂起卡死
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        {
+            if p.is_file() {
+                let _ = std::process::Command::new("explorer")
+                    .arg(format!("/select,{}", p.display()))
+                    .spawn();
+            } else {
+                let _ = std::process::Command::new("explorer").arg(&p).spawn();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&p).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("DISPLAY").is_some()
+                || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            }
+        }
+    });
     (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+}
+
+async fn open_file_with_os(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
+    let p = std::path::PathBuf::from(req.path.trim());
+    if !p.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
+        );
+    }
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "", &p.to_string_lossy()])
+                .spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&p).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("DISPLAY").is_some()
+                || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            }
+        }
+    });
+    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct FsRawQuery {
+    path: String,
+}
+
+async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
+    let raw = q.path.trim().trim_start_matches("./");
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.exists() || !p.is_file() {
+        if let Ok(cur) = std::env::current_dir() {
+            let candidate = cur.join(raw);
+            if candidate.exists() && candidate.is_file() {
+                p = candidate;
+            }
+        }
+    }
+    if !p.exists() || !p.is_file() {
+        return (StatusCode::NOT_FOUND, "Not found".into_response());
+    }
+    match std::fs::read(&p) {
+        Ok(bytes) => {
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "svg" => "image/svg+xml",
+                "ico" => "image/x-icon",
+                "bmp" => "image/bmp",
+                "pdf" => "application/pdf",
+                "mp4" => "video/mp4",
+                "mp3" => "audio/mpeg",
+                _ => "application/octet-stream",
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(val) = mime.parse() {
+                headers.insert(axum::http::header::CONTENT_TYPE, val);
+            }
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(
+                    "public, max-age=86400, stale-while-revalidate=604800",
+                ),
+            );
+            (StatusCode::OK, (headers, bytes).into_response())
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e}").into_response(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsActionPayload {
+    action: String,
+    path: String,
+    new_name: Option<String>,
+}
+
+async fn fs_action_handler(Json(req): Json<FsActionPayload>) -> impl IntoResponse {
+    let p = std::path::PathBuf::from(req.path.trim());
+    match req.action.as_str() {
+        "rename" => {
+            let Some(new_name) = req
+                .new_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "success": false, "error": "Missing new_name" })),
+                );
+            };
+            let Some(parent) = p.parent() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "success": false, "error": "Invalid parent path" })),
+                );
+            };
+            let new_path = parent.join(new_name);
+            match std::fs::rename(&p, &new_path) {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Renamed" })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                ),
+            }
+        }
+        "delete" => {
+            if !p.exists() {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Already deleted" })),
+                );
+            }
+            let res = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            match res {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Deleted" })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                ),
+            }
+        }
+        _ => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "message": "Ignored" })),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonTerminalItem {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    pub shell: String,
+    pub history: Vec<String>,
+    pub timestamp: i64,
+}
+
+fn daemon_terminals() -> &'static std::sync::Mutex<HashMap<String, DaemonTerminalItem>> {
+    static TERMINALS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, DaemonTerminalItem>>> =
+        std::sync::OnceLock::new();
+    TERMINALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalCreatePayload {
+    shell: Option<String>,
+    cwd: Option<String>,
+}
+
+async fn terminal_create(Json(req): Json<TerminalCreatePayload>) -> impl IntoResponse {
+    let shell = req.shell.unwrap_or_else(|| "powershell".to_string());
+    let cwd = req.cwd.unwrap_or_else(|| ".".to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let term_id = format!("term_{}_{:x}", now.as_millis(), now.as_nanos() % 100000);
+    let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+    let count = guard.len() + 1;
+    let name = format!("{shell} {count}");
+    let item = DaemonTerminalItem {
+        id: term_id.clone(),
+        name: name.clone(),
+        cwd: cwd.clone(),
+        shell,
+        history: vec![
+            format!("[JeikCode Persistent Terminal Session: {term_id}]"),
+            format!("Active workspace: {cwd}"),
+            "Connected to background process runner.\r\n".to_string(),
+        ],
+        timestamp: now.as_millis() as i64,
+    };
+    guard.insert(term_id.clone(), item);
+    publish_global(GlobalWireEvent::TerminalUpdated {
+        cwd: cwd.clone(),
+    });
+    Json(serde_json::json!({
+        "success": true,
+        "terminal_id": term_id,
+        "name": name,
+        "cwd": cwd,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalListQuery {
+    cwd: Option<String>,
+}
+
+async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse {
+    let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+    let list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
+        let norm_req = req_cwd.replace('\\', "/").trim_end_matches('/').to_lowercase();
+        guard
+            .values()
+            .filter(|t| {
+                if norm_req.is_empty() {
+                    return true;
+                }
+                let norm_term = t.cwd.replace('\\', "/").trim_end_matches('/').to_lowercase();
+                norm_term == norm_req || norm_term.starts_with(&norm_req) || norm_req.starts_with(&norm_term)
+            })
+            .cloned()
+            .collect()
+    } else {
+        guard.values().cloned().collect()
+    };
+    let platform = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    Json(serde_json::json!({ "success": true, "terminals": list, "platform": platform }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalClosePayload {
+    terminal_id: String,
+}
+
+async fn terminal_close(Json(req): Json<TerminalClosePayload>) -> impl IntoResponse {
+    let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+    let removed = guard.remove(&req.terminal_id);
+    if let Some(item) = removed {
+        publish_global(GlobalWireEvent::TerminalUpdated {
+            cwd: item.cwd,
+        });
+    }
+    Json(serde_json::json!({ "success": true }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalInputPayload {
+    terminal_id: String,
+    input: String,
+}
+
+async fn terminal_input(Json(req): Json<TerminalInputPayload>) -> impl IntoResponse {
+    let input = req.input.trim().to_string();
+    if input.is_empty() || input == "\x03" {
+        let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = guard.get_mut(&req.terminal_id) {
+            t.history.push("^C".to_string());
+        }
+        return Json(serde_json::json!({ "success": true, "output": "^C\r\n" }));
+    }
+
+    let cwd = {
+        let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&req.terminal_id)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| ".".to_string())
+    };
+
+    let output_str = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let output = std::process::Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(&input)
+            .current_dir(&cwd)
+            .output();
+
+        #[cfg(not(target_os = "windows"))]
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&input)
+            .current_dir(&cwd)
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.is_empty() {
+                    format!("{stdout}{stderr}")
+                } else {
+                    stdout.to_string()
+                }
+            }
+            Err(e) => format!("Execution error: {e}\r\n"),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| "Execution panicked\r\n".to_string());
+
+    {
+        let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = guard.get_mut(&req.terminal_id) {
+            for line in output_str.lines() {
+                if !line.is_empty() {
+                    t.history.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "success": true, "output": output_str }))
 }
 
 #[derive(Serialize)]
@@ -10950,6 +11358,9 @@ pub async fn ensure_webui(
         Ok(token) => token,
         Err(err) => return err,
     };
+    // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），同步写回配置，
+    // 确保 webui-listen.json 里的端口与实际绑定的端口一致，界面输入框不会残留冲突前的旧端口。
+    let _ = api_config::save_webui_listen_pref(actual_port, Some(token.clone()));
     // 选择自动打开浏览器用的本机地址：
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
@@ -12132,6 +12543,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         )
         .route("/chat/stop", post(stop_chat))
         .route("/fs/reveal", post(reveal_file_or_folder))
+        .route("/fs/open", post(open_file_with_os))
+        .route("/fs/raw", get(fs_raw_handler))
+        .route("/fs/action", post(fs_action_handler))
+        .route("/terminal/list", get(terminal_list))
+        .route("/terminal/create", post(terminal_create))
+        .route("/terminal/input", post(terminal_input))
+        .route("/terminal/close", post(terminal_close))
         .route("/chat/queue", get(get_chat_queue).post(update_chat_queue))
         .route(
             "/chat/steer",
@@ -14711,6 +15129,45 @@ mod tests {
         let sessions = list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "active-empty");
+    }
+
+    #[test]
+    fn list_projects_in_root_matches_visible_sessions_count() {
+        use jeikcode_capabilities::session::{CatalogLocation, SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+
+        // 1. 正常有消息会话
+        let mut normal_meta = SessionMeta::new("normal-session", "/project", 1);
+        normal_meta.message_count = 5;
+        manager.write_meta(&normal_meta).unwrap();
+
+        // 2. 遗弃的历史空会话（无消息，非 active）
+        let empty_unused = SessionMeta::new("unused-empty", "/project", 2);
+        manager.write_meta(&empty_unused).unwrap();
+
+        // 3. 当前活跃的空会话（无消息，active）
+        let empty_active = SessionMeta::new("active-empty", "/project", 3);
+        manager.write_meta(&empty_active).unwrap();
+
+        let active = CatalogLocation {
+            id: "active-empty".into(),
+            project_bucket: project_bucket.into(),
+        };
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
+        let projects = list_projects_in_root(tmp.path(), Some(&active)).unwrap();
+
+        assert_eq!(sessions.len(), 2, "只有 normal 和 active-empty 可见");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].hash, project_bucket);
+        assert_eq!(
+            projects[0].session_count,
+            sessions.len(),
+            "projects session_count 必须与可见会话列表长度完全一致"
+        );
     }
 
     #[test]

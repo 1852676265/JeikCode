@@ -3783,8 +3783,10 @@ fn spawn_runtime_owner_with_optional_agent(
                     }) => {
                         if let Some(runtime) = resources.as_ref() {
                             runtime.parts.bash_runtime.cancel_foreground_live_bash();
+                            if let Some(sid) = runtime.parts.bash_runtime.session_id() {
+                                jeikcode_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(&sid);
+                            }
                         }
-                        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
@@ -5399,8 +5401,10 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::Shutdown { generation: request_generation }) => {
                         if let Some(runtime) = resources.as_ref() {
                             runtime.parts.bash_runtime.cancel_foreground_live_bash();
+                            if let Some(sid) = runtime.parts.bash_runtime.session_id() {
+                                jeikcode_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(&sid);
+                            }
                         }
-                        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }

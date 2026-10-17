@@ -962,7 +962,7 @@ fn saved_listen_port() -> Option<u16> {
 }
 
 /// Write the next desktop launch. `token: None` keeps the token already on disk.
-fn save_webui_listen_pref(port: u16, token: Option<String>) -> Result<(), String> {
+pub(crate) fn save_webui_listen_pref(port: u16, token: Option<String>) -> Result<(), String> {
     if port == 0 {
         return Err("port must be 1-65535".to_string());
     }

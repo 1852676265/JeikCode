@@ -224,6 +224,9 @@ pub async fn git_action(
             let combined = if stdout.is_empty() { stderr } else { stdout };
             if out.status.success() {
                 invalidate_git_cache(&dir);
+                crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                    cwd: dir.to_string_lossy().to_string(),
+                });
                 Json(GitActionResp {
                     success: true,
                     message: combined.trim().to_string(),
@@ -995,6 +998,9 @@ pub async fn git_checkout(
 
             if out.status.success() {
                 invalidate_git_cache(&dir);
+                crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                    cwd: dir.to_string_lossy().to_string(),
+                });
                 Json(GitCheckoutResp {
                     success: true,
                     branch: target_branch,
@@ -1419,6 +1425,10 @@ pub async fn git_stage(
 
     match output {
         Ok(out) if out.status.success() => {
+            invalidate_git_cache(&dir);
+            crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                cwd: dir.to_string_lossy().to_string(),
+            });
             Json(serde_json::json!({ "success": true })).into_response()
         }
         Ok(out) => json_error(
@@ -1461,6 +1471,10 @@ pub async fn git_unstage(
 
     match output {
         Ok(out) if out.status.success() => {
+            invalidate_git_cache(&dir);
+            crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                cwd: dir.to_string_lossy().to_string(),
+            });
             Json(serde_json::json!({ "success": true })).into_response()
         }
         Ok(out) => json_error(
@@ -1565,32 +1579,46 @@ pub async fn git_discard(
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
     };
 
-    if req.is_untracked {
+    let discard_result = if req.is_untracked {
         match discard_untracked_path(&dir, &file_path) {
-            Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
-            Err(error) => json_error(StatusCode::BAD_REQUEST, error).into_response(),
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // 如果 clean 失败，可能文件其实已被 index 跟踪，回退尝试 restore 回退到 HEAD
+                let output = git_cmd_literal_paths(&dir)
+                    .args(["restore", "--staged", "--worktree", "--"])
+                    .arg(&file_path)
+                    .output();
+                match output {
+                    Ok(out) if out.status.success() => Ok(()),
+                    Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
+                    Err(e) => Err(format!("Failed to discard changes: {e}")),
+                }
+            }
         }
     } else {
+        // 先尝试恢复暂存区和工作区（无论是否被 git add，彻底回滚到 HEAD）
         let output = git_cmd_literal_paths(&dir)
-            .args(["restore", "--"])
+            .args(["restore", "--staged", "--worktree", "--"])
             .arg(&file_path)
             .output();
         match output {
-            Ok(out) if out.status.success() => {
-                invalidate_git_cache(&dir);
-                Json(serde_json::json!({ "success": true })).into_response()
+            Ok(out) if out.status.success() => Ok(()),
+            _ => {
+                // 如果 restore 失败（例如是未跟踪文件但客户端没标 untracked），回退尝试 clean
+                discard_untracked_path(&dir, &file_path)
             }
-            Ok(out) => json_error(
-                StatusCode::BAD_REQUEST,
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-            .into_response(),
-            Err(e) => json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to discard changes: {e}"),
-            )
-            .into_response(),
         }
+    };
+
+    match discard_result {
+        Ok(()) => {
+            invalidate_git_cache(&dir);
+            crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                cwd: dir.to_string_lossy().to_string(),
+            });
+            Json(serde_json::json!({ "success": true })).into_response()
+        }
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
 
@@ -1626,6 +1654,9 @@ pub async fn git_commit(
     match output {
         Ok(out) if out.status.success() => {
             invalidate_git_cache(&dir);
+            crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                cwd: dir.to_string_lossy().to_string(),
+            });
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             Json(serde_json::json!({
                 "success": true,
@@ -1683,6 +1714,10 @@ pub async fn git_push(
             let combined = if stdout.is_empty() { stderr } else { stdout };
 
             if out.status.success() {
+                invalidate_git_cache(&dir);
+                crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                    cwd: dir.to_string_lossy().to_string(),
+                });
                 Json(serde_json::json!({
                     "success": true,
                     "message": combined.trim().to_string(),
@@ -1809,6 +1844,9 @@ pub async fn git_fetch(
             if out.status.success() {
                 // Fetch 成功后，主动失效后端的 Graph 缓存和 Meta 缓存，确保后续请求能拿到最新上游提交
                 invalidate_git_cache(&dir);
+                crate::publish_global(crate::GlobalWireEvent::GitUpdated {
+                    cwd: dir.to_string_lossy().to_string(),
+                });
                 Json(serde_json::json!({
                     "success": true,
                     "message": combined.trim().to_string(),

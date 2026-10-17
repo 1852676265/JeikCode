@@ -3071,7 +3071,7 @@ pub(crate) async fn live_stop(
     axum::extract::Query(q): axum::extract::Query<LiveStopReq>,
 ) -> impl IntoResponse {
     let session_id = parse_session_id(q.session_id);
-    let accepted = if let Some(session_id) = session_id {
+    let accepted = if let Some(ref session_id) = session_id {
         if crate::native_live::prefer_registry_live_stream(&session_id) {
             crate::native_live::cancel_via_registry(&session_id).is_ok()
         } else {
@@ -3080,7 +3080,9 @@ pub(crate) async fn live_stop(
     } else {
         crate::native_live::cancel_confirmed().await.is_ok()
     };
-    jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
+    if let Some(ref sid) = session_id {
+        jeikcode_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(sid);
+    }
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
