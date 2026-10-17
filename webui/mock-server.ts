@@ -1547,40 +1547,122 @@ export function mockApiPlugin(): Plugin {
 
         // FS Locate (File & Directory name / path locate)
         if (pathname === '/fs/locate') {
-          const q = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
-          const sampleResults = [
-            {
-              name: 'JeikCodeChatPanel.kt',
-              path: 'extensions/jetbrains/src/main/kotlin/com/jeikcode/jetbrains/ui/JeikCodeChatPanel.kt',
-              rel_path: 'extensions/jetbrains/src/main/kotlin/com/jeikcode/jetbrains/ui/JeikCodeChatPanel.kt',
-              is_dir: false,
-            },
-            {
-              name: 'GitPanel.tsx',
-              path: 'webui/src/components/GitPanel.tsx',
-              rel_path: 'webui/src/components/GitPanel.tsx',
-              is_dir: false,
-            },
-            {
-              name: 'components',
-              path: 'webui/src/components',
-              rel_path: 'webui/src/components',
-              is_dir: true,
-            },
-            {
-              name: 'README.md',
-              path: 'README.md',
-              rel_path: 'README.md',
-              is_dir: false,
-            },
-          ].filter(
-            (item) =>
-              item.name.toLowerCase().includes(q) ||
-              item.rel_path.toLowerCase().includes(q),
-          );
+          const rawQ = (parsedUrl.searchParams.get('q') || '').trim().replace(/^['"`]|['"`]$/g, '');
+          const reqPath = parsedUrl.searchParams.get('path') || process.cwd();
+          let baseDir = pathMod.resolve(reqPath);
+          if (!parsedUrl.searchParams.get('path') && (baseDir.endsWith('/webui') || baseDir.endsWith('\\webui'))) {
+            baseDir = pathMod.resolve(baseDir, '..');
+          }
+          const normBase = baseDir.replace(/\\/g, '/');
+          const lowerQ = rawQ.replace(/\\/g, '/').toLowerCase();
+          const isPathQuery = lowerQ.includes('/');
+
+          if (!rawQ || !fs.existsSync(baseDir)) {
+            return sendJson({ query: rawQ, results: [] });
+          }
+
+          const results: any[] = [];
+
+          // 1. 优先检查直接命中的绝对或相对路径
+          const directCand = pathMod.isAbsolute(rawQ) ? rawQ : pathMod.resolve(baseDir, rawQ.replace(/^\.\//, ''));
+          if (fs.existsSync(directCand)) {
+            try {
+              const stat = fs.statSync(directCand);
+              const isDir = stat.isDirectory();
+              const normPath = directCand.replace(/\\/g, '/');
+              const rel = normPath.toLowerCase().startsWith(normBase.toLowerCase())
+                ? normPath.slice(normBase.length).replace(/^\/+/, '')
+                : normPath;
+              results.push({
+                name: pathMod.basename(directCand),
+                path: normPath,
+                rel_path: rel || pathMod.basename(directCand),
+                is_dir: isDir,
+              });
+            } catch {}
+          }
+
+          // 2. 深度递归遍历全量文件与目录（排除 .git, node_modules, target, dist 等）
+          const walk = (currDir: string, depth = 0) => {
+            if (depth > 16 || results.length >= 150) return;
+            let entries: any[] = [];
+            try {
+              entries = fs.readdirSync(currDir, { withFileTypes: true });
+            } catch {
+              return;
+            }
+            for (const entry of entries) {
+              const name = entry.name;
+              if (
+                name === '.git' ||
+                name === 'node_modules' ||
+                name === 'target' ||
+                name === 'dist' ||
+                name === '.cargo' ||
+                name === '.idea' ||
+                name === '.vscode' ||
+                name === '.vite'
+              ) {
+                continue;
+              }
+              const isDir = entry.isDirectory();
+              const fullP = pathMod.join(currDir, name).replace(/\\/g, '/');
+              const rel = fullP.toLowerCase().startsWith(normBase.toLowerCase())
+                ? fullP.slice(normBase.length).replace(/^\/+/, '')
+                : fullP;
+
+              const lowerName = name.toLowerCase();
+              const lowerRel = rel.toLowerCase();
+
+              const isHit = isPathQuery
+                ? lowerRel.includes(lowerQ)
+                : lowerName.includes(lowerQ) || lowerRel.includes(lowerQ);
+
+              if (isHit && !results.some((r) => r.path.toLowerCase() === fullP.toLowerCase())) {
+                results.push({
+                  name,
+                  path: fullP,
+                  rel_path: rel,
+                  is_dir: isDir,
+                });
+                if (results.length >= 150) return;
+              }
+
+              if (isDir) {
+                walk(pathMod.join(currDir, name), depth + 1);
+              }
+            }
+          };
+
+          walk(baseDir, 0);
+
+          // 排序：精准相对路径匹配最高，其次名称精准匹配，其次前缀匹配，浅层路径优先
+          results.sort((a, b) => {
+            const aExactRel = a.rel_path.toLowerCase() === lowerQ;
+            const bExactRel = b.rel_path.toLowerCase() === lowerQ;
+            if (aExactRel !== bExactRel) return bExactRel ? 1 : -1;
+
+            const aExact = a.name.toLowerCase() === lowerQ;
+            const bExact = b.name.toLowerCase() === lowerQ;
+            if (aExact !== bExact) return bExact ? 1 : -1;
+
+            const aStarts = a.name.toLowerCase().startsWith(lowerQ);
+            const bStarts = b.name.toLowerCase().startsWith(lowerQ);
+            if (aStarts !== bStarts) return bStarts ? 1 : -1;
+
+            const aRelStarts = a.rel_path.toLowerCase().startsWith(lowerQ);
+            const bRelStarts = b.rel_path.toLowerCase().startsWith(lowerQ);
+            if (aRelStarts !== bRelStarts) return bRelStarts ? 1 : -1;
+
+            if (a.rel_path.length !== b.rel_path.length) {
+              return a.rel_path.length - b.rel_path.length;
+            }
+            return a.name.length - b.name.length;
+          });
+
           return sendJson({
-            query: q,
-            results: sampleResults,
+            query: rawQ,
+            results,
           });
         }
 

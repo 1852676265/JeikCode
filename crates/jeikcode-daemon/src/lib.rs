@@ -10224,7 +10224,10 @@ async fn fs_locate(
             let is_dir = direct_candidate.is_dir();
             let norm_path = direct_candidate.to_string_lossy().replace('\\', "/");
             let norm_base = search_dir_clone.to_string_lossy().replace('\\', "/");
-            let rel = if norm_path.starts_with(&norm_base) {
+            let rel = if norm_path
+                .to_lowercase()
+                .starts_with(&norm_base.to_lowercase())
+            {
                 norm_path[norm_base.len()..]
                     .trim_start_matches('/')
                     .to_string()
@@ -10273,7 +10276,10 @@ async fn fs_locate(
                 let entry_path = entry.path();
                 let norm_path = entry_path.to_string_lossy().replace('\\', "/");
                 let norm_base = base.to_string_lossy().replace('\\', "/");
-                let rel = if norm_path.starts_with(&norm_base) {
+                let rel = if norm_path
+                    .to_lowercase()
+                    .starts_with(&norm_base.to_lowercase())
+                {
                     norm_path[norm_base.len()..]
                         .trim_start_matches('/')
                         .to_string()
@@ -10290,7 +10296,11 @@ async fn fs_locate(
                     lower_name.contains(q) || lower_rel.contains(q)
                 };
 
-                if is_hit && !matches.iter().any(|m| m.path == norm_path) {
+                if is_hit
+                    && !matches
+                        .iter()
+                        .any(|m| m.path.eq_ignore_ascii_case(&norm_path))
+                {
                     matches.push(FsLocateItem {
                         name: name.clone(),
                         path: norm_path,
@@ -10317,8 +10327,14 @@ async fn fs_locate(
             0,
         );
 
-        // 排序：精准名称匹配排前，其次前缀匹配，其次相对路径匹配
+        // 排序：精准相对路径匹配最高，其次名称精准匹配，其次前缀匹配，浅层路径优先
         matches.sort_by(|a, b| {
+            let a_exact_rel = a.rel_path.to_lowercase() == query_normalized;
+            let b_exact_rel = b.rel_path.to_lowercase() == query_normalized;
+            if a_exact_rel != b_exact_rel {
+                return b_exact_rel.cmp(&a_exact_rel);
+            }
+
             let a_exact_name = a.name.to_lowercase() == query_normalized;
             let b_exact_name = b.name.to_lowercase() == query_normalized;
             if a_exact_name != b_exact_name {
@@ -10333,6 +10349,9 @@ async fn fs_locate(
             let b_rel_starts = b.rel_path.to_lowercase().starts_with(&query_normalized);
             if a_rel_starts != b_rel_starts {
                 return b_rel_starts.cmp(&a_rel_starts);
+            }
+            if a.rel_path.len() != b.rel_path.len() {
+                return a.rel_path.len().cmp(&b.rel_path.len());
             }
             a.name.len().cmp(&b.name.len())
         });
