@@ -422,11 +422,27 @@ export function reduceTodosFromCalls(
       list = applyTodoAction([], baselineArgs);
     }
     start = baselineIdx + 1;
-  } else if (baselineFallback && baselineFallback.length > 0) {
-    // 关键防线：若在当前调用窗口内未找到全量 plan 或 clear（例如全量计划发生在历史分页之外），
-    // 坚决以传入的 baselineFallback（上一轮留存或服务端权威清单）为底座应用增量 actions，
-    // 绝不允许从空数组 [] 开始导致前面的全部任务离奇蒸发！
-    list = baselineFallback.map((item) => ({ ...item }));
+  } else {
+    // 关键防线：检查当前调用窗口内是否自带创建/增加任务的 add 动作。
+    // 如果窗口内自带有 add，说明调用流具备自闭合的任务定义起点，必须从空数组 [] 起步纯净折叠（与 Rust 后端对齐），
+    // 坚决不能以传入的 baselineFallback/stashed（可能已被 update 改写过标题）作为底座再去叠加 add，
+    // 否则标题不一致时会被判定为新任务追加在末尾，造成 A B C D E A B C D 的重放灾难！
+    // 仅当当前调用窗口纯属分页截断的 update 碎片且无任何 add 时，才采纳 baselineFallback 垫底！
+    const hasAdd = filtered.some((c) => {
+      try {
+        const v = JSON.parse(c.args);
+        if (!isRecord(v)) return false;
+        if (Array.isArray(v.actions)) {
+          return v.actions.some((a) => isRecord(a) && actionKind(a) === 'add');
+        }
+        return actionKind(v) === 'add';
+      } catch {
+        return false;
+      }
+    });
+    if (!hasAdd && baselineFallback && baselineFallback.length > 0) {
+      list = baselineFallback.map((item) => ({ ...item }));
+    }
     start = 0;
   }
   for (let i = start; i < filtered.length; i++) {

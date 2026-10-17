@@ -839,6 +839,67 @@ test('restoreStickyTodos respects empty authoritativeTodos array and does not fa
   assert.equal(restored, null, '服务端权威清单为空数组时代表无活跃待办，严禁回退 stashed 脏缓存');
 });
 
+test('reduceTodosFromCalls ignores stashed fallback when calls define add actions to prevent replay duplication', () => {
+  // Stashed state where titles were updated to "修复"
+  const stashed: TodoItem[] = [
+    { content: 'Bug 1: 修复', status: 'completed' },
+    { content: 'Bug 2: 修复', status: 'completed' },
+    { content: 'Bug 3: 修复', status: 'in_progress' },
+    { content: 'Bug 4: 排查', status: 'pending' },
+    { content: '系统测试', status: 'pending' },
+  ];
+
+  // Calls from the session transcript (starting with initial "排查" add actions)
+  const calls = [
+    {
+      name: 'todo_write',
+      args: JSON.stringify({
+        actions: [
+          { action: 'add', content: 'Bug 1: 排查', status: 'in_progress' },
+          { action: 'add', content: 'Bug 2: 排查', status: 'pending' },
+          { action: 'add', content: 'Bug 3: 排查', status: 'pending' },
+          { action: 'add', content: 'Bug 4: 排查', status: 'pending' },
+          { action: 'add', content: '系统测试', status: 'pending' },
+        ],
+      }),
+    },
+    {
+      name: 'todo_write',
+      args: JSON.stringify({
+        actions: [{ id: 1, action: 'update', content: 'Bug 1: 修复', status: 'completed' }],
+      }),
+    },
+    {
+      name: 'todo_write',
+      args: JSON.stringify({
+        actions: [{ id: 2, action: 'update', content: 'Bug 2: 修复', status: 'completed' }],
+      }),
+    },
+    {
+      name: 'todo_write',
+      args: JSON.stringify({
+        actions: [{ id: 3, action: 'update', content: 'Bug 3: 修复', status: 'in_progress' }],
+      }),
+    },
+  ];
+
+  const folded = reduceTodosFromCalls(calls, stashed);
+  assert.equal(
+    folded.length,
+    5,
+    '当调用流自带完整 add 起点时，严禁叠加在 stashed 垫底列表上导致 A B C D E A B C D 重复重放',
+  );
+  assert.equal(folded[0]?.content, 'Bug 1: 修复');
+  assert.equal(folded[0]?.status, 'completed');
+  assert.equal(folded[1]?.content, 'Bug 2: 修复');
+  assert.equal(folded[1]?.status, 'completed');
+  assert.equal(folded[2]?.content, 'Bug 3: 修复');
+  assert.equal(folded[2]?.status, 'in_progress');
+  assert.equal(folded[3]?.content, 'Bug 4: 排查');
+  assert.equal(folded[4]?.content, '系统测试');
+});
+
+
 
 
 
