@@ -13,6 +13,7 @@ import { showToast } from './Toast';
 import { ConfirmDialog } from './ConfirmDialog';
 import { getPageZoom } from '../lib/pageZoom';
 import { isLoopbackHost } from '../lib/displayPath';
+import { getCachedDirectoryTree, saveCachedDirectoryTree } from '../lib/sessionCache';
 
 export interface FileExplorerProps {
   cwd?: string;
@@ -297,6 +298,12 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
         setTree(cached);
         return;
       }
+      void getCachedDirectoryTree<TreeNode[]>(rootPath).then((idbTree) => {
+        if (idbTree && idbTree.length > 0) {
+          setTree(idbTree);
+          setLoading(false);
+        }
+      });
     }
     setLoading(true);
     try {
@@ -339,6 +346,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       const nodes = await populateNodes(res.entries);
       setTree(nodes);
       setCachedTree(rootPath, nodes);
+      void saveCachedDirectoryTree(rootPath, nodes);
     } catch (err: any) {
       showToast(err?.message || 'Failed to load file tree', 'error');
     } finally {

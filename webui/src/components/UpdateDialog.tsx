@@ -58,6 +58,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const sawInstallProgress = useRef(false);
   const targetVersionRef = useRef('');
   const currentVersionRef = useRef('');
+  const installingTicks = useRef(0);
   const reloadAfterRestartRef = useRef<() => void>(() => {});
 
   useEffect(() => {
@@ -126,7 +127,18 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         const restarted =
           s.status === 'done' ||
           (sawInstallProgress.current && (s.status === 'idle' || s.status === 'ready'));
-        if (!restarted) return;
+        if (!restarted) {
+          // 如果在 installing/99% 停留超过 6 秒，主动开始探测重载，杜绝卡死
+          if (s.status === 'installing' && (s.progress ?? 0) >= 99) {
+            installingTicks.current = (installingTicks.current || 0) + 1;
+            if (installingTicks.current > 12) {
+              stopped = true;
+              window.clearInterval(timer);
+              reloadAfterRestartRef.current();
+            }
+          }
+          return;
+        }
         stopped = true;
         window.clearInterval(timer);
         reloadAfterRestartRef.current();
@@ -175,24 +187,57 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     const from = currentVersionRef.current;
     void (async () => {
       let misses = 0;
-      const deadline = Date.now() + 60000;
+      const startTime = Date.now();
+      const deadline = startTime + 60000;
       while (Date.now() < deadline) {
         try {
           const resp = await fetch('/health', {
             credentials: 'include',
-            signal: AbortSignal.timeout(2000),
+            signal: AbortSignal.timeout(1500),
           });
-          if (!resp.ok) throw new Error(String(resp.status));
-          const body = await resp.json();
-          const got = String(body?.version ?? '');
-          if (shouldReloadUpgradedPage({ want, from, got, consecutiveMisses: misses })) {
-            window.location.reload();
-            return;
+          if (resp.ok) {
+            const body = await resp.json();
+            const got = String(body?.version ?? '');
+            if (shouldReloadUpgradedPage({ want, from, got, consecutiveMisses: misses })) {
+              window.location.reload();
+              return;
+            }
+          } else {
+            misses += 1;
           }
-          misses = 0;
         } catch {
           misses += 1;
         }
+
+        // 若原端口失联或版本未变，自动扫描相邻端口（解决端口发生顺延 13457..13465 问题）
+        if (typeof window !== 'undefined' && window.location.port) {
+          const curPort = Number(window.location.port) || 13457;
+          const candidates = [13457, curPort, curPort + 1, curPort - 1, 13458, 13459, 13460, 13461];
+          for (const p of candidates) {
+            if (p === curPort && misses < 2) continue;
+            try {
+              const probeUrl = `${window.location.protocol}//${window.location.hostname}:${p}/health`;
+              const probeResp = await fetch(probeUrl, { signal: AbortSignal.timeout(600) });
+              if (probeResp.ok) {
+                const pBody = await probeResp.json();
+                const pGot = String(pBody?.version ?? '');
+                if (shouldReloadUpgradedPage({ want, from, got: pGot, consecutiveMisses: misses })) {
+                  const newUrl = new URL(window.location.href);
+                  newUrl.port = String(p);
+                  window.location.href = newUrl.toString();
+                  return;
+                }
+              }
+            } catch {}
+          }
+        }
+
+        // 保底保护：若已等待超 8 秒且已完成安装阶段，直接触发刷新重载
+        if (Date.now() - startTime > 8000 && sawInstallProgress.current) {
+          window.location.reload();
+          return;
+        }
+
         await new Promise((resolve) => window.setTimeout(resolve, 400));
       }
       reloadStarted.current = false;
@@ -488,10 +533,12 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
           ) : (
             <button
               type="button"
-              class="btn btn-secondary"
-              disabled
+              class={sawInstallProgress.current ? 'btn btn-primary' : 'btn btn-secondary'}
+              disabled={!sawInstallProgress.current}
+              onClick={() => reloadAfterRestartRef.current()}
+              title="若已完成替换未自动跳转，可点击立即刷新重载"
             >
-              {isDesktop ? t('update.preparing') : t('update.installing')}
+              {sawInstallProgress.current ? '🚀 立即刷新重载' : (isDesktop ? t('update.preparing') : t('update.installing'))}
             </button>
           )}
           </div>

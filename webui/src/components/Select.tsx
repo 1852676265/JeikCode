@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 export interface SelectOption<T extends string> {
   value: T;
   label: ComponentChildren;
+  selectedLabel?: ComponentChildren;
 }
 
 export function Select<T extends string>({
@@ -43,7 +44,7 @@ export function Select<T extends string>({
         disabled={disabled}
         onClick={() => !disabled && setOpen(!open)}
       >
-        <span class="custom-select-value">{selected?.label ?? value}</span>
+        <span class="custom-select-value">{selected?.selectedLabel ?? selected?.label ?? value}</span>
         <svg class="custom-select-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"
           stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="6 9 12 15 18 9" />

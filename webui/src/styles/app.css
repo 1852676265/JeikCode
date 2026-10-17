@@ -4634,15 +4634,17 @@ body {
   color: var(--app-secondary-foreground);
 }
 .markdown-root hr { border: none; border-top: 1px solid var(--app-primary-border-color); margin: 0.6em 0; }
-.markdown-root :not(pre) > code {
+.markdown-root :not(pre) > code,
+.markdown-root code:not(pre code) {
   font-family: Consolas, 'SFMono-Regular', 'Liberation Mono', Menlo, Courier, monospace !important;
   word-break: break-word;
   border-radius: 4px;
   padding: 2px 6px;
-  font-size: 0.9em;
-  background: color-mix(in srgb, var(--app-secondary-background), transparent 30%);
-  color: var(--app-link-color, #60a5fa);
-  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+  font-size: 0.88em;
+  font-weight: 550;
+  background: rgba(245, 158, 11, 0.12) !important;
+  color: #fbbf24 !important;
+  border: 1px solid rgba(245, 158, 11, 0.3) !important;
 }
 .markdown-root pre,
 .markdown-root pre code,
@@ -6038,7 +6040,7 @@ body {
   display: flex;
   align-items: center;
   gap: 1px;
-  opacity: 0;
+  opacity: 1;
   transition: opacity 0.15s ease;
   flex-shrink: 0;
 }
@@ -14010,10 +14012,12 @@ body {
 /* ==========================================================================
    Markdown Light Theme Adaptations (Tables, Quotes, Codeblocks)
    ========================================================================== */
-:root[data-theme='light'] .markdown-root :not(pre) > code {
-  color: #0284c7 !important;
-  background: #f1f5f9 !important;
-  border-color: #cbd5e1 !important;
+:root[data-theme='light'] .markdown-root :not(pre) > code,
+:root[data-theme='light'] .markdown-root code:not(pre code) {
+  color: #9a3412 !important;
+  background: #fff7ed !important;
+  border: 1px solid #fed7aa !important;
+  font-weight: 550;
 }
 :root[data-theme='light'] .markdown-root blockquote {
   background: #f0f7ff !important;
@@ -14484,6 +14488,650 @@ body {
   color: #0369a1 !important;
   text-decoration-color: #0284c7 !important;
 }
+
+/* ============================================================================
+   GitHub Webhook & Auto Review Modal Styling
+   ============================================================================ */
+.git-webhook-modal-card {
+  width: min(840px, 96vw) !important;
+  max-height: 88vh !important;
+  background: var(--app-menu-background, #18181b);
+  border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.12));
+  border-radius: 12px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+}
+
+.git-badge-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-weight: 500;
+  background: color-mix(in srgb, #3b82f6 18%, transparent);
+  color: #60a5fa;
+  border: 1px solid color-mix(in srgb, #3b82f6 30%, transparent);
+}
+
+.git-project-info-banner {
+  background: var(--app-card-background, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.git-banner-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.git-banner-label {
+  color: var(--app-secondary-foreground, #a1a1aa);
+  flex-shrink: 0;
+  width: 72px;
+}
+
+.git-banner-val {
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-weight: 600;
+}
+
+.git-banner-path {
+  color: var(--app-secondary-foreground, #a1a1aa);
+  font-family: var(--app-monospace-font-family, monospace);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--app-border, rgba(255, 255, 255, 0.06));
+}
+
+.git-form-section:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+/* 渠道选择网格 */
+.git-channel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(138px, 1fr));
+  gap: 8px;
+}
+
+.git-channel-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 8px 10px;
+  background: var(--app-card-background, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+  min-height: 52px;
+}
+
+.git-channel-card:hover {
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.06));
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.git-channel-card.active {
+  background: color-mix(in srgb, #3b82f6 12%, var(--app-card-background, rgba(0, 0, 0, 0.2)));
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 1px #3b82f6;
+}
+
+.git-channel-card-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+
+.git-channel-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--app-primary-foreground, #f4f4f5);
+}
+
+.git-channel-badge {
+  font-size: 9.5px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--app-secondary-foreground, #a1a1aa);
+  margin-left: auto;
+}
+
+.git-channel-sub {
+  font-size: 10.5px;
+  color: var(--app-secondary-foreground, #71717a);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.git-channel-check {
+  position: absolute;
+  bottom: 4px;
+  right: 6px;
+  font-size: 11px;
+  color: #3b82f6;
+  font-weight: 700;
+}
+
+/* 工作同步模式双卡切换 (Webhook vs Polling) */
+.git-mode-switch-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+@media (max-width: 600px) {
+  .git-mode-switch-container {
+    grid-template-columns: 1fr;
+  }
+}
+
+.git-mode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--app-card-background, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.git-mode-card:hover {
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.05));
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.git-mode-card.active {
+  background: color-mix(in srgb, #3b82f6 10%, var(--app-card-background, rgba(0, 0, 0, 0.2)));
+  border-color: #3b82f6;
+}
+
+.git-mode-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.git-mode-header input[type='radio'] {
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+
+.git-mode-header strong {
+  font-size: 12.5px;
+  color: var(--app-primary-foreground, #f4f4f5);
+}
+
+.git-mode-desc {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #a1a1aa);
+  line-height: 1.4;
+  margin-left: 21px;
+}
+
+.git-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-primary-foreground, #f4f4f5);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.git-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 640px) {
+  .git-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.git-form-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.git-form-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--app-secondary-foreground, #d4d4d8);
+}
+
+.git-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  box-sizing: border-box;
+}
+
+.git-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.git-readonly-input {
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.04));
+  color: var(--app-secondary-foreground, #a1a1aa);
+  cursor: text;
+}
+
+.git-input-with-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.git-aux-btn {
+  height: 34px;
+  padding: 0 10px;
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.07));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.git-aux-btn:hover {
+  background: var(--app-hover-bg, rgba(255, 255, 255, 0.12));
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.git-input-hint {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #71717a);
+  line-height: 1.4;
+}
+
+.git-checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.git-checkbox-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--app-card-background, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.07));
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.git-checkbox-label:hover {
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.05));
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.git-checkbox-label input[type='checkbox'] {
+  margin-top: 2px;
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+
+.git-checkbox-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-checkbox-text strong {
+  font-size: 12.5px;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-weight: 500;
+}
+
+.git-checkbox-text span {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #a1a1aa);
+}
+
+.git-switch-inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--app-primary-foreground, #f4f4f5);
+  cursor: pointer;
+}
+
+.git-switch-inline-label input[type='checkbox'] {
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+
+.git-text-action-btn {
+  background: none;
+  border: none;
+  color: #60a5fa;
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: background 0.12s ease;
+}
+
+.git-text-action-btn:hover {
+  background: rgba(59, 130, 246, 0.12);
+  text-decoration: underline;
+}
+
+.git-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-family: var(--app-monospace-font-family, Consolas, Monaco, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 140px;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.git-textarea:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.git-test-btn {
+  height: 32px;
+  padding: 0 12px;
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.15));
+  border-radius: 6px;
+  color: var(--app-primary-foreground, #f4f4f5);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.git-test-btn:hover {
+  background: var(--app-hover-bg, rgba(255, 255, 255, 0.14));
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.git-footer-toast {
+  font-size: 12px;
+  color: #10b981;
+  font-weight: 500;
+  animation: fadeIn 0.15s ease;
+}
+
+.git-cancel-btn {
+  height: 32px;
+  padding: 0 14px;
+  background: transparent;
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  color: var(--app-secondary-foreground, #a1a1aa);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.git-cancel-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--app-primary-foreground, #f4f4f5);
+}
+
+.git-save-btn {
+  height: 32px;
+  padding: 0 16px;
+  background: #2563eb;
+  border: 1px solid #1d4ed8;
+  border-radius: 6px;
+  color: #ffffff;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.3);
+}
+
+.git-save-btn:hover {
+  background: #1d4ed8;
+  box-shadow: 0 3px 10px rgba(37, 99, 235, 0.45);
+}
+
+/* 适配器下拉选择器增强 (富文本展示) */
+.git-adapter-select {
+  width: 100%;
+}
+
+.git-adapter-select .custom-select-trigger {
+  min-height: 48px;
+  height: auto;
+  padding: 8px 12px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+}
+
+.git-adapter-select .custom-select-trigger:focus,
+.git-adapter-select .custom-select-trigger.open {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.git-adapter-select .custom-select-dropdown {
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--app-menu-background, #1c1c1f);
+  border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.14));
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  z-index: 10000;
+}
+
+.git-adapter-select .custom-select-option {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--app-border, rgba(255, 255, 255, 0.05));
+}
+
+.git-adapter-select .custom-select-option:last-child {
+  border-bottom: none;
+}
+
+.git-select-rich-option {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+}
+
+.git-select-rich-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.git-select-rich-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-primary-foreground, #f4f4f5);
+}
+
+.git-select-rich-desc {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #a1a1aa);
+  line-height: 1.4;
+}
+
+.git-select-rich-sample {
+  font-family: var(--app-monospace-font-family, monospace);
+  font-size: 10.5px;
+  color: #60a5fa;
+  opacity: 0.85;
+}
+
+/* 审查专用模型选择器与唤醒关键词单行精致排布 (模型 ➔ 思考强度 ➔ 唤醒词胶囊) */
+.git-model-trigger-panel {
+  background: var(--app-card-background, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.git-model-trigger-header {
+  display: flex;
+  align-items: center;
+}
+
+.git-model-trigger-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.git-model-selector-wrapper {
+  display: inline-flex;
+  align-items: center;
+}
+
+.git-model-selector-wrapper .model-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 顺序 1：模型胶囊在前，紧凑自适应排布 */
+.git-model-selector-wrapper .model-selector:not(.effort-selector) {
+  order: 1;
+  flex: 0 0 auto;
+}
+
+.git-model-selector-wrapper .model-selector:not(.effort-selector) .model-selector-trigger {
+  width: auto;
+  max-width: 320px;
+  height: 32px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+}
+
+/* 顺序 2：思考强度胶囊紧挨在模型选择器右侧 */
+.git-model-selector-wrapper .effort-selector {
+  order: 2;
+  flex: 0 0 auto;
+}
+
+.git-model-selector-wrapper .effort-selector .model-selector-trigger {
+  width: auto;
+  height: 32px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+}
+
+/* 顺序 3：紧随其后的唤醒词精致小胶囊 */
+.git-inline-keyword-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 6px 0 10px;
+  background: var(--app-input-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+
+.git-inline-keyword-label {
+  font-size: 11.5px;
+  color: var(--app-secondary-foreground, #a1a1aa);
+  white-space: nowrap;
+}
+
+.git-inline-keyword-input {
+  width: 76px;
+  height: 24px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.1));
+  border-radius: 5px;
+  color: #60a5fa;
+  font-family: var(--app-monospace-font-family, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  outline: none;
+  padding: 0 4px;
+}
+
+.git-inline-keyword-input:focus {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.12);
+  box-shadow: 0 0 0 1px #3b82f6;
+}
+
 
 
 

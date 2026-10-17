@@ -12,6 +12,7 @@ import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang, languageOptions } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { ConfirmDialog } from './ConfirmDialog';
+import { GitWebhookDialog } from './GitWebhookDialog';
 import { showToast } from './Toast';
 import { CwdPicker } from './CwdPicker';
 import { mergeOptimisticSession, mergeOptimisticSessions } from '../lib/sessionList';
@@ -487,6 +488,7 @@ export function Sidebar({
   const [hiddenProjectHashes, setHiddenProjectHashes] = useState<Set<string>>(() => new Set());
   const [pinnedProjects, setPinnedProjects] = useState<ProjectInfo[]>([]);
   const [removeProjectTarget, setRemoveProjectTarget] = useState<ProjectInfo | null>(null);
+  const [gitWebhookProject, setGitWebhookProject] = useState<ProjectInfo | null>(null);
   const [webPickerOpen, setWebPickerOpen] = useState(false);
   const pendingHideRef = useRef<Set<string>>(new Set());
   const pendingRevealRef = useRef<Set<string>>(new Set());
@@ -2248,7 +2250,6 @@ export function Sidebar({
                     <span class="project-group-name" title={p.working_dir}>
                       {p.name || shortDir(p.working_dir)}
                     </span>
-                    {count > 0 && <span class="project-group-badge">{count}</span>}
 
                     <div class="project-group-actions-cluster" onClick={(e) => e.stopPropagation()}>
                       {/* 在文件资源管理器打开项目目录 */}
@@ -2265,6 +2266,17 @@ export function Sidebar({
                           </svg>
                         </button>
                       )}
+
+                      {/* GitHub 联动与自动审查配置 */}
+                      <button
+                        type="button"
+                        class="project-group-action-btn"
+                        onClick={() => setGitWebhookProject(p)}
+                        title={t('gitWebhook.btnTitle')}
+                        aria-label={t('gitWebhook.btnTitle')}
+                      >
+                        <GithubLogo />
+                      </button>
 
                       {/* 在当前项目发起新会话 */}
                       <button
@@ -2481,6 +2493,13 @@ export function Sidebar({
           session={renameTarget}
           onClose={() => setRenameTarget(null)}
           onDone={(name) => handleRenamed(renameTarget.id, name)}
+        />,
+        document.body,
+      )}
+      {gitWebhookProject && createPortal(
+        <GitWebhookDialog
+          project={gitWebhookProject}
+          onClose={() => setGitWebhookProject(null)}
         />,
         document.body,
       )}

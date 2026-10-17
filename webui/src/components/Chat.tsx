@@ -5275,7 +5275,8 @@ export function Chat({
     }
     if (event.type === 'tool_start' || event.type === 'tool_result') {
       if (isTodoTool(event.name)) {
-        let argsStr = formatArgs(event.arguments);
+        const rawArgs = event.type === 'tool_start' ? event.arguments : undefined;
+        let argsStr = formatArgs(rawArgs);
         if (event.type === 'tool_result' && !argsStr && event.id) {
           // tool_result 的 event.output 是工具执行结果的文本摘要（含 [x] 列表或 status 汇报），
           // 绝不是工具的 JSON 入参！若入参为空，从已有消息树中提取该工具原先记录的 args！

@@ -27,7 +27,7 @@ jeikcode-telemetry = { path = "../jeikcode-telemetry" }
 jeikcode-updater = { path = "../jeikcode-updater" }
 
 # HTTP
-axum = { version = "0.7", features = ["macros", "multipart"] }
+axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.5", features = ["cors"] }

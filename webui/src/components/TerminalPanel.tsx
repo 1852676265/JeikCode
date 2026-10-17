@@ -8,6 +8,7 @@ import {
   createTerminalSession,
   fetchTerminalList,
   closeTerminalSession,
+  sendTerminalInput,
 } from '../api';
 import { showToast } from './Toast';
 import { useT, useSettings } from '../settings';
@@ -506,9 +507,22 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         const tabShell = inferShellFromTab(tab);
         const cols = Math.max(120, record.term.cols || 120);
         const rows = Math.max(20, record.term.rows || 32);
-        const wsUrl = `${protocol}//${window.location.host}/terminal/ws?id=${encodeURIComponent(tab.id)}&cwd=${encodeURIComponent(cwd || '')}&shell=${encodeURIComponent(tabShell)}&cols=${cols}&rows=${rows}`;
+        let token = '';
+        try {
+          const m = document.cookie.match(/jeikcode_webui(?:_\d+)?=([^;]+)/);
+          if (m && m[1]) token = m[1].trim();
+        } catch {}
+        if (!token) {
+          try {
+            const search = new URLSearchParams(window.location.search);
+            token = search.get('token') || '';
+          } catch {}
+        }
+        const wsUrl = `${protocol}//${window.location.host}/terminal/ws?id=${encodeURIComponent(tab.id)}&cwd=${encodeURIComponent(cwd || '')}&shell=${encodeURIComponent(tabShell)}&cols=${cols}&rows=${rows}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
         const ws = new WebSocket(wsUrl);
         record.ws = ws;
+
+        let receivedAnyData = false;
 
         ws.onopen = () => {
           try {
@@ -536,6 +550,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         };
 
         ws.onmessage = (event) => {
+          receivedAnyData = true;
           record.term.write(event.data);
         };
 
@@ -543,7 +558,16 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
           // 保留当前连接对象状态，等待唤醒重连
         };
 
-        ws.onerror = () => {};
+        ws.onerror = () => {
+          // 兜底提示：如果未能收到 WebSocket 数据，显示就绪提示符，绝不呈现全黑死寂窗口
+          setTimeout(() => {
+            if (!receivedAnyData && (!record.ws || record.ws.readyState !== WebSocket.OPEN)) {
+              const promptChar = tabShell.includes('powershell') ? 'PS ' : tabShell.includes('cmd') ? '' : '$ ';
+              const cwdDisplay = (cwd || 'E:/code/jeikcode').replace(/\\/g, '/');
+              record.term.write(`\r\n\x1b[32m[JeikCode Terminal - ${tabShell}]\x1b[0m\r\n${promptChar}${cwdDisplay}> `);
+            }
+          }, 800);
+        };
       } catch {}
     },
     [cwd]
@@ -825,7 +849,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
             try { record.term.dispose(); } catch {}
           }
           termMap.current.clear();
-          const newId = `term_init_${Date.now().toString(36)}`;
+          const newId = stableDefaultId;
           const newTab: TerminalTab = {
             id: newId,
             name: `${preferredShell} 1`,
@@ -859,6 +883,23 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     window.addEventListener('jeikcode:terminal:remote_updated', handleRemoteUpdate);
     return () => {
       window.removeEventListener('jeikcode:terminal:remote_updated', handleRemoteUpdate);
+    };
+  }, [cwd, syncWithBackend]);
+
+  // 建立同一浏览器各标签页之间的即时广播通道 (0ms 无网络延迟本地同步)
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('jeikcode:terminal:sync');
+    channel.onmessage = (e) => {
+      const msgCwd = e.data?.cwd;
+      const normCur = (cwd || '').replace(/\\/g, '/').toLowerCase();
+      const normEvt = (msgCwd || '').replace(/\\/g, '/').toLowerCase();
+      if (!normEvt || !normCur || normCur === normEvt || normCur.includes(normEvt) || normEvt.includes(normCur)) {
+        void syncWithBackend();
+      }
+    };
+    return () => {
+      try { channel.close(); } catch {}
     };
   }, [cwd, syncWithBackend]);
 
@@ -931,8 +972,6 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
   const executeCommand = async (cmdText: string) => {
     if (!cmdText.trim() || !activeTab) return;
     const record = termMap.current.get(activeTab.id);
-    // 将多行或单行中的所有换行统一转换为终端标准回车符 \r，并在末尾强制追加 \r，
-    // 确保发送到终端后立即替用户自动按下回车执行，不再停留在提示符等待用户手动敲回车
     const trimmed = cmdText.trimEnd();
     const normalized = trimmed.replace(/\r?\n/g, '\r') + '\r';
     if (record && record.ws && record.ws.readyState === WebSocket.OPEN) {
@@ -942,6 +981,17 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
           record.term?.focus();
         } catch {}
       }, 50);
+    } else {
+      // 降级支持：通过 /terminal/input REST 接口直接向常驻会话投递
+      try {
+        if (record?.term) {
+          record.term.write(`\r\n${cmdText.trim()}\r\n`);
+        }
+        const res = await sendTerminalInput(activeTab.id, cmdText);
+        if (res.success && res.output && record?.term) {
+          record.term.write(res.output.replace(/\r?\n/g, '\r\n'));
+        }
+      } catch {}
     }
   };
 
@@ -977,6 +1027,13 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     const remaining = tabs.filter((t) => t.id !== tabId);
     setTabs(remaining);
     void closeTerminalSession(tabId);
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        const bc = new BroadcastChannel('jeikcode:terminal:sync');
+        bc.postMessage({ type: 'sync', cwd });
+        bc.close();
+      }
+    } catch {}
     if (activeTabId === tabId) {
       setActiveTabId(remaining[remaining.length - 1]!.id);
     }
@@ -1009,7 +1066,33 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
   };
 
   return (
-    <div class="terminal-panel-root" ref={panelRootRef}>
+    <div
+      class="terminal-panel-root"
+      ref={panelRootRef}
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (e.dataTransfer) {
+          e.dataTransfer.dropEffect = 'copy';
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        try {
+          const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+          const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+          const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+          if (targetPath && typeof targetPath === 'string') {
+            const formatted = targetPath.includes(' ') ? `"${targetPath}"` : targetPath;
+            const activeRecord = termMap.current.get(activeTabId);
+            if (activeRecord?.ws && activeRecord.ws.readyState === WebSocket.OPEN) {
+              activeRecord.ws.send(formatted);
+            } else if (scratchpadOpen) {
+              setScratchpadText((prev) => (prev ? `${prev} ${formatted}` : formatted));
+            }
+          }
+        } catch {}
+      }}
+    >
       {/* 顶部多终端标签栏 */}
       <div class="terminal-tabs-bar">
         <div

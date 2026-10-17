@@ -255,12 +255,23 @@ pub async fn require_webui_token(
     let x_api_key = req.headers().get("x-api-key").and_then(|h| h.to_str().ok());
     let api_key = req.headers().get("api-key").and_then(|h| h.to_str().ok());
     let cookie = req.headers().get(COOKIE).and_then(|h| h.to_str().ok());
+    let query_token = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let mut parts = pair.split('=');
+            if parts.next()? == "token" {
+                parts.next().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    });
     // Read THIS instance's port-scoped cookie name so a sibling `/webui` on a
     // different localhost port (which shares the cookie jar) can't shadow us.
     let token = token_from_header(header)
         .or_else(|| token_from_x_api_key_header(x_api_key))
         .or_else(|| token_from_api_key_header(api_key))
-        .or_else(|| token_from_cookie(cookie, &state.webui_cookie_name));
+        .or_else(|| token_from_cookie(cookie, &state.webui_cookie_name))
+        .or_else(|| query_token);
     match token {
         Some(tok) if state.webui_tokens.is_valid(&tok) => next.run(req).await,
         _ => unauthorized_payload().into_response(),

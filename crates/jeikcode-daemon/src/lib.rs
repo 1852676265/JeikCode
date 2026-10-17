@@ -27,12 +27,14 @@ fn _isolate_jeikcode_home() {
 
 mod api_config;
 mod api_git;
+pub mod api_git_webhook;
 mod api_provider;
 mod api_update;
 pub mod approval_mode;
 mod commands;
 mod compat_api;
 mod fs_upload;
+pub mod git_adapter;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
 pub mod live_hub;
@@ -66,7 +68,10 @@ pub mod webui;
 pub(crate) use telemetry_scope::daemon_scope;
 
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{
+        ws::{Message, WebSocketUpgrade},
+        DefaultBodyLimit, Path, Query, State,
+    },
     http::{header, request::Parts as RequestParts, HeaderName, HeaderValue, Method, StatusCode},
     response::{sse::Sse, IntoResponse, Json},
     routing::{get, post},
@@ -2665,6 +2670,52 @@ impl AppState {
     pub fn is_token_enforced(&self) -> bool {
         self.enforce_token
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 检查指定会话当前是否处于活动运行中（如第一轮审查正在执行中）
+    pub async fn is_session_active(&self, session_id: &str) -> bool {
+        self.active_chats
+            .active_session_ids()
+            .await
+            .iter()
+            .any(|id| id == session_id)
+    }
+
+    /// 将新消息安全存入目标会话的代发卡片队列，并自动触发总线向前后端广播 QueueUpdated 事件
+    pub async fn push_to_session_queue(&self, session_id: &str, text: &str) {
+        let sid = session_id.trim().to_string();
+        if sid.is_empty() {
+            return;
+        }
+        let map = get_session_queues_map().await;
+        let mut writer = map.write().await;
+        let list = writer.entry(sid.clone()).or_default();
+        list.push(QueuedMessageItem {
+            id: serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+            text: text.to_string(),
+            images: None,
+            kind: "queue".to_string(),
+            approval_mode: None,
+        });
+        let cloned_list = list.clone();
+        if let Some(path) = session_queue_file_path(&sid) {
+            if let Ok(json_str) = serde_json::to_string_pretty(&cloned_list) {
+                let _ = tokio::fs::write(path, json_str).await;
+            }
+        }
+        let value_items: Vec<serde_json::Value> = cloned_list
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap_or_default())
+            .collect();
+        self.active_chats
+            .broadcast_to_session(
+                &sid,
+                ChatEvent::QueueUpdated {
+                    session_id: sid.clone(),
+                    items: value_items,
+                },
+            )
+            .await;
     }
 }
 
@@ -9702,9 +9753,49 @@ struct FsActionPayload {
     new_name: Option<String>,
 }
 
-async fn fs_action_handler(Json(req): Json<FsActionPayload>) -> impl IntoResponse {
-    let p = std::path::PathBuf::from(req.path.trim());
+async fn fs_action_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FsActionPayload>,
+) -> impl IntoResponse {
+    let raw = req.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        p = state.bind_working_dir.join(raw);
+    }
     match req.action.as_str() {
+        "create_file" | "create" => {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+            {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "File created" })),
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Already exists" })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                ),
+            }
+        }
+        "create_folder" | "mkdir" => match std::fs::create_dir_all(&p) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": true, "message": "Folder created" })),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+            ),
+        },
         "rename" => {
             let Some(new_name) = req
                 .new_name
@@ -9765,6 +9856,668 @@ async fn fs_action_handler(Json(req): Json<FsActionPayload>) -> impl IntoRespons
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct FsTreeQuery {
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FsEntryDto {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_ignored: bool,
+}
+
+async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) -> impl IntoResponse {
+    let req_path = q.path.as_deref().unwrap_or("").trim();
+    let abs_dir = if req_path.is_empty() || req_path == "." {
+        state.bind_working_dir.clone()
+    } else {
+        let p = std::path::PathBuf::from(req_path);
+        if p.is_absolute() {
+            p
+        } else {
+            state.bind_working_dir.join(p)
+        }
+    };
+    let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
+    let abs_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&abs_dir);
+
+    if !abs_dir.exists() || !abs_dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "path": abs_dir.to_string_lossy().replace('\\', "/"),
+                "entries": [],
+                "dirs": [],
+                "files": [],
+                "error": "Directory not found"
+            })),
+        );
+    }
+
+    let mut entries_res: Vec<FsEntryDto> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+
+    if let Ok(read_dir) = std::fs::read_dir(&abs_dir) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git" {
+                continue;
+            }
+            let file_type = entry.file_type();
+            let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+            let full_p = abs_dir.join(&name).to_string_lossy().replace('\\', "/");
+            let is_ignored = name == "target"
+                || name == "node_modules"
+                || name == "dist"
+                || name.starts_with('.');
+
+            if is_dir {
+                dirs.push(name.clone());
+            } else {
+                files.push(name.clone());
+            }
+
+            entries_res.push(FsEntryDto {
+                name,
+                path: full_p,
+                is_dir,
+                is_ignored,
+            });
+        }
+    }
+
+    entries_res.sort_by(|a, b| {
+        if a.is_dir == b.is_dir {
+            a.name.cmp(&b.name)
+        } else if a.is_dir {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+    dirs.sort();
+    files.sort();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "path": abs_dir.to_string_lossy().replace('\\', "/"),
+            "entries": entries_res,
+            "dirs": dirs,
+            "files": files,
+            "success": true
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct FsReadQuery {
+    path: String,
+}
+
+async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
+    let raw = q.path.trim().trim_start_matches("./");
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        let candidate = state.bind_working_dir.join(raw);
+        if candidate.exists() {
+            p = candidate;
+        } else if let Ok(cur) = std::env::current_dir() {
+            let candidate2 = cur.join(raw);
+            if candidate2.exists() {
+                p = candidate2;
+            }
+        }
+    }
+
+    let p = p.canonicalize().unwrap_or(p);
+    let p = jeikcode_capabilities::pathnorm::strip_verbatim_path(&p);
+
+    if !p.exists() || !p.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "path": q.path,
+                "content": "",
+                "success": false,
+                "error": "File not found"
+            })),
+        );
+    }
+
+    match tokio::fs::read_to_string(&p).await {
+        Ok(content) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "path": p.to_string_lossy().replace('\\', "/"),
+                "content": content,
+                "success": true
+            })),
+        ),
+        Err(_) => match tokio::fs::read(&p).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "path": p.to_string_lossy().replace('\\', "/"),
+                    "content": String::from_utf8_lossy(&bytes).to_string(),
+                    "success": true
+                })),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "path": q.path,
+                    "content": "",
+                    "success": false,
+                    "error": format!("{e}")
+                })),
+            ),
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsWritePayload {
+    path: String,
+    content: Option<String>,
+}
+
+async fn fs_write(
+    State(state): State<AppState>,
+    Json(body): Json<FsWritePayload>,
+) -> impl IntoResponse {
+    let raw = body.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        p = state.bind_working_dir.join(raw);
+    }
+    if let Some(parent) = p.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let content = body.content.unwrap_or_default();
+    match tokio::fs::write(&p, content.as_bytes()).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "message": "File saved successfully"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("{e}")
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsSearchQuery {
+    q: String,
+    path: Option<String>,
+}
+
+async fn fs_search(
+    State(state): State<AppState>,
+    Query(q): Query<FsSearchQuery>,
+) -> impl IntoResponse {
+    let query_str = q.q.trim().to_string();
+    let root = q.path.as_deref().unwrap_or("").trim();
+    let search_dir = if root.is_empty() {
+        state.bind_working_dir.clone()
+    } else {
+        let p = std::path::PathBuf::from(root);
+        if p.is_absolute() {
+            p
+        } else {
+            state.bind_working_dir.join(p)
+        }
+    };
+
+    let results = tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        if query_str.is_empty() || !search_dir.exists() {
+            return matches;
+        }
+        let lower_query = query_str.to_lowercase();
+        fn walk_search(
+            dir: &std::path::Path,
+            q: &str,
+            matches: &mut Vec<serde_json::Value>,
+            depth: usize,
+        ) {
+            if depth > 8 || matches.len() >= 100 {
+                return;
+            }
+            let Ok(read_dir) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.')
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "dist"
+                {
+                    continue;
+                }
+                let p = entry.path();
+                if p.is_dir() {
+                    walk_search(&p, q, matches, depth + 1);
+                } else if p.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&p) {
+                        for (idx, line) in content.lines().enumerate() {
+                            if line.to_lowercase().contains(q) {
+                                let norm_p = p.to_string_lossy().replace('\\', "/");
+                                matches.push(serde_json::json!({
+                                    "file": norm_p,
+                                    "line": idx + 1,
+                                    "content": line.trim(),
+                                }));
+                                if matches.len() >= 100 {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk_search(&search_dir, &lower_query, &mut matches, 0);
+        matches
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "query": q.q,
+        "results": results
+    }))
+}
+
+struct LiveTerminalProcess {
+    id: String,
+    cwd: String,
+    shell: String,
+    stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+    child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    buffer: Arc<tokio::sync::Mutex<String>>,
+    broadcast: tokio::sync::broadcast::Sender<String>,
+}
+
+fn live_terminal_processes() -> &'static std::sync::Mutex<HashMap<String, Arc<LiveTerminalProcess>>>
+{
+    static PROCESSES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<LiveTerminalProcess>>>,
+    > = std::sync::OnceLock::new();
+    PROCESSES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(windows)]
+fn resolve_git_bash_path() -> String {
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    let candidates = [
+        r"C:\Program Files\Git\bin\bash.exe".to_string(),
+        r"C:\Program Files\Git\usr\bin\bash.exe".to_string(),
+        r"C:\Program Files (x86)\Git\bin\bash.exe".to_string(),
+        format!(r"C:\Users\{username}\AppData\Local\Programs\Git\bin\bash.exe"),
+    ];
+    for p in &candidates {
+        if std::path::Path::new(p).exists() {
+            return p.clone();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("where").arg("bash").output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                let lower = trimmed.to_lowercase();
+                if !lower.contains("system32")
+                    && !lower.contains("windowsapps")
+                    && std::path::Path::new(trimmed).exists()
+                {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    "bash.exe".to_string()
+}
+
+async fn get_or_spawn_terminal_process(
+    term_id: &str,
+    cwd: &str,
+    shell_name: &str,
+) -> anyhow::Result<Arc<LiveTerminalProcess>> {
+    let existing = {
+        let guard = live_terminal_processes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.get(term_id).cloned()
+    };
+    if let Some(proc) = existing {
+        let mut child_guard = proc.child.lock().await;
+        if let Ok(None) = child_guard.try_wait() {
+            return Ok(proc.clone());
+        }
+    }
+
+    let target_cwd = if cwd.is_empty() || cwd == "." {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string()
+    } else {
+        cwd.to_string()
+    };
+
+    let shell = shell_name.to_lowercase();
+    #[cfg(windows)]
+    let (bin, args, envs): (String, Vec<String>, Vec<(String, String)>) = if shell.contains("cmd") {
+        ("cmd.exe".to_string(), vec!["/K".to_string()], vec![])
+    } else if shell.contains("git")
+        || shell.contains("gitbash")
+        || (shell.contains("bash") && !shell.contains("wsl"))
+    {
+        (
+            resolve_git_bash_path(),
+            vec!["--login".to_string(), "-i".to_string()],
+            vec![
+                ("MSYSTEM".to_string(), "MINGW64".to_string()),
+                ("CHERE_INVOKING".to_string(), "1".to_string()),
+            ],
+        )
+    } else if shell.contains("wsl") {
+        (
+            "wsl.exe".to_string(),
+            vec!["--cd".to_string(), target_cwd.clone()],
+            vec![],
+        )
+    } else {
+        (
+            "powershell.exe".to_string(),
+            vec![
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                "-".to_string(),
+            ],
+            vec![],
+        )
+    };
+
+    #[cfg(not(windows))]
+    let (bin, args, envs): (String, Vec<String>, Vec<(String, String)>) = if shell.contains("zsh") {
+        (
+            "zsh".to_string(),
+            vec!["-l".to_string(), "-i".to_string()],
+            vec![],
+        )
+    } else if shell.contains("sh") && !shell.contains("bash") {
+        ("sh".to_string(), vec!["-i".to_string()], vec![])
+    } else {
+        (
+            "bash".to_string(),
+            vec!["-l".to_string(), "-i".to_string()],
+            vec![],
+        )
+    };
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(&args);
+    cmd.current_dir(&target_cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing stdin"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing stderr"))?;
+
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(512);
+    let buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let child_arc = Arc::new(tokio::sync::Mutex::new(child));
+    let stdin_arc = Arc::new(tokio::sync::Mutex::new(stdin));
+
+    let proc = Arc::new(LiveTerminalProcess {
+        id: term_id.to_string(),
+        cwd: target_cwd.clone(),
+        shell: shell_name.to_string(),
+        stdin: stdin_arc,
+        child: child_arc.clone(),
+        buffer: buffer.clone(),
+        broadcast: broadcast_tx.clone(),
+    });
+
+    let tx_out = broadcast_tx.clone();
+    let buf_out = buffer.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&chunk[..n]).to_string();
+                    {
+                        let mut g = buf_out.lock().await;
+                        if g.len() > 256 * 1024 {
+                            let excess = g.len() - 128 * 1024;
+                            g.drain(..excess);
+                        }
+                        g.push_str(&text);
+                    }
+                    let _ = tx_out.send(text);
+                }
+            }
+        }
+    });
+
+    let tx_err = broadcast_tx.clone();
+    let buf_err = buffer.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&chunk[..n]).to_string();
+                    {
+                        let mut g = buf_err.lock().await;
+                        if g.len() > 256 * 1024 {
+                            let excess = g.len() - 128 * 1024;
+                            g.drain(..excess);
+                        }
+                        g.push_str(&text);
+                    }
+                    let _ = tx_err.send(text);
+                }
+            }
+        }
+    });
+
+    {
+        let mut guard = live_terminal_processes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(term_id.to_string(), proc.clone());
+    }
+
+    let child_wait = child_arc.clone();
+    let term_id_reap = term_id.to_string();
+    let cwd_reap = target_cwd.clone();
+    tokio::spawn(async move {
+        let mut child_guard = child_wait.lock().await;
+        let _ = child_guard.wait().await;
+        drop(child_guard);
+        {
+            let mut guard = live_terminal_processes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.remove(&term_id_reap);
+        }
+        {
+            let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&term_id_reap);
+        }
+        publish_global(GlobalWireEvent::TerminalUpdated { cwd: cwd_reap });
+    });
+
+    // 同步登记至 daemon_terminals 以供 /terminal/list 查询
+    {
+        let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+        let count = guard.len() + 1;
+        let name = format!("{shell_name} {count}");
+        guard.insert(
+            term_id.to_string(),
+            DaemonTerminalItem {
+                id: term_id.to_string(),
+                name,
+                cwd: target_cwd.clone(),
+                shell: shell_name.to_string(),
+                history: vec![],
+                timestamp: now_unix_ms(),
+            },
+        );
+    }
+
+    Ok(proc)
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalWsQuery {
+    id: Option<String>,
+    cwd: Option<String>,
+    shell: Option<String>,
+    #[allow(dead_code)]
+    cols: Option<u16>,
+    #[allow(dead_code)]
+    rows: Option<u16>,
+}
+
+async fn terminal_ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<TerminalWsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_terminal_socket(socket, q, state))
+}
+
+async fn handle_terminal_socket(
+    socket: axum::extract::ws::WebSocket,
+    q: TerminalWsQuery,
+    state: AppState,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::AsyncWriteExt;
+
+    let term_id = q.id.unwrap_or_else(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("term_{}", now.as_millis())
+    });
+    let cwd = q
+        .cwd
+        .unwrap_or_else(|| state.bind_working_dir.to_string_lossy().to_string());
+    let shell = q.shell.unwrap_or_else(|| {
+        if cfg!(windows) {
+            "powershell".to_string()
+        } else {
+            "bash".to_string()
+        }
+    });
+
+    let proc = match get_or_spawn_terminal_process(&term_id, &cwd, &shell).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("failed to spawn terminal: {e}");
+            return;
+        }
+    };
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // 1. 发送该会话累计的历史输出（重连/刷新恢复）
+    let history = {
+        let g = proc.buffer.lock().await;
+        g.clone()
+    };
+    if !history.is_empty() {
+        if ws_sender.send(Message::Text(history)).await.is_err() {
+            return;
+        }
+    }
+
+    let mut rx = proc.broadcast.subscribe();
+
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(text) = rx.recv().await {
+            if ws_sender.send(Message::Text(text)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let stdin_clone = proc.stdin.clone();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if text.starts_with("{\"resize\":") {
+                        continue;
+                    }
+                    let mut g = stdin_clone.lock().await;
+                    let _ = g.write_all(text.as_bytes()).await;
+                    let _ = g.flush().await;
+                }
+                Message::Binary(bin) => {
+                    let mut g = stdin_clone.lock().await;
+                    let _ = g.write_all(&bin).await;
+                    let _ = g.flush().await;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonTerminalItem {
     pub id: String,
@@ -9788,7 +10541,13 @@ struct TerminalCreatePayload {
 }
 
 async fn terminal_create(Json(req): Json<TerminalCreatePayload>) -> impl IntoResponse {
-    let shell = req.shell.unwrap_or_else(|| "powershell".to_string());
+    let shell = req.shell.unwrap_or_else(|| {
+        if cfg!(windows) {
+            "powershell".to_string()
+        } else {
+            "bash".to_string()
+        }
+    });
     let cwd = req.cwd.unwrap_or_else(|| ".".to_string());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9869,8 +10628,20 @@ struct TerminalClosePayload {
 async fn terminal_close(Json(req): Json<TerminalClosePayload>) -> impl IntoResponse {
     let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
     let removed = guard.remove(&req.terminal_id);
-    if let Some(item) = removed {
-        publish_global(GlobalWireEvent::TerminalUpdated { cwd: item.cwd });
+    let cwd = removed
+        .map(|item| item.cwd)
+        .unwrap_or_else(|| ".".to_string());
+    publish_global(GlobalWireEvent::TerminalUpdated { cwd });
+    {
+        let mut proc_guard = live_terminal_processes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(proc) = proc_guard.remove(&req.terminal_id) {
+            tokio::spawn(async move {
+                let mut child = proc.child.lock().await;
+                let _ = child.kill().await;
+            });
+        }
     }
     Json(serde_json::json!({ "success": true }))
 }
@@ -9882,6 +10653,7 @@ struct TerminalInputPayload {
 }
 
 async fn terminal_input(Json(req): Json<TerminalInputPayload>) -> impl IntoResponse {
+    use tokio::io::AsyncWriteExt;
     let input = req.input.trim().to_string();
     if input.is_empty() || input == "\x03" {
         let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
@@ -9889,6 +10661,26 @@ async fn terminal_input(Json(req): Json<TerminalInputPayload>) -> impl IntoRespo
             t.history.push("^C".to_string());
         }
         return Json(serde_json::json!({ "success": true, "output": "^C\r\n" }));
+    }
+
+    // 优先向常驻存活的 PTY 子进程 stdin 写入
+    {
+        let proc = {
+            let guard = live_terminal_processes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.get(&req.terminal_id).cloned()
+        };
+        if let Some(proc) = proc {
+            let mut stdin = proc.stdin.lock().await;
+            let mut formatted = input.clone();
+            if !formatted.ends_with('\n') {
+                formatted.push('\n');
+            }
+            let _ = stdin.write_all(formatted.as_bytes()).await;
+            let _ = stdin.flush().await;
+            return Json(serde_json::json!({ "success": true, "output": "" }));
+        }
     }
 
     let cwd = {
@@ -11069,6 +11861,35 @@ struct WebuiHandle {
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
 
+async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
+    let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let Ok(stream) =
+        std::net::TcpStream::connect_timeout(&loopback, std::time::Duration::from_millis(30))
+    else {
+        return false;
+    };
+    drop(stream);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(600))
+        .build();
+    let Ok(client) = client else { return false };
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    if let Ok(resp) = client.get(&health_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                if text.contains("jeikcode-daemon") {
+                    let shutdown_url = format!("http://127.0.0.1:{port}/shutdown");
+                    let _ = client.post(&shutdown_url).send().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 从 `start_port` 起尝试绑定 `host`，遇 `AddrInUse` 递增端口，直到成功或试满
 /// `max_tries` 个端口。支持通配地址（0.0.0.0 / ::）双栈监听（IPv4 + IPv6）。
 /// 返回 (主监听器, 可选次级双栈监听器, 真实端口)。
@@ -11081,6 +11902,9 @@ async fn bind_scanning(
     Option<tokio::net::TcpListener>,
     u16,
 )> {
+    if start_port > 0 {
+        let _ = try_terminate_stale_daemon_on_port(start_port).await;
+    }
     let mut last_err: Option<std::io::Error> = None;
     for offset in 0..max_tries {
         let Some(port) = start_port.checked_add(offset) else {
@@ -12468,14 +13292,21 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         extra_remote: Arc::new(std::sync::Mutex::new(None)),
     };
 
-    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，
-    // 其中 `/` 把首次访问的 `?token=` 交接成 HttpOnly Cookie（见 serve_webui_index），
-    // 之后 SPA 的同源请求自动携带该 Cookie 完成鉴权。
+    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查 + 外部 Git Webhook 回调（由 HMAC 专有验签保护）。
     let public = Router::new()
         // Health check
         .route("/health", get(health))
         // Toast click. The protocol script has no cookie; the body secret is checked.
         .route("/notify-focus", post(post_notify_focus))
+        // 外部 Git Webhook 入口：GitHub/GitLab 服务器推送回调（无法携带 WebUI Bearer/Cookie，由内部 HMAC 签名验签）
+        .route(
+            "/api/webhooks/git",
+            post(api_git_webhook::handle_git_webhook_api),
+        )
+        .route(
+            "/api/webhooks/github",
+            post(api_git_webhook::handle_git_webhook_api),
+        )
         // WebUI static assets + SPA fallback (Task 3/4). The `/` route
         // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the
         // fallback serves SPA routes/assets and never carries a token.
@@ -12551,10 +13382,15 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/fs/open", post(open_file_with_os))
         .route("/fs/raw", get(fs_raw_handler))
         .route("/fs/action", post(fs_action_handler))
+        .route("/fs/tree", get(fs_tree))
+        .route("/fs/read", get(fs_read))
+        .route("/fs/write", post(fs_write))
+        .route("/fs/search", get(fs_search))
         .route("/terminal/list", get(terminal_list))
         .route("/terminal/create", post(terminal_create))
         .route("/terminal/input", post(terminal_input))
         .route("/terminal/close", post(terminal_close))
+        .route("/terminal/ws", get(terminal_ws_handler))
         .route("/chat/queue", get(get_chat_queue).post(update_chat_queue))
         .route(
             "/chat/steer",
@@ -12640,7 +13476,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/skills", get(get_skills))
         .route("/api/skills", get(get_skills))
         // Filesystem API
-        .route("/fs/list", get(fs_list))
+        .route("/fs/list", get(fs_tree))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/pick_dir", post(fs_pick_dir))
         .route(
@@ -12664,6 +13500,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/git/fetch", post(api_git::git_fetch))
         .route("/git/action", post(api_git::git_action))
         .route("/git/working-diff", get(api_git::get_git_working_diff))
+        // Git Webhook 内部绑定配置管理 API（受 WebUI 登录 Token 保护）
+        .route(
+            "/api/git/binding",
+            get(api_git_webhook::get_git_binding_api).post(api_git_webhook::save_git_binding_api),
+        )
         // MCP API
         .route("/mcp", get(mcp_status))
         .route("/mcp/status", get(mcp_status))

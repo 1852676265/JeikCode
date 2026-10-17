@@ -10,6 +10,7 @@ import { Markdown, highlightHtml } from './Markdown';
 import { showToast } from './Toast';
 import { highlightCode, formatCodeContent } from '../lib/codeHighlight';
 import { changeEditorFontSize } from '../lib/pageZoom';
+import { getCachedFileContent, saveCachedFileContent } from '../lib/sessionCache';
 import { useT } from '../settings';
 
 export interface CodeEditorTabProps {
@@ -427,6 +428,17 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
       setLoading(false);
       return;
     }
+
+    // 优先从 L1/L2 IndexedDB 异步直出已缓存内容（1~2ms），杜绝白屏等待与加载中闪烁
+    void getCachedFileContent(filePath).then((cached) => {
+      if (!cancelled && cached !== null) {
+        setContent(cached);
+        historyRef.current = [{ text: cached, cursor: 0 }];
+        historyIndexRef.current = 0;
+        setLoading(false);
+      }
+    });
+
     setLoading(true);
     fetchFsRead(filePath)
       .then((res) => {
@@ -436,6 +448,7 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
           historyRef.current = [{ text: loaded, cursor: 0 }];
           historyIndexRef.current = 0;
           setIsDirty(false);
+          void saveCachedFileContent(filePath, loaded);
         }
       })
       .catch((err) => {
@@ -458,6 +471,7 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
     try {
       await fetchFsWrite(filePath, content);
       setIsDirty(false);
+      void saveCachedFileContent(filePath, content);
       showToast(t('editor.saveSuccess', { name: fileName }), 'success');
     } catch (err: any) {
       showToast(t('editor.saveFailed', { error: err?.message || String(err) }), 'error');

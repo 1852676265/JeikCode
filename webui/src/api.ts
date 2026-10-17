@@ -2847,5 +2847,23 @@ export async function sendTerminalInput(
   return resp.json();
 }
 
+export async function getGitBinding(projectHash: string): Promise<any> {
+  const resp = await apiFetch(`/api/git/binding?project_hash=${encodeURIComponent(projectHash)}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) return null;
+  return resp.json();
+}
+
+export async function saveGitBinding(config: any): Promise<{ success: boolean }> {
+  const resp = await apiFetch('/api/git/binding', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(config),
+  });
+  if (!resp.ok) return { success: false };
+  return resp.json();
+}
+
 
 
