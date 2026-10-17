@@ -4636,15 +4636,15 @@ body {
 .markdown-root hr { border: none; border-top: 1px solid var(--app-primary-border-color); margin: 0.6em 0; }
 .markdown-root :not(pre) > code,
 .markdown-root code:not(pre code) {
-  font-family: Consolas, 'SFMono-Regular', 'Liberation Mono', Menlo, Courier, monospace !important;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace !important;
   word-break: break-word;
-  border-radius: 4px;
-  padding: 2px 6px;
+  border-radius: 5px;
+  padding: 0.18em 0.42em;
   font-size: 0.88em;
-  font-weight: 550;
-  background: rgba(245, 158, 11, 0.12) !important;
-  color: #fbbf24 !important;
-  border: 1px solid rgba(245, 158, 11, 0.3) !important;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.09) !important;
+  color: #f3f4f6 !important;
+  border: none !important;
 }
 .markdown-root pre,
 .markdown-root pre code,
@@ -14014,10 +14014,10 @@ body {
    ========================================================================== */
 :root[data-theme='light'] .markdown-root :not(pre) > code,
 :root[data-theme='light'] .markdown-root code:not(pre code) {
-  color: #9a3412 !important;
-  background: #fff7ed !important;
-  border: 1px solid #fed7aa !important;
-  font-weight: 550;
+  color: #0f172a !important;
+  background: rgba(15, 23, 42, 0.07) !important;
+  border: none !important;
+  font-weight: 600;
 }
 :root[data-theme='light'] .markdown-root blockquote {
   background: #f0f7ff !important;
