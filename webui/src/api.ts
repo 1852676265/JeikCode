@@ -2771,6 +2771,25 @@ export interface FsSearchResult {
   matches?: [number, number][];
 }
 
+export interface FsLocateItem {
+  name: string;
+  path: string;
+  rel_path: string;
+  is_dir: boolean;
+}
+
+export async function fetchFsLocate(q: string, path?: string): Promise<{ query: string; results: FsLocateItem[] }> {
+  const params = new URLSearchParams({ q });
+  if (path) params.set('path', path);
+  const resp = await apiFetch(`/fs/locate?${params.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    return { query: q, results: [] };
+  }
+  return resp.json();
+}
+
 export async function fetchFsSearch(q: string, path?: string): Promise<{ query: string; results: FsSearchResult[] }> {
   const params = new URLSearchParams({ q });
   if (path) params.set('path', path);

@@ -2547,7 +2547,8 @@ export function Chat({
         }
         historyOffsetBySessionRef.current.set(prevId, historyOffsetRef.current);
         historyTotalBySessionRef.current.set(prevId, historyTotalRef.current);
-        hasOlderBySessionRef.current.set(prevId, hasOlder);
+        const prevHasOlder = historyOffsetRef.current > 0 || hasOlder;
+        hasOlderBySessionRef.current.set(prevId, prevHasOlder);
       }
       const detachedController = abortRef.current;
       // Prefer the ref: disk settlement writes it immediately, while React
@@ -2803,7 +2804,7 @@ export function Chat({
       const cachedOffset = sessionId ? (historyOffsetBySessionRef.current.get(sessionId) ?? 0) : 0;
       const cachedTotal = sessionId ? (historyTotalBySessionRef.current.get(sessionId) ?? 0) : 0;
       const cachedHasOlder = sessionId
-        ? (hasOlderBySessionRef.current.get(sessionId) ?? (cachedOffset > 0))
+        ? (cachedOffset > 0 || (hasOlderBySessionRef.current.get(sessionId) === true))
         : false;
       setHasOlder(cachedHasOlder);
       setLoadingOlder(false);
@@ -2873,7 +2874,10 @@ export function Chat({
 
       const savedOffset = historyOffsetBySessionRef.current.get(sessionId) ?? 0;
       const savedTotal = historyTotalBySessionRef.current.get(sessionId) ?? 0;
-      const savedHasOlder = hasOlderBySessionRef.current.get(sessionId) ?? (savedOffset > 0);
+      const savedHasOlder =
+        savedOffset > 0 ||
+        (hasOlderBySessionRef.current.get(sessionId) === true) ||
+        (activeSession?.id === sessionId && (activeSession.message_count ?? 0) > cached.length);
       historyOffsetRef.current = savedOffset;
       historyTotalRef.current = savedTotal;
       setHasOlder(savedHasOlder);
@@ -2917,6 +2921,16 @@ export function Chat({
               return;
             }
             if (res && Array.isArray(res.messages)) {
+              const diskOffset = res.offset ?? 0;
+              const diskTotal = res.message_count ?? (res.messages.length + diskOffset);
+              const olderExists = diskOffset > 0;
+              historyOffsetRef.current = diskOffset;
+              historyTotalRef.current = diskTotal;
+              setHasOlder(olderExists);
+              historyOffsetBySessionRef.current.set(sessionId, diskOffset);
+              historyTotalBySessionRef.current.set(sessionId, diskTotal);
+              hasOlderBySessionRef.current.set(sessionId, olderExists);
+
               const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0);
               const lastCur = messagesRef.current[messagesRef.current.length - 1];
               const lastLoaded = loaded[loaded.length - 1];
@@ -2946,6 +2960,8 @@ export function Chat({
                   undefined,
                   res.turns,
                   res.token_usage,
+                  diskOffset,
+                  diskTotal,
                 );
                 if (scrollRef.current && atBottomRef.current) {
                   scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -2997,6 +3013,17 @@ export function Chat({
           if (idb.turns && idb.turns.length > 0) {
             turnOutlineBySessionRef.current.set(loadId, idb.turns);
             setTurnOutline(idb.turns);
+          }
+          if (idb.historyOffset !== undefined) {
+            const diskOffset = idb.historyOffset;
+            const diskTotal = idb.historyTotal ?? (idb.messages.length + diskOffset);
+            const olderExists = diskOffset > 0;
+            historyOffsetRef.current = diskOffset;
+            historyTotalRef.current = diskTotal;
+            setHasOlder(olderExists);
+            historyOffsetBySessionRef.current.set(loadId, diskOffset);
+            historyTotalBySessionRef.current.set(loadId, diskTotal);
+            hasOlderBySessionRef.current.set(loadId, olderExists);
           }
           if (idb.todos && idb.todos.length > 0 && idb.todos.some((t: any) => t.status !== 'completed')) {
             applySessionStickyTodos(loadId, idb.todos);
@@ -3085,7 +3112,17 @@ export function Chat({
             }
             // 运行中的会话磁盘尚未落盘本轮未结消息，绝不能用落后磁盘历史覆盖缓存！
             if (serverActive === false) {
-              void saveSessionCache(projectHash, loadId, loaded, sessionResult.value.todos, undefined, sessionResult.value.turns, sessionResult.value.token_usage);
+              void saveSessionCache(
+                projectHash,
+                loadId,
+                loaded,
+                sessionResult.value.todos,
+                undefined,
+                sessionResult.value.turns,
+                sessionResult.value.token_usage,
+                diskOffset,
+                totalOnDisk,
+              );
             }
             let displayMessages: Message[] = currentCached && currentCached.length > 0 ? currentCached : loaded;
 
@@ -3141,17 +3178,13 @@ export function Chat({
                   setMessages(currentCached);
                   timelineFollow.jump();
                 }
-                if (currentCached.length >= totalOnDisk) {
-                  historyOffsetRef.current = 0;
-                  setHasOlder(false);
-                  historyOffsetBySessionRef.current.set(loadId, 0);
-                  hasOlderBySessionRef.current.set(loadId, false);
-                } else {
-                  historyOffsetRef.current = diskOffset;
-                  setHasOlder(olderExists);
-                  historyOffsetBySessionRef.current.set(loadId, diskOffset);
-                  hasOlderBySessionRef.current.set(loadId, olderExists);
-                }
+                const effectiveOlder = diskOffset > 0;
+                historyOffsetRef.current = diskOffset;
+                historyTotalRef.current = totalOnDisk;
+                setHasOlder(effectiveOlder);
+                historyOffsetBySessionRef.current.set(loadId, diskOffset);
+                historyTotalBySessionRef.current.set(loadId, totalOnDisk);
+                hasOlderBySessionRef.current.set(loadId, effectiveOlder);
               }
             } else if (loaded.length > 0) {
               // 无痕模式首开或新会话首次进入：无本地缓存，一次性直接渲染磁盘加载内容，无任何闪烁
@@ -4738,6 +4771,19 @@ export function Chat({
         const next = [...older, ...prev];
         messagesRef.current = next;
         messageCacheRef.current.set(id, next);
+        if (projectHash) {
+          void saveSessionCache(
+            projectHash,
+            id,
+            next,
+            undefined,
+            undefined,
+            detail.turns,
+            undefined,
+            newOffset,
+            newTotal,
+          );
+        }
         return next;
       });
       requestAnimationFrame(() => {

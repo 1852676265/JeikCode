@@ -11,6 +11,8 @@ export interface CachedSessionData {
   todos?: any[] | null;
   turns?: any[] | null;
   tokenUsage?: any | null;
+  historyOffset?: number;
+  historyTotal?: number;
   timestamp: number;
   mtime_ms?: number;
 }
@@ -147,6 +149,8 @@ export async function saveSessionCache(
   mtime_ms?: number,
   turns?: any[] | null,
   tokenUsage?: any | null,
+  historyOffset?: number,
+  historyTotal?: number,
 ): Promise<void> {
   const data: CachedSessionData = {
     sessionId,
@@ -155,6 +159,8 @@ export async function saveSessionCache(
     todos: todos ?? undefined,
     turns: turns ?? undefined,
     tokenUsage: tokenUsage ?? undefined,
+    historyOffset,
+    historyTotal,
     timestamp: Date.now(),
     mtime_ms,
   };

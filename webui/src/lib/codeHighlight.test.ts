@@ -33,3 +33,20 @@ test('formatCodeContent trims trailing spaces and normalizes code', () => {
   assert.ok(!formatted.includes('   \n'));
   assert.ok(formatted.endsWith('\n'));
 });
+
+test('highlightCode highlights Kotlin syntax and keywords', () => {
+  const ktCode = 'package com.example\nfun main(args: Array<String>) {\n  val x = 123\n}';
+  const html = highlightCode(ktCode, 'JeikCodeChatPanel.kt');
+  assert.ok(html.includes('class="hl-keyword"'));
+  assert.ok(html.includes('fun'));
+  assert.ok(html.includes('val'));
+  assert.ok(html.includes('class="hl-bracket'));
+});
+
+test('highlightCode parses rainbow brackets and structure for txt files', () => {
+  const txtContent = 'Section 1: [Important Item] {priority: 1}';
+  const html = highlightCode(txtContent, 'notes.txt');
+  assert.ok(html.includes('class="hl-bracket'));
+  assert.ok(html.includes('['));
+  assert.ok(html.includes('{'));
+});

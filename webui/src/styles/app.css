@@ -12625,6 +12625,77 @@ body {
   overflow-x: hidden;
   padding: 4px 0;
 }
+
+/* 高性能文件/路径搜索定位列表 */
+.file-locate-list {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 0 16px;
+}
+
+.file-locate-summary {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #64748b);
+  padding: 4px 10px 6px;
+  border-bottom: 1px solid var(--app-primary-border-color, rgba(255, 255, 255, 0.08));
+  user-select: none;
+}
+
+.file-locate-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  margin: 1px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s ease;
+  user-select: none;
+}
+
+.file-locate-row:hover {
+  background: var(--app-list-hover-background, rgba(255, 255, 255, 0.08));
+}
+
+.file-locate-row.selected {
+  background: var(--app-list-active-background, rgba(59, 130, 246, 0.22)) !important;
+  outline: 1px solid var(--app-brand, #3b82f6);
+}
+
+.file-locate-name {
+  font-weight: 550;
+  font-size: 12.5px;
+  color: var(--app-primary-foreground, #f8fafc);
+  white-space: nowrap;
+}
+
+.file-locate-relpath {
+  font-size: 11px;
+  color: var(--app-secondary-foreground, #64748b);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.file-locate-badge {
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--app-secondary-foreground, #94a3b8);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+:root[data-theme='light'] .file-locate-name {
+  color: #0f172a;
+}
+:root[data-theme='light'] .file-locate-badge {
+  background: rgba(15, 23, 42, 0.07);
+  color: #64748b;
+}
+
 .file-tree-row {
   display: flex;
   align-items: center;

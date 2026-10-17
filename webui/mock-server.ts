@@ -1545,6 +1545,45 @@ export function mockApiPlugin(): Plugin {
           return sendJson({ success: false, error: 'Path not found' }, 404);
         }
 
+        // FS Locate (File & Directory name / path locate)
+        if (pathname === '/fs/locate') {
+          const q = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
+          const sampleResults = [
+            {
+              name: 'JeikCodeChatPanel.kt',
+              path: 'extensions/jetbrains/src/main/kotlin/com/jeikcode/jetbrains/ui/JeikCodeChatPanel.kt',
+              rel_path: 'extensions/jetbrains/src/main/kotlin/com/jeikcode/jetbrains/ui/JeikCodeChatPanel.kt',
+              is_dir: false,
+            },
+            {
+              name: 'GitPanel.tsx',
+              path: 'webui/src/components/GitPanel.tsx',
+              rel_path: 'webui/src/components/GitPanel.tsx',
+              is_dir: false,
+            },
+            {
+              name: 'components',
+              path: 'webui/src/components',
+              rel_path: 'webui/src/components',
+              is_dir: true,
+            },
+            {
+              name: 'README.md',
+              path: 'README.md',
+              rel_path: 'README.md',
+              is_dir: false,
+            },
+          ].filter(
+            (item) =>
+              item.name.toLowerCase().includes(q) ||
+              item.rel_path.toLowerCase().includes(q),
+          );
+          return sendJson({
+            query: q,
+            results: sampleResults,
+          });
+        }
+
         // FS Search & Replace
         if (pathname === '/fs/search') {
           const q = parsedUrl.searchParams.get('q') || '';

@@ -35,10 +35,23 @@ const KEYWORDS_PYTHON = new Set([
   'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield'
 ]);
 
+const KEYWORDS_KOTLIN = new Set([
+  'package', 'import', 'class', 'interface', 'fun', 'val', 'var', 'is', 'in',
+  'this', 'super', 'when', 'try', 'catch', 'finally', 'for', 'do', 'while',
+  'if', 'else', 'return', 'throw', 'continue', 'break', 'object', 'typeof',
+  'as', 'typealias', 'override', 'open', 'final', 'abstract', 'private',
+  'protected', 'public', 'internal', 'enum', 'sealed', 'annotation', 'data',
+  'inline', 'noinline', 'crossinline', 'reified', 'external', 'operator',
+  'infix', 'suspend', 'tailrec', 'vararg', 'field', 'it', 'by', 'constructor',
+  'init', 'companion', 'where', 'actual', 'expect', 'set', 'get', 'null',
+  'true', 'false'
+]);
+
 const KEYWORDS_ALL = new Set([
   ...KEYWORDS_JS_TS,
   ...KEYWORDS_RUST,
   ...KEYWORDS_PYTHON,
+  ...KEYWORDS_KOTLIN,
   // Java, C#, C/C++
   'public', 'private', 'protected', 'class', 'interface', 'extends', 'implements',
   'package', 'import', 'void', 'int', 'float', 'double', 'long', 'short', 'byte',
@@ -46,9 +59,12 @@ const KEYWORDS_ALL = new Set([
   'super', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
   'break', 'continue', 'try', 'catch', 'finally', 'throw', 'throws', 'namespace',
   'using', 'get', 'set', 'override', 'virtual', 'abstract', 'sealed', 'async', 'await',
+  'auto', 'constexpr', 'template', 'typename', 'nullptr', 'include', 'define',
   // Go
   'func', 'package', 'import', 'type', 'struct', 'interface', 'var', 'const', 'defer',
   'go', 'select', 'chan', 'range', 'map', 'make', 'len', 'cap', 'nil',
+  // Swift
+  'protocol', 'extension', 'guard', 'mutating',
   // PHP
   'function', 'echo', 'print', 'array', 'isset', 'empty', 'die', 'exit',
   // Shell / Bash
@@ -56,11 +72,9 @@ const KEYWORDS_ALL = new Set([
   'grep', 'find', 'curl', 'wget', 'sudo', 'chmod', 'chown', 'tar', 'unzip', 'git'
 ]);
 
-// 纯文本、清单与锁定文件集合：不应被当做代码高亮与彩虹括号误伤！
-const PLAIN_TEXT_EXTS = new Set([
-  'lock', 'txt', 'text', 'log', 'out', 'plain', 'csv', 'tsv',
-  'env', 'example', 'sample', 'ini', 'cfg', 'conf', 'list',
-  'gitignore', 'gitattributes', 'npmignore', 'dockerignore', 'editorconfig'
+// 纯结构与大型锁定文件集合：不应被当做普通编程代码误染
+const RAW_LOCK_EXTS = new Set([
+  'lock', 'out', 'bin', 'gitignore', 'gitattributes', 'npmignore', 'dockerignore'
 ]);
 
 /**
@@ -76,16 +90,18 @@ export function highlightCode(code: string, fileName: string): string {
   const ext = lowerName.split('.').pop() || '';
   const isLockFile = lowerName.endsWith('.lock') || lowerName.includes('cargo.lock') || lowerName.includes('package-lock.json') || lowerName.includes('yarn.lock') || lowerName.includes('pnpm-lock.yaml');
   const isCodeExample = (ext === 'example' || ext === 'sample') && (lowerName.includes('.json') || lowerName.includes('.js') || lowerName.includes('.ts') || lowerName.includes('.rs') || lowerName.includes('.py'));
-  const isPlainText = !isCodeExample && (isLockFile || PLAIN_TEXT_EXTS.has(ext));
+  const isRawFile = !isCodeExample && (isLockFile || RAW_LOCK_EXTS.has(ext));
 
-  // 纯文本/清单/Lock 文件直接纯净转义，杜绝伪代码关键字和彩虹括号干扰！
-  if (isPlainText) {
+  // 超大原始二进制/锁文件直接纯净转义
+  if (isRawFile) {
     return escapeHtml(code);
   }
 
   const isJson = ext === 'json' || fileName.endsWith('.json.example') || fileName.includes('.json');
   const isRust = ext === 'rs';
   const isPy = ext === 'py';
+  const isKotlin = ext === 'kt' || ext === 'kts';
+  const isPureText = ext === 'txt' || ext === 'text' || ext === 'log' || ext === 'csv';
 
   const lines = code.split('\n');
   let bracketDepth = 0;
@@ -154,7 +170,9 @@ export function highlightCode(code: string, fileName: string): string {
         const word = line.slice(i, j);
 
         let isKw = false;
-        if (isRust) isKw = KEYWORDS_RUST.has(word);
+        if (isPureText) isKw = false;
+        else if (isKotlin) isKw = KEYWORDS_KOTLIN.has(word);
+        else if (isRust) isKw = KEYWORDS_RUST.has(word);
         else if (isPy) isKw = KEYWORDS_PYTHON.has(word);
         else isKw = KEYWORDS_ALL.has(word);
 
@@ -163,10 +181,10 @@ export function highlightCode(code: string, fileName: string): string {
         } else {
           // 查看后面是否跟着括号，如果是则是函数调用
           const afterWord = line.slice(j).trimStart();
-          if (afterWord.startsWith('(')) {
+          if (!isPureText && afterWord.startsWith('(')) {
             out += `<span class="hl-function">${escapeHtml(word)}</span>`;
           } else {
-            out += `<span class="hl-variable">${escapeHtml(word)}</span>`;
+            out += isPureText ? escapeHtml(word) : `<span class="hl-variable">${escapeHtml(word)}</span>`;
           }
         }
         i = j;

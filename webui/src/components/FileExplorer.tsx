@@ -3,10 +3,12 @@ import { createPortal } from 'preact/compat';
 import {
   fetchFsTree,
   fetchFsSearch,
+  fetchFsLocate,
   revealInFileExplorer,
   fetchFsAction,
   type FsEntry,
   type FsSearchResult,
+  type FsLocateItem,
 } from '../api';
 import { useSettings } from '../settings';
 import { showToast } from './Toast';
@@ -152,6 +154,11 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
   const [filterQuery, setFilterQuery] = useState('');
   const [searchMode, setSearchMode] = useState<'tree' | 'search'>('tree');
 
+  // 高性能全项目文件/目录定位与相对路径搜索状态
+  const [locateResults, setLocateResults] = useState<FsLocateItem[]>([]);
+  const [locateLoading, setLocateLoading] = useState(false);
+  const [selectedLocateIdx, setSelectedLocateIdx] = useState(0);
+
   // VSCode 经典搜索与替换控件状态
   const [searchQuery, setSearchQuery] = useState('');
   const [replaceQuery, setReplaceQuery] = useState('');
@@ -203,6 +210,38 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
   useEffect(() => {
     saveSelectedPaths(rootPath, Array.from(selectedPaths), lastSelectedPath);
   }, [selectedPaths, lastSelectedPath, rootPath]);
+
+  // 高性能文件/目录全量索引与相对路径搜索过滤 (支持绝对/相对路径定位与文件名搜索双模)
+  useEffect(() => {
+    const q = filterQuery.trim();
+    if (!q) {
+      setLocateResults([]);
+      setLocateLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLocateLoading(true);
+    const timer = setTimeout(() => {
+      fetchFsLocate(q, rootPath)
+        .then((res) => {
+          if (!cancelled) {
+            setLocateResults(res.results || []);
+            setSelectedLocateIdx(0);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setLocateResults([]);
+        })
+        .finally(() => {
+          if (!cancelled) setLocateLoading(false);
+        });
+    }, 80);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [filterQuery, rootPath]);
 
   // 响应外部传入的激活文件路径
   useEffect(() => {
@@ -421,6 +460,51 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     setTree(nextTree);
     setCachedTree(rootPath, nextTree);
   };
+
+  const revealAndExpandToPath = useCallback(
+    async (targetPath: string, isDir: boolean) => {
+      const normTarget = targetPath.replace(/\\/g, '/');
+      const normRoot = rootPath.replace(/\\/g, '/').replace(/\/+$/, '');
+
+      // 选中目标
+      setSelectedPaths(new Set([normTarget]));
+      setLastSelectedPath(normTarget);
+
+      if (normTarget.startsWith(normRoot)) {
+        const rel = normTarget.slice(normRoot.length).replace(/^\/+/, '');
+        const segments = rel.split('/');
+        const dirSegments = isDir ? segments : segments.slice(0, -1);
+
+        const pathsToExpand = new Set(expandedPaths);
+        let curr = normRoot;
+        for (const seg of dirSegments) {
+          curr = `${curr}/${seg}`;
+          pathsToExpand.add(curr);
+        }
+        setExpandedPaths(pathsToExpand);
+        saveExpandedPaths(rootPath, pathsToExpand);
+        void refreshTree(true);
+      }
+
+      setTimeout(() => {
+        const el = containerRef.current?.querySelector(`[title*="${normTarget}"]`) as HTMLElement | null;
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, 180);
+    },
+    [rootPath, expandedPaths, refreshTree],
+  );
+
+  const handleSelectLocateItem = useCallback(
+    async (item: FsLocateItem) => {
+      if (!item.is_dir) {
+        onOpenFile?.(item.path);
+      }
+      await revealAndExpandToPath(item.path, item.is_dir);
+    },
+    [onOpenFile, revealAndExpandToPath],
+  );
 
   // 快捷键监听：仅当焦点在资源管理器范围内时，按 Ctrl+F 调出搜索，Ctrl+H 调出替换
   useEffect(() => {
@@ -783,16 +867,32 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
           </div>
         </div>
 
-        {/* 树视图下的文件名快速过滤 */}
+        {/* 树视图下的文件名快速过滤与相对路径定位 */}
         {searchMode === 'tree' && (
           <div class="file-filter-box">
             <div class="search-input-wrapper">
               <input
                 type="text"
                 class="vscode-search-field"
-                placeholder={t('explorer.filterPlaceholder') || '按名称快速过滤...'}
+                placeholder={t('explorer.filterPlaceholder') || '按名称或相对路径快速过滤定位…'}
                 value={filterQuery}
                 onInput={(e) => setFilterQuery((e.target as HTMLInputElement).value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setSelectedLocateIdx((i) => Math.min(locateResults.length - 1, i + 1));
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setSelectedLocateIdx((i) => Math.max(0, i - 1));
+                  } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (locateResults[selectedLocateIdx]) {
+                      void handleSelectLocateItem(locateResults[selectedLocateIdx]);
+                    }
+                  } else if (e.key === 'Escape') {
+                    setFilterQuery('');
+                  }
+                }}
               />
               {filterQuery && (
                 <div class="search-field-actions">
@@ -927,7 +1027,38 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       {/* 核心内容区 */}
       <div class="file-explorer-body">
         {searchMode === 'tree' ? (
-          loading ? (
+          filterQuery.trim() ? (
+            locateLoading ? (
+              <div class="file-tree-loading">
+                <span class="git-spinner" />
+                <span>正在高性能搜索与路径定位中...</span>
+              </div>
+            ) : locateResults.length > 0 ? (
+              <div class="file-locate-list">
+                <div class="file-locate-summary">
+                  <span>共找到 {locateResults.length} 个匹配项 (按 Enter 即可快速定位/打开)</span>
+                </div>
+                {locateResults.map((item, idx) => {
+                  const isSelected = idx === selectedLocateIdx;
+                  return (
+                    <div
+                      key={item.path}
+                      class={'file-locate-row' + (isSelected ? ' selected' : '')}
+                      onClick={() => void handleSelectLocateItem(item)}
+                      title={`${item.path} (点击打开并定位)`}
+                    >
+                      <span class="file-tree-icon">{getFileIcon(item.name, item.is_dir, false)}</span>
+                      <span class="file-locate-name">{item.name}</span>
+                      <span class="file-locate-relpath" title={item.rel_path}>{item.rel_path}</span>
+                      <span class="file-locate-badge">{item.is_dir ? 'DIR' : 'FILE'}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div class="file-tree-empty">未找到匹配的文件或路径</div>
+            )
+          ) : loading ? (
             <div class="file-tree-loading">
               <span class="git-spinner" />
               <span>加载文件列表中...</span>

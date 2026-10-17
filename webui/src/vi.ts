@@ -54,6 +54,8 @@ export const vi: Record<keyof typeof en, string> = {
   'preview.emptyDesc': 'Kéo tab vào đây hoặc vào biểu tượng mắt để xem trước tài liệu và mã cùng trò chuyện AI',
   'preview.refresh': 'Làm mới xem trước',
   'preview.openInEditor': 'Mở trong trình chỉnh sửa chính',
+  'preview.openInRight': 'Xem trước trên bảng bên phải',
+  'preview.openInMain': 'Mở trong trình chỉnh sửa chính',
   'preview.clickToPreview': 'Nhấp để xem trước tệp ở bên phải',
   'preview.clickToOpenExternal': 'Nhấp để mở trong trình duyệt mặc định',
   'preview.closeTab': 'Đóng tab',

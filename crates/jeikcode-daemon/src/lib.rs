@@ -10170,6 +10170,184 @@ async fn fs_search(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct FsLocateQuery {
+    q: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FsLocateItem {
+    name: String,
+    path: String,
+    rel_path: String,
+    is_dir: bool,
+}
+
+async fn fs_locate(
+    State(state): State<AppState>,
+    Query(q): Query<FsLocateQuery>,
+) -> impl IntoResponse {
+    let raw_query = q.q.trim().trim_matches('"').trim_matches('\'').trim();
+    let root = q.path.as_deref().unwrap_or("").trim();
+    let search_dir = if root.is_empty() || root == "." {
+        state.bind_working_dir.clone()
+    } else {
+        let p = std::path::PathBuf::from(root);
+        if p.is_absolute() {
+            p
+        } else {
+            state.bind_working_dir.join(p)
+        }
+    };
+    let search_dir = search_dir.canonicalize().unwrap_or(search_dir);
+    let search_dir = jeikcode_capabilities::pathnorm::strip_verbatim_path(&search_dir);
+
+    if raw_query.is_empty() || !search_dir.exists() {
+        return Json(serde_json::json!({
+            "query": q.q,
+            "results": Vec::<FsLocateItem>::new()
+        }));
+    }
+
+    let search_dir_clone = search_dir.clone();
+    let query_str = raw_query.to_string();
+
+    let results = tokio::task::spawn_blocking(move || {
+        let mut matches: Vec<FsLocateItem> = Vec::new();
+        let query_normalized = query_str.replace('\\', "/").to_lowercase();
+        let is_path_query = query_normalized.contains('/');
+
+        // 优先检查直接命中的相对路径（如 extensions/jetbrains/src/main/kotlin/com/jeikcode/jetbrains/ui/JeikCodeChatPanel.kt）
+        let direct_candidate = search_dir_clone.join(query_str.trim_start_matches("./"));
+        if direct_candidate.exists() {
+            let is_dir = direct_candidate.is_dir();
+            let norm_path = direct_candidate.to_string_lossy().replace('\\', "/");
+            let norm_base = search_dir_clone.to_string_lossy().replace('\\', "/");
+            let rel = if norm_path.starts_with(&norm_base) {
+                norm_path[norm_base.len()..]
+                    .trim_start_matches('/')
+                    .to_string()
+            } else {
+                norm_path.clone()
+            };
+            let name = direct_candidate
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            matches.push(FsLocateItem {
+                name,
+                path: norm_path,
+                rel_path: rel,
+                is_dir,
+            });
+        }
+
+        fn walk_locate(
+            base: &std::path::Path,
+            current: &std::path::Path,
+            q: &str,
+            is_path_q: bool,
+            matches: &mut Vec<FsLocateItem>,
+            depth: usize,
+        ) {
+            if depth > 16 || matches.len() >= 150 {
+                return;
+            }
+            let Ok(read_dir) = std::fs::read_dir(current) else {
+                return;
+            };
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".git"
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "dist"
+                    || name.starts_with('.')
+                {
+                    continue;
+                }
+                let file_type = entry.file_type();
+                let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+                let entry_path = entry.path();
+                let norm_path = entry_path.to_string_lossy().replace('\\', "/");
+                let norm_base = base.to_string_lossy().replace('\\', "/");
+                let rel = if norm_path.starts_with(&norm_base) {
+                    norm_path[norm_base.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    norm_path.clone()
+                };
+
+                let lower_name = name.to_lowercase();
+                let lower_rel = rel.to_lowercase();
+
+                let is_hit = if is_path_q {
+                    lower_rel.contains(q)
+                } else {
+                    lower_name.contains(q) || lower_rel.contains(q)
+                };
+
+                if is_hit && !matches.iter().any(|m| m.path == norm_path) {
+                    matches.push(FsLocateItem {
+                        name: name.clone(),
+                        path: norm_path,
+                        rel_path: rel,
+                        is_dir,
+                    });
+                    if matches.len() >= 150 {
+                        return;
+                    }
+                }
+
+                if is_dir {
+                    walk_locate(base, &entry_path, q, is_path_q, matches, depth + 1);
+                }
+            }
+        }
+
+        walk_locate(
+            &search_dir_clone,
+            &search_dir_clone,
+            &query_normalized,
+            is_path_query,
+            &mut matches,
+            0,
+        );
+
+        // 排序：精准名称匹配排前，其次前缀匹配，其次相对路径匹配
+        matches.sort_by(|a, b| {
+            let a_exact_name = a.name.to_lowercase() == query_normalized;
+            let b_exact_name = b.name.to_lowercase() == query_normalized;
+            if a_exact_name != b_exact_name {
+                return b_exact_name.cmp(&a_exact_name);
+            }
+            let a_starts = a.name.to_lowercase().starts_with(&query_normalized);
+            let b_starts = b.name.to_lowercase().starts_with(&query_normalized);
+            if a_starts != b_starts {
+                return b_starts.cmp(&a_starts);
+            }
+            let a_rel_starts = a.rel_path.to_lowercase().starts_with(&query_normalized);
+            let b_rel_starts = b.rel_path.to_lowercase().starts_with(&query_normalized);
+            if a_rel_starts != b_rel_starts {
+                return b_rel_starts.cmp(&a_rel_starts);
+            }
+            a.name.len().cmp(&b.name.len())
+        });
+
+        matches
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "query": q.q,
+        "results": results
+    }))
+}
+
 struct LiveTerminalProcess {
     id: String,
     cwd: String,
@@ -13425,6 +13603,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/fs/read", get(fs_read))
         .route("/fs/write", post(fs_write))
         .route("/fs/search", get(fs_search))
+        .route("/fs/locate", get(fs_locate))
         .route("/terminal/list", get(terminal_list))
         .route("/terminal/create", post(terminal_create))
         .route("/terminal/input", post(terminal_input))

@@ -1,9 +1,11 @@
 import DOMPurify from 'dompurify';
-import { useMemo, useRef, useEffect } from 'preact/hooks';
+import { useMemo, useRef, useEffect, useState } from 'preact/hooks';
 import { render } from 'preact';
+import { createPortal } from 'preact/compat';
 import { markdownToHtml } from '../lib/markdownRender';
 import { MermaidDiagram } from './MermaidDiagram';
 import { useSettings } from '../settings';
+import { showToast } from './Toast';
 
 export { preprocessMarkdown, markdownToHtml } from '../lib/markdownRender';
 
@@ -69,19 +71,30 @@ function normalizePath(rawPath: string): string {
   return (hasDrive ? '' : lineCleaned.startsWith('/') ? '/' : '') + stack.join('/');
 }
 
+const ALL_FILE_EXTS = 'kt|kts|java|c|cpp|cc|cxx|h|hpp|hxx|cs|swift|m|mm|scala|clj|cljs|rs|go|py|pyw|rb|php|pl|pm|lua|r|dart|ts|tsx|js|jsx|mjs|cjs|json|json5|jsonc|toml|yaml|yml|xml|html|htm|xhtml|css|scss|sass|less|styl|sh|bash|zsh|fish|ps1|psm1|bat|cmd|sql|prisma|proto|graphql|gql|vue|svelte|astro|md|markdown|mdx|txt|text|log|diff|patch|env|properties|ini|conf|cfg|lock|svg|png|jpg|jpeg|gif|webp|ico|bmp|avif|gradle|cmake|dockerfile|containerfile|nix';
+const EXT_REGEX = new RegExp(`\\.(${ALL_FILE_EXTS})(:\\d+)?$`, 'i');
+const ROOT_DIRS_REGEX = /^(crates|src|webui|packages|desktop|docs|scripts|extensions|functions|plans|tests|assets|public|internal|cmd|api|lib)\/[\w.\-\\/]+$/i;
+
 /**
  * 智能识别一段文本是否是项目源码/资源文件路径
  */
 export function isFilePathSnippet(text: string): boolean {
-  const t = text.trim();
-  if (t.length < 3 || t.length > 260) return false;
+  const t = text.trim().replace(/^['"`]|['"`]$/g, '');
+  if (t.length < 2 || t.length > 350) return false;
   if (t.includes(' ') || t.includes('\n') || t.includes('\t')) return false;
-  return (
-    /^[\w.\-\\/]+?\.(md|markdown|rs|ts|tsx|js|jsx|json|toml|yaml|yml|py|go|html|css|sh|bash|txt|lock|svg|png|jpg|jpeg)(:\d+)?$/i.test(t) ||
-    /^[a-zA-Z]:[\\/][\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t) ||
-    /^\/[\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t) ||
-    /^(crates|src|webui|packages|desktop|docs|scripts)\/[\w.\-\\/]+$/i.test(t)
-  );
+  if (/^(https?:|\/\/)/i.test(t) || /^www\./i.test(t)) return false;
+
+  // 1. 标准扩展名匹配 (全语言源码、脚本、配置、文本及资源)
+  if (EXT_REGEX.test(t)) return true;
+
+  // 2. 绝对路径特征
+  if (/^[a-zA-Z]:[\\/][\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t)) return true;
+  if (/^\/[\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t)) return true;
+
+  // 3. 常见工程目录层级结构
+  if (ROOT_DIRS_REGEX.test(t)) return true;
+
+  return false;
 }
 
 // 解析目标文件路径 (全面支持 Windows/POSIX 绝对路径与基于 basePath / cwd 的相对路径)
@@ -231,7 +244,7 @@ export function Markdown({
         code.setAttribute('role', 'link');
       } else if (isFilePathSnippet(text)) {
         code.classList.add('file-path-badge');
-        code.setAttribute('title', `${text} (${t('preview.clickToPreview')})`);
+        code.setAttribute('title', `${text} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`);
         code.setAttribute('tabindex', '0');
         code.setAttribute('role', 'button');
       }
@@ -369,6 +382,14 @@ export function Markdown({
         const resolved = resolveTargetFile(href, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
 
+        if (e.ctrlKey || e.metaKey || e.altKey) {
+          // 按住 Ctrl / Cmd / Alt 点击：直接在中间主编辑区打开！
+          window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
+            detail: { path: resolved }
+          }));
+          return;
+        }
+
         if (targetContext === 'right') {
           // 右侧预览区点击：在右侧标签区打开，绝不跳去中间主舞台，互不干扰！
           window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
@@ -440,13 +461,112 @@ export function Markdown({
     }
   }
 
+  const [fileBadgeMenu, setFileBadgeMenu] = useState<{
+    x: number;
+    y: number;
+    filePath: string;
+    fileName: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!fileBadgeMenu) return;
+    const close = () => setFileBadgeMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setFileBadgeMenu(null);
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('contextmenu', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('contextmenu', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [fileBadgeMenu]);
+
+  function onContextMenu(e: MouseEvent) {
+    const targetEl = e.target as HTMLElement;
+    const clickable = targetEl?.closest('.file-path-badge, .file-preview-link') as HTMLElement | null;
+    if (clickable) {
+      let href = clickable.getAttribute('href') || clickable.dataset.filePath || '';
+      if (!href && clickable.tagName?.toLowerCase() === 'code') {
+        const text = (clickable.textContent || '').trim();
+        if (isFilePathSnippet(text)) {
+          href = text;
+        }
+      }
+      if (href && !href.startsWith('#') && !/^(https?:|\/\/)/i.test(href)) {
+        e.preventDefault();
+        e.stopPropagation();
+        const resolved = resolveTargetFile(href, basePath, cwd);
+        const fileName = resolved.split(/[\\/]/).pop() || resolved;
+        setFileBadgeMenu({
+          x: e.clientX,
+          y: e.clientY,
+          filePath: resolved,
+          fileName,
+        });
+      }
+    }
+  }
+
   return (
-    <div
-      ref={rootRef}
-      class="markdown-root assistant-message-content"
-      onClick={onClick}
-      onKeyDown={onKeyDown}
-      dangerouslySetInnerHTML={{ __html: renderedHtml }}
-    />
+    <>
+      <div
+        ref={rootRef}
+        class="markdown-root assistant-message-content"
+        onClick={onClick}
+        onContextMenu={onContextMenu}
+        onKeyDown={onKeyDown}
+        dangerouslySetInnerHTML={{ __html: renderedHtml }}
+      />
+      {fileBadgeMenu && typeof document !== 'undefined' && createPortal(
+        <div
+          class="file-context-menu"
+          style={{ top: `${fileBadgeMenu.y}px`, left: `${fileBadgeMenu.x}px` }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            class="context-menu-btn"
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
+                detail: { filePath: fileBadgeMenu.filePath, fileName: fileBadgeMenu.fileName }
+              }));
+              window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
+                detail: 'preview'
+              }));
+              setFileBadgeMenu(null);
+            }}
+          >
+            <span>👁️ {t('preview.openInRight')}</span>
+          </button>
+          <button
+            type="button"
+            class="context-menu-btn"
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
+                detail: { path: fileBadgeMenu.filePath }
+              }));
+              setFileBadgeMenu(null);
+            }}
+          >
+            <span>📑 {t('preview.openInMain')}</span>
+          </button>
+          <button
+            type="button"
+            class="context-menu-btn"
+            onClick={() => {
+              navigator.clipboard?.writeText(fileBadgeMenu.filePath);
+              showToast(t('explorer.copyFullPath'), 'success');
+              setFileBadgeMenu(null);
+            }}
+          >
+            <span>📋 {t('explorer.copyFullPath')}</span>
+          </button>
+        </div>,
+        document.body
+      )}
+    </>
   );
 }
