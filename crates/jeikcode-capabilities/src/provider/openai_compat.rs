@@ -902,12 +902,13 @@ fn format_messages(
                 }
             }
             Role::User => {
+                let user_text = crate::reminder::unwrap_strong_reminders(&m.text);
                 if m.images.is_empty() || !supports_vision {
                     // Text-only (no images), OR a vision-incapable target: `content`
                     // stays a STRING. Consecutive user messages stay consecutive on the
                     // wire (Grok Build / OpenAI / Responses all accept them). Merging
                     // would rewrite a previously cached user block and drop prefix hits.
-                    out.push(json!({ "role": "user", "content": m.text }));
+                    out.push(json!({ "role": "user", "content": user_text }));
                 } else {
                     // Multimodal: `content` becomes an array — text part first (if any),
                     // then each image as an OpenAI `image_url` base64 data URL. NOTE on
@@ -916,8 +917,8 @@ fn format_messages(
                     // contract, not ours. `json!()` escapes any special chars in the data
                     // URL to valid JSON; the provider unescapes on decode.
                     let mut parts: Vec<Value> = Vec::with_capacity(m.images.len() + 1);
-                    if !m.text.is_empty() {
-                        parts.push(json!({ "type": "text", "text": m.text }));
+                    if !user_text.is_empty() {
+                        parts.push(json!({ "type": "text", "text": user_text }));
                     }
                     for img in &m.images {
                         // Harden the wire shape at this L1 boundary (the kernel only stores

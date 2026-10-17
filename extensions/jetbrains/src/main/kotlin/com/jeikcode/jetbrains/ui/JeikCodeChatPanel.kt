@@ -1909,6 +1909,7 @@ internal fun shouldRenderHistoryAssistantText(message: MessageInfo): Boolean {
 
 private val INTERNAL_HISTORY_USER_PREFIXES = listOf(
     "<system-reminder>",
+    "<strong-reminder>",
     "You made code edits but have not verified them.",
     "Output limit hit — your last response was cut off",
     "Output limit hit. If the task is already complete",

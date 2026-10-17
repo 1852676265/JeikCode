@@ -35,6 +35,7 @@ raw: |-
 
   ## Output
   When discovering key milestones or critical issues, briefly state the current stage status.
+  Upon task completion, list in an endnote all modified files using full relative paths (or full absolute paths if across workspaces).
 
 # ------------------------------------------------------------------------------
 # 2. Workflow & Execution Principles (Structured Fallback)

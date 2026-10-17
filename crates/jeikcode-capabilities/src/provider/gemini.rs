@@ -634,8 +634,9 @@ fn format_contents(
 
 fn user_parts(m: &Message, vision: bool) -> Vec<Value> {
     let mut parts = Vec::new();
-    if !m.text.is_empty() {
-        parts.push(json!({ "text": m.text }));
+    let text = crate::reminder::unwrap_strong_reminders(&m.text);
+    if !text.is_empty() {
+        parts.push(json!({ "text": text }));
     }
     if vision {
         for img in &m.images {

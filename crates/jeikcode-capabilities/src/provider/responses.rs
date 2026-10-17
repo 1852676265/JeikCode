@@ -455,16 +455,17 @@ fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: boo
                 }
             }
             Role::User => {
+                let user_text = crate::reminder::unwrap_strong_reminders(&m.text);
                 if m.images.is_empty() || !supports_vision {
                     out.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": m.text,
+                        "content": user_text,
                     }));
                 } else {
                     let mut parts: Vec<Value> = Vec::new();
-                    if !m.text.is_empty() {
-                        parts.push(json!({ "type": "input_text", "text": m.text }));
+                    if !user_text.is_empty() {
+                        parts.push(json!({ "type": "input_text", "text": user_text }));
                     }
                     for img in &m.images {
                         if img.data.is_empty() {

@@ -1,8 +1,10 @@
 //! First-query + wander-loop steering for `code_explore`.
 //!
-//! 1. **Opening tail** — on the first real user query, append a
-//!    `<system-reminder>` to that same user block (same placement as the date
-//!    reminder). Stored. TUI / WebUI strip it via
+//! 1. **Opening tail** — on the first real user query, inject a
+//!    `<strong-reminder>` to that same user block (placed cleanly before any
+//!    `<system-reminder>` date block). On the wire, `<strong-reminder>` tags
+//!    are unwrapped, presenting a clean user prompt tail to the model.
+//!    TUI / WebUI / IDEs strip it completely via
 //!    [`jeikcode_capabilities::session::user_text_for_display`].
 //! 2. **Wander meter** — a per-session counter over `grep` + `glob` +
 //!    `read_file` combined. Crossing 7 in a 10-call window appends the wander
@@ -27,18 +29,37 @@ use std::sync::{Mutex, OnceLock};
 const WANDER_WINDOW: u8 = 10;
 const WANDER_NUDGE_AT: u8 = 8;
 
-const OPENING_BODY: &str = "\
-Explore the codebase generously before answering. Use `code_explore` to trace \
-cross-module flows, `grep` to locate symbols, and `read` in large blocks (several hundred \
-lines, or the whole file) to build a complete mental model. Fire concurrent calls \
-when there is no dependency between them.";
+const OPENING_BODY_ZH: &str = "\
+还有，在回答前请充分探索代码库。使用 `code_explore` 加快代码逻辑检索速度以便快速获得全貌。当工具调用之间无依赖时，优先并发发起调用。如果你没在运行探索任务，请忽略此句即可。";
+
+const OPENING_BODY_EN: &str = "\
+Also, explore the codebase generously before answering. Use `code_explore` to accelerate code logic retrieval and quickly gain a complete overview. Fire concurrent calls when there is no dependency between them. If you are not running an exploration task, please ignore this sentence.";
+
+const OPENING_BODY_VI: &str = "\
+Ngoài ra, hãy khám phá kỹ lưỡng cơ sở mã trước khi trả lời. Sử dụng `code_explore` để tăng tốc độ truy xuất logic mã nhằm nhanh chóng nắm bắt bức tranh toàn cảnh. Kích hoạt các lệnh gọi đồng thời khi không có sự phụ thuộc lẫn nhau. Nếu bạn không thực hiện nhiệm vụ khám phá, vui lòng bỏ qua câu này.";
+
+pub fn opening_body_for(locale: jeikcode_config::locale::Locale) -> &'static str {
+    match locale {
+        jeikcode_config::locale::Locale::ZhCn => OPENING_BODY_ZH,
+        jeikcode_config::locale::Locale::Vi => OPENING_BODY_VI,
+        jeikcode_config::locale::Locale::En => OPENING_BODY_EN,
+    }
+}
 
 const WANDER_BODY: &str = "\
 Little `code_explore` so far. If this is still primary code exploration, split intent \
 and call `code_explore` in parallel.";
 
-const OPENING_NEEDLE: &str = "Explore the codebase generously";
+const OPENING_NEEDLE: &str = "<strong-reminder>";
 const WANDER_NEEDLE: &str = "Little `code_explore` so far";
+
+fn has_opening_reminder(text: &str) -> bool {
+    text.contains(OPENING_NEEDLE)
+        || text.contains("加快代码逻辑检索速度")
+        || text.contains("accelerate code logic retrieval")
+        || text.contains("tăng tốc độ truy xuất logic mã")
+        || text.contains("Explore the codebase generously")
+}
 
 fn wander_meters() -> &'static Mutex<HashMap<String, u8>> {
     static MAP: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
@@ -130,7 +151,16 @@ impl LifecycleHooks for CodeToolsFirstHook {
         else {
             return;
         };
-        append_reminder(&mut query.text, OPENING_BODY, OPENING_NEEDLE);
+        if has_opening_reminder(&query.text) {
+            return;
+        }
+        let locale = jeikcode_config::i18n::current_locale();
+        let body = opening_body_for(locale);
+        jeikcode_capabilities::reminder::insert_strong_reminder_before_system_reminders(
+            &mut query.text,
+            body,
+            OPENING_NEEDLE,
+        );
     }
 
     async fn session_end(&self, _convo: &Conversation) {
@@ -280,18 +310,26 @@ mod tests {
         assert!(
             c.messages[0]
                 .text
-                .starts_with("how does auth work\n\n<system-reminder>")
-                && c.messages[0].text.contains(OPENING_NEEDLE)
-                && c.messages[0].text.contains("cross-module flows")
+                .starts_with("how does auth work\n\n<strong-reminder>")
+                && c.messages[0].text.contains("code_explore")
                 && c.messages[0].text.contains("concurrent calls"),
             "{}",
             c.messages[0].text
         );
+        // Wire unwrap gives clean user tail
+        let wire = jeikcode_capabilities::reminder::unwrap_strong_reminders(&c.messages[0].text);
+        assert!(!wire.contains("<strong-reminder>"));
+        assert!(wire.contains("code_explore"));
+        // Display strip gives original user prompt
+        let display = jeikcode_capabilities::reminder::strip_injected_reminders_for_display(
+            &c.messages[0].text,
+        );
+        assert_eq!(display, "how does auth work");
         hook.session_end(&c).await;
     }
 
     #[tokio::test]
-    async fn opening_is_idempotent_and_sits_after_an_existing_date_tail() {
+    async fn opening_is_idempotent_and_sits_before_an_existing_date_tail() {
         let hook = CodeToolsFirstHook::new(true, Some("sess-date"));
         let mut c = convo(vec![Message::user(
             "hi\n\n<system-reminder>\nCurrent date: 2026-06-15 (Mon)\n</system-reminder>",
@@ -300,14 +338,25 @@ mod tests {
         hook.turn_start(&mut c).await;
         let text = &c.messages[0].text;
         assert_eq!(
+            text.matches("<strong-reminder>").count(),
+            1,
+            "strong-reminder once: {text}"
+        );
+        assert_eq!(
             text.matches("<system-reminder>").count(),
-            2,
-            "date + opening, once each: {text}"
+            1,
+            "date once: {text}"
         );
         assert!(
-            text.contains("Current date:") && text.contains(OPENING_NEEDLE),
-            "{text}"
+            text.find("<strong-reminder>").unwrap() < text.find("<system-reminder>").unwrap(),
+            "strong-reminder must sit before date tail: {text}"
         );
+        // Wire unwrap leaves clean user tail before system-reminder
+        let wire = jeikcode_capabilities::reminder::unwrap_strong_reminders(text);
+        assert!(!wire.contains("<strong-reminder>"));
+        assert!(wire.contains("hi\n\n"));
+        assert!(wire
+            .contains("\n\n<system-reminder>\nCurrent date: 2026-06-15 (Mon)\n</system-reminder>"));
         hook.session_end(&c).await;
     }
 

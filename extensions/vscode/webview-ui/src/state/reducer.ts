@@ -93,6 +93,7 @@ function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' |
 
 const INTERNAL_USER_PREFIXES = [
   '<system-reminder>',
+  '<strong-reminder>',
   'You made code edits but have not verified them.',
   'Output limit hit — your last response was cut off',
   'Output limit hit. If the task is already complete',
@@ -112,25 +113,28 @@ function isInternalHistoryUserMessage(text: string, synthetic?: boolean): boolea
 }
 
 function stripInjectedRemindersForDisplay(text: string): string {
-  const open = '<system-reminder>';
-  const close = '</system-reminder>';
-  let rest = text;
-  let out = '';
-  while (true) {
-    const start = rest.indexOf(open);
-    if (start < 0) {
-      out += rest;
-      break;
+  const stripTag = (input: string, open: string, close: string): string => {
+    let rest = input;
+    let out = '';
+    while (true) {
+      const start = rest.indexOf(open);
+      if (start < 0) {
+        out += rest;
+        break;
+      }
+      out += rest.slice(0, start);
+      const end = rest.indexOf(close, start + open.length);
+      if (end < 0) {
+        out += rest.slice(start);
+        break;
+      }
+      rest = rest.slice(end + close.length);
     }
-    out += rest.slice(0, start);
-    const end = rest.indexOf(close, start + open.length);
-    if (end < 0) {
-      out += rest.slice(start);
-      break;
-    }
-    rest = rest.slice(end + close.length);
-  }
-  return out.replace(/\n{3,}/g, '\n\n').trim();
+    return out;
+  };
+  const withoutSys = stripTag(text, '<system-reminder>', '</system-reminder>');
+  const withoutStrong = stripTag(withoutSys, '<strong-reminder>', '</strong-reminder>');
+  return withoutStrong.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function internalOriginOf(message: { internal_origin?: string; internalOrigin?: string }): string | undefined {

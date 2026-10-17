@@ -358,9 +358,10 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
             // templates accept only a single system message.
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
+                let text = crate::reminder::unwrap_strong_reminders(&m.text);
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("user"));
-                obj.insert("content".into(), json!(m.text));
+                obj.insert("content".into(), json!(text));
                 // Ollama images are BARE base64 strings (no data: URL prefix).
                 let imgs: Vec<Value> = m
                     .images

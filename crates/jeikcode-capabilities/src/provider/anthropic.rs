@@ -783,12 +783,13 @@ fn content_to_blocks(content: Value) -> Vec<Value> {
 /// A `user` message. Text-only → `content` is a STRING (prefix-cache parity with the
 /// no-block path); with images → an array of text + base64 `image` blocks.
 fn format_user_message(m: &Message) -> Value {
+    let text = crate::reminder::unwrap_strong_reminders(&m.text);
     if m.images.is_empty() {
-        return json!({ "role": "user", "content": m.text });
+        return json!({ "role": "user", "content": text });
     }
     let mut parts: Vec<Value> = Vec::with_capacity(m.images.len() + 1);
-    if !m.text.is_empty() {
-        parts.push(json!({ "type": "text", "text": m.text }));
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
     }
     for img in &m.images {
         if img.data.is_empty() {
@@ -811,7 +812,7 @@ fn format_user_message(m: &Message) -> Value {
         }));
     }
     if parts.is_empty() {
-        json!({ "role": "user", "content": m.text })
+        json!({ "role": "user", "content": text })
     } else {
         json!({ "role": "user", "content": parts })
     }
