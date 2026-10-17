@@ -808,6 +808,38 @@ test('applyTodoAction auto-clears completed list when new batch adds multiple it
   assert.equal(next[1]?.content, 'new-2');
 });
 
+test('restoreStickyTodos respects empty authoritativeTodos array and does not fall back to stashed', () => {
+  const stashed: TodoItem[] = [
+    { content: 'stale task 1', status: 'pending' },
+    { content: 'stale task 2', status: 'in_progress' },
+  ];
+  const messages = [
+    {
+      role: 'assistant',
+      parts: [
+        {
+          kind: 'tool',
+          tool: {
+            name: 'todo_write',
+            args: JSON.stringify({
+              actions: [{ action: 'add', content: 'stale task 1' }],
+            }),
+          },
+        },
+      ],
+    },
+  ];
+
+  // 服务端返回权威空清单 []
+  const restored = restoreStickyTodos({
+    messages,
+    stashed,
+    authoritativeTodos: [],
+  });
+  assert.equal(restored, null, '服务端权威清单为空数组时代表无活跃待办，严禁回退 stashed 脏缓存');
+});
+
+
 
 
 

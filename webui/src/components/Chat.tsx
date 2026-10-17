@@ -2936,6 +2936,11 @@ export function Chat({
                   scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
                 }
               }
+              // 空闲会话权威对账：如果服务端已完成所有待办，彻底同步清空本地缓存，杜绝历史脏数据滞留
+              if (Array.isArray(res.todos) && res.todos.every((t: any) => t.status === 'completed')) {
+                activeTodosBySessionRef.current.delete(sessionId);
+                applySessionStickyTodos(sessionId, null);
+              }
             }
           }).catch(() => {});
         }
@@ -5270,23 +5275,39 @@ export function Chat({
     }
     if (event.type === 'tool_start' || event.type === 'tool_result') {
       if (isTodoTool(event.name)) {
-        const argsStr = event.type === 'tool_result' ? (event.output || '') : formatArgs(event.arguments);
-        const appliedIds = appliedTodoIdsFor(targetSid);
-        const curTodos = activeTodosBySessionRef.current.get(targetSid) ?? null;
-        const nextTodos = foldLiveTodo({
-          state: curTodos,
-          remembered: curTodos,
-          name: event.name,
-          args: argsStr,
-          callId: event.id,
-          appliedIds,
-        });
-        // 后台会话的折叠同样要落盘幂等键（跨会话重放也不能把清单打回旧状态）。
-        persistAppliedTodoIds();
-        if (nextTodos && nextTodos.length > 0 && nextTodos.some((t) => t.status !== 'completed')) {
-          activeTodosBySessionRef.current.set(targetSid, nextTodos);
-        } else {
-          activeTodosBySessionRef.current.delete(targetSid);
+        let argsStr = formatArgs(event.arguments);
+        if (event.type === 'tool_result' && !argsStr && event.id) {
+          // tool_result 的 event.output 是工具执行结果的文本摘要（含 [x] 列表或 status 汇报），
+          // 绝不是工具的 JSON 入参！若入参为空，从已有消息树中提取该工具原先记录的 args！
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (m.role === 'assistant' && m.parts) {
+              const tp = m.parts.find((p) => p.kind === 'tool' && 'tool' in p && p.tool?.id === event.id);
+              if (tp && 'tool' in tp && tp.tool?.args) {
+                argsStr = tp.tool.args;
+                break;
+              }
+            }
+          }
+        }
+        if (argsStr) {
+          const appliedIds = appliedTodoIdsFor(targetSid);
+          const curTodos = activeTodosBySessionRef.current.get(targetSid) ?? null;
+          const nextTodos = foldLiveTodo({
+            state: curTodos,
+            remembered: curTodos,
+            name: event.name,
+            args: argsStr,
+            callId: event.id,
+            appliedIds,
+          });
+          // 后台会话的折叠同样要落盘幂等键（跨会话重放也不能把清单打回旧状态）。
+          persistAppliedTodoIds();
+          if (nextTodos && nextTodos.length > 0 && nextTodos.some((t) => t.status !== 'completed')) {
+            activeTodosBySessionRef.current.set(targetSid, nextTodos);
+          } else {
+            activeTodosBySessionRef.current.delete(targetSid);
+          }
         }
       }
     }

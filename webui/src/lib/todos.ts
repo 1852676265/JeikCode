@@ -520,7 +520,9 @@ export function restoreStickyTodos(input: {
   stashed?: TodoItem[] | null;
   authoritativeTodos?: TodoItem[] | null;
 }): TodoItem[] | null {
-  if (input.authoritativeTodos && input.authoritativeTodos.length > 0) {
+  if (Array.isArray(input.authoritativeTodos)) {
+    // 关键防线：当服务端权威清单已给出时（包含权威空数组 [] 即全部完成归档），
+    // 坚决采纳服务端权威真源，严禁因为权威列表为空而绕过真源去回退 stashed 招魂复活！
     return unfinishedTodos(input.authoritativeTodos);
   }
   const calls = collectTodoCalls(input.messages);
