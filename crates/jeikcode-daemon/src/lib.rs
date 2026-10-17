@@ -9810,9 +9810,7 @@ async fn terminal_create(Json(req): Json<TerminalCreatePayload>) -> impl IntoRes
         timestamp: now.as_millis() as i64,
     };
     guard.insert(term_id.clone(), item);
-    publish_global(GlobalWireEvent::TerminalUpdated {
-        cwd: cwd.clone(),
-    });
+    publish_global(GlobalWireEvent::TerminalUpdated { cwd: cwd.clone() });
     Json(serde_json::json!({
         "success": true,
         "terminal_id": term_id,
@@ -9829,15 +9827,24 @@ struct TerminalListQuery {
 async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse {
     let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
     let list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
-        let norm_req = req_cwd.replace('\\', "/").trim_end_matches('/').to_lowercase();
+        let norm_req = req_cwd
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
         guard
             .values()
             .filter(|t| {
                 if norm_req.is_empty() {
                     return true;
                 }
-                let norm_term = t.cwd.replace('\\', "/").trim_end_matches('/').to_lowercase();
-                norm_term == norm_req || norm_term.starts_with(&norm_req) || norm_req.starts_with(&norm_term)
+                let norm_term = t
+                    .cwd
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_lowercase();
+                norm_term == norm_req
+                    || norm_term.starts_with(&norm_req)
+                    || norm_req.starts_with(&norm_term)
             })
             .cloned()
             .collect()
@@ -9863,9 +9870,7 @@ async fn terminal_close(Json(req): Json<TerminalClosePayload>) -> impl IntoRespo
     let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
     let removed = guard.remove(&req.terminal_id);
     if let Some(item) = removed {
-        publish_global(GlobalWireEvent::TerminalUpdated {
-            cwd: item.cwd,
-        });
+        publish_global(GlobalWireEvent::TerminalUpdated { cwd: item.cwd });
     }
     Json(serde_json::json!({ "success": true }))
 }
