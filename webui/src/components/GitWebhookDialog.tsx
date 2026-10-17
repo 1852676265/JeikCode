@@ -183,10 +183,23 @@ function generateRandomSecret(): string {
 
 const GLOBAL_LAST_WEBHOOK_HOST_KEY = 'jeikcode:last_webhook_host';
 
+/**
+ * 规范化用户输入的 Webhook Host / Domain：
+ * 1. 允许并欢迎输入冒号与斜杠（例如 https://junge.junv.top 或 http://127.0.0.1:13460）
+ * 2. 自动将中文全角冒号（：）、全角斜杠（／）与中文输入法按 / 键常打出的顿号（、）智能转为半角标准符号，免去频繁切换输入法的烦恼
+ * 3. 若用户误粘贴了完整的 /api/webhooks/git 或 /api/webhooks/github 后缀，自动予以剥离
+ * 4. 严禁在用户正在输入时强行截断末尾斜杠，保证手动敲入 http:// 或 https:// 时绝对畅通无阻！
+ */
+export function normalizeWebhookHost(host: string): string {
+  if (!host) return '';
+  return host
+    .replace(/：/g, ':')
+    .replace(/[／、]/g, '/')
+    .replace(/\/api\/webhooks\/(git|github)\/?$/i, '');
+}
+
 export function stripWebhookSuffix(url: string): string {
-  return url
-    .replace(/\/api\/webhooks\/(git|github)\/?$/i, '')
-    .replace(/\/+$/, '');
+  return normalizeWebhookHost(url);
 }
 
 /**
@@ -207,7 +220,7 @@ export function getLastWebhookHost(): string {
         if (item) {
           const parsed = JSON.parse(item);
           const url = parsed.webhook?.payloadUrl || parsed.webhookUrl || '';
-          const clean = stripWebhookSuffix(url);
+          const clean = normalizeWebhookHost(url).replace(/\/+$/, '');
           if (clean && !clean.includes('127.0.0.1') && !clean.includes('localhost')) {
             localStorage.setItem(GLOBAL_LAST_WEBHOOK_HOST_KEY, clean);
             return clean;
@@ -227,7 +240,7 @@ export function getLastWebhookHost(): string {
 export function setLastWebhookHost(host: string): void {
   if (typeof window === 'undefined') return;
   try {
-    const clean = stripWebhookSuffix(host.trim());
+    const clean = normalizeWebhookHost(host.trim()).replace(/\/+$/, '');
     if (clean && !clean.includes('127.0.0.1') && !clean.includes('localhost')) {
       localStorage.setItem(GLOBAL_LAST_WEBHOOK_HOST_KEY, clean);
     }
@@ -237,7 +250,7 @@ export function setLastWebhookHost(host: string): void {
 }
 
 export function getFullWebhookUrl(hostOrUrl: string): string {
-  const clean = stripWebhookSuffix(hostOrUrl.trim());
+  const clean = normalizeWebhookHost(hostOrUrl.trim()).replace(/\/+$/, '');
   if (!clean) return '';
   return `${clean}/api/webhooks/git`;
 }
@@ -701,7 +714,11 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                   class="git-input"
                   placeholder={activeChannelMeta.defaultApiBase || t('gitWebhook.customApiBasePlaceholder')}
                   value={config.customApiBase}
-                  onInput={(e) => setConfig({ ...config, customApiBase: (e.target as HTMLInputElement).value.trim() })}
+                  onInput={(e) => {
+                    const raw = (e.target as HTMLInputElement).value;
+                    const cleanApi = raw.replace(/：/g, ':').replace(/[／、]/g, '/');
+                    setConfig({ ...config, customApiBase: cleanApi });
+                  }}
                 />
                 <span class="git-input-hint">{t('gitWebhook.customApiBaseHint')}</span>
               </div>
@@ -722,21 +739,22 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                     <input
                       type="text"
                       class="git-group-input"
-                      value={stripWebhookSuffix(config.webhook.payloadUrl || '')}
+                      value={config.webhook.payloadUrl || ''}
                       placeholder={`http(s)://yourdomain:${livePort}`}
                       onInput={(e) => {
-                        const val = (e.target as HTMLInputElement).value.trim();
-                        const stripped = stripWebhookSuffix(val);
+                        const val = (e.target as HTMLInputElement).value;
+                        const normalized = normalizeWebhookHost(val);
                         setConfig({
                           ...config,
                           webhook: {
                             ...config.webhook,
-                            payloadUrl: stripped,
+                            payloadUrl: normalized,
                           },
                         });
                         // 用户编辑后，实时同步为全局默认继承项
-                        if (stripped) {
-                          setLastWebhookHost(stripped);
+                        const cleanHost = normalized.replace(/\/+$/, '').trim();
+                        if (cleanHost) {
+                          setLastWebhookHost(cleanHost);
                         }
                       }}
                     />
@@ -853,7 +871,11 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                   class="git-input"
                   placeholder={t(activeChannelMeta.repoSampleKey as any)}
                   value={config.repoIdentifier}
-                  onInput={(e) => setConfig({ ...config, repoIdentifier: (e.target as HTMLInputElement).value.trim() })}
+                  onInput={(e) => {
+                    const raw = (e.target as HTMLInputElement).value;
+                    const cleanRepo = raw.replace(/[／、]/g, '/');
+                    setConfig({ ...config, repoIdentifier: cleanRepo });
+                  }}
                 />
                 <span class="git-input-hint">{t(activeChannelMeta.repoHintKey as any)}</span>
               </div>
