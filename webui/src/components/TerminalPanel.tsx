@@ -509,9 +509,17 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         const rows = Math.max(20, record.term.rows || 32);
         let token = '';
         try {
-          const m = document.cookie.match(/jeikcode_webui(?:_\d+)?=([^;]+)/);
-          if (m && m[1]) token = m[1].trim();
+          token =
+            sessionStorage.getItem('jeikcode_webui_token') ||
+            localStorage.getItem('jeikcode_webui_token') ||
+            '';
         } catch {}
+        if (!token) {
+          try {
+            const m = document.cookie.match(/jeikcode_webui(?:_\d+)?=([^;]+)/);
+            if (m && m[1]) token = m[1].trim();
+          } catch {}
+        }
         if (!token) {
           try {
             const search = new URLSearchParams(window.location.search);
@@ -529,6 +537,12 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
             record.fitAddon.fit();
             ws.send(JSON.stringify({ resize: { cols: record.term.cols, rows: record.term.rows } }));
           } catch {}
+          // 初始激活：如果 250ms 内未收到任何输出，发送一个回车换行以激活后台 shell 提示符
+          setTimeout(() => {
+            if (!receivedAnyData && record.ws && record.ws.readyState === WebSocket.OPEN) {
+              record.ws.send('\r');
+            }
+          }, 250);
           if (isInitial) {
             const initialCmd = pendingCommandsRef.current.get(tab.id);
             if (initialCmd) {

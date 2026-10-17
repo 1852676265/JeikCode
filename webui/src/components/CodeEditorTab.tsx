@@ -440,7 +440,7 @@ export function CodeEditorTab({ filePath, onClose, cwd }: CodeEditorTabProps) {
     });
 
     setLoading(true);
-    fetchFsRead(filePath)
+    fetchFsRead(filePath, cwd)
       .then((res) => {
         if (!cancelled) {
           const loaded = res.content || '';

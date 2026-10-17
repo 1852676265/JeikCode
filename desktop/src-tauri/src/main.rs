@@ -240,6 +240,7 @@ fn main() {
             .title("JeikCode Desktop")
             .inner_size(1280.0, 800.0)
             .resizable(true)
+            .disable_drag_drop_handler()
             .on_navigation(move |url| {
                 let action = {
                     let guard = nav_origin.lock().unwrap_or_else(|e| e.into_inner());

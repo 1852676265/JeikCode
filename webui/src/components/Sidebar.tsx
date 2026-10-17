@@ -2207,9 +2207,11 @@ export function Sidebar({
               const isExpanded = expandedProjects.has(p.hash);
               const isShowAll = showAllProjects.has(p.hash);
 
-              // 过滤掉尚未发出第一条消息的空白会话（等于没创会话，且不计入项目会话数）
+              // 过滤掉尚未发出第一条消息的空白会话（新建但未发送消息者不建会话、不入列表；首发即入列并持续展示）
               const isNonEmptySession = (s: SessionMetaWithProject) => {
                 if (allOptimistic.some((opt) => opt.id === s.id)) return true;
+                if (s.id === activeSessionId) return true;
+                if (activeIds.includes(s.id) || extraRunningIds?.includes(s.id)) return true;
                 return (s.message_count ?? 0) > 0;
               };
 

@@ -2722,8 +2722,9 @@ export async function fetchFsTree(path?: string): Promise<FsTreeResponse> {
   return resp.json();
 }
 
-export async function fetchFsRead(path: string): Promise<{ path: string; content: string; success: boolean }> {
+export async function fetchFsRead(path: string, cwd?: string): Promise<{ path: string; content: string; success: boolean }> {
   const params = new URLSearchParams({ path });
+  if (cwd) params.set('cwd', cwd);
   const resp = await apiFetch(`/fs/read?${params.toString()}`, {
     headers: authHeaders(),
   });

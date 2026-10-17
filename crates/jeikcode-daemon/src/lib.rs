@@ -2492,6 +2492,9 @@ pub(crate) fn fanout_chat_events_for_session(
                     if current_sid.is_none() {
                         current_sid = Some(session_id.clone());
                     }
+                    if let Some(wd) = current_wd.clone() {
+                        publish_session_upsert(&wd, session_id);
+                    }
                 }
                 _ => {}
             }
@@ -8975,6 +8978,7 @@ fn publish_chat_session_assignment(
             now,
         );
         meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        meta.message_count = 1;
         if let Some(title) = session_title.map(str::trim).filter(|t| !t.is_empty()) {
             meta.name = title.to_string();
             // Pin API / client-provided titles (including the stable "default"
@@ -8993,6 +8997,13 @@ fn publish_chat_session_assignment(
             Some(&jeikcode_capabilities::session::PresentationFile::default()),
             &meta,
         )?;
+        publish_session_upsert(working_dir, session_id);
+        publish_global(GlobalWireEvent::Activity {
+            session_id: session_id.to_string(),
+            running: true,
+            terminal: None,
+            status: None,
+        });
     }
     let _ = event_tx.send(ChatEvent::SessionAssigned {
         session_id: session_id.to_string(),
@@ -9957,19 +9968,37 @@ async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) ->
 #[derive(Debug, Deserialize)]
 struct FsReadQuery {
     path: String,
+    cwd: Option<String>,
 }
 
 async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
     let raw = q.path.trim().trim_start_matches("./");
     let mut p = std::path::PathBuf::from(raw);
     if !p.is_absolute() {
-        let candidate = state.bind_working_dir.join(raw);
-        if candidate.exists() {
-            p = candidate;
-        } else if let Ok(cur) = std::env::current_dir() {
-            let candidate2 = cur.join(raw);
-            if candidate2.exists() {
-                p = candidate2;
+        if let Some(ref cwd_str) = q.cwd {
+            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
+            if candidate_cwd.exists() {
+                p = candidate_cwd;
+            } else {
+                let candidate = state.bind_working_dir.join(raw);
+                if candidate.exists() {
+                    p = candidate;
+                } else if let Ok(cur) = std::env::current_dir() {
+                    let candidate2 = cur.join(raw);
+                    if candidate2.exists() {
+                        p = candidate2;
+                    }
+                }
+            }
+        } else {
+            let candidate = state.bind_working_dir.join(raw);
+            if candidate.exists() {
+                p = candidate;
+            } else if let Ok(cur) = std::env::current_dir() {
+                let candidate2 = cur.join(raw);
+                if candidate2.exists() {
+                    p = candidate2;
+                }
             }
         }
     }
@@ -10237,18 +10266,18 @@ async fn get_or_spawn_terminal_process(
     } else if shell.contains("wsl") {
         (
             "wsl.exe".to_string(),
-            vec!["--cd".to_string(), target_cwd.clone()],
+            vec![
+                "--cd".to_string(),
+                target_cwd.clone(),
+                "bash".to_string(),
+                "-i".to_string(),
+            ],
             vec![],
         )
     } else {
         (
             "powershell.exe".to_string(),
-            vec![
-                "-NoLogo".to_string(),
-                "-NoExit".to_string(),
-                "-Command".to_string(),
-                "-".to_string(),
-            ],
+            vec!["-NoLogo".to_string(), "-NoExit".to_string()],
             vec![],
         )
     };
@@ -10312,10 +10341,20 @@ async fn get_or_spawn_terminal_process(
         id: term_id.to_string(),
         cwd: target_cwd.clone(),
         shell: shell_name.to_string(),
-        stdin: stdin_arc,
+        stdin: stdin_arc.clone(),
         child: child_arc.clone(),
         buffer: buffer.clone(),
         broadcast: broadcast_tx.clone(),
+    });
+
+    // 初始向 stdin 发送一次换行以促使交互式 shell 打印初始提示符与就绪信息
+    let stdin_init = stdin_arc.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let mut g = stdin_init.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let _ = g.write_all(b"\r\n").await;
+        let _ = g.flush().await;
     });
 
     let tx_out = broadcast_tx.clone();

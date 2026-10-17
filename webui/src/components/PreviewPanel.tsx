@@ -18,6 +18,15 @@ export interface PreviewPanelProps {
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp']);
 
+function normalizeToAbsolute(filePath: string, cwd?: string): string {
+  let p = (filePath || '').trim().replace(/\\/g, '/');
+  if (/^[a-zA-Z]:\//.test(p) || p.startsWith('/')) {
+    return p;
+  }
+  const base = (cwd || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  return base ? `${base}/${p.replace(/^\.?\/+/, '')}` : p;
+}
+
 export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
   const t = useT();
   const { theme } = useSettings();
@@ -28,9 +37,13 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
       window.matchMedia('(prefers-color-scheme: dark)').matches) ||
     (typeof document !== 'undefined' && document.documentElement.dataset.theme !== 'light');
 
+  const normCwd = useMemo(() => (cwd || 'default').replace(/\\/g, '/').toLowerCase(), [cwd]);
+  const storageKeyTabs = `jeikcode:right_preview_tabs:${normCwd}`;
+  const storageKeyActive = `jeikcode:right_preview_active_tab:${normCwd}`;
+
   const [tabs, setTabs] = useState<PreviewTab[]>(() => {
     try {
-      const saved = localStorage.getItem('jeikcode:right_preview_tabs');
+      const saved = localStorage.getItem(storageKeyTabs);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
@@ -41,26 +54,41 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
 
   const [activeTabId, setActiveTabId] = useState<string>(() => {
     try {
-      const saved = localStorage.getItem('jeikcode:right_preview_active_tab');
+      const saved = localStorage.getItem(storageKeyActive);
       if (saved) return saved;
     } catch {}
     return '';
   });
 
-  // 持久化保存标签与当前激活项
+  // 当项目/工作目录切换时，自动同步对应项目的独立预览标签列表，彻底杜绝跨项目同名文件混淆
   useEffect(() => {
     try {
-      localStorage.setItem('jeikcode:right_preview_tabs', JSON.stringify(tabs));
+      const savedTabs = localStorage.getItem(storageKeyTabs);
+      const parsedTabs = savedTabs ? JSON.parse(savedTabs) : [];
+      setTabs(Array.isArray(parsedTabs) ? parsedTabs : []);
+
+      const savedActive = localStorage.getItem(storageKeyActive) || '';
+      setActiveTabId(savedActive);
+    } catch {
+      setTabs([]);
+      setActiveTabId('');
+    }
+  }, [storageKeyTabs, storageKeyActive]);
+
+  // 持久化保存当前项目的标签与当前激活项
+  useEffect(() => {
+    try {
+      localStorage.setItem(storageKeyTabs, JSON.stringify(tabs));
     } catch {}
-  }, [tabs]);
+  }, [tabs, storageKeyTabs]);
 
   useEffect(() => {
     try {
       if (activeTabId) {
-        localStorage.setItem('jeikcode:right_preview_active_tab', activeTabId);
+        localStorage.setItem(storageKeyActive, activeTabId);
       }
     } catch {}
-  }, [activeTabId]);
+  }, [activeTabId, storageKeyActive]);
 
   // 保证 activeTabId 在 tabs 变化时有效
   useEffect(() => {
@@ -103,7 +131,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     setLoading(true);
     setLoadError(null);
 
-    fetchFsRead(activeTab.filePath)
+    fetchFsRead(activeTab.filePath, cwd)
       .then((res) => {
         if (cancelled) return;
         if (res.success) {
@@ -127,12 +155,13 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
 
   // 打开或追加一个标签页
   const openTab = useCallback((info: { filePath: string; fileName?: string; fileStatus?: string }, insertIndex?: number) => {
-    const filePath = info.filePath;
-    const fileName = info.fileName || filePath.split(/[\\/]/).pop() || filePath;
-    const tabId = `preview_${filePath}`;
+    const rawPath = info.filePath;
+    const absPath = normalizeToAbsolute(rawPath, cwd);
+    const fileName = info.fileName || absPath.split(/[\\/]/).pop() || absPath;
+    const tabId = `preview_${absPath}`;
 
     setTabs((prev) => {
-      const existingIdx = prev.findIndex((t) => t.id === tabId || t.filePath === filePath);
+      const existingIdx = prev.findIndex((t) => t.id === tabId || t.filePath === absPath);
       if (existingIdx !== -1) {
         // 如果已经存在，并且指定了新插入位置，则移动到该位置
         if (insertIndex !== undefined && insertIndex !== existingIdx) {
@@ -146,7 +175,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
       }
       const newTab: PreviewTab = {
         id: tabId,
-        filePath,
+        filePath: absPath,
         fileName,
         fileStatus: info.fileStatus || (fileName.split('.').pop() || 'FILE').slice(0, 3).toUpperCase(),
       };
@@ -159,7 +188,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     });
 
     setActiveTabId(tabId);
-  }, []);
+  }, [cwd]);
 
   // 监听全局打开预览事件
   useEffect(() => {
@@ -325,7 +354,24 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
   };
 
   return (
-    <div class="preview-panel-root">
+    <div
+      class="preview-panel-root"
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        try {
+          const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+          const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+          const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+          if (targetPath) {
+            openTab(typeof data === 'object' && data?.filePath ? data : { filePath: targetPath });
+          }
+        } catch {}
+      }}
+    >
       {/* 顶部多文件标签栏 (与终端多标签结构和样式高度一致) */}
       <div class="preview-tabs-bar">
         <div

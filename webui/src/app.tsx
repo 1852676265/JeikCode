@@ -321,8 +321,13 @@ export function App() {
   const [mainTabOverIdx, setMainTabOverIdx] = useState<number | null>(null);
 
   const handleOpenFile = (filePath: string, insertIndex?: number) => {
-    const tabId = `editor_${filePath}`;
-    const existingIdx = diffTabs.findIndex((t) => t.id === tabId);
+    let normPath = (filePath || '').trim().replace(/\\/g, '/');
+    if (!/^[a-zA-Z]:\//.test(normPath) && !normPath.startsWith('/') && cwd) {
+      const base = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+      normPath = `${base}/${normPath.replace(/^\.?\/+/, '')}`;
+    }
+    const tabId = `editor_${normPath}`;
+    const existingIdx = diffTabs.findIndex((t) => t.id === tabId || t.filePath === normPath);
     if (existingIdx !== -1) {
       if (insertIndex !== undefined && insertIndex !== existingIdx) {
         setDiffTabs((prev) => {
@@ -338,13 +343,13 @@ export function App() {
       setActiveMainTabId(tabId);
       return;
     }
-    const fileName = filePath.split(/[\\/]/).pop() || filePath;
+    const fileName = normPath.split(/[\\/]/).pop() || normPath;
     const ext = fileName.split('.').pop() || 'FILE';
     const newTab = {
       id: tabId,
       type: 'editor',
       fileName,
-      filePath,
+      filePath: normPath,
       fileStatus: ext.slice(0, 3).toUpperCase(),
     };
     setDiffTabs((prev) => {
@@ -499,9 +504,10 @@ export function App() {
     setActiveSession((prev) =>
       prev && prev.id === s.id && prev.name !== s.name ? { ...prev, name: s.name } : prev,
     );
-    // 当真实会话已经从后端拉出时，从乐观池移除对应的临时记录
+    // 当真实会话已经从后端拉出且已拥有消息时，才从乐观池移除对应的临时记录，杜绝首轮执行中断档消失
     setOptimisticSessions((prev) => {
       if (!prev[s.id]) return prev;
+      if ((s.message_count ?? 0) === 0) return prev;
       const next = { ...prev };
       delete next[s.id];
       return next;
