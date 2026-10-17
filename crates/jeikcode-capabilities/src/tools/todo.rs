@@ -67,8 +67,8 @@ pub fn todo_glyph(status: TodoStatus, unicode: bool) -> &'static str {
         (TodoStatus::Pending, _) => "[ ]",
         (TodoStatus::InProgress, true) => "[\u{2022}]",
         (TodoStatus::InProgress, false) => "[~]",
-        (TodoStatus::Completed, true) => "[\u{2713}]",
-        (TodoStatus::Completed, false) => "[x]",
+        (TodoStatus::Completed, true) => "[√]",
+        (TodoStatus::Completed, false) => "[√]",
     }
 }
 
@@ -1203,10 +1203,10 @@ mod tests {
     fn glyph_unicode_vs_ascii() {
         assert_eq!(todo_glyph(TodoStatus::Pending, true), "[ ]");
         assert_eq!(todo_glyph(TodoStatus::InProgress, true), "[\u{2022}]"); // [•]
-        assert_eq!(todo_glyph(TodoStatus::Completed, true), "[\u{2713}]"); // [✓]
+        assert_eq!(todo_glyph(TodoStatus::Completed, true), "[√]");
         assert_eq!(todo_glyph(TodoStatus::Pending, false), "[ ]");
         assert_eq!(todo_glyph(TodoStatus::InProgress, false), "[~]");
-        assert_eq!(todo_glyph(TodoStatus::Completed, false), "[x]");
+        assert_eq!(todo_glyph(TodoStatus::Completed, false), "[√]");
     }
 
     #[test]
@@ -1222,7 +1222,7 @@ mod tests {
             },
         ];
         let s = render_todos_text(&todos, false);
-        assert!(s.contains("[x] first"), "{s}");
+        assert!(s.contains("[√] first"), "{s}");
         assert!(s.contains("[~] second"), "{s}");
     }
 

@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn child_round_limit_is_configurable_and_zero_means_unbounded() {
-        assert_eq!(dummy().max_rounds, Some(200));
+        assert_eq!(dummy().max_rounds, Some(230));
         assert_eq!(dummy().with_max_rounds(500).max_rounds, Some(500));
         assert_eq!(dummy().with_max_rounds(0).max_rounds, None);
     }
@@ -2574,10 +2574,9 @@ mod tests {
         let out = tool.execute(args, &ctx()).await;
         assert!(!out.is_error, "unexpected error: {}", out.content);
         assert!(out.content.contains("<task_result>"));
-        assert!(
-            out.content
-                .contains("[Worker touched: src/auth/login.rs, ran: cargo check (ok)]")
-        );
+        assert!(out
+            .content
+            .contains("[Worker touched: src/auth/login.rs, ran: cargo check (ok)]"));
         assert!(out.content.contains("Authentication fix verified."));
     }
 
@@ -2657,10 +2656,9 @@ mod tests {
         let out = tool.execute(args, &ctx()).await;
         assert!(out.is_error);
         assert!(out.content.contains("<task_error>"));
-        assert!(
-            out.content
-                .contains("[Worker touched: src/auth/login.rs, ran: (none)]")
-        );
+        assert!(out
+            .content
+            .contains("[Worker touched: src/auth/login.rs, ran: (none)]"));
         assert!(out.content.contains("subagent stopped early"));
     }
 }

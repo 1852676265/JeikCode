@@ -374,56 +374,63 @@ fn apply_hunks_cpu(
             h.original_index = idx + 1;
         }
     }
+
+    // 强化 3：在多 hunk 情形下，利用已有明确锚定点的行号区间对多匹配的 hunk 做拓扑消歧
+    disambiguate_hunks_topologically(&content, &mut hunks);
+
     let hunks = if hunks.len() > 1 {
         sort_hunks_topologically(&content, &hunks)
     } else {
         hunks
     };
 
-    let mut buf = content.clone();
-    let mut total = 0usize;
-    let mut kinds: Vec<&'static str> = Vec::new();
-    let mut auto_healed_old_strings: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
+    // 强化 1：预检校验 / 试运行流水线。如果发现错误，收集全部失败 hunk 的精准诊断，聚合输出
+    let mut test_buf = content.clone();
+    let mut preflight_total = 0usize;
+    let mut preflight_kinds: Vec<&'static str> = Vec::new();
+    let mut preflight_healed: Vec<String> = Vec::new();
+    let mut preflight_skipped: Vec<String> = Vec::new();
+    let mut failed_hunks: Vec<(usize, String)> = Vec::new();
+
     for (i, h) in hunks.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err("edit: cancelled.".into());
         }
         if !h.old_string.is_empty() && h.old_string == h.new_string {
-            skipped.push(format!("{} (identical old/new)", i + 1));
-            kinds.push("skipped-identical");
+            preflight_skipped.push(format!("{} (identical old/new)", i + 1));
+            preflight_kinds.push("skipped-identical");
             continue;
         }
         match apply_hunk(
             Some(path),
-            &buf,
+            &test_buf,
             &h.old_string,
             &h.new_string,
             h.replace_all,
             h.occurrence,
         ) {
             Ok((next, n, kind, actual_matched)) => {
-                buf = next;
-                total += n;
-                kinds.push(kind);
+                test_buf = next;
+                preflight_total += n;
+                preflight_kinds.push(kind);
                 if let Some(actual) = actual_matched {
-                    auto_healed_old_strings.push(actual);
+                    preflight_healed.push(actual);
                 }
             }
             Err(e) => {
                 if let Some(rebased) = crate::tools::edit_history::try_history_rebase_cancel(
                     path,
-                    &buf,
+                    &test_buf,
                     &h.old_string,
                     &h.new_string,
                     h.replace_all,
                     Some(cancel),
                 ) {
-                    buf = rebased.merged_content;
-                    total += 1;
-                    kinds.push("historical 3-way rebase");
+                    test_buf = rebased.merged_content;
+                    preflight_total += 1;
+                    preflight_kinds.push("historical 3-way rebase");
                     if !rebased.actual_old_string.is_empty() {
-                        auto_healed_old_strings.push(rebased.actual_old_string);
+                        preflight_healed.push(rebased.actual_old_string);
                     }
                 } else if cancel.is_cancelled() {
                     return Err("edit: cancelled.".into());
@@ -433,29 +440,57 @@ fn apply_hunks_cpu(
                     } else {
                         i + 1
                     };
-                    let prior_note = if i > 0 {
-                        format!(
-                            " (Note: previous {} hunk(s) applied cleanly in temporary buffer, but all changes were discarded)",
-                            i
-                        )
-                    } else {
-                        String::new()
-                    };
-                    return Err(format!(
-                        "edit: hunk {}/{} failed. The file was NOT modified.{prior_note} {e}",
-                        hunk_idx,
-                        hunks.len()
-                    ));
+                    failed_hunks.push((hunk_idx, e));
                 }
             }
         }
     }
+
+    if !failed_hunks.is_empty() {
+        if failed_hunks.len() == 1 {
+            let (hunk_idx, e) = &failed_hunks[0];
+            let prior_success_count = hunks
+                .iter()
+                .position(|h| h.original_index == *hunk_idx)
+                .unwrap_or(0);
+            let prior_note = if prior_success_count > 0 {
+                format!(
+                    " (Note: previous {} hunk(s) applied cleanly in temporary buffer, but all changes were discarded)",
+                    prior_success_count
+                )
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "edit: hunk {}/{} failed. The file was NOT modified.{prior_note} {e}",
+                hunk_idx,
+                hunks.len()
+            ));
+        } else {
+            let mut report = format!(
+                "edit: {} of {} hunks failed verification. The file was NOT modified.\n",
+                failed_hunks.len(),
+                hunks.len()
+            );
+            for (fail_num, (hunk_idx, e)) in failed_hunks.iter().enumerate() {
+                report.push_str(&format!(
+                    "\n--- [Failure {}] Hunk {}/{} ---\n{}\n",
+                    fail_num + 1,
+                    hunk_idx,
+                    hunks.len(),
+                    e.trim()
+                ));
+            }
+            return Err(report);
+        }
+    }
+
     Ok(HunkApplyResult {
-        buf,
-        total,
-        kinds,
-        auto_healed_old_strings,
-        skipped,
+        buf: test_buf,
+        total: preflight_total,
+        kinds: preflight_kinds,
+        auto_healed_old_strings: preflight_healed,
+        skipped: preflight_skipped,
     })
 }
 
@@ -626,6 +661,102 @@ fn apply_hunk_with(
         );
     }
     Err("edit: provide a non-empty `old_string` in each edit hunk.".into())
+}
+
+/// 强化 3：在多 hunk 批量编辑中，当某 hunk 出现多个完全相同的匹配点且 caller 未指定 occurrence 时，
+/// 结合前后其它已有明确锚定点的 hunk 所在行号区间，进行拓扑消歧。
+fn disambiguate_hunks_topologically(content: &str, hunks: &mut [EditHunk]) {
+    if hunks.len() <= 1 {
+        return;
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    // 1. 查找每个 hunk 的所有精确匹配行号范围 (start_line, end_line)
+    let mut match_spans: Vec<Vec<(usize, usize)>> = Vec::with_capacity(hunks.len());
+    for h in hunks.iter() {
+        if h.old_string.is_empty() {
+            match_spans.push(Vec::new());
+            continue;
+        }
+        let old_lines: Vec<&str> = h.old_string.lines().collect();
+        let n = old_lines.len();
+        if n > content_lines.len() {
+            match_spans.push(Vec::new());
+            continue;
+        }
+        let mut spans = Vec::new();
+        for i in 0..=content_lines.len() - n {
+            if content_lines[i..i + n] == old_lines[..] {
+                spans.push((i, i + n));
+            }
+        }
+        match_spans.push(spans);
+    }
+
+    let n = hunks.len();
+    let mut anchor_starts: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        if match_spans[i].len() == 1 {
+            anchor_starts[i] = Some(match_spans[i][0].0);
+        } else if hunks[i].occurrence >= 1 && (hunks[i].occurrence as usize) <= match_spans[i].len()
+        {
+            anchor_starts[i] = Some(match_spans[i][hunks[i].occurrence as usize - 1].0);
+        }
+    }
+
+    // 2. 尝试为具有多处匹配且 occurrence == 0 的 hunk 做拓扑定界消歧
+    for i in 0..n {
+        if hunks[i].occurrence != 0 || match_spans[i].len() <= 1 {
+            continue;
+        }
+
+        // 在 caller 原始顺序中，寻找前置最近锚定行，和后置最近锚定行
+        let prev_anchor = (0..i).rev().find_map(|k| anchor_starts[k]);
+        let next_anchor = ((i + 1)..n).find_map(|k| anchor_starts[k]);
+
+        let candidates_in_window: Vec<usize> = match_spans[i]
+            .iter()
+            .enumerate()
+            .filter(|(_, &(start, _))| {
+                if let Some(prev) = prev_anchor {
+                    if start < prev {
+                        return false;
+                    }
+                }
+                if let Some(next) = next_anchor {
+                    if start > next {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(idx, _)| idx + 1)
+            .collect();
+
+        // 场景 A: 该拓扑行号区间内，恰好只有 1 个候选匹配项！
+        if candidates_in_window.len() == 1 {
+            let occ = candidates_in_window[0];
+            hunks[i].occurrence = occ as u32;
+            anchor_starts[i] = Some(match_spans[i][occ - 1].0);
+            continue;
+        }
+
+        // 场景 B: 连续相同 old_string 的多 hunk 序列与区间内的多个候选点 1 对 1 单调对齐
+        let mut group_indices = vec![i];
+        let mut k = i + 1;
+        while k < n && hunks[k].old_string == hunks[i].old_string && hunks[k].occurrence == 0 {
+            group_indices.push(k);
+            k += 1;
+        }
+        if group_indices.len() > 1 && group_indices.len() == candidates_in_window.len() {
+            for (g_idx, &h_idx) in group_indices.iter().enumerate() {
+                let occ = candidates_in_window[g_idx];
+                hunks[h_idx].occurrence = occ as u32;
+                anchor_starts[h_idx] = Some(match_spans[h_idx][occ - 1].0);
+            }
+        }
+    }
 }
 
 /// Topologically sorts multiple edit hunks within a file:
@@ -1911,11 +2042,37 @@ fn find_closest_match_snippet(
     let actual_end = (end + WINDOW_MARGIN).min(file.lines.len());
     let actual_block = file.lines[actual_start..actual_end].join("\n");
     let diff = bounded_mismatch_diff(old_string, &actual_block);
+
+    // 强化 2 优化版：精准计算核心匹配区间内缺失的具体行，与扩展 Diff 两者兼备
+    let mut missing_lines = Vec::new();
+    let old_line_set: std::collections::HashSet<String> = old_lines
+        .iter()
+        .map(|l| clean_token_normalize(l))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for (idx, line) in file.lines[start..end].iter().enumerate() {
+        let norm = clean_token_normalize(line);
+        if !norm.is_empty() && !old_line_set.contains(&norm) {
+            missing_lines.push((start + 1 + idx, line.trim()));
+        }
+    }
+
+    let mut discrepancy_note = String::new();
+    if !missing_lines.is_empty() {
+        discrepancy_note
+            .push_str("\n👉 Specific discrepancy (missing line(s) in your old_string):\n");
+        for (line_no, line_content) in missing_lines.iter().take(5) {
+            discrepancy_note.push_str(&format!("  + line {line_no}: {line_content}\n"));
+        }
+    }
+
     Some(format!(
-        "[Content Mismatch]: Closest matching block found around lines {}-{} (similarity {:.0}%):\n```diff\n{}\n```\n(Hint: adjust your old_string to match the actual file content above; do not blindly re-read the whole file)",
+        "[Content Mismatch]: Closest matching block found around lines {}-{} (similarity {:.0}%):{}\n```diff\n{}\n```\n(Hint: adjust your old_string to match the actual file content above; do not blindly re-read the whole file)",
         start + 1,
         end,
         score * 100.0,
+        discrepancy_note,
         diff.trim_end()
     ))
 }
@@ -3971,5 +4128,99 @@ fn b() { 2 }
                 && !hint.contains("```diff"),
             "Expected clean refusal without misleading diff, got: {hint}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_multi_hunk_aggregated_error_reporting() {
+        let d = tempfile::tempdir().unwrap();
+        let file_path = d.path().join("code.rs");
+        std::fs::write(&file_path, "fn a() { 1 }\nfn b() { 2 }\nfn c() { 3 }\n").unwrap();
+
+        let r = EditFileTool
+            .execute(
+                &serde_json::json!({
+                    "file_path": "code.rs",
+                    "edits": [
+                        { "old_string": "fn missing_1()", "new_string": "fn rep1()" },
+                        { "old_string": "fn b() { 2 }", "new_string": "fn b() { 20 }" },
+                        { "old_string": "fn missing_2()", "new_string": "fn rep2()" }
+                    ]
+                })
+                .to_string(),
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(r.is_error);
+        assert!(
+            r.content.contains("2 of 3 hunks failed verification"),
+            "content: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("[Failure 1] Hunk 1/3"),
+            "content: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("[Failure 2] Hunk 3/3"),
+            "content: {}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn test_missing_lines_discrepancy_pinpointed() {
+        let content = "function demo() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n";
+        let file_norm = NormalizedFile::new(content);
+
+        // 漏掉了 const b = 2;
+        let old_str_missing_b =
+            "function demo() {\n  const a = 1;\n  const c = 3;\n  return a + b + c;\n}";
+        let hint = find_closest_match_snippet(None, &file_norm, old_str_missing_b).unwrap();
+
+        assert!(
+            hint.contains("👉 Specific discrepancy (missing line(s) in your old_string):"),
+            "hint: {hint}"
+        );
+        assert!(hint.contains("const b = 2;"), "hint: {hint}");
+        assert!(
+            hint.contains("```diff"),
+            "hint should still retain expanded diff: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_topological_disambiguation_resolves_duplicate_hunks() {
+        let d = tempfile::tempdir().unwrap();
+        let file_path = d.path().join("code.rs");
+        std::fs::write(
+            &file_path,
+            "fn head() { 0 }\nmatch output { Ok(()) => () }\nmatch output { Ok(()) => () }\nfn tail() { 9 }\n",
+        )
+        .unwrap();
+
+        let r = EditFileTool
+            .execute(
+                &serde_json::json!({
+                    "file_path": "code.rs",
+                    "edits": [
+                        { "old_string": "fn head() { 0 }", "new_string": "fn head() { 100 }" },
+                        { "old_string": "match output { Ok(()) => () }", "new_string": "match output { Ok(()) => 1 }" },
+                        { "old_string": "match output { Ok(()) => () }", "new_string": "match output { Ok(()) => 2 }" },
+                        { "old_string": "fn tail() { 9 }", "new_string": "fn tail() { 900 }" }
+                    ]
+                })
+                .to_string(),
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(!r.is_error, "disambiguation should succeed: {}", r.content);
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert!(updated.contains("fn head() { 100 }"));
+        assert!(updated.contains("match output { Ok(()) => 1 }"));
+        assert!(updated.contains("match output { Ok(()) => 2 }"));
+        assert!(updated.contains("fn tail() { 900 }"));
     }
 }

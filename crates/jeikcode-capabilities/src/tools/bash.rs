@@ -67,6 +67,21 @@ pub struct BashTool {
 #[allow(non_upper_case_globals)]
 pub const BashTool: BashTool = BashTool { runtime: None };
 
+/// 单个流在内存中的最大捕获字节上限（32MB）。超过时截断丢弃后续输出，防止 OOM 换页风暴（Swap Storm）导致系统磁盘与网络假死
+const MAX_STREAM_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+fn extend_capped(cap: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) {
+    if cap.len() >= max_bytes {
+        return;
+    }
+    let take = chunk.len().min(max_bytes.saturating_sub(cap.len()));
+    cap.extend_from_slice(&chunk[..take]);
+    if cap.len() >= max_bytes {
+        cap.extend_from_slice(b"\n[output truncated: stream buffer limit (32MB) reached to prevent OOM/system thrashing]\n");
+    }
+}
+
 impl Default for BashTool {
     fn default() -> Self {
         Self { runtime: None }
@@ -394,8 +409,34 @@ impl Tool for BashTool {
                         fn open(path: *const i8, oflag: i32, ...) -> i32;
                         fn close(fd: i32) -> i32;
                         fn ioctl(fd: i32, request: u64, ...) -> i32;
+                        fn nice(inc: i32) -> i32;
                     }
                     setsid();
+                    // 降低调度优先级（nice +10），确保重计算/多线程编译等高耗任务不会饿死系统 sshd、内核中断和网关服务
+                    nice(10);
+                    #[cfg(target_os = "linux")]
+                    {
+                        extern "C" {
+                            fn syscall(num: i64, ...) -> i64;
+                        }
+                        // Linux ioprio_set: 将 I/O 调度优先级设为 Best-Effort 最低级 (class 2, priority 7)，
+                        // 避免密集磁盘读写（如 grep、find、编译）将内核 I/O 调度队列塞满导致 sshd/网络通信被推迟
+                        #[cfg(target_arch = "x86_64")]
+                        const NR_IOPRIO_SET: i64 = 251;
+                        #[cfg(target_arch = "aarch64")]
+                        const NR_IOPRIO_SET: i64 = 30;
+                        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                        syscall(NR_IOPRIO_SET, 1, 0, (2 << 13) | 7);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        extern "C" {
+                            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+                        }
+                        // macOS Darwin I/O 策略：IOPOL_TYPE_DISK = 0, IOPOL_SCOPE_PROCESS = 0, IOPOL_THROTTLE = 3
+                        // 强制将子进程的 APFS/磁盘 I/O 降为后台节流级别，避免对主进程、网络和 SSH 终端产生 I/O 竞争
+                        setiopolicy_np(0, 0, 3);
+                    }
                     const O_RDWR: i32 = 2;
                     #[cfg(target_os = "macos")]
                     const TIOCNOTTY: u64 = 0x20007471;
@@ -808,10 +849,15 @@ impl Tool for BashTool {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
                             *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                            stdout_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&out_buf[..n]);
+                            extend_capped(
+                                &mut *stdout_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                                &out_buf[..n],
+                                MAX_STREAM_CAPTURE_BYTES,
+                            );
                             if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &out_buf[..n], false) {
                                 emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
                             }
+                            tokio::task::yield_now().await;
                         }
                         Err(_) => stdout_done = true,
                     }
@@ -821,17 +867,24 @@ impl Tool for BashTool {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
                             *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                            stderr_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&err_buf[..n]);
+                            extend_capped(
+                                &mut *stderr_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                                &err_buf[..n],
+                                MAX_STREAM_CAPTURE_BYTES,
+                            );
                             if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &err_buf[..n], false) {
                                 emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
                             }
+                            tokio::task::yield_now().await;
                         }
                         Err(_) => stderr_done = true,
                     }
                 }
                 _ = tokio::time::sleep(fast_interactive_sleep), if has_output() && !live.promoted.load(Ordering::SeqCst) => {
+                    let elapsed = last_byte.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
                     let (out, errb) = snapshot();
-                    if let Some(fp) = detect_interactive_prompt_or_tui(&out, &errb) {
+                    let fp = detect_interactive_prompt_or_tui(&out, &errb);
+                    if let Some(fp) = fp {
                         let should_terminate = match fp {
                             InteractiveFingerprint::FullScreenTui => true,
                             InteractiveFingerprint::TrailingPrompt(_) => {
@@ -864,6 +917,27 @@ impl Tool for BashTool {
                                 ),
                             )));
                         }
+                    } else if elapsed >= Duration::from_secs(3) && !is_network_or_download_workload(&effective_command) {
+                        // 陌生脚本 / 阻塞式命令自适应收网：
+                        // 排除网络下载类任务（apt/npm/curl等），屏幕已静默超过 3 秒，且整棵子进程树 CPU 已经彻底归零（处于内核输入等待态）
+                        #[cfg(windows)]
+                        let busy = tree_is_busy(child_pid, &job_guard).await;
+                        #[cfg(not(windows))]
+                        let busy = tree_is_busy(child_pid).await;
+                        if busy == BusyKind::No {
+                            #[cfg(windows)]
+                            crate::process_utils::kill_windows_tree(&job_guard, child_pid);
+                            #[cfg(not(target_os = "windows"))]
+                            if let Some(pgid) = child_pid {
+                                unsafe { killpg(pgid as i32, SIGKILL) };
+                            }
+                            runtime.unregister_live_bash(child_pid_val);
+                            let (out, errb) = snapshot();
+                            let notice = "\n[Process finished emitting output and became idle waiting for stdin. Harvested available output.]";
+                            let mut full_out = out;
+                            full_out.extend_from_slice(notice.as_bytes());
+                            break Drive::Result(ok(format_streams(&full_out, &errb, Some((true, Some(0))), false)));
+                        }
                     }
                 }
                 status = child.wait() => {
@@ -872,34 +946,47 @@ impl Tool for BashTool {
                         child.terminated = true;
                     }
                     runtime.unregister_live_bash(child_pid_val);
-                    while !stdout_done {
-                        match stdout.read(&mut out_buf).await {
-                            Ok(0) | Err(_) => stdout_done = true,
-                            Ok(n) => {
-                                stdout_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&out_buf[..n]);
-                                if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &out_buf[..n], false) {
-                                    emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                    // 借鉴 Codex 工业级防线：为管道排空设置 2 秒硬超时（IO_DRAIN_TIMEOUT）。
+                    // 若子进程派生的孙子进程继承了 stdout/stderr 句柄，管道不会关闭导致 read() 无限期死等挂死整个 Agent！
+                    let drain_pipes = async {
+                        while !stdout_done {
+                            match stdout.read(&mut out_buf).await {
+                                Ok(0) | Err(_) => stdout_done = true,
+                                Ok(n) => {
+                                    extend_capped(
+                                        &mut *stdout_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                                        &out_buf[..n],
+                                        MAX_STREAM_CAPTURE_BYTES,
+                                    );
+                                    if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &out_buf[..n], false) {
+                                        emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                                    }
                                 }
                             }
                         }
-                    }
-                    if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &[], true) {
-                        emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
-                    }
-                    while !stderr_done {
-                        match stderr.read(&mut err_buf).await {
-                            Ok(0) | Err(_) => stderr_done = true,
-                            Ok(n) => {
-                                stderr_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&err_buf[..n]);
-                                if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &err_buf[..n], false) {
-                                    emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                        if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &[], true) {
+                            emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                        }
+                        while !stderr_done {
+                            match stderr.read(&mut err_buf).await {
+                                Ok(0) | Err(_) => stderr_done = true,
+                                Ok(n) => {
+                                    extend_capped(
+                                        &mut *stderr_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                                        &err_buf[..n],
+                                        MAX_STREAM_CAPTURE_BYTES,
+                                    );
+                                    if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &err_buf[..n], false) {
+                                        emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                                    }
                                 }
                             }
                         }
-                    }
-                    if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &[], true) {
-                        emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
-                    }
+                        if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &[], true) {
+                            emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                        }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(2), drain_pipes).await;
                     break Drive::Result(match status {
                         Ok(st) => {
                             let (out, errb) = snapshot();
@@ -1041,10 +1128,15 @@ impl Tool for BashTool {
                                     Ok(0) => stdout_done = true,
                                     Ok(n) => {
                                         *last_byte_bg.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                                        stdout_cap_bg.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&out_buf[..n]);
+                                        extend_capped(
+                                            &mut *stdout_cap_bg.lock().unwrap_or_else(|e| e.into_inner()),
+                                            &out_buf[..n],
+                                            MAX_STREAM_CAPTURE_BYTES,
+                                        );
                                         if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &out_buf[..n], false) {
                                             emit_live_chunk(&progress_bg, live_sent_bg.as_ref(), &chunk);
                                         }
+                                        tokio::task::yield_now().await;
                                     }
                                     Err(_) => stdout_done = true,
                                 }
@@ -1054,10 +1146,15 @@ impl Tool for BashTool {
                                     Ok(0) => stderr_done = true,
                                     Ok(n) => {
                                         *last_byte_bg.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                                        stderr_cap_bg.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&err_buf[..n]);
+                                        extend_capped(
+                                            &mut *stderr_cap_bg.lock().unwrap_or_else(|e| e.into_inner()),
+                                            &err_buf[..n],
+                                            MAX_STREAM_CAPTURE_BYTES,
+                                        );
                                         if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &err_buf[..n], false) {
                                             emit_live_chunk(&progress_bg, live_sent_bg.as_ref(), &chunk);
                                         }
+                                        tokio::task::yield_now().await;
                                     }
                                     Err(_) => stderr_done = true,
                                 }
@@ -4388,6 +4485,66 @@ pub(crate) fn detect_interactive_prompt_or_tui(
     None
 }
 
+/// 网络下载 / 包管理命令白名单：这类命令天然伴随网络 IO 等待与长耗时下载，
+/// 严禁触发静默提前收割，防止在网络下载阶段被误判误杀！
+pub(crate) fn is_network_or_download_workload(cmd: &str) -> bool {
+    let lower = cmd.trim().to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.is_empty() {
+        return false;
+    }
+    for word in words {
+        let binary = word
+            .rsplit('/')
+            .next()
+            .unwrap_or(word)
+            .rsplit('\\')
+            .next()
+            .unwrap_or(word);
+        let binary = binary.strip_suffix(".exe").unwrap_or(binary);
+        if matches!(
+            binary,
+            "apt"
+                | "apt-get"
+                | "dpkg"
+                | "yum"
+                | "dnf"
+                | "pacman"
+                | "brew"
+                | "apk"
+                | "npm"
+                | "yarn"
+                | "pnpm"
+                | "bun"
+                | "npx"
+                | "pip"
+                | "pip3"
+                | "poetry"
+                | "conda"
+                | "uv"
+                | "cargo"
+                | "rustup"
+                | "docker"
+                | "podman"
+                | "kubectl"
+                | "curl"
+                | "wget"
+                | "git"
+                | "scp"
+                | "rsync"
+                | "sftp"
+                | "gem"
+                | "composer"
+                | "go"
+                | "mvn"
+                | "gradle"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The strict read-only command allowlist: the FIRST word of every pipeline
 /// segment must be one of these for the command to be considered parallel-safe.
 /// Deliberately tiny — these commands do not write files, mutate state, or run
@@ -4778,6 +4935,7 @@ fn cargo_is_long(args: &[String]) -> bool {
             | "nextest"
             | "package"
             | "pkg"
+            | "fmt"
     )
 }
 
@@ -5567,7 +5725,11 @@ pub async fn run_shell(
             .kill_on_drop(true);
         crate::process_utils::suppress_console_window(&mut cmd);
         match cmd.spawn() {
-            Ok(c) => c,
+            Ok(c) => {
+                #[cfg(target_os = "windows")]
+                let _job = crate::process_utils::assign_child_to_kill_on_close_job(&c);
+                c
+            }
             Err(e) => {
                 return ShellOutcome {
                     stdout: String::new(),
@@ -5620,8 +5782,30 @@ pub async fn run_shell(
                     fn open(path: *const i8, oflag: i32, ...) -> i32;
                     fn close(fd: i32) -> i32;
                     fn ioctl(fd: i32, request: u64, ...) -> i32;
+                    fn nice(inc: i32) -> i32;
                 }
                 setsid();
+                nice(10);
+                #[cfg(target_os = "linux")]
+                {
+                    extern "C" {
+                        fn syscall(num: i64, ...) -> i64;
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    const NR_IOPRIO_SET: i64 = 251;
+                    #[cfg(target_arch = "aarch64")]
+                    const NR_IOPRIO_SET: i64 = 30;
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                    syscall(NR_IOPRIO_SET, 1, 0, (2 << 13) | 7);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    extern "C" {
+                        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+                    }
+                    // macOS Darwin I/O 策略：IOPOL_TYPE_DISK = 0, IOPOL_SCOPE_PROCESS = 0, IOPOL_THROTTLE = 3
+                    setiopolicy_np(0, 0, 3);
+                }
                 const O_RDWR: i32 = 2;
                 #[cfg(target_os = "macos")]
                 const TIOCNOTTY: u64 = 0x20007471;

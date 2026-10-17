@@ -1094,6 +1094,9 @@ fn search(
             return true;
         }
         files_searched += 1;
+        if files_searched % 64 == 0 {
+            std::thread::yield_now();
+        }
         let rel = crate::pathnorm::to_display(path.strip_prefix(base).unwrap_or(path));
         let mut file_matches = 0usize;
         {

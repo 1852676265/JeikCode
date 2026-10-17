@@ -456,7 +456,7 @@ impl Default for ToolOutputConfig {
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 200,
+            max_rounds: 230,
             connect_timeout_secs: 10,
             open_timeout_secs: 180,
             ttft_secs: 180,
@@ -505,7 +505,7 @@ pub struct SubAgentConfig {
     /// Deprecated compatibility field. Subtasks no longer have a total wall-clock limit;
     /// provider idle timeouts, `max_rounds`, and explicit cancellation own liveness.
     pub timeout_secs: u64,
-    /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
+    /// Per-subtask model-round high-water mark. Default 230; `0` means unbounded.
     /// Overridden by `JEIKCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
 }
@@ -519,7 +519,7 @@ impl Default for SubAgentConfig {
             max_concurrent: 3,
             // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
-            max_rounds: 200,
+            max_rounds: 230,
         }
     }
 }
@@ -620,7 +620,7 @@ pub struct Config {
     /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
     #[serde(default)]
     pub loop_config: LoopConfig,
-    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=200.
+    /// `[coding]` turn-level policy. Missing from older configs → max_rounds=230.
     #[serde(default)]
     pub coding: CodingConfig,
     /// Tool-specific behavior. Missing from older configs keeps todo enabled with

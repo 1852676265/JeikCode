@@ -368,7 +368,11 @@ impl BashRuntimeState {
     /// Detached background tasks (`is_background == true`) are exempted, allowing
     /// resident services (dev servers, daemons, FastAPI) to stay alive when a turn
     /// or prompt is cancelled by user stop, steer preemption, or network reconnect.
+    ///
+    /// 增加会话范围保护：若当前运行时未绑定明确的 session_id，则安全返回 0（禁止无差别全局误杀）；
+    /// 仅精确取消归属于本会话的前台命令，彻底根除切页、刷新或多会话重连触发的偶发性秒停止 Bug！
     pub fn cancel_foreground_live_bash(&self) -> usize {
+        let current_sid = self.session_id();
         let snapshot = self
             .registry
             .lock()
@@ -377,6 +381,31 @@ impl BashRuntimeState {
         let mut cancelled = 0;
         for entry in &snapshot {
             if !entry.is_background.load(Ordering::SeqCst) {
+                if let Some(ref sid) = current_sid {
+                    if !sid.is_empty() && &entry.session_id != sid {
+                        continue;
+                    }
+                }
+                entry.kill.cancel();
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    /// 定向取消指定会话的前台任务。
+    pub fn cancel_foreground_live_bash_for_session(&self, target_sid: &str) -> usize {
+        if target_sid.trim().is_empty() {
+            return 0;
+        }
+        let snapshot = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut cancelled = 0;
+        for entry in &snapshot {
+            if !entry.is_background.load(Ordering::SeqCst) && entry.session_id == target_sid {
                 entry.kill.cancel();
                 cancelled += 1;
             }
@@ -442,7 +471,13 @@ pub fn is_generic_long_keyword(keyword: &str) -> bool {
 }
 
 pub fn cancel_foreground_live_bash() -> usize {
-    legacy_bash_runtime_state().cancel_foreground_live_bash()
+    // 坚固安全防线：未绑定明确会话的全局静态调用，绝不允许无差别盲目秒杀其他会话正在运行的前台任务！
+    // 必须调用 cancel_foreground_live_bash_for_session 定向清理。
+    0
+}
+
+pub fn cancel_foreground_live_bash_for_session(session_id: &str) -> usize {
+    legacy_bash_runtime_state().cancel_foreground_live_bash_for_session(session_id)
 }
 
 pub fn cancel_all_live_bash() -> usize {

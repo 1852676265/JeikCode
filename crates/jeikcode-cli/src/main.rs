@@ -6,7 +6,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -3472,11 +3472,95 @@ fn run_init_command(dir: Option<PathBuf>, force: bool) -> i32 {
                 "  Tip: agent graph tools load `{DISK_CACHE_REL_DB}` automatically when up to date."
             );
             println!("  Re-run after large git pulls, or rely on incremental background refresh.");
+            ensure_gitignore_codegraph_entry(&root);
             0
         }
         Err(e) => {
             eprintln!("init error: {e}");
             1
+        }
+    }
+}
+
+/// 检查指定路径所在的目录是否属于 Git 仓库（工作树根目录或子目录）
+fn is_git_repository(dir: &Path) -> bool {
+    // 1. 优先检查当前目录是否包含 .git（包括目录或 worktree/submodule 文件）
+    if dir.join(".git").exists() {
+        return true;
+    }
+    // 2. 降级使用 git 命令检查是否位于 Git 工作树中
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(dir);
+    cmd.args(["rev-parse", "--is-inside-work-tree"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true",
+        Err(_) => false,
+    }
+}
+
+/// 判断 .gitignore 文件内容中是否已经包含了忽略 .jeikcode/codegraph/ 的规则
+/// （包括显式忽略 codegraph，或父级 .jeikcode/、.* 等整体忽略规则）
+fn gitignore_contains_codegraph(content: &str) -> bool {
+    content.lines().any(|raw_line| {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        // 匹配针对全部点前缀文件/目录的通配规则：.* 或 .*/
+        if line == ".*" || line == ".*/" {
+            return true;
+        }
+        // 剥离可能的前导与尾随修饰符
+        let rule = line.strip_prefix("**/").unwrap_or(line);
+        let rule = rule.strip_prefix('/').unwrap_or(rule);
+        let rule = rule.strip_suffix('/').unwrap_or(rule);
+        let rule = rule.strip_suffix("/*").unwrap_or(rule);
+
+        // 如果规则直接忽略了 .jeikcode/codegraph、整个 .jeikcode 目录或全局 codegraph 目录
+        rule == ".jeikcode/codegraph" || rule == ".jeikcode" || rule == "codegraph"
+    })
+}
+
+/// 在 jeikcode init / jeikcode init --force 结束时确保 .gitignore 包含 .jeikcode/codegraph/：
+/// 1. 自动判断当前是否为 git 仓库，若不是则直接退出
+/// 2. 找当前目录下是否存在 .gitignore 文件
+///    - 如果没有，就创建并写入 .jeikcode/codegraph/
+///    - 如果有，就判断 .jeikcode/codegraph/ 是否在忽略列表：如果不在就加入，如果在就忽略
+fn ensure_gitignore_codegraph_entry(root: &Path) {
+    if !is_git_repository(root) {
+        return;
+    }
+
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.exists() {
+        if let Err(e) = std::fs::write(&gitignore_path, ".jeikcode/codegraph/\n") {
+            eprintln!("warning: failed to create .gitignore: {e}");
+        }
+        return;
+    }
+
+    match std::fs::read_to_string(&gitignore_path) {
+        Ok(content) => {
+            if gitignore_contains_codegraph(&content) {
+                return;
+            }
+            let mut next = content;
+            if !next.is_empty() && !next.ends_with('\n') {
+                next.push('\n');
+            }
+            next.push_str(".jeikcode/codegraph/\n");
+            if let Err(e) = std::fs::write(&gitignore_path, next) {
+                eprintln!("warning: failed to update .gitignore: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to read .gitignore: {e}");
         }
     }
 }
@@ -4729,11 +4813,12 @@ fn install_panic_hook(telemetry: std::sync::Arc<jeikcode_telemetry::Telemetry>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_runtime_overrides, close_thinking_chunk, format_thinking_chunk,
-        format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, interactive_provider_bootstrap,
-        is_completion_invocation, jeikcode_log_path, merge_startup_notices, normalize_attach_base,
-        parse_desktop_webui_args, print_shell_completion, resolve_working_dir, runtime_config_from,
+        apply_cli_runtime_overrides, close_thinking_chunk, ensure_gitignore_codegraph_entry,
+        format_thinking_chunk, format_verbose_tool_chunk, gitignore_contains_codegraph,
+        headless_completion_exit_code, headless_completion_notify_reason,
+        interactive_provider_bootstrap, is_completion_invocation, jeikcode_log_path,
+        merge_startup_notices, normalize_attach_base, parse_desktop_webui_args,
+        print_shell_completion, resolve_working_dir, runtime_config_from,
         should_fork_busy_continue, token_from_url, truncate_log_line, Cli, Commands,
         DEFAULT_LOG_DIRECTIVES,
     };
@@ -5631,5 +5716,98 @@ mod tests {
         assert!(cmd.find_subcommand("list").is_some());
         assert!(cmd.find_subcommand("down").is_some());
         assert!(cmd.find_subcommand("upgrade").is_some());
+    }
+
+    #[test]
+    fn test_gitignore_contains_codegraph_patterns() {
+        // 直接忽略 .jeikcode/codegraph
+        assert!(gitignore_contains_codegraph(".jeikcode/codegraph/"));
+        assert!(gitignore_contains_codegraph(".jeikcode/codegraph"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph/"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph/"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph"));
+        assert!(gitignore_contains_codegraph(".jeikcode/codegraph/*"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph/*"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph/*"));
+        assert!(gitignore_contains_codegraph("codegraph/"));
+        assert!(gitignore_contains_codegraph("**/codegraph/"));
+
+        // 已经整目录忽略 .jeikcode/ 或 .*，无需重复追加
+        assert!(gitignore_contains_codegraph(".jeikcode/"));
+        assert!(gitignore_contains_codegraph(".jeikcode"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/"));
+        assert!(gitignore_contains_codegraph(".*"));
+        assert!(gitignore_contains_codegraph(".*/"));
+
+        // 前后有空白或换行
+        assert!(gitignore_contains_codegraph("  .jeikcode/codegraph/  \n"));
+
+        // 不匹配的情况（确保 rules.md, mcp.json, glossary.md 等项目配置不会被当成 codegraph 已忽略）
+        assert!(!gitignore_contains_codegraph(""));
+        assert!(!gitignore_contains_codegraph("# .jeikcode/codegraph/"));
+        assert!(!gitignore_contains_codegraph("!.jeikcode/codegraph/"));
+        assert!(!gitignore_contains_codegraph(".jeikcode/rules.md"));
+        assert!(!gitignore_contains_codegraph(".jeikcode/glossary.md"));
+        assert!(!gitignore_contains_codegraph(".jeikcode/local/"));
+        assert!(!gitignore_contains_codegraph("node_modules/"));
+        assert!(!gitignore_contains_codegraph(".jeikcode_store/"));
+    }
+
+    #[test]
+    fn test_ensure_gitignore_codegraph_entry_scenarios() {
+        // 场景 1：非 Git 仓库，不做任何操作
+        let non_git = tempfile::tempdir().unwrap();
+        ensure_gitignore_codegraph_entry(non_git.path());
+        assert!(!non_git.path().join(".gitignore").exists());
+
+        // 场景 2：是 Git 仓库，但无 .gitignore 文件 -> 自动创建并写入 .jeikcode/codegraph/\n
+        let git_repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(git_repo.path().join(".git")).unwrap();
+        ensure_gitignore_codegraph_entry(git_repo.path());
+        let gitignore = git_repo.path().join(".gitignore");
+        assert!(gitignore.exists());
+        assert_eq!(
+            std::fs::read_to_string(&gitignore).unwrap(),
+            ".jeikcode/codegraph/\n"
+        );
+
+        // 场景 3：已包含 .jeikcode/codegraph/，不重复添加
+        ensure_gitignore_codegraph_entry(git_repo.path());
+        assert_eq!(
+            std::fs::read_to_string(&gitignore).unwrap(),
+            ".jeikcode/codegraph/\n"
+        );
+
+        // 场景 4：已有 .gitignore 包含其它项目配置（如 rules.md 或 target），且不以换行符结尾，正确补齐换行并追加
+        let git_repo2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(git_repo2.path().join(".git")).unwrap();
+        let gi2 = git_repo2.path().join(".gitignore");
+        std::fs::write(&gi2, "target").unwrap();
+        ensure_gitignore_codegraph_entry(git_repo2.path());
+        assert_eq!(
+            std::fs::read_to_string(&gi2).unwrap(),
+            "target\n.jeikcode/codegraph/\n"
+        );
+
+        // 场景 5：已有以换行符结尾的 .gitignore，追加 .jeikcode/codegraph/\n
+        let git_repo3 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(git_repo3.path().join(".git")).unwrap();
+        let gi3 = git_repo3.path().join(".gitignore");
+        std::fs::write(&gi3, "node_modules/\n").unwrap();
+        ensure_gitignore_codegraph_entry(git_repo3.path());
+        assert_eq!(
+            std::fs::read_to_string(&gi3).unwrap(),
+            "node_modules/\n.jeikcode/codegraph/\n"
+        );
+
+        // 场景 6：已有 .jeikcode/ 整体忽略时，判定已忽略，不重复追加
+        let git_repo4 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(git_repo4.path().join(".git")).unwrap();
+        let gi4 = git_repo4.path().join(".gitignore");
+        std::fs::write(&gi4, ".jeikcode/\n").unwrap();
+        ensure_gitignore_codegraph_entry(git_repo4.path());
+        assert_eq!(std::fs::read_to_string(&gi4).unwrap(), ".jeikcode/\n");
     }
 }

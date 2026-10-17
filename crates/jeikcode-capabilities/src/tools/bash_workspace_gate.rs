@@ -44,7 +44,7 @@ use jeikcode_kernel::request::RequestCtx;
 use jeikcode_kernel::tool::{Tool, ToolCall};
 
 use super::approval::{
-    APPROVAL_KIND, ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore,
+    ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 use super::resolve_path;
 use super::sensitive_path::path_is_sensitive;

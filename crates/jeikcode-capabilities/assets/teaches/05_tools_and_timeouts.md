@@ -98,7 +98,7 @@ eager = "auto"                  # 积极度："auto" (按需识别) | "preferred
 
 ```toml
 [coding]
-max_rounds = 200                # 单会话模型思考交互最大轮次（0 表示无限制）
+max_rounds = 230                # 单会话模型思考交互最大轮次（0 表示无限制）
 connect_timeout_secs = 10       # TCP/TLS 建连
 open_timeout_secs = 180         # 等 HTTP 响应头（TTFB），不截断流式 body
 ttft_secs = 180                 # 首个思考/正文/工具 token（别名 first_token_timeout_secs）
@@ -116,7 +116,7 @@ first_token_timeout_retries = 3 # 首 Token 超时后自动重试次数
 ```toml
 [subagent]
 max_concurrent = 3              # 最大并发子代理数（默认 3）
-max_rounds = 200                # 每个子代理最大交互轮次（0 表示无限制）
+max_rounds = 230                # 每个子代理最大交互轮次（0 表示无限制）
 ```
 
 ---

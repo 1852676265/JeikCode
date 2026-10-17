@@ -698,7 +698,7 @@ fn default_turn_max_rounds() -> u32 {
     std::env::var("JEIKCODE_TURN_MAX_ROUNDS")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(200)
+        .unwrap_or(230)
 }
 
 fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
@@ -840,7 +840,7 @@ mod tests {
     #[test]
     fn round_caps_have_generous_defaults() {
         let c = CodingAgentConfig::new("k", "https://x/v1", "m", "/tmp");
-        assert_eq!(c.max_rounds, 200);
+        assert_eq!(c.max_rounds, 230);
         // No CodingPlan info at construction → the non-CodingPlan fallback.
         assert_eq!(c.goal_max_rounds, 300);
         // The wall-clock cap is OFF by default (0 = disabled); the goal is bounded

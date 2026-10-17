@@ -33,7 +33,7 @@ use std::sync::Arc;
 /// Last-resort per-turn high-water mark for composed child agents. Products can
 /// override it, including `0` for unbounded; exact no-progress loops are handled
 /// separately by the result-aware tool-loop policy.
-const DEFAULT_CHILD_MAX_ROUNDS: u32 = 200;
+const DEFAULT_CHILD_MAX_ROUNDS: u32 = 230;
 
 pub mod approval;
 pub mod ast_grep;
@@ -523,9 +523,18 @@ pub(crate) fn for_each_project_entry(
             return;
         }
         apply_skip_dirs(&mut builder);
+        let mut loop_count = 0usize;
         for entry in builder.build().flatten() {
             if !seen.insert(entry.path().to_path_buf()) {
                 continue;
+            }
+            // 协作式让步：每遍历 128 个条目主动让出当前线程时间片，
+            // 避免在数万乃至数十万大项目中紧密密集调用系统调用（NTFS/VFS 遍历）霸占内核 I/O 调度，
+            // 确保异地远程访问时的并发网络通信、sshd 终端回显与 HTTP 请求平滑顺畅。
+            loop_count += 1;
+            if loop_count >= 128 {
+                loop_count = 0;
+                std::thread::yield_now();
             }
             if !visit(&entry) {
                 stopped = true;

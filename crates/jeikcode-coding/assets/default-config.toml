@@ -16,13 +16,13 @@ offline_mode = "off"
 # Live knobs: max_concurrent / max_rounds. enabled / initial_turns / max_turns /
 # timeout_secs are kept only so old config files still parse.
 max_concurrent = 3
-max_rounds = 200
+max_rounds = 230
 
 [loop_config]
 max_rounds = 100
 
 [coding]
-max_rounds = 200
+max_rounds = 230
 connect_timeout_secs = 10
 open_timeout_secs = 180
 ttft_secs = 180
