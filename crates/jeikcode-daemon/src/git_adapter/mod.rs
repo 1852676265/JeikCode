@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub mod github;
+pub mod github_app;
 
 /// 平台渠道枚举
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +263,31 @@ pub struct GitAdapterConfig {
         alias = "review_model"
     )]
     pub review_model: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "github_app_id"
+    )]
+    pub github_app_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "github_app_private_key"
+    )]
+    pub github_app_private_key: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "github_app_private_key_path"
+    )]
+    pub github_app_private_key_path: Option<String>,
+    /// 记录当前 GitHub App 令牌的过期时间戳（UNIX 秒），持久化到磁盘，跨重启自动避开重复换发
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "token_expires_at"
+    )]
+    pub token_expires_at: Option<u64>,
 }
 
 fn default_keyword() -> String {

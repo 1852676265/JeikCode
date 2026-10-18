@@ -4024,14 +4024,34 @@ export function Chat({
   };
   const handleEyeDrop = (e: DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setEyeDragOver(false);
     setRightPanelTab('preview');
     setRightPanelCollapsed(false);
     try {
       const raw = e.dataTransfer?.getData('application/jeikcode-tab');
       const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
-      if (data?.filePath) {
-        window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', { detail: data }));
+      const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+      if (targetPath) {
+        window.dispatchEvent(
+          new CustomEvent('jeikcode:preview:open_file', {
+            detail: typeof data === 'object' && data?.filePath ? data : { filePath: targetPath },
+          }),
+        );
+        return;
+      }
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          const p = (file as any).path || file.name;
+          if (p) {
+            window.dispatchEvent(
+              new CustomEvent('jeikcode:preview:open_file', {
+                detail: { filePath: p, fileName: file.name },
+              }),
+            );
+          }
+        }
       }
     } catch {}
   };
@@ -4046,12 +4066,23 @@ export function Chat({
   const handleMainStageDrop = (e: DragEvent) => {
     if (e.defaultPrevented) return;
     e.preventDefault();
+    e.stopPropagation();
     try {
       const raw = e.dataTransfer?.getData('application/jeikcode-tab');
       const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
       const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
       if (targetPath && typeof targetPath === 'string' && targetPath.trim()) {
         window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: targetPath.trim() } }));
+        return;
+      }
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          const p = (file as any).path || file.name;
+          if (p) {
+            window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: p } }));
+          }
+        }
       }
     } catch {}
   };
@@ -7973,6 +8004,7 @@ export function Chat({
 
   function handleDrop(e: DragEvent) {
     e.preventDefault();
+    e.stopPropagation();
     setDragOver(false);
     const files = e.dataTransfer?.files;
     if (files && files.length) void addLocalFiles(files);

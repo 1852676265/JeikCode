@@ -53,13 +53,56 @@ pub async fn save_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl 
 }
 
 /// POST /api/git/test
-pub async fn test_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl IntoResponse {
-    let adapter = get_platform_adapter(&config.channel);
+pub async fn test_git_binding_api(Json(mut config): Json<GitAdapterConfig>) -> impl IntoResponse {
     let custom_api_base = if config.custom_api_base.trim().is_empty() {
         None
     } else {
         Some(config.custom_api_base.as_str())
     };
+
+    // 如果配置了 GitHub App 认证凭据，由纯 Rust 原生在内存中自动签发或轮换最新的官方 [bot] 令牌！
+    if config.channel == "github" {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let token_still_valid = config
+            .token_expires_at
+            .is_some_and(|exp| now + 300 < exp && !config.access_token.trim().is_empty());
+
+        if !token_still_valid {
+            if let Some(app_id_str) = config.github_app_id.as_deref() {
+                if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
+                    let pem_res = if let Some(content) = config.github_app_private_key.as_deref().filter(|s| !s.trim().is_empty()) {
+                        Some(content.to_string())
+                    } else if let Some(path) = config.github_app_private_key_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                        std::fs::read_to_string(path.trim()).ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(pem) = pem_res {
+                        if let Ok((fresh_token, _)) = crate::git_adapter::github_app::fetch_installation_token(app_id, &pem, &config.repo_identifier).await {
+                            config.access_token = fresh_token.clone();
+                            config.token_expires_at = Some(now + 3300);
+                            // 顺带同步持久化，确保后续请求直接复用有效令牌
+                            if let Some(mut existing) = crate::git_adapter::get_binding_by_project(&config.project_hash) {
+                                existing.access_token = fresh_token;
+                                existing.token_expires_at = Some(now + 3300);
+                                existing.github_app_id = Some(app_id.to_string());
+                                if let Some(p) = &config.github_app_private_key_path {
+                                    existing.github_app_private_key_path = Some(p.clone());
+                                }
+                                crate::git_adapter::save_binding(existing);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let adapter = get_platform_adapter(&config.channel);
     match adapter
         .test_connection(
             &config.access_token,
@@ -85,6 +128,110 @@ pub async fn test_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl 
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateAppTokenRequest {
+    #[serde(alias = "app_id")]
+    pub app_id: u64,
+    #[serde(default, alias = "private_key_path")]
+    pub private_key_path: Option<String>,
+    #[serde(default, alias = "private_key")]
+    pub private_key: Option<String>,
+    #[serde(default, alias = "repo_identifier")]
+    pub repo_identifier: Option<String>,
+    #[serde(default, alias = "project_hash")]
+    pub project_hash: Option<String>,
+}
+
+/// POST /api/git/generate-token
+/// 使用 GitHub App ID 和私钥，纯 Rust 原生在内存中计算 RS256 JWT 并向 GitHub 换取官方 [bot] 安装访问令牌
+pub async fn generate_app_token_api(
+    Json(req): Json<GenerateAppTokenRequest>,
+) -> impl IntoResponse {
+    let repo = req
+        .repo_identifier
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "jeikl/JeikCode".to_string());
+
+    let pem_content = if let Some(content) = req.private_key.filter(|s| !s.trim().is_empty()) {
+        content
+    } else if let Some(path) = req.private_key_path.as_deref().filter(|s| !s.trim().is_empty()) {
+        match std::fs::read_to_string(path.trim()) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Cannot read private key file '{}': {e}", path.trim())
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Missing private key (please provide a file path or key content)"
+            })),
+        )
+            .into_response();
+    };
+
+    // 纯 Rust 原生计算 JWT 并向 GitHub 换发安装令牌
+    let (token, inst_id) = match crate::git_adapter::github_app::fetch_installation_token(
+        req.app_id,
+        &pem_content,
+        &repo,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": e,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = now + 3300;
+
+    // 若传入了 project_hash，自动将签发好的 token 及 App 凭据同步写入持久化文件（项目专属隔离）
+    if let Some(hash) = req.project_hash.filter(|s| !s.trim().is_empty()) {
+        if let Some(mut cfg) = crate::git_adapter::get_binding_by_project(&hash) {
+            cfg.access_token = token.clone();
+            cfg.token_expires_at = Some(expires_at);
+            cfg.github_app_id = Some(req.app_id.to_string());
+            if let Some(p) = req.private_key_path {
+                cfg.github_app_private_key_path = Some(p);
+            }
+            crate::git_adapter::save_binding(cfg);
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "token": token,
+            "installationId": inst_id,
+            "expiresAt": expires_at,
+            "message": format!("Successfully generated official GitHub App [bot] token! (Installation: {inst_id})")
+        })),
+    ).into_response()
 }
 
 /// GET /api/webhooks/git & GET /api/webhooks/github
@@ -212,8 +359,45 @@ async fn execute_git_workflow(
         None => return Ok(()),
     };
 
-    let token = config.access_token.trim();
     let repo = &event.repo_full_name;
+    let mut token = config.access_token.trim().to_string();
+
+    // 如果是 GitHub 渠道，并且配置了 GitHub App 凭据，由纯 Rust 原生在内存中自动确保令牌为最新鲜有效状态！
+    if config.channel == "github" {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let token_still_valid = config
+            .token_expires_at
+            .is_some_and(|exp| now + 300 < exp && !token.trim().is_empty());
+
+        if !token_still_valid {
+            if let Some(app_id_str) = config.github_app_id.as_deref() {
+                if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
+                    let pem_res = if let Some(content) = config.github_app_private_key.as_deref().filter(|s| !s.trim().is_empty()) {
+                        Some(content.to_string())
+                    } else if let Some(path) = config.github_app_private_key_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                        std::fs::read_to_string(path.trim()).ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(pem) = pem_res {
+                        if let Ok((fresh_token, _)) = crate::git_adapter::github_app::fetch_installation_token(app_id, &pem, repo).await {
+                            token = fresh_token.clone();
+                            if let Some(mut existing) = crate::git_adapter::get_binding_by_project(&config.project_hash) {
+                                existing.access_token = fresh_token;
+                                existing.token_expires_at = Some(now + 3300);
+                                crate::git_adapter::save_binding(existing);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let session_id = format!("git_pr_{}_{}", config.project_hash, pr_or_issue_number);
     let pr_url = event.resolve_html_url();
     let custom_api_base = if config.custom_api_base.trim().is_empty() {
@@ -313,24 +497,38 @@ async fn execute_git_workflow(
         return Ok(());
     }
 
-    // 3. 若未在运行，若配置了有效 Token，先发出即时双语确认提示（告知用户已收到，正在处理）
+    // 3. 若未在运行，若配置了有效 Token，先发出即时看板进度卡（方案 C：无尾注，带 🌟，工整紧凑）
     if !token.is_empty() {
         let ack_message = if is_zh {
             format!(
-                "🤖 **JeikCode Reviewer**: 已收到 [{kind_label} #{pr_or_issue_number}]({pr_url})，正在结合目标分支最新代码开展深度审查，请稍候…\n\n---\n\nReceived [{kind_label} #{pr_or_issue_number}]({pr_url}). Analyzing against the latest target branch code, please wait a moment..."
+                "### 🌟 JeikCode Code Review\n\
+                - **状态 (Status)**: ⏳ 正在审查 / In Progress\n\
+                - **目标 (Target)**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
+                > *(审查完成后，完整报告将在此直接更新呈现)*"
             )
         } else if is_vi {
             format!(
-                "🤖 **JeikCode Reviewer**: Đã nhận được [{kind_label} #{pr_or_issue_number}]({pr_url}), đang tiến hành đánh giá chuyên sâu kết hợp với mã nguồn mới nhất của nhánh đích, vui lòng chờ…\n\n---\n\nReceived [{kind_label} #{pr_or_issue_number}]({pr_url}). Analyzing against the latest target branch code, please wait a moment..."
+                "### 🌟 JeikCode Code Review\n\
+                - **Trạng thái (Status)**: ⏳ Đang tiến hành đánh giá / In Progress\n\
+                - **Mục tiêu (Target)**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
+                > *(Sau khi hoàn thành đánh giá, báo cáo đầy đủ sẽ được cập nhật trực tiếp tại đây)*"
             )
         } else {
             format!(
-                "🤖 **JeikCode Reviewer**: Received [{kind_label} #{pr_or_issue_number}]({pr_url}). Analyzing against the latest target branch code, please wait a moment...\n\n---\n\n已收到 [{kind_label} #{pr_or_issue_number}]({pr_url})，正在结合目标分支最新代码开展深度审查，请稍候…"
+                "### 🌟 JeikCode Code Review\n\
+                - **Status**: ⏳ In Progress\n\
+                - **Target**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
+                > *(The complete review report will be updated here shortly)*"
             )
         };
-        let final_ack = append_jeikcode_footer(&ack_message);
         let _ = adapter
-            .post_comment(token, custom_api_base, repo, pr_or_issue_number, &final_ack)
+            .post_comment(
+                &token,
+                custom_api_base,
+                repo,
+                pr_or_issue_number,
+                &ack_message,
+            )
             .await;
     }
 
@@ -485,12 +683,12 @@ async fn execute_git_workflow(
         let final_review_output = append_jeikcode_footer(&collected_review);
         if config.update_existing_comment {
             if let Ok(Some(existing_id)) = adapter
-                .find_bot_primary_comment(token, custom_api_base, repo, pr_or_issue_number)
+                .find_bot_primary_comment(&token, custom_api_base, repo, pr_or_issue_number)
                 .await
             {
                 let _ = adapter
                     .update_comment(
-                        token,
+                        &token,
                         custom_api_base,
                         repo,
                         existing_id,
@@ -503,7 +701,7 @@ async fn execute_git_workflow(
 
         let _ = adapter
             .post_comment(
-                token,
+                &token,
                 custom_api_base,
                 repo,
                 pr_or_issue_number,
@@ -587,13 +785,12 @@ fn assemble_dynamic_prompt(config: &GitAdapterConfig) -> String {
     }
 }
 
-/// 在每一次发表或更新评论时，硬编码附加 JeikCode 署名与推广尾注
+/// 在最终发表或更新正式审查报告时，附加极简星标推广尾注
 pub fn append_jeikcode_footer(content: &str) -> String {
     let trimmed = content.trim_end();
     format!(
         "{trimmed}\n\n\
         ---\n\n\
-        Co-Authored-By: JeikCode@jeikcode.top\n\n\
-        🤖 Generated with [JeikCode](https://jeikcode.top)"
+        🌟 Generated by [JeikCode](https://jeikcode.top)"
     )
 }

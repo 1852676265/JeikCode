@@ -15456,6 +15456,63 @@ body {
   color: var(--app-primary-foreground, #f4f4f5);
 }
 
+/* 顶部快捷跳转胶囊按钮组 */
+.git-header-capsules {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.git-capsule-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--app-border, rgba(255, 255, 255, 0.1));
+  color: var(--app-secondary-foreground, #a1a1aa);
+  font-size: 11px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.git-capsule-btn:hover {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.4);
+  color: #60a5fa;
+  transform: translateY(-1px);
+}
+
+/* GitHub App 令牌激活状态横幅 */
+.git-app-status-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  margin-top: 8px;
+  background: color-mix(in srgb, #10b981 10%, transparent);
+  border: 1px solid color-mix(in srgb, #10b981 25%, transparent);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #34d399;
+}
+
+.git-token-calc-btn {
+  background: rgba(59, 130, 246, 0.15) !important;
+  border-color: rgba(59, 130, 246, 0.35) !important;
+  color: #60a5fa !important;
+  font-weight: 600 !important;
+}
+
+.git-token-calc-btn:hover {
+  background: rgba(59, 130, 246, 0.25) !important;
+  border-color: #3b82f6 !important;
+}
+
 .git-save-btn {
   height: 32px;
   padding: 0 16px;

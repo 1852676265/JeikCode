@@ -985,6 +985,19 @@ const zh = {
   'gitWebhook.copyFullUrlHint': '一键复制完整 Webhook 线上地址',
   'gitWebhook.showToken': '显示令牌',
   'gitWebhook.hideToken': '隐藏令牌',
+  'gitWebhook.capsuleApplyApp': 'Git App 申请',
+  'gitWebhook.capsuleAppId': 'App ID',
+  'gitWebhook.capsuleAppKey': 'App 密钥获取',
+  'gitWebhook.appIdLabel': 'GitHub App ID (数字标识)',
+  'gitWebhook.appIdPlaceholder': '例如: 5363962',
+  'gitWebhook.appIdHint': '在 GitHub Apps 概览页可见的专属数字 App ID',
+  'gitWebhook.privateKeyLabel': 'GitHub App 私钥 (.pem 密钥或文件路径)',
+  'gitWebhook.privateKeyPlaceholder': '输入私钥文件完整路径，或点击右侧按钮选择文件/粘贴内容',
+  'gitWebhook.browsePrivateKey': '📂 本地浏览...',
+  'gitWebhook.calcAppToken': '⚡ 计算并签发',
+  'gitWebhook.appTokenActive': '官方 [bot] 令牌已激活',
+  'gitWebhook.useManualPat': '切换为手动输入 PAT',
+  'gitWebhook.useGithubApp': '使用 GitHub 官方 App 模式 (推荐)',
 } as const;
 
 export type MsgKey = keyof typeof zh;
@@ -1943,6 +1956,19 @@ export const en: Record<MsgKey, string> = {
   'gitWebhook.copyFullUrlHint': 'Copy full Webhook endpoint URL',
   'gitWebhook.showToken': 'Show token',
   'gitWebhook.hideToken': 'Hide token',
+  'gitWebhook.capsuleApplyApp': 'Apply Git App',
+  'gitWebhook.capsuleAppId': 'App ID',
+  'gitWebhook.capsuleAppKey': 'Get Private Key',
+  'gitWebhook.appIdLabel': 'GitHub App ID',
+  'gitWebhook.appIdPlaceholder': 'e.g., 5363962',
+  'gitWebhook.appIdHint': 'Numeric App ID visible on your GitHub App General settings page',
+  'gitWebhook.privateKeyLabel': 'GitHub App Private Key (.pem file or path)',
+  'gitWebhook.privateKeyPlaceholder': 'Enter absolute path to .pem file or click browse',
+  'gitWebhook.browsePrivateKey': '📂 Browse...',
+  'gitWebhook.calcAppToken': '⚡ Generate Token',
+  'gitWebhook.appTokenActive': 'Official [bot] token active',
+  'gitWebhook.useManualPat': 'Switch to manual PAT',
+  'gitWebhook.useGithubApp': 'Use GitHub App Mode (Recommended)',
 };
 
 export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en, vi };

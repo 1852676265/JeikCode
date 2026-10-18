@@ -13462,6 +13462,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             get(api_git_webhook::get_git_binding_api).post(api_git_webhook::save_git_binding_api),
         )
         .route("/api/git/test", post(api_git_webhook::test_git_binding_api))
+        .route(
+            "/api/git/generate-token",
+            post(api_git_webhook::generate_app_token_api),
+        )
         // MCP API
         .route("/mcp", get(mcp_status))
         .route("/mcp/status", get(mcp_status))
