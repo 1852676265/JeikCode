@@ -21,6 +21,42 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.7 (2026-10-18)
+
+- **[OpenWrt & Gateway] Full OpenWrt ecosystem integration with automated symlinking and procd autostart**:
+  - Supported OpenWrt and its derivative distributions (ImmortalWrt, iStoreOS, Kwrt, LEDE) across x86_64 and aarch64 architectures as first-class citizens in the unified agent ecosystem.
+  - Implemented multi-heuristic environment fingerprinting based on `/etc/openwrt_release`, `/sbin/procd`, the UCI configuration tree, and `/etc/os-release`.
+  - Added automated `/usr/bin/jeikcode` PATH symlink creation during installation for zero-configuration, out-of-the-box execution across all shells.
+  - Integrated interactive `procd` service generation and process supervision (`respawn 3600 5 0`) in `--host` serve mode, with symmetric uninstall cleanup and dedicated documentation.
+- **[Git & Code Review] Native GitHub App authentication, auto-token refresh, and streamlined review directives**:
+  - Implemented native Rust GitHub App authentication via RS256 JWT signing and automated installation access token refresh with 55-minute in-memory caching.
+  - Refined multi-language code review prompts across Chinese, English, and Vietnamese, prioritizing user comment intent to avoid over-thinking when review is unneeded and omitting trailing co-authorship trailers.
+  - Streamlined review acknowledgment feedback cards with star indicators and sanitized nested webhook parameters.
+- **[Desktop & Editor] Windows in-app drag-and-drop restoration and expanded syntax highlight thresholds**:
+  - Disabled the native window-level FileDropHandler alongside WebView2 drop handlers on Windows Tauri builds, restoring HTML5 drag-and-drop for file tree nodes and preview tabs.
+  - Dynamically aligned `dropEffect` with `effectAllowed` in the global drag listener to eliminate forbidden cursor states in WebView2.
+  - Relaxed code highlight byte limits for large file editor tabs.
+- **[Capabilities & Subagents] Action receipts and context compaction (#62)**:
+  - Added authoritative action receipt ledgers for explore subagents, output compaction guards, and receipt-preserving historical context stubs in TaskTool and StubCompaction.
+
+---
+
+- **[OpenWrt 与软路由] 全面接入 OpenWrt 软路由生态、自动软链接与 procd 开机自启**:
+  - 全平台统一 Agent 深度接入 OpenWrt 及其主流衍生固件（ImmortalWrt、iStoreOS、Kwrt、LEDE），全面支持 x86_64 与 aarch64 芯片架构。
+  - 构建基于 `/etc/openwrt_release`、`/sbin/procd`、UCI 配置树与 `/etc/os-release` 的多维高精度指纹识别引擎。
+  - 一键安装脚本自动在系统 PATH 目录建立 `/usr/bin/jeikcode` 软链接，无需手动配置环境变量即可开箱即用。
+  - `--host` 启动模式深度集成 `procd` 交互向导与进程守护（`respawn 3600 5 0`），卸载流程对称清理软链与 profile 配置，并同步上线软路由专属部署文档。
+- **[Git 与代码审查] 原生 GitHub App 签名续期与审查提示词意图精简**:
+  - 纯 Rust 原生实现 GitHub App RS256 JWT 算法签名与安装令牌自动换发，配备 55 分钟内存自旋缓存与项目隔离持久化。
+  - 深度优化中英越三语代码审查默认提示词模板，优先关注用户需求与身份，无需审查时直接精简回复以避免过度思考，并规范审查意见末尾免除共创者署名。
+  - Webhook 交互引入轻量级状态确认卡片与星标指示，修复嵌套参数 422 校验异常。
+- **[桌面端与交互] Windows 应用内拖拽修复与代码高亮上限放宽**:
+  - 在 Windows 桌面端同时禁用窗口级 FileDropHandler 与 WebView2 放置目标，彻底解决文件树节点与标签页拖放被原生拦截失效的问题。
+  - 全局拖放监听器动态对齐 `dropEffect` 与 `effectAllowed`，消除 WebView2 环境下的禁止光标。
+  - 适度放宽大文件编辑器标签页的语法高亮字节上限。
+- **[能力系统与子智能体] 子智能体操作回执与上下文窗口压缩保护 (#62)**:
+  - 在 TaskTool 与 StubCompaction 中为 explore 子 agent 提供权威操作回执账本、输出压缩保护以及保留回执的历史会话压缩存根。
+
 ## v7.2.5-beta.6 (2026-10-18)
 
 - **[Git & Webhook] Webhook host resilience, connectivity feedback, and browser-friendly status page**:
