@@ -800,7 +800,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
             e.dataTransfer?.setData('application/jeikcode-tab', JSON.stringify(data));
             e.dataTransfer?.setData('text/plain', node.path);
             if (e.dataTransfer) {
-              e.dataTransfer.effectAllowed = 'copyMove';
+              e.dataTransfer.effectAllowed = 'all';
             }
           }}
           onDragEnd={() => {
@@ -1109,7 +1109,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                           e.dataTransfer?.setData('application/jeikcode-tab', JSON.stringify(data));
                           e.dataTransfer?.setData('text/plain', group.file);
                           if (e.dataTransfer) {
-                            e.dataTransfer.effectAllowed = 'copyMove';
+                            e.dataTransfer.effectAllowed = 'all';
                           }
                         }}
                         onDragEnd={() => {

@@ -720,26 +720,42 @@ export function CodeEditorTab({
     };
   }, []);
 
+  const handleEditorDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  };
+
+  const handleEditorDrop = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+      const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+      const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+      if (targetPath) {
+        window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: targetPath.trim() } }));
+        return;
+      }
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          const p = (file as any).path || file.name;
+          if (p) {
+            window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: p } }));
+          }
+        }
+      }
+    } catch {}
+  };
+
   return (
     <div
       class="code-editor-root"
       ref={editorRootRef}
-      onDragOver={(e) => {
-        e.preventDefault();
-        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        try {
-          const raw = e.dataTransfer?.getData('application/jeikcode-tab');
-          const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
-          const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
-          if (targetPath) {
-            window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: targetPath.trim() } }));
-          }
-        } catch {}
-      }}
+      onDragOver={handleEditorDragOver}
+      onDrop={handleEditorDrop}
     >
       {/* 顶部工具栏 */}
       {!hideHeaderToolbar && (
@@ -1067,7 +1083,11 @@ export function CodeEditorTab({
       )}
 
       {/* 核心舞台：代码编辑器 或 Markdown 深度渲染 或 图片预览 或 二进制引导卡片 */}
-      <div class="code-editor-stage">
+      <div
+        class="code-editor-stage"
+        onDragOver={handleEditorDragOver}
+        onDrop={handleEditorDrop}
+      >
         {loading ? (
           <div class="diff-loading-wrap">
             <div class="git-spinner" />
@@ -1178,7 +1198,11 @@ export function CodeEditorTab({
             />
           </div>
         ) : (
-          <div class="editor-code-container">
+          <div
+            class="editor-code-container"
+            onDragOver={handleEditorDragOver}
+            onDrop={handleEditorDrop}
+          >
             {/* 行号侧栏 (单个 pre 极速渲染，大文件缩放与滚动零延迟) */}
             <div class="editor-line-numbers" ref={lineNumbersRef} aria-hidden="true">
               {targetLineBand && (
@@ -1187,7 +1211,11 @@ export function CodeEditorTab({
               <pre class="line-numbers-pre">{lineNumbersText}</pre>
             </div>
             {/* 代码主体包装器 (双层叠加：高亮预览底层 + 原生透明编辑上层) */}
-            <div class="editor-code-wrapper">
+            <div
+              class="editor-code-wrapper"
+              onDragOver={handleEditorDragOver}
+              onDrop={handleEditorDrop}
+            >
               {targetLineBand && (
                 <div class="editor-target-lines-band" style={targetLineBand} aria-hidden="true" />
               )}
@@ -1199,23 +1227,8 @@ export function CodeEditorTab({
                 class={'editor-textarea' + (viewMode === 'preview' ? ' is-preview-readonly' : '')}
                 value={content}
                 readOnly={viewMode === 'preview'}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
-                }}
-                onDrop={(e) => {
-                  // 拦截原生插入文本行为，防止将文件路径追加到代码中，统一在新标签页打开！
-                  e.preventDefault();
-                  e.stopPropagation();
-                  try {
-                    const raw = e.dataTransfer?.getData('application/jeikcode-tab');
-                    const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
-                    const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
-                    if (targetPath) {
-                      window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: targetPath.trim() } }));
-                    }
-                  } catch {}
-                }}
+                onDragOver={handleEditorDragOver}
+                onDrop={handleEditorDrop}
                 onInput={(e) => {
                   const val = (e.target as HTMLTextAreaElement).value;
                   const cur = (e.target as HTMLTextAreaElement).selectionStart;

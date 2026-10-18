@@ -232,7 +232,7 @@ fn main() {
         .setup(|app| {
             let webui_origin = Arc::new(Mutex::new(None));
             let nav_origin = Arc::clone(&webui_origin);
-            let window = tauri::WebviewWindowBuilder::new(
+            let window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
@@ -240,7 +240,6 @@ fn main() {
             .title("JeikCode Desktop")
             .inner_size(1280.0, 800.0)
             .resizable(true)
-            .disable_drag_drop_handler()
             .on_navigation(move |url| {
                 let action = {
                     let guard = nav_origin.lock().unwrap_or_else(|e| e.into_inner());
@@ -259,10 +258,34 @@ fn main() {
                     open_in_external_browser(&external_browser_url(&url));
                 }
                 tauri::webview::NewWindowResponse::Deny
-            })
-            .build()?;
+            });
+            // Windows 上有两套原生放置目标，都会把「不是系统文件」的拖放写成 DROPEFFECT_NONE，
+            // 光标就是禁止。disable_drag_drop_handler / tauri.conf.json 的 dragDropEnabled
+            // 只卸 WebView2 那一套；窗口自己的 FileDropHandler 还在，应用内拖文件树、标签照样被禁。
+            // 两套都关掉，拖放才进页面里的 HTML5。
+            #[cfg(target_os = "windows")]
+            let window_builder = window_builder.disable_drag_drop_handler().drag_and_drop(false);
+            let window = window_builder.build()?;
 
             watch_host_presence(window.clone());
+            let drop_window = window.clone();
+            // 仅原生拖放还开着的平台会收到这些事件（Windows 已关掉，改由页面 HTML5 处理）。
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::DragDrop(drop_event) = event {
+                    if let tauri::DragDropEvent::Drop { paths, .. } = drop_event {
+                        for path in paths {
+                            let p_str = path.to_string_lossy().replace('\\', "/");
+                            let json_path = serde_json::to_string(&p_str).unwrap_or_default();
+                            let script = format!(
+                                "window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {{ detail: 'preview' }}));\
+                                 window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {{ detail: {{ filePath: {json_path} }} }}));\
+                                 window.dispatchEvent(new CustomEvent('jeikcode:open_file', {{ detail: {{ path: {json_path} }} }}));"
+                            );
+                            let _ = drop_window.eval(&script);
+                        }
+                    }
+                }
+            });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {

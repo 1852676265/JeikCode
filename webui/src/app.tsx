@@ -400,6 +400,71 @@ export function App() {
     window.addEventListener('jeikcode:switch_main_tab', onSwitchTab);
     return () => window.removeEventListener('jeikcode:switch_main_tab', onSwitchTab);
   }, []);
+
+  // 全局拖拽防护与解绑：彻底解除拖动限制，杜绝光标在未监听区域出现禁止图标，
+  // 并阻止原生浏览器/WebView 将网页直接导航替换为所拖动文件的默认行为。
+  // 使用捕获阶段 (capture: true) 拦截 dragenter/dragover，确保在进入任何子元素前已标记 copy 效果，绝不闪现禁止图标！
+  useEffect(() => {
+    const handleGlobalDragOver = (e: DragEvent) => {
+      e.preventDefault();
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      // WebView2 比 Chrome 严：dropEffect 不在 effectAllowed 里时，光标直接变成禁止。
+      // 预览标签只允许 move，这里若写死 copy，拖到编辑区就会一直是禁止。
+      const allowed = dt.effectAllowed;
+      dt.dropEffect =
+        allowed === 'move' || allowed === 'linkMove'
+          ? 'move'
+          : allowed === 'link' || allowed === 'copyLink'
+            ? 'link'
+            : 'copy';
+    };
+    const handleGlobalDrop = (e: DragEvent) => {
+      e.preventDefault();
+      try {
+        const raw = e.dataTransfer?.getData('application/jeikcode-tab');
+        const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
+        const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+        if (targetPath && typeof targetPath === 'string' && targetPath.trim()) {
+          window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
+          window.dispatchEvent(
+            new CustomEvent('jeikcode:preview:open_file', {
+              detail: typeof data === 'object' && data?.filePath ? data : { filePath: targetPath.trim() },
+            }),
+          );
+          return;
+        }
+        if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+          for (let i = 0; i < e.dataTransfer.files.length; i++) {
+            const file = e.dataTransfer.files[i];
+            const p = (file as any).path || file.name;
+            if (p) {
+              window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', { detail: 'preview' }));
+              window.dispatchEvent(
+                new CustomEvent('jeikcode:preview:open_file', {
+                  detail: { filePath: p, fileName: file.name },
+                }),
+              );
+            }
+          }
+        }
+      } catch {}
+    };
+
+    const listen = { capture: true, passive: false } as const;
+    window.addEventListener('dragenter', handleGlobalDragOver, listen);
+    window.addEventListener('dragover', handleGlobalDragOver, listen);
+    window.addEventListener('drop', handleGlobalDrop, listen);
+    document.addEventListener('dragenter', handleGlobalDragOver, listen);
+    document.addEventListener('dragover', handleGlobalDragOver, listen);
+    return () => {
+      window.removeEventListener('dragenter', handleGlobalDragOver, listen);
+      window.removeEventListener('dragover', handleGlobalDragOver, listen);
+      window.removeEventListener('drop', handleGlobalDrop, listen);
+      document.removeEventListener('dragenter', handleGlobalDragOver, listen);
+      document.removeEventListener('dragover', handleGlobalDragOver, listen);
+    };
+  }, []);
   // Chat reports whether it is showing the centered landing (empty) state, so the
   // session-title header can hide on landing (matching the design's full-bleed hero).
   const [isLanding, setIsLanding] = useState(true);

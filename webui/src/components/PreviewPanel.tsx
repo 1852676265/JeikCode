@@ -334,8 +334,20 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     try {
       const raw = e.dataTransfer?.getData('application/jeikcode-tab');
       const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
-      if (data?.filePath) {
-        openTab(data, targetIndex);
+      const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+      if (targetPath) {
+        openTab(typeof data === 'object' && data?.filePath ? data : { filePath: targetPath }, targetIndex);
+        setDraggedTabIndex(null);
+        return;
+      }
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          const p = (file as any).path || file.name;
+          if (p) {
+            openTab({ filePath: p, fileName: file.name }, targetIndex);
+          }
+        }
       }
     } catch {}
     setDraggedTabIndex(null);
@@ -377,8 +389,19 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     try {
       const raw = e.dataTransfer?.getData('application/jeikcode-tab');
       const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
-      if (data?.filePath) {
-        openTab(data);
+      const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+      if (targetPath) {
+        openTab(typeof data === 'object' && data?.filePath ? data : { filePath: targetPath });
+        return;
+      }
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          const p = (file as any).path || file.name;
+          if (p) {
+            openTab({ filePath: p, fileName: file.name });
+          }
+        }
       }
     } catch {}
   };
@@ -404,12 +427,23 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
       }}
       onDrop={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         try {
           const raw = e.dataTransfer?.getData('application/jeikcode-tab');
           const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
           const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
           if (targetPath) {
             openTab(typeof data === 'object' && data?.filePath ? data : { filePath: targetPath });
+            return;
+          }
+          if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+            for (let i = 0; i < e.dataTransfer.files.length; i++) {
+              const file = e.dataTransfer.files[i];
+              const p = (file as any).path || file.name;
+              if (p) {
+                openTab({ filePath: p, fileName: file.name });
+              }
+            }
           }
         } catch {}
       }}
@@ -542,11 +576,23 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
         }}
         onDrop={(e) => {
           e.preventDefault();
+          e.stopPropagation();
           try {
             const raw = e.dataTransfer?.getData('application/jeikcode-tab');
             const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
-            if (data?.filePath) {
-              openTab(data);
+            const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
+            if (targetPath) {
+              openTab(typeof data === 'object' && data?.filePath ? data : { filePath: targetPath });
+              return;
+            }
+            if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+              for (let i = 0; i < e.dataTransfer.files.length; i++) {
+                const file = e.dataTransfer.files[i];
+                const p = (file as any).path || file.name;
+                if (p) {
+                  openTab({ filePath: p, fileName: file.name });
+                }
+              }
             }
           } catch {}
         }}

@@ -81,8 +81,9 @@ const RAW_LOCK_EXTS = new Set([
  * 将代码文本转换为带有丰富高亮 span 的 HTML 字符串。
  */
 export function highlightCode(code: string, fileName: string): string {
-  // 对于超大文件（代码长度 > 250KB 或超过 3500 行），采用纯文本快速安全转义，保证瞬时毫秒级秒开与缩放零卡顿！
-  if (code.length > 250_000 || (code.length > 3000 && code.split('\n').length > 3500)) {
+  // 对于超大极端文件（代码长度 > 800KB 或超过 16000 行），采用纯文本快速安全转义，保证瞬时毫秒级秒开与缩放零卡顿！
+  // 放宽至 800KB / 16000 行以完美覆盖 Chat.tsx (~1.1万行/460KB) 等大型复杂组件的语法高亮
+  if (code.length > 800_000 || (code.length > 5000 && code.split('\n').length > 16_000)) {
     return escapeHtml(code);
   }
 
