@@ -358,24 +358,32 @@ export function saveProjectGitConfig(projectHash: string, config: GitAdapterConf
   const cleanPayload = config.webhook?.payloadUrl
     ? normalizeWebhookHost(config.webhook.payloadUrl).replace(/\/+$/, '')
     : '';
-  const normalizedConfig = {
+  const normalizedConfig: any = {
     ...config,
-    project_hash: projectHash,
     projectHash,
-    repo_identifier: config.repoIdentifier,
-    repoIdentifier: config.repoIdentifier,
-    access_token: config.accessToken,
-    accessToken: config.accessToken,
-    custom_api_base: config.customApiBase,
-    customApiBase: config.customApiBase,
-    sync_mode: config.syncMode,
-    syncMode: config.syncMode,
     webhook: {
       ...config.webhook,
       payloadUrl: cleanPayload,
-      payload_url: cleanPayload,
     },
   };
+  // 必须清理下划线重复字段，防止 Serde 因 duplicate field 抛错而静默保存失败
+  delete normalizedConfig.project_hash;
+  delete normalizedConfig.repo_identifier;
+  delete normalizedConfig.access_token;
+  delete normalizedConfig.custom_api_base;
+  delete normalizedConfig.sync_mode;
+  if (normalizedConfig.webhook) {
+    delete normalizedConfig.webhook.payload_url;
+  }
+  if (normalizedConfig.polling) {
+    delete normalizedConfig.polling.interval_seconds;
+    delete normalizedConfig.polling.only_active_pr;
+  }
+  if (normalizedConfig.events) {
+    delete normalizedConfig.events.pull_request;
+    delete normalizedConfig.events.issue_comment;
+  }
+
   try {
     localStorage.setItem(`jeikcode_git_binding_${projectHash}`, JSON.stringify(normalizedConfig));
     if (cleanPayload) {
@@ -385,7 +393,9 @@ export function saveProjectGitConfig(projectHash: string, config: GitAdapterConf
     // ignore
   }
   // 异步同步到后端持久化文件 (~/.jeikcode/git-bindings.json)
-  saveGitBinding(normalizedConfig).catch(() => {});
+  saveGitBinding(normalizedConfig).catch((e) => {
+    console.error('[git_webhook] Failed to save binding:', e);
+  });
 }
 
 interface GitWebhookDialogProps {
@@ -468,11 +478,10 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     getGitBinding(project.hash).then((remote) => {
       if (remote && remote.channel) {
         setConfig((prev) => {
-          const rawRemotePayload = remote.webhook?.payload_url || remote.webhook?.payloadUrl || '';
+          const rawRemotePayload = remote.webhook?.payloadUrl || remote.webhook?.payload_url || '';
           const cleanRemotePayload = normalizeWebhookHost(rawRemotePayload).replace(/\/+$/, '');
-          const effectivePayload = isValidWebhookHost(cleanRemotePayload)
-            ? cleanRemotePayload
-            : (isValidWebhookHost(prev.webhook.payloadUrl) ? prev.webhook.payloadUrl : getLastWebhookHost());
+          // 关键修复：项目已有的配置绝对优先，绝不被继承值覆盖！
+          const effectivePayload = cleanRemotePayload || prev.webhook.payloadUrl || getLastWebhookHost();
 
           return {
             ...prev,
@@ -554,19 +563,19 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     }
     setTesting(true);
     try {
-      const payload = {
+      const payload: any = {
         ...config,
-        project_hash: project.hash,
         projectHash: project.hash,
-        repo_identifier: config.repoIdentifier.trim(),
         repoIdentifier: config.repoIdentifier.trim(),
-        access_token: config.accessToken.trim(),
         accessToken: config.accessToken.trim(),
-        custom_api_base: config.customApiBase.trim(),
         customApiBase: config.customApiBase.trim(),
-        sync_mode: config.syncMode,
         syncMode: config.syncMode,
       };
+      delete payload.project_hash;
+      delete payload.repo_identifier;
+      delete payload.access_token;
+      delete payload.custom_api_base;
+      delete payload.sync_mode;
       const res = await testGitBinding(payload);
       if (res.success) {
         showToast(
