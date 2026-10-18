@@ -21,6 +21,32 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.8 (2026-10-19)
+
+- **[Edit Tool & Diagnostics] Standardized single-column Git diffs, exact discrepancy diagnostics, and cascading conflict recovery**:
+  - Upgraded `edit` tool failure diagnostics with single-column, strictly-orthogonal Git Diff formatting, eliminating duplicate sign artifacts and redundant pseudo headers.
+  - Introduced line-discrepancy microscopic analysis (`👉 Exact Line Discrepancy`) pinpointing extra trailing characters, missing lines, and whitespace mismatches.
+  - Expanded ambiguous multi-occurrence matches with full 6-line surrounding context and a three-option resolution guide.
+  - Implemented post-topological cascading overlap conflict detection, attributing causal dependencies between conflicting hunks with symmetric Git diff rendering and single-merge guidance.
+- **[WebUI & Console Diff] Native terminal-aligned diff viewer with isolated unselectable gutter**:
+  - Restructured `<DiffBody>` and CSS layouts to isolate line numbers in a fixed-width gutter with clean border separation (`user-select: none`), preventing line number pollution during patch copying.
+  - Unified diff presentation across shell commands (`git diff`), edit tools, and diagnostic fallbacks.
+- **[Markdown & Code Highlighting] Container code fence isolation and syntax language normalization**:
+  - Strengthened markdown code block container isolation to prevent nested backtick fences from prematurely closing parent code blocks.
+
+---
+
+- **[Edit 工具与诊断] 单列标准 Git Diff 协议、微观失配诊断与级联冲突因果恢复**:
+  - 将 `edit` 工具失配诊断全面重构为单列正交 Git Diff 标准格式，彻底消除加减号双重打标与冗余伪头部。
+  - 引入行内微观差异显微镜（`👉 Exact Line Discrepancy`），精准指出多余尾随字符、缺失行与缩进空白偏差。
+  - 升级多重重复命中歧义诊断，展开上下各 6 行完整纯净代码与三选一消歧决策指引。
+  - 实现拓扑排序最终状态下的级联重叠冲突因果推导，精准指出导致下游级联冲突的元凶 Hunk，对称还原冲突现场 Git Diff，并提供单一合并指引。
+- **[WebUI 与终端 Diff] 深度对齐原生命令行控制台质感的统一 Diff 面板**:
+  - 重构 `<DiffBody>` 与 CSS 样式，将行号抽离为独立的防划选 Gutter 槽（`user-select: none`），彻底解决行号与符号挤压串用问题。
+  - 统一收敛终端只读命令（`git diff`）、编辑类工具与失配诊断的差异展示层。
+- **[Markdown 与代码高亮] 容器代码块围栏防破损与高亮语言规范化**:
+  - 加固 Markdown 容器代码块围栏隔离，杜绝内部反引号引发的外层代码块提前闭合破坏。
+
 ## v7.2.5-beta.7 (2026-10-18)
 
 - **[OpenWrt & Gateway] Full OpenWrt ecosystem integration with automated symlinking and procd autostart**:
