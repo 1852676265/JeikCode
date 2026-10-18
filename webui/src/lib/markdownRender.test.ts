@@ -310,3 +310,88 @@ test('Mermaid labels and TeX survive mount encoding without injecting HTML', () 
   assert.equal(decodeURIComponent(mount[1]), source);
   assert.doesNotMatch(html, /<script\b|<br\s*\/?>|class="katex"/i);
 });
+
+test('markdownToHtml with highlight=true correctly highlights bash command containing URL without treating // as comment', () => {
+  const md = [
+    '```bash',
+    '# Linux / macOS / OpenWrt / HarmonyOS PC 适用一键安装',
+    'curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh',
+    '```',
+  ].join('\n');
+  const html = markdownToHtml(md, { highlight: true });
+
+  assert.match(html, /class="hl-comment"># Linux \/ macOS/);
+  assert.doesNotMatch(html, /class="hl-comment">\/\/raw/);
+  assert.match(html, /https:\/\/raw\.githubusercontent\.com\/jeikl\/JeikCode\/main\/scripts\/install\.sh/);
+  assert.match(html, /class="hl-operator">\|<\/span>/);
+});
+
+test('markdownToHtml correctly closes diff code block containing nested diff markers without swallowing subsequent prose and headings', () => {
+  const userSample = [
+    '我们可以把目前的报错拆解一下，看看它为什么会误导 Agent：',
+    '',
+    '---',
+    '',
+    '### 一、当前报错存在的 3 个核心痛点（为什么会误导模型）',
+    '',
+    '#### 1. 上下文行全部打上 `+` 号，造成严重的视觉/注意力噪音',
+    '看你工具打印出来的 Diff：',
+    '```diff',
+    '--- expected (your old_string)',
+    '+++ actual (in file)',
+    '@@ -1,3 +1,14 @@',
+    '+',
+    '+### 官方一键在线安装',
+    '+',
+    '+脚本会自动检测系统与 CPU 架构（x86_64、aarch64 等）...',
+    '+',
+    '+::: code-group',
+    '+',
+    ' ```bash [Linux / macOS / OpenWrt / HarmonyOS PC]',
+    ' curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | bash',
+    '-```}],path:',
+    '\\ No newline at end of file',
+    '+```',
+    '+',
+    '+```powershell [Windows (PowerShell)]',
+    '+irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | iex',
+    '+```',
+    '```',
+    '- **模型的心理逻辑**：在标准的 Diff 里，`+` 代表多余新增内容。',
+    '',
+    '#### 2. `\\ No newline at end of file` 制造了二次干扰',
+    '`-```}],path:` 下面紧跟着一行 `\\ No newline at end of file`。',
+    '',
+    '#### 3. 提示语容易让模型“病急乱投医”',
+    '',
+    '---',
+    '',
+    '### 二、如何改进？什么样的报错对 LLM 最清晰？',
+    '',
+    '#### 方案 A：只高亮真正冲突的字符',
+    '```text',
+    'edit failed: old_string not found in file.',
+    '```',
+    '',
+    '#### 方案 B：优化 Diff 格式',
+    '```diff',
+    '--- your old_string',
+    '+++ actual in file',
+    '```',
+  ].join('\n');
+
+  const html = markdownToHtml(userSample);
+
+  // 1. 标题必须独立渲染为 h3 和 h4，严禁被吞入代码块
+  assert.match(html, /<h3[^>]*>一、当前报错存在的 3 个核心痛点/);
+  assert.match(html, /<h4[^>]*>1\. 上下文行全部打上 <code>\+<\/code> 号/);
+  assert.match(html, /<h4[^>]*>2\. <code>\\ No newline at end of file<\/code> 制造了二次干扰/);
+  assert.match(html, /<h4[^>]*>3\. 提示语容易让模型“病急乱投医”/);
+  assert.match(html, /<h3[^>]*>二、如何改进？什么样的报错对 LLM 最清晰？/);
+  assert.match(html, /<h4[^>]*>方案 A：只高亮真正冲突的字符/);
+  assert.match(html, /<h4[^>]*>方案 B：优化 Diff 格式/);
+
+  // 2. 正确分割为 3 个独立的代码块，无正文泄漏
+  const blocks = html.match(/class="code-block-wrapper/g) ?? [];
+  assert.equal(blocks.length, 3);
+});

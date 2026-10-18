@@ -7478,7 +7478,12 @@ impl ArtifactDetector {
                     artifact_type,
                     fence_len,
                     mut depth,
-                } => match Self::find_next_fence_in_block(remaining, fence_len, depth) {
+                } => match Self::find_next_fence_in_block(
+                    remaining,
+                    fence_len,
+                    depth,
+                    &artifact_type,
+                ) {
                     Some(FenceInsideBlock::OuterClose {
                         line_start,
                         after_fence_line,
@@ -7652,6 +7657,7 @@ impl ArtifactDetector {
         text: &str,
         outer_fence_len: usize,
         current_depth: usize,
+        artifact_type: &str,
     ) -> Option<FenceInsideBlock> {
         let mut search_start = 0;
         while let Some(relative_marker_start) = text[search_start..].find("```") {
@@ -7680,7 +7686,10 @@ impl ArtifactDetector {
                 // CommonMark: Only fences with cur_fence_len >= outer_fence_len can close or nest
                 if cur_fence_len >= outer_fence_len {
                     if trailing.is_empty() {
-                        if current_depth > 1 {
+                        // 仅当当前代码块本身是 Markdown 容器类型时，才支持内部子代码块深度栈跟踪；
+                        // 对于普通代码块（如 diff, bash, rust 等），内部的反引号只是普通代码文本，
+                        // 遇到与外层围栏匹配的纯闭合行时直接作为外部代码块的 OuterClose 闭合！
+                        if artifact_type == "markdown" && current_depth > 1 {
                             return Some(FenceInsideBlock::InnerClose { after_fence_line });
                         } else {
                             return Some(FenceInsideBlock::OuterClose {
@@ -7688,7 +7697,7 @@ impl ArtifactDetector {
                                 after_fence_line,
                             });
                         }
-                    } else if !trailing.contains('`') {
+                    } else if artifact_type == "markdown" && !trailing.contains('`') {
                         return Some(FenceInsideBlock::InnerOpen { after_fence_line });
                     }
                 }
@@ -7745,6 +7754,12 @@ impl ArtifactDetector {
             || title.starts_with("第八")
             || title.starts_with("第九")
             || title.starts_with("第十")
+            || title.starts_with("一、")
+            || title.starts_with("二、")
+            || title.starts_with("三、")
+            || title.starts_with("四、")
+            || title.starts_with("五、")
+            || title.starts_with("方案")
             || title.starts_with("步骤")
             || title.starts_with("总结")
             || title.starts_with("结论")
@@ -7752,6 +7767,20 @@ impl ArtifactDetector {
             || title.starts_with("核心结论")
             || title.starts_with("为什么")
             || title.starts_with("如何");
+
+        let is_numbered = title.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && (title.contains(". ")
+                || title.contains("、")
+                || title.contains("：")
+                || title.contains(":"));
+
+        let is_doc_keyword_en = title.to_lowercase().starts_with("step")
+            || title.to_lowercase().starts_with("summary")
+            || title.to_lowercase().starts_with("conclusion")
+            || title.to_lowercase().starts_with("overview")
+            || title.to_lowercase().starts_with("solution")
+            || title.to_lowercase().starts_with("option")
+            || title.to_lowercase().starts_with("note");
 
         let has_cjk = title
             .chars()
@@ -7764,7 +7793,7 @@ impl ArtifactDetector {
             || title.contains('?')
             || title.contains('!');
 
-        is_doc_keyword || (has_cjk && has_cjk_punct)
+        is_doc_keyword || is_doc_keyword_en || is_numbered || (has_cjk && has_cjk_punct)
     }
 
     fn is_html_start(&self, text: &str) -> bool {
@@ -16619,6 +16648,25 @@ mod tests {
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
         assert!(
             matches!(&events[4], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
+        );
+    }
+
+    #[test]
+    fn artifact_detector_closes_diff_block_with_internal_backticks() {
+        let mut detector = ArtifactDetector::new();
+        let input = "看你工具打印出来的 Diff：\n```diff\n--- expected\n+++ actual\n ```bash\n-```\n+```\n```\n后续正文标题";
+        let events = detector.process(input);
+
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content.contains("Diff："))
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("diff"))
+        );
+        assert!(matches!(&events[2], ChatEvent::ArtifactContent { .. }));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content.contains("后续正文标题"))
         );
     }
 

@@ -77,6 +77,50 @@ const RAW_LOCK_EXTS = new Set([
   'lock', 'out', 'bin', 'gitignore', 'gitattributes', 'npmignore', 'dockerignore'
 ]);
 
+// 仅支持 # 作为单行注释的语言（绝不支持 // 或 -- 注释，防止 URL 协议或命令行参数被腰斩）
+const HASH_COMMENT_LANGS = new Set([
+  'bash', 'sh', 'zsh', 'shell', 'ksh', 'csh', 'fish',
+  'python', 'py', 'python3', 'pyw',
+  'ruby', 'rb',
+  'perl', 'pl', 'pm',
+  'yaml', 'yml',
+  'toml',
+  'dockerfile', 'containerfile',
+  'r',
+  'makefile', 'make', 'cmake',
+  'powershell', 'ps', 'ps1', 'psm1',
+  'ini', 'conf', 'cfg', 'properties', 'env'
+]);
+
+// 支持 // 作为单行注释的语言
+const SLASH_COMMENT_LANGS = new Set([
+  'javascript', 'js', 'jsx', 'mjs', 'cjs',
+  'typescript', 'ts', 'tsx', 'mts', 'cts',
+  'c', 'cpp', 'cc', 'cxx', 'c++', 'h', 'hpp', 'hxx',
+  'java', 'kotlin', 'kt', 'kts', 'scala', 'groovy',
+  'csharp', 'cs', 'c#',
+  'go', 'golang',
+  'rust', 'rs',
+  'swift',
+  'php',
+  'dart',
+  'jsonc'
+]);
+
+// 支持 -- 作为单行注释的语言 (SQL, Lua, Haskell 等)
+const DASH_COMMENT_LANGS = new Set([
+  'sql', 'mysql', 'pgsql', 'sqlite', 'tsql', 'plsql',
+  'lua',
+  'haskell', 'hs',
+  'ada', 'elm'
+]);
+
+// 纯文本或无单行注释语言
+const NO_COMMENT_LANGS = new Set([
+  'txt', 'text', 'log', 'csv', 'tsv', 'json', 'md', 'markdown', 'html', 'xml', 'svg',
+  'diff', 'patch'
+]);
+
 /**
  * 将代码文本转换为带有丰富高亮 span 的 HTML 字符串。
  */
@@ -87,8 +131,15 @@ export function highlightCode(code: string, fileName: string): string {
     return escapeHtml(code);
   }
 
-  const lowerName = fileName.toLowerCase();
-  const ext = lowerName.split('.').pop() || '';
+  const lowerName = fileName.toLowerCase().replace(/\\/g, '/');
+  const baseName = lowerName.split('/').pop() || '';
+  const ext = baseName.includes('.') ? baseName.split('.').pop() || '' : baseName;
+
+  let resolvedLang = ext;
+  if (baseName === 'dockerfile' || baseName.startsWith('dockerfile.')) resolvedLang = 'dockerfile';
+  else if (baseName === 'makefile' || baseName.startsWith('makefile.')) resolvedLang = 'makefile';
+  else if (baseName === 'gemfile') resolvedLang = 'ruby';
+
   const isLockFile = lowerName.endsWith('.lock') || lowerName.includes('cargo.lock') || lowerName.includes('package-lock.json') || lowerName.includes('yarn.lock') || lowerName.includes('pnpm-lock.yaml');
   const isCodeExample = (ext === 'example' || ext === 'sample') && (lowerName.includes('.json') || lowerName.includes('.js') || lowerName.includes('.ts') || lowerName.includes('.rs') || lowerName.includes('.py'));
   const isRawFile = !isCodeExample && (isLockFile || RAW_LOCK_EXTS.has(ext));
@@ -98,11 +149,16 @@ export function highlightCode(code: string, fileName: string): string {
     return escapeHtml(code);
   }
 
-  const isJson = ext === 'json' || fileName.endsWith('.json.example') || fileName.includes('.json');
-  const isRust = ext === 'rs';
-  const isPy = ext === 'py';
-  const isKotlin = ext === 'kt' || ext === 'kts';
-  const isPureText = ext === 'txt' || ext === 'text' || ext === 'log' || ext === 'csv';
+  const isJson = resolvedLang === 'json' || fileName.endsWith('.json.example') || fileName.includes('.json');
+  const isRust = resolvedLang === 'rs' || resolvedLang === 'rust';
+  const isPy = resolvedLang === 'py' || resolvedLang === 'python' || resolvedLang === 'python3';
+  const isKotlin = resolvedLang === 'kt' || resolvedLang === 'kts' || resolvedLang === 'kotlin';
+  const isPureText = NO_COMMENT_LANGS.has(resolvedLang);
+
+  const isHashComment = HASH_COMMENT_LANGS.has(resolvedLang);
+  const isSlashComment = SLASH_COMMENT_LANGS.has(resolvedLang);
+  const isDashComment = DASH_COMMENT_LANGS.has(resolvedLang);
+  const isNoComment = isPureText || resolvedLang === 'json';
 
   const lines = code.split('\n');
   let bracketDepth = 0;
@@ -113,20 +169,64 @@ export function highlightCode(code: string, fileName: string): string {
     const len = line.length;
 
     while (i < len) {
-      // 1. 注释检测 (//, #, --)
-      if (line.slice(i, i + 2) === '//' || line.slice(i, i + 2) === '--') {
-        out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
-        break;
-      }
-      if (line[i] === '#') {
-        out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
-        break;
-      }
-
-      // 连续 3 个及以上反引号属于代码块围栏，整行作为围栏输出，避免将围栏语言标记拆分
+      // 0. 连续 3 个及以上反引号属于代码块围栏，整行作为围栏输出，避免将围栏语言标记拆分
       if (line.slice(i, i + 3) === '```') {
         out += escapeHtml(line.slice(i));
         break;
+      }
+
+      // 1. URL 协议检测 (https://, http://, ftp://, file://, ws://, wss://, git://)
+      // 绝不将 URL 中的 // 暴力识别为注释！在代码块/命令中将完整 URL 作为独立整体渲染
+      const urlMatch = line.slice(i).match(/^(?:https?|ftp|file|ws|wss|git):\/\/[^\s"'`<>]+/i);
+      if (urlMatch) {
+        const urlStr = urlMatch[0];
+        out += `<span class="hl-string">${escapeHtml(urlStr)}</span>`;
+        i += urlStr.length;
+        continue;
+      }
+
+      // 2. 单行注释检测 (严格按语言规则匹配，避免将 URL 或自减操作符暴力判定为注释)
+      if (!isNoComment) {
+        if (isHashComment) {
+          // 仅支持 # 作为注释的语言 (bash, python, yaml 等)
+          if (line[i] === '#') {
+            const isBashVarLen = (resolvedLang === 'bash' || resolvedLang === 'sh' || resolvedLang === 'zsh') && (
+              (i > 0 && line[i - 1] === '$') ||
+              (i >= 2 && line.slice(i - 2, i) === '${')
+            );
+            if (!isBashVarLen && (i === 0 || /\s|;/.test(line[i - 1]))) {
+              out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
+              break;
+            }
+          }
+        } else if (isDashComment) {
+          // 仅支持 -- 作为注释的语言 (sql, lua 等)
+          if (line.slice(i, i + 2) === '--' && (i === 0 || /\s/.test(line[i - 1]))) {
+            out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
+            break;
+          }
+        } else if (isSlashComment) {
+          // 支持 // 作为注释的语言 (js, ts, rust, c, cpp, java, go 等)
+          if (line.slice(i, i + 2) === '//') {
+            const isColonPrefix = i > 0 && line[i - 1] === ':';
+            if (!isColonPrefix) {
+              out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
+              break;
+            }
+          }
+        } else {
+          // 兜底 / 未知语言：支持 // 和 #，必须排除 :// 且不开启 -- 避免误伤 CLI 参数与自减
+          if (line.slice(i, i + 2) === '//') {
+            const isColonPrefix = i > 0 && line[i - 1] === ':';
+            if (!isColonPrefix) {
+              out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
+              break;
+            }
+          } else if (line[i] === '#' && (i === 0 || /\s|;/.test(line[i - 1]))) {
+            out += `<span class="hl-comment">${escapeHtml(line.slice(i))}</span>`;
+            break;
+          }
+        }
       }
 
       // 2. 字符串检测 (双引号 / 单引号 / 反引号)

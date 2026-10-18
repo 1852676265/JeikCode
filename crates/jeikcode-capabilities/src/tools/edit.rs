@@ -311,7 +311,7 @@ impl Tool for EditFileTool {
         crate::tools::write_state::record_edit(&path);
         #[cfg(feature = "codeintel")]
         crate::codeintel::notify_code_index_file_changed(&path, Some(&buf));
-        let diff = build_compact_diff(&original, &buf);
+        let diff = build_compact_diff(&original, &buf, Some(&path));
         let cost_time = t0.elapsed();
         let kind_note = if kinds.len() == 1 {
             if kinds[0] == "exact" {
@@ -392,6 +392,17 @@ fn apply_hunks_cpu(
     let mut preflight_skipped: Vec<String> = Vec::new();
     let mut failed_hunks: Vec<(usize, String)> = Vec::new();
 
+    let orig_lines: Vec<&str> = content.lines().collect();
+
+    #[derive(Debug, Clone)]
+    struct AppliedHunkInfo {
+        original_index: usize,
+        old_start_line: usize,
+        old_end_line: usize,
+        new_string: String,
+    }
+    let mut applied_records: Vec<AppliedHunkInfo> = Vec::new();
+
     for (i, h) in hunks.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err("edit: cancelled.".into());
@@ -410,6 +421,13 @@ fn apply_hunks_cpu(
             h.occurrence,
         ) {
             Ok((next, n, kind, actual_matched)) => {
+                let (s, e) = locate_hunk_lines(&orig_lines, &h.old_string).unwrap_or((0, 0));
+                applied_records.push(AppliedHunkInfo {
+                    original_index: h.original_index,
+                    old_start_line: s + 1,
+                    old_end_line: e,
+                    new_string: h.new_string.clone(),
+                });
                 test_buf = next;
                 preflight_total += n;
                 preflight_kinds.push(kind);
@@ -426,6 +444,13 @@ fn apply_hunks_cpu(
                     h.replace_all,
                     Some(cancel),
                 ) {
+                    let (s, e) = locate_hunk_lines(&orig_lines, &h.old_string).unwrap_or((0, 0));
+                    applied_records.push(AppliedHunkInfo {
+                        original_index: h.original_index,
+                        old_start_line: s + 1,
+                        old_end_line: e,
+                        new_string: h.new_string.clone(),
+                    });
                     test_buf = rebased.merged_content;
                     preflight_total += 1;
                     preflight_kinds.push("historical 3-way rebase");
@@ -447,6 +472,45 @@ fn apply_hunks_cpu(
     }
 
     if !failed_hunks.is_empty() {
+        // 级联冲突识别（只有在各种拓扑排序和全部编辑试运行完毕后的最终状态才进行因果推导）：
+        let mut cascade_causes: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut cascade_victims: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+
+        for (victim_orig_idx, e) in failed_hunks.iter_mut() {
+            if let Some(victim_hunk) = hunks.iter().find(|h| h.original_index == *victim_orig_idx) {
+                if let Some((target_s, target_e)) =
+                    locate_hunk_lines(&orig_lines, &victim_hunk.old_string)
+                {
+                    let target_start = target_s + 1;
+                    let target_end = target_e;
+
+                    if let Some(cause) = applied_records.iter().find(|app| {
+                        let max_start = app.old_start_line.max(target_start);
+                        let min_end = app.old_end_line.min(target_end);
+                        max_start <= min_end && app.old_end_line > 0 && target_end > 0
+                    }) {
+                        let inter_start = cause.old_start_line.max(target_start);
+                        let inter_end = cause.old_end_line.min(target_end);
+                        cascade_causes.insert(cause.original_index);
+                        cascade_victims.insert(*victim_orig_idx, cause.original_index);
+
+                        *e = format_cascade_conflict_diagnostic(
+                            cause.original_index,
+                            *victim_orig_idx,
+                            (cause.old_start_line, cause.old_end_line),
+                            (target_start, target_end),
+                            (inter_start, inter_end),
+                            &cause.new_string,
+                            &victim_hunk.old_string,
+                            &test_buf,
+                            Some(path),
+                        );
+                    }
+                }
+            }
+        }
+
         if failed_hunks.len() == 1 {
             let (hunk_idx, e) = &failed_hunks[0];
             let prior_success_count = hunks
@@ -468,19 +532,87 @@ fn apply_hunks_cpu(
             ));
         } else {
             let mut report = format!(
-                "edit: {} of {} hunks failed verification. The file was NOT modified.\n",
+                "edit: {} of {} hunks failed verification. The file was NOT modified.\n(All changes were safely discarded; no partial dirty writes occurred)\n\n\
+                 {}\
+                 📋 Hunk Verification Summary:\n",
                 failed_hunks.len(),
-                hunks.len()
+                hunks.len(),
+                EDIT_DIFF_PROTOCOL_LEGEND
             );
+
+            for (i, h) in hunks.iter().enumerate() {
+                let original_idx = if h.original_index > 0 {
+                    h.original_index
+                } else {
+                    i + 1
+                };
+                let json_idx = original_idx.saturating_sub(1);
+                if let Some((fail_num, _)) = failed_hunks
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (idx, _))| *idx == original_idx)
+                {
+                    if let Some(cause_id) = cascade_victims.get(&original_idx) {
+                        report.push_str(&format!(
+                            "  [✗] Hunk {}/{} (edits[{}]) : CASCADE BLOCKED by Hunk {} (see Failure {} below)\n",
+                            original_idx,
+                            hunks.len(),
+                            json_idx,
+                            cause_id,
+                            fail_num + 1
+                        ));
+                    } else {
+                        report.push_str(&format!(
+                            "  [✗] Hunk {}/{} (edits[{}]) : failed verification (see Failure {} below)\n",
+                            original_idx,
+                            hunks.len(),
+                            json_idx,
+                            fail_num + 1
+                        ));
+                    }
+                } else if cascade_causes.contains(&original_idx) {
+                    report.push_str(&format!(
+                        "  [✔] Hunk {}/{} (edits[{}]) : verified in memory (⚠️ CAUSE OF DOWNSTREAM CASCADE CONFLICTS)\n",
+                        original_idx,
+                        hunks.len(),
+                        json_idx
+                    ));
+                } else {
+                    report.push_str(&format!(
+                        "  [✔] Hunk {}/{} (edits[{}]) : verified cleanly in memory\n",
+                        original_idx,
+                        hunks.len(),
+                        json_idx
+                    ));
+                }
+            }
+
+            report.push_str(
+                "\n========================================================================",
+            );
+
             for (fail_num, (hunk_idx, e)) in failed_hunks.iter().enumerate() {
+                // 已经在外层顶部统一渲染过协议说明，因此子错误块中如果包含重复说明则直接剔除，避免机械重复
+                let sanitized_e = e.trim().replace(EDIT_DIFF_PROTOCOL_LEGEND.trim(), "");
                 report.push_str(&format!(
-                    "\n--- [Failure {}] Hunk {}/{} ---\n{}\n",
+                    "\n--- [Failure {}] Hunk {}/{} (edits[{}]) ---\n{}\n",
                     fail_num + 1,
                     hunk_idx,
                     hunks.len(),
-                    e.trim()
+                    hunk_idx.saturating_sub(1),
+                    sanitized_e.trim()
                 ));
             }
+
+            report.push_str(
+                "\n========================================================================\n",
+            );
+            if !cascade_victims.is_empty() {
+                report.push_str("(Hint: cascading conflicts detected — merge overlapping sequential edits into ONE unified hunk instead of modifying overlapping lines sequentially)\n");
+            } else {
+                report.push_str("(Hint: fix only the failed hunks noted above; keep cleanly applied hunks intact; surrounding context lines without '-' or '+' are for reference only)\n");
+            }
+
             return Err(report);
         }
     }
@@ -1102,7 +1234,13 @@ fn apply_text_hunk(
             return Ok((updated, 1, "exact-occurrence", None));
         }
         return Err(format!(
-            "old_string appears {count} times — it must be unique. Add surrounding context, set replace_all=true, or set occurrence to a 1-based index (1 to {count}).\n{}",
+            "old_string appears {count} times — it must be unique. Add surrounding context, set replace_all=true, or set occurrence to a 1-based index (1 to {count}).\n\n\
+            👉 Resolution options (choose ONE):\n  \
+            1. Add surrounding context lines to your old_string to make it unique (see surrounding lines below);\n  \
+            2. Set \"occurrence\": 1 to {count} in this edit hunk to target a specific occurrence;\n  \
+            3. Set \"replace_all\": true in this edit hunk to replace all {count} occurrences at once.\n\n\
+            {}\n\
+            (Hint: to make your old_string unique, include distinct lines above or below your target)",
             format_match_sites(content, &old_match)
         ));
     }
@@ -1140,7 +1278,7 @@ fn replace_nth(content: &str, old: &str, new: &str, n: usize) -> String {
 
 fn format_match_sites(content: &str, needle: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    let mut out = String::from("Matches:");
+    let mut out = String::from("Matches:\n```````diff");
     let mut from = 0usize;
     let mut idx = 0usize;
     const MATCH_CONTEXT_RADIUS: usize = 6;
@@ -1153,7 +1291,7 @@ fn format_match_sites(content: &str, needle: &str) -> String {
             .saturating_sub(1)
             .saturating_sub(MATCH_CONTEXT_RADIUS);
         let end = (line_no - 1 + span + MATCH_CONTEXT_RADIUS).min(lines.len());
-        out.push_str(&format!("\n  [{idx}] line {line_no}:"));
+        out.push_str(&format!("\n\n--- [{idx}] line {line_no} ---"));
         for (i, line) in lines[start..end].iter().enumerate() {
             let n = start + i + 1;
             let mark = if n >= line_no && n < line_no + span {
@@ -1172,6 +1310,7 @@ fn format_match_sites(content: &str, needle: &str) -> String {
             break;
         }
     }
+    out.push_str("\n```````");
     out
 }
 
@@ -1202,20 +1341,18 @@ async fn write_encoded(
 /// and NEW whole-file contents, capped so a large edit can't flood the model
 /// context / transcript. The TUI re-parses this into a line-numbered, color-
 /// coded diff block; the model reads it as a normal unified diff.
-fn build_compact_diff(old_file: &str, new_file: &str) -> String {
+fn build_compact_diff(old_file: &str, new_file: &str, path: Option<&std::path::Path>) -> String {
     const MAX_DIFF_LINES: usize = 60;
-    // Bound the Myers diff with a deadline: this runs synchronously on the async
-    // executor thread over the WHOLE file, and two large, mostly-different files
-    // (e.g. replacing a minified blob) can otherwise spin for a long time and
-    // stall the event loop. On timeout `similar` returns a coarser-but-valid
-    // diff instead of hanging (same guard codex uses).
     let mut config = similar::TextDiff::configure();
     config.timeout(std::time::Duration::from_millis(200));
-    let full = config
-        .diff_lines(old_file, new_file)
-        .unified_diff()
-        .context_radius(3)
-        .to_string();
+    let mut diff = config.diff_lines(old_file, new_file);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(3);
+    if let Some(p) = path {
+        let display = crate::pathnorm::to_display(p);
+        unified.header(&format!("a/{display}"), &format!("b/{display}"));
+    }
+    let full = unified.to_string();
     let full = full.trim_end();
     let lines: Vec<&str> = full.lines().collect();
     if lines.len() <= MAX_DIFF_LINES {
@@ -1946,26 +2083,214 @@ fn best_window_by_line_similarity(
     (best_i, (best_i + n).min(m), best)
 }
 
-fn bounded_mismatch_diff(old_string: &str, actual_block: &str) -> String {
-    let mut config = similar::TextDiff::configure();
-    config.timeout(std::time::Duration::from_millis(200));
-    let full = config
-        .diff_lines(old_string, actual_block)
-        .unified_diff()
-        .header("expected (your old_string)", "actual (in file)")
-        .context_radius(5)
-        .to_string();
-    const MAX_DIFF_LINES: usize = 80;
-    let full = full.trim_end();
-    let lines: Vec<&str> = full.lines().collect();
-    if lines.len() <= MAX_DIFF_LINES {
-        return full.to_string();
+const EDIT_DIFF_PROTOCOL_LEGEND: &str = "\
+Below is the discrepancy between your old_string and the actual file content:\n\
+Lines with '-' are the mismatched or erroneous line(s) in your old_string.\n\
+Lines with '+' are the actual, authoritative content in the file.\n\
+'>>> ' indicates the target matching location(s) in the file.\n\
+Lines without '-' or '+' are surrounding context for reference only.\n\
+Adjust your old_string based on the comparison below to achieve an exact match.\n\n";
+
+#[derive(Debug)]
+struct ExactDiscrepancy {
+    line_no: usize,
+    expected: String,
+    actual: String,
+    hint: String,
+}
+
+fn format_cascade_conflict_diagnostic(
+    cause_orig_idx: usize,
+    victim_orig_idx: usize,
+    cause_span: (usize, usize),
+    victim_span: (usize, usize),
+    inter_span: (usize, usize),
+    cause_new_string: &str,
+    victim_old_string: &str,
+    test_buf: &str,
+    path: Option<&std::path::Path>,
+) -> String {
+    let cause_json = cause_orig_idx.saturating_sub(1);
+    let victim_json = victim_orig_idx.saturating_sub(1);
+
+    let test_buf_norm = NormalizedFile::new(test_buf);
+    let diff_block = find_closest_match_snippet(path, &test_buf_norm, victim_old_string)
+        .unwrap_or_else(|| {
+            format!(
+                "```````diff\n- {}\n+ {}\n```````",
+                victim_old_string.trim(),
+                cause_new_string.trim()
+            )
+        });
+
+    format!(
+        "⚠️ Cascading Overlap Conflict (Hunk {cause_orig_idx} ➔ Hunk {victim_orig_idx}):\n\
+         Hunk {victim_orig_idx} (edits[{victim_json}]) targets code in lines {}-{} that was just modified or removed by Hunk {cause_orig_idx} (edits[{cause_json}]).\n\
+         Although Hunk {victim_orig_idx}'s old_string exists in the original file, it no longer matches the post-Hunk-{cause_orig_idx} buffer!\n\n\
+         📍 Overlap Site:\n  \
+         • Hunk {cause_orig_idx} (edits[{cause_json}]) targeted span  : lines {}-{} (based on original file)\n  \
+         • Hunk {victim_orig_idx} (edits[{victim_json}]) targeted span: lines {}-{} (based on original file)\n  \
+         • Intersection lines            : lines {}-{}\n\n\
+         {}\n",
+        victim_span.0, victim_span.1,
+        cause_span.0, cause_span.1,
+        victim_span.0, victim_span.1,
+        inter_span.0, inter_span.1,
+        diff_block.trim()
+    )
+}
+
+fn build_structured_mismatch_diff(
+    path: Option<&std::path::Path>,
+    file: &NormalizedFile<'_>,
+    old_string: &str,
+    start: usize,
+    end: usize,
+    score: f32,
+) -> String {
+    use similar::{ChangeTag, TextDiff};
+
+    let target_display = path
+        .map(|p| crate::pathnorm::to_display(p))
+        .map(|s| format!(" in {s}"))
+        .unwrap_or_default();
+
+    const CONTEXT_RADIUS: usize = 3;
+    let ctx_before_start = start.saturating_sub(CONTEXT_RADIUS);
+    let ctx_after_end = (end + CONTEXT_RADIUS).min(file.lines.len());
+
+    let mut before_lines = Vec::new();
+    for i in ctx_before_start..start {
+        before_lines.push(format!("  {:>4} | {}", i + 1, file.lines[i]));
     }
-    let mut out = lines[..MAX_DIFF_LINES].join("\n");
+
+    let mut after_lines = Vec::new();
+    for i in end..ctx_after_end {
+        after_lines.push(format!("  {:>4} | {}", i + 1, file.lines[i]));
+    }
+
+    let file_core = file.lines[start..end].join("\n");
+    let mut config = TextDiff::configure();
+    config.timeout(std::time::Duration::from_millis(200));
+    let diff = config.diff_lines(old_string, &file_core);
+
+    let mut core_lines = Vec::new();
+    let mut curr_line = start + 1;
+    let mut discrepancy: Option<ExactDiscrepancy> = None;
+
+    let changes: Vec<_> = diff.iter_all_changes().collect();
+    let mut idx = 0;
+    while idx < changes.len() {
+        let change = &changes[idx];
+        match change.tag() {
+            ChangeTag::Equal => {
+                let val = change.value().trim_end_matches(['\r', '\n']);
+                core_lines.push(format!("  {:>4} | {}", curr_line, val));
+                curr_line += 1;
+                idx += 1;
+            }
+            ChangeTag::Delete => {
+                let exp = change.value().trim_end_matches(['\r', '\n']);
+                core_lines.push(format!("- {:>4} | {}", curr_line, exp));
+
+                // Check if immediately followed by an Insert (replacement pair)
+                if idx + 1 < changes.len() && changes[idx + 1].tag() == ChangeTag::Insert {
+                    let act = changes[idx + 1].value().trim_end_matches(['\r', '\n']);
+                    core_lines.push(format!("+ {:>4} | {}", curr_line, act));
+
+                    if discrepancy.is_none() {
+                        let hint = if exp.trim() == act.trim() {
+                            "Notice whitespace/indentation mismatch".to_string()
+                        } else if exp.starts_with(act) && !act.is_empty() {
+                            let extra = &exp[act.len()..];
+                            format!(
+                                "Notice extra trailing characters in your input: {:?}",
+                                extra
+                            )
+                        } else if act.starts_with(exp) && !exp.is_empty() {
+                            let missing = &act[exp.len()..];
+                            format!(
+                                "Notice missing trailing characters from actual file: {:?}",
+                                missing
+                            )
+                        } else {
+                            "Notice character mismatch on this line".to_string()
+                        };
+
+                        discrepancy = Some(ExactDiscrepancy {
+                            line_no: curr_line,
+                            expected: exp.to_string(),
+                            actual: act.to_string(),
+                            hint,
+                        });
+                    }
+
+                    curr_line += 1;
+                    idx += 2;
+                } else {
+                    if discrepancy.is_none() {
+                        discrepancy = Some(ExactDiscrepancy {
+                            line_no: curr_line,
+                            expected: exp.to_string(),
+                            actual: String::new(),
+                            hint: format!(
+                                "Notice extra unexpected line in your old_string: {:?}",
+                                exp
+                            ),
+                        });
+                    }
+                    idx += 1;
+                }
+            }
+            ChangeTag::Insert => {
+                let act = change.value().trim_end_matches(['\r', '\n']);
+                core_lines.push(format!("+ {:>4} | {}", curr_line, act));
+
+                if discrepancy.is_none() {
+                    discrepancy = Some(ExactDiscrepancy {
+                        line_no: curr_line,
+                        expected: String::new(),
+                        actual: act.to_string(),
+                        hint: format!("Notice missing line from actual file: {:?}", act),
+                    });
+                }
+
+                curr_line += 1;
+                idx += 1;
+            }
+        }
+    }
+
+    let mut out = String::new();
     out.push_str(&format!(
-        "\n… ({} more diff lines)",
-        lines.len() - MAX_DIFF_LINES
+        "[Content Mismatch]: Closest matching block found around lines {}-{}{target_display} (similarity {:.0}%):\n\n",
+        start + 1,
+        end,
+        score * 100.0,
     ));
+
+    out.push_str(EDIT_DIFF_PROTOCOL_LEGEND);
+
+    if let Some(disc) = discrepancy {
+        out.push_str(&format!(
+            "👉 Exact Line Discrepancy (around line {}):\n  expected : {:?}\n  actual   : {:?}\n  ({})\n\n",
+            disc.line_no, disc.expected, disc.actual, disc.hint
+        ));
+    }
+
+    out.push_str("```````diff\n");
+    if !before_lines.is_empty() {
+        out.push_str(&before_lines.join("\n"));
+        out.push_str("\n\n");
+    }
+    out.push_str(&core_lines.join("\n"));
+    if !after_lines.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&after_lines.join("\n"));
+    }
+    out.push_str("\n```````\n");
+    out.push_str("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)");
+
     out
 }
 
@@ -1997,7 +2322,7 @@ fn find_closest_match_snippet(
     let (mut start, mut end, mut score) = best_window_by_token_bag(file, &old_tokens, window_n);
 
     const SMALL_HUNK_LINES: usize = 8;
-    if old_tokens.len() <= SMALL_HUNK_LINES && score < 0.30 {
+    if old_tokens.len() <= SMALL_HUNK_LINES {
         let refined = best_window_by_line_similarity(file, &old_tokens);
         if refined.2 > score {
             start = refined.0;
@@ -2035,45 +2360,11 @@ fn find_closest_match_snippet(
         ));
     }
 
-    // 场景 2：代码确实在当前文件，但手抖漏写了一行（相似度 >= 50%）
-    // 100% 复用原有的上下拓展 6 行（WINDOW_MARGIN = 6）的 Unified Diff 设计！
-    const WINDOW_MARGIN: usize = 6;
-    let actual_start = start.saturating_sub(WINDOW_MARGIN);
-    let actual_end = (end + WINDOW_MARGIN).min(file.lines.len());
-    let actual_block = file.lines[actual_start..actual_end].join("\n");
-    let diff = bounded_mismatch_diff(old_string, &actual_block);
-
-    // 强化 2 优化版：精准计算核心匹配区间内缺失的具体行，与扩展 Diff 两者兼备
-    let mut missing_lines = Vec::new();
-    let old_line_set: std::collections::HashSet<String> = old_lines
-        .iter()
-        .map(|l| clean_token_normalize(l))
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    for (idx, line) in file.lines[start..end].iter().enumerate() {
-        let norm = clean_token_normalize(line);
-        if !norm.is_empty() && !old_line_set.contains(&norm) {
-            missing_lines.push((start + 1 + idx, line.trim()));
-        }
-    }
-
-    let mut discrepancy_note = String::new();
-    if !missing_lines.is_empty() {
-        discrepancy_note
-            .push_str("\n👉 Specific discrepancy (missing line(s) in your old_string):\n");
-        for (line_no, line_content) in missing_lines.iter().take(5) {
-            discrepancy_note.push_str(&format!("  + line {line_no}: {line_content}\n"));
-        }
-    }
-
-    Some(format!(
-        "[Content Mismatch]: Closest matching block found around lines {}-{} (similarity {:.0}%):{}\n```diff\n{}\n```\n(Hint: adjust your old_string to match the actual file content above; do not blindly re-read the whole file)",
-        start + 1,
-        end,
-        score * 100.0,
-        discrepancy_note,
-        diff.trim_end()
+    // 场景 2：代码确实在当前文件，但手抖漏写、多写或错位（相似度 >= 50%）
+    // 采用三段式带行号纯净上下文 + 行内微观差异标示：
+    // 上下各保留最多 3 行不带 +/- 的纯净上下文行，中间核心区间精确 Diff，杜绝无关行滥加 '+' 造成视觉噪音。
+    Some(build_structured_mismatch_diff(
+        path, file, old_string, start, end, score,
     ))
 }
 
@@ -2293,7 +2584,7 @@ mod tests {
         // new-side start reflects the changed line's position in the file.
         let old = "fn main() {\n    let x = 1;\n}\n";
         let new = "fn main() {\n    let x = 2;\n}\n";
-        let diff = build_compact_diff(old, new);
+        let diff = build_compact_diff(old, new, None);
         assert!(
             diff.contains("@@"),
             "must be a unified diff with a hunk header: {diff}"
@@ -2317,7 +2608,7 @@ mod tests {
     fn compact_diff_caps_huge_diffs() {
         let old = String::new();
         let new: String = (0..200).map(|i| format!("line {i}\n")).collect();
-        let diff = build_compact_diff(&old, &new);
+        let diff = build_compact_diff(&old, &new, None);
         assert!(
             diff.lines().count() <= 61,
             "capped: {} lines",
@@ -3035,11 +3326,10 @@ mod tests {
         );
         assert!(r.content.contains("```diff"), "{}", r.content);
         assert!(
-            r.content.contains("expected (your old_string)"),
+            r.content.contains("Exact Line Discrepancy"),
             "{}",
             r.content
         );
-        assert!(r.content.contains("actual (in file)"), "{}", r.content);
         assert!(
             r.content.contains("adjust your old_string"),
             "{}",
@@ -4107,9 +4397,34 @@ fn b() { 2 }
         assert!(
             hint.contains("[Content Mismatch]: Closest matching block found around lines")
                 && hint.contains("```diff")
-                && hint.contains("(Hint: adjust your old_string to match the actual file content above; do not blindly re-read the whole file)"),
+                && hint.contains("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)"),
             "Expected expanded Unified Diff, got: {hint}"
         );
+    }
+
+    #[test]
+    fn test_structured_mismatch_diff_with_line_numbers_and_discrepancy() {
+        let content =
+            "line 1\nline 2\n```bash [Linux]\ncurl install.sh | bash\n```\nline 7\nline 8\n";
+        let file_norm = NormalizedFile::new(content);
+
+        // 模型在末尾多传了 "}],path:"
+        let old_str_with_trailing = "```bash [Linux]\ncurl install.sh | bash\n```}],path:";
+        let path = std::path::Path::new("scripts/test.md");
+        let hint =
+            find_closest_match_snippet(Some(path), &file_norm, old_str_with_trailing).unwrap();
+
+        assert!(hint.contains("in scripts/test.md"));
+        assert!(hint.contains("👉 Exact Line Discrepancy"));
+        assert!(hint.contains("Notice extra trailing characters in your input: \"}],path:\""));
+        assert!(hint.contains(
+            "Below is the discrepancy between your old_string and the actual file content:"
+        ));
+        assert!(hint.contains("Lines with '-' are the mismatched or erroneous line(s)"));
+        assert!(hint.contains("2 | line 2")); // 上下文行不带任何 - 或 +
+        assert!(hint.contains("-    5 | ```}],path:"));
+        assert!(hint.contains("+    5 | ```"));
+        assert!(hint.contains("6 | line 7")); // 下文上下文行不带任何 - 或 +
     }
 
     #[test]
@@ -4179,10 +4494,7 @@ fn b() { 2 }
             "function demo() {\n  const a = 1;\n  const c = 3;\n  return a + b + c;\n}";
         let hint = find_closest_match_snippet(None, &file_norm, old_str_missing_b).unwrap();
 
-        assert!(
-            hint.contains("👉 Specific discrepancy (missing line(s) in your old_string):"),
-            "hint: {hint}"
-        );
+        assert!(hint.contains("👉 Exact Line Discrepancy"), "hint: {hint}");
         assert!(hint.contains("const b = 2;"), "hint: {hint}");
         assert!(
             hint.contains("```diff"),
@@ -4222,5 +4534,61 @@ fn b() { 2 }
         assert!(updated.contains("match output { Ok(()) => 1 }"));
         assert!(updated.contains("match output { Ok(()) => 2 }"));
         assert!(updated.contains("fn tail() { 900 }"));
+    }
+
+    #[tokio::test]
+    async fn test_cascading_overlap_conflict_diagnostics() {
+        let d = tempfile::tempdir().unwrap();
+        let file_path = d.path().join("code.rs");
+        let initial = [
+            "fn run() {",
+            "    init_stage();",
+            "    process_data();",
+            "    cleanup();",
+            "}",
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&file_path, &initial).unwrap();
+
+        // Both Hunk 1 and Hunk 2 write to line 3 (process_data)
+        // Hunk 1 writes handle_alpha()
+        // Hunk 2 writes handle_beta()
+        // This is a TRUE write-write conflict that cannot be resolved by reordering
+        let r = EditFileTool
+            .execute(
+                &serde_json::json!({
+                    "file_path": "code.rs",
+                    "edits": [
+                        {
+                            "old_string": "    init_stage();\n    process_data();",
+                            "new_string": "    init_stage();\n    handle_alpha();"
+                        },
+                        {
+                            "old_string": "    process_data();\n    cleanup();",
+                            "new_string": "    handle_beta();\n    cleanup();"
+                        }
+                    ]
+                })
+                .to_string(),
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(
+            r.is_error,
+            "cascading overlap must be rejected: {}",
+            r.content
+        );
+        assert!(r
+            .content
+            .contains("⚠️ Cascading Overlap Conflict (Hunk 2 ➔ Hunk 1)"));
+        assert!(r.content.contains("Hunk 1 (edits[0]) targets code in lines 2-3 that was just modified or removed by Hunk 2 (edits[1])"));
+        assert!(r.content.contains("Overlap Site:"));
+        assert!(r.content.contains("Intersection lines"));
+
+        // File must stay 100% untouched on disk
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(on_disk, initial);
     }
 }

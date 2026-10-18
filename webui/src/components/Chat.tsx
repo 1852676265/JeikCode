@@ -10676,7 +10676,12 @@ function DiffBody({
         {lines.map((line, i) => {
           if (line.kind === 'meta') {
             return (
-              <span key={i} class="diff-line diff-meta">{line.text || ' '}</span>
+              <span key={i} class="diff-line diff-meta">
+                <span class="diff-ln" />
+                <span class="diff-content">
+                  <span class="diff-code">{line.text || ' '}</span>
+                </span>
+              </span>
             );
           }
           const ln = line.kind === 'del' ? line.oldLine : (line.newLine ?? line.oldLine);
@@ -10684,9 +10689,11 @@ function DiffBody({
           const body = line.text.replace(/^[-+ ]/, '');
           return (
             <span key={i} class={'diff-line diff-' + line.kind}>
-              <span class="diff-ln">{ln ?? ''}</span>
-              <span class="diff-sign">{sign}</span>
-              <span>{body || ' '}</span>
+              <span class="diff-ln">{ln != null ? ln : ''}</span>
+              <span class="diff-content">
+                <span class="diff-sign">{sign}</span>
+                <span class="diff-code">{body || ' '}</span>
+              </span>
             </span>
           );
         })}

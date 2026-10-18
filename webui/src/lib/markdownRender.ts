@@ -96,7 +96,7 @@ function renderCodeBlock(code: string, infostring?: string, enableHighlight = fa
   // 对真实编程语言代码块注入语法高亮
   const isPlainDoc = lang === 'markdown' || lang === 'md' || lang === 'txt' || lang === 'text' || lang === 'mermaid' || !lang;
   const highlighted = (enableHighlight && !isPlainDoc)
-    ? highlightCode(text, `snippet.${lang}`)
+    ? highlightCode(text, `snippet.${normalizedLang || lang}`)
     : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const showLang = shouldShowCodeLanguage(lang);
   const langLabel = showLang

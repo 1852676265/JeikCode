@@ -73,20 +73,37 @@ pub async fn test_git_binding_api(Json(mut config): Json<GitAdapterConfig>) -> i
         if !token_still_valid {
             if let Some(app_id_str) = config.github_app_id.as_deref() {
                 if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
-                    let pem_res = if let Some(content) = config.github_app_private_key.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let pem_res = if let Some(content) = config
+                        .github_app_private_key
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                    {
                         Some(content.to_string())
-                    } else if let Some(path) = config.github_app_private_key_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                    } else if let Some(path) = config
+                        .github_app_private_key_path
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                    {
                         std::fs::read_to_string(path.trim()).ok()
                     } else {
                         None
                     };
 
                     if let Some(pem) = pem_res {
-                        if let Ok((fresh_token, _)) = crate::git_adapter::github_app::fetch_installation_token(app_id, &pem, &config.repo_identifier).await {
+                        if let Ok((fresh_token, _)) =
+                            crate::git_adapter::github_app::fetch_installation_token(
+                                app_id,
+                                &pem,
+                                &config.repo_identifier,
+                            )
+                            .await
+                        {
                             config.access_token = fresh_token.clone();
                             config.token_expires_at = Some(now + 3300);
                             // 顺带同步持久化，确保后续请求直接复用有效令牌
-                            if let Some(mut existing) = crate::git_adapter::get_binding_by_project(&config.project_hash) {
+                            if let Some(mut existing) =
+                                crate::git_adapter::get_binding_by_project(&config.project_hash)
+                            {
                                 existing.access_token = fresh_token;
                                 existing.token_expires_at = Some(now + 3300);
                                 existing.github_app_id = Some(app_id.to_string());
@@ -147,9 +164,7 @@ pub struct GenerateAppTokenRequest {
 
 /// POST /api/git/generate-token
 /// 使用 GitHub App ID 和私钥，纯 Rust 原生在内存中计算 RS256 JWT 并向 GitHub 换取官方 [bot] 安装访问令牌
-pub async fn generate_app_token_api(
-    Json(req): Json<GenerateAppTokenRequest>,
-) -> impl IntoResponse {
+pub async fn generate_app_token_api(Json(req): Json<GenerateAppTokenRequest>) -> impl IntoResponse {
     let repo = req
         .repo_identifier
         .filter(|s| !s.trim().is_empty())
@@ -157,7 +172,11 @@ pub async fn generate_app_token_api(
 
     let pem_content = if let Some(content) = req.private_key.filter(|s| !s.trim().is_empty()) {
         content
-    } else if let Some(path) = req.private_key_path.as_deref().filter(|s| !s.trim().is_empty()) {
+    } else if let Some(path) = req
+        .private_key_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         match std::fs::read_to_string(path.trim()) {
             Ok(c) => c,
             Err(e) => {
@@ -375,18 +394,33 @@ async fn execute_git_workflow(
         if !token_still_valid {
             if let Some(app_id_str) = config.github_app_id.as_deref() {
                 if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
-                    let pem_res = if let Some(content) = config.github_app_private_key.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let pem_res = if let Some(content) = config
+                        .github_app_private_key
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                    {
                         Some(content.to_string())
-                    } else if let Some(path) = config.github_app_private_key_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                    } else if let Some(path) = config
+                        .github_app_private_key_path
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                    {
                         std::fs::read_to_string(path.trim()).ok()
                     } else {
                         None
                     };
 
                     if let Some(pem) = pem_res {
-                        if let Ok((fresh_token, _)) = crate::git_adapter::github_app::fetch_installation_token(app_id, &pem, repo).await {
+                        if let Ok((fresh_token, _)) =
+                            crate::git_adapter::github_app::fetch_installation_token(
+                                app_id, &pem, repo,
+                            )
+                            .await
+                        {
                             token = fresh_token.clone();
-                            if let Some(mut existing) = crate::git_adapter::get_binding_by_project(&config.project_hash) {
+                            if let Some(mut existing) =
+                                crate::git_adapter::get_binding_by_project(&config.project_hash)
+                            {
                                 existing.access_token = fresh_token;
                                 existing.token_expires_at = Some(now + 3300);
                                 crate::git_adapter::save_binding(existing);

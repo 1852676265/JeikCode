@@ -50,3 +50,40 @@ test('highlightCode parses rainbow brackets and structure for txt files', () => 
   assert.ok(html.includes('['));
   assert.ok(html.includes('{'));
 });
+
+test('highlightCode does not treat URL slashes as comments in bash commands', () => {
+  const bashCmd = '# Linux / macOS / OpenWrt / HarmonyOS PC 适用一键安装\ncurl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh';
+  const html = highlightCode(bashCmd, 'snippet.bash');
+  assert.ok(html.includes('class="hl-comment"'));
+  assert.ok(html.includes('# Linux / macOS'));
+  assert.ok(!html.includes('<span class="hl-comment">//raw.githubusercontent.com'));
+  assert.ok(html.includes('https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh'));
+  assert.ok(html.includes('|'));
+  assert.ok(html.includes('sh'));
+});
+
+test('highlightCode does not treat python floor division // as comments', () => {
+  const pyCode = 'result = a // b  # floor division';
+  const html = highlightCode(pyCode, 'calc.py');
+  assert.ok(!html.includes('class="hl-comment">//'));
+  assert.ok(html.includes('class="hl-comment"># floor division'));
+});
+
+test('highlightCode does not treat decrement operator -- as comment in JS/TS/Rust', () => {
+  const tsCode = 'count--;\n// finished';
+  const html = highlightCode(tsCode, 'main.ts');
+  assert.ok(!html.includes('class="hl-comment">--'));
+  assert.ok(html.includes('class="hl-comment">// finished'));
+});
+
+test('highlightCode highlights SQL dashed comments properly', () => {
+  const sql = 'SELECT * FROM users; -- select all';
+  const html = highlightCode(sql, 'query.sql');
+  assert.ok(html.includes('class="hl-comment">-- select all'));
+});
+
+test('highlightCode does not treat URL with colon in TS as comment', () => {
+  const tsCode = 'const endpoint = https://api.jeikcode.top/v1;';
+  const html = highlightCode(tsCode, 'config.ts');
+  assert.ok(!html.includes('class="hl-comment">//api.jeikcode.top'));
+});

@@ -86,7 +86,9 @@ pub async fn fetch_installation_token(
     if !resp.status().is_success() {
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
-        return Err(format!("GitHub App installations query failed ({status}): {err}"));
+        return Err(format!(
+            "GitHub App installations query failed ({status}): {err}"
+        ));
     }
 
     let installations: Vec<serde_json::Value> = resp
@@ -109,7 +111,9 @@ pub async fn fetch_installation_token(
             if account.is_empty() {
                 return false;
             }
-            repo_identifier.to_lowercase().contains(&account.to_lowercase())
+            repo_identifier
+                .to_lowercase()
+                .contains(&account.to_lowercase())
         })
         .unwrap_or(&installations[0]);
 
@@ -133,7 +137,9 @@ pub async fn fetch_installation_token(
     if !token_resp.status().is_success() {
         let status = token_resp.status();
         let err = token_resp.text().await.unwrap_or_default();
-        return Err(format!("GitHub App token creation failed ({status}): {err}"));
+        return Err(format!(
+            "GitHub App token creation failed ({status}): {err}"
+        ));
     }
 
     let token_json: serde_json::Value = token_resp

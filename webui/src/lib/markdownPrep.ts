@@ -41,8 +41,6 @@ export const TEXT_CONTAINER_LANGS = new Set([
   'console',
   'log',
   'logs',
-  'diff',
-  'patch',
   'terminal',
   'shell-session',
   'error',
@@ -128,6 +126,7 @@ export function findMatchingFenceClose(
   start: number,
   fence: FenceState,
 ): number {
+  const isContainer = MARKDOWN_LANGS.has(fence.lang?.toLowerCase() ?? '') || TEXT_CONTAINER_LANGS.has(fence.lang?.toLowerCase() ?? '');
   let depth = 1;
 
   for (let k = start; k < lines.length; k++) {
@@ -137,12 +136,19 @@ export function findMatchingFenceClose(
     // 遇到带语言标签的代码块开启行
     const nextOpen = fenceOpen(lines[k]);
     if (nextOpen && trimmed.length > nextOpen.length && nextOpen.marker === fence.marker) {
-      // 只有当内部围栏长度大于等于外层时，才需要递增深度栈；
-      // 若内部长度小于外层（如 4 反引号包裹 3 反引号代码块），内部无论开启还是闭合都无法触及外层，直接放行作为普通内容
-      if (nextOpen.length >= fence.length) {
-        depth += 1;
+      // 关键防御：如果内部围栏长度严格小于外层围栏长度（例如 4 反引号包裹 3 反引号），
+      // 内部围栏在 CommonMark 规范下纯属普通内容，绝不构成断裂！放行继续查找！
+      if (nextOpen.length < fence.length) {
+        continue;
       }
-      continue;
+      if (isContainer) {
+        depth += 1;
+        continue;
+      } else {
+        // 对于明确的代码语言（非容器）：若尚未闭合就遇到了另一个明确带语言的新代码块开启，
+        // 说明当前代码块未闭合即断裂，返回 -1 触发自愈，绝不能跨越新代码块去贪婪匹配
+        return -1;
+      }
     }
 
     // 遇到合法的纯闭合围栏（必须大于等于外层长度）
@@ -159,7 +165,7 @@ export function findMatchingFenceClose(
 
 /**
  * 提升嵌套代码块的外层围栏长度：
- * 当代码块内部包含了子围栏（无论外层是 Rust, Java, Python, C#, Diff 还是 Markdown 容器），
+ * 当代码块内部包含了子围栏（无论外层是 Markdown 容器还是嵌入文档代码块），
  * 若外层反引号数量小于等于内部子围栏，marked 解析器在遇到内部第一个闭合 ``` 时就会错误截断外层代码块，
  * 导致后续内容变成散落富文本并在尾部触发二次反相开启。
  * 本函数自动将外层开启与闭合围栏的反引号长度提升为 `maxInnerLen + 1`（如 4 个反引号），
@@ -178,6 +184,10 @@ export function promoteNestedCodeFences(raw: string): string {
       continue;
     }
 
+    const lang = open.lang?.toLowerCase() ?? '';
+    const isMarkdownContainer = MARKDOWN_LANGS.has(lang);
+    const isDiff = lang === 'diff' || lang === 'patch';
+
     let depth = 1;
     let maxInnerLen = 0;
     let closeIdx = -1;
@@ -187,7 +197,7 @@ export function promoteNestedCodeFences(raw: string): string {
       const line = lines[k];
       const nextOpen = fenceOpen(line);
 
-      // 若内部出现带语言的代码块开启（通用支持所有编程语言的嵌套保护）
+      // 若内部出现带语言的代码块开启（通用支持所有编程语言与 diff 内部的嵌套保护）
       if (nextOpen && nextOpen.marker === open.marker && nextOpen.lang) {
         foundSubFence = true;
         maxInnerLen = Math.max(maxInnerLen, nextOpen.length);
@@ -203,19 +213,29 @@ export function promoteNestedCodeFences(raw: string): string {
       const curMarkerLen = mEnd - lead.index;
       const isPureClose = curMarkerLen >= 3 && rawLine.slice(mEnd).trim() === '';
 
-      if (isPureClose) {
+      // ★ 核心修复：在 diff / patch 代码块内部，带有 diff 行前缀（如 `+``` ` 或 `-``` `）的行，
+      // 属于被对比代码在 diff 上下文中的内部闭合行，必须消费内部嵌套 depth，
+      // 绝不能让其遗留 depth 导致末尾真正的纯闭合围栏被误吞！
+      const isDiffInnerClose = isDiff && /^[\+\-]\s*`{3,}/.test(rawLine);
+
+      if (isPureClose || isDiffInnerClose) {
         if (depth > 1) {
           foundSubFence = true;
-          maxInnerLen = Math.max(maxInnerLen, mEnd);
+          maxInnerLen = Math.max(maxInnerLen, curMarkerLen >= 3 ? curMarkerLen : open.length);
           depth -= 1;
-        } else if (depth === 1) {
+        } else if (depth === 1 && isPureClose) {
           closeIdx = k;
           break;
         }
       }
     }
 
-    if (foundSubFence && maxInnerLen >= open.length) {
+    // 关键黄金防线：
+    // 1. 如果成功找到外层闭合 closeIdx，且内部有子围栏，成对提升开启与闭合围栏；
+    // 2. 对于 Markdown 容器语言，若处于流式生成中（closeIdx === -1），提升开启以便 repairUnclosedFences 在末尾对齐补全；
+    // 3. 对于普通代码块（如 diff, rust 等），若找不到闭合（closeIdx === -1），绝对不能单方面提升开启，避免破坏 3 字符闭合导致吞噬正文！
+    const canPromote = foundSubFence && maxInnerLen >= open.length && (closeIdx !== -1 || isMarkdownContainer);
+    if (canPromote) {
       const newLen = Math.max(open.length + 1, maxInnerLen + 1);
       const openMarker = open.marker.repeat(newLen);
 
@@ -362,8 +382,10 @@ export function isStructuralTerminator(line: string, currentFence: FenceState): 
   }
 
   // 3. 遇到另一个明确开启新语言代码块的行（例如上一块漏闭合，直接开启新的 ```rust）
+  // 核心原则：只有当新代码块的围栏长度大于等于当前代码块时，才构成外部代码块的断裂开启！
+  // 若新代码块围栏长度小于外层（如 4 反引号代码块内部包含了 3 反引号的示例文档），内部围栏纯属合法内容，绝不提前腰斩
   const opening = fenceOpen(line);
-  if (opening && trimmed.length > opening.length) {
+  if (opening && opening.length >= currentFence.length && trimmed.length > opening.length) {
     return true;
   }
 
@@ -375,7 +397,7 @@ export function isStructuralTerminator(line: string, currentFence: FenceState): 
     const headingText = headingMatch[1].trim();
     if (HASH_COMMENT_LANGS.has(lang)) {
       const isDocumentHeading =
-        /^(?:第[一二三四五六七八九十0-9]+[步章节部分点项]|步骤\s*\d+|[一二三四五六七八九十]+[、.：:]|\d+[、.：:]\s*[\u4e00-\u9fa5]|为什么|如何|总结|结论|注意事项|核心结论)/.test(headingText) ||
+        /^(?:第[一二三四五六七八九十0-9]+[步章节部分点项]|步骤\s*\d+|[一二三四五六七八九十]+[、.：:]|\d+[、.：:]\s*[\u4e00-\u9fa5]|为什么|如何|总结|结论|注意事项|核心结论|方案\s*[A-Za-z0-9\u4e00-\u9fa5]|step\s*\d+|summary|conclusion|overview|solution|option)/i.test(headingText) ||
         (/[\u4e00-\u9fa5]/.test(headingText) && /[？?！!：:（）()]/.test(headingText));
       if (isDocumentHeading) {
         return true;
