@@ -21,6 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.5-beta.9 (2026-10-19)
+
+- **[Edit Tool & Precision Diagnostics] 3-line focused context window and trailing equal-line suppression**:
+  - Constrained Content Mismatch diff outputs to a compact 3-line context window centered on the first detected discrepancy line.
+  - Eliminated screen flooding across oversized hunks by truncating redundant identical lines, focusing model attention strictly on the active conflict site.
+
+---
+
+- **[Edit 工具与精准诊断] 冲突行聚焦 ±3 行上下文与冗余相同行自动剪裁**:
+  - 将编辑失配诊断（Content Mismatch）的 Diff 代码块严格约束在以第一处冲突行为圆心的 ±3 行（最窄 7-8 行）紧凑窗口之内。
+  - 彻底剪除超长 Hunk 中后续几十行完全相同的无冲突 Equal 行，根除刷屏现象并高度聚焦大模型注意力。
+
 ## v7.2.5 (2026-10-19)
 
 - **[WebUI & IDE Workspace] Full-featured persistent terminal, file explorer, code editor tab, rich preview, and console-aligned diff viewer**:
