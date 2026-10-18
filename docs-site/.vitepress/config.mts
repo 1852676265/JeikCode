@@ -147,6 +147,14 @@ export default defineConfig({
             ],
           },
           {
+            text: 'Deployment',
+            collapsed: false,
+            items: [
+              { text: 'Daemon & Headless', link: '/deploy/daemon' },
+              { text: 'OpenWrt & Gateways', link: '/deploy/openwrt' },
+            ],
+          },
+          {
             text: 'Configuration Guide',
             collapsed: false,
             items: [
@@ -226,6 +234,14 @@ export default defineConfig({
               { text: '代码图谱', link: '/zh/usage/codegraph' },
               { text: 'WebUI 界面与远程访问', link: '/zh/usage/webui' },
               { text: 'API 兼容端点（OpenAI、Anthropic）', link: '/zh/usage/api-compat' },
+            ],
+          },
+          {
+            text: '部署与常驻服务',
+            collapsed: false,
+            items: [
+              { text: '后台 Daemon 与无头运行', link: '/zh/deploy/daemon' },
+              { text: 'OpenWrt 软路由部署', link: '/zh/deploy/openwrt' },
             ],
           },
           {

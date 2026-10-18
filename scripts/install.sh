@@ -47,6 +47,16 @@ case "$uname_s" in
     *) echo "Unsupported OS: $uname_s (Windows users: download the zip from the release page)"; exit 1 ;;
 esac
 
+# Detect OpenWrt and its derivatives (ImmortalWrt, iStoreOS, Kwrt, LEDE, etc.)
+is_openwrt=0
+if [ "$os" = "linux" ]; then
+    if [ -f /etc/openwrt_release ] || [ -f /etc/openwrt_version ] || [ -x /sbin/procd ] || [ -d /etc/config -a -x /sbin/uci ]; then
+        is_openwrt=1
+    elif [ -f /etc/os-release ] && grep -Eqi 'openwrt|immortalwrt|istoreos|kwrt|lede' /etc/os-release 2>/dev/null; then
+        is_openwrt=1
+    fi
+fi
+
 case "$uname_m" in
     arm64|aarch64) arch="arm64" ;;
     x86_64|amd64)  arch="x64"   ;;
@@ -200,6 +210,20 @@ echo ""
 echo "Installed: $TARGET"
 "$TARGET" --version 2>/dev/null || true
 
+# --- OpenWrt compatibility: automatically link to /usr/bin if needed ---
+OPENWRT_LINKED=0
+if [ "$is_openwrt" = 1 ] && [ "$TARGET" != "/usr/bin/jeikcode${ext}" ] && [ -d /usr/bin ]; then
+    if [ -w /usr/bin ]; then
+        ln -sf "$TARGET" "/usr/bin/jeikcode${ext}"
+        OPENWRT_LINKED=1
+        echo "==> [OpenWrt] 已自动创建软链接: /usr/bin/jeikcode -> $TARGET"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo ln -sf "$TARGET" "/usr/bin/jeikcode${ext}"
+        OPENWRT_LINKED=1
+        echo "==> [OpenWrt] 已自动创建软链接: /usr/bin/jeikcode -> $TARGET (sudo)"
+    fi
+fi
+
 # --- check & sync config if ~/.jeikcode exists ---
 JEIKCODE_HOME="${JEIKCODE_HOME:-$HOME/.jeikcode}"
 if [ -d "$JEIKCODE_HOME" ]; then
@@ -221,39 +245,57 @@ if [ "$os" = "windows" ]; then
     echo "      powershell -c \"irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | iex\""
 fi
 
-case ":$PATH:" in
-    *":$PREFIX:"*) ;;
-    *)
-        LINE="export PATH=\"$PREFIX:\$PATH\""
-        RC=""
-        if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
-            RC="$HOME/.zshrc"
-        elif [ -n "${BASH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "bash" ]; then
-            RC="$HOME/.bashrc"
-        fi
-
-        if [ -n "$RC" ]; then
-            if [ -f "$RC" ] && grep -qxF "$LINE" "$RC" 2>/dev/null; then
-                :
-            else
-                echo "" >> "$RC"
-                echo "# Added by JeikCode installer" >> "$RC"
-                echo "$LINE" >> "$RC"
-                echo ""
-                echo "Added $PREFIX to PATH in $RC"
+if [ "${JEIKCODE_NO_PATH_UPDATE:-0}" != "1" ]; then
+    case ":$PATH:" in
+        *":$PREFIX:"*) ;;
+        *)
+            LINE="export PATH=\"$PREFIX:\$PATH\""
+            RC=""
+            if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
+                RC="$HOME/.zshrc"
+            elif [ -n "${BASH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "bash" ]; then
+                RC="$HOME/.bashrc"
+            elif [ "$is_openwrt" = 1 ] && [ -w /etc/profile ]; then
+                RC="/etc/profile"
+            elif [ -f "$HOME/.profile" ] || [ "$is_openwrt" = 1 ]; then
+                RC="$HOME/.profile"
             fi
-            echo ""
-            echo "To start using jeikcode right now, run:"
-            echo ""
-            echo "    source $RC"
-            echo ""
-        else
-            echo ""
-            echo "Note: $PREFIX is not in your PATH. Add this line to your shell rc:"
-            echo "    $LINE"
-        fi
-        ;;
-esac
+
+            if [ -n "$RC" ]; then
+                if [ -f "$RC" ] && grep -qxF "$LINE" "$RC" 2>/dev/null; then
+                    :
+                else
+                    echo "" >> "$RC"
+                    echo "# Added by JeikCode installer" >> "$RC"
+                    echo "$LINE" >> "$RC"
+                    echo ""
+                    echo "Added $PREFIX to PATH in $RC"
+                fi
+                if [ "$OPENWRT_LINKED" != 1 ]; then
+                    echo ""
+                    echo "To start using jeikcode right now, run:"
+                    echo ""
+                    echo "    source $RC"
+                    echo ""
+                fi
+            else
+                if [ "$OPENWRT_LINKED" != 1 ]; then
+                    echo ""
+                    echo "Note: $PREFIX is not in your PATH. Add this line to your shell rc:"
+                    echo "    $LINE"
+                fi
+            fi
+            ;;
+    esac
+fi
+
+if [ "$OPENWRT_LINKED" = 1 ]; then
+    echo ""
+    echo "To start using jeikcode right now, run:"
+    echo ""
+    echo "    jeikcode --version"
+    echo ""
+fi
 
 echo ""
 echo "==> JeikCode uses the official release update channel. To enable auto-update, add to ~/.jeikcode/config.toml:"

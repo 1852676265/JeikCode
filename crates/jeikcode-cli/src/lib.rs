@@ -16,6 +16,7 @@ fn _isolate_jeikcode_home() {
 pub mod askpass;
 pub mod config_sync;
 pub mod host_service;
+pub mod procd;
 pub mod systemd;
 pub mod uninstall;
 

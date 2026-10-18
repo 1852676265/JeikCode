@@ -385,10 +385,14 @@ fn build_context(plan: &super::scan::Plan) -> anyhow::Result<ExecuteContext> {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let rc = super::paths::unix_rc_paths();
-        for path in [rc.zshrc, rc.bashrc] {
+        for path in [rc.zshrc, rc.bashrc, rc.profile] {
             if path.exists() {
                 rc_files.push((path, prefix.clone()));
             }
+        }
+        let etc_profile = std::path::PathBuf::from("/etc/profile");
+        if etc_profile.exists() {
+            rc_files.push((etc_profile, prefix.clone()));
         }
     }
     let _ = plan; // suppress unused-var warning on non-unix builds

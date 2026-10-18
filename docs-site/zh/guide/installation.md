@@ -14,8 +14,8 @@ JeikCode 核心引擎采用高性能 Rust 构建，支持在各大主流操作�
 
 ::: code-group
 
-```bash [Linux / macOS / HarmonyOS PC]
-curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | bash
+```bash [Linux / macOS / OpenWrt / HarmonyOS PC]
+curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh
 ```
 
 ```powershell [Windows (PowerShell)]

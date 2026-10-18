@@ -51,7 +51,8 @@ if [ -z "$BIN" ]; then
     # `.exe` variants cover a Windows-shell (MSYS/MinGW/Cygwin) install — install.sh drops
     # jeikcode.exe into ~/.local/bin there.
     for c in /usr/local/bin/jeikcode "$HOME/.local/bin/jeikcode" \
-             /usr/local/bin/jeikcode.exe "$HOME/.local/bin/jeikcode.exe"; do
+             /usr/local/bin/jeikcode.exe "$HOME/.local/bin/jeikcode.exe" \
+             /usr/bin/jeikcode; do
         [ -e "$c" ] && BIN=$c && break
     done
 fi
@@ -62,6 +63,25 @@ if [ -z "$BIN" ]; then
     echo "jeikcode binary not found in PATH or default locations." >&2
     echo "If installed elsewhere, pass JEIKCODE_BIN=/path/to/jeikcode" >&2
 fi
+
+SYMLINK_BIN=""
+if [ -n "$BIN" ] && [ -L "$BIN" ]; then
+    SYMLINK_BIN="$BIN"
+    REAL_TARGET=$(readlink "$BIN" 2>/dev/null || true)
+    if [ -n "$REAL_TARGET" ]; then
+        case "$REAL_TARGET" in
+            /*) BIN="$REAL_TARGET" ;;
+            *)  BIN="$(dirname "$SYMLINK_BIN")/$REAL_TARGET" ;;
+        esac
+    fi
+fi
+
+if [ -z "$SYMLINK_BIN" ] && [ -L /usr/bin/jeikcode ] && [ "/usr/bin/jeikcode" != "$BIN" ]; then
+    LINK_DEST=$(readlink /usr/bin/jeikcode 2>/dev/null || true)
+    if [ "$LINK_DEST" = "$BIN" ] || [ "$(readlink -f /usr/bin/jeikcode 2>/dev/null || true)" = "$(readlink -f "$BIN" 2>/dev/null || true)" ]; then
+        SYMLINK_BIN="/usr/bin/jeikcode"
+    fi
+fi
 BIN_DIR=$(dirname "$BIN" 2>/dev/null || echo "")
 
 DATA="${JEIKCODE_HOME:-$HOME/.jeikcode}"
@@ -69,12 +89,13 @@ DATA="${JEIKCODE_HOME:-$HOME/.jeikcode}"
 # ---- plan ----
 echo "Will remove (Group 1):"
 [ -n "$BIN" ] && echo "  $BIN"
+[ -n "$SYMLINK_BIN" ] && echo "  $SYMLINK_BIN (symlink)"
 if [ -n "$BIN_DIR" ]; then
     for f in jeikcode.bak .jeikcode.rolling .jeikcode.download .jeikcode.writable-probe; do
         [ -e "$BIN_DIR/$f" ] && echo "  $BIN_DIR/$f"
     done
 fi
-for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "/etc/profile"; do
     if [ -e "$rc" ] && grep -q "Added by JeikCode installer" "$rc" 2>/dev/null; then
         echo "  $rc (PATH line)"
     fi
@@ -128,7 +149,7 @@ fi
 rmdir "$DATA" 2>/dev/null || true
 
 # rc cleanup
-for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "/etc/profile"; do
     [ -e "$rc" ] || continue
     if grep -q "Added by JeikCode installer" "$rc"; then
         cp "$rc" "$rc.jeikcode-uninstall.bak"
@@ -138,10 +159,26 @@ for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
             skip == 1 && /^export PATH=/ { skip=0; next }
             skip == 1 && /^[[:space:]]*$/ { next }
             { skip=0; print }
-        ' "$rc.jeikcode-uninstall.bak" > "$rc"
+        ' "$rc.jeikcode-uninstall.bak" > "$rc.tmp"
+        if [ -w "$rc" ]; then
+            mv "$rc.tmp" "$rc"
+        elif command -v sudo >/dev/null 2>&1; then
+            sudo mv "$rc.tmp" "$rc"
+        else
+            rm -f "$rc.tmp"
+        fi
         echo "edited $rc (backup: $rc.jeikcode-uninstall.bak)"
     fi
 done
+
+# symlink
+if [ -n "$SYMLINK_BIN" ] && [ -L "$SYMLINK_BIN" ]; then
+    if [ -w "$SYMLINK_BIN" ] || [ -w "$(dirname "$SYMLINK_BIN")" ]; then
+        rm -f "$SYMLINK_BIN"
+    else
+        sudo rm -f "$SYMLINK_BIN"
+    fi
+fi
 
 # binary
 if [ -n "$BIN" ] && [ -e "$BIN" ]; then

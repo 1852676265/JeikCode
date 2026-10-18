@@ -45,7 +45,7 @@
 - 🔍 **语义代码图谱 (CodeExplore)**：深度内置 Tree-Sitter 原生支持 12+ 种主流语言。融合领域双语词林（`thesaurus`），支持用业务大白话直接提问全局代码与上下游调用链路，1~3ms 极速无感增量差量更新；
 - 🛡️ **98–99% 极致缓存 (KV-Cache)**：基于严格 Append-Only 字节级不可变性与圣地地基设计（`sacred_floor`），首部系统提示词永久固化，彻底杜绝缓存雪崩（Cache Thrashing），API 调用成本降低 90%+，毫秒级首字极速吐出；
 - ⚡ **9k 极简提示词与严苛纪律**：拒绝 30~50k 臃肿系统开销，单次起手仅占约 9~11k Token，将绝大部分宝贵上下文留给代码；全面开源，规则修改热重载即刻生效；
-- 📱 **全场景协同与移动端适配**：终端 TUI、现代 WebUI、Tauri 桌面端与后台 Daemon 全覆盖。WebUI 深度定制手机与平板触控界面，出门在外随时随地随身编程；
+- 📱 **全场景协同与全平台统一 Agent**：终端 TUI、现代 WebUI、Tauri 桌面端、后台 Daemon 以及 OpenWrt 软路由/网关全覆盖。无缝在 Windows、macOS、Linux（x86/ARM）与 OpenWrt 软路由环境部署运行，统一架构、同一智能体心智与全端一致体验；
 - 🔒 **类 Git 状态机并发原子保护**：多文件大范围并发编辑严格原子性保护防脏写，强模型与弱模型均能稳定执行，支持一键 Undo 历史检查点回滚；
 - 🔄 **原生五大协议全栈兼容**：原生自适应支持 `OpenAI Chat`、`OpenAI Responses`、`Anthropic Claude`、`Google Gemini` 与 `Ollama` 格式，账号凭据与模型配置彻底解耦；
 - 🧩 **开放生态与第三方兼容端点**：服务端暴露标准 OpenAI/Claude/Gemini API 端点，外部第三方工具、翻译插件或 OpenClaw 等 Agent 框架可直接无缝接入；
@@ -68,8 +68,8 @@
 ### 2. 官方终端一键安装脚本 (CLI)
 
 ```bash
-# Linux / macOS 终端执行
-curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | bash
+# Linux / macOS / OpenWrt 终端执行
+curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh
 ```
 
 ```powershell

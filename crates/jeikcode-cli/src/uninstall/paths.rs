@@ -54,6 +54,7 @@ pub fn uninstall_manifest() -> UninstallManifest {
 pub struct UnixRcPaths {
     pub zshrc: PathBuf,
     pub bashrc: PathBuf,
+    pub profile: PathBuf,
 }
 
 #[cfg(unix)]
@@ -67,6 +68,7 @@ pub fn unix_rc_paths_for_home(home: &Path) -> UnixRcPaths {
     UnixRcPaths {
         zshrc: home.join(".zshrc"),
         bashrc: home.join(".bashrc"),
+        profile: home.join(".profile"),
     }
 }
 
@@ -75,12 +77,14 @@ pub fn unix_rc_paths_for_home(home: &Path) -> UnixRcPaths {
 pub struct UnixRcPaths {
     pub zshrc: PathBuf,
     pub bashrc: PathBuf,
+    pub profile: PathBuf,
 }
 #[cfg(all(not(unix), test))]
 pub fn unix_rc_paths_for_home(home: &Path) -> UnixRcPaths {
     UnixRcPaths {
         zshrc: home.join(".zshrc"),
         bashrc: home.join(".bashrc"),
+        profile: home.join(".profile"),
     }
 }
 
@@ -158,5 +162,6 @@ mod tests {
         let rc = unix_rc_paths_for_home(std::path::Path::new("/Users/test"));
         assert_eq!(rc.zshrc, std::path::Path::new("/Users/test/.zshrc"));
         assert_eq!(rc.bashrc, std::path::Path::new("/Users/test/.bashrc"));
+        assert_eq!(rc.profile, std::path::Path::new("/Users/test/.profile"));
     }
 }

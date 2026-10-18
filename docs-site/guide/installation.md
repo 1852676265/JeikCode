@@ -14,8 +14,8 @@ The automated install script detects your operating system and CPU architecture 
 
 ::: code-group
 
-```bash [Linux / macOS / HarmonyOS PC]
-curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | bash
+```bash [Linux / macOS / OpenWrt / HarmonyOS PC]
+curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh
 ```
 
 ```powershell [Windows (PowerShell)]

@@ -84,7 +84,10 @@ pub fn list_services() -> Vec<HostServiceEntry> {
     let mut entries = Vec::new();
 
     #[cfg(target_os = "linux")]
-    entries.extend(scan_systemd());
+    {
+        entries.extend(crate::procd::scan_procd());
+        entries.extend(scan_systemd());
+    }
 
     #[cfg(target_os = "macos")]
     entries.extend(scan_launchd());
@@ -107,6 +110,7 @@ pub fn list_services() -> Vec<HostServiceEntry> {
 pub fn uninstall_service(entry: &HostServiceEntry) -> Result<()> {
     match entry.platform {
         "systemd" => uninstall_systemd(&entry.service_name),
+        "procd" => crate::procd::uninstall_procd(&entry.service_name),
         "launchd" => uninstall_launchd(&entry.service_name),
         "schtasks" => uninstall_schtasks(&entry.service_name),
         "runkey" => uninstall_run_key(&entry.service_name),
@@ -116,7 +120,7 @@ pub fn uninstall_service(entry: &HostServiceEntry) -> Result<()> {
 
 /// Parse the port number from a JeikCode service name.
 /// Accepts: `jeikcode-4096`, `com.jeikcode-3000`, `JeikCode-5000`
-fn parse_port_from_name(name: &str) -> Option<u16> {
+pub(crate) fn parse_port_from_name(name: &str) -> Option<u16> {
     // Find the last occurrence of a digit sequence at the end (possibly after a dot or dash)
     let stem = name.trim_end_matches(".service").trim_end_matches(".plist");
     let suffix = stem.rsplit(|c: char| c == '-' || c == '.').next()?;
@@ -148,6 +152,19 @@ pub fn prompt_host_service_setup(opts: &HostServiceSetupOptions<'_>) -> Result<b
 
     #[cfg(target_os = "linux")]
     {
+        if crate::procd::is_openwrt() {
+            return crate::procd::prompt_procd_setup(
+                opts.host,
+                opts.port,
+                opts.workdir,
+                opts.no_token,
+                opts.fixed_token,
+                opts.display_token,
+                opts.yolo,
+                opts.no_telemetry,
+                opts.banner,
+            );
+        }
         if !crate::systemd::is_systemd_available() {
             return Ok(false);
         }

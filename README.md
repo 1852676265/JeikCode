@@ -45,7 +45,7 @@
 - 🔍 **Semantic CodeGraph (CodeExplore)**: Powered by Tree-Sitter across 12+ programming languages. Seamlessly integrates domain bilingual thesauruses (`thesaurus`) to query code using everyday business natural language, backed by 1~3ms zero-touch incremental patching;
 - 🛡️ **98–99% KV-Cache Protection (Sacred Floor)**: Enforces strict append-only byte immutability and memory preservation (`sacred_floor`), keeping system prefixes frozen across turns. Completely eliminates cache thrashing, slash token expenses by over 90%, and compresses TTFT to milliseconds;
 - ⚡ **9k Minimal Prompts & High Discipline**: Avoids 30–50k token system bloat. A standard greeting turn consumes only ~9–11k tokens, reserving the maximum context window strictly for your codebase. Fully open-source and live-reloadable;
-- 📱 **Omni-Platform Workflows & Mobile UI**: Full coverage across terminal TUI, modern WebUI, Tauri desktop apps, and headless background daemons. WebUI is specifically optimized for phone and tablet touchscreens for on-the-go coding;
+- 📱 **Omni-Platform Workflows & Unified Agent**: Full coverage across terminal TUI, modern WebUI, Tauri desktop apps, background daemons, and OpenWrt routers/gateways. Runs seamlessly across Windows, macOS, Linux (x86/ARM), and OpenWrt (iStoreOS/ImmortalWrt/Kwrt/LEDE) with a unified mental model and coherent cross-platform experience;
 - 🔒 **Git-like State Machine Atomic Protection**: Strict concurrent file edit boundaries eliminate dirty writes. Operates safely across frontier and lightweight models, complete with one-click undo/rollback checkpoints;
 - 🔄 **Native Support for 5 Industry Protocols**: Seamlessly integrates `OpenAI Chat`, `OpenAI Responses`, `Anthropic Claude`, `Google Gemini`, and `Ollama` formats, with complete decoupling of accounts and models;
 - 🧩 **Tri-Protocol Gateway & Open Ecosystem**: Exposes standard OpenAI, Anthropic, and Gemini compatible server endpoints, enabling tools like OpenClaw or translation plugins to connect effortlessly;
@@ -68,8 +68,8 @@ Out-of-the-box cross-platform desktop application with embedded WebUI and automa
 ### 2. Official Terminal One-Liner (CLI)
 
 ```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | bash
+# Linux / macOS / OpenWrt
+curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh
 ```
 
 ```powershell

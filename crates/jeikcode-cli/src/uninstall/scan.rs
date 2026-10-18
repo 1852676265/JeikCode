@@ -24,6 +24,31 @@ pub fn scan(binary_path: &Path, jeikcode_dir: &Path) -> Result<Plan> {
     if binary_path.exists() {
         items.push(item(Group::Binary, binary_path.to_path_buf(), "binary")?);
     }
+    #[cfg(unix)]
+    {
+        let link_candidate = Path::new("/usr/bin/jeikcode");
+        if link_candidate != binary_path {
+            if let Ok(meta) = fs::symlink_metadata(link_candidate) {
+                if meta.file_type().is_symlink() {
+                    let points_to_binary = fs::read_link(link_candidate)
+                        .map(|target| {
+                            target == binary_path
+                                || fs::canonicalize(link_candidate)
+                                    .map(|c| c == binary_path)
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if points_to_binary {
+                        items.push(item(
+                            Group::Binary,
+                            link_candidate.to_path_buf(),
+                            "system symlink",
+                        )?);
+                    }
+                }
+            }
+        }
+    }
     if let Some(dir) = binary_path.parent() {
         // Self-update backup uses extension `.bak` appended (jeikcode.bak / jeikcode.exe.bak).
         let bak_name = {
