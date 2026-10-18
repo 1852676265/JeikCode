@@ -21,7 +21,7 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
-## v7.2.5-beta.9 (2026-10-19)
+## v7.2.6-beta.1 (2026-10-19)
 
 - **[Edit Tool & Precision Diagnostics] 3-line focused context window and trailing equal-line suppression**:
   - Constrained Content Mismatch diff outputs to a compact 3-line context window centered on the first detected discrepancy line.
