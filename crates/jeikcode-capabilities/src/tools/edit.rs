@@ -2155,49 +2155,35 @@ fn build_structured_mismatch_diff(
         .map(|s| format!(" in {s}"))
         .unwrap_or_default();
 
-    const CONTEXT_RADIUS: usize = 3;
-    let ctx_before_start = start.saturating_sub(CONTEXT_RADIUS);
-    let ctx_after_end = (end + CONTEXT_RADIUS).min(file.lines.len());
-
-    let mut before_lines = Vec::new();
-    for i in ctx_before_start..start {
-        before_lines.push(format!("  {:>4} | {}", i + 1, file.lines[i]));
-    }
-
-    let mut after_lines = Vec::new();
-    for i in end..ctx_after_end {
-        after_lines.push(format!("  {:>4} | {}", i + 1, file.lines[i]));
-    }
-
     let file_core = file.lines[start..end].join("\n");
     let mut config = TextDiff::configure();
     config.timeout(std::time::Duration::from_millis(200));
     let diff = config.diff_lines(old_string, &file_core);
 
-    let mut core_lines = Vec::new();
-    let mut curr_line = start + 1;
-    let mut discrepancy: Option<ExactDiscrepancy> = None;
-
     let changes: Vec<_> = diff.iter_all_changes().collect();
-    let mut idx = 0;
-    while idx < changes.len() {
-        let change = &changes[idx];
+
+    // 1. 第一遍扫描：准确定位第一处失配冲突点所在的真实文件物理行号与差异细节
+    let mut first_conflict_line: Option<usize> = None;
+    let mut discrepancy: Option<ExactDiscrepancy> = None;
+    let mut scan_line = start + 1;
+    let mut scan_idx = 0;
+
+    while scan_idx < changes.len() {
+        let change = &changes[scan_idx];
         match change.tag() {
             ChangeTag::Equal => {
-                let val = change.value().trim_end_matches(['\r', '\n']);
-                core_lines.push(format!("  {:>4} | {}", curr_line, val));
-                curr_line += 1;
-                idx += 1;
+                scan_line += 1;
+                scan_idx += 1;
             }
             ChangeTag::Delete => {
+                if first_conflict_line.is_none() {
+                    first_conflict_line = Some(scan_line);
+                }
                 let exp = change.value().trim_end_matches(['\r', '\n']);
-                core_lines.push(format!("- {:>4} | {}", curr_line, exp));
 
-                // Check if immediately followed by an Insert (replacement pair)
-                if idx + 1 < changes.len() && changes[idx + 1].tag() == ChangeTag::Insert {
-                    let act = changes[idx + 1].value().trim_end_matches(['\r', '\n']);
-                    core_lines.push(format!("+ {:>4} | {}", curr_line, act));
-
+                if scan_idx + 1 < changes.len() && changes[scan_idx + 1].tag() == ChangeTag::Insert
+                {
+                    let act = changes[scan_idx + 1].value().trim_end_matches(['\r', '\n']);
                     if discrepancy.is_none() {
                         let hint = if exp.trim() == act.trim() {
                             "Notice whitespace/indentation mismatch".to_string()
@@ -2218,19 +2204,18 @@ fn build_structured_mismatch_diff(
                         };
 
                         discrepancy = Some(ExactDiscrepancy {
-                            line_no: curr_line,
+                            line_no: scan_line,
                             expected: exp.to_string(),
                             actual: act.to_string(),
                             hint,
                         });
                     }
-
-                    curr_line += 1;
-                    idx += 2;
+                    scan_line += 1;
+                    scan_idx += 2;
                 } else {
                     if discrepancy.is_none() {
                         discrepancy = Some(ExactDiscrepancy {
-                            line_no: curr_line,
+                            line_no: scan_line,
                             expected: exp.to_string(),
                             actual: String::new(),
                             hint: format!(
@@ -2239,24 +2224,94 @@ fn build_structured_mismatch_diff(
                             ),
                         });
                     }
-                    idx += 1;
+                    scan_idx += 1;
                 }
             }
             ChangeTag::Insert => {
+                if first_conflict_line.is_none() {
+                    first_conflict_line = Some(scan_line);
+                }
                 let act = change.value().trim_end_matches(['\r', '\n']);
-                core_lines.push(format!("+ {:>4} | {}", curr_line, act));
-
                 if discrepancy.is_none() {
                     discrepancy = Some(ExactDiscrepancy {
-                        line_no: curr_line,
+                        line_no: scan_line,
                         expected: String::new(),
                         actual: act.to_string(),
                         hint: format!("Notice missing line from actual file: {:?}", act),
                     });
                 }
+                scan_line += 1;
+                scan_idx += 1;
+            }
+        }
+    }
 
+    // 2. 以冲突行（first_conflict_line）为绝对圆心，严格锁定上下各 3 行（最多 7-8 行）紧凑上下文，
+    // 杜绝长 Hunk 后续几十行完全相同的 Equal 行全量刷屏！
+    let target_conflict_line = first_conflict_line.unwrap_or(start + 1);
+    const FOCUS_RADIUS: usize = 3;
+    let focus_start = target_conflict_line.saturating_sub(FOCUS_RADIUS).max(1);
+    let focus_end = target_conflict_line + FOCUS_RADIUS;
+
+    let mut core_lines = Vec::new();
+    let mut curr_line = start + 1;
+    let mut idx = 0;
+
+    while idx < changes.len() {
+        let change = &changes[idx];
+        match change.tag() {
+            ChangeTag::Equal => {
+                let val = change.value().trim_end_matches(['\r', '\n']);
+                if curr_line >= focus_start && curr_line <= focus_end {
+                    core_lines.push(format!("  {:>4} | {}", curr_line, val));
+                }
                 curr_line += 1;
                 idx += 1;
+            }
+            ChangeTag::Delete => {
+                let exp = change.value().trim_end_matches(['\r', '\n']);
+                let in_focus = curr_line >= focus_start && curr_line <= focus_end;
+
+                if idx + 1 < changes.len() && changes[idx + 1].tag() == ChangeTag::Insert {
+                    let act = changes[idx + 1].value().trim_end_matches(['\r', '\n']);
+                    if in_focus {
+                        core_lines.push(format!("- {:>4} | {}", curr_line, exp));
+                        core_lines.push(format!("+ {:>4} | {}", curr_line, act));
+                    }
+                    curr_line += 1;
+                    idx += 2;
+                } else {
+                    if in_focus {
+                        core_lines.push(format!("- {:>4} | {}", curr_line, exp));
+                    }
+                    idx += 1;
+                }
+            }
+            ChangeTag::Insert => {
+                let act = change.value().trim_end_matches(['\r', '\n']);
+                if curr_line >= focus_start && curr_line <= focus_end {
+                    core_lines.push(format!("+ {:>4} | {}", curr_line, act));
+                }
+                curr_line += 1;
+                idx += 1;
+            }
+        }
+    }
+
+    // 如果冲突行在整个 block 的开头或结尾导致前后缺少上下文，从物理文件中优雅补齐参考行
+    let mut display_lines = Vec::new();
+    if focus_start < (start + 1) {
+        for i in focus_start..(start + 1) {
+            if i >= 1 && i <= file.lines.len() {
+                display_lines.push(format!("  {:>4} | {}", i, file.lines[i - 1]));
+            }
+        }
+    }
+    display_lines.extend(core_lines);
+    if focus_end > end {
+        for i in (end + 1)..=focus_end {
+            if i <= file.lines.len() {
+                display_lines.push(format!("  {:>4} | {}", i, file.lines[i - 1]));
             }
         }
     }
@@ -2279,15 +2334,7 @@ fn build_structured_mismatch_diff(
     }
 
     out.push_str("```````diff\n");
-    if !before_lines.is_empty() {
-        out.push_str(&before_lines.join("\n"));
-        out.push_str("\n\n");
-    }
-    out.push_str(&core_lines.join("\n"));
-    if !after_lines.is_empty() {
-        out.push_str("\n\n");
-        out.push_str(&after_lines.join("\n"));
-    }
+    out.push_str(&display_lines.join("\n"));
     out.push_str("\n```````\n");
     out.push_str("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)");
 
