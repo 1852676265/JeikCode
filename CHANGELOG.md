@@ -73,33 +73,82 @@
 - **[能力系统与子智能体] 子智能体操作回执与上下文窗口压缩保护 (#62)**:
   - 在 TaskTool 与 StubCompaction 中为 explore 子 agent 提供权威操作回执账本、输出压缩保护以及保留回执的历史会话压缩存根。
 
-## v7.2.5-beta.8 (2026-10-19)
+## v7.2.5 (2026-10-19)
 
-- **[Edit Tool & Diagnostics] Standardized single-column Git diffs, exact discrepancy diagnostics, and cascading conflict recovery**:
+- **[WebUI & IDE Workspace] Persistent full-featured terminal, file explorer, code editor tab, rich preview, and console-aligned diff viewer**:
+  - Integrated a full-featured terminal emulator powered by XTerm.js and node-pty WebSocket streaming, supporting multi-tab management, independent capture zoom isolation, persistent shells across browser refreshes, and dynamic viewport fitting.
+  - Added an intuitive File Explorer tab with breadcrumb path navigation, quick file manipulation menus (create, rename, delete, open in OS), and seamless switching between conversations and workspace files.
+  - Introduced a tabbed Code Editor with syntax highlighting, indentation formatting, rainbow bracket matching, and compound extension support (such as `.json.example`).
+  - Added a dedicated Rich Media & Markdown Preview Panel supporting side-by-side document browsing, relative link resolution, and media rendering (images, PDF, audio, video).
+  - Restructured `<DiffBody>` and CSS layouts to align with native Git terminal standards, isolating line numbers in a fixed-width gutter with clean border separation (`user-select: none`), preventing line number pollution during patch copying.
+  - Embedded the Git Commits panel into the Changes view with a resizable split layout for desktop and web environments, full project-relative diff paths, and rich transcript copying.
+- **[Daemon & Architecture] Terminal session management, session branching, live approval isolation, and broadcast resilience**:
+  - Extracted terminal session management into a dedicated daemon module with cascaded process tree termination via `taskkill` on Windows and `kill -9` on POSIX upon terminal closure to eliminate zombie process leaks.
+  - Supported non-destructive conversation branching and session forking at arbitrary message boundaries with counter re-derivation, cache-epoch isolation, and lineage tree REST endpoints.
+  - Isolated live approval modes (Build, Plan, Bypass) per session ID with automatic resource cleanup upon session deletion and seamless global fallback.
+  - Expanded active chat event broadcast channel capacity from 512 to 4096, preventing `Lagged` event drops and ensuring reliable turn completion and message delivery in concurrent multi-agent workflows.
+  - Hardened "stop current turn" handling to deliver both request and session aliases, eliminating `session_busy` collisions when immediately sending the next message.
+  - Added real recursive directory search for `fs locate`, asynchronous backend routes for file manipulation, and raw media streaming with MIME detection.
+- **[Git Platform & Automated Code Review Bot] Native GitHub App authentication, webhook dispatcher, and automated review execution**:
+  - Implemented 100% native Rust GitHub App authentication via RS256 JWT signing, automatic installation access token refresh, and 55-minute in-memory caching with project-isolated token expiration persistence.
+  - Provided modular Git adapter infrastructure with project-level webhook dispatch endpoints (`/api/webhooks/git` and `/api/webhooks/github`), supporting push and pull request event normalization.
+  - Wired up the Git webhook auto-review engine to execute real review turns through the chat pipeline and stream markdown reports directly to PR comments.
+  - Added the `POST /api/git/test` remote verification endpoint, enabling one-click repository connectivity and permission verification within the Webhook dialog.
+  - Refined multi-language code review prompts across Chinese, English, and Vietnamese, prioritizing user comment intent to avoid over-thinking when review is unneeded and omitting trailing co-authorship trailers.
+  - Streamlined review acknowledgment feedback cards with star indicators, sanitized nested webhook parameters, and provided an automated project Git automation toggle.
+- **[OpenWrt & Gateway Support] Full OpenWrt ecosystem integration with automated symlinking and procd autostart**:
+  - Supported OpenWrt and its derivative distributions (ImmortalWrt, iStoreOS, Kwrt, LEDE) across x86_64 and aarch64 architectures as first-class citizens in the unified agent ecosystem.
+  - Implemented multi-heuristic environment fingerprinting based on `/etc/openwrt_release`, `/sbin/procd`, the UCI configuration tree, and `/etc/os-release`.
+  - Added automated `/usr/bin/jeikcode` PATH symlink creation during installation for zero-configuration, out-of-the-box execution across all shells.
+  - Integrated interactive `procd` service generation and process supervision (`respawn 3600 5 0`) in `--host` serve mode, with symmetric uninstall cleanup and dedicated documentation across READMEs and docs-site.
+- **[Capabilities & Tooling] Subagent transparency receipts, context compaction, single-column diff diagnostics, and bash loop prevention**:
+  - Worker and explore subagents now prepend an authoritative, compact action receipt ledger (`[Worker touched: ..., ran: ...]` and `[Explore queried: ..., searched: ...]`), providing tamper-proof physical execution evidence (#62).
+  - Added context window compaction guards (16KB ceiling) and receipt-preserving historical context stubs in TaskTool and StubCompaction.
   - Upgraded `edit` tool failure diagnostics with single-column, strictly-orthogonal Git Diff formatting, eliminating duplicate sign artifacts and redundant pseudo headers.
   - Introduced line-discrepancy microscopic analysis (`👉 Exact Line Discrepancy`) pinpointing extra trailing characters, missing lines, and whitespace mismatches.
   - Expanded ambiguous multi-occurrence matches with full 6-line surrounding context and a three-option resolution guide.
   - Implemented post-topological cascading overlap conflict detection, attributing causal dependencies between conflicting hunks with symmetric Git diff rendering and single-merge guidance.
-- **[WebUI & Console Diff] Native terminal-aligned diff viewer with isolated unselectable gutter**:
-  - Restructured `<DiffBody>` and CSS layouts to isolate line numbers in a fixed-width gutter with clean border separation (`user-select: none`), preventing line number pollution during patch copying.
-  - Unified diff presentation across shell commands (`git diff`), edit tools, and diagnostic fallbacks.
-- **[Markdown & Code Highlighting] Container code fence isolation and syntax language normalization**:
-  - Strengthened markdown code block container isolation to prevent nested backtick fences from prematurely closing parent code blocks.
+  - Hardened `bash` against hang hazards: enforced 32MB stream buffer limits, 2-second drain pipe reader timeouts, auto-harvested idle blocking commands, and scoped foreground live cancellations strictly to target sessions.
+  - Reset turn round counters and limits upon receiving `steer` commands, providing renewed turn budgets for redirected execution.
 
 ---
 
-- **[Edit 工具与诊断] 单列标准 Git Diff 协议、微观失配诊断与级联冲突因果恢复**:
-  - 将 `edit` 工具失配诊断全面重构为单列正交 Git Diff 标准格式，彻底消除加减号双重打标与冗余伪头部。
-  - 引入行内微观差异显微镜（`👉 Exact Line Discrepancy`），精准指出多余尾随字符、缺失行与缩进空白偏差。
-  - 升级多重重复命中歧义诊断，展开上下各 6 行完整纯净代码与三选一消歧决策指引。
+- **[WebUI 前端与 IDE 工作台] 全功能持久化终端、资源管理器、代码编辑器、分屏预览与原生对齐 Diff 面板**:
+  - 深度集成基于 XTerm.js 与 node-pty 全双工 WebSocket 流式连接的终端系统，支持多标签管理、独立捕获缩放隔离、跨刷新保持持久 Shell 会话与视口动态自适应。
+  - 新增原生体验的文件资源管理器，支持面包屑导航、文件树展开与快捷操作菜单（新建、重命名、删除、系统打开），侧边栏支持双胶囊一键切换对话与资源管理。
+  - 引入集成语法高亮、缩进格式化、彩虹括号的多标签代码编辑器，支持复合后缀（如 `.json.example`）高亮与快捷文件跳转。
+  - 新增富媒体与 Markdown 预览面板，支持分屏对照查阅、相对路径解析与图片/PDF/音频/视频原生渲染。
+  - 重构 `<DiffBody>` 与 CSS 样式，将行号抽离为独立的防划选 Gutter 槽（`user-select: none`），彻底解决行号与符号挤压串用问题，鼠标划选复制直接得到纯净的 patch。
+  - 在变更视图中原生内嵌 Git 提交历史卡片（Commits Panel），支持拖拽分栏比例、规范化完整项目相对路径与富文本复制。
+- **[中端与守护进程架构] 终端会话管理池、对话分支派生、会话级审批隔离与广播扩容**:
+  - 将终端会话管理抽取为独立的守护进程模块，在终端关闭时通过 Windows (`taskkill`) 与 POSIX (`kill -9`) 级联终止完整子进程树，彻底杜绝僵尸进程残留泄漏。
+  - 支持在任意历史消息节点发起无损对话分叉（Session Forking），自动重推导计数并隔离缓存代际，提供谱系树查询 REST 接口。
+  - 审批模式（Build、Plan、Bypass）支持按会话 ID 精确隔离，会话删除管线自动级联清理隔离配置。
+  - 将广播总线容量由 512 扩展至 4096，并在前端协同检测未结工具状态，彻底根除并发多 Agent 结束时最终消息丢失问题。
+  - 加固「停止当前回合」投递逻辑，同时投递请求别名与会话别名，根除「立即发送」撞上 `session_busy` 的碰撞冲突。
+  - 引入真实的递归目录扫描端点 `fs locate`，提供异步文件操作与带 MIME 识别的媒体流后台路由。
+- **[Git 平台与自动化代码审查机器人] 原生 GitHub App 鉴权、Webhook 分发与审查全链路闭环**:
+  - 100% 纯 Rust 原生实现 GitHub App RS256 JWT 算法签名鉴权与安装令牌自动换发，配备 55 分钟内存自旋缓存与项目隔离持久化存储。
+  - 引入模块化 Git 平台适配器架构，提供项目级 Webhook 分发端点（`/api/webhooks/git` 与 `/api/webhooks/github`），标准化分发 Push 与 Pull Request 事件。
+  - 将 Git Webhook 自动审查引擎与对话管线深度串联，实时执行真实审查轮次并将 Markdown 报告直接回写至 PR 评论。
+  - 新增 `POST /api/git/test` 远端连通性核验端点，支持在 Webhook 配置对话框中一键测试目标仓库访问权限与网络可达性。
+  - 深度优化中英越三语代码审查默认提示词模板，优先关注用户需求与身份权限，无需审查时直接精简回复以避免过度思考，并规范审查意见末尾免除共创者署名。
+  - Webhook 交互引入轻量级状态确认卡片与星标指示，修复嵌套参数 422 校验异常，并支持项目级自动化联动总开关。
+- **[OpenWrt 软路由与网关支持] 全面接入 OpenWrt 软路由生态、自动软链接与 procd 开机自启**:
+  - 全平台统一 Agent 深度接入 OpenWrt 及其主流衍生固件（ImmortalWrt、iStoreOS、Kwrt、LEDE），全面支持 x86_64 与 aarch64 芯片架构。
+  - 构建基于 `/etc/openwrt_release`、`/sbin/procd`、UCI 配置树与 `/etc/os-release` 的多维高精度指纹识别引擎。
+  - 一键安装脚本自动在系统 PATH 目录建立 `/usr/bin/jeikcode` 软链接，无需手动配置环境变量即可开箱即用。
+  - `--host` 启动模式深度集成 `procd` 交互向导与进程守护（`respawn 3600 5 0`），卸载流程对称清理软链与 profile 配置，并同步上线软路由专属部署文档。
+- **[智能体能力底座与工具系统] 子智能体操作回执、上下文压缩保护、单列 Diff 诊断与 Bash 防挂死**:
+  - Worker 与 Explore 子智能体引入权威紧凑型双向操作回执账本（`[Worker touched: ...]` 与 `[Explore queried: ...]`），提供防篡改物理执行凭据并杜绝幻觉 (#62)。
+  - 在 TaskTool 与 StubCompaction 中引入上下文窗口防爆截断（16KB 硬上限）以及保留回执的历史会话压缩存根。
+  - `edit` 工具失配诊断全面重构为单列正交 Git Diff 标准格式，彻底消除加减号双重打标与冗余伪头部。
+  - 引入行内微观差异显微镜（`👉 Exact Line Discrepancy`），精准指出多余尾随字符、缺失行与缩进空白偏差；升级多重重复命中歧义诊断，展开上下各 6 行完整代码与三选一消歧决策指引。
   - 实现拓扑排序最终状态下的级联重叠冲突因果推导，精准指出导致下游级联冲突的元凶 Hunk，对称还原冲突现场 Git Diff，并提供单一合并指引。
-- **[WebUI 与终端 Diff] 深度对齐原生命令行控制台质感的统一 Diff 面板**:
-  - 重构 `<DiffBody>` 与 CSS 样式，将行号抽离为独立的防划选 Gutter 槽（`user-select: none`），彻底解决行号与符号挤压串用问题。
-  - 统一收敛终端只读命令（`git diff`）、编辑类工具与失配诊断的差异展示层。
-- **[Markdown 与代码高亮] 容器代码块围栏防破损与高亮语言规范化**:
-  - 加固 Markdown 容器代码块围栏隔离，杜绝内部反引号引发的外层代码块提前闭合破坏。
+  - 强化 `bash` 工具防线：设立单流 32MB 内存缓冲区截断以规避 OOM，引入 2 秒管道排空超时防止孙进程挂死，并将前台取消精准约束至目标会话范围。
+  - 在接收到 `steer` 指令时重置当前轮次计数与轮次上限，为转向任务提供全新的回合预算。
 
-## v7.2.5-beta.7 (2026-10-18)
+## v7.2.4 (2026-10-15)
 
 - **[OpenWrt & Gateway] Full OpenWrt ecosystem integration with automated symlinking and procd autostart**:
   - Supported OpenWrt and its derivative distributions (ImmortalWrt, iStoreOS, Kwrt, LEDE) across x86_64 and aarch64 architectures as first-class citizens in the unified agent ecosystem.
