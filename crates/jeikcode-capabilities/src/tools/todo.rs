@@ -1064,6 +1064,20 @@ pub fn clear_todo_board(session_id: &str) {
     );
 }
 
+/// Fully purge the session slot and any associated live bindings when a session is deleted.
+pub fn purge_todo_board(session_id: &str) {
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    guard.remove(session_id);
+    drop(guard);
+
+    let mut bindings = live_bindings()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    bindings.retain(|_, b| b.session_id != session_id && b.owner.strong_count() > 0);
+}
+
 /// After streaming has stopped, drop the live board only when every item is checked.
 /// Returns the closed board so the caller can keep it as history. Open items stay.
 pub fn close_todo_board_if_complete(session_id: &str) -> Option<TodoBoard> {
