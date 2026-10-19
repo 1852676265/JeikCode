@@ -388,6 +388,54 @@
 .markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; overflow-wrap: anywhere; }
 .markdown-root ul, .markdown-root ol { padding-inline-start: 2em; margin-bottom: 0.4em; }
 .markdown-root li { margin-bottom: 2px; overflow-wrap: anywhere; }
+.markdown-root li:has(> input[type="checkbox"]),
+.markdown-root li.task-list-item {
+  list-style: none;
+  margin-left: -1.15em;
+}
+.markdown-root li > input[type="checkbox"],
+.markdown-root input[type="checkbox"].task-list-item-checkbox {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  margin: 0 0.55em 0 0;
+  vertical-align: -2.5px;
+  cursor: default;
+  outline: none;
+  position: relative;
+  box-sizing: border-box;
+  pointer-events: none;
+  user-select: none;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+.markdown-root li > input[type="checkbox"]:not(:checked),
+.markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
+  border: 1.5px solid var(--vscode-checkbox-border, rgba(255, 255, 255, 0.22));
+  background: color-mix(in srgb, var(--vscode-foreground, #888) 8%, transparent);
+}
+.markdown-root li > input[type="checkbox"]:checked,
+.markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
+  border: 1.5px solid #34d399;
+  background-color: rgba(52, 211, 153, 0.16);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%2334d399' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+}
+body.vscode-light .markdown-root li > input[type="checkbox"]:not(:checked),
+body.vscode-light .markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
+  border: 1.5px solid #cbd2d9;
+  background: #ffffff;
+}
+body.vscode-light .markdown-root li > input[type="checkbox"]:checked,
+body.vscode-light .markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
+  border: 1.5px solid #16a34a;
+  background-color: rgba(22, 163, 74, 0.12);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%2316a34a' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+}
 .markdown-root h1, .markdown-root h2, .markdown-root h3, .markdown-root h4 { margin-top: 0.8em; margin-bottom: 0.3em; font-weight: 600; }
 .markdown-root > :first-child { margin-top: 0; }
 .markdown-root > :last-child { margin-bottom: 0; }

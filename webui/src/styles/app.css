@@ -4871,13 +4871,75 @@ body {
   cursor: pointer;
   font-weight: 600;
 }
-.markdown-root li:has(> input[type="checkbox"]) {
+.markdown-root li:has(> input[type="checkbox"]),
+.markdown-root li.task-list-item {
   list-style: none;
   margin-left: -1.15em;
 }
-.markdown-root li > input[type="checkbox"] {
-  margin-right: 0.45em;
-  vertical-align: middle;
+.markdown-root li > input[type="checkbox"],
+.markdown-root input[type="checkbox"].task-list-item-checkbox {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  margin: 0 0.55em 0 0;
+  vertical-align: -2.5px;
+  cursor: default;
+  outline: none;
+  position: relative;
+  box-sizing: border-box;
+  pointer-events: none;
+  user-select: none;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* 未选中状态 (Unchecked / Pending): 细腻微透边框，优雅融入主题底色 */
+.markdown-root li > input[type="checkbox"]:not(:checked),
+.markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
+  border: 1.5px solid var(--app-border, rgba(255, 255, 255, 0.22));
+  background: color-mix(in srgb, var(--app-secondary-foreground, #888) 8%, transparent);
+}
+
+/* 选中状态 (Checked / Completed): 高品质翡翠绿 √，亮色暗色均清晰醒目且不突兀 */
+.markdown-root li > input[type="checkbox"]:checked,
+.markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
+  border: 1.5px solid #34d399;
+  background-color: rgba(52, 211, 153, 0.16);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%2334d399' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+}
+
+/* 亮色模式适配 (Light Theme) */
+:root[data-theme='light'] .markdown-root li > input[type="checkbox"]:not(:checked),
+:root[data-theme='light'] .markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
+  border: 1.5px solid #cbd2d9;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .markdown-root li > input[type="checkbox"]:checked,
+:root[data-theme='light'] .markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
+  border: 1.5px solid #16a34a;
+  background-color: rgba(22, 163, 74, 0.12);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%2316a34a' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) .markdown-root li > input[type="checkbox"]:not(:checked),
+  :root:not([data-theme='dark']) .markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
+    border: 1.5px solid #cbd2d9;
+    background: #ffffff;
+  }
+
+  :root:not([data-theme='dark']) .markdown-root li > input[type="checkbox"]:checked,
+  :root:not([data-theme='dark']) .markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
+    border: 1.5px solid #16a34a;
+    background-color: rgba(22, 163, 74, 0.12);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%2316a34a' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+  }
 }
 .markdown-root .md-alert {
   border-left-width: 4px;
