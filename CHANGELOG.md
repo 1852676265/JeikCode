@@ -21,6 +21,58 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.7 (2026-10-19)
+
+- **[TodoList & Lifecycle Architecture] Authoritative session board synchronization, turn-settlement archival, and continuation guards**:
+  - Re-architected task checklists around a single authoritative reactive session `TodoBoard`, binding `TodoTool` reads and writes directly to session instances with lock-safe commit and readback consistency to eliminate state divergence.
+  - Aligned `TodoHook` continuation checks to inspect the live session board instead of re-deriving stale checklists from transcript history, preventing spurious completion nudges and stopwatch timer runaways when all tasks are finished.
+  - Prevented premature checklist clearing when all items complete mid-turn, smoothly preserving the live checklist on the canvas until explicit turn completion, and deferring archival into the corresponding assistant message.
+  - Supported explicit board resets via `clear_todo_board` and `/todo clear`, routing daemon and TUI `/todo` commands, additions, and session picker replays through the authoritative board.
+- **[Markdown Rendering & Checkbox Styling] Custom high-contrast checkboxes, single-line alignment, and nested task list indentation**:
+  - Replaced browser-native disabled checkboxes with custom high-fidelity components to eliminate dark-mode opacity dimming, styling them with an emerald checkmark (`#34d399`) under dark theme and an elegant forest green (`#16a34a`) under light theme.
+  - Fixed marked tokenizer bug where task list items followed by numbers (e.g. `- [ ] 1. xxx`) were incorrectly parsed as nested ordered lists (`<ol>`), safely unpacking them back into inline text streams via `walkTokens` while preserving original numbers, code snippets, and inline emphasis.
+  - Enhanced CSS selectors (`li:has(input[type="checkbox"])`) to force inline flow on child block containers, guaranteeing clean horizontal alignment with the task checkbox.
+  - Restored block-level layout for nested lists inside markdown task items, allowing child items to wrap naturally and maintain hierarchy indentations.
+- **[Cross-Platform Updater & Daemon] Robust in-place binary replacement, graceful service reload, and multi-language support**:
+  - Hardened cross-platform updater routines for Windows, Linux, macOS, and OpenWrt, resolving process locking and permission barriers during binary download and in-place replacement.
+  - Enhanced daemon restart transitions with parent PID wait guards, listen port inheritance (`RESTART_LISTEN_PORT_ENV`), and robust health-check polling during reload.
+  - Refined desktop Tauri updater lifecycle transitions and completed i18n catalogs across zh, en, and vi for update states.
+- **[WebUI & Mobile Layout] Mobile model and reasoning effort selector optimization**:
+  - Relocated the reasoning effort picker button into the header bar of the model selector modal on mobile devices, placed neatly adjacent to model configurations.
+  - Cleared crowded mobile top navigation bar space, allowing session titles and model badges to display cleanly without truncation or overlap.
+  - Fine-tuned modal action buttons, touch tap targets, and elevated effort drawer modal overlay z-index (`100001`) to ensure seamless modal stacking.
+- **[MCP Integration & Schema Sanitizer] Infinite recursion and thread stack overflow protection**:
+  - Introduced cycle detection, recursion depth bounding, and generic object schema fallbacks during MCP tool JSON Schema inlining and wire payload sanitization.
+  - Prevented infinite recursion and thread stack overflow crashes when discovering MCP servers with self-referencing or mutually recursive schema definitions (such as `rea-agents`).
+- **[Documentation & Deployment] Comprehensive autostart and remote access documentation and streamlined installation guide**:
+  - Added the "Autostart & Remote Access" guide covering unified cross-platform CLI daemon autostart configuration (`jeikcode --host ...`) and desktop built-in `0.0.0.0` remote listening.
+  - Refactored the "Quick Installation" guide into four clean delivery paths: Terminal, Desktop, Docker, and Standalone binaries, removing redundant daemon sections and aligning English and Chinese documentation symmetrically.
+
+---
+
+- **[待办清单与生命周期架构] 会话全局看板权威同步、回合结算归档与停机拦截卫士**:
+  - 重构任务清单架构，将会话待办收拢为单一响应式权威看板（`TodoBoard`），读写全链路直接绑定会话级实例，写后读回强一致，杜绝工具内存与全局看板的双轨割裂；
+  - 优化 `TodoHook` 停机拦截（Continuation Hook）逻辑，优先校验会话全局看板而非从历史转录中折算陈旧状态，彻底杜绝所有任务已完成后仍被误报存在未完项的异常追问与画布计时器持续累加死锁；
+  - 防止 TodoList 在回合中途全部完成时被提前清空，支持后续追加新任务时在既有清单末尾平滑顺延；待办列表在回合中途勾选完成仍稳定显示在面板上，待助手停机结算后才精准归档至发起调用的对应助手卡片；
+  - 增加 `clear_todo_board` 显式清空机制与 `/todo clear` 支持，并将 Daemon 与 TUI 端 `/todo` 命令、任务添加及会话切换重放统一收敛至会话看板。
+- **[Markdown 渲染与任务列表] 高对比度待办复选框质感升级、同行水平对齐与嵌套列表层级缩进恢复**:
+  - 采用自定义高保真样式组件替代浏览器原生 disabled 复选框，根除深色模式下透明度衰减导致的模糊发灰；暗色主题呈现发光翡翠绿（`#34d399`），亮色主题平滑适配为优雅森林绿（`#16a34a`），规范统一 15px 规格、4px 微圆角与垂直基线对齐；
+  - 修复 marked 词法解析缺陷：当任务项后紧随数字序号（如 `- [ ] 1. xxx`）时被误判为嵌套有序列表（`<ol>`）导致复选框与文字断开换行的问题，在 `walkTokens` 阶段安全还原为行内流并保证 child 块元素水平同行对齐；
+  - 恢复 Markdown 任务项内嵌套子级列表的块级排版，确保子级条目能够正常换行并完整保留多层级缩进结构，同时保持待办复选框与首段文字单行行内紧凑对齐。
+- **[跨平台更新器与守护进程] 原地覆盖替换鲁棒性提升、守护进程平滑重启与多语言支持**:
+  - 强化跨平台更新器在 Windows、Linux、macOS 与 OpenWrt 环境下的执行鲁棒性，根除二进制下载与替换过程中的文件锁定及权限冲突问题；
+  - 优化守护进程重启链路，支持等待父进程 PID 退出、精确监听端口继承（`RESTART_LISTEN_PORT_ENV`）与重启健康检查轮询；
+  - 完善桌面端 Tauri 更新生命周期与弹窗状态机，全量补齐多语言字典（zh / en / vi）中更新相关的文案定义。
+- **[WebUI 与移动端体验] 移动端模型与思考强度选择器界面重构与排版优化**:
+  - 将手机端思考强度选择按钮收拢至模型选择弹窗顶部（模型配置右侧），大幅释放移动端顶栏宝贵空间，消除会话标题与状态图标的重叠挤压；
+  - 精细微调移动端弹窗各操作按钮高度、外边距与点击热区，并将思考强度抽屉遮罩层级提升至 `100001`，确保弹层层叠显示与交互流畅自然。
+- **[MCP 集成与 Schema 清洗] 递归引用检测与线程栈溢出硬崩溃防护**:
+  - 在 MCP 工具 JSON Schema 引用内联与出入站清洗流程中引入循环引用检测、内联深度上限与通用对象回退机制；
+  - 彻底避免在接入包含自引用或互递归类型定义（如 `rea-agents`）的 MCP 服务时因无限递归导致线程栈溢出硬崩溃。
+- **[文档站点与部署指南] 全新开机自启与远程访问权威指南及快速安装重构**:
+  - 新增「开机自启与远程访问」章节，全面覆盖跨平台命令行常驻服务配置（`jeikcode --host ...`）与桌面端 `0.0.0.0` 远程监听；
+  - 将快速安装指南重构为清晰的四大交付形态：终端命令行、桌面端应用、Docker 容器化与独立单文件，剔除冗余孤立部署章节并保持中英文全链路对称。
+
 ## v7.2.7-beta.5 (2026-10-19)
 
 - **[TodoList & Lifecycle Architecture] Authoritative session board synchronization and stop-hook continuation guard**:
