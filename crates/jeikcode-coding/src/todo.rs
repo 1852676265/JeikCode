@@ -43,6 +43,14 @@ pub struct TodoHook {
     live: Option<TodoLive>,
 }
 
+impl Drop for TodoHook {
+    fn drop(&mut self) {
+        if let Some(live) = &self.live {
+            jeikcode_capabilities::tools::unbind_todo_session(live);
+        }
+    }
+}
+
 impl Default for TodoHook {
     fn default() -> Self {
         Self::new()
@@ -312,8 +320,9 @@ mod tests {
     async fn completed_board_does_not_nudge_when_the_transcript_fold_still_looks_open() {
         let session_id = format!("stop-check-{}", std::process::id());
         let tool = jeikcode_capabilities::tools::TodoTool::new();
-        let hook = TodoHook::with_live(tool.live());
-        jeikcode_capabilities::tools::bind_todo_session(&tool.live(), &session_id);
+        let live = tool.live();
+        let hook = TodoHook::with_live(live.clone());
+        jeikcode_capabilities::tools::bind_todo_session(&live, &session_id);
         jeikcode_capabilities::tools::commit_todo_board(
             &session_id,
             &[
@@ -334,8 +343,11 @@ mod tests {
             ),
             Message::assistant("here is the summary…", vec![]),
         ]);
+        let res = hook.offer_continuation(&convo).await;
+        jeikcode_capabilities::tools::unbind_todo_session(&live);
+        jeikcode_capabilities::tools::clear_todo_board(&session_id);
         assert!(
-            hook.offer_continuation(&convo).await.is_none(),
+            res.is_none(),
             "a finished TodoBoard must not be reopened by the transcript fold"
         );
     }

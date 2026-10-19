@@ -948,6 +948,14 @@ pub fn todo_session_of(live: &TodoLive) -> Option<String> {
         .cloned()
 }
 
+/// Remove the session binding for this tool instance.
+pub fn unbind_todo_session(live: &TodoLive) {
+    live_bindings()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(&live_key(live));
+}
+
 /// The one live checklist for `session_id`. Readers take the read lock and
 /// therefore observe a finished write.
 pub fn read_todo_board(session_id: &str) -> Option<TodoBoard> {
@@ -1064,6 +1072,12 @@ pub fn bind_todowrite(reg: &mut ToolRegistry) -> TodoLive {
 #[derive(Clone)]
 pub struct TodoTool {
     live: TodoLive,
+}
+
+impl Drop for TodoTool {
+    fn drop(&mut self) {
+        unbind_todo_session(&self.live);
+    }
 }
 
 impl Default for TodoTool {
