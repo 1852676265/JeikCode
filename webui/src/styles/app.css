@@ -4029,6 +4029,12 @@ body {
   user-select: none;
   white-space: nowrap;
 }
+/* 方向键漫游到待发卡片按钮上时的焦点环（与回溯弹窗一致的可见反馈） */
+.queued-action-btn:focus-visible,
+.queued-footer-actions:focus-visible {
+  outline: 2px solid var(--app-brand, #10a37f);
+  outline-offset: 2px;
+}
 .queued-btn-send-now {
   background: var(--color-primary, #3b82f6);
   color: #ffffff;
@@ -4048,14 +4054,16 @@ body {
   background: color-mix(in srgb, var(--app-brand), transparent 72%);
   border-color: var(--app-brand);
 }
+/* 取消（撤回待发消息）：与 Esc 快捷键对应，用危险色告知这是一次撤回动作 */
 .queued-btn-cancel {
   background: transparent;
-  color: var(--app-secondary-foreground);
-  border: 1px solid var(--app-input-border);
+  color: var(--app-error-foreground, #e05c5c);
+  border: 1px solid color-mix(in srgb, var(--app-error-foreground, #e05c5c) 55%, transparent);
 }
-.queued-btn-cancel:hover:not(:disabled) {
-  background: var(--app-hover-bg, rgba(128, 128, 128, 0.1));
-  color: var(--app-primary-foreground);
+.queued-btn-cancel:hover:not(:disabled),
+.queued-btn-cancel:focus-visible {
+  background: color-mix(in srgb, var(--app-error-foreground, #e05c5c) 14%, transparent);
+  color: var(--app-error-foreground, #e05c5c);
 }
 .queued-action-btn:disabled {
   opacity: 0.5;

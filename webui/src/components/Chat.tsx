@@ -28,6 +28,8 @@
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { InputHistory, canNavigateInputHistory, inputHistoryKey } from '../lib/inputHistory';
+import { resolveComposerEnterAction, resolveComposerEscapeAction, tailQueuedCard } from '../lib/composerShortcuts';
+import { QueuedCardActions } from './QueuedCardActions';
 import { createTimelineFollow } from '../lib/timelineFollow';
 
 /** First paint / page size for long transcripts. Older messages load on demand. */
@@ -365,6 +367,12 @@ function sameImageSet(a?: ImageData[], b?: ImageData[]): boolean {
   const right = b ?? [];
   if (left.length !== right.length) return false;
   return left.every((img, i) => img.media_type === right[i]?.media_type && img.data === right[i]?.data);
+}
+
+/** True on touch-first viewports: the soft keyboard's Enter is a real newline. */
+function isMobileComposer(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.innerWidth <= 768 || ('ontouchstart' in window && window.innerWidth <= 1024);
 }
 
 /** Zero-pad a number to 2 digits — shared by formatMsgTime / formatMsgTimeFull. */
@@ -1130,6 +1138,11 @@ export function Chat({
   });
   const queuedRef = useRef(queued);
   queuedRef.current = queued;
+  /**
+   * 需要接管键盘焦点的待发卡片 id：用户在输入框按回车生成卡片后，卡片按钮
+   * 立刻获得焦点，方向键即可在「转向 / 立即发送 / 取消」之间移动、回车即点击。
+   */
+  const [focusCardId, setFocusCardId] = useState<number | null>(null);
   const queuedBySessionRef = useRef<Map<string, QueuedMessage[]>>(loadQueuedFromStorage());
   // 「立即发送」发起的程序化停止标记：命中后旧回合的 stopped 终态不得再把其余排队卡片回吐到输入框。
   const programmaticStopMarkRef = useRef<ProgrammaticStopMark | null>(null);
@@ -6902,7 +6915,13 @@ export function Chat({
     return 'ok';
   }
 
-  async function sendMessage(explicitText?: string | Event) {
+  /**
+   * 发送一条消息。
+   *
+   * `options.asSteerCard`（Ctrl/Cmd+Enter）：在回合执行中不直接发送，而是落成
+   * 待发卡片并立即执行「转向」，让插话无需鼠标介入。
+   */
+  async function sendMessage(explicitText?: string | Event, options?: { asSteerCard?: boolean }) {
     const rawText = typeof explicitText === 'string' ? explicitText : input;
     const currentTargetSid = sessionId ?? activeIdRef.current;
     if (currentTargetSid) {
@@ -7019,17 +7038,23 @@ export function Chat({
         await deliver(messageText, images, modeState.confirmedMode, recordAcceptedInput);
         return;
       }
-      setQueued((q) => [
-        ...q,
-        {
-          id: queueIdRef.current++,
-          text: messageText,
-          images: images.length ? images : undefined,
-          approvalMode: modeState.confirmedMode,
-          kind: 'queue',
-        },
-      ]);
+      const card: QueuedMessage = {
+        id: queueIdRef.current++,
+        text: messageText,
+        images: images.length ? images : undefined,
+        approvalMode: modeState.confirmedMode,
+        kind: 'queue',
+      };
+      setQueued((q) => [...q, card]);
       recordAcceptedInput(); // Accepted into this session's next-turn queue.
+      if (options?.asSteerCard) {
+        // Ctrl+Enter：卡片落地的瞬间就替用户点下「转向」，无需再动鼠标。
+        setFocusCardId(null);
+        void handleSteerQueuedMessage(card);
+        return;
+      }
+      // 普通回车：把键盘焦点交给卡片按钮，方向键切换动作、回车即点击。
+      setFocusCardId(card.id);
       return;
     }
 
@@ -7192,11 +7217,18 @@ export function Chat({
     const targetSid = sid;
     // 客户端关联键：随卡片持久化，刷新后与内核回传的 client_input_ids 对账。
     const clientInputId = q.clientInputId ?? randomUUID();
-    const updateTargetQueued = (updater: (item: QueuedMessage) => QueuedMessage) =>
+    const updateTargetQueued = (updater: (item: QueuedMessage) => QueuedMessage) => {
+      const applyTo = (items: QueuedMessage[]) =>
+        items.map((item) => (item.id === q.id ? updater(item) : item));
+      // 卡片就在当前视图里时走响应式更新：新建会话的 request id 别名尚未绑定
+      // session id，此刻 activeIdRef 仍为空，卡片状态不能只写进后台持久化副本。
+      if (activeIdRef.current === targetSid || queuedRef.current.some((item) => item.id === q.id)) {
+        setQueued(applyTo);
+        return;
+      }
       // 定向更新目标会话队列：前台/后台两态与 localStorage、后端 `/chat/queue` 三处同步。
-      updateQueuedForSession(targetSid, (items) =>
-        items.map((item) => (item.id === q.id ? updater(item) : item)),
-      );
+      persistSessionQueue(targetSid, applyTo(queuedBySessionRef.current.get(targetSid) ?? []));
+    };
 
     updateTargetQueued((item) => ({ ...item, kind: 'steering' as const, clientInputId }));
     try {
@@ -7659,6 +7691,20 @@ export function Chat({
   function handleKeyDown(e: KeyboardEvent) {
     if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
 
+    // 回车语义统一由 composerShortcuts 判定：Ctrl/Cmd+Enter 落成待发卡片并立即
+    // 转向；Shift+Enter 换行；触屏软键盘的回车是真实换行；其余为发送。
+    const enterAction = resolveComposerEnterAction({
+      key: e.key,
+      defaultPrevented: e.defaultPrevented,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+      altKey: e.altKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      mobile: isMobileComposer(),
+    });
+
     // 斜杠菜单导航（使用与渲染层一致的合并列表：本地命令 + 远程技能）
     if (slashOpen) {
       const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
@@ -7737,21 +7783,78 @@ export function Chat({
       }
     }
 
-    if (e.key === 'Enter' && !e.shiftKey) {
-      if (e.isComposing || e.keyCode === 229) {
-        return;
-      }
-      const isMobileDevice = typeof window !== 'undefined' && (
-        window.innerWidth <= 768 || ('ontouchstart' in window && window.innerWidth <= 1024)
-      );
-      if (isMobileDevice) {
-        // 移动端/触控屏软键盘上回车为真实换行，避免误触发自动发送
-        return;
-      }
+    if (enterAction === 'steer-card') {
+      // Ctrl/Cmd+Enter：落成待发卡片并立即自动转向，无需再点一次「转向」。
+      e.preventDefault();
+      setSlashOpen(false);
+      setAtOpen(false);
+      void sendMessage(undefined, { asSteerCard: true });
+      return;
+    }
+    if (enterAction === 'send') {
       e.preventDefault();
       sendMessage();
+      return;
+    }
+    if (e.key === 'Escape') {
+      // 输入框里的 Esc：等同按一次队尾待发卡片的「取消」——不论该卡片是否已转向，
+      // 都把这条待发消息收回输入框。
+      const escapeAction = resolveComposerEscapeAction({
+        defaultPrevented: e.defaultPrevented,
+        pendingCardCount: queuedRef.current.length,
+      });
+      if (escapeAction === 'cancel-card') {
+        const tail = tailQueuedCard(queuedRef.current);
+        if (tail && tail.kind !== 'steering') {
+          e.preventDefault();
+          handleCancelQueuedMessage(tail);
+        }
+      }
     }
   }
+
+  /**
+   * 把键盘焦点交回输入框；带字符时把该字符一并送回输入框，
+   * 避免卡片按钮抢走焦点后用户敲的字被吞掉。
+   */
+  function returnFocusToComposer(typedChar?: string) {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.focus();
+    if (!typedChar) return;
+    try {
+      // insertText 会派发 input 事件，输入框的 onInput 随即把字符并入草稿。
+      document.execCommand('insertText', false, typedChar);
+    } catch {
+      // 少数环境禁用 execCommand：至少保证焦点已经回到输入框。
+    }
+  }
+
+  /** 把焦点送进指定待发卡片的动作区（方向键可达）。 */
+  function focusQueuedCardActions(cardId: number) {
+    const container = document.querySelector(`[data-queued-card-actions="${cardId}"]`);
+    if (!container) return;
+    const button = container.querySelector<HTMLButtonElement>('button[data-action]:not(:disabled)');
+    button?.focus();
+  }
+
+  // 输入框为空时，方向键直接进入最新待发卡片的动作区；
+  // 草稿非空时左右键仍然只负责移动光标。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const ta = textareaRef.current;
+      if (!ta || document.activeElement !== ta) return;
+      if (ta.value.length > 0) return;
+      const target = tailQueuedCard(queuedRef.current);
+      if (!target) return;
+      e.preventDefault();
+      focusQueuedCardActions(target.id);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   async function handleStop() {
     const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
@@ -8594,7 +8697,7 @@ export function Chat({
                     class="btn-send"
                     onClick={sendMessage}
                     disabled={Boolean(modeState.pendingMode) || uploading}
-                    title={t('chat.queue')}
+                    title={`${t('chat.queue')} · ${t('chat.steerCardShortcut')}`}
                     aria-label={t('chat.queue')}
                   >
                     ↑
@@ -9259,53 +9362,25 @@ export function Chat({
               <div class="queued-text-content">
                 {q.text}
               </div>
-              <div class="queued-footer-actions">
-                {q.kind === 'queue' && (
-                  <button
-                    type="button"
-                    class="queued-action-btn queued-btn-steer"
-                    onClick={() => void handleSteerQueuedMessage(q)}
-                    title={t('chat.steerQueued')}
-                    aria-label={t('chat.steerAction')}
-                  >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M3 11.5V8.5a3.5 3.5 0 0 1 3.5-3.5H12" />
-                      <path d="M9.5 2.5 12.5 5 9.5 7.5" />
-                    </svg>
-                    <span>{t('chat.steerAction')}</span>
-                  </button>
-                )}
-
-                {(q.kind === 'queue' || q.kind === 'steer') && (
-                  <button
-                    type="button"
-                    class="queued-action-btn queued-btn-send-now"
-                    onClick={() => void handleSendImmediately(q)}
-                    title={t('chat.sendNowTitle')}
-                    aria-label={t('chat.sendNow')}
-                  >
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <polygon points="5 3 19 12 5 21 5 3" fill="currentColor" />
-                    </svg>
-                    <span>{t('chat.sendNow')}</span>
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  class="queued-action-btn queued-btn-cancel"
-                  onClick={() => handleCancelQueuedMessage(q)}
-                  disabled={q.kind === 'steering'}
-                  title={t('chat.removeQueued')}
-                  aria-label={t('chat.cancelAction')}
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                  <span>{t('chat.cancelAction')}</span>
-                </button>
-              </div>
+              <QueuedCardActions
+                cardId={q.id}
+                kind={q.kind}
+                labels={{
+                  steer: t('chat.steerAction'),
+                  sendNow: t('chat.sendNow'),
+                  cancel: t('chat.cancelAction'),
+                  steerTitle: t('chat.steerQueued'),
+                  sendNowTitle: t('chat.sendNowTitle'),
+                  cancelTitle: t('chat.removeQueued'),
+                  groupTitle: t('chat.queuedCardActions'),
+                }}
+                autoFocus={q.id === focusCardId}
+                onAutoFocusDone={() => setFocusCardId(null)}
+                onSteer={() => void handleSteerQueuedMessage(q)}
+                onSendNow={() => void handleSendImmediately(q)}
+                onCancel={() => handleCancelQueuedMessage(q)}
+                onReturnToComposer={(typedChar) => returnFocusToComposer(typedChar)}
+              />
             </div>
           </div>
         ))}
