@@ -21,6 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.7-beta.3 (2026-10-19)
+
+- **[Cross-Platform Updater & Daemon] Robust in-place binary replacement and graceful service reload**:
+  - Hardened updater routines across Windows, Linux, macOS, and OpenWrt, resolving file locking and permission barriers during binary download and replacement.
+  - Enhanced daemon restart transitions with parent PID wait guards, listen port inheritance, and robust health-check polling during reload.
+  - Refined desktop Tauri updater lifecycle transitions and completed i18n catalogs across zh, en, and vi for update states.
+- **[Markdown Rendering & Task Lists] Single-line checkbox alignment and nested list unwrapping**:
+  - Fixed marked tokenizer bug where task list items followed by numbers (e.g. `- [ ] 1. xxx`) were incorrectly parsed as nested ordered lists (`<ol>`), splitting checkboxes and text onto separate lines.
+  - Unpacked pseudo-nested lists back into inline text streams via `walkTokens` while preserving numbers, inline code, and formatting.
+  - Enhanced CSS rules (`li:has(input[type="checkbox"])`) to enforce inline flow on child block containers, guaranteeing clean horizontal alignment.
+
+---
+
+- **[跨平台更新器与守护进程] 原地覆盖替换鲁棒性提升与守护进程平滑重启**:
+  - 强化跨平台更新器在 Windows、Linux、macOS 与 OpenWrt 环境下的执行鲁棒性，根除二进制下载与替换过程中的文件锁定及权限冲突问题。
+  - 优化守护进程重启链路，支持等待父进程 PID 退出、精确监听端口继承与重启健康检查轮询。
+  - 完善桌面端 Tauri 更新生命周期与弹窗状态机，全量补齐多语言字典（zh / en / vi）中更新相关的文案定义。
+- **[Markdown 渲染与任务列表] 待办复选框单行对齐与伪嵌套列表解包**:
+  - 修复 marked 词法解析缺陷：当任务项后紧随数字序号（如 `- [ ] 1. xxx`）时被误判为嵌套有序列表（`<ol>`）导致复选框与文字断开换行的问题。
+  - 在 `walkTokens` 阶段将伪嵌套有序列表安全还原为行内文本流，完整保留原始序号、内联代码及强调格式。
+  - 增强 CSS 选择器（`li:has(input[type="checkbox"])`）并强制子级块元素内联排版，彻底保障水平同行对齐。
+
 ## v7.2.7-beta.2 (2026-10-19)
 
 - **[MCP Integration & Schema Sanitizer] Infinite recursion and thread stack overflow protection**:
