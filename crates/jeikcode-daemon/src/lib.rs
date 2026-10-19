@@ -2069,6 +2069,16 @@ impl ActiveChatRegistry {
         }
     }
 
+    /// Evict all in-memory tracking state (sequences, cached terminal frames, standby watchers, aliases)
+    /// when a session is deleted, preventing resource leakage across session lifecycles.
+    pub(crate) async fn clear_session(&self, session_id: &str) {
+        let mut index = self.inner.write().await;
+        index.session_seq.remove(session_id);
+        index.session_terminal.remove(session_id);
+        index.standby_watchers.remove(session_id);
+        index.aliases.remove(session_id);
+    }
+
     async fn active_session_ids(&self) -> Vec<String> {
         let mut sessions: Vec<String> = self
             .inner
@@ -4573,8 +4583,7 @@ async fn get_session_detail(
                 }
             };
             let turns = session_user_outline(&messages);
-            let (message_count, offset, messages) =
-                apply_session_message_window(messages, &query);
+            let (message_count, offset, messages) = apply_session_message_window(messages, &query);
             let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let turn_running = state
                 .active_chats
@@ -5444,6 +5453,7 @@ async fn delete_session(
             Ok(Ok(())) => {
                 let working_dir = state_clone.project.read().await.working_dir.clone();
                 let id_for_cleanup = id.clone();
+                let active_chats_cleanup = state_clone.active_chats.clone();
                 // Session files are already gone. Reap MCP, kill session background tasks,
                 // and clean up session background log files asynchronously.
                 tokio::spawn(async move {
@@ -5459,6 +5469,9 @@ async fn delete_session(
 
                     // Release session-scoped approval mode override
                     crate::live_api::live_clear_session_approval_mode(&id_for_cleanup);
+
+                    // Clean up active chat registry state (session seq, terminal frames, standby watchers)
+                    active_chats_cleanup.clear_session(&id_for_cleanup).await;
                 });
                 state_clone.telemetry.track(Event::UseCommand {
                     type_: "delete_session".into(),
@@ -15406,6 +15419,42 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "the idle standby watcher must stay silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_chat_registry_clear_session_evicts_all_session_state() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-evict"), None).await.unwrap();
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-evict"))
+            .await;
+        assert!(registry.complete(&admission.operation_id).await);
+
+        // Before clear_session: attaching with replay_terminal=true yields the recorded terminal frame
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let outcome1 = registry
+            .subscribe_or_standby("session-evict", &tx1, true)
+            .await;
+        assert!(matches!(outcome1, WatchOutcome::Standby));
+        assert!(matches!(
+            rx1.try_recv()
+                .expect("recorded terminal present before clear"),
+            ChatEvent::Done { .. }
+        ));
+
+        // Evict session on delete
+        registry.clear_session("session-evict").await;
+
+        // After clear_session: attaching with replay_terminal=true finds no lingering terminal
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let outcome2 = registry
+            .subscribe_or_standby("session-evict", &tx2, true)
+            .await;
+        assert!(matches!(outcome2, WatchOutcome::Standby));
+        assert!(
+            rx2.try_recv().is_err(),
+            "cleared session must not replay lingering terminal frames"
         );
     }
 

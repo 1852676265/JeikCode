@@ -2142,6 +2142,19 @@ impl SessionManager {
                 let _ = fs::copy(&src, &dst);
             }
         }
+        if let (Ok(src), Ok(dst)) = (
+            self.todo_board_path(source_id),
+            self.todo_board_path(destination_id),
+        ) {
+            if src.is_file() {
+                let _ = fs::copy(&src, &dst);
+            }
+        }
+        if let Some(board) = crate::tools::read_todo_board(source_id) {
+            crate::tools::restore_todo_board(destination_id, board);
+        } else {
+            self.restore_todo_board(destination_id);
+        }
         Ok((forked, destination_lease))
     }
 
@@ -3149,6 +3162,8 @@ impl SessionManager {
             self.presentation_path(id)?,
             self.legacy_path(id)?,
             self.bashkw_path(id)?,
+            self.todo_board_path(id)?,
+            self.pending_permission_path(id)?,
         ];
         for path in &targets {
             validate_delete_target(path)?;
@@ -3163,6 +3178,7 @@ impl SessionManager {
         if let Ok(dir) = self.artifacts_dir(id) {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
         }
+        crate::tools::purge_todo_board(id);
         Ok(())
     }
 
@@ -6203,6 +6219,10 @@ mod tests {
             .unwrap();
 
         let lease = mgr.acquire_lease("s1").unwrap();
+        std::fs::write(mgr.todo_board_path("s1").unwrap(), b"{}").unwrap();
+        std::fs::write(mgr.pending_permission_path("s1").unwrap(), b"{}").unwrap();
+        assert!(mgr.todo_board_path("s1").unwrap().exists());
+        assert!(mgr.pending_permission_path("s1").unwrap().exists());
         mgr.save_rewind_transaction_with_lease(
             &lease,
             &super::super::rewind::RewindTransactionJournal {
@@ -6222,8 +6242,147 @@ mod tests {
         assert!(!mgr.jsonl_path("s1").unwrap().exists());
         assert!(!mgr.presentation_path("s1").unwrap().exists());
         assert!(!mgr.rewind_transaction_path("s1").unwrap().exists());
+        assert!(!mgr.todo_board_path("s1").unwrap().exists());
+        assert!(!mgr.pending_permission_path("s1").unwrap().exists());
         // Idempotent: deleting again is fine.
         mgr.delete(&lease).unwrap();
+    }
+
+    #[test]
+    fn delete_purges_todo_board_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        mgr.write_meta(&SessionMeta::new("s_purge", "/p", 1))
+            .unwrap();
+        mgr.save_snapshot("s_purge", &snap(&["task turn"])).unwrap();
+
+        let item = crate::tools::TodoItem {
+            content: "in-memory task to purge".into(),
+            status: crate::tools::TodoStatus::InProgress,
+        };
+        crate::tools::commit_todo_board("s_purge", &[item]);
+        assert!(crate::tools::read_todo_board("s_purge").is_some());
+
+        let lease = mgr.acquire_lease("s_purge").unwrap();
+        mgr.delete(&lease).unwrap();
+        assert!(
+            crate::tools::read_todo_board("s_purge").is_none(),
+            "in-memory todo board must be fully purged on session delete"
+        );
+    }
+
+    #[test]
+    fn fork_native_session_preserves_todo_board_on_disk_and_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source_todo").unwrap();
+        let snapshot = snap(&["first turn", "second turn"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![],
+        };
+        let mut source_meta = SessionMeta::new("source_todo", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        source_meta.turn_count = 2;
+        source_meta.message_count = 2;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        let task = crate::tools::TodoItem {
+            content: "retained branched task".into(),
+            status: crate::tools::TodoStatus::InProgress,
+        };
+        crate::tools::commit_todo_board("source_todo", &[task.clone()]);
+        mgr.save_snapshot("source_todo", &snapshot).unwrap();
+        assert!(mgr.todo_board_path("source_todo").unwrap().is_file());
+
+        let (forked, fork_lease) = mgr
+            .fork_native_session("source_todo", "dest_todo", 20)
+            .unwrap();
+
+        assert_eq!(forked.meta.id, "dest_todo");
+        assert!(
+            mgr.todo_board_path("dest_todo").unwrap().is_file(),
+            "forked session must inherit persisted .todo file on disk"
+        );
+
+        let inherited_board = crate::tools::read_todo_board("dest_todo")
+            .expect("forked session must inherit live todo board in memory");
+        assert_eq!(inherited_board.items.len(), 1);
+        assert_eq!(inherited_board.items[0].content, "retained branched task");
+        assert_eq!(
+            inherited_board.items[0].status,
+            crate::tools::TodoStatus::InProgress
+        );
+
+        // Cleanup
+        mgr.delete(&fork_lease).unwrap();
+        assert!(!mgr.todo_board_path("dest_todo").unwrap().exists());
+        assert!(crate::tools::read_todo_board("dest_todo").is_none());
+
+        mgr.delete(&source_lease).unwrap();
+        assert!(!mgr.todo_board_path("source_todo").unwrap().exists());
+        assert!(crate::tools::read_todo_board("source_todo").is_none());
+    }
+
+    #[test]
+    fn fork_native_session_restores_todo_board_to_memory_when_source_only_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source_cold").unwrap();
+        let snapshot = snap(&["turn 1"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![],
+        };
+        let mut source_meta = SessionMeta::new("source_cold", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        // Write .todo directly on disk, but ensure it is not registered in memory
+        let board = crate::tools::TodoBoard {
+            id: "cold-board-1".into(),
+            seq: 1,
+            items: vec![crate::tools::TodoItem {
+                content: "cold persisted task".into(),
+                status: crate::tools::TodoStatus::Pending,
+            }],
+        };
+        let bytes = serde_json::to_vec(&board).unwrap();
+        std::fs::write(mgr.todo_board_path("source_cold").unwrap(), bytes).unwrap();
+        assert!(crate::tools::read_todo_board("source_cold").is_none());
+
+        let (forked, fork_lease) = mgr
+            .fork_native_session("source_cold", "dest_cold", 20)
+            .unwrap();
+        assert_eq!(forked.meta.id, "dest_cold");
+        assert!(mgr.todo_board_path("dest_cold").unwrap().is_file());
+
+        let restored = crate::tools::read_todo_board("dest_cold").expect(
+            "forked session must restore todo board to memory even when source was cold on disk",
+        );
+        assert_eq!(restored.items.len(), 1);
+        assert_eq!(restored.items[0].content, "cold persisted task");
+        assert_eq!(restored.items[0].status, crate::tools::TodoStatus::Pending);
+
+        mgr.delete(&fork_lease).unwrap();
+        assert!(!mgr.todo_board_path("dest_cold").unwrap().exists());
+        assert!(crate::tools::read_todo_board("dest_cold").is_none());
+
+        mgr.delete(&source_lease).unwrap();
+        assert!(!mgr.todo_board_path("source_cold").unwrap().exists());
+        assert!(crate::tools::read_todo_board("source_cold").is_none());
     }
 
     #[test]
