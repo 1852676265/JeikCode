@@ -731,6 +731,17 @@ pub async fn run_upgrade_for_channel(
 /// Child waits for this parent pid to exit before binding the listen port.
 pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
 
+/// Actual listen port of the process that is being replaced.
+/// argv `--port` can still be the first choice from before a cold-start scan.
+pub const RESTART_LISTEN_PORT_ENV: &str = "JEIKCODE_RESTART_LISTEN_PORT";
+
+/// Successor must bind [`RESTART_LISTEN_PORT_ENV`] and must not scan or
+/// shut down any other jeikcode on a neighboring port.
+pub const RESTART_EXACT_PORT_ENV: &str = "JEIKCODE_RESTART_EXACT_PORT";
+
+/// Token the browser already stored. Set only when argv has no `--token`.
+pub const RESTART_TOKEN_ENV: &str = "JEIKCODE_RESTART_TOKEN";
+
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -767,9 +778,80 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+/// `--port 13457` or `--port=13457` from the inherited argv.
+pub fn listen_port_from_args<I, S>(args: I) -> Option<u16>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--port" {
+            let value = args.get(index + 1)?;
+            return value.to_str()?.parse().ok().filter(|port: &u16| *port > 0);
+        }
+        if let Some(rest) = arg.to_str().and_then(|text| text.strip_prefix("--port=")) {
+            return rest.parse().ok().filter(|port: &u16| *port > 0);
+        }
+        index += 1;
+    }
+    None
+}
+
+pub fn restart_listen_port_from_env() -> Option<u16> {
+    std::env::var(RESTART_LISTEN_PORT_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|port: &u16| *port > 0)
+}
+
+/// Read and remove the inherited webui token so later child processes do not
+/// see it.
+pub fn take_restart_token() -> Option<String> {
+    let token = std::env::var(RESTART_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    std::env::remove_var(RESTART_TOKEN_ENV);
+    token
+}
+
+/// `Some(port)` means this start is the successor of an in-place upgrade and
+/// must bind that port only.
+pub fn planned_restart_port(
+    exact: Option<&str>,
+    listen_port: Option<&str>,
+    fallback: u16,
+) -> Option<u16> {
+    if exact != Some("1") {
+        return None;
+    }
+    let port = listen_port
+        .and_then(|value| value.parse().ok())
+        .filter(|port: &u16| *port > 0)
+        .unwrap_or(fallback);
+    (port > 0).then_some(port)
+}
+
+/// The listen socket is the handoff signal. A desktop shell that never
+/// `wait`s its child leaves a zombie whose pid still looks alive.
+pub fn predecessor_socket_released(port_accepting: bool) -> bool {
+    !port_accepting
+}
+
+fn tcp_port_accepting(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(80)).is_ok()
+}
+
 /// Call at process start, before binding any port. The successor started by
-/// [`restart_replaced_process`] waits here until the old process has exited
-/// and released the listen socket.
+/// [`restart_replaced_process`] waits until this process's listen port stops
+/// accepting. It does not kill any pid, and it does not wait out a zombie.
 pub fn wait_for_predecessor_if_requested() {
     let Ok(raw) = std::env::var(RESTART_WAIT_PID_ENV) else {
         return;
@@ -778,13 +860,28 @@ pub fn wait_for_predecessor_if_requested() {
         return;
     };
     std::env::remove_var(RESTART_WAIT_PID_ENV);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let port = restart_listen_port_from_env()
+        .or_else(|| listen_port_from_args(std::env::args_os().skip(1)));
+    let Some(port) = port else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && pid_is_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
-        if !pid_is_alive(pid) {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+        if predecessor_socket_released(tcp_port_accepting(port)) {
+            std::thread::sleep(std::time::Duration::from_millis(150));
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Predecessor is gone, but something else is answering on this port.
+        // Leave that process alone; exact bind will fail instead of scanning.
+        if !pid_is_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -798,16 +895,32 @@ fn supervised_by_service_manager() -> bool {
 /// After an in-place swap, start the new binary with the current argv, then
 /// exit this process so the listen port is released.
 ///
-/// Spawn a detached successor that waits for this pid (`RESTART_WAIT_PID_ENV`)
-/// before binding. Do not use `cmd.exe`: the helper is killed when this
+/// The successor is this same server, not a second port. It inherits argv
+/// (`--port`, `--token`) plus the actual listen port, and it binds only that
+/// port. No other jeikcode process is signaled.
+///
+/// Spawn a detached successor that waits until this process stops accepting
+/// on `listen_port`. Do not use `cmd.exe`: the helper is killed when this
 /// process exits. Under systemd/launchd, `exec` keeps the supervised pid.
 ///
 /// If the successor cannot be started, returns `Err` and the caller MUST keep
 /// serving so a remote browser is not left with a dead port.
-pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> {
+pub fn restart_replaced_process(
+    exe: &Path,
+    listen_port: u16,
+    token: Option<&str>,
+) -> Result<std::convert::Infallible> {
     // The binary on disk is already the selected release. A staged
     // pending.json must not replace it again on the next start.
     std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if listen_port > 0 {
+        std::env::set_var(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
+    }
+    std::env::set_var(RESTART_EXACT_PORT_ENV, "1");
+    let token = token.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(token) = token {
+        std::env::set_var(RESTART_TOKEN_ENV, token);
+    }
     #[cfg(unix)]
     if supervised_by_service_manager() {
         return re_exec_self(Some(exe));
@@ -817,8 +930,15 @@ pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> 
     let mut cmd = std::process::Command::new(exe);
     cmd.args(&args)
         .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
-        .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1")
-        .stdin(std::process::Stdio::null())
+        .env(RESTART_EXACT_PORT_ENV, "1")
+        .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if listen_port > 0 {
+        cmd.env(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
+    }
+    if let Some(token) = token {
+        cmd.env(RESTART_TOKEN_ENV, token);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
@@ -2678,5 +2798,34 @@ mod tests {
             .await
             .expect("package-managed build must not error, just no-op");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn listen_port_comes_from_argv_flag() {
+        assert_eq!(
+            listen_port_from_args([
+                "webui", "--host", "0.0.0.0", "--port", "13458", "--token", "t"
+            ]),
+            Some(13458)
+        );
+        assert_eq!(listen_port_from_args(["serve", "--port=4096"]), Some(4096));
+        assert_eq!(listen_port_from_args(["webui", "--port", "0"]), None);
+        assert_eq!(listen_port_from_args(["tui"]), None);
+    }
+
+    #[test]
+    fn exact_restart_keeps_the_live_port_instead_of_the_argv_fallback() {
+        assert_eq!(
+            planned_restart_port(Some("1"), Some("13458"), 13457),
+            Some(13458)
+        );
+        assert_eq!(planned_restart_port(Some("1"), None, 13457), Some(13457));
+        assert_eq!(planned_restart_port(None, Some("13458"), 13457), None);
+    }
+
+    #[test]
+    fn zombie_pid_does_not_block_once_the_listen_socket_is_gone() {
+        assert!(predecessor_socket_released(false));
+        assert!(!predecessor_socket_released(true));
     }
 }

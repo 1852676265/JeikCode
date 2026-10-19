@@ -11889,6 +11889,9 @@ async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
 /// 从 `start_port` 起尝试绑定 `host`，遇 `AddrInUse` 递增端口，直到成功或试满
 /// `max_tries` 个端口。支持通配地址（0.0.0.0 / ::）双栈监听（IPv4 + IPv6）。
 /// 返回 (主监听器, 可选次级双栈监听器, 真实端口)。
+///
+/// 就地升级的后继进程带 `JEIKCODE_RESTART_EXACT_PORT`。它只重试自己的端口，
+/// 不调用 `/shutdown`，也不顺延到旁边的 TUI / 另一个桌面端。
 async fn bind_scanning(
     host: &str,
     start_port: u16,
@@ -11898,7 +11901,74 @@ async fn bind_scanning(
     Option<tokio::net::TcpListener>,
     u16,
 )> {
-    if start_port > 0 {
+    if let Some(port) = exact_restart_port(start_port) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match bind_scanning_ports(host, port, 1, false).await {
+                Ok(bound) => return Ok(bound),
+                Err(err) if bind_failure_is_busy(&err) && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    bind_scanning_ports(host, start_port, max_tries, true).await
+}
+
+fn exact_restart_port(fallback: u16) -> Option<u16> {
+    let exact = std::env::var(jeikcode_updater::RESTART_EXACT_PORT_ENV).ok();
+    if exact.as_deref() != Some("1") {
+        return None;
+    }
+    let listen = std::env::var(jeikcode_updater::RESTART_LISTEN_PORT_ENV).ok();
+    std::env::remove_var(jeikcode_updater::RESTART_EXACT_PORT_ENV);
+    std::env::remove_var(jeikcode_updater::RESTART_LISTEN_PORT_ENV);
+    jeikcode_updater::planned_restart_port(exact.as_deref(), listen.as_deref(), fallback)
+}
+
+fn bind_failure_is_busy(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("no free port")
+        || text.contains("AddrInUse")
+        || text.contains("occupied")
+        || text.contains("os error 98")
+        || text.contains("os error 10048")
+}
+
+/// `serve` 不走端口扫描。升级后继进程在前代刚退出时重试同一地址，失败就退出，
+/// 不会改去旁边的端口。
+async fn bind_restart_listener(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let exact = std::env::var(jeikcode_updater::RESTART_EXACT_PORT_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
+    let attempts = if exact { 50 } else { 1 };
+    let mut last = None;
+    for _ in 0..attempts {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) if exact && err.kind() == std::io::ErrorKind::AddrInUse => {
+                last = Some(err);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("bind failed")))
+}
+
+async fn bind_scanning_ports(
+    host: &str,
+    start_port: u16,
+    max_tries: u16,
+    reclaim_stale: bool,
+) -> anyhow::Result<(
+    tokio::net::TcpListener,
+    Option<tokio::net::TcpListener>,
+    u16,
+)> {
+    if reclaim_stale && start_port > 0 {
         let _ = try_terminate_stale_daemon_on_port(start_port).await;
     }
     let mut last_err: Option<std::io::Error> = None;
@@ -13681,7 +13751,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let (listener, dual_stack_v6) = match prebound_listener {
         Some(l) => (l, prebound_dual_stack_v6),
         None => {
-            let primary = match tokio::net::TcpListener::bind(&addr).await {
+            let primary = match bind_restart_listener(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Fatal: failed to bind to {}: {}", addr, e);

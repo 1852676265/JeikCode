@@ -4871,11 +4871,35 @@ body {
   cursor: pointer;
   font-weight: 600;
 }
+.markdown-root li:has(input[type="checkbox"]),
 .markdown-root li:has(> input[type="checkbox"]),
 .markdown-root li.task-list-item {
   list-style: none;
   margin-left: -1.15em;
 }
+/* 杜绝任务项内部由于段落 <p> 或列表容器引发的意外折行 */
+.markdown-root li:has(input[type="checkbox"]) > p,
+.markdown-root li.task-list-item > p {
+  display: inline;
+  margin: 0;
+}
+.markdown-root li:has(input[type="checkbox"]) > ol,
+.markdown-root li:has(input[type="checkbox"]) > ul,
+.markdown-root li.task-list-item > ol,
+.markdown-root li.task-list-item > ul {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.markdown-root li:has(input[type="checkbox"]) > ol > li,
+.markdown-root li:has(input[type="checkbox"]) > ul > li,
+.markdown-root li.task-list-item > ol > li,
+.markdown-root li.task-list-item > ul > li {
+  display: inline;
+  margin: 0;
+}
+.markdown-root li input[type="checkbox"],
 .markdown-root li > input[type="checkbox"],
 .markdown-root input[type="checkbox"].task-list-item-checkbox {
   appearance: none;
@@ -4896,6 +4920,7 @@ body {
 }
 
 /* 未选中状态 (Unchecked / Pending): 细腻微透边框，优雅融入主题底色 */
+.markdown-root li input[type="checkbox"]:not(:checked),
 .markdown-root li > input[type="checkbox"]:not(:checked),
 .markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
   border: 1.5px solid var(--app-border, rgba(255, 255, 255, 0.22));
@@ -4903,6 +4928,7 @@ body {
 }
 
 /* 选中状态 (Checked / Completed): 高品质翡翠绿 √，亮色暗色均清晰醒目且不突兀 */
+.markdown-root li input[type="checkbox"]:checked,
 .markdown-root li > input[type="checkbox"]:checked,
 .markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
   border: 1.5px solid #34d399;
@@ -4914,12 +4940,14 @@ body {
 }
 
 /* 亮色模式适配 (Light Theme) */
+:root[data-theme='light'] .markdown-root li input[type="checkbox"]:not(:checked),
 :root[data-theme='light'] .markdown-root li > input[type="checkbox"]:not(:checked),
 :root[data-theme='light'] .markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
   border: 1.5px solid #cbd2d9;
   background: #ffffff;
 }
 
+:root[data-theme='light'] .markdown-root li input[type="checkbox"]:checked,
 :root[data-theme='light'] .markdown-root li > input[type="checkbox"]:checked,
 :root[data-theme='light'] .markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
   border: 1.5px solid #16a34a;
@@ -4928,12 +4956,14 @@ body {
 }
 
 @media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) .markdown-root li input[type="checkbox"]:not(:checked),
   :root:not([data-theme='dark']) .markdown-root li > input[type="checkbox"]:not(:checked),
   :root:not([data-theme='dark']) .markdown-root input[type="checkbox"].task-list-item-checkbox:not(:checked) {
     border: 1.5px solid #cbd2d9;
     background: #ffffff;
   }
 
+  :root:not([data-theme='dark']) .markdown-root li input[type="checkbox"]:checked,
   :root:not([data-theme='dark']) .markdown-root li > input[type="checkbox"]:checked,
   :root:not([data-theme='dark']) .markdown-root input[type="checkbox"].task-list-item-checkbox:checked {
     border: 1.5px solid #16a34a;

@@ -25,6 +25,31 @@ marked.use({
     if (token.type === 'code' && (token as any).codeBlockStyle === 'indented') {
       token.type = 'paragraph';
       (token as any).tokens = [{ type: 'text', raw: token.text, text: token.text }];
+    } else if (
+      token.type === 'list_item' &&
+      (token as any).task &&
+      Array.isArray((token as any).tokens) &&
+      (token as any).tokens.length > 0
+    ) {
+      // 修复 marked 待办任务项后紧跟数字编号（如 `- [ ] 1. xxx`）被错误切分为嵌套有序列表导致断行的问题。
+      // 当待办列表项的首个 token 是单条目有序列表且以数字加点/括号开头时，将其还原为行内文本流，避免断行。
+      const first = (token as any).tokens[0];
+      if (
+        first &&
+        first.type === 'list' &&
+        first.ordered &&
+        Array.isArray(first.items) &&
+        first.items.length === 1 &&
+        /^\s*\d+[\.\)]\s+/.test(first.raw)
+      ) {
+        const rawText = first.raw.trimEnd();
+        (token as any).tokens.splice(0, 1, {
+          type: 'text',
+          raw: rawText,
+          text: rawText,
+          tokens: (marked as any).Lexer.lexInline(rawText),
+        });
+      }
     }
   },
 });

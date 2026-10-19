@@ -17,7 +17,35 @@ marked.setOptions({
   gfm: true,
   breaks: false,
 });
-marked.use({ extensions: [vscodeFileLinkExtension] });
+marked.use({
+  extensions: [vscodeFileLinkExtension],
+  walkTokens(token) {
+    if (
+      token.type === 'list_item' &&
+      (token as any).task &&
+      Array.isArray((token as any).tokens) &&
+      (token as any).tokens.length > 0
+    ) {
+      const first = (token as any).tokens[0];
+      if (
+        first &&
+        first.type === 'list' &&
+        first.ordered &&
+        Array.isArray(first.items) &&
+        first.items.length === 1 &&
+        /^\s*\d+[\.\)]\s+/.test(first.raw)
+      ) {
+        const rawText = first.raw.trimEnd();
+        (token as any).tokens.splice(0, 1, {
+          type: 'text',
+          raw: rawText,
+          text: rawText,
+          tokens: (marked as any).Lexer.lexInline(rawText),
+        });
+      }
+    }
+  },
+});
 
 interface MarkdownProps {
   content: string;

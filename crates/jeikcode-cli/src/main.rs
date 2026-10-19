@@ -1677,7 +1677,14 @@ fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
 }
 
 async fn async_main() {
-    if let Some(launch) = desktop_webui_fast_launch() {
+    let inherited_token = jeikcode_updater::take_restart_token();
+    if let Some(mut launch) = desktop_webui_fast_launch() {
+        if let Some(port) = jeikcode_updater::restart_listen_port_from_env() {
+            launch.port = port;
+        }
+        if launch.token.is_none() {
+            launch.token = inherited_token.clone();
+        }
         let msg = jeikcode_daemon::ensure_webui(
             &launch.host,
             launch.port,
@@ -1852,7 +1859,7 @@ async fn async_main() {
         eprintln!("\nPlease report this at: https://github.com/jeikl/JeikCode/issues");
     }));
 
-    match run().await {
+    match run(inherited_token).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             restore_terminal_if_tui();
@@ -1862,7 +1869,7 @@ async fn async_main() {
     }
 }
 
-async fn run() -> Result<i32> {
+async fn run(inherited_token: Option<String>) -> Result<i32> {
     let run_start = std::time::Instant::now();
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --
     // clap help text is generated during parse, so we must resolve
@@ -2050,12 +2057,16 @@ async fn run() -> Result<i32> {
                 return Ok(0);
             }
             Commands::Webui {
-                port,
+                mut port,
                 host,
                 no_open,
                 token,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
+                    port = inherited;
+                }
+                let token = token.or_else(|| inherited_token.clone());
                 let msg =
                     jeikcode_daemon::ensure_webui(&host, port, !no_open, token.as_deref(), None)
                         .await;
@@ -2070,7 +2081,7 @@ async fn run() -> Result<i32> {
             }
             Commands::Serve {
                 host,
-                port,
+                mut port,
                 dir,
                 token,
                 no_token,
@@ -2078,6 +2089,10 @@ async fn run() -> Result<i32> {
                 idle_timeout,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
+                    port = inherited;
+                }
+                let token = token.or_else(|| inherited_token.clone());
                 let code = run_serve_mode(
                     host,
                     port,

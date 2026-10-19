@@ -23,3 +23,10 @@ test('a same-version reinstall waits for the listen port to drop', () => {
   assert.equal(shouldReloadUpgradedPage({ ...base, consecutiveMisses: 1 }), false);
   assert.equal(shouldReloadUpgradedPage({ ...base, consecutiveMisses: 2 }), true);
 });
+
+test('a different process version never counts as the upgraded server', () => {
+  const base = { want: 'v7.2.7-beta.1', from: '7.2.6', consecutiveMisses: 4 };
+  assert.equal(shouldReloadUpgradedPage({ ...base, got: '7.2.4-beta.10' }), false);
+  assert.equal(shouldReloadUpgradedPage({ ...base, got: '7.2.6' }), false);
+  assert.equal(shouldReloadUpgradedPage({ ...base, got: '7.2.7-beta.1' }), true);
+});

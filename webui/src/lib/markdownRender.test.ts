@@ -395,3 +395,28 @@ test('markdownToHtml correctly closes diff code block containing nested diff mar
   const blocks = html.match(/class="code-block-wrapper/g) ?? [];
   assert.equal(blocks.length, 3);
 });
+
+test('task list checkboxes with numbered labels do not split into nested ol or line breaks', () => {
+  const sample = [
+    '### 📋 渲染效果展示',
+    '',
+    '#### 🚀 技能模块发布与验证任务',
+    '- [ ] 1. 梳理技能输入参数与 schema 校验规则',
+    '- [ ] 2. 补齐本地端到端（E2E）自动化测试用例',
+    '- [ ] 3. 编写 `SKILL.md` 的触发条件与使用示例',
+    '- [ ] 4. 敏感凭证解耦（检查是否移入环境变量或服务端 Hub）',
+    '- [x] 5. 初始化项目结构与依赖清单（已打钩）',
+  ].join('\n');
+
+  const html = markdownToHtml(sample);
+
+  // 严禁生成多余的嵌套 <ol> 容器造成断行
+  assert.doesNotMatch(html, /<ol>/);
+  assert.doesNotMatch(html, /<\/ol>/);
+
+  // 复选框与带数字的文字处于同一行内文本流中
+  assert.match(html, /<li><input disabled="" type="checkbox"> 1\. 梳理技能输入参数与 schema 校验规则<\/li>/);
+  assert.match(html, /<li><input disabled="" type="checkbox"> 2\. 补齐本地端到端（E2E）自动化测试用例<\/li>/);
+  assert.match(html, /<li><input disabled="" type="checkbox"> 3\. 编写 <code>SKILL\.md<\/code> 的触发条件与使用示例<\/li>/);
+  assert.match(html, /<li><input checked="" disabled="" type="checkbox"> 5\. 初始化项目结构与依赖清单（已打钩）<\/li>/);
+});

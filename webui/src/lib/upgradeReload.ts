@@ -21,8 +21,6 @@ export function shouldReloadUpgradedPage(input: {
   const sameTarget = want.length > 0 && want === from;
   if (!sameTarget && want && got === want) return true;
   // 同版本重装没有新版本号。端口要先真正断过，再连上，才说明进程换过。
-  if (sameTarget && input.consecutiveMisses >= 2) return true;
-  // 目标版本字符串和健康检查不一致时，连续失败后版本相对起点变了，也算换过进程。
-  if (!sameTarget && input.consecutiveMisses >= 2 && got !== from) return true;
+  if (sameTarget && input.consecutiveMisses >= 2 && got === want) return true;
   return false;
 }

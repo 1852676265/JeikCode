@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::Query,
+    extract::{Query, State},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -522,7 +522,10 @@ pub async fn get_status() -> impl IntoResponse {
 }
 
 /// POST /api/update/execute
-pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl IntoResponse {
+pub async fn execute_update(
+    State(state): State<AppState>,
+    payload: Option<Json<ExecuteUpdateRequest>>,
+) -> impl IntoResponse {
     if IS_UPDATING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -534,6 +537,8 @@ pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl
     }
 
     let req = payload.map(|Json(p)| p).unwrap_or_default();
+    let listen_port = state.bind_port;
+    let restart_token = state.webui_tokens.display();
 
     tokio::spawn(async move {
         set_update_status(UpdateStatus {
@@ -552,6 +557,8 @@ pub async fn execute_update(payload: Option<Json<ExecuteUpdateRequest>>) -> impl
             req.channel,
             req.download_url,
             req.force.unwrap_or(false),
+            listen_port,
+            restart_token,
         )
         .await
         {
@@ -714,6 +721,8 @@ async fn run_cli_update(
     channel_opt: Option<String>,
     _direct_url: Option<String>,
     force: bool,
+    listen_port: u16,
+    restart_token: Option<String>,
 ) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
@@ -789,11 +798,23 @@ async fn run_cli_update(
                 });
                 // File is already swapped in place. Restart so remote WebUI /
                 // serve picks up the new image (Unix exec; Windows delayed spawn).
+                let restart_token = restart_token.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    let _ = jeikcode_updater::restart_replaced_process(&exe).map_err(|e| {
-                        tracing::error!("in-place upgrade restart failed: {e}");
+                    let Err(err) = jeikcode_updater::restart_replaced_process(
+                        &exe,
+                        listen_port,
+                        restart_token.as_deref(),
+                    );
+                    tracing::error!("in-place upgrade restart failed: {err}");
+                    set_update_status(UpdateStatus {
+                        status: "error".to_string(),
+                        progress: 0,
+                        bytes: 0,
+                        total: 0,
+                        error: Some(format!("重启失败: {err}")),
                     });
+                    IS_UPDATING.store(false, Ordering::SeqCst);
                 });
             }
             jeikcode_updater::UpgradeEvent::Failed(err) => {

@@ -9,10 +9,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::Manager;
+
+static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// 这次桌面壳拉起的 WebUI。端口可能因占用从 13457 顺延。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,7 +292,7 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {
-                    Ok((url, child)) => {
+                    Ok((url, child, launch)) => {
                         if let Some(slot) = handle.try_state::<ChildSlot>() {
                             *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
                         }
@@ -299,6 +302,7 @@ fn main() {
                             url.parse()
                                 .unwrap_or_else(|_| "about:blank".parse().expect("about:blank")),
                         );
+                        supervise_webui(handle.clone(), window.clone(), webui_origin.clone(), url, launch);
                     }
                     Err(err) => {
                         let text =
@@ -315,6 +319,7 @@ fn main() {
         .expect("启动 JeikCode Desktop 失败")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
                 if let Some(slot) = app.try_state::<ChildSlot>() {
                     if let Some(child) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         let _ = child.kill();
@@ -326,39 +331,97 @@ fn main() {
 
 struct ChildSlot(Mutex<Option<std::process::Child>>);
 
-fn start_webui(app: &tauri::AppHandle) -> Result<(String, std::process::Child), String> {
+struct WebuiLaunch {
+    bin: PathBuf,
+    port: u16,
+    token: String,
+    home: PathBuf,
+    bundled: Option<PathBuf>,
+}
+
+fn start_webui(
+    app: &tauri::AppHandle,
+) -> Result<(String, std::process::Child, WebuiLaunch), String> {
     let bundled = bundled_cli(app);
     let bin = publish_cli(bundled.as_deref()).map_err(|e| format!("安装命令行失败：{e}"))?;
     let home = home_dir();
     let (port, saved_token) = saved_webui_listen();
     let token = saved_token.unwrap_or_else(|| mint_desktop_token(port));
-    let mut cmd = Command::new(&bin);
+    let mut launch = WebuiLaunch {
+        bin,
+        port,
+        token,
+        home,
+        bundled,
+    };
+    let (url, child) = spawn_desktop_server(&launch, false, Duration::from_secs(90))?;
+    let probe_port = url
+        .parse::<tauri::Url>()
+        .ok()
+        .and_then(|parsed| parsed.port())
+        .unwrap_or(launch.port);
+    if probe_port != launch.port {
+        launch.port = probe_port;
+        let dir = jeikcode_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let body = format!(
+            "{{\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
+            launch.token
+        );
+        let _ = std::fs::write(dir.join("webui-listen.json"), body);
+    }
+    Ok((url, child, launch))
+}
+
+fn spawn_desktop_server(
+    launch: &WebuiLaunch,
+    exact_port: bool,
+    url_timeout: Duration,
+) -> Result<(String, std::process::Child), String> {
+    let mut cmd = Command::new(&launch.bin);
     cmd.arg("webui")
         .arg("--host")
         .arg("0.0.0.0")
         .arg("--port")
-        .arg(port.to_string())
+        .arg(launch.port.to_string())
         .arg("--no-open")
         .arg("--token")
-        .arg(&token);
+        .arg(&launch.token);
     cmd.env("JEIKCODE_DESKTOP", "1");
-    if let Some(ref bundled) = bundled {
+    if exact_port {
+        // 与 jeikcode-updater 的同名变量一致：只绑定这个端口，不顺延，也不关闭别的进程。
+        cmd.env("JEIKCODE_RESTART_EXACT_PORT", "1");
+        cmd.env("JEIKCODE_RESTART_LISTEN_PORT", launch.port.to_string());
+    }
+    if let Some(ref bundled) = launch.bundled {
         cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
     }
-    cmd.current_dir(&home)
+    cmd.current_dir(&launch.home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     suppress_console(&mut cmd);
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("无法启动 {}：{e}", bin.display()))?;
+        .map_err(|e| format!("无法启动 {}：{e}", launch.bin.display()))?;
     let stderr = child.stderr.take();
-    let mut url = stderr
-        .map(|pipe| read_url(pipe))
-        .transpose()?
-        .flatten()
-        .ok_or_else(|| "jeikcode webui 没有打印出地址".to_string())?;
+    let url_result = match stderr {
+        Some(pipe) => read_url(pipe, url_timeout),
+        None => Ok(None),
+    };
+    let mut url = match url_result {
+        Ok(Some(url)) => url,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("jeikcode webui 没有打印出地址".to_string());
+        }
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
     if !url.contains("desktop=") {
         let separator = if url.contains('?') { "&" } else { "?" };
         url.push_str(&format!("{separator}desktop=1"));
@@ -370,18 +433,109 @@ fn start_webui(app: &tauri::AppHandle) -> Result<(String, std::process::Child), 
         .parse::<tauri::Url>()
         .ok()
         .and_then(|parsed| parsed.port())
-        .unwrap_or(port);
-    if probe_port != port {
-        let dir = jeikcode_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let body = format!("{{\n  \"port\": {probe_port},\n  \"token\": \"{token}\"\n}}\n");
-        let _ = std::fs::write(dir.join("webui-listen.json"), body);
-    }
+        .unwrap_or(launch.port);
     let ready_deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < ready_deadline && !health_ready(probe_port) {
         std::thread::sleep(Duration::from_millis(40));
     }
     Ok((url, child))
+}
+
+/// 只回收桌面壳自己拉起的子进程。升级后的新进程是脱离的后继，不在这个句柄里。
+/// 端口恢复后在壳内打开原来的地址；不要按进程名清理，也不要打开系统浏览器。
+fn supervise_webui(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    origin: Arc<Mutex<Option<WebuiOrigin>>>,
+    mut url: String,
+    launch: WebuiLaunch,
+) {
+    std::thread::spawn(move || {
+        let mut relaunched = false;
+        loop {
+            if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return;
+            }
+            if !take_exited_child(&app) {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return;
+            }
+            if wait_until_health(launch.port, Duration::from_secs(20)) {
+                open_webui_in_shell(&window, &origin, &url);
+                return;
+            }
+            if relaunched || DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return;
+            }
+            relaunched = true;
+            match spawn_desktop_server(&launch, true, Duration::from_secs(30)) {
+                Ok((next_url, child)) => {
+                    if let Some(slot) = app.try_state::<ChildSlot>() {
+                        *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+                    }
+                    url = next_url;
+                    open_webui_in_shell(&window, &origin, &url);
+                }
+                Err(err) => {
+                    let text =
+                        serde_json::to_string(&err).unwrap_or_else(|_| "\"重启失败\"".into());
+                    let _ = window.eval(&format!(
+                        "var status = document.getElementById('status'); if (status) status.textContent = {text};"
+                    ));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn take_exited_child(app: &tauri::AppHandle) -> bool {
+    let Some(slot) = app.try_state::<ChildSlot>() else {
+        return false;
+    };
+    let mut guard = slot.0.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(child) = guard.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            guard.take();
+            true
+        }
+        Ok(None) => false,
+        Err(_) => {
+            guard.take();
+            true
+        }
+    }
+}
+
+fn wait_until_health(port: u16, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return false;
+        }
+        if health_ready(port) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+fn open_webui_in_shell(
+    window: &tauri::WebviewWindow,
+    origin: &Mutex<Option<WebuiOrigin>>,
+    url: &str,
+) {
+    remember_webui_origin(origin, url);
+    if let Ok(parsed) = url.parse() {
+        let _ = window.navigate(parsed);
+    }
 }
 
 /// Keep the printed launch address, but open this computer through loopback.
@@ -408,7 +562,10 @@ fn bundled_cli(app: &tauri::AppHandle) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn read_url(pipe: impl std::io::Read + Send + 'static) -> Result<Option<String>, String> {
+fn read_url(
+    pipe: impl std::io::Read + Send + 'static,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
@@ -439,7 +596,7 @@ fn read_url(pipe: impl std::io::Read + Send + 'static) -> Result<Option<String>,
             }
         }
     });
-    match rx.recv_timeout(Duration::from_secs(90)) {
+    match rx.recv_timeout(timeout) {
         Ok(url) => Ok(Some(url)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("等待 WebUI 启动超时".into()),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
