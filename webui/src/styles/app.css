@@ -9488,6 +9488,79 @@ body {
   animation: spin 0.6s linear infinite !important;
 }
 
+/* 模型选择弹窗内的思考强度按钮（桌面端隐藏，手机端在媒体查询下显现） */
+.model-header-effort-btn {
+  display: none !important;
+  align-items: center !important;
+  gap: 5px !important;
+  height: 30px !important;
+  padding: 0 8px !important;
+  border-radius: 6px !important;
+  border: 1px solid var(--app-primary-border-color, rgba(255, 255, 255, 0.15)) !important;
+  background: var(--app-card-background, rgba(255, 255, 255, 0.06)) !important;
+  color: var(--app-secondary-foreground) !important;
+  font-size: 12px !important;
+  cursor: pointer !important;
+  flex-shrink: 0 !important;
+  transition: all 0.12s ease !important;
+  white-space: nowrap !important;
+}
+.model-header-effort-btn:hover,
+.model-header-effort-btn.is-active {
+  background: var(--app-hover-bg, rgba(255, 255, 255, 0.12)) !important;
+  color: var(--app-primary-foreground) !important;
+  border-color: var(--app-border-focus, rgba(255, 255, 255, 0.3)) !important;
+}
+.model-header-effort-icon {
+  font-size: 12px !important;
+  line-height: 1 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+}
+.model-header-effort-label {
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  max-width: 80px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+.model-header-effort-chevron {
+  font-size: 10px !important;
+  opacity: 0.7 !important;
+  transition: transform 0.15s ease !important;
+}
+.model-header-effort-chevron.rotated {
+  transform: rotate(180deg) !important;
+}
+
+/* 模型选择弹窗右上角关闭按钮 */
+.modal-close-btn {
+  margin-left: auto !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 30px !important;
+  height: 30px !important;
+  padding: 0 !important;
+  border-radius: 6px !important;
+  border: none !important;
+  background: transparent !important;
+  color: var(--app-secondary-foreground) !important;
+  cursor: pointer !important;
+  flex-shrink: 0 !important;
+  transition: all 0.12s ease !important;
+}
+.modal-close-btn:hover {
+  background: var(--app-hover-bg, rgba(255, 255, 255, 0.12)) !important;
+  color: var(--app-primary-foreground) !important;
+}
+
+/* 思考强度抽屉遮罩层级必须高于模型弹窗（99999） */
+.modal-overlay.effort-selector-modal-overlay {
+  z-index: 100001 !important;
+}
+
 /* 消息气泡底部单行操作栏（时间在前，复制按钮在后，垂直中轴与边缘精准对齐） */
 .msg-footer-row {
   display: inline-flex !important;
@@ -10085,6 +10158,9 @@ body {
     min-width: 0;
     max-width: none !important;
   }
+  .session-title-btn svg {
+    flex-shrink: 0 !important;
+  }
   .session-title-text {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -10172,6 +10248,10 @@ body {
     border: 1px solid var(--app-primary-border-color, rgba(255, 255, 255, 0.16)) !important;
     box-shadow: none;
     opacity: 1;
+  }
+  /* 手机端顶栏隐藏思考强度按钮，转移到模型选择弹窗内的模型配置右侧，释放左上角小云朵宝贵空间 */
+  .top-nav-model-slot .effort-selector {
+    display: none !important;
   }
   .top-nav-model-slot .effort-prefix {
     display: none;
@@ -10647,15 +10727,47 @@ body {
   }
   .model-header-title-badge {
     font-size: 14px !important;
+    flex-shrink: 0 !important;
+  }
+  .model-header-refresh-btn {
+    height: 34px !important;
+    width: 34px !important;
+    flex-shrink: 0 !important;
+  }
+  .model-header-config-btn {
+    height: 34px !important;
+    padding: 0 10px !important;
+    flex-shrink: 0 !important;
+    max-width: 110px !important;
+  }
+  .model-header-config-btn span {
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+  .model-header-effort-btn {
+    display: inline-flex !important;
+    height: 34px !important;
+    padding: 0 8px !important;
+    flex-shrink: 0 !important;
+    max-width: 105px !important;
+  }
+  .model-header-effort-label {
+    max-width: 65px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+  .model-streamlined-header .modal-close-btn {
+    margin-left: auto !important;
+    height: 34px !important;
+    width: 34px !important;
+    flex-shrink: 0 !important;
   }
   .model-header-search-wrap {
     flex: 1 1 100% !important;
     order: 5;
     height: 38px !important;
-  }
-  .model-header-config-btn {
-    height: 34px !important;
-    padding: 0 10px !important;
   }
   .model-cascade-body {
     flex-direction: column;
@@ -10712,6 +10824,9 @@ body {
   }
 
   /* === Effort picker sheet === */
+  .modal-overlay.effort-selector-modal-overlay {
+    z-index: 100001 !important;
+  }
   .modal-card.effort-selector-modal-card {
     width: 100% !important;
     max-width: 100% !important;
