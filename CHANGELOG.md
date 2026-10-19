@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.7-beta.5 (2026-10-19)
+
+- **[TodoList & Lifecycle Architecture] Authoritative session board synchronization and stop-hook continuation guard**:
+  - Bound `TodoTool` reads and writes directly to the authoritative session `TodoBoard`, ensuring lock-safe commit and read-back consistency and eliminating split-brain states between tool-local memory and global boards.
+  - Aligned `TodoHook` continuation checks to inspect the live session board instead of re-deriving stale checklists from transcript history, preventing spurious completion nudges when all tasks are finished.
+  - Supported explicit board resets via `clear_todo_board` and `/todo clear`, and routed daemon and TUI `/todo` commands, additions, and session picker replays through the authoritative session board.
+
+---
+
+- **[待办清单与生命周期架构] 会话全局看板权威同步与停机拦截卫士优化**:
+  - 将 `TodoTool` 的读写全链路直接绑定到全局权威会话 `TodoBoard`，确保写后读回状态强一致，彻底消除工具本地内存与全局看板间的双轨割裂。
+  - 优化 `TodoHook` 停机拦截（Continuation Hook）逻辑，优先读取实时会话看板而非从历史转录中折算陈旧状态，杜绝所有任务已完成后仍被误报存在未完项的异常重唤。
+  - 增加 `clear_todo_board` 显式清空机制与 `/todo clear` 支持，并将 Daemon 与 TUI 端 `/todo` 命令、任务添加及会话切换重放统一收敛至会话看板。
+
 ## v7.2.7-beta.4 (2026-10-19)
 
 - **[TodoList & Session Board] Persistent single-board live checklist and turn-settlement archival**:
