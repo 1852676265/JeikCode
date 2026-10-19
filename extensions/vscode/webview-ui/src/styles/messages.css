@@ -387,6 +387,12 @@
 
 .markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; overflow-wrap: anywhere; }
 .markdown-root ul, .markdown-root ol { padding-inline-start: 2em; margin-bottom: 0.4em; }
+.markdown-root li > ul { list-style: circle; }
+.markdown-root li > ul > li > ul { list-style: square; }
+.markdown-root li > ul,
+.markdown-root li > ol {
+  margin: 0.2em 0 0.3em;
+}
 .markdown-root li { margin-bottom: 2px; overflow-wrap: anywhere; }
 .markdown-root li:has(> input[type="checkbox"]),
 .markdown-root li:has(> p > input[type="checkbox"]),
@@ -408,7 +414,7 @@
 .markdown-root li.task-list-item > ol {
   display: block;
   margin: 0.25em 0 0.35em;
-  padding-inline-start: 1.5em;
+  padding-inline-start: 1.85em;
 }
 .markdown-root li:has(> input[type="checkbox"]) > ul > li,
 .markdown-root li:has(> input[type="checkbox"]) > ol > li,

@@ -4705,7 +4705,13 @@ body {
   line-height: 1.65;
 }
 .markdown-root ul { list-style: disc; padding-inline-start: 1.5em; margin: 0.3em 0 0.5em; }
+.markdown-root li > ul { list-style: circle; }
+.markdown-root li > ul > li > ul { list-style: square; }
 .markdown-root ol { list-style: decimal; padding-inline-start: 1.5em; margin: 0.3em 0 0.5em; }
+.markdown-root li > ul,
+.markdown-root li > ol {
+  margin: 0.2em 0 0.3em;
+}
 .markdown-root li { margin-bottom: 3px; }
 .markdown-root li::marker { color: var(--app-secondary-foreground); }
 .markdown-root h1, .markdown-root h2, .markdown-root h3, .markdown-root h4,
@@ -4752,6 +4758,14 @@ body {
   border-radius: 0 8px 8px 0;
   background: color-mix(in srgb, var(--app-brand, #3b82f6) 8%, transparent);
   color: var(--app-secondary-foreground);
+}
+.markdown-root blockquote blockquote {
+  margin: 6px 0;
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--app-brand, #3b82f6) 5%, transparent);
+}
+.markdown-root li > blockquote {
+  margin: 6px 0;
 }
 .markdown-root hr { border: none; border-top: 1px solid var(--app-primary-border-color); margin: 0.6em 0; }
 .markdown-root :not(pre) > code,
@@ -4893,7 +4907,7 @@ body {
 .markdown-root li.task-list-item > ol {
   display: block;
   margin: 0.25em 0 0.35em;
-  padding-inline-start: 1.5em;
+  padding-inline-start: 1.85em;
 }
 .markdown-root li:has(> input[type="checkbox"]) > ul > li,
 .markdown-root li:has(> input[type="checkbox"]) > ol > li,

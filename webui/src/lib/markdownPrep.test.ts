@@ -406,6 +406,27 @@ test('task list checkboxes with [√], [✔], [✓], [v] normalize to checked st
   assert.equal(uncheckedMatches.length, 1);
 });
 
+test('nested lists with 4-space indent preserve hierarchy and are not stripped', () => {
+  const md = [
+    '- [√] 一级任务 A',
+    '  - [√] 二级子任务 A1',
+    '    - [ ] 三级孙任务 A1a',
+    '    - [x] 三级孙任务 A1b',
+    '  - [ ] 二级子任务 A2',
+    '- [ ] 一级任务 B',
+    '  1. 二级步骤 1',
+    '  2. 二级步骤 2',
+    '     - 三级说明点 2.1',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+
+  // 三级孙任务必须嵌套在二级 ul 内部，绝不能被提升到最外层
+  assert.match(out, /二级子任务 A1[\s\S]*?<ul>[\s\S]*?三级孙任务 A1a/);
+  assert.match(out, /三级孙任务 A1a[\s\S]*?三级孙任务 A1b/);
+  assert.match(out, /二级步骤 2[\s\S]*?<ul>[\s\S]*?三级说明点 2\.1/);
+});
+
 
 
 

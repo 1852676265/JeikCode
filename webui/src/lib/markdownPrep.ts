@@ -733,6 +733,7 @@ export function preprocessMarkdown(raw: string): string {
   let inTable = false;
   const footnotes: { id: string; n: number; def: string }[] = [];
   const footnoteIds = new Map<string, number>();
+  let lastListIndent = -1;
 
   const prevBlank = (): boolean => result.length === 0 || result[result.length - 1].trim() === '';
 
@@ -740,10 +741,35 @@ export function preprocessMarkdown(raw: string): string {
     let line = lines[i];
 
     // ★ 智能解开模型误加的 4 空格缩进富文本块：
-    // 在非围栏代码块外，如果一行文本缩进了 4+ 个空格，但其内容明显是 Markdown 块级结构（如标题、水平线、新的围栏代码块、列表项），
-    // 将其多余的前置 4 空格缩进剥除，彻底避免 marked 误将其判定为 Indented Code Block 导致富文本降级为纯文本或灰色框！
-    if (!inFence && /^(?: {4}|\t)(?:#{1,6}\s+|[-*_]{3,}\s*$|(?:```|~~~)|[-*+]\s+|\d+\.\s+)/.test(line)) {
-      line = line.replace(/^(?: {4}|\t)/, '');
+    // 在非围栏代码块外，如果一行文本缩进了 4+ 个空格，且内容是顶层结构（如标题、水平线、新的代码块），剥除前置 4 空格；
+    // 对于列表项（[-*+] 或数字标号）：
+    // 若前面已有父级列表项（处于列表嵌套流中，且当前行缩进大于等于已有父级缩进），代表合法的子级嵌套列表，绝不剥除缩进；
+    // 仅当此列表项孤立出现（前面无父级列表）且缩进 4+ 空格时，才剥除误加的 4 空格，避免被 marked 判定为 Indented Code Block！
+    if (!inFence) {
+      if (!line.trim()) {
+        // 空行不重置 lastListIndent，以便跨空行的紧凑/宽松子列表正常识别
+      } else if (/^\s*#{1,6}\s+|^\s*[-*_]{3,}\s*$/.test(line)) {
+        lastListIndent = -1;
+        if (/^(?: {4}|\t)(?:#{1,6}\s+|[-*_]{3,}\s*$)/.test(line)) {
+          line = line.replace(/^(?: {4}|\t)/, '');
+        }
+      } else if (/^(?: {4}|\t)(?:```|~~~)/.test(line)) {
+        lastListIndent = -1;
+        line = line.replace(/^(?: {4}|\t)/, '');
+      } else {
+        const listMatch = line.match(/^(\s*)(?:[-*+]|\d+[\.\)])\s+/);
+        if (listMatch) {
+          const indent = listMatch[1].length;
+          if (lastListIndent === -1 && indent >= 4) {
+            line = line.replace(/^(?: {4}|\t)/, '');
+            lastListIndent = indent - 4;
+          } else {
+            lastListIndent = indent;
+          }
+        } else if (!/^\s{2,}/.test(line)) {
+          lastListIndent = -1;
+        }
+      }
     }
 
     // ★ 智能拆解与前置文本/标题/列表项粘连的围栏开启标记（如 `二、中文对照版本```markdown`、`- **代码现状**：```rust` 或 `示例：```ts`）：
