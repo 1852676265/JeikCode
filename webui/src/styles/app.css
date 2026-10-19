@@ -13993,6 +13993,23 @@ body {
 /* ==========================================================================
    Terminal Panel Styles (Multi-Tab & Scratchpad Command Box)
    ========================================================================== */
+
+/* 终端面板槽位：始终保留布局盒，只切显隐。
+   xterm v6 依据“容器是否与视口相交”决定是否暂停渲染，display:none 会让所有终端进入暂停态，
+   恢复时若命中不了自愈标记就会停在空白（黑屏），因此这里只做显隐切换、不摘掉布局盒。
+   隐藏态必须同时压制 visibility 与 opacity：visibility 虽然可继承，但子元素
+   .terminal-xterm-viewport.active 显式声明了 visibility: visible，会顶掉祖先的隐藏而穿透出来。 */
+.terminal-panel-slot.is-hidden {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+.terminal-panel-slot.is-hidden .terminal-xterm-viewport,
+.terminal-panel-slot.is-hidden .terminal-xterm-viewport.active {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
 .terminal-panel-root {
   display: flex;
   flex-direction: column;
