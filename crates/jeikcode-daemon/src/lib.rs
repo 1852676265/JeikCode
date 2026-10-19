@@ -1229,11 +1229,24 @@ struct ActiveChatIndex {
     /// WebUI gets a push the moment an API turn starts instead of having to
     /// poll. Keyed by session id (the `session_id` alias the watcher used).
     standby_watchers: HashMap<String, Vec<mpsc::UnboundedSender<ChatEvent>>>,
-    /// 会话级断点续传游标（严格单调递增）。
+    /// Session-scoped event state. Survives the operation: the turn's frames live
+    /// in the operation, but "how far did this session get" and "what was its
+    /// terminal frame" must outlive the turn.
     ///
-    /// 它是我们自己定义的序号，与模型上下文无关 —— 回合结束清空回合缓冲、
-    /// 上下文压缩、历史改写都不会重置它，所以跨回合重连可以带着旧游标精准续传。
+    /// The resume cursor (`after_seq`) is session-scoped while the frames were
+    /// turn-scoped — that mismatch is exactly why a subscriber attaching after the
+    /// turn ended could never learn the turn was over, and the WebUI stayed stuck
+    /// in "running" (red stop button, clock still ticking, checklist frozen).
     session_seq: HashMap<String, u64>,
+    /// 会话级终态帧记录。
+    ///
+    /// 断点续传游标是会话级的，帧却只活在回合里 —— 回合一结束，断链重连 / 刷新 /
+    /// 切回的订阅者就再也拿不到终态帧，前端会一直停在「运行中」（红色停止按钮 + 计时器
+    /// 一直叠加 + 清单定格），只能靠切一次会话顺带修好。终态帧是整个回合最重要的一帧，
+    /// 它必须活得比 operation 久，所以记在会话上而不是记在 operation 里。
+    ///
+    /// 键是会话的 alias；值是（序号, 帧本身）。
+    session_terminal: HashMap<String, (u64, ChatEvent)>,
 }
 
 /// Atomic admission and identity-aware cleanup for background `/chat` turns.
@@ -1453,9 +1466,11 @@ impl ActiveChatRegistry {
         let index = self.inner.read().await;
         let operation_id = index.aliases.get(session_id)?.clone();
         let operation = index.operations.get(&operation_id)?;
-        if operation.terminal_reached || operation.stopped {
-            return None;
-        }
+        // A terminal turn is NOT a reason to bail out: the terminal frame may still
+        // be queued for the fan-out. Handing back the snapshot plus the bus lets a
+        // watcher that attaches now either read the terminal from the snapshot or
+        // receive it live — instead of parking, which means keepalives only and a
+        // client that waits forever.
         let guard = operation
             .replay
             .lock()
@@ -1547,17 +1562,31 @@ impl ActiveChatRegistry {
         &self,
         session_id: &str,
         standby_tx: &mpsc::UnboundedSender<ChatEvent>,
+        replay_terminal: bool,
     ) -> WatchOutcome {
         let mut index = self.inner.write().await;
         if let Some(operation_id) = index.aliases.get(session_id).cloned() {
             if let Some(operation) = index.operations.get(&operation_id) {
                 if !operation.terminal_reached && !operation.stopped {
                     return WatchOutcome::Live(operation.event_bus.subscribe());
-                } else {
-                    index.aliases.remove(session_id);
                 }
-            } else {
-                index.aliases.remove(session_id);
+            }
+            index.aliases.remove(session_id);
+        }
+        // The session's turn is over (or never started). Hand the watcher the
+        // terminal frame recorded on the session — parking here would mean
+        // keepalives only and a client that waits forever for a finished turn.
+        //
+        // The lookup is by session id and deliberately independent of the alias:
+        // the alias is gone once the operation is cleaned up, and a watcher
+        // attaching after the turn ended is exactly the case that must not hang.
+        //
+        // Only the reattach path asks for it: the idle standby watcher must stay
+        // silent, or it would re-deliver the same terminal on every re-arm and
+        // spin.
+        if replay_terminal {
+            if let Some((_, terminal)) = index.session_terminal.get(session_id) {
+                let _ = standby_tx.send(terminal.clone());
             }
         }
         // One standby slot per session: WebUI reconnect/refresh used to pile up
@@ -1985,13 +2014,38 @@ impl ActiveChatRegistry {
         true
     }
 
-    /// Mark that a terminal event (Done, Stopped, or Error) has been emitted.
-    /// Immediately excludes this operation from `active_session_ids` so the UI
-    /// spinner stops rotating without waiting for background handle.shutdown() or task join.
-    async fn mark_terminal(&self, operation_id: &str) {
+    /// Mark that a terminal event (Done, Stopped, or Error) has been emitted, and
+    /// record that terminal frame **on the session** in the same critical section
+    /// that raises the flag.
+    ///
+    /// The flag used to become visible before the terminal frame existed anywhere:
+    /// the frame was still queued for the fan-out task, so a watcher attaching in
+    /// that window saw "already terminal" with nothing to replay — and it parked,
+    /// and parking means keepalives only, never a terminal. The WebUI then stayed
+    /// in "running" forever (red stop button, clock still ticking, checklist
+    /// frozen) until the user happened to switch sessions.
+    ///
+    /// Recording the frame here makes "this turn is over" and "here is its
+    /// terminal frame" a single fact, so a late watcher can always be told.
+    async fn mark_terminal(&self, operation_id: &str, terminal: &ChatEvent) {
         let mut index = self.inner.write().await;
-        if let Some(op) = index.operations.get_mut(operation_id) {
-            op.terminal_reached = true;
+        let Some(op) = index.operations.get_mut(operation_id) else {
+            return;
+        };
+        // The terminal frame takes the next slot in the turn's replay log, so its
+        // cursor is the same number the replay snapshot hands out.
+        let seq = op.seq_base
+            + op.replay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len() as u64
+            + 1;
+        op.terminal_reached = true;
+        let aliases = op.aliases.clone();
+        for alias in aliases {
+            index
+                .session_terminal
+                .insert(alias, (seq, terminal.clone()));
         }
     }
 
@@ -8968,7 +9022,9 @@ pub(crate) async fn process_chat_request(
                 ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
             ) {
                 terminal_sent.store(true, std::sync::atomic::Ordering::Release);
-                active_chats.mark_terminal(&operation_id).await;
+                // Record the terminal frame on the session before the flag becomes
+                // visible, so a watcher attaching right now can always be told.
+                active_chats.mark_terminal(&operation_id, &chat_event).await;
             }
             let _ = event_tx.send(chat_event);
         }
@@ -9349,7 +9405,7 @@ async fn chat_watch(
         } else {
             match state
                 .active_chats
-                .subscribe_or_standby(&session_id, &tx)
+                .subscribe_or_standby(&session_id, &tx, true)
                 .await
             {
                 WatchOutcome::Live(mut bus_rx) => {
@@ -9399,7 +9455,7 @@ async fn chat_watch(
     } else {
         match state
             .active_chats
-            .subscribe_or_standby(&session_id, &tx)
+            .subscribe_or_standby(&session_id, &tx, false)
             .await
         {
             WatchOutcome::Live(mut bus_rx) => {
@@ -15240,22 +15296,99 @@ mod tests {
         assert_eq!(active_ids, vec![session_id.to_string()]);
     }
 
+    fn done_event(session_id: &str) -> ChatEvent {
+        ChatEvent::Done {
+            tokens: 0,
+            tool_calls: 0,
+            session_id: session_id.to_string(),
+            stop_reason: Some("stopped".into()),
+            message: None,
+        }
+    }
+
     #[tokio::test]
     async fn terminated_chat_operation_is_not_treated_as_live_by_watch() {
         let registry = ActiveChatRegistry::default();
         let admission = registry.admit(Some("session-term"), None).await.unwrap();
-        registry.mark_terminal(&admission.operation_id).await;
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-term"))
+            .await;
 
-        // subscribe_live_with_replay should return None for terminated turn
-        assert!(registry
-            .subscribe_live_with_replay("session-term")
-            .await
-            .is_none());
+        // A terminated turn is never handed back as a live subscription the
+        // client could wait on forever. The watcher still gets the turn's bus so
+        // an in-flight terminal frame reaches it.
+        assert!(
+            registry
+                .subscribe_live_with_replay("session-term")
+                .await
+                .is_some(),
+            "a terminated turn must still hand its watcher a way to learn the terminal"
+        );
 
-        // subscribe_or_standby should return Standby and remove stale alias
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = registry.subscribe_or_standby("session-term", &tx).await;
+        // subscribe_or_standby parks (the alias is stale) and hands over the
+        // recorded terminal, so the watcher is not left with keepalives only.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("session-term", &tx, true)
+            .await;
         assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(matches!(
+            rx.try_recv()
+                .expect("the recorded terminal must be delivered"),
+            ChatEvent::Done { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_watcher_attaching_after_the_turn_ended_still_receives_the_terminal_frame() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-gone"), None).await.unwrap();
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-gone"))
+            .await;
+        // The turn is over: the operation and its frame log are gone.
+        assert!(registry.complete(&admission.operation_id).await);
+
+        // A watcher that attaches now — a page refresh, a switch back to this
+        // session, or a long disconnect coming back — must still learn that the
+        // turn ended. Otherwise the WebUI stays in "running" forever: red stop
+        // button, clock still ticking, checklist frozen.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("session-gone", &tx, true)
+            .await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(
+            matches!(
+                rx.try_recv().expect(
+                    "a watcher attaching after the turn ended must receive the terminal frame"
+                ),
+                ChatEvent::Done { .. }
+            ),
+            "the terminal frame must outlive the operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_idle_standby_watcher_is_never_given_the_terminal_frame() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-idle"), None).await.unwrap();
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-idle"))
+            .await;
+        assert!(registry.complete(&admission.operation_id).await);
+
+        // The idle standby watcher re-arms on every focus/switch. Handing it the
+        // same terminal again would make it spin, so it must stay silent.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("session-idle", &tx, false)
+            .await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(
+            rx.try_recv().is_err(),
+            "the idle standby watcher must stay silent"
+        );
     }
 
     #[tokio::test]
