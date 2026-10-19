@@ -399,6 +399,7 @@ fn upsert_todo(
     idx + 1
 }
 
+#[allow(dead_code)]
 fn maybe_auto_clear_finished(list: &mut Vec<TodoItem>) {
     if !list.is_empty() && list.iter().all(|t| t.status == TodoStatus::Completed) {
         list.clear();
@@ -484,14 +485,9 @@ fn apply_actions_batch(
     };
 
     if has_add || !seed_updates.is_empty() {
-        // 关键修复：绝不能仅仅因为 add_count >= 2 就把还在进行中的任务列表暴力清空！
-        // 只有当已有列表此前已经全部完成（全是 Completed），且当前没有对未完成任务的引用时，才允许清除已闭环的旧计划。
-        // 若列表中仍有 pending 或 in_progress 的任务，100% 严格追加，绝不清空！
-        let is_unfinished = tmp.iter().any(|t| t.status != TodoStatus::Completed);
-        if !is_unfinished {
-            maybe_auto_clear_finished(&mut tmp);
-        }
-
+        // 关键修复：中间状态打完所有勾时，todolist 必须完整保留；
+        // 若后续追加新任务（add），严格在既有清单末尾平滑追加，绝不断链清空！
+        // 只有显式 action="clear" 才会清空清单。
         if has_add {
             for item in arr {
                 if action_kind(item) == Some("add") {
@@ -574,7 +570,7 @@ fn action_status(v: &serde_json::Value) -> Option<TodoStatus> {
 fn apply_add(
     list: &mut Vec<TodoItem>,
     v: &serde_json::Value,
-    auto_clear: bool,
+    _auto_clear: bool,
 ) -> Result<usize, String> {
     let content = v
         .get("content")
@@ -582,9 +578,6 @@ fn apply_add(
         .map(normalize_todo_content)
         .filter(|c| !c.is_empty())
         .ok_or_else(|| "todowrite: `add` needs non-empty `content`. Example: {\"action\": \"add\", \"content\": \"Implement feature X\"}.".to_string())?;
-    if auto_clear {
-        maybe_auto_clear_finished(list);
-    }
     Ok(upsert_todo(list, content, action_status(v), None))
 }
 
@@ -1871,23 +1864,26 @@ mod tests {
         ];
         apply_todo_action(
             &mut list,
-            r#"{"actions":[{"action":"add","content":"next-1"},{"action":"add","content":"next-2"},{"action":"update","id":1,"status":"in_progress"}]}"#,
+            r#"{"actions":[{"action":"add","content":"next-1"},{"action":"add","content":"next-2"},{"action":"update","id":3,"status":"in_progress"}]}"#,
         );
         assert_eq!(
             list.len(),
-            2,
-            "finished list must be replaced, not appended"
+            4,
+            "finished list must be appended without breaking chain"
         );
-        assert_eq!(list[0].content, "next-1");
-        assert_eq!(list[0].status, TodoStatus::InProgress);
-        assert_eq!(list[1].content, "next-2");
+        assert_eq!(list[0].content, "done-1");
+        assert_eq!(list[0].status, TodoStatus::Completed);
+        assert_eq!(list[1].content, "done-2");
+        assert_eq!(list[1].status, TodoStatus::Completed);
+        assert_eq!(list[2].content, "next-1");
+        assert_eq!(list[2].status, TodoStatus::InProgress);
+        assert_eq!(list[3].content, "next-2");
     }
 
     #[test]
     fn add_update_on_finished_list_accepts_append_style_ids() {
         // The live failure: list is `[x] 1. 查询…`, model adds a follow-up as
-        // id 2 and updates id 2. Auto-clear restarts at 1; append-style ids
-        // must still land on the new row.
+        // id 2 and updates id 2. Completed list must smoothly append.
         let mut list = vec![TodoItem {
             content: "查询沉睡资源客户列表".into(),
             status: TodoStatus::Completed,
@@ -1896,9 +1892,11 @@ mod tests {
             &mut list,
             r#"{"actions":[{"action":"add","content":"导出Excel","id":2},{"action":"update","id":2,"status":"in_progress"}]}"#,
         );
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].content, "导出Excel");
-        assert_eq!(list[0].status, TodoStatus::InProgress);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].content, "查询沉睡资源客户列表");
+        assert_eq!(list[0].status, TodoStatus::Completed);
+        assert_eq!(list[1].content, "导出Excel");
+        assert_eq!(list[1].status, TodoStatus::InProgress);
     }
 
     #[test]

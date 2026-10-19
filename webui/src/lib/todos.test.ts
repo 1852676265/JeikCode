@@ -229,7 +229,7 @@ test('clear + add + update in one batch replaces the plan', () => {
   ]);
 });
 
-test('add on a finished list auto-clears so ids restart at 1', () => {
+test('add on a finished list appends smoothly without breaking chain', () => {
   const list = applyTodoAction(
     [
       { content: 'done-1', status: 'completed' },
@@ -239,11 +239,13 @@ test('add on a finished list auto-clears so ids restart at 1', () => {
       actions: [
         { action: 'add', content: 'next-1' },
         { action: 'add', content: 'next-2' },
-        { action: 'update', id: 1, status: 'in_progress' },
+        { action: 'update', id: 3, status: 'in_progress' },
       ],
     }),
   );
   assert.deepEqual(list, [
+    { content: 'done-1', status: 'completed' },
+    { content: 'done-2', status: 'completed' },
     { content: 'next-1', status: 'in_progress' },
     { content: 'next-2', status: 'pending' },
   ]);
@@ -259,7 +261,10 @@ test('add+update on a finished list accepts append-style ids', () => {
       ],
     }),
   );
-  assert.deepEqual(list, [{ content: '导出Excel', status: 'in_progress' }]);
+  assert.deepEqual(list, [
+    { content: '查询沉睡资源客户列表', status: 'completed' },
+    { content: '导出Excel', status: 'in_progress' },
+  ]);
 });
 
 test('duplicate titles upsert instead of duplicating', () => {
@@ -790,7 +795,7 @@ test('reduceTodosFromCalls preserves in-progress list across mid-turn multi-add 
   assert.equal(reduced[5]?.content, 'task-6');
 });
 
-test('applyTodoAction auto-clears completed list when new batch adds multiple items', () => {
+test('applyTodoAction preserves completed list when new batch adds multiple items', () => {
   const finishedList: TodoItem[] = [
     { content: 'old-1', status: 'completed' },
     { content: 'old-2', status: 'completed' },
@@ -804,9 +809,11 @@ test('applyTodoAction auto-clears completed list when new batch adds multiple it
   });
 
   const next = applyTodoAction(finishedList, newPlanArgs);
-  assert.equal(next.length, 2, '全部已完成的旧列表在开启新批量任务时应自动清除');
-  assert.equal(next[0]?.content, 'new-1');
-  assert.equal(next[1]?.content, 'new-2');
+  assert.equal(next.length, 4, '全部已完成的旧列表在追加新任务时应平滑追加，绝不断链');
+  assert.equal(next[0]?.content, 'old-1');
+  assert.equal(next[1]?.content, 'old-2');
+  assert.equal(next[2]?.content, 'new-1');
+  assert.equal(next[3]?.content, 'new-2');
 });
 
 test('restoreStickyTodos respects empty authoritativeTodos array and does not fall back to stashed', () => {

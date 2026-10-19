@@ -1418,7 +1418,7 @@ export function Chat({
     if (changed) persistAppliedTodoIds();
   }
   function applySessionStickyTodos(sessionId: string | null | undefined, items: TodoItem[] | null) {
-    const sticky = items && items.length > 0 && !items.every((t) => t.status === 'completed') ? items : null;
+    const sticky = items && items.length > 0 ? items : null;
     setActiveTodos(sticky);
     activeTodosRef.current = sticky;
     if (!sessionId) return;
@@ -1686,27 +1686,34 @@ export function Chat({
   const detachedPollTimerRef = useRef<number | null>(null);
   const detachedWatchAbortRef = useRef<AbortController | null>(null);
   const sessionWatchersRef = useRef<Map<string, AbortController>>(new Map());
-  // 手动停止屏障：记录用户手动点击停止的会话与其保护截止时间戳。
-  // 设立 2.5 秒的屏障，防止刚被 stop 的后端任务在短暂退出期内重放旧 user/残余事件给新的 idle watch，
+  // 终端收尾/停止屏障：记录刚刚收尾结束或手动停止的会话与其保护截止时间戳。
+  // 设立 2.5 秒的屏障，防止刚结算/被 stop 的后端任务在短暂退出期内重放旧 user/残余事件给新的 idle watch，
   // 导致会话状态被错误“弹回”忙碌(busy)状态。
-  const manualStopGuardUntilRef = useRef<Map<string, number>>(new Map());
+  const terminalSettleGuardUntilRef = useRef<Map<string, number>>(new Map());
+  function markSessionTerminalSettled(sid: string) {
+    if (!sid) return;
+    terminalSettleGuardUntilRef.current.set(sid, Date.now() + 2500);
+  }
   function markSessionManuallyStopped(sid: string) {
     if (!sid) return;
     recordUserManualStop(sid);
-    manualStopGuardUntilRef.current.set(sid, Date.now() + 2500);
+    markSessionTerminalSettled(sid);
   }
-  function isSessionInManualStopGuard(sid: string): boolean {
+  function isSessionTerminalSettled(sid: string): boolean {
     if (!sid) return false;
-    const until = manualStopGuardUntilRef.current.get(sid);
+    const until = terminalSettleGuardUntilRef.current.get(sid);
     if (!until) return false;
     if (Date.now() > until) {
-      manualStopGuardUntilRef.current.delete(sid);
+      terminalSettleGuardUntilRef.current.delete(sid);
       return false;
     }
     return true;
   }
+  function isSessionInManualStopGuard(sid: string): boolean {
+    return isSessionTerminalSettled(sid);
+  }
   function clearManualStopGuard(sid: string) {
-    if (sid) manualStopGuardUntilRef.current.delete(sid);
+    if (sid) terminalSettleGuardUntilRef.current.delete(sid);
   }
   function stopDetachedHistoryPoll(targetSid?: string) {
     if (detachedPollTimerRef.current != null) {
@@ -2072,6 +2079,17 @@ export function Chat({
       onLiveRunningChange?.(id, false);
       liveLifecycleRef.current = { running: false, terminalConsumed: true };
       transitionChatRecovery({ type: 'authoritative_terminal' });
+      commitActiveTodosIntoLastAssistant();
+    } else if (!fresh.running && diskSettled && busyRef.current) {
+      // 关键防死锁：即便画布文本已包含/领先磁盘文本（不需要整体重写正文），
+      // 但只要后端会话已确认彻底停下且结算（!fresh.running），必须立即解除 busy 锁、停表并剥离待办，
+      // 绝不能因为文本长度未落后而卡死在 Working 状态！
+      setBusyAndClock(false);
+      busyRef.current = false;
+      onLiveRunningChange?.(id, false);
+      liveLifecycleRef.current = { running: false, terminalConsumed: true };
+      transitionChatRecovery({ type: 'authoritative_terminal' });
+      commitActiveTodosIntoLastAssistant();
     }
     const settledSticky = detail.todos;
     if (settledSticky !== undefined) {
@@ -2249,6 +2267,7 @@ export function Chat({
     setHistoryHint(null);
     setBusyAndClock(false);
     busyRef.current = false;
+    markSessionTerminalSettled(loadId);
     commitActiveTodosIntoLastAssistant();
     const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(loadId) ?? []);
     // 回合结束进入待机：输入框上方已归档沉淀，持久化缓存写入 null，绝不残留脏待办
@@ -2330,10 +2349,19 @@ export function Chat({
         let skipSecondHandle = false;
         if (!activated) {
           if (isSessionInManualStopGuard(loadId)) {
-            // 用户刚手动点击了停止，该会话可能收到后端正在关闭期间重放的旧 user/text 消息，坚决不能误激活为新轮次！
+            // 用户刚手动点击了停止或会话刚完成终端结算，后端正在退出期间可能重放旧 user/残余事件，坚决不能误激活为新轮次！
             return;
           }
           if (event.type === 'user') {
+            const cleanText = visibleUserText(event.content).trim();
+            const alreadyPresent = messagesRef.current.some((m) => {
+              if (m.role !== 'user') return false;
+              return m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text, cleanText));
+            });
+            if (alreadyPresent) {
+              // 关键防线：该用户提问早已存在于当前画布上，纯属后端重放的旧提问帧，坚决不能误激活为新轮次！
+              return;
+            }
             handleEvent(event);
             skipSecondHandle = true;
           } else if (!isWatchTurnActivationEvent(event.type)) {
@@ -3663,7 +3691,24 @@ export function Chat({
    * plan becomes part of that reply's transcript chrome (bottom of the bubble).
    */
   function commitActiveTodosIntoLastAssistant() {
-    const items = activeTodosRef.current;
+    let items = activeTodosRef.current ?? (activeIdRef.current ? activeTodosBySessionRef.current.get(activeIdRef.current) ?? null : null);
+    if (!items || items.length === 0) {
+      // 兜底真源：若引用暂空，从当前最后一条助手的 tool 输出中提取权威清单
+      for (let i = messagesRef.current.length - 1; i >= 0; i--) {
+        const m = messagesRef.current[i];
+        if (m.role !== 'assistant') continue;
+        for (const p of m.parts) {
+          if (p.kind === 'tool' && p.tool && isTodoTool(p.tool.name) && p.tool.output) {
+            const parsed = parseTodosFromOutput(p.tool.output);
+            if (parsed && parsed.length > 0) {
+              items = parsed;
+              break;
+            }
+          }
+        }
+        if (items && items.length > 0) break;
+      }
+    }
     if (!items || items.length === 0) {
       setActiveTodos(null);
       activeTodosRef.current = null;
@@ -3674,7 +3719,7 @@ export function Chat({
     }
     // 只有当所有待办项都已经全部处于 completed 状态时，才将卡片归档沉淀到 assistant 回复的最底下，
     // 并将输入框上方的 active sticky 清空消除，彻底抹平本地所有待办缓存。
-    const isAllDone = items.every((t) => t.status === 'completed');
+    const isAllDone = items.length > 0 && items.every((t) => t.status === 'completed');
     if (isAllDone) {
       applySessionStickyTodos(activeIdRef.current, null);
       setMessages((prev) => freezeTodosIntoLastAssistant(prev, items));
@@ -5416,11 +5461,7 @@ export function Chat({
       // 真正的治本真源：后台流优先直接采纳后端 TodoTool 执行的权威产物（render_todos_numbered），彻底消除本地模拟折叠导致的状态漂移！
       const fromOutput = parseTodosFromOutput(event.output);
       if (fromOutput && fromOutput.length > 0) {
-        if (fromOutput.every((t) => t.status === 'completed')) {
-          activeTodosBySessionRef.current.delete(targetSid);
-        } else {
-          activeTodosBySessionRef.current.set(targetSid, fromOutput);
-        }
+        activeTodosBySessionRef.current.set(targetSid, fromOutput);
       }
     } else if (event.type === 'tool_start' && isTodoTool(event.name)) {
       const argsStr = formatArgs(event.arguments);
@@ -5437,10 +5478,8 @@ export function Chat({
         });
         // 后台会话的折叠同样要落盘幂等键（跨会话重放也不能把清单打回旧状态）。
         persistAppliedTodoIds();
-        if (nextTodos && nextTodos.length > 0 && nextTodos.some((t) => t.status !== 'completed')) {
+        if (nextTodos && nextTodos.length > 0) {
           activeTodosBySessionRef.current.set(targetSid, nextTodos);
-        } else {
-          activeTodosBySessionRef.current.delete(targetSid);
         }
       }
     }
@@ -5822,10 +5861,8 @@ export function Chat({
             // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
             persistAppliedTodoIds();
             if (activeIdRef.current) {
-              if (next && next.length > 0 && next.some((t) => t.status !== 'completed')) {
+              if (next && next.length > 0) {
                 activeTodosBySessionRef.current.set(activeIdRef.current, next);
-              } else {
-                activeTodosBySessionRef.current.delete(activeIdRef.current);
               }
             }
             activeTodosRef.current = next;
@@ -5951,10 +5988,8 @@ export function Chat({
                 // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
                 persistAppliedTodoIds();
                 if (activeIdRef.current) {
-                  if (next && next.length > 0 && next.some((t) => t.status !== 'completed')) {
+                  if (next && next.length > 0) {
                     activeTodosBySessionRef.current.set(activeIdRef.current, next);
-                  } else {
-                    activeTodosBySessionRef.current.delete(activeIdRef.current);
                   }
                 }
                 activeTodosRef.current = next;
@@ -6121,6 +6156,9 @@ export function Chat({
         }
         setIsCompacting(false);
         setBusyAndClock(false);
+        if (event.session_id) {
+          markSessionTerminalSettled(event.session_id);
+        }
         closeOpenArtifactFence();
         finalizePendingToolsOnCanvas();
         commitActiveTodosIntoLastAssistant();

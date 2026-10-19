@@ -237,7 +237,7 @@ function applyOne(list: TodoItem[], v: Record<string, unknown>): TodoItem[] {
   if (kind === 'add') {
     const content = typeof v.content === 'string' ? normalizeTodoContent(v.content) : '';
     if (!content) return list;
-    return upsertTodo(maybeAutoClearFinished(list), content, parseActionStatus(v), null).list;
+    return upsertTodo(list, content, parseActionStatus(v), null).list;
   }
   if (kind === 'insert') {
     const content = typeof v.content === 'string' ? normalizeTodoContent(v.content) : '';
@@ -312,13 +312,9 @@ function applyBatch(list: TodoItem[], actions: Record<string, unknown>[]): TodoI
   const addLandings: number[] = [];
   const addActions = actions.filter((action) => actionKind(action) === 'add');
   if (addActions.length > 0) {
-    // 关键对齐：绝不能仅仅因为 add 数量 >= 2 就把还在进行中的任务列表暴力清空！
-    // 只有当已有列表此前已经全部完成（全是 completed）时，才允许清除已闭环的旧计划；
-    // 若列表中仍有 pending 或 in_progress 的任务，100% 严格追加，绝不清空！
-    const isUnfinished = next.some((t) => t.status !== 'completed');
-    if (!isUnfinished) {
-      next = maybeAutoClearFinished(next);
-    }
+    // 关键修复：中间状态打完所有勾时，todolist 必须完整保留；
+    // 若后续追加新任务（add），严格在既有清单末尾平滑追加，绝不断链清空！
+    // 只有显式 action="clear" 才会清空清单。
     for (const action of addActions) {
       const content = typeof action.content === 'string' ? normalizeTodoContent(action.content) : '';
       if (!content) continue;
