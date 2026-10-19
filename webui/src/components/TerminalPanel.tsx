@@ -252,12 +252,16 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     if (saved && saved.length > 0) return saved;
     const norm = (cwd || 'default').replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
     const id = `term_main_${norm}`;
+    // 首个标签必须跟随宿主机真实平台（Windows→PowerShell，macOS→Zsh，Linux→Bash）。
+    // 此前硬编码 DEFAULT_SHELL('powershell')：非 Windows 宿主上标签名写着 powershell，
+    // 后端却按 bash 启动实际进程，导致“标签名与真实终端不一致”。
+    const shell = getDefaultShellForPlatform(resolveHostPlatform(cwd));
     return [
       {
         id,
-        name: `${DEFAULT_SHELL} 1`,
+        name: `${shell} 1`,
         cwd: cwd || '.',
-        shell: DEFAULT_SHELL,
+        shell,
         timestamp: 0,
       },
     ];
@@ -357,6 +361,28 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       }
     >
   >(new Map());
+
+  // 画面失效标记：面板隐藏或页面挂起时置位，回来后必须整体重绘一次。
+  // 只在真的可能失效时才重绘，避免无谓的 DOM 重绘（重绘会重建行节点、清掉终端里的文本选区）。
+  const stalePaintRef = useRef(false);
+
+  // 面板恢复可见时，把所有终端（含挂机后台标签）整屏重绘一次。
+  // xterm v6 在容器不可见时会暂停渲染（RenderService._isPaused），期间所有渲染请求被丢弃，
+  // 恢复可见只有命中“自愈标记”才会补画；挂机期间没有任何写入时标记不会置位，
+  // 于是所有终端（不只是当前可见的那个）都会停在空白（黑屏）。
+  //
+  // 安全性：term.refresh() 只走渲染器重绘（CoreBrowserTerminal.refresh → RenderService.refreshRows），
+  // 不经过 onData、不发送任何字节到 PTY、不做 resize，因此绝不会让已运行的终端掉线。
+  // 这里只做重绘、不做尺寸同步：遍历后台终端触发 ConPTY resize 会打乱后台命令行对齐。
+  const repaintAllTerminals = useCallback(() => {
+    if (!stalePaintRef.current) return;
+    stalePaintRef.current = false;
+    for (const record of termMap.current.values()) {
+      try {
+        record.term.refresh(0, Math.max(0, record.term.rows - 1));
+      } catch {}
+    }
+  }, []);
 
   // 1. 终端内部 Ctrl + 鼠标滚轮独立调整字号（在捕获阶段拦截，阻止触发全局缩放）
   useEffect(() => {
@@ -672,6 +698,13 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         // 否则防抖，避免字号滚轮每一步都让 ConPTY 重绘并打乱命令对齐。
         const layoutSync = (immediate: boolean) => {
           measureAndFit();
+          // xterm v6 内部用 IntersectionObserver 在容器不可见时暂停渲染（display:none 会命中），
+          // 恢复可见时只有“隐藏期间发生过写入/尺寸变化”才会自愈重绘，否则视口会一直停在空白（黑屏）。
+          // 这里无条件整屏重绘一次：可见时立刻出画；仍处于暂停态时 xterm 只记录待刷新标记，
+          // 等真正恢复可见时由它自身补画，两条路径都能保证画面回来。
+          try {
+            term.refresh(0, Math.max(0, term.rows - 1));
+          } catch {}
           if (immediate) {
             if (resizeTimer) clearTimeout(resizeTimer);
             resizeTimer = null;
@@ -732,14 +765,22 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     [isDark, t, cwd, preferredShell, connectTabSocket]
   );
 
-  // 激活 Tab 切换时：检查连接自愈，平滑重测并立刻聚焦
+  // 激活 Tab 切换 / 终端面板重新可见时：检查连接自愈，平滑重测并立刻聚焦
   useEffect(() => {
     const record = termMap.current.get(activeTabId);
     const activeTab = tabs.find((t) => t.id === activeTabId);
     if (record && activeTab) {
-      if (!record.ws || record.ws.readyState === WebSocket.CLOSED || record.ws.readyState === WebSocket.CLOSING) {
+      const broken =
+        !record.ws ||
+        record.ws.readyState === WebSocket.CLOSED ||
+        record.ws.readyState === WebSocket.CLOSING;
+      if (broken) {
+        // 面板从隐藏恢复时 active 会翻转，此处必须重做一次断线检查：
+        // 切换右侧面板不会触发 visibilitychange / focus，若 WebSocket 已在隐藏期间断开，
+        // 漏掉这次重连，终端就会永远停在空视口（黑屏）且无法再接收输出。
         connectTabSocket(activeTab, record, false);
       }
+      if (active === false) return;
       requestAnimationFrame(() => {
         try {
           record.layoutSync?.(true);
@@ -747,27 +788,39 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         } catch {}
       });
     }
-  }, [activeTabId, tabs, connectTabSocket]);
+  }, [activeTabId, tabs, connectTabSocket, active]);
 
   // 当终端切回前台可见状态时 (active 变化或从隐藏恢复)，执行双阶段自愈重测拟合，杜绝切后台尺寸坍缩导致的折行混乱
   useEffect(() => {
-    if (active === false) return;
+    if (active === false) {
+      // 面板进入隐藏：xterm 渲染被暂停，回来时必须整体重绘一次
+      stalePaintRef.current = true;
+      return;
+    }
+    // 先把全部终端（含挂机后台标签）重绘出来，再做当前可见终端的尺寸自愈。
+    repaintAllTerminals();
     const timer1 = setTimeout(() => {
       termMap.current.get(activeTabId)?.layoutSync?.(false);
+      repaintAllTerminals();
     }, 80);
     const timer2 = setTimeout(() => {
       termMap.current.get(activeTabId)?.layoutSync?.(true);
+      repaintAllTerminals();
     }, 250);
     return () => {
       clearTimeout(timer1);
       clearTimeout(timer2);
     };
-  }, [active, activeTabId]);
+  }, [active, activeTabId, repaintAllTerminals]);
 
   // 页面离开切回（visibilitychange）、窗口恢复焦点（focus）时，自动健康检查并对断开的终端自愈重连
   useEffect(() => {
     const handleWakeup = () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        // 页面挂起：浏览器会冻结渲染，回来时画面可能已失效
+        stalePaintRef.current = true;
+        return;
+      }
       for (const tab of tabs) {
         const record = termMap.current.get(tab.id);
         if (record) {
@@ -779,7 +832,11 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       if (active !== false) {
         setTimeout(() => {
           termMap.current.get(activeTabId)?.layoutSync?.(true);
+          repaintAllTerminals();
         }, 120);
+      } else {
+        // 页面从后台恢复时同样要重绘全部终端，避免挂机标签停在空白黑屏
+        repaintAllTerminals();
       }
     };
     document.addEventListener('visibilitychange', handleWakeup);
@@ -788,7 +845,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       document.removeEventListener('visibilitychange', handleWakeup);
       window.removeEventListener('focus', handleWakeup);
     };
-  }, [tabs, active, activeTabId, connectTabSocket]);
+  }, [tabs, active, activeTabId, connectTabSocket, repaintAllTerminals]);
 
   // 同步并拉取后端项目常驻终端会话（跨页面刷新、多标签、异地访问保持强一致广播同步，彻底消除死尸缓存污染）
   const syncWithBackend = useCallback(async () => {
@@ -931,14 +988,14 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       const customEvent = e as CustomEvent<{ command: string; shell?: string }>;
       const { command, shell } = customEvent.detail || {};
       if (!command) return;
-      const targetShell = shell || getMainstreamShell();
+      const targetShell = shell || getMainstreamShell(hostPlatform);
       void createNewTab(targetShell, command);
     };
     window.addEventListener('jeikcode:terminal:run_command', handleRunCommand);
     return () => {
       window.removeEventListener('jeikcode:terminal:run_command', handleRunCommand);
     };
-  }, [createNewTab]);
+  }, [createNewTab, hostPlatform]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
 

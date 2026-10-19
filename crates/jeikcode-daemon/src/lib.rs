@@ -10500,9 +10500,18 @@ async fn handle_terminal_socket(
     }
 
     let mut send_task = tokio::spawn(async move {
-        while let Ok(text) = rx.recv().await {
-            if ws_sender.send(Message::Text(text)).await.is_err() {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(text) => {
+                    if ws_sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                // 订阅端落后（浏览器后台节流 / 长时间挂起导致 TCP 背压）时，
+                // 只能丢弃过期消息，绝不能因此结束循环：一旦 send_task 结束，
+                // select! 会中止 recv_task 并关闭整条 WebSocket，前端终端就再也收不到输出（黑屏）。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
             }
         }
     });
@@ -10600,7 +10609,7 @@ struct TerminalListQuery {
 
 async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse {
     let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
-    let list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
+    let mut list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
         let norm_req = req_cwd
             .replace('\\', "/")
             .trim_end_matches('/')
@@ -10625,6 +10634,9 @@ async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse 
     } else {
         guard.values().cloned().collect()
     };
+    // HashMap 的迭代顺序是不确定的，直接返回会让前端终端标签顺序在每次同步后随机抖动。
+    // 统一按创建时间（其次按 id）排序，保证多端 / 多标签页看到的标签顺序完全一致。
+    list.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
     let platform = if cfg!(windows) {
         "windows"
     } else if cfg!(target_os = "macos") {

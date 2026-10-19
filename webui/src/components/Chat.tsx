@@ -8852,7 +8852,23 @@ export function Chat({
                 </Suspense>
               </div>
 
-              <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+              {/* 终端面板始终保留布局盒，只用 visibility 切换显隐。
+                  若改成 display:none，xterm v6 的 IntersectionObserver 会判定容器不可见并暂停渲染，
+                  恢复可见时所有终端（包含挂机后台标签）都会停在空白黑屏。 */}
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  zIndex: rightPanelTab === 'terminal' ? 1 : 0,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  minHeight: 0,
+                  height: '100%',
+                  width: '100%',
+                  visibility: rightPanelTab === 'terminal' ? 'visible' : 'hidden',
+                  pointerEvents: rightPanelTab === 'terminal' ? 'auto' : 'none',
+                }}
+              >
                 <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
               </div>
 
@@ -9508,7 +9524,21 @@ export function Chat({
             </Suspense>
           </div>
 
-          <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+          {/* 终端面板始终保留布局盒，只用 visibility 切换显隐（原因同上）。 */}
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: rightPanelTab === 'terminal' ? 1 : 0,
+              display: 'flex',
+              flexDirection: 'column',
+              minHeight: 0,
+              height: '100%',
+              width: '100%',
+              visibility: rightPanelTab === 'terminal' ? 'visible' : 'hidden',
+              pointerEvents: rightPanelTab === 'terminal' ? 'auto' : 'none',
+            }}
+          >
             <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
           </div>
 

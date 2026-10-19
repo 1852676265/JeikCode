@@ -3172,6 +3172,9 @@ body {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  /* 终端面板需要脱离文档流、绝对定位填满面板（只切 visibility 不切 display:none），
+     否则 xterm v6 会因容器不可见而暂停渲染，导致恢复后黑屏。 */
+  position: relative;
 }
 
 /* Git Panel */
