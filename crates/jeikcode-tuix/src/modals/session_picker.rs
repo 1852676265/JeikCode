@@ -762,8 +762,7 @@ pub(crate) fn replay_session(
     // Seed the persistent todo panel + id→title cache BEFORE rendering so a
     // rebuilt batch's `todo update #N` children can splice in task titles the
     // same way the live path does. (Also resets a prior session's panel/titles.)
-    state.active_todos = crate::event_loop::todo_progress_from_board(&session.id)
-        .or_else(|| crate::event_loop::todo_progress_from_messages(&session.messages));
+    state.active_todos = crate::event_loop::todo_progress_from_board(&session.id);
     crate::event_loop::sync_todo_titles(state);
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {
@@ -1486,6 +1485,13 @@ mod tests {
         }
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
+        jeikcode_capabilities::tools::commit_todo_board(
+            &session.id,
+            &[jeikcode_capabilities::tools::TodoItem {
+                content: "task C".into(),
+                status: jeikcode_capabilities::tools::todo::TodoStatus::Pending,
+            }],
+        );
         session.messages = vec![
             Message::user("go"),
             // Single-call steps (len == 1) so this test stays focused on the
@@ -1542,7 +1548,7 @@ mod tests {
                 .any(|s| s.contains("task A") || s.contains("task B") || s.contains("task C")),
             "todowrite no longer renders an inline block on replay: {cmd_out:?}"
         );
-        // Panel seeded from the transcript's LAST valid todowrite (task C, 1 pending).
+        // Panel comes from this session's TodoBoard, not a fold of the transcript.
         let panel = state
             .active_todos
             .clone()
@@ -1594,6 +1600,7 @@ mod tests {
             results.iter().any(|s| s.contains("error: bad todo item")),
             "a FAILED todowrite's error result must NOT be suppressed: {results:?}"
         );
+        jeikcode_capabilities::tools::clear_todo_board(&session.id);
     }
 
     #[test]

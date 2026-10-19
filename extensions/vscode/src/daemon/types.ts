@@ -252,6 +252,8 @@ export interface SessionDetail {
   updated_at: number;
   message_count: number;
   messages: MessageInfo[];
+  /** The session's single live checklist. Empty when that board is closed. */
+  todos?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
 }
 
 export interface MessageInfo {

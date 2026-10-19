@@ -14,7 +14,7 @@ import type {
   SessionTerminalState,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
-import { applyTodoCall, reduceTodosFromMessages } from './todo';
+import { applyTodoCall, isTodoToolName, todosFromToolOutput } from './todo';
 import { buildSearchMatches } from '../utils/search';
 
 let _msgCounter = 0;
@@ -743,7 +743,14 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
           ? upsertToolBlock({ ...assistant, toolCalls: tools }, updatedTool)
           : { ...assistant, toolCalls: tools };
       }
-      return { ...state, messages: msgs };
+      const todos = action.success && isTodoToolName(action.name)
+        ? todosFromToolOutput(action.output)
+        : null;
+      return {
+        ...state,
+        messages: msgs,
+        activeTodos: todos ?? state.activeTodos,
+      };
     }
 
     case 'STREAM_WARNING': {
@@ -1149,7 +1156,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         messages: mergedMessages,
-        activeTodos: reduceTodosFromMessages(mergedMessages),
+        activeTodos: action.todos ?? [],
         isGenerating: false,
         persistenceWarning: undefined,
       };

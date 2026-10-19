@@ -293,7 +293,7 @@ test('replayed tool start cannot reopen a terminal todo call', () => {
   assert.equal(shouldRenderToolCall(state.messages[0].toolCalls![0]), true);
 });
 
-test('session load rebuilds projection, while switch and clear remove stale todos', () => {
+test('session load uses the server checklist, while switch and clear remove stale todos', () => {
   let state = chatReducer({ ...initialState, activeSessionId: 'old', activeTodos: [] }, {
     type: 'LOAD_SESSION_MESSAGES',
     messages: [
@@ -312,8 +312,14 @@ test('session load rebuilds projection, while switch and clear remove stale todo
         }],
       },
     ],
+    todos: [
+      { content: '检查分支', status: 'completed' },
+      { content: '发布版本', status: 'completed' },
+    ],
   });
+  assert.equal(state.activeTodos.length, 2);
   assert.equal(state.activeTodos[1]?.status, 'completed');
+  assert.equal(state.activeTodos[1]?.content, '发布版本');
 
   state = chatReducer(state, { type: 'SET_ACTIVE_SESSION', sessionId: 'new' });
   assert.deepEqual(state.activeTodos, []);

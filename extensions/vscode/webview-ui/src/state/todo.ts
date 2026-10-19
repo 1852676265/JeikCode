@@ -333,6 +333,23 @@ export function applyTodoCall(
   return applied ?? items;
 }
 
+/** Numbered list printed by TodoWrite. That text is the session board, not a new fold. */
+export function todosFromToolOutput(output: string): TodoItemData[] | null {
+  const items: TodoItemData[] = [];
+  for (const line of output.split('\n')) {
+    const match = line.match(/^\s*\[([√✓xXvV~\-• ])\]\s*\d+\.\s+(.+)$/);
+    if (!match) continue;
+    const mark = match[1];
+    const status: TodoStatus = mark === '~'
+      ? 'in_progress'
+      : mark === ' ' || mark === '•' || mark === '-'
+        ? 'pending'
+        : 'completed';
+    items.push({ content: match[2].trim(), status });
+  }
+  return items.length > 0 ? items : null;
+}
+
 export function reduceTodosFromMessages(messages: ChatMessage[]): TodoItemData[] {
   let items: TodoItemData[] = [];
   for (const message of messages) {

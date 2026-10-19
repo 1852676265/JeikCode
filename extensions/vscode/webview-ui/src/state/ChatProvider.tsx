@@ -266,7 +266,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'SET_SETUP_STATUS', error: msg.message });
           break;
         case 'sessionMessages':
-          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages, terminal: msg.terminal });
+          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages, todos: msg.todos, terminal: msg.terminal });
           break;
         case 'context':
           dispatch({

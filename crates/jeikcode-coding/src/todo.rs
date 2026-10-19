@@ -157,19 +157,17 @@ impl LifecycleHooks for TodoHook {
         self.sync_live(&items);
     }
 
-    async fn turn_start(&self, convo: &mut Conversation) {
+    async fn turn_start(&self, _convo: &mut Conversation) {
         let Some(live) = &self.live else {
             return;
         };
-        if let Some(session_id) = jeikcode_capabilities::tools::todo::todo_session_of(live) {
-            let items = jeikcode_capabilities::tools::read_todo_board(&session_id)
-                .map(|board| board.items)
-                .unwrap_or_default();
-            self.sync_live(&items);
-        } else {
-            let todos = derive_current_todos(&convo.messages);
-            self.sync_live(&todos);
-        }
+        let Some(session_id) = jeikcode_capabilities::tools::todo::todo_session_of(live) else {
+            return;
+        };
+        let items = jeikcode_capabilities::tools::read_todo_board(&session_id)
+            .map(|board| board.items)
+            .unwrap_or_default();
+        self.sync_live(&items);
     }
 
     /// The model wants to stop. If the live checklist still has OPEN items
@@ -192,23 +190,15 @@ impl LifecycleHooks for TodoHook {
     /// 工具调用留在记录里，历史画布仍能画到那一条消息上。还有未完成项时保留，下一轮接着改。
     async fn turn_complete(
         &self,
-        convo: &Conversation,
+        _convo: &Conversation,
         _reason: &jeikcode_kernel::event::StopReason,
         ctx: &TurnCtx,
     ) {
-        if let Some(session_id) = ctx.session_id.as_deref() {
-            if jeikcode_capabilities::tools::close_todo_board_if_complete(session_id).is_some() {
-                self.sync_live(&[]);
-            }
-        } else {
-            let todos = derive_current_todos(&convo.messages);
-            if !todos.is_empty()
-                && todos
-                    .iter()
-                    .all(|item| item.status == TodoStatus::Completed)
-            {
-                self.sync_live(&[]);
-            }
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            return;
+        };
+        if jeikcode_capabilities::tools::close_todo_board_if_complete(session_id).is_some() {
+            self.sync_live(&[]);
         }
     }
 }
@@ -550,13 +540,30 @@ mod tests {
         let tool = TodoTool::new();
         let live = tool.live();
         let hook = TodoHook::with_live(live.clone());
-        let ctx = TurnCtx::default();
+        let session_id = format!("clear-board-{}", std::process::id());
+        jeikcode_capabilities::tools::bind_todo_session(&live, &session_id);
+        jeikcode_capabilities::tools::commit_todo_board(
+            &session_id,
+            &[
+                TodoItem {
+                    content: "step 1".into(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "step 2".into(),
+                    status: TodoStatus::Completed,
+                },
+            ],
+        );
+        let ctx = TurnCtx {
+            session_id: Some(session_id.clone().into()),
+            ..TurnCtx::default()
+        };
 
-        // Turn 1: checklist finishes with all items completed.
         let mut convo = convo_with(vec![
             Message::user("ship feature"),
             todowrite_msg(
-                r#"{"todos":[{"content":"step 1","status":"completed"},{"content":"step 2","status":"completed"}]}"#,
+                r#"{"todos":[{"content":"step 1","status":"pending"},{"content":"step 2","status":"in_progress"}]}"#,
             ),
             Message::assistant("all done", vec![]),
         ]);
@@ -582,5 +589,7 @@ mod tests {
             live.lock().unwrap().is_empty(),
             "pre_request on next turn must not resurrect completed checklist from prior turn"
         );
+        jeikcode_capabilities::tools::unbind_todo_session(&live);
+        jeikcode_capabilities::tools::clear_todo_board(&session_id);
     }
 }

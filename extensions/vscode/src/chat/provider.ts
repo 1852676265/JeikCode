@@ -14,6 +14,7 @@ import {
   ProvidersResponse,
   ImageInput,
   PermissionDecision,
+  SessionDetail,
   SessionMeta,
 } from '../daemon/types';
 import { getQuickActionPrompt } from './quickActions';
@@ -35,6 +36,7 @@ type PanelSessionInfo = {
   projectHash?: string;
   workingDir?: string;
   messages?: MessageInfo[];
+  todos?: SessionDetail['todos'];
   messagesPromise?: Promise<MessageInfo[] | undefined>;
 };
 
@@ -487,6 +489,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           sessionId,
           projectHash,
           messages,
+          todos: detail.todos,
           messagesPromise: undefined,
         });
         const targetRuntime = this._getRuntime(sessionId);
@@ -495,6 +498,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postOrQueueToPanel(sessionId, {
           type: 'sessionMessages',
           messages,
+          todos: detail.todos,
           terminal: this._terminalForWebview(targetRuntime.terminal),
         }, targetRuntime.streamGeneration ?? 0);
         return messages;
@@ -1631,6 +1635,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           sessionId,
           projectHash,
           messages,
+          todos: detail.todos,
           messagesPromise: undefined,
         });
       }
@@ -1639,6 +1644,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postOrQueueToPanel(sessionId, {
         type: 'sessionMessages',
         messages,
+        todos: detail.todos,
         terminal: this._terminalForWebview(rt.terminal),
       }, generation);
     } catch {
@@ -1770,6 +1776,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({
           type: 'sessionMessages',
           messages: messagesToLoad,
+          todos: this._panelSessions.get(sid)?.todos,
           terminal: this._terminalForWebview(terminal),
         }, webview);
         historyGeneration = streamGeneration;
