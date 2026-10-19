@@ -21,6 +21,24 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.7-beta.2 (2026-10-19)
+
+- **[MCP Integration & Schema Sanitizer] Infinite recursion and thread stack overflow protection**:
+  - Introduced cycle detection, recursion depth bounding, and generic object schema fallbacks during MCP tool JSON Schema inlining and wire payload sanitization.
+  - Prevented infinite recursion and thread stack overflow crashes when discovering MCP servers with self-referencing or mutually recursive schema definitions (such as `rea-agents`).
+- **[TodoList & Turn Lifecycle] Persistent single-document live checklist and post-settlement archival**:
+  - Unified live todo checklists into a single reactive document updated exclusively via bus tool outputs, retaining completed checklists on the canvas panel throughout the remainder of the active turn.
+  - Deferred checklist archival into the corresponding assistant message until the turn settles, preventing premature list dismissal or spurious rebuilds from transcript history during idle sessions.
+
+---
+
+- **[MCP 集成与 Schema 清洗] 递归引用检测与线程栈溢出硬崩溃防护**:
+  - 在 MCP 工具 JSON Schema 引用内联与出入站清洗流程中引入循环引用检测、内联深度上限与通用对象回退机制。
+  - 彻底避免在接入包含自引用或互递归类型定义（如 `rea-agents`）的 MCP 服务时因无限递归导致线程栈溢出硬崩溃。
+- **[待办清单与回合生命周期] 单一实时文档模型与回合结算归档保障**:
+  - 将实时待办收归为单一响应式文档模型，统一由总线工具执行结果驱动更新，回合中途全部勾选完成的清单持续稳定停留在画板面板上。
+  - 待助手回复停止结算后，才精准归档至发起该次调用的对应助手卡片，避免空闲会话或历史转录加载时意外重构或丢失待办清单。
+
 ## v7.2.7-beta.1 (2026-10-19)
 
 - **[WebUI & Mobile Layout] Mobile model and reasoning effort selector optimization**:
