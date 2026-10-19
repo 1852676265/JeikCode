@@ -32,7 +32,9 @@ import { resolveComposerEnterAction, resolveComposerEscapeAction, tailQueuedCard
 import { QueuedCardActions } from './QueuedCardActions';
 import { createTimelineFollow } from '../lib/timelineFollow';
 
-/** First paint / page size for long transcripts. Older messages load on demand. */
+/** First paint / page size for long transcripts. Older messages load on demand.
+ *  Hard cap: a tail must not grow past this when the cut falls mid-turn.
+ *  Walking back to the opening question pulls a whole tool turn into the timeline. */
 const HISTORY_PAGE = 48;
 /** 「立即发送」程序化停止标记的有效期：后端 /chat/stop 的 stop_and_wait 上限仅 2.5s。 */
 const PROGRAMMATIC_STOP_MARK_TTL_MS = 15000;
@@ -244,6 +246,11 @@ import {
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { onGlobalEvent } from '../lib/globalEvents';
+import {
+  acceptReplayFrame,
+  createReplayFold,
+  replayFrameOnCanvas,
+} from '../lib/replayFold';
 import {
   bindUserMessageIdentity,
   foldLiveTodo,
@@ -1882,6 +1889,16 @@ export function Chat({
       return next;
     });
   }
+  /** 这条 watch 对应的页偏移。正在看的会话用实时偏移，后台会话用切走时记下的偏移。 */
+  function watchReplayOffset(sessionId: string): number {
+    if (activeIdRef.current === sessionId) return historyOffsetRef.current;
+    return historyOffsetBySessionRef.current.get(sessionId) ?? 0;
+  }
+  /** 判断回放帧是否已经在当前页上：前台看画布，后台看该会话缓存。 */
+  function watchReplayCanvas(sessionId: string): Message[] {
+    if (activeIdRef.current === sessionId) return messagesRef.current;
+    return messageCacheRef.current.get(sessionId) ?? [];
+  }
   /** Restore Build / AcceptEdits / Plan approval (and user-input) cards after
    *  refresh or session switch. Auto never parks; only non-Auto modes emit these. */
   function restorePendingInteractive(loadId: string, loadGeneration: number) {
@@ -1986,6 +2003,8 @@ export function Chat({
           break;
         }
 
+        // 每次重连重新判断折叠线。游标已经越过页外前缀时，不会再把它们补进画布。
+        const fold = createReplayFold();
         const attachCursor = readStreamCursor(loadId);
         const attachAfterSeq = resolveAfterSeq(attachCursor, messagesRef.current.length === 0);
         const attachNeedsDedup = attachAfterSeq === undefined;
@@ -1995,8 +2014,8 @@ export function Chat({
             loadId,
             (event) => {
               retryCount = 0; // 成功收到有效事件立即重置重试计数器
-              // 游标推进：回放帧带 seq，握手帧带 cursor。
-              if (typeof event.seq === 'number') writeStreamCursor(loadId, event.seq);
+              // 握手帧带 cursor。回放帧的 seq 要等决定落笔后再推进：
+              // 折叠线以上先按住的帧如果提前记账，断线重连会把还没画上的新回合跳过。
               if (event.type === 'session_start') {
                 writeStreamCursor(loadId, event.cursor);
                 return;
@@ -2010,46 +2029,58 @@ export function Chat({
                 return;
               }
 
-              const isCurrentView = activeIdRef.current === loadId;
-              if (isCurrentView) {
-                if (event.type === 'text' || event.type === 'reasoning') {
-                  ensureAssistantBubbleForWatch();
-                }
-                // Reattach after refresh / sidebar switch. Server replay includes
-                // permission_request / user_input_request for every non-Auto mode that
-                // parks (Build / AcceptEdits / Plan). Must restore those modals or the
-                // turn deadlocks in WaitingApproval with a blinking cursor.
-                handleEvent(event, {
-                  requireReplayDedup: attachNeedsDedup,
-                  repeatUserAfterSettled: false,
-                });
-                timelineFollow.changed();
-                if (
-                  event.type === 'done' ||
-                  event.type === 'stopped' ||
-                  event.type === 'error'
-                ) {
-                  terminalSeen = true;
-                  sessionWatchersRef.current.delete(loadId);
-                  localActiveStreamsBySessionRef.current.delete(loadId);
-                  settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
-                }
-              } else {
-                // 对标 opencode 多会话后台推送体系：
-                // 当用户切至其他会话时，后台会话流实时将事件写入专属缓存 messageCacheRef！
-                applyEventToSessionCache(loadId, event);
-                if (
-                  event.type === 'done' ||
-                  event.type === 'stopped' ||
-                  event.type === 'error'
-                ) {
-                  terminalSeen = true;
-                  sessionWatchersRef.current.delete(loadId);
-                  localActiveStreamsBySessionRef.current.delete(loadId);
-                  backgroundRunningSessionsRef.current.delete(loadId);
-                  localTurnSessionsRef.current.delete(loadId);
-                  onLiveRunningChange?.(loadId, false);
-                  archiveBackgroundTodos(loadId);
+              // 折叠线以上的回放先按住。页大小仍是 HISTORY_PAGE，不能为了补上提问去拉整轮。
+              const frames = acceptReplayFrame(
+                fold,
+                event,
+                watchReplayOffset(loadId),
+                (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
+              );
+              for (const frame of frames) {
+                if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
+                const isCurrentView = activeIdRef.current === loadId;
+                if (isCurrentView) {
+                  if (frame.type === 'text' || frame.type === 'reasoning') {
+                    ensureAssistantBubbleForWatch();
+                  }
+                  // Reattach after refresh / sidebar switch. Server replay includes
+                  // permission_request / user_input_request for every non-Auto mode that
+                  // parks (Build / AcceptEdits / Plan). Must restore those modals or the
+                  // turn deadlocks in WaitingApproval with a blinking cursor.
+                  // 带 seq 的是回放帧（缓冲里的累积正文），必须按身份合并。
+                  // 游标存在时如果当成直播增量，整段正文会再接一遍，提问也会补到回答后面。
+                  handleEvent(frame, {
+                    requireReplayDedup: attachNeedsDedup || typeof frame.seq === 'number',
+                    repeatUserAfterSettled: false,
+                  });
+                  timelineFollow.changed();
+                  if (
+                    frame.type === 'done' ||
+                    frame.type === 'stopped' ||
+                    frame.type === 'error'
+                  ) {
+                    terminalSeen = true;
+                    sessionWatchersRef.current.delete(loadId);
+                    localActiveStreamsBySessionRef.current.delete(loadId);
+                    settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
+                  }
+                } else {
+                  // 对标 opencode 多会话后台推送体系：
+                  // 当用户切至其他会话时，后台会话流实时将事件写入专属缓存 messageCacheRef！
+                  applyEventToSessionCache(loadId, frame);
+                  if (
+                    frame.type === 'done' ||
+                    frame.type === 'stopped' ||
+                    frame.type === 'error'
+                  ) {
+                    terminalSeen = true;
+                    sessionWatchersRef.current.delete(loadId);
+                    localActiveStreamsBySessionRef.current.delete(loadId);
+                    backgroundRunningSessionsRef.current.delete(loadId);
+                    localTurnSessionsRef.current.delete(loadId);
+                    onLiveRunningChange?.(loadId, false);
+                    archiveBackgroundTodos(loadId);
+                  }
                 }
               }
             },
@@ -2375,11 +2406,11 @@ export function Chat({
       ? resolveAfterSeq(readStreamCursor(loadId), messagesRef.current.length === 0)
       : -1;
     const idleNeedsDedup = idleAfterSeq === undefined;
+    const fold = createReplayFold();
     void watchChatSession(
       loadId,
       (event) => {
-        // 游标推进：回放帧带 seq，握手帧带 cursor。
-        if (typeof event.seq === 'number') writeStreamCursor(loadId, event.seq);
+        // 握手帧带 cursor。回放帧的 seq 要等决定落笔后再推进，按住的页外前缀不能提前记账。
         if (event.type === 'session_start') {
           writeStreamCursor(loadId, event.cursor);
           return;
@@ -2393,87 +2424,99 @@ export function Chat({
           return;
         }
 
-        const isCurrentView = activeIdRef.current === loadId;
-        if (!isCurrentView) {
-          // 核心对标：会话在后台运行时，总线推流绝不丢弃，实时反哺进会话专属缓存 messageCacheRef！
-          applyEventToSessionCache(loadId, event);
+        // 折叠线以上的回放先按住。页大小仍是 HISTORY_PAGE，不能为了补上提问去拉整轮。
+        const frames = acceptReplayFrame(
+          fold,
+          event,
+          watchReplayOffset(loadId),
+          (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
+        );
+        for (const frame of frames) {
+          if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
+          const isCurrentView = activeIdRef.current === loadId;
+          if (!isCurrentView) {
+            // 核心对标：会话在后台运行时，总线推流绝不丢弃，实时反哺进会话专属缓存 messageCacheRef！
+            applyEventToSessionCache(loadId, frame);
+            if (
+              frame.type === 'done' ||
+              frame.type === 'stopped' ||
+              frame.type === 'error'
+            ) {
+              terminalSeen = true;
+              sessionWatchersRef.current.delete(loadId);
+              backgroundRunningSessionsRef.current.delete(loadId);
+              localTurnSessionsRef.current.delete(loadId);
+              onLiveRunningChange?.(loadId, false);
+              archiveBackgroundTodos(loadId);
+            }
+            continue;
+          }
+
+          if (sessionGenerationRef.current !== loadGeneration) {
+            continue;
+          }
+          let skipSecondHandle = false;
+          if (!activated) {
+            if (isSessionInManualStopGuard(loadId)) {
+              // 用户刚手动点击了停止或会话刚完成终端结算，后端正在退出期间可能重放旧 user/残余事件，坚决不能误激活为新轮次！
+              continue;
+            }
+            if (frame.type === 'user') {
+              const cleanText = visibleUserText(frame.content).trim();
+              const alreadyPresent = messagesRef.current.some((m) => {
+                if (m.role !== 'user') return false;
+                return m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text, cleanText));
+              });
+              if (alreadyPresent) {
+                // 关键防线：该用户提问早已存在于当前画布上，纯属后端重放的旧提问帧，坚决不能误激活为新轮次！
+                continue;
+              }
+              handleEvent(frame);
+              skipSecondHandle = true;
+            } else if (!isWatchTurnActivationEvent(frame.type)) {
+              continue;
+            }
+            activated = true;
+            idleWatchFlashDisconnectsRef.current.delete(loadId);
+            idleWatchAbortRef.current = null;
+            detachedWatchAbortRef.current = abort;
+            sessionWatchersRef.current.set(loadId, abort);
+            transitionChatRecovery({ type: 'active_check_succeeded', active: true });
+            requestIdRef.current = loadId;
+            setBusyAndClock(true);
+            busyRef.current = true;
+            // A remote turn preserves the reader's current follow intent.
+            seedAppliedTodoIds(loadId, todoCallIdsFromMessages(messagesRef.current));
+            // Backup: restore Build/AcceptEdits/Plan approval cards mid-turn.
+            restorePendingInteractive(loadId, loadGeneration);
+            // API turn 已 admit(会话已建):通知 App 刷新侧栏,让新建会话实时出现。
+            onLiveTurnDone?.();
+          }
+          if (frame.type === 'text' || frame.type === 'reasoning') {
+            ensureAssistantBubbleForWatch();
+          }
+          if (skipSecondHandle) {
+            timelineFollow.changed();
+            continue;
+          }
+          // Restore permission/user-input for every non-Auto mode that parks.
+          handleEvent(frame, {
+            requireReplayDedup: idleNeedsDedup || typeof frame.seq === 'number',
+          });
+          // Keep the main scroller pinned while we are following (user can scroll
+          // up mid-turn to release follow).
+          timelineFollow.changed();
           if (
-            event.type === 'done' ||
-            event.type === 'stopped' ||
-            event.type === 'error'
+            frame.type === 'done' ||
+            frame.type === 'stopped' ||
+            frame.type === 'error'
           ) {
             terminalSeen = true;
-            sessionWatchersRef.current.delete(loadId);
-            backgroundRunningSessionsRef.current.delete(loadId);
-            localTurnSessionsRef.current.delete(loadId);
-            onLiveRunningChange?.(loadId, false);
-            archiveBackgroundTodos(loadId);
+            // 游标会话级递增，跨回合不清（清了就没法续传断线期间的内容）。
+            idleWatchFlashDisconnectsRef.current.delete(loadId);
+            // 回合结束:回空闲态重新待机,保证下一个 API turn 一 admit 就被推到。
+            settleToIdleWatch(projectHash, loadId, loadGeneration);
           }
-          return;
-        }
-
-        if (sessionGenerationRef.current !== loadGeneration) {
-          return;
-        }
-        let skipSecondHandle = false;
-        if (!activated) {
-          if (isSessionInManualStopGuard(loadId)) {
-            // 用户刚手动点击了停止或会话刚完成终端结算，后端正在退出期间可能重放旧 user/残余事件，坚决不能误激活为新轮次！
-            return;
-          }
-          if (event.type === 'user') {
-            const cleanText = visibleUserText(event.content).trim();
-            const alreadyPresent = messagesRef.current.some((m) => {
-              if (m.role !== 'user') return false;
-              return m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text, cleanText));
-            });
-            if (alreadyPresent) {
-              // 关键防线：该用户提问早已存在于当前画布上，纯属后端重放的旧提问帧，坚决不能误激活为新轮次！
-              return;
-            }
-            handleEvent(event);
-            skipSecondHandle = true;
-          } else if (!isWatchTurnActivationEvent(event.type)) {
-            return;
-          }
-          activated = true;
-          idleWatchFlashDisconnectsRef.current.delete(loadId);
-          idleWatchAbortRef.current = null;
-          detachedWatchAbortRef.current = abort;
-          sessionWatchersRef.current.set(loadId, abort);
-          transitionChatRecovery({ type: 'active_check_succeeded', active: true });
-          requestIdRef.current = loadId;
-          setBusyAndClock(true);
-          busyRef.current = true;
-          // A remote turn preserves the reader's current follow intent.
-          seedAppliedTodoIds(loadId, todoCallIdsFromMessages(messagesRef.current));
-          // Backup: restore Build/AcceptEdits/Plan approval cards mid-turn.
-          restorePendingInteractive(loadId, loadGeneration);
-          // API turn 已 admit(会话已建):通知 App 刷新侧栏,让新建会话实时出现。
-          onLiveTurnDone?.();
-        }
-        if (event.type === 'text' || event.type === 'reasoning') {
-          ensureAssistantBubbleForWatch();
-        }
-        if (skipSecondHandle) {
-          timelineFollow.changed();
-          return;
-        }
-        // Restore permission/user-input for every non-Auto mode that parks.
-        handleEvent(event, { requireReplayDedup: idleNeedsDedup });
-        // Keep the main scroller pinned while we are following (user can scroll
-        // up mid-turn to release follow).
-        timelineFollow.changed();
-        if (
-          event.type === 'done' ||
-          event.type === 'stopped' ||
-          event.type === 'error'
-        ) {
-          terminalSeen = true;
-          // 游标会话级递增，跨回合不清（清了就没法续传断线期间的内容）。
-          idleWatchFlashDisconnectsRef.current.delete(loadId);
-          // 回合结束:回空闲态重新待机,保证下一个 API turn 一 admit 就被推到。
-          settleToIdleWatch(projectHash, loadId, loadGeneration);
         }
       },
       abort.signal,

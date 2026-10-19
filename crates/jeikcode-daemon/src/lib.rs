@@ -331,6 +331,10 @@ struct SessionDetailQuery {
     limit: Option<usize>,
 }
 
+/// `tail` is a hard page cap. Never walk the cut back to the user who opened
+/// the turn: a long tool turn can be far larger than one page, and pulling it
+/// into the first paint stalls the timeline. A question that sits above the
+/// page stays there; `/chat/watch` must not append that prefix under the answer.
 fn apply_session_message_window<T>(
     messages: Vec<T>,
     query: &SessionDetailQuery,
@@ -384,6 +388,22 @@ mod session_window_tests {
         let (total, offset, msgs) =
             apply_session_message_window(vec!['a', 'b'], &SessionDetailQuery::default());
         assert_eq!((total, offset, msgs), (2, 0, vec!['a', 'b']));
+    }
+
+    #[test]
+    fn tail_stays_capped_when_the_cut_falls_mid_turn() {
+        // 8 rows, tail 3 starts on an assistant. The page stays 3; it must not
+        // grow back to the question that opened the turn.
+        let q = SessionDetailQuery {
+            tail: Some(3),
+            offset: None,
+            limit: None,
+        };
+        let (total, offset, window) =
+            apply_session_message_window(vec!["u", "a", "t", "u2", "a2", "t2", "a3", "a4"], &q);
+        assert_eq!(total, 8);
+        assert_eq!(offset, 5);
+        assert_eq!(window, vec!["t2", "a3", "a4"]);
     }
 
     #[test]
@@ -4553,7 +4573,8 @@ async fn get_session_detail(
                 }
             };
             let turns = session_user_outline(&messages);
-            let (message_count, offset, messages) = apply_session_message_window(messages, &query);
+            let (message_count, offset, messages) =
+                apply_session_message_window(messages, &query);
             let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let turn_running = state
                 .active_chats
@@ -9314,7 +9335,6 @@ async fn chat_watch(
     //   缺省           → 全量补发（无游标兜底，前端按身份幂等收敛）
     let mut replay_head: Vec<(u64, ChatEvent)> = Vec::new();
     let mut handshake: Option<String> = None;
-    let mut buffer_len = 0u64;
     // Prefer atomic snapshot+subscribe when a turn is live so a mid-stream
     // browser refresh gets the full thinking/text/tool history, not only
     // deltas after reconnect. Idle standby watchers skip this so a leftover
@@ -9325,7 +9345,7 @@ async fn chat_watch(
             .subscribe_live_with_replay(&session_id)
             .await
         {
-            buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+            let buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
             tracing::debug!(
                 session_id = %session_id,
                 replay_events = snapshot.len(),
@@ -9507,14 +9527,8 @@ async fn chat_watch(
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let head_session_id = session_id.clone();
     let live_session_id = session_id.clone();
-    // 补发/握手帧在前（带 seq），实时帧在后（同样携带单调递增 seq）。
-    // 前端每收到一帧就实时推进本地游标，断线/刷新重连带回来续传 —— 精准无缝续接，不重复、不重播！
-    let last_head_seq = replay_head
-        .iter()
-        .map(|(seq, _)| *seq)
-        .max()
-        .unwrap_or(buffer_len);
-
+    // 只有补发帧带 seq。实时帧不带：直播序号和缓冲下标不是同一套，写进游标后
+    // 刷新会以为自己已经越过缓冲，服务端整段重放，前端又当成新 token 往上接。
     let head_json: Vec<String> = handshake
         .into_iter()
         .chain(
@@ -9527,15 +9541,12 @@ async fn chat_watch(
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
 
-    let live_seq_counter =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
     let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
-        let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok::<_, std::convert::Infallible>(
             axum::response::sse::Event::default().data(chat_watch_frame_json(
                 &event,
                 &live_session_id,
-                Some(seq),
+                None,
             )),
         )
     });
