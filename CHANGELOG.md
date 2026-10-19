@@ -21,6 +21,26 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.7-beta.4 (2026-10-19)
+
+- **[TodoList & Session Board] Persistent single-board live checklist and turn-settlement archival**:
+  - Maintained a single live todo board per session updated by tool executions, eliminating partial unfinished list foldings during session reads.
+  - Cleared the todo board only upon explicit turn stop when all tasks are complete, while WebUI simultaneously renders the checklist onto the trailing assistant bubble.
+- **[Markdown Rendering & Nested Task Lists] Indented nested list layout restoration and task preprocessing**:
+  - Restored block-level layout for nested lists inside markdown task items, allowing child items to wrap naturally and maintain hierarchy indentations.
+  - Kept the task checkbox inline with its primary sentence, preventing broken wrapping.
+  - Enhanced preprocessing in `markdownPrep` to correctly handle inline code, numbers, and bold styling within task items.
+
+---
+
+- **[待办清单与会话看板] 会话级单一实时待办看板与回合停机归档机制**:
+  - 会话维护唯一的实时待办看板，工具写入直接更新此看板，会话读取不再从转录历史中折出残缺未完成项。
+  - 待办列表仅在回合正式停止（stop）且所有任务全量完成时才执行清空，WebUI 同步在最后一条助手消息尾部呈现完整清单。
+- **[Markdown 渲染与嵌套任务列表] 嵌套列表层级缩进恢复与任务项预处理增强**:
+  - 将 Markdown 任务项内嵌套的子级列表恢复为块级排版，确保子级条目能够正常换行并完整保留多层级缩进结构。
+  - 待办复选框与首段文字保持单行行内紧凑对齐，彻底消除多余断行。
+  - 优化 `markdownPrep` 预处理流程，稳健支持包含内联代码、数字序号及粗体样式的任务条目解析。
+
 ## v7.2.7-beta.3 (2026-10-19)
 
 - **[Cross-Platform Updater & Daemon] Robust in-place binary replacement and graceful service reload**:
