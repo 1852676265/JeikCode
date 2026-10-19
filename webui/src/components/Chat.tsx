@@ -6524,8 +6524,7 @@ export function Chat({
       );
       return 'error';
     }
-    // Next user turn: freeze sticky todos under prior assistant, clear sticky.
-    commitActiveTodosIntoLastAssistant();
+    // 画到上一条消息尾部只发生在正式 stop 且全部勾完之后，不在发送下一条时提前归档。
     if (sessionId) idleWatchFlashDisconnectsRef.current.delete(sessionId);
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in

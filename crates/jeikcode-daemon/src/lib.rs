@@ -923,7 +923,7 @@ pub struct SessionDetail {
     /// `manual` / `scheduled` / `protocol`. Protocol sessions are observed in Auto.
     #[serde(default, skip_serializing_if = "is_manual_session_origin")]
     pub origin: jeikcode_capabilities::session::SessionOrigin,
-    /// Authoritative active todo list derived from the whole session transcript.
+    /// The session's single live checklist. Empty after a completed board is closed on stop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<jeikcode_capabilities::tools::TodoItem>,
 }
@@ -4512,10 +4512,10 @@ async fn get_session_detail(
                     .live_turn_session_ids()
                     .iter()
                     .any(|sid| sid == &id);
-            let todos = jeikcode_capabilities::tools::session_sticky_todos(
-                &session.snapshot.messages,
-                turn_running,
-            );
+            let _ = turn_running;
+            let todos = jeikcode_capabilities::tools::read_todo_board(&id)
+                .map(|board| board.items)
+                .unwrap_or_default();
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,

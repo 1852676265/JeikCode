@@ -747,14 +747,72 @@ fn is_real_user_message(message: &Message) -> bool {
     message.role == jeikcode_kernel::message::Role::User && !message.synthetic
 }
 
+fn closed_titles(closed: &[TodoItem]) -> std::collections::HashSet<String> {
+    closed
+        .iter()
+        .map(|item| normalize_todo_content(&item.content))
+        .filter(|title| !title.is_empty())
+        .collect()
+}
+
+/// Every row is a title from the checklist that was already fully completed and closed.
+fn replay_of_closed(list: &[TodoItem], closed: &[TodoItem]) -> bool {
+    if closed.is_empty() || list.is_empty() {
+        return false;
+    }
+    let titles = closed_titles(closed);
+    list.iter()
+        .all(|item| titles.contains(&normalize_todo_content(&item.content)))
+}
+
+fn args_have_explicit_add(args: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return false;
+    };
+    if action_kind(&value) == Some("add") {
+        return true;
+    }
+    value
+        .get("actions")
+        .and_then(|actions| actions.as_array())
+        .is_some_and(|actions| actions.iter().any(|item| action_kind(item) == Some("add")))
+}
+
 /// Fold one user turn onto the list carried from earlier turns.
-/// A full `todos` plan replaces the carried list. Plain actions apply on top of it,
-/// so an unfinished checklist can continue. An empty batch leaves the carried list.
-fn fold_turn_calls(carried: &mut Vec<TodoItem>, batch: &mut Vec<(&str, &str)>) {
+/// A full `todos` plan replaces the carried list. Plain actions apply on top of an
+/// unfinished list. After a completed list was closed, only a new plan or an explicit
+/// `add` of a new title may start another list. Updates that merely restate the closed
+/// rows are not a live checklist.
+fn fold_turn_calls(
+    carried: &mut Vec<TodoItem>,
+    batch: &mut Vec<(&str, &str)>,
+    closed: &mut Vec<TodoItem>,
+) {
     if batch.is_empty() {
         return;
     }
     let has_plan = batch.iter().any(|(_, args)| is_todo_plan(args));
+    if !closed.is_empty() && carried.is_empty() {
+        let next = if has_plan {
+            reduce_todos(batch.iter().copied())
+        } else {
+            let mut fresh = Vec::new();
+            for (_, args) in batch.iter().copied() {
+                if args_have_explicit_add(args) {
+                    apply_todo_action(&mut fresh, args);
+                }
+            }
+            fresh
+        };
+        if !replay_of_closed(&next, closed) {
+            *carried = next;
+            if !carried.is_empty() {
+                closed.clear();
+            }
+        }
+        batch.clear();
+        return;
+    }
     if has_plan || carried.is_empty() {
         *carried = reduce_todos(batch.iter().copied());
     } else {
@@ -774,12 +832,13 @@ fn fold_turn_calls(carried: &mut Vec<TodoItem>, batch: &mut Vec<(&str, &str)>) {
 /// into the next turn.
 pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
     let mut carried = Vec::new();
+    let mut closed = Vec::new();
     let mut batch = Vec::new();
     for message in messages {
         if is_real_user_message(message) {
-            fold_turn_calls(&mut carried, &mut batch);
+            fold_turn_calls(&mut carried, &mut batch, &mut closed);
             if list_fully_completed(&carried) {
-                carried.clear();
+                closed = std::mem::take(&mut carried);
             }
             continue;
         }
@@ -789,7 +848,7 @@ pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
             }
         }
     }
-    fold_turn_calls(&mut carried, &mut batch);
+    fold_turn_calls(&mut carried, &mut batch, &mut closed);
     carried
 }
 
@@ -833,10 +892,149 @@ fn current_turn_wrote_todos(messages: &[Message]) -> bool {
     })
 }
 
-/// Live list handle shared with the coding `TodoHook` so `execute` validates ids
-/// against the same fold the transcript uses. Transcript remains the source of
-/// truth; the hook refreshes this from [`derive_current_todos`] each request.
+/// Live list handle shared with the coding `TodoHook`.
+/// The session [`TodoBoard`] is the stored checklist. This vec is the copy the
+/// tool mutates while a turn is running.
 pub type TodoLive = Arc<Mutex<Vec<TodoItem>>>;
+
+/// One checklist bound to one session. `id` is the part id, `seq` is its cursor.
+/// It is not part of the model payload.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TodoBoard {
+    pub id: String,
+    pub seq: u64,
+    pub items: Vec<TodoItem>,
+}
+
+struct TodoSlot {
+    board: Option<TodoBoard>,
+    /// Set when a completed board was closed after stop. Blocks reloading that file.
+    closed: bool,
+}
+
+fn todo_registry() -> &'static std::sync::RwLock<std::collections::HashMap<String, TodoSlot>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<String, TodoSlot>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+fn live_bindings() -> &'static Mutex<std::collections::HashMap<usize, String>> {
+    static BINDINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, String>>> =
+        std::sync::OnceLock::new();
+    BINDINGS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn live_key(live: &TodoLive) -> usize {
+    Arc::as_ptr(live) as usize
+}
+
+/// Remember which session this tool instance is serving.
+pub fn bind_todo_session(live: &TodoLive, session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    live_bindings()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(live_key(live), session_id.to_string());
+}
+
+pub fn todo_session_of(live: &TodoLive) -> Option<String> {
+    live_bindings()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&live_key(live))
+        .cloned()
+}
+
+/// The one live checklist for `session_id`. Readers take the read lock and
+/// therefore observe a finished write.
+pub fn read_todo_board(session_id: &str) -> Option<TodoBoard> {
+    let guard = todo_registry()
+        .read()
+        .unwrap_or_else(|err| err.into_inner());
+    guard.get(session_id).and_then(|slot| slot.board.clone())
+}
+
+pub fn todo_session_is_closed(session_id: &str) -> bool {
+    let guard = todo_registry()
+        .read()
+        .unwrap_or_else(|err| err.into_inner());
+    guard.get(session_id).is_some_and(|slot| slot.closed)
+}
+
+/// Install a board loaded from disk, unless this process already has a newer slot.
+pub fn restore_todo_board(session_id: &str, board: TodoBoard) {
+    if session_id.is_empty() || board.items.is_empty() {
+        return;
+    }
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    if guard.contains_key(session_id) {
+        return;
+    }
+    guard.insert(
+        session_id.to_string(),
+        TodoSlot {
+            board: Some(board),
+            closed: false,
+        },
+    );
+}
+
+/// Replace the session's single checklist. The same part id stays until it is closed.
+pub fn commit_todo_board(session_id: &str, items: &[TodoItem]) -> TodoBoard {
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    let slot = guard.entry(session_id.to_string()).or_insert(TodoSlot {
+        board: None,
+        closed: false,
+    });
+    slot.closed = false;
+    let board = match slot.board.take() {
+        Some(mut existing) => {
+            existing.seq = existing.seq.saturating_add(1);
+            existing.items = items.to_vec();
+            existing
+        }
+        None => TodoBoard {
+            id: format!(
+                "todo-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(1)
+            ),
+            seq: 1,
+            items: items.to_vec(),
+        },
+    };
+    slot.board = Some(board.clone());
+    board
+}
+
+/// After streaming has stopped, drop the live board only when every item is checked.
+/// Returns the closed board so the caller can keep it as history. Open items stay.
+pub fn close_todo_board_if_complete(session_id: &str) -> Option<TodoBoard> {
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    let Some(slot) = guard.get_mut(session_id) else {
+        return None;
+    };
+    let Some(board) = slot.board.as_ref() else {
+        return None;
+    };
+    if !list_fully_completed(&board.items) {
+        return None;
+    }
+    let closed = slot.board.take()?;
+    slot.closed = true;
+    Some(closed)
+}
 
 /// Register (or replace) `todowrite` and return the live list for [`TodoHook`].
 pub fn bind_todowrite(reg: &mut ToolRegistry) -> TodoLive {
@@ -873,6 +1071,13 @@ impl TodoTool {
 
     pub fn live(&self) -> TodoLive {
         Arc::clone(&self.live)
+    }
+
+    fn publish_board(&self, items: &[TodoItem]) {
+        let Some(session_id) = todo_session_of(&self.live) else {
+            return;
+        };
+        commit_todo_board(&session_id, items);
     }
 
     fn lock_live(&self) -> std::sync::MutexGuard<'_, Vec<TodoItem>> {
@@ -1046,6 +1251,7 @@ impl Tool for TodoTool {
             return match parse_todos(&args) {
                 Ok(todos) => {
                     *self.lock_live() = todos.clone();
+                    self.publish_board(&todos);
                     ok(render_todos_numbered(&todos, false))
                 }
                 Err(e) => err(with_current_list(e, &list)),
@@ -1089,6 +1295,7 @@ impl Tool for TodoTool {
             )),
             Ok(ApplyOutcome::Changed) => {
                 *self.lock_live() = list.clone();
+                self.publish_board(&list);
                 ok(format!(
                     "{summary}\n\n{}",
                     render_todos_numbered(&list, false)
@@ -1319,6 +1526,29 @@ mod tests {
     }
 
     #[test]
+    fn todo_board_stays_until_stop_closes_a_finished_list() {
+        let session = format!("todo-board-{}", std::process::id());
+        let open = vec![TodoItem {
+            content: "still".into(),
+            status: TodoStatus::Pending,
+        }];
+        let first = commit_todo_board(&session, &open);
+        assert_eq!(read_todo_board(&session).unwrap().id, first.id);
+        assert!(close_todo_board_if_complete(&session).is_none());
+        assert_eq!(read_todo_board(&session).unwrap().items.len(), 1);
+        let done = vec![TodoItem {
+            content: "still".into(),
+            status: TodoStatus::Completed,
+        }];
+        let updated = commit_todo_board(&session, &done);
+        assert_eq!(updated.id, first.id);
+        assert!(updated.seq > first.seq);
+        let closed = close_todo_board_if_complete(&session).unwrap();
+        assert_eq!(closed.items.len(), 1);
+        assert!(read_todo_board(&session).is_none());
+    }
+
+    #[test]
     fn session_sticky_todos_hides_completed_plan_once_idle() {
         let msgs = vec![Message::assistant(
             "",
@@ -1371,6 +1601,44 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].content, "fresh");
         assert_eq!(fresh[0].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn closed_checklist_is_not_rebuilt_from_later_incremental_calls() {
+        let msgs = vec![
+            Message::user("plan it"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"keep-a","status":"completed"},{"content":"keep-b","status":"completed"},{"content":"keep-c","status":"completed"}]}"#.into(),
+                }],
+            ),
+            Message::user("next"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "2".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"actions":[{"action":"update","id":2,"content":"keep-b","status":"pending"},{"action":"update","id":3,"content":"keep-c","status":"in_progress"}]}"#.into(),
+                }],
+            ),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "3".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"keep-b","status":"pending"},{"content":"keep-c","status":"in_progress"}]}"#.into(),
+                }],
+            ),
+        ];
+        assert!(
+            derive_current_todos(&msgs).is_empty(),
+            "a closed checklist must not come back as a shorter unfinished list"
+        );
+        assert!(session_sticky_todos(&msgs, false).is_empty());
+        assert!(session_sticky_todos(&msgs, true).is_empty());
     }
 
     #[test]

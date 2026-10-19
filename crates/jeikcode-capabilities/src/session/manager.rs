@@ -1096,6 +1096,52 @@ impl SessionManager {
     pub fn snapshot_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "snapshot")
     }
+
+    fn todo_board_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "todo")
+    }
+
+    /// 会话唯一待办。完成并 stop 之后文件删掉，下次读取为空。
+    fn persist_todo_board(&self, id: &str) -> SessionResult<()> {
+        let path = self.todo_board_path(id)?;
+        if crate::tools::todo_session_is_closed(id) {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|error| io_at(&path, error))?;
+            }
+            return Ok(());
+        }
+        match crate::tools::read_todo_board(id) {
+            Some(board) if !board.items.is_empty() => {
+                let bytes =
+                    serde_json::to_vec(&board).map_err(|error| SessionStoreError::Corrupt {
+                        kind: "todo board",
+                        message: format!("{}: {error}", path.display()),
+                    })?;
+                atomic_write(&path, &bytes)
+            }
+            _ => {
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|error| io_at(&path, error))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn restore_todo_board(&self, id: &str) {
+        if crate::tools::todo_session_is_closed(id) || crate::tools::read_todo_board(id).is_some() {
+            return;
+        }
+        let Ok(path) = self.todo_board_path(id) else {
+            return;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        if let Ok(board) = serde_json::from_slice::<crate::tools::TodoBoard>(&bytes) {
+            crate::tools::restore_todo_board(id, board);
+        }
+    }
     /// Directory under which per-session tool-output artifacts are stored.
     /// Sibling of the snapshot: `<root>/<id>.artifacts/`.
     pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
@@ -1555,7 +1601,8 @@ impl SessionManager {
         let bytes = serialize_bounded(snap, "snapshot", MAX_SNAPSHOT_BYTES)?;
         self.with_meta_lock(id, || {
             self.ensure_native_writable(id, "save snapshot")?;
-            atomic_write(&self.snapshot_path(id)?, &bytes)
+            atomic_write(&self.snapshot_path(id)?, &bytes)?;
+            self.persist_todo_board(id)
         })
     }
 
@@ -1564,6 +1611,7 @@ impl SessionManager {
             read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
         validate_snapshot(&snapshot)?;
+        self.restore_todo_board(id);
         Ok(snapshot)
     }
 

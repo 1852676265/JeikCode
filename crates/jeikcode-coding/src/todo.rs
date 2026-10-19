@@ -95,10 +95,6 @@ fn is_actionable_tool(name: &str) -> bool {
         || name.eq_ignore_ascii_case("cmd")
 }
 
-fn derive_active_live_todos(messages: &[Message]) -> Vec<TodoItem> {
-    derive_current_todos(messages)
-}
-
 /// True iff the model performed actionable modifications this turn (e.g. edited files,
 /// executed commands, updated todos). Pure informational / read-only queries (read, grep,
 /// glob, code_explore) and explicit questions to the user (request_user_input) are
@@ -126,17 +122,22 @@ fn active_work_or_managed_todos_this_turn(convo: &Conversation) -> bool {
 
 #[async_trait]
 impl LifecycleHooks for TodoHook {
-    async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
-        let todos = derive_active_live_todos(messages);
-        self.sync_live(&todos);
+    async fn pre_request(&self, _messages: &mut Vec<Message>, ctx: &TurnCtx) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            return;
+        };
+        jeikcode_capabilities::tools::bind_todo_session(live, session_id);
+        let items = jeikcode_capabilities::tools::read_todo_board(session_id)
+            .map(|board| board.items)
+            .unwrap_or_default();
+        self.sync_live(&items);
     }
 
-    async fn turn_start(&self, convo: &mut Conversation) {
-        // Live TUI sync only.
-        // Dynamic reminder insertion (Current task list...) is removed per architecture decision;
-        // system-level guidelines live permanently in System 3 (<todo_rules>).
-        let todos = derive_active_live_todos(&convo.messages);
-        self.sync_live(&todos);
+    async fn turn_start(&self, _convo: &mut Conversation) {
+        // 实时清单以会话上的 TodoBoard 为准，不从转录折算回灌。
     }
 
     /// The model wants to stop. If the task list still has OPEN items (pending or in_progress),
@@ -158,16 +159,14 @@ impl LifecycleHooks for TodoHook {
     /// 工具调用留在记录里，历史画布仍能画到那一条消息上。还有未完成项时保留，下一轮接着改。
     async fn turn_complete(
         &self,
-        convo: &Conversation,
+        _convo: &Conversation,
         _reason: &jeikcode_kernel::event::StopReason,
-        _ctx: &TurnCtx,
+        ctx: &TurnCtx,
     ) {
-        let todos = derive_current_todos(&convo.messages);
-        if !todos.is_empty()
-            && todos
-                .iter()
-                .all(|item| item.status == TodoStatus::Completed)
-        {
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            return;
+        };
+        if jeikcode_capabilities::tools::close_todo_board_if_complete(session_id).is_some() {
             self.sync_live(&[]);
         }
     }
