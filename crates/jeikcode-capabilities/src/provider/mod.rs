@@ -174,10 +174,15 @@ pub(crate) fn friendly_http_error(code: u16, detail: &str) -> String {
 /// and strips meta keywords like `$schema`/`$id` that cause upstream 400s (e.g. Gemini Schema errors).
 pub(crate) fn sanitize_schema_for_wire(val: &Value) -> Value {
     let sanitized = crate::schema_sanitizer::sanitize_mcp_schema(val.clone());
-    sanitize_schema_for_wire_inner(&sanitized)
+    sanitize_schema_for_wire_inner(&sanitized, 0)
 }
 
-fn sanitize_schema_for_wire_inner(val: &Value) -> Value {
+const MAX_WIRE_SANITIZE_DEPTH: usize = 64;
+
+fn sanitize_schema_for_wire_inner(val: &Value, depth: usize) -> Value {
+    if depth > MAX_WIRE_SANITIZE_DEPTH {
+        return val.clone();
+    }
     match val {
         Value::Object(map) => {
             let mut out = serde_json::Map::new();
@@ -227,12 +232,14 @@ fn sanitize_schema_for_wire_inner(val: &Value) -> Value {
                                         } else {
                                             merged_props.insert(
                                                 k.clone(),
-                                                sanitize_schema_for_wire_inner(v),
+                                                sanitize_schema_for_wire_inner(v, depth + 1),
                                             );
                                         }
                                     } else {
-                                        merged_props
-                                            .insert(k.clone(), sanitize_schema_for_wire_inner(v));
+                                        merged_props.insert(
+                                            k.clone(),
+                                            sanitize_schema_for_wire_inner(v, depth + 1),
+                                        );
                                     }
                                 }
                             }
@@ -269,11 +276,15 @@ fn sanitize_schema_for_wire_inner(val: &Value) -> Value {
                     out.insert("enum".to_string(), json!([v]));
                     continue;
                 }
-                out.insert(k.clone(), sanitize_schema_for_wire_inner(v));
+                out.insert(k.clone(), sanitize_schema_for_wire_inner(v, depth + 1));
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_schema_for_wire_inner).collect()),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|item| sanitize_schema_for_wire_inner(item, depth + 1))
+                .collect(),
+        ),
         _ => val.clone(),
     }
 }

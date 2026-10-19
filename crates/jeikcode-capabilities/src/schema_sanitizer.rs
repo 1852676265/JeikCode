@@ -119,13 +119,32 @@ pub fn is_bare_object(val: &serde_json::Map<String, serde_json::Value>) -> bool 
     !has_non_empty_props && !has_additional
 }
 
+/// Maximum inline recursion depth for JSON schema definitions to prevent stack overflow.
+pub const MAX_INLINE_DEPTH: usize = 16;
+
+/// Maximum tree depth for recursive schema node cleaning.
+pub const MAX_CLEAN_DEPTH: usize = 64;
+
 /// Resolve and inline local references (`$ref: "#/$defs/..."` or `"#/definitions/..."`)
-/// Matches OpenCode's `inlineLocalReferences`.
+/// Matches OpenCode's `inlineLocalReferences`, augmented with cycle detection and bounded recursion depth.
 fn inline_local_references(
     node: &mut serde_json::Value,
     defs: &HashMap<String, serde_json::Value>,
-    seen: &mut HashSet<String>,
+    active_refs: &mut HashSet<String>,
+    depth: usize,
 ) {
+    if depth > MAX_INLINE_DEPTH {
+        if let serde_json::Value::Object(map) = node {
+            if map.contains_key("$ref") {
+                map.remove("$ref");
+                if !map.contains_key("type") {
+                    map.insert("type".to_string(), serde_json::json!("object"));
+                }
+            }
+        }
+        return;
+    }
+
     match node {
         serde_json::Value::Object(map) => {
             if let Some(ref_val) = map.get("$ref").and_then(|r| r.as_str()) {
@@ -133,31 +152,49 @@ fn inline_local_references(
                     .strip_prefix("#/$defs/")
                     .or_else(|| ref_val.strip_prefix("#/definitions/"));
                 if let Some(name) = name {
-                    if !seen.contains(name) {
-                        if let Some(target) = defs.get(name).cloned() {
-                            seen.insert(name.to_string());
-                            let mut resolved = target;
-                            inline_local_references(&mut resolved, defs, seen);
-                            seen.remove(name);
+                    if active_refs.contains(name) {
+                        // Cycle detected: recursive type definition (e.g. Node -> child: Node).
+                        // Break cycle by stripping $ref and falling back to a generic object
+                        // to keep the schema valid for LLM tool calling without infinite expansion.
+                        map.remove("$ref");
+                        if !map.contains_key("type")
+                            && !map.contains_key("properties")
+                            && !map.contains_key("anyOf")
+                            && !map.contains_key("oneOf")
+                        {
+                            map.insert("type".to_string(), serde_json::json!("object"));
+                        }
+                        return;
+                    }
 
-                            map.remove("$ref");
-                            if let serde_json::Value::Object(target_map) = resolved {
-                                for (k, v) in target_map {
-                                    map.entry(k).or_insert(v);
-                                }
+                    if let Some(target) = defs.get(name).cloned() {
+                        active_refs.insert(name.to_string());
+                        let mut resolved = target;
+                        inline_local_references(&mut resolved, defs, active_refs, depth + 1);
+                        active_refs.remove(name);
+
+                        map.remove("$ref");
+                        if let serde_json::Value::Object(target_map) = resolved {
+                            for (k, v) in target_map {
+                                map.entry(k).or_insert(v);
                             }
                         }
+                        return;
+                    } else {
+                        // Broken or unresolvable ref: remove dangling reference
+                        map.remove("$ref");
+                        return;
                     }
                 }
             }
 
             for child in map.values_mut() {
-                inline_local_references(child, defs, seen);
+                inline_local_references(child, defs, active_refs, depth + 1);
             }
         }
         serde_json::Value::Array(arr) => {
             for child in arr {
-                inline_local_references(child, defs, seen);
+                inline_local_references(child, defs, active_refs, depth + 1);
             }
         }
         _ => {}
@@ -272,7 +309,7 @@ pub fn sanitize_mcp_schema(schema: serde_json::Value) -> serde_json::Value {
     // 2. Inline local references throughout the schema tree
     if !defs_map.is_empty() {
         let mut seen = HashSet::new();
-        inline_local_references(&mut schema, &defs_map, &mut seen);
+        inline_local_references(&mut schema, &defs_map, &mut seen, 0);
         if let Some(root_obj) = schema.as_object_mut() {
             root_obj.remove("$defs");
             root_obj.remove("definitions");
@@ -280,7 +317,10 @@ pub fn sanitize_mcp_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     // 3. Recursive tree cleaning
-    fn clean_node(v: &mut serde_json::Value) {
+    fn clean_node(v: &mut serde_json::Value, depth: usize) {
+        if depth > MAX_CLEAN_DEPTH {
+            return;
+        }
         match v {
             serde_json::Value::Object(map) => {
                 // Remove additionalProperties: true
@@ -320,7 +360,7 @@ pub fn sanitize_mcp_schema(schema: serde_json::Value) -> serde_json::Value {
                     });
 
                     for child in props.values_mut() {
-                        clean_node(child);
+                        clean_node(child, depth + 1);
                     }
                     Some(props.keys().cloned().collect())
                 } else {
@@ -343,34 +383,34 @@ pub fn sanitize_mcp_schema(schema: serde_json::Value) -> serde_json::Value {
                 }
 
                 if let Some(items) = map.get_mut("items") {
-                    clean_node(items);
+                    clean_node(items, depth + 1);
                 }
                 if let Some(any_of) = map.get_mut("anyOf").and_then(|a| a.as_array_mut()) {
                     for child in any_of {
-                        clean_node(child);
+                        clean_node(child, depth + 1);
                     }
                 }
                 if let Some(one_of) = map.get_mut("oneOf").and_then(|o| o.as_array_mut()) {
                     for child in one_of {
-                        clean_node(child);
+                        clean_node(child, depth + 1);
                     }
                 }
                 if let Some(all_of) = map.get_mut("allOf").and_then(|a| a.as_array_mut()) {
                     for child in all_of {
-                        clean_node(child);
+                        clean_node(child, depth + 1);
                     }
                 }
             }
             serde_json::Value::Array(arr) => {
                 for child in arr {
-                    clean_node(child);
+                    clean_node(child, depth + 1);
                 }
             }
             _ => {}
         }
     }
 
-    clean_node(&mut schema);
+    clean_node(&mut schema, 0);
     schema
 }
 
@@ -543,5 +583,103 @@ mod tests {
         assert!(!props.contains_key("accept"));
         let required = cleaned.get("required").unwrap().as_array().unwrap();
         assert_eq!(required, &vec![json!("goggles")]);
+    }
+
+    #[test]
+    fn test_recursive_schema_does_not_overflow() {
+        let raw = json!({
+            "type": "object",
+            "properties": {
+                "val": {
+                    "$ref": "#/$defs/Node"
+                }
+            },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "child": {
+                            "$ref": "#/$defs/Node"
+                        }
+                    }
+                }
+            }
+        });
+        let cleaned = sanitize_mcp_schema(raw);
+        assert!(!cleaned.as_object().unwrap().contains_key("$defs"));
+    }
+
+    #[test]
+    fn test_recursive_union_schema_like_rea_schema0() {
+        let raw = json!({
+            "type": "object",
+            "properties": {
+                "evidence": {
+                    "type": "object",
+                    "properties": {
+                        "normalized_result": {
+                            "$ref": "#/$defs/__schema0"
+                        }
+                    }
+                }
+            },
+            "$defs": {
+                "__schema0": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "number" },
+                        { "type": "boolean" },
+                        { "type": "null" },
+                        {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/$defs/__schema0"
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": {
+                                "$ref": "#/$defs/__schema0"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let cleaned = sanitize_mcp_schema(raw);
+        assert!(!cleaned.as_object().unwrap().contains_key("$defs"));
+        let ev = cleaned.get("properties").unwrap().get("evidence").unwrap();
+        assert!(ev
+            .get("properties")
+            .unwrap()
+            .get("normalized_result")
+            .is_some());
+    }
+
+    #[test]
+    fn test_mutually_recursive_schema_does_not_overflow() {
+        let raw = json!({
+            "type": "object",
+            "properties": {
+                "a": { "$ref": "#/$defs/TypeA" }
+            },
+            "$defs": {
+                "TypeA": {
+                    "type": "object",
+                    "properties": {
+                        "b": { "$ref": "#/$defs/TypeB" }
+                    }
+                },
+                "TypeB": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "$ref": "#/$defs/TypeA" }
+                    }
+                }
+            }
+        });
+        let cleaned = sanitize_mcp_schema(raw);
+        assert!(!cleaned.as_object().unwrap().contains_key("$defs"));
     }
 }
