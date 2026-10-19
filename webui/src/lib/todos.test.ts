@@ -1036,8 +1036,9 @@ test('archived tool output does not resurrect the live panel', () => {
     settled.archive ?? [],
     'call_1',
   );
-  assert.equal(placed[0]!.parts.some((part) => part.kind === 'todo_list'), true);
-  assert.equal(placed[2]!.parts.some((part) => part.kind === 'todo_list'), false);
+  assert.equal(placed[0]!.parts.some((part) => part.kind === 'todo_list'), false);
+  assert.equal(placed[2]!.parts.some((part) => part.kind === 'todo_list'), true);
+  assert.equal(placed[2]!.parts.filter((part) => part.kind === 'todo_list').length, 1);
 });
 
 

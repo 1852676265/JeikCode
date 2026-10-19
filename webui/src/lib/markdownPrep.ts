@@ -680,6 +680,21 @@ export function repairUnclosedFences(source: string): string {
 const GENERIC_LANG = new Set(['', 'text', 'plain', 'plaintext', 'txt', 'output', 'console']);
 
 /** 去掉代码块正文里重复的语言行，例如 ```text 下面第一行又是 text。 */
+/**
+ * 规范化任务列表复选框标记：
+ * 将常见变体（如 `- [√]`、`- [✔]`、`- [✓]`、`- [v]`、`- [V]`）自动转换为标准 GFM `- [x]`，
+ * 使得 marked 能够将其识别为 task list checkbox 并渲染为高品质精美勾选框。
+ */
+export function normalizeTaskCheckboxes(line: string): string {
+  return line.replace(
+    /^(\s*(?:>\s*)*(?:[-*+]|\d+[\.\)]))\s*\[\s*([√✔✓vVxX]|\s*)\s*\](\s+|$)/,
+    (_, prefix, mark, space) => {
+      const isChecked = /[√✔✓vVxX]/.test(mark);
+      return `${prefix} [${isChecked ? 'x' : ' '}]${space || ' '}`;
+    },
+  );
+}
+
 export function stripLanguageSentinel(code: string, lang: string): string {
   const trailingNl = code.endsWith('\n');
   const text = trailingNl ? code.slice(0, -1) : code;
@@ -815,6 +830,7 @@ export function preprocessMarkdown(raw: string): string {
 
     line = replaceFullwidthPipes(line);
     line = fixAtxHeading(line);
+    line = normalizeTaskCheckboxes(line);
     const trimmed = line.trim();
 
     const footnoteDef = trimmed.match(/^\[\^([^\]]+)\]:\s*(.*)$/);

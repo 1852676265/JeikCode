@@ -739,31 +739,98 @@ pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
     list
 }
 
-/// The current todo list, folded over the transcript (see [`reduce_todos`]). Returns `vec![]`
-/// if there is no valid `todowrite` and no `todo` events.
+fn list_fully_completed(list: &[TodoItem]) -> bool {
+    !list.is_empty() && list.iter().all(|item| item.status == TodoStatus::Completed)
+}
+
+fn is_real_user_message(message: &Message) -> bool {
+    message.role == jeikcode_kernel::message::Role::User && !message.synthetic
+}
+
+/// Fold one user turn onto the list carried from earlier turns.
+/// A full `todos` plan replaces the carried list. Plain actions apply on top of it,
+/// so an unfinished checklist can continue. An empty batch leaves the carried list.
+fn fold_turn_calls(carried: &mut Vec<TodoItem>, batch: &mut Vec<(&str, &str)>) {
+    if batch.is_empty() {
+        return;
+    }
+    let has_plan = batch.iter().any(|(_, args)| is_todo_plan(args));
+    if has_plan || carried.is_empty() {
+        *carried = reduce_todos(batch.iter().copied());
+    } else {
+        for (_, args) in batch.iter() {
+            apply_todo_action(carried, args);
+        }
+    }
+    batch.clear();
+}
+
+/// The live todo list (see [`reduce_todos`]).
+///
+/// Rounds inside one real user turn share one list, including a fully checked list:
+/// a later `add` in that same turn appends. A fully checked list is dropped only when
+/// the next real user message starts, after that turn's calls are already in the
+/// transcript for the history canvas. A list that still has open items is carried
+/// into the next turn.
 pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
-    reduce_todos(
-        messages
-            .iter()
-            .flat_map(|m| m.tool_calls.iter())
-            .map(|c| (c.name.as_str(), c.arguments.as_str())),
-    )
+    let mut carried = Vec::new();
+    let mut batch = Vec::new();
+    for message in messages {
+        if is_real_user_message(message) {
+            fold_turn_calls(&mut carried, &mut batch);
+            if list_fully_completed(&carried) {
+                carried.clear();
+            }
+            continue;
+        }
+        for call in &message.tool_calls {
+            if is_todo_tool_name(&call.name) {
+                batch.push((call.name.as_str(), call.arguments.as_str()));
+            }
+        }
+    }
+    fold_turn_calls(&mut carried, &mut batch);
+    carried
 }
 
 /// Live panel exposed by the session API.
 ///
-/// A finished checklist stays visible only while that turn is still running, so the
-/// canvas can keep it until stop. Once the session is idle, a fully completed plan
-/// is history and must not come back as the active board.
+/// A finished checklist stays visible only while the turn that wrote it is still
+/// running. A later user message starts a new turn; that turn does not inherit the
+/// previous completed plan just because the session is busy again.
 pub fn session_sticky_todos(messages: &[Message], turn_running: bool) -> Vec<TodoItem> {
     let todos = derive_current_todos(messages);
-    if todos.is_empty()
-        || (!turn_running && todos.iter().all(|t| t.status == TodoStatus::Completed))
-    {
-        Vec::new()
-    } else {
-        todos
+    if todos.is_empty() {
+        return Vec::new();
     }
+    if !todos
+        .iter()
+        .all(|item| item.status == TodoStatus::Completed)
+    {
+        return todos;
+    }
+    if turn_running && current_turn_wrote_todos(messages) {
+        return todos;
+    }
+    Vec::new()
+}
+
+/// Todo calls after the latest real user message belong to the running turn.
+/// Synthetic continuation nudges stay inside that same turn.
+fn current_turn_wrote_todos(messages: &[Message]) -> bool {
+    let start = messages
+        .iter()
+        .rposition(|message| {
+            message.role == jeikcode_kernel::message::Role::User && !message.synthetic
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    messages[start..].iter().any(|message| {
+        message
+            .tool_calls
+            .iter()
+            .any(|call| is_todo_tool_name(&call.name))
+    })
 }
 
 /// Live list handle shared with the coding `TodoHook` so `execute` validates ids
@@ -1266,6 +1333,77 @@ mod tests {
             "an idle completed plan must not be returned as the live panel"
         );
         assert_eq!(session_sticky_todos(&msgs, true).len(), 2);
+    }
+
+    #[test]
+    fn session_sticky_todos_drops_completed_plan_when_a_new_user_turn_starts() {
+        let done = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"completed"}]}"#.into(),
+            }],
+        );
+        let mut msgs = vec![Message::user("plan it"), done.clone()];
+        assert_eq!(session_sticky_todos(&msgs, true).len(), 2);
+        msgs.push(Message::synthetic_user("before you finish"));
+        assert_eq!(
+            session_sticky_todos(&msgs, true).len(),
+            2,
+            "a synthetic nudge is still the same turn"
+        );
+        msgs.push(Message::user("你好"));
+        assert!(
+            session_sticky_todos(&msgs, true).is_empty(),
+            "a new user turn must not receive the previous completed checklist"
+        );
+        assert!(derive_current_todos(&msgs).is_empty());
+        msgs.push(Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "2".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"action":"add","content":"fresh"}"#.into(),
+            }],
+        ));
+        let fresh = derive_current_todos(&msgs);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].content, "fresh");
+        assert_eq!(fresh[0].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn open_checklist_continues_into_the_next_user_turn() {
+        let msgs = vec![
+            Message::user("plan it"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"keep","status":"pending"},{"content":"done","status":"completed"}]}"#.into(),
+                }],
+            ),
+            Message::user("continue"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "2".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"action":"add","content":"next"}"#.into(),
+                }],
+            ),
+        ];
+        let todos = derive_current_todos(&msgs);
+        assert_eq!(
+            todos
+                .iter()
+                .map(|item| item.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep", "done", "next"]
+        );
+        assert_eq!(session_sticky_todos(&msgs, true).len(), 3);
     }
 
     #[test]

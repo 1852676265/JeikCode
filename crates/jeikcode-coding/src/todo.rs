@@ -96,24 +96,7 @@ fn is_actionable_tool(name: &str) -> bool {
 }
 
 fn derive_active_live_todos(messages: &[Message]) -> Vec<TodoItem> {
-    let todos = derive_current_todos(messages);
-    if todos.is_empty() || !todos.iter().all(|t| t.status == TodoStatus::Completed) {
-        return todos;
-    }
-    let start = messages
-        .iter()
-        .rposition(|m| m.role == Role::User && !m.synthetic)
-        .unwrap_or(0);
-    let touched_this_turn = messages[start..].iter().any(|m| {
-        m.tool_calls
-            .iter()
-            .any(|c| jeikcode_capabilities::tools::is_todo_tool_name(&c.name))
-    });
-    if touched_this_turn {
-        todos
-    } else {
-        Vec::new()
-    }
+    derive_current_todos(messages)
 }
 
 /// True iff the model performed actionable modifications this turn (e.g. edited files,
@@ -171,8 +154,8 @@ impl LifecycleHooks for TodoHook {
         Some(format_completion_nudge(&todos))
     }
 
-    /// Turn 彻底终结。只有在最终 stop 且整个 agent 回复完全结束的那一刻，
-    /// 检测当前 todolist 是否非空且所有项目全部处于 completed 状态；若是，才统一做完成清空！
+    /// 大轮结束。只有清单已经全部完成时才清掉内存里的实时副本。
+    /// 工具调用留在记录里，历史画布仍能画到那一条消息上。还有未完成项时保留，下一轮接着改。
     async fn turn_complete(
         &self,
         convo: &Conversation,
@@ -180,7 +163,11 @@ impl LifecycleHooks for TodoHook {
         _ctx: &TurnCtx,
     ) {
         let todos = derive_current_todos(&convo.messages);
-        if !todos.is_empty() && todos.iter().all(|t| t.status == TodoStatus::Completed) {
+        if !todos.is_empty()
+            && todos
+                .iter()
+                .all(|item| item.status == TodoStatus::Completed)
+        {
             self.sync_live(&[]);
         }
     }

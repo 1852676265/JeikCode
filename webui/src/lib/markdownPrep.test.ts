@@ -379,6 +379,33 @@ test('unclosed bash code block triggers structural terminator on clear Chinese d
   assert.doesNotMatch(out, /<code class="language-bash">[\s\S]*?这是第二步的说明文本[\s\S]*?<\/code>/);
 });
 
+test('task list checkboxes with [√], [✔], [✓], [v] normalize to checked state', () => {
+  const md = [
+    '- [√] **需求与架构设计**：完成方案评审',
+    '- [✔] 核心逻辑实现',
+    '- [✓] 多语言纯粹性',
+    '- [v] CI/CD 流水线',
+    '- [V] 双语变更日志',
+    '- [ ] 全量上线推流',
+    '  - [√] 缩进子任务',
+    '> - [√] 引用块任务',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+
+  // 严禁将 [√] 留为普通文本字符渲染在 <li>[√] ...</li> 里
+  assert.doesNotMatch(out, /<li>\[√\]/);
+  assert.doesNotMatch(out, /<li>\[✔\]/);
+  assert.doesNotMatch(out, /<li>\[✓\]/);
+
+  // 必须全部规范化识别为 checked 的 checkbox 输入框
+  const checkedMatches = out.match(/<input checked="" disabled="" type="checkbox">/g) ?? [];
+  assert.equal(checkedMatches.length, 7);
+
+  const uncheckedMatches = out.match(/<input disabled="" type="checkbox">/g) ?? [];
+  assert.equal(uncheckedMatches.length, 1);
+});
+
 
 
 

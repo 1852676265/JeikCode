@@ -155,8 +155,6 @@ import {
 import {
   foldTodoToolCall,
   isTodoTool,
-  isTodoPlanCall,
-  parseTodoPlan,
   parseTodosFromOutput,
   placeArchivedTodos,
   reduceLiveTodo,
@@ -1475,7 +1473,7 @@ export function Chat({
     if (items && items.length > 0) activeTodosBySessionRef.current.set(sessionId, items);
     else activeTodosBySessionRef.current.delete(sessionId);
   }
-  /** 回合回复已经停止。勾完的清单归档到持有这次调用的助手消息，然后实时文档清空。 */
+  /** 最终停止且正文已经落地。只有全部勾完才贴到最后一条助手消息，然后清掉实时清单。 */
   function commitActiveTodosIntoLastAssistant() {
     const sid = activeIdRef.current;
     if (!sid) return;
@@ -3748,21 +3746,12 @@ export function Chat({
     // Running session-level todo list across turns.
     // Baseline is the last full plan; subsequent actions fold over it.
     let sessionTodoList: TodoItem[] = [];
-    let turnHadTodoCalls = false;
-    let turnSawFullPlan = false;
-    const flushTurnTodos = () => {
+    // 未完成清单跨大轮保留。只有全部完成时才贴到当前最后一条助手消息，然后清空，下一轮从空清单开始。
+    const closeCompletedTurnTodos = () => {
       const list = sessionTodoList;
-      const had = turnHadTodoCalls;
-      const sawPlan = turnSawFullPlan;
-      turnHadTodoCalls = false;
-      turnSawFullPlan = false;
-      sessionTodoList = [];
-      if (!had || loaded.length === 0 || !sawPlan) return;
-      // 只有这一轮自己的清单全部完成时，才贴在该轮助手回复尾部。
-      // 清单在 flush 后立刻清空，避免下一轮没有 todo 调用时把旧清单再贴一次。
       const isAllDone = list.length > 0 && list.every((t) => t.status === 'completed');
       if (!isAllDone) return;
-
+      sessionTodoList = [];
       for (let i = loaded.length - 1; i >= 0; i--) {
         if (loaded[i]!.role !== 'assistant') continue;
         loaded[i] = {
@@ -3775,7 +3764,9 @@ export function Chat({
     let userTurnOrdinal = 0;
     for (const [rawIndex, msg] of msgs.entries()) {
       if (msg.role === 'user') {
-        flushTurnTodos();
+        if (!msg.synthetic && !isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) {
+          closeCompletedTurnTodos();
+        }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
         const visible = stripSteerEnvelopeForDisplay(
           stripInjectedRemindersForDisplay(
@@ -3846,9 +3837,7 @@ export function Chat({
             },
           });
           if (isTodoTool(tc.name)) {
-            if (isTodoPlanCall(rawArgs)) turnSawFullPlan = true;
             sessionTodoList = foldTodoToolCall(sessionTodoList, tc.name, rawArgs) ?? [];
-            turnHadTodoCalls = true;
           }
         }
         loaded.push({
@@ -3899,14 +3888,12 @@ export function Chat({
           const authoritative = parseTodosFromOutput(output);
           if (authoritative && authoritative.length > 0) {
             sessionTodoList = authoritative;
-            turnHadTodoCalls = true;
-            turnSawFullPlan = true;
           }
         }
       }
       // system messages: skip
     }
-    flushTurnTodos();
+    closeCompletedTurnTodos();
     return loaded;
   }
 

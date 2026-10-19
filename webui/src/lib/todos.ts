@@ -588,30 +588,24 @@ export function restoreStickyTodos(input: {
   return input.stashed && input.stashed.length > 0 ? cloneTodos(input.stashed) : null;
 }
 
-/** Attach an archived checklist to the assistant that owns `revision`, not whichever reply is newest. */
+/**
+ * 全部完成后，贴到这次停止时的最后一条助手消息尾部，且只有一份。
+ * 不按最早的 todo 调用回贴，避免下一轮中途停止时把上一份完成清单画到新消息上。
+ */
 export function placeArchivedTodos<T extends {
   role: string;
   parts: Array<{ kind: string; tool?: { id?: string }; items?: TodoItem[] }>;
 }>(
   messages: T[],
   items: TodoItem[],
-  revision: string | null,
+  _revision: string | null,
 ): T[] {
-  if (items.length === 0) return messages;
+  if (items.length === 0 || !items.every((item) => item.status === 'completed')) return messages;
   let index = -1;
-  if (revision) {
-    index = messages.findIndex(
-      (message) =>
-        message.role === 'assistant' &&
-        message.parts.some((part) => part.kind === 'tool' && part.tool?.id === revision),
-    );
-  }
-  if (index < 0) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i]!.role === 'assistant') {
-        index = i;
-        break;
-      }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === 'assistant') {
+      index = i;
+      break;
     }
   }
   if (index < 0) return messages;

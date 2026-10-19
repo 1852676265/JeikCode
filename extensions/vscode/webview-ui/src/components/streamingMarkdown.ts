@@ -382,8 +382,42 @@ function repairGfmTableDelimiters(source: string): string {
   return output.join('\n');
 }
 
+/**
+ * 规范化任务列表复选框标记：
+ * 将常见变体（如 `- [√]`、`- [✔]`、`- [✓]`、`- [v]`、`- [V]`）自动转换为标准 GFM `- [x]`。
+ */
+export function normalizeTaskCheckboxes(source: string): string {
+  const lines = source.split('\n');
+  let inFence = false;
+  const out: string[] = [];
+
+  for (const line of lines) {
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (!inFence) {
+      out.push(
+        line.replace(
+          /^(\s*(?:>\s*)*(?:[-*+]|\d+[\.\)]))\s*\[\s*([√✔✓vVxX]|\s*)\s*\](\s+|$)/,
+          (_, prefix, mark, space) => {
+            const isChecked = /[√✔✓vVxX]/.test(mark);
+            return `${prefix} [${isChecked ? 'x' : ' '}]${space || ' '}`;
+          },
+        ),
+      );
+    } else {
+      out.push(line);
+    }
+  }
+
+  return out.join('\n');
+}
+
 export function prepareMarkdownForRender(source: string, streaming: boolean): string {
-  const repairedTables = repairGfmTableDelimiters(source);
+  const normalizedTasks = normalizeTaskCheckboxes(source);
+  const repairedTables = repairGfmTableDelimiters(normalizedTasks);
   const tableSafeSource = separateTableFromFollowingParagraph(repairedTables);
   const protectedSource = protectInlineCodeFenceLines(tableSafeSource);
   return streaming ? repairStreamingMarkdown(protectedSource) : protectedSource;
