@@ -7,8 +7,11 @@ import {
   isTodoTool,
   parseTodoPlan,
   parseTodosFromOutput,
+  placeArchivedTodos,
+  reduceLiveTodo,
   reduceTodosFromCalls,
   restoreStickyTodos,
+  settleLiveTodo,
   stickyFromDiskCatchUp,
   todoBaselineForLiveApply,
   todoCallIdsFromMessages,
@@ -352,7 +355,7 @@ test('multi-turn folding maintains running todo list and supports re-planning', 
   assert.equal(sessionTodos?.[0]?.status, 'in_progress');
 });
 
-test('restoreStickyTodos folds unfinished todowrite rows after a session switch', () => {
+test('restoreStickyTodos does not resurrect a checklist from archived tool rows', () => {
   const messages = [
     {
       role: 'assistant',
@@ -373,9 +376,31 @@ test('restoreStickyTodos folds unfinished todowrite rows after a session switch'
       ],
     },
   ];
-  const restored = restoreStickyTodos({ messages });
-  assert.equal(restored?.length, 3);
-  assert.equal(restored?.[1]?.status, 'in_progress');
+  assert.equal(restoreStickyTodos({ messages }), null);
+  const fromServer = restoreStickyTodos({
+    messages,
+    authoritativeTodos: [
+      { content: 'task 1', status: 'completed' },
+      { content: 'task 2', status: 'in_progress' },
+      { content: 'task 3', status: 'pending' },
+    ],
+  });
+  assert.equal(fromServer?.length, 3);
+  assert.equal(fromServer?.[1]?.status, 'in_progress');
+  assert.equal(
+    restoreStickyTodos({
+      messages: [],
+      authoritativeTodos: [],
+    }),
+    null,
+  );
+  assert.equal(
+    restoreStickyTodos({
+      messages: [],
+      authoritativeTodos: [{ content: 'done', status: 'completed' }],
+    })?.length,
+    1,
+  );
 });
 
 test('incognito restore of completed items 1 and 2 hides the sticky panel', () => {
@@ -416,7 +441,7 @@ test('incognito restore of completed items 1 and 2 hides the sticky panel', () =
   assert.equal(restoreStickyTodos({ messages, stashed: null }), null);
 });
 
-test('restoreStickyTodos hides a fully completed plan even if a stash remains', () => {
+test('server snapshot replaces a stale in-memory list', () => {
   const messages = [
     {
       role: 'assistant',
@@ -433,11 +458,22 @@ test('restoreStickyTodos hides a fully completed plan even if a stash remains', 
       ],
     },
   ];
-  const restored = restoreStickyTodos({
-    messages,
-    stashed: [{ content: 'stale', status: 'pending' }],
-  });
-  assert.equal(restored, null);
+  assert.equal(
+    restoreStickyTodos({
+      messages,
+      stashed: [{ content: 'stale', status: 'pending' }],
+      authoritativeTodos: [],
+    }),
+    null,
+  );
+  assert.equal(
+    restoreStickyTodos({
+      messages,
+      stashed: [{ content: 'stale', status: 'pending' }],
+      authoritativeTodos: [{ content: 'live', status: 'in_progress' }],
+    })?.[0]?.content,
+    'live',
+  );
 });
 
 test('restoreStickyTodos keeps the live stash when the tail only has incremental updates', () => {
@@ -465,7 +501,7 @@ test('restoreStickyTodos keeps the live stash when the tail only has incremental
   assert.deepEqual(restored, stash);
 });
 
-test('restoreStickyTodos falls back to an unfinished frozen todo_list part', () => {
+test('restoreStickyTodos ignores a frozen todo_list part', () => {
   const items = [
     { content: 'open', status: 'pending' as const },
   ];
@@ -477,7 +513,7 @@ test('restoreStickyTodos falls back to an unfinished frozen todo_list part', () 
       },
     ],
   });
-  assert.deepEqual(restored, items);
+  assert.equal(restored, null);
 });
 
 test('applyLiveTodoToolCall ignores a replayed call id and replaces on a new full plan', () => {
@@ -544,7 +580,13 @@ test('stickyFromDiskCatchUp leaves the live panel alone while the turn is runnin
     undefined,
   );
   const settled = stickyFromDiskCatchUp({ running: false, messages });
-  assert.equal(settled?.[0]?.content, 'disk');
+  assert.equal(settled, null);
+  const fromServer = stickyFromDiskCatchUp({
+    running: false,
+    messages,
+    authoritativeTodos: [{ content: 'disk', status: 'pending' }],
+  });
+  assert.equal(fromServer?.[0]?.content, 'disk');
 });
 
 test('todoCallIdsFromMessages collects todowrite call ids', () => {
@@ -929,7 +971,7 @@ test('parseTodosFromOutput extracts authoritative numbered list across various g
   assert.equal(parsed?.[5]?.status, 'completed');
 });
 
-test('restoreStickyTodos adopts authoritative list directly from latest tool output', () => {
+test('archived tool output does not resurrect the live panel', () => {
   const messages = [
     {
       role: 'assistant',
@@ -948,12 +990,54 @@ test('restoreStickyTodos adopts authoritative list directly from latest tool out
     },
   ];
 
-  const restored = restoreStickyTodos({ messages });
-  assert.equal(restored?.length, 2);
-  assert.equal(restored?.[0]?.content, '真实后端清单 A');
-  assert.equal(restored?.[0]?.status, 'pending');
-  assert.equal(restored?.[1]?.content, '真实后端清单 B');
-  assert.equal(restored?.[1]?.status, 'in_progress');
+  assert.equal(restoreStickyTodos({ messages }), null);
+  const preview = reduceLiveTodo(null, {
+    type: 'preview',
+    callId: 'call_1',
+    items: [
+      { content: '真实后端清单 A', status: 'pending' },
+      { content: '真实后端清单 B', status: 'in_progress' },
+    ],
+  });
+  const replayedPreview = reduceLiveTodo(preview, {
+    type: 'preview',
+    callId: 'call_1',
+    items: [{ content: 'ghost', status: 'pending' }],
+  });
+  assert.equal(replayedPreview, preview);
+  const result = reduceLiveTodo(preview, {
+    type: 'result',
+    callId: 'call_1',
+    items: [
+      { content: '真实后端清单 A', status: 'completed' },
+      { content: '真实后端清单 B', status: 'completed' },
+    ],
+  });
+  assert.equal(result?.resultApplied, true);
+  assert.equal(reduceLiveTodo(result, {
+    type: 'result',
+    callId: 'call_1',
+    items: [{ content: 'ghost', status: 'pending' }],
+  }), result);
+  const settled = settleLiveTodo(result);
+  assert.equal(settled.next, null);
+  assert.equal(settled.archive?.length, 2);
+  assert.equal(settleLiveTodo(reduceLiveTodo(null, {
+    type: 'result',
+    callId: 'open',
+    items: [{ content: 'still', status: 'in_progress' }],
+  })).archive, null);
+  const placed = placeArchivedTodos(
+    [
+      { role: 'assistant', parts: [{ kind: 'tool', tool: { id: 'call_1' } }] },
+      { role: 'user', parts: [{ kind: 'text' }] },
+      { role: 'assistant', parts: [{ kind: 'text' }] },
+    ],
+    settled.archive ?? [],
+    'call_1',
+  );
+  assert.equal(placed[0]!.parts.some((part) => part.kind === 'todo_list'), true);
+  assert.equal(placed[2]!.parts.some((part) => part.kind === 'todo_list'), false);
 });
 
 

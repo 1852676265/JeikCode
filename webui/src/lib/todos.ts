@@ -94,11 +94,6 @@ function validateActionsMix(actions: Record<string, unknown>[]): boolean {
   return true;
 }
 
-function maybeAutoClearFinished(list: TodoItem[]): TodoItem[] {
-  if (list.length > 0 && list.every((item) => item.status === 'completed')) return [];
-  return list;
-}
-
 function normalizeTodoContent(content: string): string {
   return content.split(/\s+/).filter(Boolean).join(' ');
 }
@@ -511,47 +506,76 @@ export interface StickyTodoMessage {
   }>;
 }
 
-function unfinishedTodos(items: TodoItem[] | null | undefined): TodoItem[] | null {
-  if (!items || items.length === 0) return null;
-  if (items.every((item) => item.status === 'completed')) return null;
-  return items;
-}
-
-function collectTodoCalls(messages: StickyTodoMessage[]): Array<{ name: string; args: string }> {
-  const calls: Array<{ name: string; args: string }> = [];
-  for (const message of messages) {
-    if (message.role !== 'assistant' || !message.parts) continue;
-    for (const part of message.parts) {
-      if (part.kind === 'tool' && part.tool && isTodoTool(part.tool.name)) {
-        calls.push({ name: part.tool.name, args: part.tool.args });
-      }
-    }
-  }
-  return calls;
-}
-
-function unfinishedTodoListFromParts(messages: StickyTodoMessage[]): TodoItem[] | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const parts = messages[i]!.parts;
-    if (!parts) continue;
-    for (let j = parts.length - 1; j >= 0; j--) {
-      const part = parts[j]!;
-      if (part.kind !== 'todo_list' || !part.items?.length) continue;
-      return unfinishedTodos(part.items);
-    }
-  }
-  return null;
+function cloneTodos(items: TodoItem[]): TodoItem[] {
+  return items.map((item) => ({ ...item }));
 }
 
 /**
- * Rebuild the composer sticky todo panel from a transcript window.
+ * The one live checklist for a session.
  *
- * Unfinished plans are intentionally not frozen onto assistant bubbles, so
- * looking for a trailing `todo_list` part after a sidebar switch always
- * missed the live panel. Fold `todowrite` tool rows instead (TUI
- * `todo_progress_from_messages` parity). Keep `stashed` when the visible
- * window only has incremental updates — the original plan may sit outside
- * the history tail.
+ * `revision` is the todo tool call the bus last applied. A replay of that
+ * same call does not change the document. `resultApplied` is the authoritative
+ * tool_result; an earlier tool_start is only a preview of the same revision.
+ */
+export interface LiveTodoDocument {
+  items: TodoItem[];
+  revision: string | null;
+  resultApplied: boolean;
+}
+
+export type LiveTodoEvent =
+  | { type: 'preview'; callId?: string; items: TodoItem[] }
+  | { type: 'result'; callId?: string; items: TodoItem[] }
+  | { type: 'hydrate'; items: TodoItem[] }
+  | { type: 'clear' };
+
+/** Bus/hydrate transition. Returns the same document when the event is a replay. */
+export function reduceLiveTodo(
+  doc: LiveTodoDocument | null,
+  event: LiveTodoEvent,
+): LiveTodoDocument | null {
+  if (event.type === 'clear') return null;
+  if (event.type === 'hydrate') {
+    return event.items.length > 0
+      ? { items: cloneTodos(event.items), revision: null, resultApplied: false }
+      : null;
+  }
+  if (event.items.length === 0) return null;
+  if (
+    event.callId &&
+    doc &&
+    doc.revision === event.callId &&
+    (event.type === 'preview' || doc.resultApplied)
+  ) {
+    return doc;
+  }
+  return {
+    items: cloneTodos(event.items),
+    revision: event.callId ?? null,
+    resultApplied: event.type === 'result',
+  };
+}
+
+/**
+ * Turn reply has stopped (not an in-flight SSE delta).
+ * A fully checked list leaves the live document and is archived once.
+ * Open items stay live for the next step.
+ */
+export function settleLiveTodo(doc: LiveTodoDocument | null): {
+  archive: TodoItem[] | null;
+  next: LiveTodoDocument | null;
+} {
+  if (!doc || doc.items.length === 0) return { archive: null, next: doc };
+  if (!doc.items.every((item) => item.status === 'completed')) {
+    return { archive: null, next: doc };
+  }
+  return { archive: cloneTodos(doc.items), next: null };
+}
+
+/**
+ * Live panel after a switch or reload.
+ * The server list replaces the document. Message parts are history and are
+ * not folded back into the live document.
  */
 export function restoreStickyTodos(input: {
   messages: StickyTodoMessage[];
@@ -559,37 +583,44 @@ export function restoreStickyTodos(input: {
   authoritativeTodos?: TodoItem[] | null;
 }): TodoItem[] | null {
   if (Array.isArray(input.authoritativeTodos)) {
-    // 关键防线：当服务端权威清单已给出时（包含权威空数组 [] 即全部完成归档），
-    // 坚决采纳服务端权威真源，严禁因为权威列表为空而绕过真源去回退 stashed 招魂复活！
-    return unfinishedTodos(input.authoritativeTodos);
+    return input.authoritativeTodos.length > 0 ? cloneTodos(input.authoritativeTodos) : null;
   }
-  // 关键真源优先：优先从最近的已完成 todo 工具输出中提取后端权威编号清单（治本之策：消除本地折叠漂移）
-  for (let i = input.messages.length - 1; i >= 0; i--) {
-    const parts = input.messages[i]?.parts;
-    if (!parts) continue;
-    for (let j = parts.length - 1; j >= 0; j--) {
-      const p = parts[j];
-      if (p && p.kind === 'tool' && p.tool && isTodoTool(p.tool.name) && p.tool.output) {
-        const fromOutput = parseTodosFromOutput(p.tool.output);
-        if (fromOutput && fromOutput.length > 0) {
-          return unfinishedTodos(fromOutput);
-        }
+  return input.stashed && input.stashed.length > 0 ? cloneTodos(input.stashed) : null;
+}
+
+/** Attach an archived checklist to the assistant that owns `revision`, not whichever reply is newest. */
+export function placeArchivedTodos<T extends {
+  role: string;
+  parts: Array<{ kind: string; tool?: { id?: string }; items?: TodoItem[] }>;
+}>(
+  messages: T[],
+  items: TodoItem[],
+  revision: string | null,
+): T[] {
+  if (items.length === 0) return messages;
+  let index = -1;
+  if (revision) {
+    index = messages.findIndex(
+      (message) =>
+        message.role === 'assistant' &&
+        message.parts.some((part) => part.kind === 'tool' && part.tool?.id === revision),
+    );
+  }
+  if (index < 0) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]!.role === 'assistant') {
+        index = i;
+        break;
       }
     }
   }
-  const calls = collectTodoCalls(input.messages);
-  if (calls.length > 0) {
-    const rawFolded = reduceTodosFromCalls(calls, input.stashed);
-    // 若历史调用折叠出的清单全部已完成，代表该轮计划已全部结算，严禁回退 stashed 招魂复活！
-    if (rawFolded.length > 0 && rawFolded.every((item) => item.status === 'completed')) {
-      return null;
-    }
-    const folded = unfinishedTodos(rawFolded);
-    if (folded) return folded;
-    if (calls.some((call) => isTodoPlanCall(call.args) || isClearActionCall(call.args))) return null;
-    return unfinishedTodos(input.stashed);
-  }
-  return unfinishedTodoListFromParts(input.messages) ?? unfinishedTodos(input.stashed);
+  if (index < 0) return messages;
+  const current = messages[index]!;
+  const parts = current.parts.filter((part) => part.kind !== 'todo_list');
+  parts.push({ kind: 'todo_list', items: cloneTodos(items) });
+  const next = messages.slice();
+  next[index] = { ...current, parts };
+  return next;
 }
 
 export function todoCallIdsFromMessages(messages: StickyTodoMessage[]): string[] {

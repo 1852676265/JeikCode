@@ -270,8 +270,8 @@ fn unknown_or_uninferable_action(v: &serde_json::Value) -> String {
 }
 
 /// Legal `actions` mixes (id-shifting ops cannot share a batch with a different kind):
-/// - `add` + `update` (add only appends; existing ids stay unless the list was
-///   already a closed plan — see [`maybe_auto_clear_finished`])
+/// - `add` + `update` (add only appends; a finished plan stays in place so later
+///   adds extend it instead of restarting ids)
 /// - `clear` + `add` + `update` (`clear` always runs first, then add, then update)
 /// - `insert` + `update` (internally: all inserts first, then updates by post-insert id)
 /// - `delete` only (any order; ids are pre-batch)
@@ -399,13 +399,6 @@ fn upsert_todo(
     idx + 1
 }
 
-#[allow(dead_code)]
-fn maybe_auto_clear_finished(list: &mut Vec<TodoItem>) {
-    if !list.is_empty() && list.iter().all(|t| t.status == TodoStatus::Completed) {
-        list.clear();
-    }
-}
-
 /// Map an `update` id onto the list after this batch's adds.
 ///
 /// Models use two numberings:
@@ -491,12 +484,12 @@ fn apply_actions_batch(
         if has_add {
             for item in arr {
                 if action_kind(item) == Some("add") {
-                    add_landings.push(apply_add(&mut tmp, item, false)?);
+                    add_landings.push(apply_add(&mut tmp, item)?);
                 }
             }
         }
         for item in &seed_updates {
-            add_landings.push(apply_add(&mut tmp, item, false)?);
+            add_landings.push(apply_add(&mut tmp, item)?);
         }
     }
 
@@ -567,11 +560,7 @@ fn action_status(v: &serde_json::Value) -> Option<TodoStatus> {
         .and_then(TodoStatus::parse)
 }
 
-fn apply_add(
-    list: &mut Vec<TodoItem>,
-    v: &serde_json::Value,
-    _auto_clear: bool,
-) -> Result<usize, String> {
+fn apply_add(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Result<usize, String> {
     let content = v
         .get("content")
         .and_then(|c| c.as_str())
@@ -609,7 +598,7 @@ fn apply_update(
         if item_has_content(v)
             && (list_is_seedable(list) || id == (list.len() as u64).saturating_add(1))
         {
-            apply_add(list, v, true)?;
+            apply_add(list, v)?;
             return Ok(());
         }
         return Err(unknown_task_id(id, list));
@@ -656,11 +645,11 @@ fn apply_update(
 /// can roll back.
 fn try_apply_one_action(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Result<(), String> {
     match action_kind(v) {
-        Some("add") => apply_add(list, v, true).map(|_| ()),
+        Some("add") => apply_add(list, v).map(|_| ()),
         Some("insert") => apply_insert(list, v).map(|_| ()),
         Some("update") => {
             if list_is_seedable(list) && item_has_content(v) {
-                apply_add(list, v, true).map(|_| ())
+                apply_add(list, v).map(|_| ())
             } else {
                 apply_update(list, v, list.len(), &[])
             }
@@ -759,6 +748,22 @@ pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
             .flat_map(|m| m.tool_calls.iter())
             .map(|c| (c.name.as_str(), c.arguments.as_str())),
     )
+}
+
+/// Live panel exposed by the session API.
+///
+/// A finished checklist stays visible only while that turn is still running, so the
+/// canvas can keep it until stop. Once the session is idle, a fully completed plan
+/// is history and must not come back as the active board.
+pub fn session_sticky_todos(messages: &[Message], turn_running: bool) -> Vec<TodoItem> {
+    let todos = derive_current_todos(messages);
+    if todos.is_empty()
+        || (!turn_running && todos.iter().all(|t| t.status == TodoStatus::Completed))
+    {
+        Vec::new()
+    } else {
+        todos
+    }
 }
 
 /// Live list handle shared with the coding `TodoHook` so `execute` validates ids
@@ -1244,6 +1249,23 @@ mod tests {
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].content, "new"); // LAST wins
         assert_eq!(todos[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn session_sticky_todos_hides_completed_plan_once_idle() {
+        let msgs = vec![Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "1".into(),
+                name: "todowrite".into(),
+                arguments: r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"completed"}]}"#.into(),
+            }],
+        )];
+        assert!(
+            session_sticky_todos(&msgs, false).is_empty(),
+            "an idle completed plan must not be returned as the live panel"
+        );
+        assert_eq!(session_sticky_todos(&msgs, true).len(), 2);
     }
 
     #[test]

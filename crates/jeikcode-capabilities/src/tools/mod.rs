@@ -97,8 +97,8 @@ pub use report_finding::{Finding, ReportFindingTool};
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
 pub use task::TaskTool;
 pub use todo::{
-    bind_todowrite, derive_current_todos, is_todo_tool_name, todo_action_kind, TodoItem, TodoLive,
-    TodoTool, TODO_TOOL_ALIASES, TODO_TOOL_NAME,
+    bind_todowrite, derive_current_todos, is_todo_tool_name, session_sticky_todos,
+    todo_action_kind, TodoItem, TodoLive, TodoTool, TODO_TOOL_ALIASES, TODO_TOOL_NAME,
 };
 #[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;

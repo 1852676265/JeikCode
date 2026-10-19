@@ -4484,6 +4484,7 @@ async fn get_session_freshness(
 
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(
+    State(state): State<AppState>,
     Path((hash, id)): Path<(String, String)>,
     Query(query): Query<SessionDetailQuery>,
 ) -> impl IntoResponse {
@@ -4500,8 +4501,21 @@ async fn get_session_detail(
             let turns = session_user_outline(&messages);
             let (message_count, offset, messages) = apply_session_message_window(messages, &query);
             let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
-            let todos =
-                jeikcode_capabilities::tools::derive_current_todos(&session.snapshot.messages);
+            let turn_running = state
+                .active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|sid| sid == &id)
+                || crate::native_live::live_running_session_id().as_deref() == Some(id.as_str())
+                || jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global()
+                    .live_turn_session_ids()
+                    .iter()
+                    .any(|sid| sid == &id);
+            let todos = jeikcode_capabilities::tools::session_sticky_todos(
+                &session.snapshot.messages,
+                turn_running,
+            );
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
