@@ -388,32 +388,35 @@
 .markdown-root p { white-space: pre-wrap; margin-top: 0.1em; margin-bottom: 0.2em; overflow-wrap: anywhere; }
 .markdown-root ul, .markdown-root ol { padding-inline-start: 2em; margin-bottom: 0.4em; }
 .markdown-root li { margin-bottom: 2px; overflow-wrap: anywhere; }
-.markdown-root li:has(input[type="checkbox"]),
 .markdown-root li:has(> input[type="checkbox"]),
+.markdown-root li:has(> p > input[type="checkbox"]),
 .markdown-root li.task-list-item {
   list-style: none;
   margin-left: -1.15em;
 }
-.markdown-root li:has(input[type="checkbox"]) > p,
-.markdown-root li.task-list-item > p {
+.markdown-root li:has(> input[type="checkbox"]) > p:first-child,
+.markdown-root li:has(> p > input[type="checkbox"]) > p:first-child,
+.markdown-root li.task-list-item > p:first-child {
   display: inline;
   margin: 0;
 }
-.markdown-root li:has(input[type="checkbox"]) > ol,
-.markdown-root li:has(input[type="checkbox"]) > ul,
-.markdown-root li.task-list-item > ol,
-.markdown-root li.task-list-item > ul {
-  display: inline;
-  margin: 0;
-  padding: 0;
-  list-style: none;
+.markdown-root li:has(> input[type="checkbox"]) > ul,
+.markdown-root li:has(> input[type="checkbox"]) > ol,
+.markdown-root li:has(> p > input[type="checkbox"]) > ul,
+.markdown-root li:has(> p > input[type="checkbox"]) > ol,
+.markdown-root li.task-list-item > ul,
+.markdown-root li.task-list-item > ol {
+  display: block;
+  margin: 0.25em 0 0.35em;
+  padding-inline-start: 1.5em;
 }
-.markdown-root li:has(input[type="checkbox"]) > ol > li,
-.markdown-root li:has(input[type="checkbox"]) > ul > li,
-.markdown-root li.task-list-item > ol > li,
-.markdown-root li.task-list-item > ul > li {
-  display: inline;
-  margin: 0;
+.markdown-root li:has(> input[type="checkbox"]) > ul > li,
+.markdown-root li:has(> input[type="checkbox"]) > ol > li,
+.markdown-root li:has(> p > input[type="checkbox"]) > ul > li,
+.markdown-root li:has(> p > input[type="checkbox"]) > ol > li,
+.markdown-root li.task-list-item > ul > li,
+.markdown-root li.task-list-item > ol > li {
+  display: list-item;
 }
 .markdown-root li input[type="checkbox"],
 .markdown-root li > input[type="checkbox"],
