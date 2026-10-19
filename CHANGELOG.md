@@ -21,6 +21,40 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.7-beta.1 (2026-10-19)
+
+- **[WebUI & Mobile Layout] Mobile model and reasoning effort selector optimization**:
+  - Relocated the reasoning effort picker button into the header bar of the model selector modal on mobile devices, placed neatly adjacent to model configurations.
+  - Cleared crowded mobile top navigation bar space, allowing session titles and model badges to display cleanly without truncation or overlap.
+  - Fine-tuned modal action buttons, touch tap targets, and elevated effort drawer modal overlay z-index (`100001`) to ensure seamless modal stacking.
+- **[Markdown Rendering & Checkbox Styling] Custom high-contrast task list checkboxes across light and dark themes**:
+  - Replaced browser-native disabled checkboxes with custom high-fidelity styled components to eliminate muddy gray opacity dimming.
+  - Styled checkboxes with a luminous emerald checkmark (`#34d399`) under dark theme and an elegant forest green (`#16a34a`) under light theme and system preferences.
+  - Standardized box geometry to 15px with subtle 4px rounded corners and aligned baselines for harmonious multi-line text flow.
+- **[Task Discipline & Canvas State] Prevention of premature todo clearing and canvas timer deadlocks**:
+  - Guarded TodoList against premature clearing when all items complete mid-turn, enabling subsequent tasks to append smoothly without ID resets or chain breaks.
+  - Resolved runaway stopwatch timers and canvas deadlocks by establishing terminal settlement guards against replayed user prompt events and cleanly detaching settled checklists.
+- **[Documentation & Deployment] Streamlined installation guide and dedicated autostart and remote access documentation**:
+  - Added the comprehensive "Autostart & Remote Access" guide detailing cross-platform daemon configuration (`jeikcode --host ...`) and desktop `0.0.0.0` listening.
+  - Refactored the "Quick Installation" guide into four clean delivery paths: Terminal CLI, Desktop GUI, Docker containerization, and Standalone binaries.
+  - Removed obsolete standalone deployment sections and aligned both English and Chinese documentation symmetrically.
+
+---
+
+- **[WebUI 与移动端体验] 移动端模型与思考强度选择器界面重构与排版优化**:
+  - 将手机端思考强度选择按钮收拢至模型选择弹窗顶部（模型配置右侧），大幅释放移动端顶栏宝贵空间，消除会话标题与状态图标的重叠挤压。
+  - 精细微调移动端弹窗各操作按钮高度、外边距与点击热区，并将思考强度抽屉遮罩层级提升至 `100001`，确保弹层层叠显示与交互流畅自然。
+- **[Markdown 渲染与待办清单] 亮色与暗色模式下高对比度待办复选框质感升级**:
+  - 彻底用自定义高保真样式组件替代浏览器原生 disabled 复选框，彻底杜绝深色模式下因系统透明度衰减导致的模糊发灰问题。
+  - 暗色主题下呈现发光翡翠绿对勾（`#34d399`），亮色主题与系统浅色偏好下平滑适配为优雅森林绿（`#16a34a`），对比度清晰舒适。
+  - 规范统一 15px 规格与 4px 微圆角外形，并精准校准垂直基线以适配多行列表排版。
+- **[任务流程与画布状态] 待办清单防提前清空与画布计时器死锁修复**:
+  - 防止 TodoList 在回合中途全部完成时被提前清空，支持后续追加新任务时在既有清单末尾顺延，杜绝任务 ID 重置与断链。
+  - 设立终端收尾屏障并对重放提问去重，根治回合结束时已完成清单无法及时剥离、画布计时器持续累加以及消息被误判为 Steer 卡片的死锁顽疾。
+- **[文档站点与部署指南] 全新开机自启与远程访问权威指南及快速安装重构**:
+  - 新增「开机自启与远程访问」章节，全面覆盖跨平台命令行常驻服务配置（`jeikcode --host ...`）与桌面端 `0.0.0.0` 远程监听。
+  - 将快速安装指南重构为清晰的四大交付形态：终端命令行、桌面端应用、Docker 容器化与独立单文件，剔除冗余孤立部署章节并保持中英文全链路对称。
+
 ## v7.2.6 (2026-10-19)
 
 - **[Edit Tool & Precision Diagnostics] 3-line focused context window and trailing equal-line suppression**:
