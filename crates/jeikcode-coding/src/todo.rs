@@ -294,7 +294,7 @@ mod tests {
         let session_id = format!("stop-check-{}", std::process::id());
         let tool = jeikcode_capabilities::tools::TodoTool::new();
         let hook = TodoHook::with_live(tool.live());
-        jeikcode_capabilities::tools::bind_todo_session(tool.live(), &session_id);
+        jeikcode_capabilities::tools::bind_todo_session(&tool.live(), &session_id);
         jeikcode_capabilities::tools::commit_todo_board(
             &session_id,
             &[
