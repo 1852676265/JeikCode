@@ -24983,20 +24983,19 @@ pub(crate) fn todo_progress_from_args(args: &str) -> Option<crate::render::TodoP
         .map(|todos| todo_progress_from_items(&todos))
 }
 
-/// Todo panel state derived from a full transcript — the last VALID `todowrite`
-/// call wins (mirrors capabilities::derive_current_todos, but over the core
-/// conversation message type held by `Session.messages`; tool calls live inside
-/// `AssistantWithToolCalls`). `None` when the session never used todowrite, or
-/// when the last valid call cleared the list. Used to seed the panel on
-/// `/resume` / session switch with zero extra storage.
+/// Live panel for a session. Reads the one TodoBoard. Empty or closed → no panel.
+pub(crate) fn todo_progress_from_board(session_id: &str) -> Option<crate::render::TodoProgress> {
+    let board = jeikcode_capabilities::tools::read_todo_board(session_id)?;
+    if board.items.is_empty() {
+        return None;
+    }
+    Some(todo_progress_from_items(&board.items))
+}
+
+/// Historical helper kept for tests that build a transcript without a board.
 pub(crate) fn todo_progress_from_messages(
     messages: &[jeikcode_kernel::message::Message],
 ) -> Option<crate::render::TodoProgress> {
-    // Fold `todowrite` (replace) + `todo` (add/update) in transcript order through the SAME
-    // reducer capabilities uses, so a resumed session's panel reflects incremental updates —
-    // not just the last full-list todowrite. Collect (name, args) in order first.
-    // kernel `Message.tool_calls` is a flat field (non-empty only on assistant
-    // messages that requested tools), so no content-variant match is needed.
     let calls: Vec<(&str, &str)> = messages
         .iter()
         .flat_map(|m| m.tool_calls.iter())
@@ -25004,7 +25003,7 @@ pub(crate) fn todo_progress_from_messages(
         .collect();
     let todos = jeikcode_capabilities::tools::todo::reduce_todos(calls);
     if todos.is_empty() {
-        return None; // no list, or the last valid todowrite cleared it → hide panel
+        return None;
     }
     Some(todo_progress_from_items(&todos))
 }

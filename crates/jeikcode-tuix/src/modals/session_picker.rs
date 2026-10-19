@@ -762,7 +762,7 @@ pub(crate) fn replay_session(
     // Seed the persistent todo panel + id→title cache BEFORE rendering so a
     // rebuilt batch's `todo update #N` children can splice in task titles the
     // same way the live path does. (Also resets a prior session's panel/titles.)
-    state.active_todos = crate::event_loop::todo_progress_from_messages(&session.messages);
+    state.active_todos = crate::event_loop::todo_progress_from_board(&session.id);
     crate::event_loop::sync_todo_titles(state);
     for (i, m) in session.messages.iter().enumerate() {
         if is_real_user_message(m) {

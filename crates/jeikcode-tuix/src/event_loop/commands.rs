@@ -3917,8 +3917,7 @@ fn execute_slash_command_impl(
                 }
                 // Re-print the (possibly mutated) list as confirmation — shared by
                 // add-success, clear, and a bare `/todo`.
-                let out =
-                    format_todo_command(&ctx.current_session.messages, ctx.caps.unicode_symbols);
+                let out = format_todo_board(&ctx.current_session.id, ctx.caps.unicode_symbols);
                 renderer.render(UiLine::CommandOutput(out));
                 renderer.flush();
             }
@@ -6249,8 +6248,7 @@ fn reseed_todo_conversation(
     ctx.current_session
         .update_from_conversation_snapshot(snapshot);
     ctx.current_session.touch();
-    state.active_todos =
-        crate::event_loop::todo_progress_from_messages(&ctx.current_session.messages);
+    state.active_todos = crate::event_loop::todo_progress_from_board(&ctx.current_session.id);
     crate::event_loop::sync_todo_titles(state);
 }
 
@@ -6258,6 +6256,15 @@ fn reseed_todo_conversation(
 /// on the model, so the next turn's TodoHook sees it and the model can act on it.
 fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
     let id = format!("todo-add-{}", ctx.current_session.messages.len());
+    let sid = ctx.current_session.id.clone();
+    let mut items = jeikcode_capabilities::tools::read_todo_board(&sid)
+        .map(|board| board.items)
+        .unwrap_or_default();
+    items.push(jeikcode_capabilities::tools::TodoItem {
+        content: content.to_string(),
+        status: jeikcode_capabilities::tools::todo::TodoStatus::Pending,
+    });
+    jeikcode_capabilities::tools::commit_todo_board(&sid, &items);
     reseed_todo_conversation(ctx, state, todo_add_messages(id, content));
 }
 
@@ -6266,7 +6273,22 @@ fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
 /// empty list and injects nothing).
 fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
     let id = format!("todo-clear-{}", ctx.current_session.messages.len());
+    jeikcode_capabilities::tools::clear_todo_board(&ctx.current_session.id);
     reseed_todo_conversation(ctx, state, todo_clear_messages(id));
+}
+
+fn format_todo_board(session_id: &str, unicode: bool) -> String {
+    let Some(board) = jeikcode_capabilities::tools::read_todo_board(session_id) else {
+        return t(Msg::TodoNoList).into_owned();
+    };
+    if board.items.is_empty() {
+        return t(Msg::TodoNoList).into_owned();
+    }
+    format!(
+        "{}\n{}",
+        t(Msg::TodoListHeader),
+        jeikcode_capabilities::tools::todo::render_todos_text(&board.items, unicode)
+    )
 }
 
 /// Build the `/todo` output from the session message history.

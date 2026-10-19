@@ -1016,6 +1016,20 @@ pub fn commit_todo_board(session_id: &str, items: &[TodoItem]) -> TodoBoard {
     board
 }
 
+/// Explicit wipe (`/todo clear`). Readers afterwards see no live checklist.
+pub fn clear_todo_board(session_id: &str) {
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    guard.insert(
+        session_id.to_string(),
+        TodoSlot {
+            board: None,
+            closed: true,
+        },
+    );
+}
+
 /// After streaming has stopped, drop the live board only when every item is checked.
 /// Returns the closed board so the caller can keep it as history. Open items stay.
 pub fn close_todo_board_if_complete(session_id: &str) -> Option<TodoBoard> {
@@ -1073,11 +1087,25 @@ impl TodoTool {
         Arc::clone(&self.live)
     }
 
-    fn publish_board(&self, items: &[TodoItem]) {
-        let Some(session_id) = todo_session_of(&self.live) else {
-            return;
-        };
-        commit_todo_board(&session_id, items);
+    /// 当前会话清单。已绑定会话时只读实例；读锁在写锁放开后才能拿到提交后的状态。
+    fn board_items(&self) -> Vec<TodoItem> {
+        if let Some(session_id) = todo_session_of(&self.live) {
+            if let Some(board) = read_todo_board(&session_id) {
+                return board.items;
+            }
+        }
+        self.lock_live().clone()
+    }
+
+    /// 写入唯一清单，再读回提交后的条目，供工具输出使用。
+    fn commit_and_read(&self, items: &[TodoItem]) -> Vec<TodoItem> {
+        if let Some(session_id) = todo_session_of(&self.live) {
+            let board = commit_todo_board(&session_id, items);
+            *self.lock_live() = board.items.clone();
+            return board.items;
+        }
+        *self.lock_live() = items.to_vec();
+        items.to_vec()
     }
 
     fn lock_live(&self) -> std::sync::MutexGuard<'_, Vec<TodoItem>> {
@@ -1243,18 +1271,17 @@ impl Tool for TodoTool {
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&args) else {
             return err("todowrite: invalid JSON arguments.".to_string());
         };
-        let mut list = self.lock_live().clone();
+        let mut list = self.board_items();
 
         // Legacy full-list replace (resume / old transcripts). Prefer `actions`.
         // `actions` wins if both fields are present (same as the fold).
         if v.get("actions").and_then(|a| a.as_array()).is_none() && v.get("todos").is_some() {
             return match parse_todos(&args) {
                 Ok(todos) => {
-                    *self.lock_live() = todos.clone();
-                    self.publish_board(&todos);
-                    ok(render_todos_numbered(&todos, false))
+                    let stored = self.commit_and_read(&todos);
+                    ok(render_todos_numbered(&stored, false))
                 }
-                Err(e) => err(with_current_list(e, &list)),
+                Err(e) => err(with_current_list(e, &self.board_items())),
             };
         }
 
@@ -1272,36 +1299,38 @@ impl Tool for TodoTool {
         ) {
             return ok(format!(
                 "Current task list:\n\n{}",
-                render_todos_numbered(&list, false)
+                render_todos_numbered(&self.board_items(), false)
             ));
         }
 
         if v.get("actions").and_then(|a| a.as_array()).is_none() {
             return err(with_current_list(
                 "todowrite: provide a non-empty `actions` array of task action objects.",
-                &list,
+                &self.board_items(),
             ));
         }
 
         let summary = match todo_change_summary(&v) {
             Ok(s) => s,
-            Err(e) => return err(with_current_list(e, &list)),
+            Err(e) => return err(with_current_list(e, &self.board_items())),
         };
 
         match try_apply_todo_args(&mut list, &args) {
-            Ok(ApplyOutcome::Unchanged) => ok(format!(
-                "No change — already in that state. Do not retry.\n\n{}",
-                render_todos_numbered(&list, false)
-            )),
-            Ok(ApplyOutcome::Changed) => {
-                *self.lock_live() = list.clone();
-                self.publish_board(&list);
+            Ok(ApplyOutcome::Unchanged) => {
+                let stored = self.board_items();
                 ok(format!(
-                    "{summary}\n\n{}",
-                    render_todos_numbered(&list, false)
+                    "No change — already in that state. Do not retry.\n\n{}",
+                    render_todos_numbered(&stored, false)
                 ))
             }
-            Err(e) => err(with_current_list(e, &self.lock_live())),
+            Ok(ApplyOutcome::Changed) => {
+                let stored = self.commit_and_read(&list);
+                ok(format!(
+                    "{summary}\n\n{}",
+                    render_todos_numbered(&stored, false)
+                ))
+            }
+            Err(e) => err(with_current_list(e, &self.board_items())),
         }
     }
 }

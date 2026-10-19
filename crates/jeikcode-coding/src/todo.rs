@@ -63,6 +63,19 @@ impl TodoHook {
             *live.lock().unwrap_or_else(|e| e.into_inner()) = todos.to_vec();
         }
     }
+
+    /// 结束拦截只看会话上的那一份清单。没有绑会话时才退回转录，供旧单测使用。
+    fn stop_check_items(&self, convo: &Conversation) -> Vec<TodoItem> {
+        let Some(live) = &self.live else {
+            return derive_current_todos(&convo.messages);
+        };
+        if let Some(session_id) = jeikcode_capabilities::tools::todo::todo_session_of(live) {
+            return jeikcode_capabilities::tools::read_todo_board(&session_id)
+                .map(|board| board.items)
+                .unwrap_or_default();
+        }
+        live.lock().unwrap_or_else(|err| err.into_inner()).clone()
+    }
 }
 
 /// Index of the current real-user turn's start (last non-synthetic user message).
@@ -140,11 +153,12 @@ impl LifecycleHooks for TodoHook {
         // 实时清单以会话上的 TodoBoard 为准，不从转录折算回灌。
     }
 
-    /// The model wants to stop. If the task list still has OPEN items (pending or in_progress),
-    /// and actionable work was performed without answering or asking, inject a one-shot nudge
-    /// to close them out and continue the turn. Fires at most once per real-user turn.
+    /// The model wants to stop. If the live checklist still has OPEN items
+    /// (pending or in_progress), and actionable work was performed without
+    /// answering or asking, inject a one-shot nudge to close them out and
+    /// continue the turn. Fires at most once per real-user turn.
     async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
-        let todos = derive_current_todos(&convo.messages);
+        let todos = self.stop_check_items(convo);
         let has_open = todos.iter().any(|t| t.status != TodoStatus::Completed);
         if !has_open
             || !active_work_or_managed_todos_this_turn(convo)
@@ -272,6 +286,38 @@ mod tests {
         assert!(
             TodoHook::new().offer_continuation(&convo).await.is_some(),
             "open item on stop after todowrite must nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_board_does_not_nudge_when_the_transcript_fold_still_looks_open() {
+        let session_id = format!("stop-check-{}", std::process::id());
+        let tool = jeikcode_capabilities::tools::TodoTool::new();
+        let hook = TodoHook::with_live(tool.live());
+        jeikcode_capabilities::tools::bind_todo_session(tool.live(), &session_id);
+        jeikcode_capabilities::tools::commit_todo_board(
+            &session_id,
+            &[
+                TodoItem {
+                    content: "a".into(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "b".into(),
+                    status: TodoStatus::Completed,
+                },
+            ],
+        );
+        let convo = convo_of(vec![
+            Message::user("do the audit"),
+            todowrite_msg(
+                r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#,
+            ),
+            Message::assistant("here is the summary…", vec![]),
+        ]);
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "a finished TodoBoard must not be reopened by the transcript fold"
         );
     }
 

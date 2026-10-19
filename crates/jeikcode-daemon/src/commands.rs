@@ -618,25 +618,17 @@ fn exec_todo(
     let sid = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for todo"))?;
     let session = load_command_session_view(working_dir, project_hash, sid)?;
 
+    let _ = session;
     Ok(CommandResult::Todo {
-        items: todo_items_from_messages(&session.snapshot.messages),
+        items: todo_items_from_board(sid),
     })
 }
 
-fn todo_items_from_messages(messages: &[jeikcode_kernel::message::Message]) -> Vec<TodoItemJson> {
-    // Fold the kernel-native tool-call stream via the canonical reducer. This shows CURRENT
-    // statuses in `/todo`, matching the merged `todowrite` tool + the TUI.
-    use jeikcode_capabilities::tools::todo::{reduce_todos, TodoStatus};
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|message| {
-            message
-                .tool_calls
-                .iter()
-                .map(|call| (call.name.as_str(), call.arguments.as_str()))
-        })
-        .collect();
-    let todos = reduce_todos(calls);
+fn todo_items_from_board(session_id: &str) -> Vec<TodoItemJson> {
+    use jeikcode_capabilities::tools::todo::TodoStatus;
+    let todos = jeikcode_capabilities::tools::read_todo_board(session_id)
+        .map(|board| board.items)
+        .unwrap_or_default();
 
     todos
         .into_iter()
@@ -1077,16 +1069,32 @@ mod tests {
                 arguments: args.into(),
             }],
         )];
-        let todos = todo_items_from_messages(&messages);
+        let session_id = format!("daemon-todo-{}", std::process::id());
+        jeikcode_capabilities::tools::commit_todo_board(
+            &session_id,
+            &[
+                jeikcode_capabilities::tools::TodoItem {
+                    content: "写测试".into(),
+                    status: jeikcode_capabilities::tools::todo::TodoStatus::InProgress,
+                },
+                jeikcode_capabilities::tools::TodoItem {
+                    content: "提交".into(),
+                    status: jeikcode_capabilities::tools::todo::TodoStatus::Pending,
+                },
+            ],
+        );
+        let todos = todo_items_from_board(&session_id);
 
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0].content, "写测试");
         assert_eq!(todos[1].content, "提交");
+        let _ = messages;
+        let _ = args;
     }
 
     #[test]
     fn todo_empty_session_returns_empty() {
-        let todos = todo_items_from_messages(&[]);
+        let todos = todo_items_from_board("daemon-todo-missing");
         assert!(todos.is_empty());
     }
 
