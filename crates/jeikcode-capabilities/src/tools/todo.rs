@@ -23,7 +23,7 @@ use jeikcode_kernel::message::Message;
 use jeikcode_kernel::tool::{Tool, ToolContext, ToolRegistry, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -919,8 +919,19 @@ fn todo_registry() -> &'static std::sync::RwLock<std::collections::HashMap<Strin
     REGISTRY.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
-fn live_bindings() -> &'static Mutex<std::collections::HashMap<usize, String>> {
-    static BINDINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, String>>> =
+/// A live handle's session binding.
+///
+/// The owner is a weak reference to the very allocation the key points at. That
+/// weak reference pins the allocation, so the address can never be recycled onto
+/// a different live handle while a binding exists — a bare address would alias
+/// a freed handle onto a fresh one and hand it the previous session's checklist.
+struct LiveBinding {
+    owner: Weak<Mutex<Vec<TodoItem>>>,
+    session_id: String,
+}
+
+fn live_bindings() -> &'static Mutex<std::collections::HashMap<usize, LiveBinding>> {
+    static BINDINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, LiveBinding>>> =
         std::sync::OnceLock::new();
     BINDINGS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -937,15 +948,30 @@ pub fn bind_todo_session(live: &TodoLive, session_id: &str) {
     live_bindings()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .insert(live_key(live), session_id.to_string());
+        .insert(
+            live_key(live),
+            LiveBinding {
+                owner: Arc::downgrade(live),
+                session_id: session_id.to_string(),
+            },
+        );
 }
 
 pub fn todo_session_of(live: &TodoLive) -> Option<String> {
-    live_bindings()
+    let mut guard = live_bindings()
         .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get(&live_key(live))
-        .cloned()
+        .unwrap_or_else(|err| err.into_inner());
+    let key = live_key(live);
+    match guard.get(&key) {
+        Some(binding) if binding.owner.strong_count() > 0 => Some(binding.session_id.clone()),
+        Some(_) => {
+            // The owner died without unbinding (a panicking caller). The binding no
+            // longer describes a live checklist, so it must not be handed out.
+            guard.remove(&key);
+            None
+        }
+        None => None,
+    }
 }
 
 /// Remove the session binding for this tool instance.
@@ -2956,5 +2982,59 @@ mod tests {
         assert!(r.content.contains("1. renamed"), "{}", r.content);
         assert!(r.content.contains("2. second"), "{}", r.content);
         assert!(!r.content.contains("keep me"), "{}", r.content);
+    }
+
+    #[test]
+    fn a_dead_live_handle_never_hands_its_session_to_a_fresh_one() {
+        let live: TodoLive = Arc::new(Mutex::new(Vec::new()));
+        let key = live_key(&live);
+        bind_todo_session(&live, "dead-session");
+        assert_eq!(todo_session_of(&live).as_deref(), Some("dead-session"));
+
+        // The owner dies without unbinding (a panicking caller). The weak owner
+        // keeps the allocation pinned, so the address cannot be recycled onto a
+        // different live handle and alias the dead session onto it.
+        drop(live);
+        {
+            let guard = live_bindings().lock().unwrap();
+            let binding = guard.get(&key).expect("binding outlives its owner");
+            assert_eq!(binding.owner.strong_count(), 0);
+        }
+
+        let fresh: TodoLive = Arc::new(Mutex::new(Vec::new()));
+        assert_ne!(live_key(&fresh), key, "the dead allocation stays pinned");
+        assert!(
+            todo_session_of(&fresh).is_none(),
+            "a fresh live handle must not inherit a dead session"
+        );
+    }
+
+    #[test]
+    fn a_dead_binding_is_cleared_on_lookup() {
+        let live: TodoLive = Arc::new(Mutex::new(Vec::new()));
+        let key = live_key(&live);
+        // A binding whose owner is already dead — the owner was dropped without
+        // unbinding, so the binding describes no live checklist any more.
+        let dead_owner = {
+            let dead: TodoLive = Arc::new(Mutex::new(Vec::new()));
+            Arc::downgrade(&dead)
+        };
+        assert_eq!(dead_owner.strong_count(), 0);
+        live_bindings().lock().unwrap().insert(
+            key,
+            LiveBinding {
+                owner: dead_owner,
+                session_id: "stale".into(),
+            },
+        );
+
+        assert!(
+            todo_session_of(&live).is_none(),
+            "a dead binding must not be served"
+        );
+        assert!(
+            !live_bindings().lock().unwrap().contains_key(&key),
+            "the dead binding must be cleared on lookup"
+        );
     }
 }

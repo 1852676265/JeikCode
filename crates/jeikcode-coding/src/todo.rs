@@ -5,11 +5,15 @@
 //! Note: Per architecture alignment with OpenCode / Grok Build conventions, dynamic
 //! turn-start task list re-announcements have been retired in favor of the permanent,
 //! static System 3 (`<todo_rules>`) guidelines.
+//!
+//! Architecture: ONE checklist per session. The session [`TodoBoard`] is the single
+//! source of truth; the live vector is only the working copy the tool mutates while
+//! a turn runs. The transcript is never folded to rebuild the checklist — a folded
+//! transcript is a reconstruction that drifts (compaction drops the baseline, a
+//! closed board looks open again), so it can never decide what to do.
 
 use async_trait::async_trait;
-use jeikcode_capabilities::tools::todo::{
-    derive_current_todos, todo_glyph, TodoItem, TodoLive, TodoStatus,
-};
+use jeikcode_capabilities::tools::todo::{todo_glyph, TodoItem, TodoLive, TodoStatus};
 use jeikcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use jeikcode_kernel::message::{Conversation, Message, Role};
 
@@ -72,10 +76,11 @@ impl TodoHook {
         }
     }
 
-    /// 结束拦截只看会话上的那一份清单。没有绑会话时才退回转录，供旧单测使用。
-    fn stop_check_items(&self, convo: &Conversation) -> Vec<TodoItem> {
+    /// 结束拦截只看会话上的那一份清单：已绑会话就读 board，未绑会话就读 live 副本。
+    /// 不再从转录折叠 —— 会话清单是唯一真相，转录里的旧 todowrite 不足以重建它。
+    fn stop_check_items(&self) -> Vec<TodoItem> {
         let Some(live) = &self.live else {
-            return derive_current_todos(&convo.messages);
+            return Vec::new();
         };
         if let Some(session_id) = jeikcode_capabilities::tools::todo::todo_session_of(live) {
             return jeikcode_capabilities::tools::read_todo_board(&session_id)
@@ -175,7 +180,7 @@ impl LifecycleHooks for TodoHook {
     /// answering or asking, inject a one-shot nudge to close them out and
     /// continue the turn. Fires at most once per real-user turn.
     async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
-        let todos = self.stop_check_items(convo);
+        let todos = self.stop_check_items();
         let has_open = todos.iter().any(|t| t.status != TodoStatus::Completed);
         if !has_open
             || !active_work_or_managed_todos_this_turn(convo)
@@ -227,15 +232,77 @@ mod tests {
         c
     }
 
+    // ---- offer_continuation: safety-net for actionable work ---------------------------------
+
+    fn convo_of(msgs: Vec<Message>) -> Conversation {
+        let mut c = Conversation::new();
+        c.messages = msgs;
+        c
+    }
+
+    /// A session-scoped checklist: one tool instance, one bound session, one board.
+    ///
+    /// The board is the single source of truth — the transcript never rebuilds it.
+    /// Dropping the fixture unbinds the session and clears the board, so a failing
+    /// assertion can never leave a global binding behind for a later test.
+    struct BoardFixture {
+        tool: jeikcode_capabilities::tools::TodoTool,
+        hook: TodoHook,
+        live: TodoLive,
+        session_id: String,
+    }
+
+    impl BoardFixture {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tool = jeikcode_capabilities::tools::TodoTool::new();
+            let live = tool.live();
+            let hook = TodoHook::with_live(live.clone());
+            let session_id = format!("todo-test-{tag}-{}-{seq}", std::process::id());
+            jeikcode_capabilities::tools::bind_todo_session(&live, &session_id);
+            Self {
+                tool,
+                hook,
+                live,
+                session_id,
+            }
+        }
+
+        /// Replace the session checklist — the one place the checklist lives.
+        fn set_items(&self, items: &[(&str, TodoStatus)]) {
+            jeikcode_capabilities::tools::commit_todo_board(
+                &self.session_id,
+                &items
+                    .iter()
+                    .map(|(content, status)| TodoItem {
+                        content: (*content).to_string(),
+                        status: *status,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        /// The live working copy the hook keeps in sync with the board.
+        fn live_items(&self) -> Vec<TodoItem> {
+            self.live.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl Drop for BoardFixture {
+        fn drop(&mut self) {
+            jeikcode_capabilities::tools::unbind_todo_session(&self.live);
+            jeikcode_capabilities::tools::clear_todo_board(&self.session_id);
+        }
+    }
+
     #[tokio::test]
     async fn turn_start_does_not_inject_dynamic_reminder() {
-        let mut convo = convo_with(vec![
-            Message::user("do it"),
-            todowrite_msg(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#),
-            Message::user("what next?"),
-        ]);
+        let fixture = BoardFixture::new("turn-start-no-inject");
+        fixture.set_items(&[("step one", TodoStatus::InProgress)]);
+        let mut convo = convo_with(vec![Message::user("do it"), Message::user("what next?")]);
         let before_len = convo.messages.len();
-        TodoHook::new().turn_start(&mut convo).await;
+        fixture.hook.turn_start(&mut convo).await;
         assert_eq!(
             convo.messages.len(),
             before_len,
@@ -244,19 +311,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_syncs_live_so_execute_rejects_unknown_ids() {
-        use jeikcode_capabilities::tools::TodoTool;
+    async fn hook_syncs_live_from_session_board_so_execute_rejects_unknown_ids() {
         use jeikcode_kernel::tool::{Tool, ToolContext};
         use tokio_util::sync::CancellationToken;
 
-        let tool = TodoTool::new();
-        let hook = TodoHook::with_live(tool.live());
-        let msgs = vec![
-            Message::user("do it"),
-            todowrite_msg(r#"{"todos":[{"content":"only","status":"pending"}]}"#),
-        ];
-        let mut convo = convo_with(msgs);
-        hook.turn_start(&mut convo).await;
+        let fixture = BoardFixture::new("unknown-ids");
+        fixture.set_items(&[("only", TodoStatus::Pending)]);
+        let mut convo = convo_with(vec![Message::user("do it")]);
+        fixture.hook.turn_start(&mut convo).await;
+
+        assert_eq!(
+            fixture.live_items().len(),
+            1,
+            "turn_start must copy the session checklist into the live working copy"
+        );
 
         let ctx = ToolContext {
             working_dir: std::path::PathBuf::from("."),
@@ -264,7 +332,8 @@ mod tests {
             progress: jeikcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         };
-        let bad = tool
+        let bad = fixture
+            .tool
             .execute(r#"{"action":"update","id":3,"status":"completed"}"#, &ctx)
             .await;
         assert!(bad.is_error, "{}", bad.content);
@@ -274,58 +343,35 @@ mod tests {
 
     #[tokio::test]
     async fn no_injection_when_no_list() {
+        let fixture = BoardFixture::new("no-list");
         let mut convo = convo_with(vec![
             Message::user("hi"),
             Message::assistant("hello", vec![]),
         ]);
         let before = convo.messages.len();
-        TodoHook::new().turn_start(&mut convo).await;
+        fixture.hook.turn_start(&mut convo).await;
         assert_eq!(convo.messages.len(), before, "empty list → no injection");
-    }
-
-    // ---- offer_continuation: safety-net for actionable work ---------------------------------
-
-    fn convo_of(msgs: Vec<Message>) -> Conversation {
-        let mut c = Conversation::new();
-        c.messages = msgs;
-        c
     }
 
     #[tokio::test]
     async fn nudges_to_close_out_open_items_on_stop() {
+        let fixture = BoardFixture::new("nudge-open-items");
+        fixture.set_items(&[("a", TodoStatus::Completed), ("b", TodoStatus::InProgress)]);
         let convo = convo_of(vec![
             Message::user("do the audit"),
-            todowrite_msg(
-                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
-            ),
+            todowrite_msg(r#"{"actions":[{"action":"add","content":"b"}]}"#),
             Message::assistant("here is the summary…", vec![]),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_some(),
+            fixture.hook.offer_continuation(&convo).await.is_some(),
             "open item on stop after todowrite must nudge"
         );
     }
 
     #[tokio::test]
     async fn completed_board_does_not_nudge_when_the_transcript_fold_still_looks_open() {
-        let session_id = format!("stop-check-{}", std::process::id());
-        let tool = jeikcode_capabilities::tools::TodoTool::new();
-        let live = tool.live();
-        let hook = TodoHook::with_live(live.clone());
-        jeikcode_capabilities::tools::bind_todo_session(&live, &session_id);
-        jeikcode_capabilities::tools::commit_todo_board(
-            &session_id,
-            &[
-                TodoItem {
-                    content: "a".into(),
-                    status: TodoStatus::Completed,
-                },
-                TodoItem {
-                    content: "b".into(),
-                    status: TodoStatus::Completed,
-                },
-            ],
-        );
+        let fixture = BoardFixture::new("board-wins-over-transcript");
+        fixture.set_items(&[("a", TodoStatus::Completed), ("b", TodoStatus::Completed)]);
         let convo = convo_of(vec![
             Message::user("do the audit"),
             todowrite_msg(
@@ -333,17 +379,16 @@ mod tests {
             ),
             Message::assistant("here is the summary…", vec![]),
         ]);
-        let res = hook.offer_continuation(&convo).await;
-        jeikcode_capabilities::tools::unbind_todo_session(&live);
-        jeikcode_capabilities::tools::clear_todo_board(&session_id);
         assert!(
-            res.is_none(),
+            fixture.hook.offer_continuation(&convo).await.is_none(),
             "a finished TodoBoard must not be reopened by the transcript fold"
         );
     }
 
     #[tokio::test]
     async fn no_nudge_when_all_completed() {
+        let fixture = BoardFixture::new("nudge-all-completed");
+        fixture.set_items(&[("a", TodoStatus::Completed), ("b", TodoStatus::Completed)]);
         let convo = convo_of(vec![
             Message::user("do it"),
             todowrite_msg(
@@ -352,22 +397,25 @@ mod tests {
             Message::assistant("all done", vec![]),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_none(),
+            fixture.hook.offer_continuation(&convo).await.is_none(),
             "all completed → let it stop"
         );
     }
 
     #[tokio::test]
     async fn no_nudge_when_no_todos() {
+        let fixture = BoardFixture::new("nudge-no-todos");
         let convo = convo_of(vec![
             Message::user("hi"),
             Message::assistant("hi there", vec![]),
         ]);
-        assert!(TodoHook::new().offer_continuation(&convo).await.is_none());
+        assert!(fixture.hook.offer_continuation(&convo).await.is_none());
     }
 
     #[tokio::test]
     async fn no_nudge_when_list_untouched_this_turn() {
+        let fixture = BoardFixture::new("nudge-untouched");
+        fixture.set_items(&[("a", TodoStatus::InProgress)]);
         let convo = convo_of(vec![
             Message::user("plan it"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
@@ -376,7 +424,7 @@ mod tests {
             Message::assistant("foo does X.", vec![]),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_none(),
+            fixture.hook.offer_continuation(&convo).await.is_none(),
             "a stale open list not touched this turn must not force a continuation"
         );
     }
@@ -384,6 +432,8 @@ mod tests {
     #[tokio::test]
     async fn no_nudge_when_only_read_tools_performed() {
         // Read-only tools should be exempted so question answering is not hijacked
+        let fixture = BoardFixture::new("nudge-read-only");
+        fixture.set_items(&[("a", TodoStatus::InProgress)]);
         let convo = convo_of(vec![
             Message::user("plan it"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
@@ -399,7 +449,7 @@ mod tests {
             ),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_none(),
+            fixture.hook.offer_continuation(&convo).await.is_none(),
             "read-only tools must be exempted from continuation nudge"
         );
     }
@@ -407,6 +457,8 @@ mod tests {
     #[tokio::test]
     async fn no_nudge_when_request_user_input_called() {
         // Asking the user for confirmation should be exempted from continuation nudge
+        let fixture = BoardFixture::new("nudge-ask-user");
+        fixture.set_items(&[("a", TodoStatus::InProgress)]);
         let convo = convo_of(vec![
             Message::user("plan it"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
@@ -422,7 +474,7 @@ mod tests {
             ),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_none(),
+            fixture.hook.offer_continuation(&convo).await.is_none(),
             "asking the user via request_user_input must be exempted from continuation nudge"
         );
     }
@@ -430,6 +482,8 @@ mod tests {
     #[tokio::test]
     async fn nudges_when_model_performed_work_tools_without_calling_todowrite() {
         // Agent did real modification work (edit/write) but neglected to update todo -> nudge
+        let fixture = BoardFixture::new("nudge-after-work");
+        fixture.set_items(&[("a", TodoStatus::InProgress)]);
         let convo = convo_of(vec![
             Message::user("plan it"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
@@ -445,18 +499,24 @@ mod tests {
             ),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_some(),
+            fixture.hook.offer_continuation(&convo).await.is_some(),
             "working agent that omitted todowrite after write must be nudged before ending turn"
         );
     }
 
     #[tokio::test]
     async fn nudge_includes_concrete_unfinished_item_list() {
+        let fixture = BoardFixture::new("nudge-lists-board");
+        fixture.set_items(&[
+            ("task finished", TodoStatus::Completed),
+            ("task ongoing", TodoStatus::InProgress),
+            ("task pending", TodoStatus::Pending),
+        ]);
+        // The transcript still carries an older plan. The board is the only source,
+        // so the stale entry must not reach the nudge.
         let convo = convo_of(vec![
             Message::user("do the audit"),
-            todowrite_msg(
-                r#"{"todos":[{"content":"task finished","status":"completed"},{"content":"task ongoing","status":"in_progress"},{"content":"task pending","status":"pending"}]}"#,
-            ),
+            todowrite_msg(r#"{"todos":[{"content":"stale item","status":"pending"}]}"#),
             Message::assistant(
                 "I worked on this",
                 vec![ToolCall {
@@ -466,24 +526,30 @@ mod tests {
                 }],
             ),
         ]);
-        let nudge = TodoHook::new().offer_continuation(&convo).await.unwrap();
+        let nudge = fixture.hook.offer_continuation(&convo).await.unwrap();
         assert!(nudge.contains("[~] 2. task ongoing"));
         assert!(nudge.contains("[ ] 3. task pending"));
         assert!(
             !nudge.contains("1. task finished"),
             "completed items must not be listed in unfinished nudge"
         );
+        assert!(
+            !nudge.contains("stale item"),
+            "the nudge must come from the session board, not the transcript"
+        );
     }
 
     #[tokio::test]
     async fn nudges_at_most_once_per_turn() {
+        let fixture = BoardFixture::new("nudge-once");
+        fixture.set_items(&[("a", TodoStatus::InProgress)]);
         let mut convo = convo_of(vec![
             Message::user("do it"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
             Message::assistant("summary", vec![]),
         ]);
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_some(),
+            fixture.hook.offer_continuation(&convo).await.is_some(),
             "first stop nudges"
         );
         // Kernel injected the nudge as a synthetic user message; model stops again without closing.
@@ -494,7 +560,7 @@ mod tests {
             .messages
             .push(Message::assistant("still open", vec![]));
         assert!(
-            TodoHook::new().offer_continuation(&convo).await.is_none(),
+            fixture.hook.offer_continuation(&convo).await.is_none(),
             "already nudged this turn → let it stop (no spin)"
         );
     }
@@ -511,6 +577,8 @@ mod tests {
             "search_replace",
             "global_search_replace",
         ] {
+            let fixture = BoardFixture::new("nudge-alias");
+            fixture.set_items(&[("a", TodoStatus::InProgress)]);
             let convo = convo_of(vec![
                 Message::user("plan it"),
                 todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
@@ -526,7 +594,7 @@ mod tests {
                 ),
             ]);
             assert!(
-                TodoHook::new().offer_continuation(&convo).await.is_some(),
+                fixture.hook.offer_continuation(&convo).await.is_some(),
                 "actionable tool `{tool_name}` with open todos must trigger continuation nudge"
             );
         }
@@ -534,62 +602,46 @@ mod tests {
 
     #[tokio::test]
     async fn completed_checklist_cleared_on_turn_complete_is_not_resurrected_next_turn() {
-        use jeikcode_capabilities::tools::TodoTool;
         use jeikcode_kernel::event::StopReason;
 
-        let tool = TodoTool::new();
-        let live = tool.live();
-        let hook = TodoHook::with_live(live.clone());
-        let session_id = format!("clear-board-{}", std::process::id());
-        jeikcode_capabilities::tools::bind_todo_session(&live, &session_id);
-        jeikcode_capabilities::tools::commit_todo_board(
-            &session_id,
-            &[
-                TodoItem {
-                    content: "step 1".into(),
-                    status: TodoStatus::Completed,
-                },
-                TodoItem {
-                    content: "step 2".into(),
-                    status: TodoStatus::Completed,
-                },
-            ],
-        );
+        let fixture = BoardFixture::new("clear-board");
+        fixture.set_items(&[
+            ("step 1", TodoStatus::Completed),
+            ("step 2", TodoStatus::Completed),
+        ]);
         let ctx = TurnCtx {
-            session_id: Some(session_id.clone().into()),
+            session_id: Some(fixture.session_id.clone().into()),
             ..TurnCtx::default()
         };
 
         let mut convo = convo_with(vec![
             Message::user("ship feature"),
-            todowrite_msg(
-                r#"{"todos":[{"content":"step 1","status":"pending"},{"content":"step 2","status":"in_progress"}]}"#,
-            ),
             Message::assistant("all done", vec![]),
         ]);
-        hook.turn_start(&mut convo).await;
-        assert_eq!(live.lock().unwrap().len(), 2);
+        fixture.hook.turn_start(&mut convo).await;
+        assert_eq!(fixture.live_items().len(), 2);
 
-        hook.turn_complete(&convo, &StopReason::Stopped, &ctx).await;
+        fixture
+            .hook
+            .turn_complete(&convo, &StopReason::Stopped, &ctx)
+            .await;
         assert!(
-            live.lock().unwrap().is_empty(),
+            fixture.live_items().is_empty(),
             "turn_complete must clear live when all items are completed"
         );
 
         // Turn 2: user sends a new message; turn_start and pre_request must not resurrect Turn 1's completed list.
         convo.messages.push(Message::user("thanks, what is 2+2?"));
-        hook.turn_start(&mut convo).await;
+        fixture.hook.turn_start(&mut convo).await;
         assert!(
-            live.lock().unwrap().is_empty(),
+            fixture.live_items().is_empty(),
             "turn_start on next turn must not resurrect completed checklist from prior turn"
         );
 
-        hook.pre_request(&mut convo.messages, &ctx).await;
+        fixture.hook.pre_request(&mut convo.messages, &ctx).await;
         assert!(
-            live.lock().unwrap().is_empty(),
+            fixture.live_items().is_empty(),
             "pre_request on next turn must not resurrect completed checklist from prior turn"
         );
-        jeikcode_capabilities::tools::unbind_todo_session(&live);
-        jeikcode_capabilities::tools::clear_todo_board(&session_id);
     }
 }
