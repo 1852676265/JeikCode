@@ -149,8 +149,19 @@ impl LifecycleHooks for TodoHook {
         self.sync_live(&items);
     }
 
-    async fn turn_start(&self, _convo: &mut Conversation) {
-        // 实时清单以会话上的 TodoBoard 为准，不从转录折算回灌。
+    async fn turn_start(&self, convo: &mut Conversation) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        if let Some(session_id) = jeikcode_capabilities::tools::todo::todo_session_of(live) {
+            let items = jeikcode_capabilities::tools::read_todo_board(&session_id)
+                .map(|board| board.items)
+                .unwrap_or_default();
+            self.sync_live(&items);
+        } else {
+            let todos = derive_current_todos(&convo.messages);
+            self.sync_live(&todos);
+        }
     }
 
     /// The model wants to stop. If the live checklist still has OPEN items
@@ -173,15 +184,23 @@ impl LifecycleHooks for TodoHook {
     /// 工具调用留在记录里，历史画布仍能画到那一条消息上。还有未完成项时保留，下一轮接着改。
     async fn turn_complete(
         &self,
-        _convo: &Conversation,
+        convo: &Conversation,
         _reason: &jeikcode_kernel::event::StopReason,
         ctx: &TurnCtx,
     ) {
-        let Some(session_id) = ctx.session_id.as_deref() else {
-            return;
-        };
-        if jeikcode_capabilities::tools::close_todo_board_if_complete(session_id).is_some() {
-            self.sync_live(&[]);
+        if let Some(session_id) = ctx.session_id.as_deref() {
+            if jeikcode_capabilities::tools::close_todo_board_if_complete(session_id).is_some() {
+                self.sync_live(&[]);
+            }
+        } else {
+            let todos = derive_current_todos(&convo.messages);
+            if !todos.is_empty()
+                && todos
+                    .iter()
+                    .all(|item| item.status == TodoStatus::Completed)
+            {
+                self.sync_live(&[]);
+            }
         }
     }
 }
