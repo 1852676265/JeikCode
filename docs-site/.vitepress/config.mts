@@ -130,8 +130,9 @@ export default defineConfig({
             collapsed: false,
             items: [
               { text: 'Introduction', link: '/guide/introduction' },
-              { text: 'Quick Installation (TUI, Desktop)', link: '/guide/installation' },
+              { text: 'Quick Installation (Terminal, Desktop, Docker, Standalone)', link: '/guide/installation' },
               { text: 'Quickstart', link: '/guide/getting-started' },
+              { text: 'Autostart & Remote Access', link: '/guide/autostart-and-remote' },
               { text: 'Updates & Uninstall', link: '/guide/updates' },
               { text: 'Common Commands', link: '/usage/slash-commands' },
             ],
@@ -144,14 +145,6 @@ export default defineConfig({
               { text: 'CodeExplore', link: '/usage/codegraph' },
               { text: 'WebUI & Remote Access', link: '/usage/webui' },
               { text: 'API Compatibility Endpoints (OpenAI, Anthropic)', link: '/usage/api-compat' },
-            ],
-          },
-          {
-            text: 'Deployment',
-            collapsed: false,
-            items: [
-              { text: 'Daemon & Headless', link: '/deploy/daemon' },
-              { text: 'OpenWrt & Gateways', link: '/deploy/openwrt' },
             ],
           },
           {
@@ -220,8 +213,9 @@ export default defineConfig({
             collapsed: false,
             items: [
               { text: '产品简介', link: '/zh/guide/introduction' },
-              { text: '快速安装（TUI、桌面端）', link: '/zh/guide/installation' },
+              { text: '快速安装（终端、桌面端、Docker、单文件）', link: '/zh/guide/installation' },
               { text: '快速开始', link: '/zh/guide/getting-started' },
+              { text: '开机自启与远程访问', link: '/zh/guide/autostart-and-remote' },
               { text: '更新与卸载', link: '/zh/guide/updates' },
               { text: '常用命令', link: '/zh/usage/slash-commands' },
             ],
@@ -234,14 +228,6 @@ export default defineConfig({
               { text: '代码图谱', link: '/zh/usage/codegraph' },
               { text: 'WebUI 界面与远程访问', link: '/zh/usage/webui' },
               { text: 'API 兼容端点（OpenAI、Anthropic）', link: '/zh/usage/api-compat' },
-            ],
-          },
-          {
-            text: '部署与常驻服务',
-            collapsed: false,
-            items: [
-              { text: '后台 Daemon 与无头运行', link: '/zh/deploy/daemon' },
-              { text: 'OpenWrt 软路由部署', link: '/zh/deploy/openwrt' },
             ],
           },
           {

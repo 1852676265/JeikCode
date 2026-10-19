@@ -56,22 +56,18 @@ jeikcode run "帮我分析当前项目的依赖并输出安全风险报告"
 
 ---
 
-### 方式四：独立后台服务与远程协同 (Daemon / Serve)
+### 方式四：后台常驻与远程管理 (Daemon)
 
-在服务器无头（Headless）部署或希望作为长期常驻服务时，可在命令行直接指定主机地址、端口与鉴权 Token：
+如果你希望将 JeikCode 作为全天候开机自启的守护服务，或在云服务器/局域网软路由中长期部署，只需在命令行统一输入：
 
 ```bash
-# 局域网/公网监听（安全加固：绑定非 127.0.0.1 必须设置访问 Token）
+# 启动后台服务并按向导一键注册开机自启
 jeikcode --host 0.0.0.0 --port 13457 --token sk-your-secret-token
-
-# 也可以使用等价的 daemon 或 serve 子命令
-jeikcode daemon --host 0.0.0.0 --port 13457 --token sk-your-secret-token
-
-# 仅在绝对受信任的私有隔离网络下允许免密模式
-jeikcode --host 0.0.0.0 --port 13457 --no-token
 ```
 
-> ⚠️ **安全强制约束**：为了杜绝服务器被未授权扫描导致远程执行命令风险，**绑定非 Loopback 接口时服务端强制要求配置 `--token` 或环境变量 `JEIKCODE_SERVER_TOKEN`**，拒绝无鉴权裸奔启动。
+终端会根据你的操作系统特征（Linux、macOS、Windows、OpenWrt）自动配置对应的开机自启后台服务，并打印出 WebUI 远程管理地址。
+
+> 💡 **详细配置与多端协同**：更多关于跨平台 CLI 开机自启机制与桌面端内置监听的介绍，请参阅下一节专门的 [开机自启与远程访问](/zh/guide/autostart-and-remote)。
 
 ---
 

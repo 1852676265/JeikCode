@@ -56,22 +56,18 @@ JeikCode starts a local HTTP service and opens your browser automatically. The b
 
 ---
 
-### Method 4: Standalone Service and Remote Daemon (Serve / Daemon)
+### Method 4: Persistent Background Daemon & Remote Management
 
-For headless server deployments or persistent team instances, start the service specifying the host, port, and authentication token:
+If you wish to run JeikCode as an always-on background daemon service or deploy on a remote server/gateway, run a single command in your terminal:
 
 ```bash
-# Listen on all interfaces with an access token (Security: Token is REQUIRED for non-loopback binds)
+# Start background service and follow the wizard to enable autostart
 jeikcode --host 0.0.0.0 --port 13457 --token sk-your-secret-token
-
-# Equivalent daemon and serve subcommands
-jeikcode daemon --host 0.0.0.0 --port 13457 --token sk-your-secret-token
-
-# No-token mode (Only permitted in completely trusted and isolated private networks)
-jeikcode --host 0.0.0.0 --port 13457 --no-token
 ```
 
-> ⚠️ **Security Requirement**: To protect systems against unauthorized command execution and remote access, **binding to any non-loopback interface strictly requires `--token` or the `JEIKCODE_SERVER_TOKEN` environment variable**. Unauthenticated external exposure will be rejected on startup.
+The CLI automatically detects your OS environment (Linux, macOS, Windows, OpenWrt) to configure the appropriate autostart background daemon, and prints the WebUI remote management URL.
+
+> 💡 **Detailed Autostart & Multi-Device Sync**: For deep details on CLI autostart mechanics and desktop built-in listeners, see the dedicated [Autostart & Remote Access](/guide/autostart-and-remote) guide.
 
 ---
 
