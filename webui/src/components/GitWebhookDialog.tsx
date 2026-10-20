@@ -415,7 +415,7 @@ export function toCleanApiPayload(config: GitAdapterConfig, projectHash: string)
       issueComment: config.events?.issueComment !== false,
       push: Boolean(config.events?.push),
     },
-    triggerKeyword: config.triggerKeyword || '@bot',
+    triggerKeyword: (config.triggerKeyword !== undefined ? config.triggerKeyword : '@bot').trim(),
     autoReviewNewPr: config.autoReviewNewPr !== false,
     updateExistingComment: config.updateExistingComment !== false,
     reviewPromptTemplate: config.reviewPromptTemplate || '',
@@ -1314,9 +1314,10 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                     class="git-inline-keyword-input"
                     placeholder="@bot"
                     value={config.triggerKeyword}
-                    onInput={(e) => setConfig({ ...config, triggerKeyword: (e.target as HTMLInputElement).value.trim() })}
+                    onInput={(e) => setConfig({ ...config, triggerKeyword: (e.target as HTMLInputElement).value })}
                   />
                 </div>
+                <span class="git-inline-keyword-hint">{t('gitWebhook.keywordSeparatorHint')}</span>
               </div>
 
               <span class="git-input-hint" style={{ marginTop: '2px', display: 'block' }}>

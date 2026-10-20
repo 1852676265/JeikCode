@@ -331,10 +331,11 @@ struct SessionDetailQuery {
     limit: Option<usize>,
 }
 
-/// `tail` is a hard page cap. Never walk the cut back to the user who opened
-/// the turn: a long tool turn can be far larger than one page, and pulling it
-/// into the first paint stalls the timeline. A question that sits above the
-/// page stays there; `/chat/watch` must not append that prefix under the answer.
+/// `tail` is a hard page cap. Do not walk the cut back through every tool row:
+/// a long turn is larger than one page, and pulling it into the first paint
+/// stalls the timeline. The opening user question is pinned separately by
+/// [`take_session_page`]; `/chat/watch` must still not append the tool prefix
+/// under the answer.
 fn apply_session_message_window<T>(
     messages: Vec<T>,
     query: &SessionDetailQuery,
@@ -351,6 +352,43 @@ fn apply_session_message_window<T>(
         offset,
         messages.into_iter().skip(offset).take(limit).collect(),
     )
+}
+
+/// Tail page plus, when the cut falls inside a turn, the one user question that
+/// opened it. `offset` stays the index of the first non-pinned row so the gap
+/// can still be loaded. `pinned_user_index` is that question's absolute index.
+fn take_session_page(
+    mut messages: Vec<MessageInfo>,
+    query: &SessionDetailQuery,
+) -> (usize, usize, Vec<MessageInfo>, Option<usize>) {
+    let total = messages.len();
+    if let Some(n) = query.tail.filter(|n| *n > 0) {
+        let offset = total.saturating_sub(n);
+        if offset == 0 {
+            return (total, 0, messages, None);
+        }
+        let mut window: Vec<MessageInfo> = messages.drain(offset..).collect();
+        let pinned = if window
+            .first()
+            .is_some_and(|msg| !is_visible_user_turn_start(msg))
+        {
+            (0..messages.len())
+                .rev()
+                .find(|&i| is_visible_user_turn_start(&messages[i]))
+        } else {
+            None
+        };
+        if let Some(idx) = pinned {
+            let user = messages.remove(idx);
+            window.insert(0, user);
+        }
+        return (total, offset, window, pinned);
+    }
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let end = offset.saturating_add(limit).min(messages.len());
+    let window = messages.drain(offset..end).collect();
+    (total, offset, window, None)
 }
 
 #[cfg(test)]
@@ -404,6 +442,66 @@ mod session_window_tests {
         assert_eq!(total, 8);
         assert_eq!(offset, 5);
         assert_eq!(window, vec!["t2", "a3", "a4"]);
+    }
+
+    fn page_msg(role: &str, content: &str) -> MessageInfo {
+        MessageInfo {
+            role: role.into(),
+            content: content.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms: None,
+            id: None,
+        }
+    }
+
+    #[test]
+    fn tail_pins_the_opening_user_without_pulling_the_gap() {
+        let q = SessionDetailQuery {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+        };
+        let messages = vec![
+            page_msg("user", "上一问"),
+            page_msg("assistant", "上一答"),
+            page_msg("user", "这一问"),
+            page_msg("assistant", "思考"),
+            page_msg("tool", "结果"),
+            page_msg("assistant", "回答"),
+        ];
+        let (total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(total, 6);
+        assert_eq!(offset, 4);
+        assert_eq!(pinned, Some(2));
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["这一问", "结果", "回答"]
+        );
+    }
+
+    #[test]
+    fn tail_does_not_pin_when_the_page_already_starts_on_a_user() {
+        let q = SessionDetailQuery {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+        };
+        let (total, offset, window, pinned) = take_session_page(
+            vec![page_msg("user", "问"), page_msg("assistant", "答")],
+            &q,
+        );
+        assert_eq!((total, offset, pinned), (2, 0, None));
+        assert_eq!(window.len(), 2);
     }
 
     #[test]
@@ -926,8 +1024,14 @@ pub struct SessionDetail {
     /// Total messages in the transcript (not the returned window size).
     pub message_count: usize,
     /// Index of `messages[0]` in the full transcript.
+    /// When `pinned_user_index` is set, `messages[0]` is that question and this
+    /// is the index of `messages[1]`.
     #[serde(default)]
     pub offset: usize,
+    /// Absolute index of the user question pinned ahead of a mid-turn tail page.
+    /// Rows between it and `offset` are not included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_user_index: Option<usize>,
     /// All user questions (short text) in transcript order. Independent of the
     /// `messages` window so the WebUI turn rail can list the full session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1244,11 +1348,8 @@ struct ActiveChatIndex {
     operations: HashMap<String, ActiveChatOperation>,
     aliases: HashMap<String, String>,
     /// `/chat/watch` observers that arrived while the session had NO active
-    /// turn. They stay parked here until a turn is admitted for this session
-    /// (`admit` drains and converts them to live broadcast subscribers), so the
-    /// WebUI gets a push the moment an API turn starts instead of having to
-    /// poll. Keyed by session id (the `session_id` alias the watcher used).
-    standby_watchers: HashMap<String, Vec<mpsc::UnboundedSender<ChatEvent>>>,
+    /// turn. Keyed by session id -> client id -> sender.
+    standby_watchers: HashMap<String, HashMap<String, mpsc::UnboundedSender<ChatEvent>>>,
     /// Session-scoped event state. Survives the operation: the turn's frames live
     /// in the operation, but "how far did this session get" and "what was its
     /// terminal frame" must outlive the turn.
@@ -1467,7 +1568,7 @@ impl ActiveChatRegistry {
             }
         }
         if let Some(watchers) = index.standby_watchers.get(session_id) {
-            for tx in watchers {
+            for tx in watchers.values() {
                 let _ = tx.send(event.clone());
             }
         }
@@ -1581,6 +1682,7 @@ impl ActiveChatRegistry {
     async fn subscribe_or_standby(
         &self,
         session_id: &str,
+        client_id: Option<&str>,
         standby_tx: &mpsc::UnboundedSender<ChatEvent>,
         replay_terminal: bool,
     ) -> WatchOutcome {
@@ -1609,15 +1711,27 @@ impl ActiveChatRegistry {
                 let _ = standby_tx.send(terminal.clone());
             }
         }
-        // One standby slot per session: WebUI reconnect/refresh used to pile up
-        // many dead parkers (drained 4+), spamming admit logs and wasting tasks.
-        // Drop prior standby senders; their SSE side closes when the channel dies.
+        // Multi-client standby pool: prune dead senders, and update or register this client_id.
+        // A single tab refreshing reuses its client_id and replaces its own dead sender without piling up;
+        // multiple independent remote clients with distinct client_ids stay concurrently subscribed.
         let entry = index
             .standby_watchers
             .entry(session_id.to_string())
             .or_default();
-        entry.clear();
-        entry.push(standby_tx.clone());
+        entry.retain(|_, tx| !tx.is_closed());
+        let cid = client_id.unwrap_or("").trim();
+        let key = if cid.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            cid.to_string()
+        };
+        // Hard capacity cap per session (max 16 concurrent standby tabs/devices) to prevent unbounded memory growth.
+        if entry.len() >= 16 && !entry.contains_key(&key) {
+            if let Some(oldest_key) = entry.keys().next().cloned() {
+                entry.remove(&oldest_key);
+            }
+        }
+        entry.insert(key, standby_tx.clone());
         WatchOutcome::Standby
     }
 
@@ -1692,9 +1806,10 @@ impl ActiveChatRegistry {
         session_id: &str,
         bus: &tokio::sync::broadcast::Sender<ChatEvent>,
     ) -> usize {
-        if let Some(watchers) = index.standby_watchers.remove(session_id) {
+        if let Some(mut watchers) = index.standby_watchers.remove(session_id) {
+            watchers.retain(|_, tx| !tx.is_closed());
             let n = watchers.len();
-            for tx in watchers {
+            for (_cid, tx) in watchers {
                 let mut rx = bus.subscribe();
                 tokio::spawn(async move {
                     loop {
@@ -4583,7 +4698,8 @@ async fn get_session_detail(
                 }
             };
             let turns = session_user_outline(&messages);
-            let (message_count, offset, messages) = apply_session_message_window(messages, &query);
+            let (message_count, offset, messages, pinned_user_index) =
+                take_session_page(messages, &query);
             let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let turn_running = state
                 .active_chats
@@ -4608,6 +4724,7 @@ async fn get_session_detail(
                 updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
                 message_count,
                 offset,
+                pinned_user_index,
                 turns,
                 messages,
                 preferred_model: session.meta.preferred_model.clone(),
@@ -4629,6 +4746,7 @@ async fn get_session_detail(
                 updated_at: 0,
                 message_count: 0,
                 offset: 0,
+                pinned_user_index: None,
                 turns: Vec::new(),
                 messages: Vec::new(),
                 preferred_model: None,
@@ -9316,6 +9434,9 @@ struct ChatWatchQuery {
     /// - 缺省：全量补发（无游标兜底，前端按身份幂等收敛）。
     #[serde(default)]
     after_seq: Option<i64>,
+    /// 观察端唯一客户端标识（例如浏览器标签页 UUID），防止单页面刷新堆积，同时允许跨设备/多屏幕并发待机观察。
+    #[serde(default)]
+    client_id: Option<String>,
 }
 
 /// GET /chat/watch?session_id=… — reattach to a turn owned by another client.
@@ -9365,7 +9486,7 @@ async fn chat_watch(
                 after_seq = ?q.after_seq,
                 "chat_watch: LIVE with replay"
             );
-            let maybe_user = snapshot
+            let opening_user = snapshot
                 .iter()
                 .find(|(_, e)| matches!(e, ChatEvent::User { .. }))
                 .cloned();
@@ -9375,22 +9496,22 @@ async fn chat_watch(
                     // 新会话：画布本来就是空的，补发毫无意义；只给一个起始游标。
                     // 但是如果本轮存在活跃用户提问，必须在头部送达，防止刷新后用户提问丢失！
                     handshake = Some(chat_watch_session_start_json(&session_id, buffer_len));
-                    if let Some(user) = maybe_user {
+                    if let Some(user) = opening_user {
                         replay_head = vec![user];
                     }
                 }
                 // 游标有效（没越过缓冲末尾）：只补它之后的帧。
-                // 核心防线：当前回合的活跃用户提问（ChatEvent::User）必须始终放在头部，
-                // 绝不受 after_seq 过滤丢弃，确保断线重连或 F5 刷新后用户消息绝不丢失！
+                // 开场提问的 seq 可能已经小于游标（页把提问切掉了）。把它补回头部，
+                // 游标之后的提问（中途 steer）原样保留，不再把所有 User 事件剥掉。
                 Some(after) if after >= 0 && (after as u64) <= buffer_len => {
                     let mut filtered: Vec<(u64, ChatEvent)> = snapshot
                         .into_iter()
-                        .filter(|(seq, e)| {
-                            !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64
-                        })
+                        .filter(|(seq, _)| *seq >= after as u64)
                         .collect();
-                    if let Some(user) = maybe_user {
-                        filtered.insert(0, user);
+                    if let Some((user_seq, user)) = opening_user {
+                        if !filtered.iter().any(|(seq, _)| *seq == user_seq) {
+                            filtered.insert(0, (user_seq, user));
+                        }
                     }
                     replay_head = filtered;
                 }
@@ -9438,7 +9559,7 @@ async fn chat_watch(
         } else {
             match state
                 .active_chats
-                .subscribe_or_standby(&session_id, &tx, true)
+                .subscribe_or_standby(&session_id, q.client_id.as_deref(), &tx, true)
                 .await
             {
                 WatchOutcome::Live(mut bus_rx) => {
@@ -9488,7 +9609,7 @@ async fn chat_watch(
     } else {
         match state
             .active_chats
-            .subscribe_or_standby(&session_id, &tx, false)
+            .subscribe_or_standby(&session_id, q.client_id.as_deref(), &tx, false)
             .await
         {
             WatchOutcome::Live(mut bus_rx) => {
@@ -15360,7 +15481,7 @@ mod tests {
         // recorded terminal, so the watcher is not left with keepalives only.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = registry
-            .subscribe_or_standby("session-term", &tx, true)
+            .subscribe_or_standby("session-term", None, &tx, true)
             .await;
         assert!(matches!(outcome, WatchOutcome::Standby));
         assert!(matches!(
@@ -15386,7 +15507,7 @@ mod tests {
         // button, clock still ticking, checklist frozen.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = registry
-            .subscribe_or_standby("session-gone", &tx, true)
+            .subscribe_or_standby("session-gone", None, &tx, true)
             .await;
         assert!(matches!(outcome, WatchOutcome::Standby));
         assert!(
@@ -15413,7 +15534,7 @@ mod tests {
         // same terminal again would make it spin, so it must stay silent.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = registry
-            .subscribe_or_standby("session-idle", &tx, false)
+            .subscribe_or_standby("session-idle", None, &tx, false)
             .await;
         assert!(matches!(outcome, WatchOutcome::Standby));
         assert!(
@@ -15434,7 +15555,7 @@ mod tests {
         // Before clear_session: attaching with replay_terminal=true yields the recorded terminal frame
         let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
         let outcome1 = registry
-            .subscribe_or_standby("session-evict", &tx1, true)
+            .subscribe_or_standby("session-evict", None, &tx1, true)
             .await;
         assert!(matches!(outcome1, WatchOutcome::Standby));
         assert!(matches!(
@@ -15449,12 +15570,90 @@ mod tests {
         // After clear_session: attaching with replay_terminal=true finds no lingering terminal
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
         let outcome2 = registry
-            .subscribe_or_standby("session-evict", &tx2, true)
+            .subscribe_or_standby("session-evict", None, &tx2, true)
             .await;
         assert!(matches!(outcome2, WatchOutcome::Standby));
         assert!(
             rx2.try_recv().is_err(),
             "cleared session must not replay lingering terminal frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_client_standby_preserves_concurrent_watchers_and_prunes_dead_senders() {
+        let registry = ActiveChatRegistry::default();
+        let session_id = "session-multi-client";
+
+        // 1. 本机端 client-local 注册待机
+        let (tx_local, _rx_local) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .subscribe_or_standby(session_id, Some("client-local"), &tx_local, false)
+            .await;
+
+        // 2. 异地端 client-remote 注册待机（必须并存，绝不能被 clear 踢掉）
+        let (tx_remote, mut rx_remote) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .subscribe_or_standby(session_id, Some("client-remote"), &tx_remote, false)
+            .await;
+
+        {
+            let index = registry.inner.read().await;
+            let watchers = index.standby_watchers.get(session_id).unwrap();
+            assert_eq!(
+                watchers.len(),
+                2,
+                "both local and remote standby watchers must be kept concurrently"
+            );
+            assert!(watchers.contains_key("client-local"));
+            assert!(watchers.contains_key("client-remote"));
+        }
+
+        // 3. 本机端 client-local 刷新页面，重新注册（相同的 client_id 必须原地覆盖，不堆积多余连接）
+        let (tx_local_refresh, mut rx_local_refresh) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .subscribe_or_standby(session_id, Some("client-local"), &tx_local_refresh, false)
+            .await;
+
+        {
+            let index = registry.inner.read().await;
+            let watchers = index.standby_watchers.get(session_id).unwrap();
+            assert_eq!(
+                watchers.len(),
+                2,
+                "same client_id must update existing slot without leaking"
+            );
+        }
+
+        // 4. 任务 admit：唤醒所有并发 standby watchers 并分发给两者
+        let admission = registry.admit(Some(session_id), None).await.unwrap();
+        let bus = registry.event_bus(&admission.operation_id).await.unwrap();
+
+        // 发送第一帧 User 提问
+        let user_event = ChatEvent::User {
+            content: "帮我写冒泡排序".into(),
+            session_id: Some(session_id.to_string()),
+            created_at: Some(12345),
+            message_id: None,
+            order: None,
+            turn_ordinal: None,
+        };
+        let _ = bus.send(user_event);
+
+        // 验证异地端和本机端在同一时刻都能无遗漏地收到该 User 事件！
+        let remote_received = rx_remote
+            .recv()
+            .await
+            .expect("remote client must receive live user event");
+        assert!(
+            matches!(remote_received, ChatEvent::User { ref content, .. } if content == "帮我写冒泡排序")
+        );
+
+        let local_received = rx_local_refresh
+            .recv()
+            .await
+            .expect("local client must receive live user event");
+        assert!(
+            matches!(local_received, ChatEvent::User { ref content, .. } if content == "帮我写冒泡排序")
         );
     }
 

@@ -87,7 +87,7 @@ import { getPageZoom } from '../lib/pageZoom';
 const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })));
 const DiffViewer = lazy(() => import('./DiffViewer').then((m) => ({ default: m.DiffViewer })));
 import { CodeEditorTab } from './CodeEditorTab';
-import { TerminalPanel } from './TerminalPanel';
+import { TerminalPanel, getSavedTerminalCount } from './TerminalPanel';
 import { PreviewPanel } from './PreviewPanel';
 import {
   fetchGitFileDiff,
@@ -176,7 +176,7 @@ import {
   clearAllSessionCache,
   getMemorySession,
 } from '../lib/sessionCache';
-import { gitStore } from '../lib/gitStore';
+import { gitStore, type GitProjectState } from '../lib/gitStore';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
   deserializeQueuedCard,
@@ -236,6 +236,7 @@ import {
 import {
   formatTurnElapsed,
   resumeTurnClockEpoch,
+  rootTurnUserTs,
   stampLastAssistantElapsed,
   turnDurationMs,
   turnTotalElapsedMs,
@@ -262,6 +263,7 @@ import {
   paintCachedAssistantDelta,
   ensureWorkingAssistant,
   paintUserMessage,
+  placeRecoveredTurnUsers,
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
@@ -287,6 +289,8 @@ interface Message {
   ts?: number;
   /** Browser-local correlation for an optimistic /live submission. Never persisted. */
   pendingSteerId?: string;
+  /** 是否为中途转向注入（Steer）消息（用于区分自然新回合与中途转向） */
+  isSteer?: boolean;
   /** Wall-clock duration of this assistant turn (ms). Stamped when the turn
    *  finishes so the timeline can show "用时 12s" after refresh. Live ticks
    *  sum prior stamped turns plus the current turn stopwatch. */
@@ -401,10 +405,7 @@ function sameDay(a: Date, b: Date): boolean {
  *  wall-clock fact the user reads the same way they read a timestamp in
  *  any messaging app. */
 function precedingUserTs(msgs: Message[], idx: number): number | undefined {
-  for (let i = idx - 1; i >= 0; i--) {
-    if (msgs[i]!.role === 'user') return msgs[i]!.ts;
-  }
-  return undefined;
+  return rootTurnUserTs(msgs, idx);
 }
 
 function formatMsgTime(ts: number | undefined, t: (key: MsgKey, params?: Record<string, string | number>) => string): string {
@@ -1059,8 +1060,8 @@ export function Chat({
       if (stored && stored > 0 && stored <= now) epoch = stored;
     }
     if (epoch == null) {
-      // 优先从当前轮次用户提问的真实发送时间恢复，确保长任务断联刷新后不从 0s 重新开始
-      const lastUserTs = [...messagesRef.current].reverse().find((m) => m.role === 'user')?.ts;
+      // 优先从当前轮次用户提问的真实发送时间恢复（穿透中途 steer 转向，确保长任务断联刷新后不从 0s 重新开始）
+      const lastUserTs = rootTurnUserTs(messagesRef.current, messagesRef.current.length);
       if (lastUserTs && Number.isFinite(lastUserTs) && lastUserTs > 0 && lastUserTs <= now) {
         epoch = lastUserTs;
       } else if (transcriptHasOpenUserTurn(messagesRef.current)) {
@@ -1857,7 +1858,7 @@ export function Chat({
           const session = await getSession(hash, id, { tail: HISTORY_PAGE });
           if (activeIdRef.current === id) continue;
           if (!session || !Array.isArray(session.messages)) continue;
-          const loaded = sessionMessagesToDisplay(session.messages, session.offset ?? 0);
+          const loaded = sessionMessagesToDisplay(session.messages, session.offset ?? 0, session.pinned_user_index);
           messageCacheRef.current.set(id, loaded);
           const surface = hydrateSession(
             loaded,
@@ -1898,6 +1899,21 @@ export function Chat({
   function watchReplayCanvas(sessionId: string): Message[] {
     if (activeIdRef.current === sessionId) return messagesRef.current;
     return messageCacheRef.current.get(sessionId) ?? [];
+  }
+  /** 回放里被页切掉的提问插回这一轮前面，再画后面的帧。 */
+  function placeReplayUsers(
+    sessionId: string,
+    accepted: { placeUsers: Array<{ type: string; content?: string; created_at?: number; message_id?: string }>; before?: { messageId?: string; toolId?: string } },
+  ) {
+    if (accepted.placeUsers.length === 0) return;
+    const base = watchReplayCanvas(sessionId);
+    const placed = placeRecoveredTurnUsers(base, accepted.placeUsers, accepted.before);
+    if (placed === base) return;
+    messageCacheRef.current.set(sessionId, placed);
+    if (activeIdRef.current === sessionId) {
+      messagesRef.current = placed;
+      setMessages(placed);
+    }
   }
   /** Restore Build / AcceptEdits / Plan approval (and user-input) cards after
    *  refresh or session switch. Auto never parks; only non-Auto modes emit these. */
@@ -2029,14 +2045,15 @@ export function Chat({
                 return;
               }
 
-              // 折叠线以上的回放先按住。页大小仍是 HISTORY_PAGE，不能为了补上提问去拉整轮。
-              const frames = acceptReplayFrame(
+              // 折叠线以上的工具/正文先按住。被页切掉的提问插回这一轮前面，不能丢掉，也不能补到回答下面。
+              const accepted = acceptReplayFrame(
                 fold,
                 event,
                 watchReplayOffset(loadId),
                 (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
               );
-              for (const frame of frames) {
+              placeReplayUsers(loadId, accepted);
+              for (const frame of accepted.paint) {
                 if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
                 const isCurrentView = activeIdRef.current === loadId;
                 if (isCurrentView) {
@@ -2177,7 +2194,7 @@ export function Chat({
 
     const detail = await getSession(hash, id, { tail: HISTORY_PAGE });
     if (activeIdRef.current !== id || !detail || !Array.isArray(detail.messages)) return null;
-    const disk = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0);
+    const disk = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0, detail.pinned_user_index);
     const canvas = messagesRef.current;
     const diskHasUser = diskHasCanvasUser(disk, canvas);
     const diskSettled = diskHasUser && !transcriptHasInFlightAssistant(disk) && !fresh.running;
@@ -2221,7 +2238,7 @@ export function Chat({
     try {
       const detail = await getSession(hash, sid, { tail: HISTORY_PAGE });
       if (!detail || !Array.isArray(detail.messages)) return false;
-      const loaded = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0);
+      const loaded = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0, detail.pinned_user_index);
       const canvas = activeIdRef.current === sid
         ? messagesRef.current
         : (messageCacheRef.current.get(sid) ?? []);
@@ -2424,14 +2441,15 @@ export function Chat({
           return;
         }
 
-        // 折叠线以上的回放先按住。页大小仍是 HISTORY_PAGE，不能为了补上提问去拉整轮。
-        const frames = acceptReplayFrame(
+        // 折叠线以上的工具/正文先按住。被页切掉的提问插回这一轮前面，不能丢掉，也不能补到回答下面。
+        const accepted = acceptReplayFrame(
           fold,
           event,
           watchReplayOffset(loadId),
           (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
         );
-        for (const frame of frames) {
+        placeReplayUsers(loadId, accepted);
+        for (const frame of accepted.paint) {
           if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
           const isCurrentView = activeIdRef.current === loadId;
           if (!isCurrentView) {
@@ -2599,6 +2617,13 @@ export function Chat({
           const sid = activeIdRef.current;
           if (sid && event.session_id === sid) {
             setIsCompacting(event.status === 'compacting');
+            // 跨实例状态同步：收到当前会话的 running: true 广播时，
+            // 若异地端尚未激活 busy，立即将 busy 置为 true 并同步时钟与侧栏红点状态
+            if (event.running && !busyRef.current) {
+              setBusyAndClock(true);
+              busyRef.current = true;
+              onLiveRunningChange?.(sid, true);
+            }
           }
           if (!event.running || event.terminal) {
             const targetSid = event.session_id;
@@ -2863,8 +2888,8 @@ export function Chat({
       finishTurnClock({ stamp: false });
       if (destRunning) {
         const sessionStarted = sessionId ? turnStartedAtBySessionRef.current.get(sessionId) : undefined;
-        // Fallback to the latest user message's send timestamp if stashed clock is absent
-        const lastUserTs = [...(cached ?? [])].reverse().find((m) => m.role === 'user')?.ts;
+        // Fallback to the root user message's send timestamp (penetrating steers) if stashed clock is absent
+        const lastUserTs = rootTurnUserTs(cached ?? [], (cached ?? []).length);
         const started = sessionStarted ?? lastUserTs ?? resumeTurnStartedAt(Date.now(), destElapsed);
         if (sessionId) {
           turnStartedAtBySessionRef.current.set(sessionId, started);
@@ -3091,7 +3116,7 @@ export function Chat({
               historyTotalBySessionRef.current.set(sessionId, diskTotal);
               hasOlderBySessionRef.current.set(sessionId, olderExists);
 
-              const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0);
+              const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0, res.pinned_user_index);
               const lastCur = messagesRef.current[messagesRef.current.length - 1];
               const lastLoaded = loaded[loaded.length - 1];
               const hasUnfinishedTool = lastCur?.parts?.some(
@@ -3252,6 +3277,7 @@ export function Chat({
             const loaded = sessionMessagesToDisplay(
               sessionResult.value.messages,
               sessionResult.value.offset ?? 0,
+              sessionResult.value.pinned_user_index,
             );
             const totalOnDisk = sessionResult.value.message_count ?? loaded.length;
             const diskOffset = sessionResult.value.offset ?? 0;
@@ -3566,7 +3592,7 @@ export function Chat({
 
           const res = await getSession(curHash, cand.id, { tail: HISTORY_PAGE });
           if (res && Array.isArray(res.messages)) {
-            const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0);
+            const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0, res.pinned_user_index);
             messageCacheRef.current.set(cand.id, loaded);
             await saveSessionCache(curHash, cand.id, loaded, res.todos, undefined, res.turns, res.token_usage);
           }
@@ -3797,7 +3823,11 @@ export function Chat({
   }, []);
 
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
-  function sessionMessagesToDisplay(msgs: SessionMessage[], sourceOffset = 0): Message[] {
+  function sessionMessagesToDisplay(
+    msgs: SessionMessage[],
+    sourceOffset = 0,
+    pinnedUserIndex?: number,
+  ): Message[] {
     const loaded: Message[] = [];
     // Running session-level todo list across turns.
     // Baseline is the last full plan; subsequent actions fold over it.
@@ -3818,7 +3848,11 @@ export function Chat({
       }
     };
     let userTurnOrdinal = 0;
+    const pinned = typeof pinnedUserIndex === 'number';
     for (const [rawIndex, msg] of msgs.entries()) {
+      const sourceIndex = pinned && rawIndex === 0
+        ? pinnedUserIndex
+        : sourceOffset + (pinned ? rawIndex - 1 : rawIndex);
       if (msg.role === 'user') {
         if (!msg.synthetic && !isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) {
           closeCompletedTurnTodos();
@@ -3836,7 +3870,7 @@ export function Chat({
           parts: [{ kind: 'text', text: visible }],
           images: msg.images && msg.images.length ? msg.images : undefined,
           ts: msg.created_at,
-          sourceIndex: sourceOffset + rawIndex,
+          sourceIndex,
           turnNavOrdinal,
           id: msg.id,
         });
@@ -3901,7 +3935,7 @@ export function Chat({
           parts,
           ts: msg.created_at,
           elapsedMs: msg.elapsed_ms,
-          sourceIndex: sourceOffset + rawIndex,
+          sourceIndex,
           id: msg.id,
         });
       } else if (msg.role === 'tool' && msg.tool_result) {
@@ -3951,6 +3985,20 @@ export function Chat({
     }
     closeCompletedTurnTodos();
     return loaded;
+  }
+
+  /** 往前补页时，首屏钉住的那条提问已经在画布上，按 id / 绝对下标去掉重复。 */
+  function prependOlderMessages(prev: Message[], older: Message[]): Message[] {
+    const seenId = new Set(prev.map((m) => m.id).filter((id): id is string => !!id));
+    const seenIndex = new Set(
+      prev.map((m) => m.sourceIndex).filter((n): n is number => typeof n === 'number'),
+    );
+    const fresh = older.filter((m) => {
+      if (m.id && seenId.has(m.id)) return false;
+      if (typeof m.sourceIndex === 'number' && seenIndex.has(m.sourceIndex)) return false;
+      return true;
+    });
+    return [...fresh, ...prev];
   }
 
   // ── Live SSE adapter: map LiveWireEvent → SSEEvent (for variants that overlap) ──
@@ -4331,6 +4379,43 @@ export function Chat({
     setGitRefreshTrigger((n) => n + 1);
   };
 
+  // 终端活跃标签页数量与预览/差异标签页数量（角标与提问历史对齐）
+  const [terminalCount, setTerminalCount] = useState<number>(() =>
+    getSavedTerminalCount(effectiveWorkingDir || cwd),
+  );
+  useEffect(() => {
+    setTerminalCount(getSavedTerminalCount(effectiveWorkingDir || cwd));
+  }, [effectiveWorkingDir, cwd]);
+  useEffect(() => {
+    const handleRemoteUpdate = () => {
+      setTerminalCount(getSavedTerminalCount(effectiveWorkingDir || cwd));
+    };
+    window.addEventListener('jeikcode:terminal:remote_updated', handleRemoteUpdate);
+    return () => {
+      window.removeEventListener('jeikcode:terminal:remote_updated', handleRemoteUpdate);
+    };
+  }, [effectiveWorkingDir, cwd]);
+
+  // 订阅项目全局 Git 状态，计算未提交代码更改数量（对齐提问历史角标）
+  const [gitProjectState, setGitProjectState] = useState<GitProjectState>(() =>
+    gitStore.getState(effectiveWorkingDir),
+  );
+  useEffect(() => {
+    setGitProjectState(gitStore.getState(effectiveWorkingDir));
+    if (effectiveWorkingDir) {
+      gitStore.scheduleRefresh(effectiveWorkingDir, { immediate: true });
+    }
+    return gitStore.subscribe(effectiveWorkingDir, setGitProjectState);
+  }, [effectiveWorkingDir]);
+
+  const gitChangedCount = useMemo(() => {
+    if (!gitProjectState || !gitProjectState.gitStatus) return 0;
+    const staged = gitProjectState.gitStatus.staged?.length ?? 0;
+    const unstaged = gitProjectState.gitStatus.unstaged?.length ?? 0;
+    const untracked = gitProjectState.gitStatus.untracked?.length ?? 0;
+    return staged + unstaged + untracked;
+  }, [gitProjectState]);
+
   // Auto-refresh Git state whenever turnNavItems length changes or turns complete
   useEffect(() => {
     setGitRefreshTrigger((n) => n + 1);
@@ -4660,6 +4745,7 @@ export function Chat({
           parts: [{ kind: 'text', text: cleanText }],
           images: resolvedImages,
           ts: now,
+          isSteer: true,
           sourceIndex: turnIndex,
           turnNavOrdinal: turnOrdinal,
           // 内核身份优先；旧 daemon 无此字段时退回本地 client id。
@@ -4800,7 +4886,7 @@ export function Chat({
       hasOlderBySessionRef.current.set(sid, olderExists);
       if (detail.turns && detail.turns.length > 0) setTurnOutline(detail.turns);
       setMessages((prev) => {
-        const next = [...older, ...prev];
+        const next = prependOlderMessages(prev, older);
         messagesRef.current = next;
         messageCacheRef.current.set(sid, next);
         return next;
@@ -4905,7 +4991,7 @@ export function Chat({
       hasOlderBySessionRef.current.set(id, olderExists);
       if (detail.turns && detail.turns.length > 0) setTurnOutline(detail.turns);
       setMessages((prev) => {
-        const next = [...older, ...prev];
+        const next = prependOlderMessages(prev, older);
         messagesRef.current = next;
         messageCacheRef.current.set(id, next);
         if (projectHash) {
@@ -6653,6 +6739,7 @@ export function Chat({
             images: images.length ? images : undefined,
             ts: now,
             pendingSteerId: pendingSteer.id,
+            isSteer: true,
             id: pendingSteer.id,
             sourceIndex: turnIndex,
             turnNavOrdinal: turnOrdinal,
@@ -8876,6 +8963,7 @@ export function Chat({
                   <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                     <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
                   </svg>
+                  {gitChangedCount > 0 && <span class="tab-badge">{gitChangedCount}</span>}
                 </button>
 
                 <button
@@ -8888,6 +8976,7 @@ export function Chat({
                   <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M3 5l4 3-4 3m6 0h4" />
                   </svg>
+                  {terminalCount > 0 && <span class="tab-badge">{terminalCount}</span>}
                 </button>
 
                 <button
@@ -8905,6 +8994,7 @@ export function Chat({
                     <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                     <circle cx="12" cy="12" r="3" />
                   </svg>
+                  {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
                 </button>
 
                 <button
@@ -9014,7 +9104,7 @@ export function Chat({
                   width: '100%',
                 }}
               >
-                <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
+                <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} onTabsCountChange={setTerminalCount} />
               </div>
 
               <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
@@ -9067,6 +9157,7 @@ export function Chat({
                 <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
               </svg>
               <span class="rail-tab-text">Git</span>
+              {gitChangedCount > 0 && <span class="tab-badge">{gitChangedCount}</span>}
             </button>
             <button
               type="button"
@@ -9082,6 +9173,7 @@ export function Chat({
                 <path d="M3 5l4 3-4 3m6 0h4" />
               </svg>
               <span class="rail-tab-text">{t('panel.terminal') || '终端'}</span>
+              {terminalCount > 0 && <span class="tab-badge">{terminalCount}</span>}
             </button>
             <button
               type="button"
@@ -9102,6 +9194,7 @@ export function Chat({
                 <circle cx="12" cy="12" r="3" />
               </svg>
               <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
+              {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
             </button>
             <button
               type="button"
@@ -9534,6 +9627,7 @@ export function Chat({
               <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                 <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
               </svg>
+              {gitChangedCount > 0 && <span class="tab-badge">{gitChangedCount}</span>}
             </button>
 
             <button
@@ -9546,6 +9640,7 @@ export function Chat({
               <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M3 5l4 3-4 3m6 0h4" />
               </svg>
+              {terminalCount > 0 && <span class="tab-badge">{terminalCount}</span>}
             </button>
 
             <button
@@ -9563,6 +9658,7 @@ export function Chat({
                 <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                 <circle cx="12" cy="12" r="3" />
               </svg>
+              {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
             </button>
           </div>
 
@@ -9655,7 +9751,7 @@ export function Chat({
               width: '100%',
             }}
           >
-            <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
+            <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} onTabsCountChange={setTerminalCount} />
           </div>
 
           <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
@@ -9707,6 +9803,7 @@ export function Chat({
               <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
             </svg>
             <span class="rail-tab-text">Git</span>
+            {gitChangedCount > 0 && <span class="tab-badge">{gitChangedCount}</span>}
           </button>
           <button
             type="button"
@@ -9722,6 +9819,7 @@ export function Chat({
               <path d="M3 5l4 3-4 3m6 0h4" />
             </svg>
             <span class="rail-tab-text">{t('panel.terminal') || '终端'}</span>
+            {terminalCount > 0 && <span class="tab-badge">{terminalCount}</span>}
           </button>
           <button
             type="button"
@@ -9742,6 +9840,7 @@ export function Chat({
               <circle cx="12" cy="12" r="3" />
             </svg>
             <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
+            {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
           </button>
           <button
             type="button"

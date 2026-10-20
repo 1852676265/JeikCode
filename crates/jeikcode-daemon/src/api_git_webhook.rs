@@ -339,10 +339,12 @@ pub async fn handle_git_webhook_api(
             )
                 .into_response();
         }
-        // 若开启，检查唤醒词
+        // 若开启，检查唤醒词（支持全角/半角逗号及竖线分隔的多唤醒词，任一匹配即可触发）
         let body = event.body_text.as_deref().unwrap_or("");
-        let keyword = binding_config.trigger_keyword.trim();
-        if !keyword.is_empty() && !body.contains(keyword) {
+        if !crate::git_adapter::comment_matches_trigger_keywords(
+            body,
+            &binding_config.trigger_keyword,
+        ) {
             return (StatusCode::OK, "Comment does not contain trigger keyword").into_response();
         }
     }

@@ -69,3 +69,62 @@ export function stampLastAssistantElapsed<T extends { role: string; elapsedMs?: 
   return msgs;
 }
 
+/**
+ * 判断一条用户消息是否为中途转向注入（Steer）消息。
+ * 判定依据（任一满足即可）：
+ * 1. 显式标记 isSteer === true 或带有 pendingSteerId 关联；
+ * 2. 文本中包含标准转向标记 [jeikcode-steer] 或包裹在 <user-query> ... </user-query> 转向信封中。
+ */
+export function isSteerUserMessage(msg: {
+  role?: string;
+  isSteer?: boolean;
+  pendingSteerId?: string;
+  parts?: Array<{ kind?: string; text?: string }>;
+  content?: string;
+}): boolean {
+  if (msg.role && msg.role !== 'user') return false;
+  if (msg.isSteer === true || Boolean(msg.pendingSteerId)) return true;
+
+  const rawText =
+    msg.content ??
+    msg.parts
+      ?.filter((p) => p.kind === 'text')
+      .map((p) => p.text)
+      .join('\n') ??
+    '';
+
+  if (!rawText) return false;
+  return rawText.includes('[jeikcode-steer]') || /<user-query>[\s\S]*?<\/user-query>/i.test(rawText);
+}
+
+/**
+ * 寻找当前 Assistant 消息所属轮次的真正根用户提问时间戳（Root Turn User Timestamp）。
+ * 遇到中途插入的 Steer 转向消息时自动向上穿透，直到找到发起该整趟任务的最初用户提问。
+ * 如果没有更早的非 Steer 用户提问，则回退使用找到的最早用户提问。
+ */
+export function rootTurnUserTs<
+  T extends {
+    role: string;
+    ts?: number;
+    isSteer?: boolean;
+    pendingSteerId?: string;
+    parts?: Array<{ kind?: string; text?: string }>;
+    content?: string;
+  },
+>(msgs: T[], idx: number): number | undefined {
+  let fallbackTs: number | undefined = undefined;
+  for (let i = idx - 1; i >= 0; i--) {
+    const m = msgs[i]!;
+    if (m.role === 'user') {
+      if (fallbackTs === undefined && m.ts != null) {
+        fallbackTs = m.ts;
+      }
+      if (!isSteerUserMessage(m)) {
+        return m.ts ?? fallbackTs;
+      }
+    }
+  }
+  return fallbackTs;
+}
+
+

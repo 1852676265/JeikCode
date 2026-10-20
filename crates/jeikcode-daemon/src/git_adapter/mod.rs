@@ -297,6 +297,27 @@ fn default_keyword() -> String {
     "@bot".to_string()
 }
 
+/// 解析配置的唤醒词列表（支持中英文逗号、中英文竖线（全半角）及换行符分隔，任选其一均可触发）
+pub fn extract_trigger_keywords(raw: &str) -> Vec<&str> {
+    raw.split([',', '，', '|', '｜', '\n', '\r'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 检查评论内容是否命中了配置的任意一个唤醒词
+pub fn comment_matches_trigger_keywords(body: &str, raw_keywords: &str) -> bool {
+    let keywords = extract_trigger_keywords(raw_keywords);
+    if keywords.is_empty() {
+        return true;
+    }
+
+    let body_lower = body.to_lowercase();
+    keywords
+        .into_iter()
+        .any(|kw| body.contains(kw) || body_lower.contains(&kw.to_lowercase()))
+}
+
 /// 统一 Git 平台适配器 Trait（多平台扩展规范）
 #[async_trait::async_trait]
 pub trait GitPlatformAdapter: Send + Sync {
@@ -614,5 +635,48 @@ mod tests {
 
         let default_adapter = get_platform_adapter("custom");
         assert_eq!(default_adapter.platform_id(), "github");
+    }
+
+    #[test]
+    fn test_extract_and_match_trigger_keywords() {
+        // 单个关键词
+        assert!(comment_matches_trigger_keywords(
+            "hello @bot please review",
+            "@bot"
+        ));
+        assert!(comment_matches_trigger_keywords(
+            "hello @BOT please review",
+            "@bot"
+        ));
+        assert!(!comment_matches_trigger_keywords("hello world", "@bot"));
+
+        // 多唤醒词：英文逗号、中文逗号、半角竖线、全角竖线
+        let config = "@bot, /review，审查|请协助｜audit";
+        let keywords = extract_trigger_keywords(config);
+        assert_eq!(keywords, vec!["@bot", "/review", "审查", "请协助", "audit"]);
+
+        // 任选其一触发
+        assert!(comment_matches_trigger_keywords("请帮我 @bot 看下", config));
+        assert!(comment_matches_trigger_keywords(
+            "/review this PR please",
+            config
+        ));
+        assert!(comment_matches_trigger_keywords(
+            "麻烦审查一下这个代码",
+            config
+        ));
+        assert!(comment_matches_trigger_keywords("请协助排查问题", config));
+        assert!(comment_matches_trigger_keywords("Ready for AUDIT", config));
+        assert!(!comment_matches_trigger_keywords(
+            "这是一条无关评论",
+            config
+        ));
+
+        // 空白或未配置默认放行
+        assert!(comment_matches_trigger_keywords("any comment", ""));
+        assert!(comment_matches_trigger_keywords(
+            "any comment",
+            "   ,  ， | ｜ "
+        ));
     }
 }

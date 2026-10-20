@@ -587,6 +587,24 @@ export async function getChatPending(sessionId: string): Promise<ChatPendingInte
 }
 
 /**
+ * 获取或分配当前浏览器标签页（Window Tab）专属的唯一客户端 ID。
+ * 存放在 sessionStorage 中，单标签页刷新保持不变（防止同端重复注册），多标签页/多设备各具唯一性（避免多端待机互踢）。
+ */
+export function getTabClientId(): string {
+  if (typeof window === 'undefined' || !window.sessionStorage) return 'default_client';
+  try {
+    let id = window.sessionStorage.getItem('jeikcode_tab_client_id');
+    if (!id) {
+      id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `client_${Date.now().toString(36)}`;
+      window.sessionStorage.setItem('jeikcode_tab_client_id', id);
+    }
+    return id;
+  } catch {
+    return 'default_client';
+  }
+}
+
+/**
  * Reattach to a turn started by another client (OpenAI API / another tab).
  * Same SSE `ChatEvent` frames as `POST /chat`.
  */
@@ -595,11 +613,13 @@ export async function watchChatSession(
   /** 回放帧带 `seq` 游标，调用方据此推进断点续传游标（见 `SeqTaggedFrame`）。 */
   onEvent: (event: SSEEvent & SeqTaggedFrame) => void,
   signal?: AbortSignal,
-  opts?: { standbyOnly?: boolean; afterSeq?: number },
+  opts?: { standbyOnly?: boolean; afterSeq?: number; clientId?: string },
 ): Promise<void> {
   const params = new URLSearchParams({ session_id: sessionId });
   if (opts?.standbyOnly) params.set('standby', 'true');
   if (opts?.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
+  const effectiveClientId = opts?.clientId || getTabClientId();
+  if (effectiveClientId) params.set('client_id', effectiveClientId);
   const streamAbort = new AbortController();
   const onParentAbort = () => streamAbort.abort();
   if (signal) {
@@ -886,8 +906,13 @@ export interface SessionDetail {
   updated_at: number;
   /** Total messages on disk (not the returned window size). */
   message_count: number;
-  /** Index of `messages[0]` in the full transcript. Absent on older daemons. */
+  /** Index of `messages[0]` in the full transcript. Absent on older daemons.
+   *  When `pinned_user_index` is set, `messages[0]` is that pinned question and
+   *  `offset` is the index of `messages[1]`. */
   offset?: number;
+  /** Absolute index of the user question pinned in front of a mid-turn tail page.
+   *  The rows between it and `offset` are not in this page. */
+  pinned_user_index?: number;
   /** All user questions for the right-rail outline. Independent of the message window. */
   turns?: SessionTurnOutline[];
   messages: SessionMessage[];

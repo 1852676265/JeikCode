@@ -280,6 +280,82 @@ export function paintUserMessage<T extends ProjectionMessage>(
   ];
 }
 
+export interface TurnUserAnchor {
+  messageId?: string;
+  toolId?: string;
+}
+
+function turnAnchorIndex<T extends ProjectionMessage>(messages: T[], before?: TurnUserAnchor): number {
+  if (before?.messageId) {
+    const idx = identifiedAssistantIndex(messages, before.messageId);
+    if (idx >= 0) return idx;
+  }
+  if (before?.toolId) {
+    const idx = messages.findIndex(
+      (message) =>
+        message.role === 'assistant' &&
+        message.parts.some((part) => part.kind === 'tool' && part.tool.id === before.toolId),
+    );
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+/**
+ * 把被首屏切掉的这一轮提问插回该轮助手内容前面。
+ * 已经在画布上则不动。这一轮还不在页上时，按新回合追加到末尾。
+ * 连续多条（开场提问、中途 steer）按到达顺序排在锚点前面，不能叠到回答下面。
+ */
+export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
+  messages: T[],
+  events: Array<{ type: string; content?: string; created_at?: number; message_id?: string }>,
+  before?: TurnUserAnchor,
+): T[] {
+  let next = messages;
+  let cursor: number | null = null;
+  let insertedAt: number | null = null;
+  for (const event of events) {
+    if (event.type === 'user_identified' && event.message_id && insertedAt != null) {
+      const row = next[insertedAt];
+      if (
+        row &&
+        row.role === 'user' &&
+        !row.id &&
+        !next.some((message) => message.id === event.message_id)
+      ) {
+        const copy = next.slice();
+        copy[insertedAt] = { ...row, id: event.message_id };
+        next = copy;
+      }
+      continue;
+    }
+    if (event.type !== 'user' || typeof event.content !== 'string') continue;
+    const userTs = event.created_at && event.created_at > 0 ? event.created_at : Date.now();
+    if (userMessageAlreadyOnCanvas(next, event.content, userTs)) continue;
+    const userText = visibleUserText(event.content);
+    const row = {
+      role: 'user',
+      parts: [{ kind: 'text', text: userText }],
+      ts: userTs,
+      ...(event.message_id ? { id: event.message_id } : {}),
+    } as T;
+    if (cursor == null) cursor = turnAnchorIndex(next, before);
+    if (cursor < 0) {
+      const painted = paintUserMessage(next, event.content, userTs, () => row);
+      insertedAt = Math.max(0, painted.length - 2);
+      cursor = painted.length - 1;
+      next = painted;
+      continue;
+    }
+    const copy = next.slice();
+    copy.splice(cursor, 0, row);
+    insertedAt = cursor;
+    cursor += 1;
+    next = copy;
+  }
+  return next;
+}
+
 export function paintAssistantText<T extends ProjectionMessage>(
   messages: T[],
   content: string,

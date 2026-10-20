@@ -42,6 +42,12 @@ function measureTerminalGrid(term: Terminal, container: HTMLElement): { cols: nu
 export interface TerminalPanelProps {
   cwd?: string;
   active?: boolean;
+  onTabsCountChange?: (count: number) => void;
+}
+
+export function getSavedTerminalCount(projectCwd?: string): number {
+  const saved = getSavedSessions(projectCwd);
+  return saved && saved.length > 0 ? saved.length : 1;
 }
 
 export interface ShellOption {
@@ -230,7 +236,26 @@ function saveSessions(tabs: TerminalTab[], projectCwd?: string) {
   } catch {}
 }
 
-export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
+function getSavedActiveTab(projectCwd?: string): string | null {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const norm = (projectCwd || 'default').replace(/\\/g, '/').trim().toLowerCase();
+      return window.sessionStorage.getItem(`jeikcode:terminal:active_tab:${norm}`);
+    }
+  } catch {}
+  return null;
+}
+
+function saveActiveTab(tabId: string, projectCwd?: string) {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const norm = (projectCwd || 'default').replace(/\\/g, '/').trim().toLowerCase();
+      window.sessionStorage.setItem(`jeikcode:terminal:active_tab:${norm}`, tabId);
+    }
+  } catch {}
+}
+
+export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelProps) {
   const t = useT();
   const { theme } = useSettings();
   const isDark =
@@ -267,7 +292,22 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     ];
   });
 
-  const [activeTabId, setActiveTabId] = useState<string>(() => tabs[0]?.id || '');
+  const [activeTabId, setActiveTabIdState] = useState<string>(() => {
+    const saved = getSavedActiveTab(cwd);
+    if (saved && tabs.some((t) => t.id === saved)) return saved;
+    return tabs[0]?.id || '';
+  });
+
+  const setActiveTabId = useCallback(
+    (idOrFn: string | ((prev: string) => string)) => {
+      setActiveTabIdState((prev) => {
+        const next = typeof idOrFn === 'function' ? idOrFn(prev) : idOrFn;
+        saveActiveTab(next, cwd);
+        return next;
+      });
+    },
+    [cwd]
+  );
 
   const [hostPlatform, setHostPlatform] = useState<HostPlatform>(() => resolveHostPlatform(cwd));
   const isHostWin = hostPlatform === 'windows';
@@ -280,7 +320,9 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     }
   }, [cwd, hostPlatform]);
 
-  // 细分 Shell 下拉选项控制（+号默认创建主流终端，下拉三角▾才选择具体 Shell）
+  useEffect(() => {
+    onTabsCountChange?.(tabs.length);
+  }, [tabs.length, onTabsCountChange]);
   const [shellDropdownOpen, setShellDropdownOpen] = useState(false);
   const shellDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -374,8 +416,8 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
   // 安全性：term.refresh() 只走渲染器重绘（CoreBrowserTerminal.refresh → RenderService.refreshRows），
   // 不经过 onData、不发送任何字节到 PTY、不做 resize，因此绝不会让已运行的终端掉线。
   // 这里只做重绘、不做尺寸同步：遍历后台终端触发 ConPTY resize 会打乱后台命令行对齐。
-  const repaintAllTerminals = useCallback(() => {
-    if (!stalePaintRef.current) return;
+  const repaintAllTerminals = useCallback((force = false) => {
+    if (!force && !stalePaintRef.current) return;
     stalePaintRef.current = false;
     for (const record of termMap.current.values()) {
       try {
@@ -757,7 +799,11 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         term.focus();
       } else if (record.container !== el) {
         record.container = el;
-        record.term.open(el);
+        if (record.term.element && record.term.element.parentElement !== el) {
+          el.appendChild(record.term.element);
+        } else if (!record.term.element) {
+          record.term.open(el);
+        }
         record.layoutSync?.(true);
         record.term.focus();
       }
@@ -784,28 +830,35 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       requestAnimationFrame(() => {
         try {
           record.layoutSync?.(true);
+          record.term.refresh(0, Math.max(0, record.term.rows - 1));
           record.term.focus();
         } catch {}
       });
     }
   }, [activeTabId, tabs, connectTabSocket, active]);
 
-  // 当终端切回前台可见状态时 (active 变化或从隐藏恢复)，执行双阶段自愈重测拟合，杜绝切后台尺寸坍缩导致的折行混乱
+  // 当终端切回前台可见状态时 (active 变化或从隐藏恢复)，执行多阶段自愈重绘拟合，杜绝切后台尺寸坍缩与停在黑屏
   useEffect(() => {
     if (active === false) {
       // 面板进入隐藏：xterm 渲染被暂停，回来时必须整体重绘一次
       stalePaintRef.current = true;
       return;
     }
-    // 先把全部终端（含挂机后台标签）重绘出来，再做当前可见终端的尺寸自愈。
-    repaintAllTerminals();
+    // 先把全部终端（含挂机后台标签）强制重绘出来，再做当前可见终端的尺寸自愈。
+    repaintAllTerminals(true);
+    const activeRec = termMap.current.get(activeTabId);
+    activeRec?.layoutSync?.(true);
+    try {
+      activeRec?.term.refresh(0, Math.max(0, (activeRec.term.rows || 1) - 1));
+    } catch {}
+
     const timer1 = setTimeout(() => {
       termMap.current.get(activeTabId)?.layoutSync?.(false);
-      repaintAllTerminals();
+      repaintAllTerminals(true);
     }, 80);
     const timer2 = setTimeout(() => {
       termMap.current.get(activeTabId)?.layoutSync?.(true);
-      repaintAllTerminals();
+      repaintAllTerminals(true);
     }, 250);
     return () => {
       clearTimeout(timer1);
@@ -869,6 +922,8 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
           setTabs(enriched);
           saveSessions(enriched, cwd);
           setActiveTabId((cur) => {
+            const saved = getSavedActiveTab(cwd);
+            if (saved && enriched.some((t: any) => t.id === saved)) return saved;
             const has = enriched.some((t: any) => t.id === cur);
             return has ? cur : enriched[0]!.id;
           });

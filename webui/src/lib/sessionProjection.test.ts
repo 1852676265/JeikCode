@@ -11,6 +11,7 @@ import {
   paintAssistantText,
   paintCachedAssistantDelta,
   paintUserMessage,
+  placeRecoveredTurnUsers,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -612,7 +613,8 @@ test('an unrouted delta still opens the placeholder round it belongs to', () => 
   const thought = paintAssistantReasoning(canvas, '新回合思考', false, 'm-2');
   assert.equal(thought[2]?.parts[0]?.text, '新回合思考');
 });
-test('background cache stamps every round so a replay can never leak old body into the newest bubble', () => {
+
+test('background cache stamps every round so a replay can never leak old body into the newest bubble', () => {
   // 后台会话（用户正看着别的会话）的真实序列：本回合正文 → steer → 新回合正文。
   let canvas: Array<{ role: string; id?: string; parts: Array<{ kind: string; text?: string }> }> = [
     { role: 'user', parts: [{ kind: 'text', text: '重构网络层' }] },
@@ -871,5 +873,45 @@ test('正文与思考无 partId 极端重放恢复：严格按顺序呈现，绝
   assert.equal((parts[2] as any).text, '阶段2思考');
   assert.equal(parts[3]?.kind, 'text');
   assert.equal((parts[3] as any).text, '阶段2结论');
+});
+
+test('被页切掉的提问插回这一轮助手前面，不会追加到回答下面', () => {
+  const canvas = [
+    { role: 'user', parts: [{ kind: 'text' as const, text: '上一问' }], id: 'u-old' },
+    { role: 'assistant', id: 'm-old', parts: [{ kind: 'text' as const, text: '上一答' }] },
+    {
+      role: 'assistant',
+      id: 'm-now',
+      parts: [{ kind: 'tool' as const, tool: { id: 'call-1', name: 'bash', args: '', status: 'done' as const } }],
+    },
+  ];
+  const placed = placeRecoveredTurnUsers(
+    canvas,
+    [{ type: 'user', content: '这一问', created_at: 10, message_id: 'u-now' }],
+    { messageId: 'm-now', toolId: 'call-1' },
+  );
+  assert.equal(placed.length, 4);
+  assert.equal(placed[2]?.role, 'user');
+  assert.equal(placed[2]?.id, 'u-now');
+  assert.equal(placed[3]?.id, 'm-now');
+  assert.equal(
+    placeRecoveredTurnUsers(placed, [{ type: 'user', content: '这一问', created_at: 10 }], { messageId: 'm-now' }),
+    placed,
+  );
+});
+
+test('这一轮还没落盘时，补回的提问作为新回合追加并带上 Working 占位', () => {
+  const canvas = [
+    { role: 'assistant', id: 'm-old', parts: [{ kind: 'text' as const, text: '上一答' }] },
+  ];
+  const placed = placeRecoveredTurnUsers(
+    canvas,
+    [{ type: 'user', content: '新提问', created_at: 4 }],
+    { messageId: 'm-missing' },
+  );
+  assert.equal(placed.length, 3);
+  assert.equal(placed[1]?.role, 'user');
+  assert.equal(placed[2]?.role, 'assistant');
+  assert.equal(placed[2]?.parts.length, 0);
 });
 

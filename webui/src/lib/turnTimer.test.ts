@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   formatTurnElapsed,
+  isSteerUserMessage,
   resumeTurnClockEpoch,
+  rootTurnUserTs,
   stampLastAssistantElapsed,
   turnDurationMs,
   turnTotalElapsedMs,
@@ -59,3 +61,96 @@ test('turnTotalElapsedMs prefers the user-bubble span, else stamped full-turn el
   assert.equal(turnTotalElapsedMs(5000, 5000, 1_200_000), 1_200_000);
   assert.equal(turnTotalElapsedMs(undefined, 9, undefined), undefined);
 });
+
+test('isSteerUserMessage detects explicit tags, pending steer IDs, and steer markers', () => {
+  // 普通用户提问
+  assert.equal(isSteerUserMessage({ role: 'user', content: '帮我重构代码' }), false);
+  assert.equal(
+    isSteerUserMessage({ role: 'user', parts: [{ kind: 'text', text: '正常问题' }] }),
+    false,
+  );
+
+  // 显式标记
+  assert.equal(isSteerUserMessage({ role: 'user', isSteer: true }), true);
+  assert.equal(isSteerUserMessage({ role: 'user', pendingSteerId: 'steer-123' }), true);
+
+  // 包含 [jeikcode-steer] 或信封
+  assert.equal(
+    isSteerUserMessage({
+      role: 'user',
+      content: '<user-query>\n启动服务器\n</user-query>\n\n[jeikcode-steer]\n',
+    }),
+    true,
+  );
+  assert.equal(
+    isSteerUserMessage({
+      role: 'user',
+      parts: [{ kind: 'text', text: '换用 sqlite [jeikcode-steer]' }],
+    }),
+    true,
+  );
+
+  // 非 user 角色绝不误判
+  assert.equal(isSteerUserMessage({ role: 'assistant', isSteer: true }), false);
+});
+
+test('rootTurnUserTs penetrates mid-turn steers and preserves root start timestamp', () => {
+  const t0 = 1_000_000; // 09:14 最初提问
+  const tSteer1 = 1_060_000; // 09:15 第一次转向 (60s 后)
+  const tSteer2 = 1_090_000; // 09:15:30 第二次转向 (90s 后)
+  const tEnd = 1_120_000; // 09:16 最终完整 stop (120s 后)
+
+  // 场景 2：中途经历两次 steer，Assistant 当前处于第 5 项
+  const messagesWithSteers = [
+    { role: 'user', ts: t0, parts: [{ kind: 'text', text: '帮我开发一个新功能' }] },
+    { role: 'assistant', parts: [{ kind: 'text', text: '正在分析...' }] },
+    {
+      role: 'user',
+      ts: tSteer1,
+      isSteer: true,
+      parts: [{ kind: 'text', text: '改用方案 B [jeikcode-steer]' }],
+    },
+    { role: 'assistant', parts: [{ kind: 'text', text: '收到，切换方案 B' }] },
+    {
+      role: 'user',
+      ts: tSteer2,
+      pendingSteerId: 'steer-abc',
+      parts: [{ kind: 'text', text: '同时启动服务器预览' }],
+    },
+    { role: 'assistant', parts: [{ kind: 'text', text: '处理完成' }], ts: tEnd },
+  ];
+
+  // 为最后的 assistant (index = 5) 寻找根用户提问时间戳
+  const rootTs = rootTurnUserTs(messagesWithSteers, 5);
+  // 必须穿透两次 steer，精准返回 t0（最初提问时间），而不是 tSteer2 或 tSteer1
+  assert.equal(rootTs, t0);
+
+  // 计算实时计时与完成结算计时：必须是完整的 120 秒，而不是最后转向后的 30 秒！
+  const fullDuration = turnDurationMs(rootTs, tEnd);
+  assert.equal(fullDuration, 120_000);
+  assert.equal(turnTotalElapsedMs(rootTs, tEnd, undefined), 120_000);
+});
+
+test('rootTurnUserTs starts fresh from 0 for naturally queued turn after previous stop', () => {
+  const tTurn1User = 1_000_000;
+  const tTurn1End = 1_050_000;
+  const tTurn2User = 1_050_000; // 排队消息在上一轮 complete 后自动触发
+  const tNow = 1_065_000; // 运行了 15 秒
+
+  // 场景 1：排队自然承接，上一轮已完整结清
+  const messagesQueuedHandoff = [
+    { role: 'user', ts: tTurn1User, parts: [{ kind: 'text', text: '问题 1' }] },
+    { role: 'assistant', ts: tTurn1End, elapsedMs: 50_000, parts: [{ kind: 'text', text: '回答 1' }] },
+    { role: 'user', ts: tTurn2User, parts: [{ kind: 'text', text: '排队的第 2 个独立问题' }] },
+    { role: 'assistant', parts: [{ kind: 'text', text: '正在回答问题 2...' }] },
+  ];
+
+  // 为第二轮的 assistant (index = 3) 寻找根用户提问时间戳
+  const rootTs = rootTurnUserTs(messagesQueuedHandoff, 3);
+  // 必须是本轮自身的提问 tTurn2User，而不是上一轮的 tTurn1User
+  assert.equal(rootTs, tTurn2User);
+
+  // 耗时只从本轮提问开始计 (15s)，绝不污染上一轮的耗时
+  assert.equal(turnDurationMs(rootTs, tNow), 15_000);
+});
+
