@@ -132,50 +132,77 @@ export function CodeEditorTab({
   const [imgScale, setImgScale] = useState<number>(1.0);
   const [imgDimensions, setImgDimensions] = useState<{ w: number; h: number } | null>(null);
 
+  const onViewModeChangeRef = useRef(onViewModeChange);
+  useEffect(() => {
+    onViewModeChangeRef.current = onViewModeChange;
+  }, [onViewModeChange]);
+
   const setViewMode = useCallback(
     (updater: 'edit' | 'preview' | 'image' | 'binary' | ((prev: 'edit' | 'preview' | 'image' | 'binary') => 'edit' | 'preview' | 'image' | 'binary')) => {
       setViewModeState((prev) => {
         const next = typeof updater === 'function' ? updater(prev) : updater;
         if (next === 'edit' || next === 'preview') {
-          onViewModeChange?.(next);
+          onViewModeChangeRef.current?.(next);
+        }
+        if (next === 'edit') {
+          window.setTimeout(() => {
+            textareaRef.current?.focus();
+          }, 50);
         }
         return next;
       });
     },
-    [onViewModeChange],
+    [],
   );
 
-  // 当 filePath 切换时，重置视图模式与图片缩放，优先使用外部传入的 defaultViewMode
+  // 仅在首次挂载或 filePath 真正发生改变时，才重置初始模式，严禁在手动切换模式后因外部重绘而被反复重置
+  const lastFilePathRef = useRef<string | null>(null);
   useEffect(() => {
+    if (lastFilePathRef.current === filePath) return;
+    lastFilePathRef.current = filePath;
+
     if (isImage && !isSvg) setViewModeState('image');
     else if (isSvg) setViewModeState('image');
     else if (isBinary) setViewModeState('binary');
     else if (defaultViewMode) {
       setViewModeState(defaultViewMode);
-      onViewModeChange?.(defaultViewMode);
+      onViewModeChangeRef.current?.(defaultViewMode);
     } else if (isMarkdown) {
       setViewModeState('preview');
-      onViewModeChange?.('preview');
+      onViewModeChangeRef.current?.('preview');
     } else {
       setViewModeState('edit');
-      onViewModeChange?.('edit');
+      onViewModeChangeRef.current?.('edit');
     }
     setImgScale(1.0);
     setImgDimensions(null);
-  }, [filePath, isImage, isSvg, isBinary, isMarkdown, defaultViewMode, onViewModeChange]);
+  }, [filePath, isImage, isSvg, isBinary, isMarkdown, defaultViewMode]);
 
   // 监听外部触发的视图切换广播 (例如右侧面板顶栏铅笔图标点击)
   useEffect(() => {
     const handleToggle = () => {
-      const next = viewMode === 'edit' ? 'preview' : 'edit';
-      setViewMode(next);
-      showToast(next === 'preview' ? t('editor.switchToPreview') : t('editor.switchToEdit'), 'info');
+      setViewMode((prev) => {
+        const next = prev === 'edit' ? 'preview' : 'edit';
+        showToast(next === 'preview' ? t('editor.switchToPreview') : t('editor.switchToEdit'), 'info');
+        return next;
+      });
     };
     window.addEventListener(`jeikcode:editor:toggle_mode:${filePath}`, handleToggle);
     return () => {
       window.removeEventListener(`jeikcode:editor:toggle_mode:${filePath}`, handleToggle);
     };
-  }, [viewMode, filePath, setViewMode]);
+  }, [filePath, setViewMode, t]);
+
+  // 监听外部保存指令广播 (例如右侧面板顶栏保存图标点击)
+  useEffect(() => {
+    const handleExternalSave = () => {
+      void handleSave();
+    };
+    window.addEventListener(`jeikcode:editor:save:${filePath}`, handleExternalSave);
+    return () => {
+      window.removeEventListener(`jeikcode:editor:save:${filePath}`, handleExternalSave);
+    };
+  }, [filePath, handleSave]);
 
   // 图片预览模式下 Ctrl + 鼠标滚轮缩放图片
   const handleImageWheel = (e: WheelEvent) => {

@@ -82,6 +82,12 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
   // 右侧面板当前激活标签的模式：默认从各处点进来的均为预览模式 ('preview')
   const [activeViewMode, setActiveViewMode] = useState<'preview' | 'edit'>('preview');
 
+  const handleViewModeChange = useCallback((m: 'edit' | 'preview' | 'image' | 'binary') => {
+    if (m === 'edit' || m === 'preview') {
+      setActiveViewMode(m);
+    }
+  }, []);
+
   useEffect(() => {
     setActiveViewMode('preview');
   }, [activeTabId]);
@@ -564,6 +570,20 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
             </button>
           )}
 
+          {activeTab && activeViewMode === 'edit' && (
+            <button
+              type="button"
+              class="preview-action-btn"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent(`jeikcode:editor:save:${activeTab.filePath}`));
+              }}
+              title={`${t('editor.save') || '保存'} (Ctrl+S)`}
+              aria-label="Save"
+            >
+              💾
+            </button>
+          )}
+
           {tabs.length > 0 && (
             <button
               type="button"
@@ -633,7 +653,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
             startLine={activeTab.startLine}
             endLine={activeTab.endLine}
             defaultViewMode="preview"
-            onViewModeChange={(m) => setActiveViewMode(m)}
+            onViewModeChange={handleViewModeChange}
             hideHeaderToolbar={true}
           />
         )}
