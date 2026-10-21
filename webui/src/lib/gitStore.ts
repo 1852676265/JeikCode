@@ -112,7 +112,7 @@ class ProjectGitManager {
   private inflights = new Map<string, InflightControl>();
   private pendingVersions = new Map<string, number>();
   private lastFetchTimes = new Map<string, number>();
-  private fetchInflight = new Map<string, boolean>();
+  private fetchInflight = new Map<string, Promise<boolean>>();
 
   private normalizeKey(cwd?: string): string {
     return cwd ? cwd.trim() : '';
@@ -478,7 +478,7 @@ class ProjectGitManager {
    * - 可见性守卫（后台隐藏标签页绝不偷跑网络请求）
    * - Fetch 成功后自动级联 scheduleRefresh(forceAll: true) 刷新全部远端分支与提交图
    */
-  public async triggerAutoFetch(
+  public triggerAutoFetch(
     cwd: string | undefined,
     options: {
       force?: boolean;
@@ -491,47 +491,51 @@ class ProjectGitManager {
 
     // 1. 节流：非强制时，距上次成功未满 60 秒直接跳过
     if (!options.force && now - last < 60_000) {
-      return false;
+      return Promise.resolve(false);
     }
 
     // 2. 避免后台未激活标签偷跑
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-      return false;
+      return Promise.resolve(false);
     }
 
-    // 3. 避免并发碰撞
-    if (this.fetchInflight.get(key)) {
-      return false;
+    // 3. 并发 Promise 共享池：已有在飞请求直接复用该 Promise，等待同一网络响应，绝不返回 false 误报失败
+    const existing = this.fetchInflight.get(key);
+    if (existing) {
+      return existing;
     }
 
     const cur = this.getState(key);
     const targetDir = cur.activeRepoRoot || key;
 
-    this.fetchInflight.set(key, true);
-    try {
-      const res = await gitFetch({ cwd: targetDir, prune: options.prune ?? true });
-      this.lastFetchTimes.set(key, Date.now());
+    const fetchPromise = (async () => {
+      try {
+        const res = await gitFetch({ cwd: targetDir, prune: options.prune ?? true });
+        this.lastFetchTimes.set(key, Date.now());
 
-      // Fetch 成功后，远程引用 (refs/remotes/*) 和 FETCH_HEAD 已经更新，
-      // 级联拉取最新的 status 与完整的 graph，更新 UI 和 sessionStorage
-      this.scheduleRefresh(key, {
-        immediate: true,
-        forceAll: true,
-        reason: 'autofetch_complete',
-      });
-      return res.success;
-    } catch (err) {
-      // 静默处理网络错误/超时，不污染主界面
-      console.debug('[GitStore] Silent fetch skipped or failed:', err);
-      return false;
-    } finally {
-      this.fetchInflight.set(key, false);
-    }
+        // Fetch 成功后，远程引用 (refs/remotes/*) 和 FETCH_HEAD 已经更新，
+        // 级联拉取最新的 status 与完整的 graph，更新 UI 并触发后端以最新 FETCH_HEAD 重新落缓存
+        await this.scheduleRefresh(key, {
+          immediate: true,
+          forceAll: true,
+          reason: 'autofetch_complete',
+        });
+        return res.success;
+      } catch (err) {
+        console.debug('[GitStore] Silent fetch skipped or failed:', err);
+        return false;
+      } finally {
+        this.fetchInflight.delete(key);
+      }
+    })();
+
+    this.fetchInflight.set(key, fetchPromise);
+    return fetchPromise;
   }
 
   public isFetching(cwd?: string): boolean {
     const key = this.normalizeKey(cwd);
-    return Boolean(this.fetchInflight.get(key));
+    return this.fetchInflight.has(key);
   }
 
   public setActiveRepoRoot(

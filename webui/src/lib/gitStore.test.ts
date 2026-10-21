@@ -108,3 +108,12 @@ test('saveSessionActiveRepo and getSessionActiveRepo restore binding with fallba
   ];
   assert.equal(getSessionActiveRepo(sid, movedRepos as any), '/mnt/storage/JeikCode');
 });
+
+test('gitStore triggerAutoFetch shares in-flight Promise for concurrent calls', async () => {
+  const cwd = '/test/repo/concurrent-fetch';
+  // Mock fetch by triggering two concurrent calls
+  const p1 = gitStore.triggerAutoFetch(cwd, { force: true });
+  const p2 = gitStore.triggerAutoFetch(cwd, { force: true });
+  assert.equal(p1, p2, 'Concurrent calls to triggerAutoFetch must return the exact same in-flight Promise');
+  await Promise.allSettled([p1, p2]);
+});

@@ -26,6 +26,7 @@ struct ReposCacheEntry {
 #[derive(Clone)]
 struct GraphCacheEntry {
     head_commit: String,
+    fetch_head_commit: Option<String>,
     current_branch: Option<String>,
     branch_param: Option<String>,
     limit: usize,
@@ -796,7 +797,7 @@ pub async fn get_git_graph(
             }
         });
 
-    // 极速 HEAD 验证：若当前 commit 与当前分支均未改变且查询参数相同，直接 0ms 返回内存缓存
+    // 极速 HEAD 与 FETCH_HEAD 联合验证：若本地 commit、远端 FETCH_HEAD 与当前分支均未改变，直接 0ms 返回内存缓存
     let head_commit = git_cmd(&dir)
         .args(["rev-parse", "--verify", "HEAD"])
         .output()
@@ -809,10 +810,28 @@ pub async fn get_git_graph(
             }
         });
 
+    let fetch_head_commit = git_cmd(&dir)
+        .args(["rev-parse", "-q", "--verify", "FETCH_HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            } else {
+                None
+            }
+        });
+
     if let Some(ref head) = head_commit {
         if let Ok(cache) = get_graph_cache().lock() {
             if let Some(entry) = cache.get(&dir) {
                 if entry.head_commit == *head
+                    && entry.fetch_head_commit == fetch_head_commit
                     && entry.current_branch == current_branch
                     && entry.branch_param == q.branch
                     && entry.limit == limit
@@ -941,6 +960,7 @@ pub async fn get_git_graph(
                 dir.clone(),
                 GraphCacheEntry {
                     head_commit: head,
+                    fetch_head_commit,
                     current_branch: current_branch.clone(),
                     branch_param: q.branch,
                     limit,
@@ -1820,10 +1840,52 @@ pub async fn git_fetch(
         if !trimmed.is_empty() {
             args.push(trimmed);
         } else {
-            args.push("--all".to_string());
+            args.push("origin".to_string());
         }
     } else {
-        args.push("--all".to_string());
+        // 优先检查当前分支绑定的 remote，若无则默认 origin，若无 origin 再回退 --all，杜绝陈旧失效 remote 拖垮
+        let current_branch_name = git_cmd(&dir)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() || s == "HEAD" { None } else { Some(s) }
+                } else {
+                    None
+                }
+            });
+
+        let tracking_remote = current_branch_name.as_ref().and_then(|b| {
+            git_cmd(&dir)
+                .args(["config", "--get", &format!("branch.{b}.remote")])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        let r = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if r.is_empty() { None } else { Some(r) }
+                    } else {
+                        None
+                    }
+                })
+        });
+
+        if let Some(r) = tracking_remote {
+            args.push(r);
+        } else {
+            let has_origin = git_cmd(&dir)
+                .args(["remote", "get-url", "origin"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if has_origin {
+                args.push("origin".to_string());
+            } else {
+                args.push("--all".to_string());
+            }
+        }
     }
 
     if req.prune.unwrap_or(true) {

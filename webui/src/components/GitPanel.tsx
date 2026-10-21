@@ -581,7 +581,8 @@ export function GitPanel({
     setIsFetching(true);
     if (!silent) setPanelError(null);
     try {
-      const ok = await gitStore.triggerAutoFetch(cwd, { force: !silent });
+      const fetchTarget = effectiveCwd || cwd;
+      const ok = await gitStore.triggerAutoFetch(fetchTarget, { force: !silent });
       if (!silent) {
         if (ok) {
           showToast(t('git.fetchSuccess'), 'success');
@@ -598,13 +599,19 @@ export function GitPanel({
     } finally {
       setIsFetching(false);
     }
-  }, [cwd, isFetching, t]);
+  }, [cwd, effectiveCwd, isFetching, t]);
 
-  // 综合刷新（本地状态 + 获取全部远程代码）
+  // 综合刷新（阶段一：本地状态毫秒级先到先更；阶段二：网络Fetch异步非阻塞，远端新引用到货后级联重绘图谱并重新落缓存）
   const handleFullRefresh = useCallback(async () => {
-    loadGitData(false);
-    await handleFetch(false);
-  }, [loadGitData, handleFetch]);
+    // 阶段 1：本地即时快速刷新（<15ms 本地更改列表、当前分支、ahead/behind 即刻上屏）
+    gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false, filterBranch });
+    // 阶段 2：异步并发拉取远程最新代码（按钮优雅旋转，完全非阻塞，连击自动单飞复用）
+    void (async () => {
+      await handleFetch(false);
+      // 阶段 3：远程到货后，无条件以 forceAll 刷新图谱，后端校验双指纹变动并重新落缓存
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true, filterBranch });
+    })();
+  }, [cwd, filterBranch, handleFetch]);
 
   // Initial load 与外部 refreshTrigger 联动
   const seenRefreshRef = useRef<number | null>(null);
