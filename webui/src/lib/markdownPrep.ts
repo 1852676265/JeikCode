@@ -898,9 +898,16 @@ export function preprocessMarkdown(raw: string): string {
 
     const isHeading = /^\s*#{1,6}\s+/.test(line);
     const openingNow = fenceOpen(line);
+    const isNonOneOrderedList = /^\s*([2-9]|\d{2,})[\.\)]\s+/.test(line);
     if ((isHeading || openingNow) && result.length > 0) {
       const prevLine = result[result.length - 1].trim();
       if (prevLine !== '' && !prevLine.startsWith('#')) {
+        result.push('');
+      }
+    } else if (isNonOneOrderedList && result.length > 0) {
+      const prevLine = result[result.length - 1].trim();
+      const prevIsList = /^(?:[-*+]|\d+[\.\)])\s+/.test(prevLine);
+      if (prevLine !== '' && !prevIsList) {
         result.push('');
       }
     }

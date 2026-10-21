@@ -33,6 +33,18 @@ pub trait McpClient: Send + Sync {
         arguments: serde_json::Value,
     ) -> Result<CallToolResult>;
 
+    /// Call a tool on the server with optional execution hints (e.g. read_only).
+    /// Default implementation delegates to `call_tool`.
+    async fn call_tool_with_options(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        is_read_only: bool,
+    ) -> Result<CallToolResult> {
+        let _ = is_read_only;
+        self.call_tool(tool_name, arguments).await
+    }
+
     /// Get the server name.
     fn server_name(&self) -> &str;
 

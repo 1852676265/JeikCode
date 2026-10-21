@@ -87,6 +87,7 @@ pub enum McpScope {
     #[default]
     Project,
     Session,
+    Global,
 }
 
 pub const DEFAULT_MAX_CONCURRENT_CALLS: usize = 8;
@@ -1228,8 +1229,17 @@ mod tests {
             server_entry_to_config(&name, entry).unwrap().scope,
             McpScope::Session
         );
+        let global_entry: McpConfigFile = serde_json::from_str(
+            r#"{"mcpServers":{"search":{"command":"search-mcp","scope":"global"}}}"#,
+        )
+        .unwrap();
+        let (name, entry) = global_entry.mcp_servers.into_iter().next().unwrap();
+        assert_eq!(
+            server_entry_to_config(&name, entry).unwrap().scope,
+            McpScope::Global
+        );
         assert!(serde_json::from_str::<McpConfigFile>(
-            r#"{"mcpServers":{"bad":{"command":"bad","scope":"global"}}}"#
+            r#"{"mcpServers":{"bad":{"command":"bad","scope":"invalid_scope"}}}"#
         )
         .is_err());
     }

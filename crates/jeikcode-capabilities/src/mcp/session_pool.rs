@@ -73,6 +73,8 @@ impl SessionMcpPool {
             .get_or_init(|| {
                 let pool = Arc::new(Self::new());
                 spawn_idle_reaper(pool.clone());
+                // In a long-lived host using the global pool, the reaper task is active.
+                pool.reaper_proven.store(true, Ordering::Release);
                 pool
             })
             .clone()
@@ -365,15 +367,12 @@ impl Drop for SessionMcpLease {
             // Long-lived host: park for warm reuse; the TTL sweep reclaims it later.
             return;
         }
-        // No usable async reaper here: kill the children NOW (synchronously — we are inside
-        // `Drop`). This closes their stdout pipes, unblocking any reader still parked on
-        // them, and stops the process tree from leaking past this host.
+        // No usable async reaper here: kill this session's children NOW
+        // (synchronously — we are inside `Drop`). This closes their stdout pipes,
+        // unblocking any reader still parked on them, and stops the process tree
+        // from leaking past this host. We ONLY kill this session's own children;
+        // project-scoped or other sessions' processes must never be disturbed.
         self.generation.registry.kill_all_children_now();
-        // The session registry only knows its OWN clients. A session-less assembly (e.g.
-        // `SessionMode::Disabled`, or the schema probe) spawns through the project pool /
-        // probe path, so drain the process-global list too — that is the only way to reap a
-        // child this lease never owned. Superset of the call above; both are idempotent.
-        super::kill_all_mcp_children_now();
         if let Some(pool) = pool {
             pool.retire_key_now(&key);
         }

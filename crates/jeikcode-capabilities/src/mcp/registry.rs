@@ -66,6 +66,8 @@ pub enum McpConnectEvent {
     Warning { name: String, message: String },
     /// Server withheld because it comes from an untrusted project's `.mcp.json`.
     BlockedUntrusted { name: String },
+    /// Server notified that its tool catalog changed dynamically.
+    ToolsChanged { name: String },
 }
 
 /// Canonical trust-store key for a project dir. Its ordinary-path hash stays
@@ -555,7 +557,14 @@ impl McpRegistry {
 
         let configs: Vec<_> = configs
             .into_iter()
-            .filter(|config| config.scope == scope)
+            .filter(|config| match scope {
+                super::config::McpScope::Session => {
+                    config.scope == super::config::McpScope::Session
+                }
+                super::config::McpScope::Project | super::config::McpScope::Global => {
+                    config.scope != super::config::McpScope::Session
+                }
+            })
             .collect();
 
         // Gate: withhold project-source servers from untrusted projects.
@@ -617,6 +626,52 @@ impl McpRegistry {
                             let name = config.name.clone();
                             let max_concurrent_calls = config.max_concurrent_calls;
                             let timeout_ms = config.timeout_ms();
+
+                            if config.scope == super::config::McpScope::Global {
+                                match super::GlobalMcpPool::global().get_or_spawn(&config).await {
+                                    Ok(client) => {
+                                        servers.write().await.insert(name.clone(), client);
+                                        server_timeouts_ms
+                                            .write()
+                                            .await
+                                            .insert(name.clone(), timeout_ms);
+                                        server_call_limits.write().await.insert(
+                                            name.clone(),
+                                            Arc::new(Semaphore::new(max_concurrent_calls)),
+                                        );
+                                        failed_servers.write().await.remove(&name);
+                                        status_overrides
+                                            .write()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .remove(&name);
+                                        if let Some(tx) = tx {
+                                            let _ = tx.send(McpConnectEvent::Connected { name });
+                                        }
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        failed_servers
+                                            .write()
+                                            .await
+                                            .insert(name.clone(), e.to_string());
+                                        status_overrides
+                                            .write()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .insert(
+                                                name.clone(),
+                                                ServerStatus::Failed(e.to_string()),
+                                            );
+                                        if let Some(tx) = tx {
+                                            let _ = tx.send(McpConnectEvent::Failed {
+                                                name,
+                                                error: e.to_string(),
+                                            });
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+
                             let mut client: Box<dyn McpClient> = match &config.config {
                                 super::config::McpTransportConfig::Stdio {
                                     command,
@@ -1040,7 +1095,7 @@ impl McpRegistry {
 
         let configs: Vec<_> = configs
             .into_iter()
-            .filter(|config| config.scope == super::config::McpScope::Project)
+            .filter(|config| config.scope != super::config::McpScope::Session)
             .collect();
 
         // Gate: withhold project-source servers from untrusted projects.
@@ -1072,6 +1127,38 @@ impl McpRegistry {
         // risk() can consult it (and so a reconnect after a transient failure is still
         // trusted).
         self.apply_trust_from_config(&config);
+
+        if config.scope == super::config::McpScope::Global {
+            let client = match super::GlobalMcpPool::global().get_or_spawn(&config).await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.failed_servers
+                        .write()
+                        .await
+                        .insert(config.name.clone(), e.to_string());
+                    let mut overrides = match self.status_overrides.write() {
+                        Ok(o) => o,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    overrides.insert(config.name.clone(), ServerStatus::Failed(e.to_string()));
+                    return Err(e);
+                }
+            };
+            self.servers
+                .write()
+                .await
+                .insert(config.name.clone(), client);
+            self.server_timeouts_ms
+                .write()
+                .await
+                .insert(config.name.clone(), config.timeout_ms());
+            self.server_call_limits.write().await.insert(
+                config.name.clone(),
+                Arc::new(Semaphore::new(config.max_concurrent_calls)),
+            );
+            return Ok(());
+        }
+
         let mut client: Box<dyn McpClient> = match &config.config {
             super::config::McpTransportConfig::Stdio {
                 command,
@@ -1213,6 +1300,16 @@ impl McpRegistry {
             self.cached_tools_snapshot().await
         } else {
             discovered
+        }
+    }
+
+    /// Invalidate cached tools for a specific server when its tool list changes dynamically.
+    pub async fn invalidate_tool_cache(&self, server_name: &str) {
+        self.tool_cache.write().await.remove(server_name);
+        if let Some(tx) = &self.connect_events {
+            let _ = tx.send(McpConnectEvent::ToolsChanged {
+                name: server_name.to_string(),
+            });
         }
     }
 
@@ -1430,6 +1527,17 @@ impl McpRegistry {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<(String, Vec<jeikcode_kernel::message::ImageContent>)> {
+        self.call_tool_with_images_and_options(server_name, tool_name, arguments, false)
+            .await
+    }
+
+    pub async fn call_tool_with_images_and_options(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        is_read_only: bool,
+    ) -> Result<(String, Vec<jeikcode_kernel::message::ImageContent>)> {
         // Increment in-flight under the same lock park_if_idle uses, so a reaper
         // cannot observe in_flight==0 then shut down a client this call already
         // intends to use. Released before ensure/connect so we cannot deadlock.
@@ -1475,7 +1583,9 @@ impl McpRegistry {
             .await
             .map_err(|_| anyhow::anyhow!("MCP server '{}' is shutting down", server_name))?;
 
-        let result = client.call_tool(tool_name, arguments).await?;
+        let result = client
+            .call_tool_with_options(tool_name, arguments, is_read_only)
+            .await?;
 
         // Extract text and image blocks
         let mut chunks = Vec::new();

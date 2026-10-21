@@ -263,8 +263,8 @@ fn seed_fork_defaults() {
     if !tools_dest.exists() {
         let _ = std::fs::write(&tools_dest, BUILTIN_TOOLS_ASSET);
     }
-    // mcp.json — the fork's default MCP server wiring (brave-search /
-    // ddg-search / js-reverse). Only seeded when the user has no mcp.json.
+    // mcp.json — the fork's default MCP server wiring (ddg-search).
+    // Only seeded when the user has no mcp.json.
     let mcp_dest = dir.join("mcp.json");
     if !mcp_dest.exists() {
         let _ = std::fs::write(&mcp_dest, MCP_JSON_ASSET);
@@ -335,7 +335,7 @@ static THESAURUS_ASSETS: std::sync::LazyLock<
 /// `[tools.tool_output] no_fold_tools`), embedded for first-run seeding.
 static BUILTIN_TOOLS_ASSET: &str = include_str!("../../assets/builtin-tools.txt");
 
-/// Bundled default MCP server wiring (brave-search / ddg-search / js-reverse),
+/// Bundled default MCP server wiring (ddg-search),
 /// seeded as `~/.jeikcode/mcp.json` on first run (never overwrites existing).
 static MCP_JSON_ASSET: &str = include_str!("../../assets/mcp.json");
 

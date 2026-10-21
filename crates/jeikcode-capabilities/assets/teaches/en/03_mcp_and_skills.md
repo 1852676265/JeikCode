@@ -55,14 +55,17 @@ jeikcode mcp logout github
 
 ### 1.4 Core Parameter Nuances & Behavioral Differences
 
-- **`scope` Lifecycle Mode (`"project"` vs `"session"`)**:
-  - `"project"` (default): Project-shared singleton. All sessions under the same project share one background child process, with lifecycle tied to the project, exempt from idle reclamation. Best for stateless tools (filesystem, git, search).
-  - `"session"`: Isolated per session. Each session spawns an independent child process, injecting `JEIKCODE_SESSION_ID=<current_session_id>` into the child environment. Best for browsers (Playwright), stateful debuggers, or tools requiring session isolation.
-  - **Process Idle Reclamation**: Under `scope: "session"`, when switching away from a session and no tool calls occur for longer than `[mcp.session] idle_ttl_secs` (default 600s / 10 minutes), the system automatically reaps the process to free memory; the process lazily restarts upon the next tool call. Set `idle_ttl_secs = 0` in `config.toml` to disable idle reclamation.
-- **`maxConcurrentCalls` Concurrency Cap**:
-  - Valid range: 1 to 64 (default 8).
-  - Keep default 8 for stateless read-heavy services;
-  - Set explicitly to `1` for stateful or exclusive control tools (Playwright, Puppeteer) to prevent race conditions.
+- **`scope` Lifecycle Mode (`"global"` vs `"project"` vs `"session"`)**:
+  - `"global"`: Application-wide shared singleton. Reused across all projects and sessions, with lifecycle spanning the entire application. Best for stateless cloud or public APIs (Brave web search, translation) for maximum resource efficiency.
+  - `"project"` (default): Project-shared singleton. All sessions under the same project share one background child process, with lifecycle tied to the project. Best for stateless or workspace tools (filesystem, git, code analysis).
+  - `"session"`: Isolated per session. Each session spawns an independent child process, injecting `JEIKCODE_SESSION_ID=<current_session_id>` into the child environment. Best for browsers (Playwright), stateful debuggers, or tools requiring dedicated sandboxes.
+  - **Process Idle Reclamation**: Under `scope: "session"`, when switching away from a session and no tool calls occur for longer than `[mcp.session] idle_ttl_secs` (default 600s / 10 minutes), the system automatically reaps the process to free memory; set `idle_ttl_secs = 0` in `config.toml` to disable idle reclamation.
+- **`maxConcurrentCalls` Concurrency Cap (Per-Server Concurrency Control)**:
+  - **Default Value**: `8` (Unset defaults to 8, allowing up to 8 concurrent requests simultaneously; optimal for stateless read-heavy services like filesystem or web search);
+  - **Valid Range**: `1` to `64`;
+  - **When to Explicitly Set to `1` (FIFO Queue / Serial Mode)**:
+    1. **Stateful Exclusive Tools**: Browser automation (Playwright, Puppeteer), screen control, debuggers; serial execution prevents race conditions and UI collision;
+    2. **Single-threaded / Lightweight Scripts**: Custom Python/Bash MCP servers lacking multiplexing support; setting to `1` prevents process overload or packet cross-talk.
 - **`disabled` Temporary Disable**:
   - Set to `true` to temporarily disable a server without removing its configuration.
 

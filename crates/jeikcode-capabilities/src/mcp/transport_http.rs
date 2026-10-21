@@ -52,6 +52,8 @@ pub struct HttpClient {
     /// every later request must echo in `MCP-Protocol-Version`. `None` until the
     /// handshake completes, which is exactly when the spec says not to send the header.
     negotiated_version: Arc<Mutex<Option<String>>>,
+    /// Consecutive failure count for exponential backoff throttling.
+    consecutive_failures: Arc<AtomicU64>,
 }
 
 impl HttpClient {
@@ -84,6 +86,7 @@ impl HttpClient {
             client,
             session_id: Arc::new(Mutex::new(None)),
             negotiated_version: Arc::new(Mutex::new(None)),
+            consecutive_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -152,6 +155,13 @@ impl HttpClient {
         }
         let request = serde_json::Value::Object(request);
 
+        // Apply backoff if consecutive errors were observed
+        let failures = self.consecutive_failures.load(Ordering::Relaxed);
+        if failures > 0 {
+            let delay_ms = (200u64.saturating_mul(1 << (failures.min(5) - 1))).min(3000);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
         let mut req = self.client.post(&self.url).json(&request);
 
         let user_has_accept = self
@@ -200,29 +210,41 @@ impl HttpClient {
         } else {
             self.timeout_ms
         });
-        let response = timeout(timeout_duration, req.send())
-            .await
-            .with_context(|| {
-                format!(
+        let response = match timeout(timeout_duration, req.send()).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(err)) => {
+                self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                return Err(err).context(format!(
+                    "HTTP request to MCP server {} failed",
+                    self.server_name
+                ));
+            }
+            Err(_) => {
+                self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                bail!(
                     "HTTP request to MCP server {} timed out after {}ms",
                     self.server_name,
                     timeout_duration.as_millis()
-                )
-            })?
-            .with_context(|| format!("HTTP request to MCP server {} failed", self.server_name))?;
+                );
+            }
+        };
 
         // Capture the session id the server may have handed out (e.g. on initialize).
         self.capture_session_id(response.headers()).await;
 
         if !response.status().is_success() {
             let status = response.status();
+            if status.is_server_error() {
+                self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            }
             if (status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN)
                 && self.auth.is_some()
             {
                 bail!(
-                    "MCP server {} requires OAuth; run `jeikcode mcp login {}` or `/mcp login {}`",
+                    "MCP server '{}' authentication failed or expired (HTTP {}). Please run `jeikcode mcp login {}` or `/mcp login {}` to authorize access.",
                     self.server_name,
+                    status,
                     self.server_name,
                     self.server_name
                 );
@@ -235,6 +257,9 @@ impl HttpClient {
                 body
             );
         }
+
+        // On success, reset the failure backoff counter
+        self.consecutive_failures.store(0, Ordering::Relaxed);
 
         // MCP "Streamable HTTP" servers (deepwiki, context7, etc.) may
         // return responses as `text/event-stream` SSE frames rather than
@@ -512,13 +537,30 @@ impl McpClient for HttpClient {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult> {
+        self.call_tool_with_options(tool_name, arguments, false)
+            .await
+    }
+
+    async fn call_tool_with_options(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        is_read_only: bool,
+    ) -> Result<CallToolResult> {
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments
         });
 
-        let result = self.send_request("tools/call", Some(params)).await?;
-        Ok(CallToolResult::parse_lenient(result))
+        match self.send_request("tools/call", Some(params.clone())).await {
+            Ok(result) => Ok(CallToolResult::parse_lenient(result)),
+            Err(e) if is_read_only => {
+                // 只读工具幂等安全重试一次
+                let result = self.send_request("tools/call", Some(params)).await?;
+                Ok(CallToolResult::parse_lenient(result))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn server_name(&self) -> &str {

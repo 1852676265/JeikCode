@@ -187,9 +187,11 @@ impl Tool for McpToolAdapter {
             }
         };
 
+        let arguments = coerce_mcp_arguments(&self.schema, arguments);
+
         match self
             .registry
-            .call_tool_with_images(&self.server, &self.tool, arguments)
+            .call_tool_with_images_and_options(&self.server, &self.tool, arguments, self.read_only)
             .await
         {
             Ok((content, images)) => ToolResult {
@@ -206,6 +208,106 @@ impl Tool for McpToolAdapter {
             },
         }
     }
+}
+
+/// Coerces model-generated JSON arguments against the tool's JSON schema properties.
+/// Repairs common LLM type-drift bugs (e.g. `"10"` -> `10`, `"true"` -> `true`, stringified arrays/objects).
+pub fn coerce_mcp_arguments(
+    schema: &serde_json::Value,
+    mut args: serde_json::Value,
+) -> serde_json::Value {
+    let serde_json::Value::Object(ref mut args_map) = args else {
+        return args;
+    };
+
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return args;
+    };
+
+    for (prop_name, prop_schema) in properties {
+        let Some(arg_val) = args_map.get_mut(prop_name) else {
+            continue;
+        };
+
+        let prop_type = prop_schema.get("type").and_then(serde_json::Value::as_str);
+
+        match prop_type {
+            Some("integer") => {
+                if let serde_json::Value::String(s) = arg_val {
+                    if let Ok(num) = s.trim().parse::<i64>() {
+                        *arg_val = serde_json::Value::Number(num.into());
+                    }
+                }
+            }
+            Some("number") => {
+                if let serde_json::Value::String(s) = arg_val {
+                    if let Ok(num) = s.trim().parse::<f64>() {
+                        if let Some(n) = serde_json::Number::from_f64(num) {
+                            *arg_val = serde_json::Value::Number(n);
+                        }
+                    }
+                }
+            }
+            Some("boolean") => {
+                if let serde_json::Value::String(s) = arg_val {
+                    let s_lower = s.trim().to_ascii_lowercase();
+                    if s_lower == "true" || s_lower == "1" {
+                        *arg_val = serde_json::Value::Bool(true);
+                    } else if s_lower == "false" || s_lower == "0" {
+                        *arg_val = serde_json::Value::Bool(false);
+                    }
+                } else if let serde_json::Value::Number(n) = arg_val {
+                    if n.as_i64() == Some(1) {
+                        *arg_val = serde_json::Value::Bool(true);
+                    } else if n.as_i64() == Some(0) {
+                        *arg_val = serde_json::Value::Bool(false);
+                    }
+                }
+            }
+            Some("string") => match arg_val {
+                serde_json::Value::Number(n) => {
+                    *arg_val = serde_json::Value::String(n.to_string());
+                }
+                serde_json::Value::Bool(b) => {
+                    *arg_val = serde_json::Value::String(b.to_string());
+                }
+                _ => {}
+            },
+            Some("array") => {
+                if let serde_json::Value::String(s) = arg_val {
+                    let trimmed = s.trim();
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            if parsed.is_array() {
+                                *arg_val = parsed;
+                            }
+                        }
+                    } else {
+                        *arg_val =
+                            serde_json::Value::Array(vec![serde_json::Value::String(s.clone())]);
+                    }
+                }
+            }
+            Some("object") => {
+                if let serde_json::Value::String(s) = arg_val {
+                    let trimmed = s.trim();
+                    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            if parsed.is_object() {
+                                *arg_val = parsed;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    args
 }
 
 #[cfg(test)]
@@ -430,5 +532,35 @@ mod tests {
             goggles.get("items").unwrap(),
             &serde_json::json!({ "type": "string" })
         );
+    }
+
+    #[test]
+    fn coerce_mcp_arguments_repairs_type_drift() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer" },
+                "ratio": { "type": "number" },
+                "enabled": { "type": "boolean" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "title": { "type": "string" }
+            }
+        });
+
+        let drifted_args = serde_json::json!({
+            "count": "42",
+            "ratio": "3.14",
+            "enabled": "true",
+            "tags": "[\"rust\", \"mcp\"]",
+            "title": 12345
+        });
+
+        let coerced = coerce_mcp_arguments(&schema, drifted_args);
+
+        assert_eq!(coerced["count"], serde_json::json!(42));
+        assert_eq!(coerced["ratio"], serde_json::json!(3.14));
+        assert_eq!(coerced["enabled"], serde_json::json!(true));
+        assert_eq!(coerced["tags"], serde_json::json!(["rust", "mcp"]));
+        assert_eq!(coerced["title"], serde_json::json!("12345"));
     }
 }

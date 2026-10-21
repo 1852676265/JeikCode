@@ -69,6 +69,8 @@ pub struct StdioClient {
     /// its failed generation after taking `reconnect_lock` to detect that another
     /// caller already repaired the connection.
     connection_generation: Arc<AtomicU64>,
+    /// Circular buffer retaining recent stderr output to diagnose crashes.
+    stderr_log: Arc<StdMutex<std::collections::VecDeque<String>>>,
 }
 
 #[derive(Debug)]
@@ -155,6 +157,7 @@ impl StdioClient {
             recovery_cancel: CancellationToken::new(),
             owns_transport_lifetime: true,
             connection_generation: Arc::new(AtomicU64::new(0)),
+            stderr_log: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -184,7 +187,7 @@ impl StdioClient {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         crate::process_utils::apply_enriched_path_env(&mut cmd);
@@ -239,6 +242,37 @@ impl StdioClient {
 
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = child.stdout.take().context("Failed to get stdout")?;
+        if let Some(stderr) = child.stderr.take() {
+            let stderr_log = self.stderr_log.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let capped_line = if line.len() > 512 {
+                        let cutoff = line
+                            .char_indices()
+                            .map(|(idx, _)| idx)
+                            .take_while(|&idx| idx <= 512)
+                            .last()
+                            .unwrap_or(0);
+                        let mut truncated = line[..cutoff].to_string();
+                        truncated.push_str("... [truncated]");
+                        truncated
+                    } else {
+                        line
+                    };
+                    let mut log = stderr_log.lock().unwrap_or_else(|p| p.into_inner());
+                    if log.len() >= 30 {
+                        log.pop_front();
+                    }
+                    log.push_back(capped_line);
+                    while log.iter().map(|s| s.len()).sum::<usize>() > 8192 && log.len() > 1 {
+                        log.pop_front();
+                    }
+                }
+            });
+        }
         let reader = BufReader::new(stdout);
 
         #[cfg(target_os = "windows")]
@@ -314,9 +348,9 @@ impl StdioClient {
                 request_may_have_been_sent: false,
             })?;
             body.push(b'\n');
-            // Once write_all starts, a failure can still mean that a partial or
-            // complete request reached the server. Treat the outcome as unknown
-            // so side-effecting tools are never replayed automatically.
+            // Write request (NDJSON). If writing or flushing fails, the request has
+            // not been completely transmitted to the server; mark request_may_have_been_sent
+            // as false so broken pipes before transmission can be cleanly reconnected.
             tokio::time::timeout_at(deadline, stdin.write_all(&body))
                 .await
                 .with_context(|| {
@@ -328,12 +362,12 @@ impl StdioClient {
                 .map_err(|error| RequestAttemptError {
                     error,
                     generation,
-                    request_may_have_been_sent: true,
+                    request_may_have_been_sent: false,
                 })?
                 .map_err(|error| RequestAttemptError {
                     error: error.into(),
                     generation,
-                    request_may_have_been_sent: true,
+                    request_may_have_been_sent: false,
                 })?;
             tokio::time::timeout_at(deadline, stdin.flush())
                 .await
@@ -346,12 +380,12 @@ impl StdioClient {
                 .map_err(|error| RequestAttemptError {
                     error,
                     generation,
-                    request_may_have_been_sent: true,
+                    request_may_have_been_sent: false,
                 })?
                 .map_err(|error| RequestAttemptError {
                     error: error.into(),
                     generation,
-                    request_may_have_been_sent: true,
+                    request_may_have_been_sent: false,
                 })?;
         }
 
@@ -361,6 +395,7 @@ impl StdioClient {
         // can finish without an extra model round.
         let result = loop {
             if tokio::time::Instant::now() >= hard_deadline {
+                self.notify_cancelled(id, "hard deadline reached").await;
                 return Err(RequestAttemptError {
                     error: anyhow::anyhow!(
                         "MCP request {method} reached configured max_timeout_secs ({}ms)",
@@ -382,6 +417,8 @@ impl StdioClient {
                     });
                 }
                 Err(_) => {
+                    self.notify_cancelled(id, "request timeout with no progress")
+                        .await;
                     return Err(RequestAttemptError {
                         error: anyhow::anyhow!(
                             "MCP request {method} timed out after {}ms with no progress",
@@ -477,7 +514,7 @@ impl StdioClient {
             return Err(RequestAttemptError {
                 error,
                 generation,
-                request_may_have_been_sent: true,
+                request_may_have_been_sent: false,
             });
         }
 
@@ -485,6 +522,7 @@ impl StdioClient {
             let now = tokio::time::Instant::now();
             if now >= hard_deadline {
                 self.remove_pending(id);
+                self.notify_cancelled(id, "hard deadline reached").await;
                 return Err(RequestAttemptError {
                     error: anyhow::Error::new(StdioRequestTimedOut(format!(
                         "MCP request {method} reached configured max_timeout_secs ({}ms)",
@@ -500,6 +538,8 @@ impl StdioClient {
                 Ok(None) => PendingFrame::TransportError("MCP response dispatcher closed".into()),
                 Err(_) => {
                     self.remove_pending(id);
+                    self.notify_cancelled(id, "request timeout with no progress")
+                        .await;
                     return Err(RequestAttemptError {
                         error: anyhow::Error::new(StdioRequestTimedOut(format!(
                             "MCP request {method} timed out after {}ms with no progress",
@@ -786,7 +826,119 @@ impl StdioClient {
             recovery_cancel: self.recovery_cancel.clone(),
             owns_transport_lifetime: false,
             connection_generation: self.connection_generation.clone(),
+            stderr_log: self.stderr_log.clone(),
         }
+    }
+
+    /// Send an out-of-band notification without waiting for response.
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let mut notification = serde_json::Map::new();
+        notification.insert("jsonrpc".into(), serde_json::Value::String("2.0".into()));
+        notification.insert("method".into(), serde_json::Value::String(method.into()));
+        if let Some(p) = params {
+            notification.insert("params".into(), p);
+        }
+        let mut body = serde_json::to_vec(&serde_json::Value::Object(notification))?;
+        body.push(b'\n');
+
+        let mut stdin = self.stdin.lock().await;
+        if let Some(stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(&body).await;
+            let _ = stdin.flush().await;
+        }
+        Ok(())
+    }
+
+    /// Notify server that a pending request has been cancelled by the host.
+    async fn notify_cancelled(&self, request_id: u64, reason: &str) {
+        let params = serde_json::json!({
+            "requestId": request_id,
+            "reason": reason
+        });
+        let _ = self
+            .send_notification("notifications/cancelled", Some(params))
+            .await;
+    }
+
+    /// Active Ping probe: verifies that the server's event loop is unblocked and responsive.
+    /// In JSON-RPC, receiving any valid frame matching our request id (including
+    /// MethodNotFound -32601) proves that the subprocess is alive and actively processing.
+    pub async fn ping(&self) -> Result<()> {
+        let deadline = Duration::from_millis(1500);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let request = build_jsonrpc_request("ping", None, id);
+        let mut body = serde_json::to_vec(&request)?;
+        body.push(b'\n');
+
+        {
+            let mut stdin = tokio::time::timeout(Duration::from_millis(500), self.stdin.lock())
+                .await
+                .context("MCP stdin lock contention during ping")?;
+            let stdin = stdin
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("stdin closed"))?;
+            stdin.write_all(&body).await?;
+            stdin.flush().await?;
+        }
+
+        let start = tokio::time::Instant::now();
+        loop {
+            if start.elapsed() >= deadline {
+                anyhow::bail!("MCP ping timed out (unresponsive zombie)");
+            }
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match tokio::time::timeout(remaining, self.recv_jsonrpc_value()).await {
+                Ok(Ok(val)) => {
+                    if jsonrpc_id_matches(&val, id) {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => anyhow::bail!("MCP ping timed out (unresponsive zombie)"),
+            }
+        }
+    }
+
+    /// Formats recent stderr lines for crash diagnostics.
+    fn recent_stderr(&self) -> String {
+        let log = self.stderr_log.lock().unwrap_or_else(|p| p.into_inner());
+        if log.is_empty() {
+            String::new()
+        } else {
+            log.iter().cloned().collect::<Vec<_>>().join("\n")
+        }
+    }
+
+    /// Check whether the subprocess is currently running and alive.
+    async fn is_process_alive(&self) -> bool {
+        let mut process = self.process.lock().await;
+        if let Some(child) = process.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_exit)) => false,
+                Ok(None) => true,
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Pre-flight health check: if the child process exited, disconnected,
+    /// or was previously reaped/parked, transparently cold-start before writing.
+    async fn ensure_connected_and_alive(&self) -> Result<()> {
+        let is_connected = matches!(&*self.status.lock().await, ServerStatus::Connected);
+        let process_alive = self.is_process_alive().await;
+        let stdin_alive = self.stdin.lock().await.is_some();
+        if !is_connected || !process_alive || !stdin_alive {
+            let generation = self.connection_generation.load(Ordering::SeqCst);
+            let error = anyhow::anyhow!("stdio process is not alive or disconnected");
+            self.reconnect_after_failure(generation, &error).await?;
+        }
+        Ok(())
     }
 
     async fn send_request_with_reconnect(
@@ -796,6 +948,9 @@ impl StdioClient {
         retry_after_send: bool,
     ) -> Result<serde_json::Value> {
         self.wait_for_background_recovery().await?;
+        // Pre-Flight Check: 若子进程已结束、休眠或连接丢失，无论何种操作均静默冷启动恢复
+        let _ = self.ensure_connected_and_alive().await;
+
         match self.send_request(method, params.clone()).await {
             Ok(value) => Ok(value),
             Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
@@ -803,10 +958,34 @@ impl StdioClient {
                     let first_error = format!("{:#}", attempt.error);
                     self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
                         .await;
-                    return Err(attempt.error).context(
-                        "MCP tool execution result is unknown; request was not replayed to avoid \
-                         duplicate side effects, and stdio recovery continues in the background",
-                    );
+                    let stderr_hint = self.recent_stderr();
+                    let extra = if stderr_hint.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Stderr: {stderr_hint}")
+                    };
+                    return Err(attempt.error).context(format!(
+                        "MCP connection dropped while awaiting response from server '{}' (method: {}). \
+                         The connection has been automatically restored in the background. \
+                         If this was a modifying action, please verify whether it took effect before deciding whether to retry.{}",
+                        self.server_name, method, extra
+                    ));
+                }
+                // 超时表明对端子进程可能已陷入死锁/假死，主动清理以使后续请求能拉起全新健康进程
+                let is_timeout = attempt
+                    .error
+                    .downcast_ref::<StdioRequestTimedOut>()
+                    .is_some()
+                    || attempt
+                        .error
+                        .downcast_ref::<tokio::time::error::Elapsed>()
+                        .is_some();
+                if is_timeout {
+                    self.mark_failed_if_generation_current(
+                        attempt.generation,
+                        format!("stdio process unresponsive (timeout): {:#}", attempt.error),
+                    )
+                    .await;
                 }
                 if let Err(reconnect_error) = self
                     .reconnect_after_failure(attempt.generation, &attempt.error)
@@ -824,7 +1003,10 @@ impl StdioClient {
                             )
                             .await;
                         }
-                        Err(retry.error).context("MCP request failed after one stdio reconnect")
+                        Err(retry.error).context(format!(
+                            "MCP request '{}' on server '{}' failed after reconnect",
+                            method, self.server_name
+                        ))
                     }
                 }
             }
@@ -865,13 +1047,24 @@ impl McpClient for StdioClient {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult> {
+        self.call_tool_with_options(tool_name, arguments, false)
+            .await
+    }
+
+    async fn call_tool_with_options(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        is_read_only: bool,
+    ) -> Result<CallToolResult> {
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments
         });
 
+        // 只读类工具具有天然幂等性，发送后即使中断亦可安全透明重试
         let result = self
-            .send_request_with_reconnect("tools/call", Some(params), false)
+            .send_request_with_reconnect("tools/call", Some(params), is_read_only)
             .await?;
         Ok(CallToolResult::parse_lenient(result))
     }
@@ -885,9 +1078,13 @@ impl McpClient for StdioClient {
             if let Some(child) = process.as_mut() {
                 match child.try_wait() {
                     Ok(Some(exit)) => {
-                        return ServerStatus::Failed(format!(
-                            "stdio process exited unexpectedly: {exit}"
-                        ));
+                        let stderr = self.recent_stderr();
+                        let details = if stderr.trim().is_empty() {
+                            format!("stdio process exited unexpectedly: {exit}")
+                        } else {
+                            format!("stdio process exited unexpectedly: {exit}. Stderr: {stderr}")
+                        };
+                        return ServerStatus::Failed(details);
                     }
                     Err(error) => {
                         return ServerStatus::Failed(format!(
@@ -1113,6 +1310,11 @@ fn dispatch_jsonrpc_frame(pending: &PendingRequests, value: serde_json::Value) {
             let _ = sender.send(PendingFrame::Activity);
         }
         return;
+    }
+    if value.get("method").and_then(serde_json::Value::as_str)
+        == Some("notifications/tools/list_changed")
+    {
+        tracing::info!("MCP notification: tools/list_changed received");
     }
     let senders: Vec<_> = pending
         .lock()
@@ -1462,5 +1664,18 @@ mod tests {
 
         let cloned = client.clone_for_recovery();
         assert_eq!(cloned.session_id(), Some("session-123"));
+    }
+
+    #[tokio::test]
+    async fn is_process_alive_detects_exit_or_absence() {
+        let client = StdioClient::new(
+            "test".to_string(),
+            "echo".to_string(),
+            Vec::new(),
+            BTreeMap::new(),
+            Some(1_000),
+        );
+        // Initially no process spawned -> is_process_alive returns false
+        assert!(!client.is_process_alive().await);
     }
 }

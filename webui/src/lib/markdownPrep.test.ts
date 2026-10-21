@@ -427,6 +427,29 @@ test('nested lists with 4-space indent preserve hierarchy and are not stripped',
   assert.match(out, /二级步骤 2[\s\S]*?<ul>[\s\S]*?三级说明点 2\.1/);
 });
 
+test('ordered list continuing after code block and paragraph parses as distinct items', () => {
+  const md = [
+    '源码铁证：',
+    '1. **配置归属**：',
+    '   在 `crates/jeikcode-config/src/config/mod.rs` 与各默认配置中：',
+    '   ```toml',
+    '   [mcp.session]',
+    '   idle_ttl_secs = 600',
+    '   ```',
+    '   该配置属于 `[mcp.session]` 子表，而不是全局或 project 配置。',
+    '2. **Reaper 守护线程范围**：',
+    '   在 `crates/jeikcode-capabilities/src/mcp/session_pool.rs` 中。',
+    '3. **`ProjectMcpPool` 完全没有闲置回收程**：',
+    '   在 `crates/jeikcode-capabilities/src/mcp/pool.rs` 中。',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+
+  // 确保 2. 和 3. 被成功解析为列表项 li，而不是被合并在 p 内部
+  assert.match(out, /<li[^>]*>[\s\S]*?Reaper 守护线程范围/);
+  assert.match(out, /<li[^>]*>[\s\S]*?ProjectMcpPool/);
+});
+
 
 
 

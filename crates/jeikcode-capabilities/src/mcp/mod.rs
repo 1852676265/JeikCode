@@ -22,6 +22,7 @@ use jeikcode_kernel::tool::{Tool, ToolRegistry};
 
 pub mod client;
 pub mod config;
+pub mod global_pool;
 pub mod oauth;
 pub mod pool;
 pub mod registry;
@@ -40,6 +41,7 @@ pub use config::{
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthConfig, McpScope,
     McpServerConfig, McpTransportConfig,
 };
+pub use global_pool::GlobalMcpPool;
 pub use oauth::{
     login_github_oauth, login_mcp_oauth, refresh_mcp_oauth_token, McpOAuthLoginOptions,
     McpOAuthToken, McpTokenStore,
@@ -54,10 +56,11 @@ pub use session_pool::{SessionMcpLease, SessionMcpPool};
 pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};
 pub use types::*;
 
-/// Reap every project-scoped and session-scoped MCP transport. Drivers must
+/// Reap every global, project-scoped and session-scoped MCP transport. Drivers must
 /// call this on host exit; `OnceLock` globals do not run `Drop` on process
 /// teardown, and session stdio children otherwise become orphans.
 pub async fn shutdown_all_mcp_pools() {
+    GlobalMcpPool::global().shutdown_all().await;
     ProjectMcpPool::global().shutdown_all().await;
     SessionMcpPool::global().shutdown_all().await;
     kill_all_mcp_children_now();

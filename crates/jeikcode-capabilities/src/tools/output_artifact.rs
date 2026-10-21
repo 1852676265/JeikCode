@@ -89,6 +89,8 @@ pub const THRESHOLD_BYTES: usize = 32 * 1024;
 /// `[tools.tool_output] terminal_max_bytes` (24 KiB); the effective line is
 /// `min(max_bytes, terminal_max_bytes)` so lowering either tightens the class.
 pub const TERMINAL_THRESHOLD_BYTES: usize = 24 * 1024;
+/// Threshold for external MCP tools — provides dedicated guardrails to protect context windows.
+pub const MCP_THRESHOLD_BYTES: usize = 32 * 1024;
 /// Uniform preview kept from each end of a compressed result (bytes).
 const PREVIEW_HEAD_BYTES: usize = 1500;
 const PREVIEW_TAIL_BYTES: usize = 2200;
@@ -143,6 +145,8 @@ pub struct ArtifactMiddleware {
     /// `[tools.tool_output] terminal_max_bytes`; defaults to
     /// [`TERMINAL_THRESHOLD_BYTES`].
     terminal_threshold_bytes: usize,
+    /// Threshold for MCP tool outputs. Defaults to [`MCP_THRESHOLD_BYTES`].
+    mcp_threshold_bytes: usize,
     /// Tool names whose output must reach the model verbatim (never
     /// compressed), configured via `[tools.tool_output] no_fold_tools`.
     /// Batch-friendly: every listed tool name opts out of compression, on top
@@ -156,6 +160,7 @@ impl ArtifactMiddleware {
             store,
             threshold_bytes: THRESHOLD_BYTES,
             terminal_threshold_bytes: TERMINAL_THRESHOLD_BYTES,
+            mcp_threshold_bytes: MCP_THRESHOLD_BYTES,
             no_fold_tools: std::collections::HashSet::new(),
         }
     }
@@ -171,6 +176,13 @@ impl ArtifactMiddleware {
     /// the early line — terminal tools then follow the general threshold.
     pub fn with_terminal_threshold_bytes(mut self, bytes: usize) -> Self {
         self.terminal_threshold_bytes = bytes;
+        self
+    }
+
+    /// Override the MCP tool threshold for this instance (bytes). `0` drops
+    /// the early line — MCP tools then follow the general threshold.
+    pub fn with_mcp_threshold_bytes(mut self, bytes: usize) -> Self {
+        self.mcp_threshold_bytes = bytes;
         self
     }
 
@@ -216,6 +228,9 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
         let threshold = match tool.map(|t| t.name()) {
             Some(name) if crate::is_shell_tool_name(name) && self.terminal_threshold_bytes > 0 => {
                 self.threshold_bytes.min(self.terminal_threshold_bytes)
+            }
+            Some(name) if name.starts_with("mcp__") && self.mcp_threshold_bytes > 0 => {
+                self.threshold_bytes.min(self.mcp_threshold_bytes)
             }
             _ => self.threshold_bytes,
         };
@@ -695,6 +710,38 @@ mod tests {
         assert_eq!(
             r.content, mid,
             "terminal line 0 → terminal follows the general line"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_are_truncated_with_artifact_id_at_mcp_threshold() {
+        use jeikcode_kernel::middleware::ToolMiddleware;
+        use jeikcode_kernel::tool::ToolResult;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let big = "x".repeat(35 * 1024); // 35 KB exceeds 32 KB threshold
+
+        let mw = super::ArtifactMiddleware::new(store.clone())
+            .with_threshold_bytes(64 * 1024)
+            .with_mcp_threshold_bytes(32 * 1024);
+
+        let mut r = ToolResult {
+            call_id: "mcp-call".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
+
+        mw.after(&mut r, Some(&NamedProbe("mcp__brave_search__web_search")))
+            .await;
+
+        assert!(
+            r.content.contains(super::ARTIFACT_TRUNCATION_MARKER_PREFIX),
+            "MCP tool output exceeding 32 KB must generate standard artifact truncation marker"
+        );
+        assert!(
+            r.content.contains("fetch_output(artifact_id="),
+            "MCP truncation must instruct LLM to use fetch_output with the generated artifact ID"
         );
     }
 }
