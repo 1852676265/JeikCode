@@ -36,7 +36,7 @@ import {
 } from '../lib/gitGraph';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { gitPanelFingerprint } from '../lib/gitRefresh';
-import { gitStore, type GitProjectState } from '../lib/gitStore';
+import { gitStore, getSessionActiveRepo, type GitProjectState } from '../lib/gitStore';
 
 interface ParsedCommitMessage {
   subject: string;
@@ -74,6 +74,7 @@ function parseCommitMessage(rawMessage: string): ParsedCommitMessage {
 
 interface GitPanelProps {
   cwd?: string;
+  sessionId?: string;
   refreshTrigger?: number;
   onBranchChanged?: (newBranch: string) => void;
   onOpenFileDiff?: (commit: GitCommitItem, file: GitCommitFile, repoRoot?: string) => void;
@@ -82,6 +83,7 @@ interface GitPanelProps {
 
 export function GitPanel({
   cwd,
+  sessionId,
   refreshTrigger,
   onBranchChanged,
   onOpenFileDiff,
@@ -195,10 +197,20 @@ export function GitPanel({
   const [commitFiles, setCommitFiles] = useState<Record<string, GitCommitFile[]>>({});
   const [loadingCommitHash, setLoadingCommitHash] = useState<string | null>(null);
 
-  // 异步探测子仓库列表（仅在初次或 cwd 变更时触发，不阻塞主视图渲染）
+  // 异步探测子仓库列表（并在传入 sessionId 时优先对齐当前会话绑定的子仓）
   useEffect(() => {
-    void gitStore.refreshRepos(cwd);
-  }, [cwd]);
+    void gitStore.refreshRepos(cwd, sessionId);
+  }, [cwd, sessionId]);
+
+  // 跨会话切换时，若当前会话绑定了特定子仓，静默对齐当前激活子仓
+  useEffect(() => {
+    if (!sessionId || repos.length === 0) return;
+    const target = getSessionActiveRepo(sessionId, repos);
+    if (target && target !== storeState.activeRepoRoot) {
+      gitStore.setActiveRepoRoot(cwd, target, sessionId);
+      setSelectedBranch(null);
+    }
+  }, [sessionId, repos]);
 
   // VSCode Context Menu State
   interface ContextMenuState {
@@ -1940,6 +1952,36 @@ export function GitPanel({
 
   return (
     <div class="git-panel-root">
+      {/* Multi-Repo Switcher Bar (VSCode style - 顶层常驻置顶) */}
+      {repos.length > 0 && (
+        <div class="git-repo-bar">
+          <span class="git-repo-label" title={t('git.switchRepo')}>
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M1.75 2.5h3.61a1.5 1.5 0 0 1 1.06.44l1.08 1.06h6.75A1.75 1.75 0 0 1 16 5.75v7.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V4.25C0 3.28.78 2.5 1.75 2.5z" />
+            </svg>
+          </span>
+          <select
+            class="git-repo-select"
+            value={effectiveCwd}
+            onChange={(e) => {
+              const newRoot = (e.target as HTMLSelectElement).value;
+              gitStore.setActiveRepoRoot(cwd, newRoot, sessionId);
+              setSelectedBranch(null);
+            }}
+            title={effectiveCwd}
+          >
+            {repos.map((r) => (
+              <option key={r.root} value={r.root}>
+                {r.name} {r.current_branch ? `(${r.current_branch})` : ''} {r.is_root ? `· ${t('git.rootRepo')}` : `· ${r.relative_path}`}
+              </option>
+            ))}
+          </select>
+          {repos.length > 1 && (
+            <span class="git-badge-counter">{t('git.repoCount', { count: repos.length })}</span>
+          )}
+        </div>
+      )}
+
       {/* Top Toolbar */}
       <div class="git-panel-toolbar">
         <div class="git-panel-subtabs">
@@ -2027,36 +2069,6 @@ export function GitPanel({
           </svg>
         </button>
       </div>
-
-      {/* Multi-Repo Switcher Bar (VSCode style) */}
-      {repos.length > 0 && (
-        <div class="git-repo-bar">
-          <span class="git-repo-label" title={t('git.switchRepo')}>
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M1.75 2.5h3.61a1.5 1.5 0 0 1 1.06.44l1.08 1.06h6.75A1.75 1.75 0 0 1 16 5.75v7.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V4.25C0 3.28.78 2.5 1.75 2.5z" />
-            </svg>
-          </span>
-          <select
-            class="git-repo-select"
-            value={effectiveCwd}
-            onChange={(e) => {
-              const newRoot = (e.target as HTMLSelectElement).value;
-              gitStore.setActiveRepoRoot(cwd, newRoot);
-              setSelectedBranch(null);
-            }}
-            title={effectiveCwd}
-          >
-            {repos.map((r) => (
-              <option key={r.root} value={r.root}>
-                {r.name} {r.current_branch ? `(${r.current_branch})` : ''} {r.is_root ? `· ${t('git.rootRepo')}` : `· ${r.relative_path}`}
-              </option>
-            ))}
-          </select>
-          {repos.length > 1 && (
-            <span class="git-badge-counter">{t('git.repoCount', { count: repos.length })}</span>
-          )}
-        </div>
-      )}
 
       {/* Alert / Notifications */}
       {error && (

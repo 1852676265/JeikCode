@@ -13,6 +13,78 @@ import { gitPanelFingerprint, toolTouchesWorktree } from './gitRefresh.ts';
 
 export { toolTouchesWorktree };
 
+export interface SessionRepoRecord {
+  index: number;
+  name?: string;
+  root: string;
+}
+
+function getSafeLocalStorage(): Storage | null {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return window.localStorage;
+  }
+  if (typeof globalThis !== 'undefined' && (globalThis as any).localStorage) {
+    return (globalThis as any).localStorage;
+  }
+  return null;
+}
+
+export function getSessionActiveRepo(sessionId?: string | null, repos?: GitRepoInfo[]): string | null {
+  if (!sessionId || !repos || repos.length === 0) return null;
+  try {
+    const storage = getSafeLocalStorage();
+    const raw = storage ? storage.getItem(`jeikcode:session_repo:${sessionId}`) : null;
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<SessionRepoRecord>;
+      // 1. 优先按 root 绝对路径匹配
+      if (parsed.root && repos.some((r) => r.root === parsed.root)) {
+        return parsed.root;
+      }
+      // 2. 其次按仓库名匹配（防路径或排序漂移）
+      if (parsed.name) {
+        const byName = repos.find((r) => r.name.toLowerCase() === parsed.name!.toLowerCase());
+        if (byName) return byName.root;
+      }
+      // 3. 索引平滑兜底
+      if (typeof parsed.index === 'number' && parsed.index >= 0 && parsed.index < repos.length) {
+        return repos[parsed.index].root;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function saveSessionActiveRepo(
+  sessionId: string | null | undefined,
+  repoRoot: string,
+  repos: GitRepoInfo[],
+): void {
+  const storage = getSafeLocalStorage();
+  if (!sessionId || !storage) return;
+  try {
+    const idx = repos.findIndex((r) => r.root === repoRoot);
+    const item = idx !== -1 ? repos[idx] : undefined;
+    const record: SessionRepoRecord = {
+      index: idx !== -1 ? idx : 0,
+      name: item?.name,
+      root: repoRoot,
+    };
+    storage.setItem(`jeikcode:session_repo:${sessionId}`, JSON.stringify(record));
+  } catch {}
+}
+
+export function resolveDefaultRepoRoot(repos: GitRepoInfo[]): string | null {
+  if (!repos || repos.length === 0) return null;
+  // 1. 优先匹配核心主力仓（如 JeikCode，不区分大小写）
+  const core = repos.find((r) => r.name.toLowerCase() === 'jeikcode');
+  if (core) return core.root;
+  // 2. 其次匹配标记为 is_root 的仓
+  const rootRepo = repos.find((r) => r.is_root);
+  if (rootRepo) return rootRepo.root;
+  // 3. 默认以第 0 个子仓为基准
+  return repos[0].root;
+}
+
 export interface GitProjectState {
   branches: GitBranchesResponse | null;
   commits: GitCommitItem[];
@@ -305,12 +377,17 @@ class ProjectGitManager {
           })),
         });
 
+        const curState = this.getState(key);
         const nextState: GitProjectState = {
           branches: branchRes,
           commits: newCommits,
           gitStatus: statusRes,
-          repos: prevState.repos,
-          activeRepoRoot: prevState.activeRepoRoot,
+          // 动态继承最新内存中的 repos 与 activeRepoRoot，坚决防止被请求前的旧快照覆盖重置
+          repos: curState.repos && curState.repos.length > 0 ? curState.repos : prevState.repos,
+          activeRepoRoot:
+            curState.activeRepoRoot !== undefined && curState.activeRepoRoot !== null
+              ? curState.activeRepoRoot
+              : prevState.activeRepoRoot,
           filterBranch: effectiveBranchFilter,
           loading: false,
           error: null,
@@ -355,16 +432,24 @@ class ProjectGitManager {
   /**
    * 异步轻量更新 repos 列表（仅在初次或确有需要时调用，不阻断主视图渲染）
    */
-  public async refreshRepos(cwd?: string): Promise<void> {
+  public async refreshRepos(cwd?: string, sessionId?: string | null): Promise<void> {
     const key = this.normalizeKey(cwd);
     try {
       const res = await fetchGitRepos(key);
       const cur = this.getState(key);
       let nextActive = cur.activeRepoRoot;
       if (res.repos.length > 0) {
-        if (!nextActive || !res.repos.some((r) => r.root === nextActive)) {
-          const rootRepo = res.repos.find((r) => r.is_root) || res.repos[0];
-          nextActive = rootRepo ? rootRepo.root : null;
+        // 1. 优先尝试从当前会话绑定的历史记忆中恢复（老会话精准还原）
+        const fromSession = getSessionActiveRepo(sessionId, res.repos);
+        if (fromSession) {
+          nextActive = fromSession;
+        } else if (!nextActive || !res.repos.some((r) => r.root === nextActive)) {
+          // 2. 新会话或尚未绑定：自动默认激活主力子仓（如 JeikCode 或 0 号仓）
+          const defRoot = resolveDefaultRepoRoot(res.repos);
+          nextActive = defRoot;
+          if (sessionId && defRoot) {
+            saveSessionActiveRepo(sessionId, defRoot, res.repos);
+          }
         }
       }
       const switchedRepo = nextActive !== cur.activeRepoRoot;
@@ -449,13 +534,20 @@ class ProjectGitManager {
     return Boolean(this.fetchInflight.get(key));
   }
 
-  public setActiveRepoRoot(cwd: string | undefined, repoRoot: string | null): void {
+  public setActiveRepoRoot(
+    cwd: string | undefined,
+    repoRoot: string | null,
+    sessionId?: string | null,
+  ): void {
     const key = this.normalizeKey(cwd);
     const cur = this.getState(key);
     const updated: GitProjectState = {
       ...cur,
       activeRepoRoot: repoRoot,
     };
+    if (sessionId && repoRoot && cur.repos && cur.repos.length > 0) {
+      saveSessionActiveRepo(sessionId, repoRoot, cur.repos);
+    }
     this.states.set(key, updated);
     this.saveToStorage(key, updated);
     this.notify(key);

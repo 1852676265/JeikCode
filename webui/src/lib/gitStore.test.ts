@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { gitStore, type GitProjectState } from './gitStore.ts';
+import {
+  gitStore,
+  resolveDefaultRepoRoot,
+  saveSessionActiveRepo,
+  getSessionActiveRepo,
+  type GitProjectState,
+} from './gitStore.ts';
 
 test('gitStore provides synchronous default state without blank loading screen', () => {
   const cwd = '/test/repo/project-a';
@@ -49,4 +55,56 @@ test('gitStore setOptimisticState updates state synchronously and notifies subsc
   assert.equal((observedState as any).gitStatus?.staged.length, 1);
   assert.equal((observedState as any).gitStatus?.staged[0]?.path, 'foo.txt');
   unsubscribe();
+});
+
+test('resolveDefaultRepoRoot prioritizes JeikCode and fallbacks gracefully', () => {
+  const dummyRepos = [
+    { root: '/root/src-dev/hermes-agent', name: 'hermes-agent', relative_path: 'hermes-agent', is_root: false },
+    { root: '/root/src-dev/JeikCode', name: 'JeikCode', relative_path: 'JeikCode', is_root: false },
+    { root: '/root/src-dev/openclaw', name: 'openclaw', relative_path: 'openclaw', is_root: false },
+  ];
+
+  assert.equal(resolveDefaultRepoRoot(dummyRepos as any), '/root/src-dev/JeikCode');
+
+  const otherRepos = [
+    { root: '/root/other/a', name: 'sub-a', relative_path: 'sub-a', is_root: false },
+    { root: '/root/other/b', name: 'sub-b', relative_path: 'sub-b', is_root: true },
+  ];
+  assert.equal(resolveDefaultRepoRoot(otherRepos as any), '/root/other/b');
+
+  const plainRepos = [
+    { root: '/root/other/x', name: 'sub-x', relative_path: 'sub-x', is_root: false },
+    { root: '/root/other/y', name: 'sub-y', relative_path: 'sub-y', is_root: false },
+  ];
+  assert.equal(resolveDefaultRepoRoot(plainRepos as any), '/root/other/x');
+  assert.equal(resolveDefaultRepoRoot([]), null);
+});
+
+test('saveSessionActiveRepo and getSessionActiveRepo restore binding with fallback', () => {
+  const dummyRepos = [
+    { root: '/root/src-dev/hermes-agent', name: 'hermes-agent', relative_path: 'hermes-agent', is_root: false },
+    { root: '/root/src-dev/JeikCode', name: 'JeikCode', relative_path: 'JeikCode', is_root: false },
+  ];
+
+  // Mock localStorage in Node.js test environment if absent
+  if (typeof globalThis.localStorage === 'undefined') {
+    const store = new Map<string, string>();
+    (globalThis as any).localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => store.set(k, String(v)),
+      removeItem: (k: string) => store.delete(k),
+      clear: () => store.clear(),
+    };
+  }
+
+  const sid = 'test-session-123';
+  saveSessionActiveRepo(sid, '/root/src-dev/JeikCode', dummyRepos as any);
+  const restored = getSessionActiveRepo(sid, dummyRepos as any);
+  assert.equal(restored, '/root/src-dev/JeikCode');
+
+  // Test name matching even if root path changed
+  const movedRepos = [
+    { root: '/mnt/storage/JeikCode', name: 'JeikCode', relative_path: 'JeikCode', is_root: false },
+  ];
+  assert.equal(getSessionActiveRepo(sid, movedRepos as any), '/mnt/storage/JeikCode');
 });
