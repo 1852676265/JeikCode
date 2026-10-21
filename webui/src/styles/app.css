@@ -15104,6 +15104,55 @@ body {
   box-sizing: border-box !important;
 }
 
+.git-webhook-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.08));
+}
+
+.git-header-text-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.git-header-text-wrap h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--app-primary-foreground, #f4f4f5);
+}
+
+.git-webhook-footer {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  padding: 12px 20px !important;
+  background: var(--app-menu-background, #18181b) !important;
+  border-top: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.12)) !important;
+  flex-shrink: 0 !important;
+}
+
+.git-footer-left {
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+}
+
+.git-footer-right {
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+}
+
 .git-webhook-body {
   flex: 1 1 auto !important;
   min-height: 0 !important;
@@ -16115,6 +16164,216 @@ body {
 .git-group-btn:hover {
   background: var(--app-hover-bg, rgba(255, 255, 255, 0.15));
   color: #38bdf8;
+}
+
+/* ============================================================================
+   Git Webhook & Auto Review Modal Responsive (Mobile & Small Screens)
+   ============================================================================ */
+@media (max-width: 768px) {
+  .git-webhook-modal-overlay {
+    align-items: flex-end !important;
+    justify-content: center !important;
+    padding: 0 !important;
+  }
+
+  .git-webhook-modal-card {
+    width: 100% !important;
+    max-width: 100% !important;
+    max-height: 90dvh !important;
+    height: auto !important;
+    border-bottom-left-radius: 0 !important;
+    border-bottom-right-radius: 0 !important;
+    border-top-left-radius: 20px !important;
+    border-top-right-radius: 20px !important;
+    border-bottom: none !important;
+    margin: 0 !important;
+    box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.6) !important;
+    animation: mobileSheetSlideUp 0.24s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  }
+
+  .git-webhook-header {
+    padding: 10px 16px 8px !important;
+    gap: 8px !important;
+  }
+
+  .git-header-text-wrap h3 {
+    font-size: 13px !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+  }
+
+  .git-header-text-wrap .modal-sub {
+    font-size: 10.5px !important;
+    line-height: 1.35 !important;
+  }
+
+  .git-webhook-body {
+    padding: 12px 14px !important;
+    gap: 12px !important;
+    -webkit-overflow-scrolling: touch !important;
+  }
+
+  .git-project-info-banner {
+    padding: 8px 12px !important;
+    gap: 3px !important;
+  }
+
+  .git-banner-row {
+    font-size: 11.5px !important;
+    gap: 6px !important;
+  }
+
+  .git-banner-label {
+    width: 60px !important;
+    font-size: 11px !important;
+  }
+
+  .git-banner-path {
+    font-size: 11px !important;
+  }
+
+  /* 彻底解决手机端开关横幅左右挤压导致文字竖排溢出的问题 */
+  .git-enable-hero-banner {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    padding: 12px 14px !important;
+    gap: 10px !important;
+    min-height: auto !important;
+    position: relative !important;
+  }
+
+  .git-enable-hero-left {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 10px !important;
+    width: 100% !important;
+  }
+
+  .git-enable-hero-left .git-enable-toggle-core {
+    margin: 0 !important;
+  }
+
+  .git-enable-status-chip {
+    position: absolute !important;
+    top: 12px !important;
+    right: 12px !important;
+    height: 24px !important;
+    padding: 0 10px !important;
+    font-size: 10.5px !important;
+  }
+
+  .git-enable-hero-text {
+    width: 100% !important;
+    margin-top: 2px !important;
+    gap: 4px !important;
+  }
+
+  .git-enable-hero-title strong {
+    font-size: 13px !important;
+    line-height: 1.4 !important;
+    word-break: break-word !important;
+  }
+
+  .git-enable-hero-desc {
+    font-size: 11px !important;
+    line-height: 1.4 !important;
+    word-break: break-word !important;
+  }
+
+  .git-section-title {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+
+  .git-header-capsules {
+    display: flex !important;
+    width: 100% !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+  }
+
+  .git-capsule-btn {
+    flex: 1 1 auto !important;
+    justify-content: center !important;
+    text-align: center !important;
+    padding: 5px 8px !important;
+    font-size: 11px !important;
+  }
+
+  .git-form-grid {
+    grid-template-columns: 1fr !important;
+    gap: 10px !important;
+  }
+
+  .git-webhook-input-group {
+    height: 36px !important;
+  }
+
+  .git-group-input {
+    font-size: 11.5px !important;
+    padding: 0 8px !important;
+  }
+
+  .git-group-addon {
+    font-size: 10.5px !important;
+    padding: 0 6px !important;
+  }
+
+  .git-group-btn {
+    padding: 0 10px !important;
+    font-size: 11.5px !important;
+  }
+
+  .git-textarea {
+    min-height: 110px !important;
+    font-size: 11.5px !important;
+    padding: 8px 10px !important;
+  }
+
+  .git-webhook-footer {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 10px !important;
+    align-items: stretch !important;
+    padding: 10px 14px max(14px, env(safe-area-inset-bottom)) !important;
+    background: var(--app-menu-background, #18181b) !important;
+    border-top: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.12)) !important;
+    position: sticky !important;
+    bottom: 0 !important;
+    z-index: 10 !important;
+  }
+
+  .git-footer-left {
+    width: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+  }
+
+  .git-footer-left .git-test-btn {
+    width: 100% !important;
+    height: 38px !important;
+    font-size: 12.5px !important;
+    font-weight: 600 !important;
+  }
+
+  .git-footer-right {
+    width: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+  }
+
+  .git-footer-right .git-cancel-btn,
+  .git-footer-right .git-save-btn {
+    flex: 1 1 0 !important;
+    height: 38px !important;
+    font-size: 12.5px !important;
+    font-weight: 600 !important;
+  }
 }
 
 

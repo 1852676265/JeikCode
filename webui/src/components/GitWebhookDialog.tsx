@@ -474,6 +474,12 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
       const effectiveVh = vh / zoom;
       const effectiveVw = vw / zoom;
 
+      // 移动端视口（<= 768px）自适应委托给 CSS 底部抽屉与响应式样式，不内联写死像素宽高
+      if (effectiveVw <= 768) {
+        setModalAdaptiveStyle({});
+        return;
+      }
+
       // 上下各预留 24px、左右各预留 20px 安全边距，让弹窗无论如何缩放均居中保持完整可见
       const safeMaxHeight = Math.max(340, Math.floor(effectiveVh - 48));
       const safeWidth = Math.min(860, Math.max(320, Math.floor(effectiveVw - 40)));
@@ -777,15 +783,15 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
         aria-labelledby="git-adapter-title"
       >
         {/* 顶部标题栏 */}
-        <div class="modal-header">
+        <div class="modal-header git-webhook-header">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={{ flexShrink: 0, color: 'var(--app-primary-foreground)' }}>
             <line x1="6" y1="3" x2="6" y2="15"></line>
             <circle cx="18" cy="6" r="3"></circle>
             <circle cx="6" cy="18" r="3"></circle>
             <path d="M18 9a9 9 0 0 1-9 9"></path>
           </svg>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-            <h3 id="git-adapter-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div class="git-header-text-wrap">
+            <h3 id="git-adapter-title">
               <span>{t('gitWebhook.adapterTitle')}</span>
               <span class="git-badge-tag">{t('gitWebhook.tag')}</span>
             </h3>
@@ -1389,8 +1395,8 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
         </div>
 
         {/* 弹窗底部操作栏 */}
-        <div class="modal-footer git-webhook-footer" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 20px', borderTop: '1px solid var(--app-menu-border)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <div class="modal-footer git-webhook-footer">
+          <div class="git-footer-left">
             <button
               type="button"
               class="git-test-btn"
@@ -1406,7 +1412,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
             {toast && <span class={`git-footer-toast ${toast.type}`}>{toast.msg}</span>}
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div class="git-footer-right">
             <button type="button" class="git-cancel-btn" onClick={onClose}>
               {t('common.cancel')}
             </button>

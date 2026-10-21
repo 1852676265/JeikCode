@@ -154,3 +154,28 @@ test('rootTurnUserTs starts fresh from 0 for naturally queued turn after previou
   assert.equal(turnDurationMs(rootTs, tNow), 15_000);
 });
 
+test('rootTurnUserTs preserves continuation across disk-restored messages where text was stripped', () => {
+  const t0 = 1_000_000;
+  const tSteer = 1_100_000;
+  const tEnd = 1_300_000;
+
+  // 场景 3：消息从 session/detail (磁盘) 落盘拉回，文本中的 [jeikcode-steer] 已被 strip 干净，
+  // 但凭借 isSteer: true 标记依然必须能够向上穿透，精准找回最初提问时间戳！
+  const diskRestoredMessages = [
+    { role: 'user', ts: t0, parts: [{ kind: 'text', text: '手机端机器人git设置异常 继续' }] },
+    { role: 'assistant', parts: [{ kind: 'text', text: '分析代码中...' }], ts: 1_050_000 },
+    {
+      role: 'user',
+      ts: tSteer,
+      isSteer: true, // 磁盘恢复阶段识别并保留的 isSteer
+      parts: [{ kind: 'text', text: '不知道这个问题好不好修' }], // 已经 strip 掉信封标记的纯净用户文本
+    },
+    { role: 'assistant', parts: [{ kind: 'text', text: '这个问题非常好修...' }], ts: tEnd },
+  ];
+
+  const rootTs = rootTurnUserTs(diskRestoredMessages, 3);
+  assert.equal(rootTs, t0, '落盘恢复后的消息必须成功穿透中途 steer 提问，找回 t0');
+  assert.equal(turnTotalElapsedMs(rootTs, tEnd, undefined), 300_000, '总用时必须是延续后的 300 秒');
+});
+
+

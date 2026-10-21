@@ -235,6 +235,7 @@ import {
 } from '../lib/chatTerminal';
 import {
   formatTurnElapsed,
+  isSteerUserMessage,
   resumeTurnClockEpoch,
   rootTurnUserTs,
   stampLastAssistantElapsed,
@@ -3858,9 +3859,11 @@ export function Chat({
           closeCompletedTurnTodos();
         }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
+        const rawContent = msg.content ?? '';
+        const isSteer = isSteerUserMessage({ role: 'user', content: rawContent });
         const visible = stripSteerEnvelopeForDisplay(
           stripInjectedRemindersForDisplay(
-            stripVisionAnnotation(msg.content ?? ''),
+            stripVisionAnnotation(rawContent),
           ),
         );
         if (!visible && !(msg.images && msg.images.length)) continue;
@@ -3870,6 +3873,7 @@ export function Chat({
           parts: [{ kind: 'text', text: visible }],
           images: msg.images && msg.images.length ? msg.images : undefined,
           ts: msg.created_at,
+          isSteer: isSteer ? true : undefined,
           sourceIndex,
           turnNavOrdinal,
           id: msg.id,
@@ -4005,6 +4009,7 @@ export function Chat({
 
   function flushHeldDuplicateUser(text: string) {
     const userText = visibleUserText(text) || text;
+    const isSteer = isSteerUserMessage({ role: 'user', content: text });
     const now = Date.now();
     setMessages((prev) => {
       const next = paintUserMessage(prev, userText, now, (base) => {
@@ -4015,6 +4020,7 @@ export function Chat({
           role: 'user' as const,
           parts: [{ kind: 'text', text: userText }],
           ts: now,
+          isSteer: isSteer ? true : undefined,
           sourceIndex: turnIndex,
           turnNavOrdinal: turnOrdinal,
         };

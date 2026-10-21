@@ -4858,8 +4858,14 @@ pub(crate) fn attach_display_images(
     attach_image_sets(messages, sets);
 }
 
+fn is_steer_user_message(msg: &MessageInfo) -> bool {
+    msg.role == "user"
+        && (msg.content.contains("[jeikcode-steer]")
+            || (msg.content.contains("<user-query>") && msg.content.contains("</user-query>")))
+}
+
 fn is_visible_user_turn_start(msg: &MessageInfo) -> bool {
-    msg.role == "user" && !msg.synthetic
+    msg.role == "user" && !msg.synthetic && !is_steer_user_message(msg)
 }
 
 fn is_visible_assistant_reply(msg: &MessageInfo) -> bool {
@@ -17014,6 +17020,54 @@ mod tests {
         ];
         stamp_turn_elapsed_on_last_assistants(&mut messages, &[]);
         assert_eq!(messages[1].elapsed_ms, Some(1_240_000));
+    }
+
+    #[test]
+    fn stamp_turn_elapsed_penetrates_mid_turn_steers_and_preserves_root_elapsed() {
+        use jeikcode_capabilities::session::TurnStat;
+
+        let mut messages = vec![
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_000_000);
+                m.content = "最初提问".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(5_000));
+                m.created_at = Some(1_005_000);
+                m
+            },
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_060_000);
+                m.content = "<user-query>\n中途转向\n</user-query>\n\n[jeikcode-steer]\n".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(10_000));
+                m.created_at = Some(1_120_000);
+                m
+            },
+        ];
+        let stats = vec![TurnStat {
+            after_message: 4,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 2,
+            tool_call_count: 1,
+            duration_ms: 120_000,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1,
+            model_usage: vec![],
+        }];
+        stamp_turn_elapsed_on_last_assistants(&mut messages, &stats);
+        // messages[1]（中间阶段 Assistant）保留自身单轮耗时，不被整体覆盖
+        assert_eq!(messages[1].elapsed_ms, Some(5_000));
+        // messages[3]（最终回复）必须是穿透 steer 后的整轮回合总耗时 120s！
+        assert_eq!(messages[3].elapsed_ms, Some(120_000));
     }
 
     #[test]

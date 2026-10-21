@@ -13,6 +13,7 @@
  */
 
 import { appendReasoningPart, type MsgPart } from './toolRows.ts';
+import { isSteerUserMessage } from './turnTimer.ts';
 import {
   DISPLAY_TRUNCATION_MARK,
   reconcileRunningTranscript,
@@ -332,11 +333,13 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
     if (event.type !== 'user' || typeof event.content !== 'string') continue;
     const userTs = event.created_at && event.created_at > 0 ? event.created_at : Date.now();
     if (userMessageAlreadyOnCanvas(next, event.content, userTs)) continue;
+    const isSteer = isSteerUserMessage({ role: 'user', content: event.content });
     const userText = visibleUserText(event.content);
     const row = {
       role: 'user',
       parts: [{ kind: 'text', text: userText }],
       ts: userTs,
+      ...(isSteer ? { isSteer: true } : {}),
       ...(event.message_id ? { id: event.message_id } : {}),
     } as T;
     if (cursor == null) cursor = turnAnchorIndex(next, before);
