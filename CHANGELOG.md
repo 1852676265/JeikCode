@@ -21,6 +21,34 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.8-beta.1 (2026-10-21)
+
+- **[Git Platform Integration & Mobile UX] Mobile screen adaptation for Git adapter dialog**:
+  - Refactored the hero toggle banner into a responsive vertical flow layout with full-width text container and absolutely positioned status chip, completely eliminating text squeezing and vertical overflow on narrow screens.
+  - Removed hardcoded inline pixel dimensions on viewports <= 768px, transitioning to the native bottom sheet modal specification (`max-height: 90dvh`, rounded top corners, touch scrolling).
+  - Formatted header action capsules into an auto-wrapping grid and optimized sticky footer buttons with touch padding and safe-area margins.
+- **[Turn Timer & Steer Architecture] Mid-turn steer continuation and disk persistence alignment**:
+  - Fixed steer timer regression where settled turns reverted to isolated prompt durations after disk persistence; excluded steer messages from standalone turn boundaries in daemon elapsed stamping so cumulative wall-clock time is stamped on the final assistant message.
+  - Retained the `isSteer` flag when projecting restored session messages from disk (`sessionMessagesToDisplay`) and playback recovery rows, ensuring `rootTurnUserTs` penetrates mid-turn steers across reloads and refreshes.
+- **[Wake Words & Right Panel Badges] Multi-delimiter trigger keywords and tab notification counters**:
+  - Added support for multi-delimiter trigger keyword parsing (commas and pipes, half-width and full-width) with inline hints and full i18n catalogs.
+  - Enhanced right inspector tab buttons with badge counters for Git changes, open terminals, and diff preview tabs.
+  - Repaired terminal black screen issues by preventing destructive re-open calls on existing xterm instances and persisting active tab selections.
+
+---
+
+- **[Git 平台联动与移动端体验] Git 机器人配置弹窗移动端响应式布局重构**:
+  - 将总启用开关横幅重构为垂直流式自适应容器，文本区域独占 100% 完整宽度，状态芯片以绝对定位靠右展现，彻底根除小屏下文字垂直折行与上下严重溢出的缺陷；
+  - 移动端视口（<= 768px）解除内联写死像素尺寸限制，平滑切换为标准移动端 Native 底部抽屉规范（上圆角 20px、触控顺畅滚动）；
+  - 快捷胶囊按钮优化为流式自动换行排版，底部操作栏采用适宜拇指单手触控的舒适布局并兼容系统安全区底边距。
+- **[回合计时器与转向架构] 中途发送消息（Steer）计时器延续与落盘一致性修复**:
+  - 修复中途发送消息（Steer）在任务结束落盘后计时器回退为原始时间的缺陷，后端 `stamp_turn_elapsed_on_last_assistants` 精准排除 steer 消息作为独立回合起点，确保整趟任务的延续总时长盖印在最终 Assistant 消息上；
+  - 前端从磁盘恢复历史消息（`sessionMessagesToDisplay`）及回放补回提问时保持识别并持久化 `isSteer` 标记，确保 `rootTurnUserTs` 在实时运行、任务落盘及页面刷新后均能稳定穿透中途 steer，锁定最初发起提问的时间戳。
+- **[唤醒词与右侧面板徽章] 多分隔符评论区唤醒词解析与标签状态数字角标**:
+  - 支持多分隔符唤醒词解析（半角/全角逗号及竖线任选其一），并在前端提供轻量小字提示与完整 i18n 多语言包覆盖；
+  - 为右侧面板顶栏与悬浮导轨的 Git、终端 (>_) 及预览 (👁) 图标添加数字角标，精准对齐未提交改动数、终端打开数与 Diff 标签数；
+  - 根治终端切回或刷新黑屏缺陷，杜绝在已有 xterm 实例上重复调用 `term.open()` 破坏 DOM 树，消除阻断重绘的拦截标记，并增加会话激活终端持久化记忆。
+
 ## v7.2.7 (2026-10-19)
 
 - **[TodoList & Lifecycle Architecture] Authoritative session board synchronization, turn-settlement archival, and continuation guards**:
