@@ -21,6 +21,38 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.8-beta.2 (2026-10-21)
+
+- **[Git Multi-Repository & Progressive Async Fetch] Sub-repository auto-activation, sticky switcher bar, per-session persistence, and non-blocking fetch**:
+  - Automatically activates the primary sub-repository (e.g. `JeikCode`) on new sessions in multi-repo workspaces without a root Git repository, while restoring previously selected sub-repositories for existing sessions using dual-key memory (path/name match + index fallback).
+  - Hoisted the multi-repo dropdown switcher to the sticky top of the Git panel, ensuring it remains visible and clickable across all subviews.
+  - Resolved state merge race conditions in `gitStore.ts` to prevent detected sub-repositories from being wiped out by stale snapshots.
+  - Implemented progressive asynchronous updates for full refresh: instant local status rendering (<15ms) decoupled from background remote fetch, coupled with dual-ref fingerprint verification (`HEAD` + `FETCH_HEAD`) and on-demand graph re-caching.
+  - Upgraded concurrent fetch coordination to a single-flight Promise sharing pool, eliminating erroneous "Failed to fetch remote branches" error toasts on rapid clicks.
+- **[Preview Panel & Code Editor UX] Editor mode viewMode loop resolution and direct save shortcut**:
+  - Stabilized `onViewModeChange` callback references with initialization guards in `CodeEditorTab.tsx`, preventing `useEffect` from resetting `viewMode` back to preview on parent re-renders.
+  - Automatically injected textarea focus upon switching to edit mode for instant cursor positioning.
+  - Added a quick save button in the Preview panel top bar during edit mode, enabling seamless one-click saving in remote browser environments.
+- **[Security & CI Stability] Dependency audit upgrade and TypeScript strictness**:
+  - Updated Vite to `8.3.5` to eliminate the high-severity advisory in `launch-editor` and ensure green `npm audit --audit-level=high` checks.
+  - Aligned optional `sessionId` types and adjusted event listener declaration orders for strict TypeScript compilation.
+
+---
+
+- **[多仓库支持与渐进式异步拉取] 子仓库智能首选激活、顶层常驻切换栏、会话级记忆与非阻塞异步拉取**:
+  - 在非 Git 根目录的多仓库工作区下，新建会话自动激活主力子仓（如 `JeikCode`），历史老会话通过“路径/名称匹配 + 索引平滑兜底”精准还原上次选中的子仓；
+  - 将多仓库下拉切换栏提升并常驻置顶于 Git 面板最上方，彻底解决空状态拦截导致选择栏不可见的问题；
+  - 修复 `gitStore.ts` 状态合并并发覆写缺陷，彻底杜绝已探测子仓被旧快照冲成空数组的隐患；
+  - 引入渐进式异步分阶段更新架构：本地工作区改动与分支状态毫秒级（<15ms）瞬间直出，后台定向拉取远程代码完全非阻塞，到货后通过 `HEAD + FETCH_HEAD` 双游标指纹按需重绘图谱并重新落盘入库；
+  - 升级并发拉取锁为真正的 Single-Flight Promise 共享池，连击或切屏自动复用同次网络请求，根除红标误报。
+- **[预览面板与代码编辑体验] 预览区编辑模式死循环阻断与一键快捷保存**:
+  - 修复 `CodeEditorTab` 中 `useEffect` 因父组件回调函数引用变化而导致编辑态被强制重置回只读预览态的死锁问题；
+  - 切换到编辑模式时自动注入光标聚焦（`textarea.focus()`），解决异地远程浏览器访问时光标无法就位的缺陷；
+  - 右侧预览面板顶栏在编辑模式下动态展现保存按钮（💾），支持一键快速落盘，无需受限于异地网络快捷键差异。
+- **[安全性与 CI 流水线稳定性] 依赖安全审计修复与严格类型校验**:
+  - 升级 Vite 至最新修复版本 `8.3.5`，解决 `launch-editor` 高危安全警报并保障 CI 依赖审计全绿通过；
+  - 规范化 `sessionId` 可选联合类型，纠正外部保存事件监听器声明顺序，消除严格模式下的 TypeScript 构建报错。
+
 ## v7.2.8-beta.1 (2026-10-21)
 
 - **[Git Platform Integration & Mobile UX] Mobile screen adaptation for Git adapter dialog**:
