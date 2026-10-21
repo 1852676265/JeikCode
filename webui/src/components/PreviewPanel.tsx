@@ -18,6 +18,21 @@ export interface PreviewTab {
 export interface PreviewPanelProps {
   cwd?: string;
   onOpenInMainEditor?: (filePath: string) => void;
+  onTabsCountChange?: (count: number) => void;
+}
+
+export function getSavedPreviewCount(projectCwd?: string): number {
+  if (typeof window === 'undefined' || !window.localStorage) return 0;
+  try {
+    const normCwd = (projectCwd || 'default').replace(/\\/g, '/').toLowerCase();
+    const storageKeyTabs = `jeikcode:right_preview_tabs:${normCwd}`;
+    const saved = localStorage.getItem(storageKeyTabs);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) return parsed.length;
+    }
+  } catch {}
+  return 0;
 }
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp']);
@@ -31,7 +46,7 @@ function normalizeToAbsolute(filePath: string, cwd?: string): string {
   return base ? `${base}/${p.replace(/^\.?\/+/, '')}` : p;
 }
 
-export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
+export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: PreviewPanelProps) {
   const t = useT();
   const { theme } = useSettings();
   const isDark =
@@ -91,7 +106,8 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     try {
       localStorage.setItem(storageKeyTabs, JSON.stringify(tabs));
     } catch {}
-  }, [tabs, storageKeyTabs]);
+    onTabsCountChange?.(tabs.length);
+  }, [tabs, storageKeyTabs, onTabsCountChange]);
 
   useEffect(() => {
     try {

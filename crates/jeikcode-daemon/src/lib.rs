@@ -10772,13 +10772,27 @@ struct TerminalCreatePayload {
 }
 
 async fn terminal_create(Json(req): Json<TerminalCreatePayload>) -> impl IntoResponse {
-    let shell = req.shell.unwrap_or_else(|| {
-        if cfg!(windows) {
-            "powershell".to_string()
-        } else {
-            "bash".to_string()
+    let shell = match req.shell {
+        Some(s) if !s.is_empty() => {
+            let lower = s.to_ascii_lowercase();
+            if cfg!(not(windows))
+                && (lower.contains("power") || lower.contains("pwsh") || lower.contains("cmd"))
+            {
+                "bash".to_string()
+            } else if cfg!(windows) && lower == "bash" {
+                "gitbash".to_string()
+            } else {
+                s
+            }
         }
-    });
+        _ => {
+            if cfg!(windows) {
+                "powershell".to_string()
+            } else {
+                "bash".to_string()
+            }
+        }
+    };
     let cwd = req.cwd.unwrap_or_else(|| ".".to_string());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

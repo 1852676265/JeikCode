@@ -153,6 +153,39 @@ class ProjectGitManager {
     return Boolean(set && set.size > 0);
   }
 
+  /**
+   * 0ms 瞬间乐观更新：立即同步修改内存与缓存状态，并通知全量订阅者（GitPanel、标签计数徽章等），杜绝任何网络延迟带来的卡顿视觉
+   */
+  public setOptimisticState(
+    cwd: string | undefined,
+    updater: (prev: GitProjectState) => GitProjectState,
+  ): void {
+    const key = this.normalizeKey(cwd);
+    const cur = this.getState(key);
+    const updated = updater(cur);
+    const fingerprint = gitPanelFingerprint({
+      branch: updated.branches?.current || updated.gitStatus?.current_branch || '',
+      ahead: updated.gitStatus?.ahead,
+      behind: updated.gitStatus?.behind,
+      staged: updated.gitStatus?.staged || [],
+      unstaged: updated.gitStatus?.unstaged || [],
+      untracked: updated.gitStatus?.untracked || [],
+      commits: updated.commits.map((c) => ({
+        hash: c.hash,
+        message: c.message,
+        refs: c.refs,
+      })),
+    });
+    const finalState: GitProjectState = {
+      ...updated,
+      fingerprint,
+      version: cur.version + 1,
+    };
+    this.states.set(key, finalState);
+    this.saveToStorage(key, finalState);
+    this.notify(key);
+  }
+
   private notify(key: string): void {
     const state = this.states.get(key);
     if (!state) return;
@@ -235,6 +268,15 @@ class ProjectGitManager {
 
         // 如果之前的当前分支名变了，必须重新拉取 Graph
         if (prevState.branches?.current !== branchRes.current) {
+          shouldFetchGraph = true;
+        }
+
+        // 如果 ahead / behind 变化了，说明有新增 commit 或远端更新，必须拉取 Graph
+        if (
+          prevState.gitStatus &&
+          (prevState.gitStatus.ahead !== statusRes.ahead ||
+            prevState.gitStatus.behind !== statusRes.behind)
+        ) {
           shouldFetchGraph = true;
         }
 

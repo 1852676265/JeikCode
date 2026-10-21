@@ -42,6 +42,7 @@ struct ShellLaunch {
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    actual_shell: String,
 }
 
 fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
@@ -53,6 +54,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                 program: "cmd.exe".to_string(),
                 args: vec!["/K".to_string()],
                 env: Vec::new(),
+                actual_shell: "cmd".to_string(),
             };
         }
         if shell == "wsl" || (shell.contains("wsl") && !shell.contains("git")) {
@@ -66,6 +68,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                     "-i".to_string(),
                 ],
                 env: Vec::new(),
+                actual_shell: "wsl".to_string(),
             };
         }
         if shell == "gitbash"
@@ -81,6 +84,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                     // MSYS 只有打开 pcon 才会把 ConPTY 当成真正的终端。
                     ("MSYS".to_string(), "enable_pcon".to_string()),
                 ],
+                actual_shell: "gitbash".to_string(),
             };
         }
         let program = if shell.contains("pwsh") {
@@ -92,6 +96,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
             program: program.to_string(),
             args: vec!["-NoLogo".to_string(), "-NoExit".to_string()],
             env: Vec::new(),
+            actual_shell: "powershell".to_string(),
         };
     }
     #[cfg(not(windows))]
@@ -101,6 +106,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                 program: "zsh".to_string(),
                 args: vec!["-l".to_string(), "-i".to_string()],
                 env: Vec::new(),
+                actual_shell: "zsh".to_string(),
             };
         }
         // "powershell" / "pwsh" 含有 "sh"，不能因此落到 /bin/sh。
@@ -115,12 +121,14 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                 program: "sh".to_string(),
                 args: vec!["-i".to_string()],
                 env: Vec::new(),
+                actual_shell: "sh".to_string(),
             };
         }
         ShellLaunch {
             program: "bash".to_string(),
             args: vec!["-l".to_string(), "-i".to_string()],
             env: Vec::new(),
+            actual_shell: "bash".to_string(),
         }
     }
 }
@@ -201,6 +209,7 @@ fn spawn_pty_command(
         program: program.to_string(),
         args: args.to_vec(),
         env: env.to_vec(),
+        actual_shell: program.to_string(),
     };
     let cmd = command_from_launch(&launch, cwd);
     let pty_system = native_pty_system();
@@ -428,13 +437,21 @@ fn register_daemon_terminal(term_id: &str, shell_name: &str, cwd: &str) {
     let mut guard = daemon_terminals()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
+    let count = guard.len();
     if let Some(existing) = guard.get_mut(term_id) {
         existing.cwd = cwd.to_string();
         existing.shell = shell_name.to_string();
+        // 自动纠正历史上或前端并发误传的异构平台终端名称
+        if (cfg!(not(windows)) && existing.name.starts_with("powershell"))
+            || (cfg!(windows)
+                && existing.name.starts_with("bash")
+                && !existing.name.contains("git"))
+        {
+            existing.name = format!("{shell_name} {count}");
+        }
         return;
     }
-    let count = guard.len() + 1;
-    let name = format!("{shell_name} {count}");
+    let name = format!("{shell_name} {}", count + 1);
     guard.insert(
         term_id.to_string(),
         DaemonTerminalItem {
@@ -508,11 +525,12 @@ pub(crate) async fn get_or_spawn_terminal_process(
         cols,
         rows,
     )?;
+    let actual_shell = launch.actual_shell.clone();
     let pid = spawned.child.process_id();
     let killer = spawned.child.clone_killer();
     let (broadcast, _) = tokio::sync::broadcast::channel::<String>(512);
     let greeting = format!(
-        "\x1b[32m[JeikCode Terminal: {term_id} ({shell_name})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
+        "\x1b[32m[JeikCode Terminal: {term_id} ({actual_shell})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
     );
     let buffer = Arc::new(Mutex::new(greeting));
     start_reader(spawned.reader, buffer.clone(), broadcast.clone());
@@ -526,7 +544,7 @@ pub(crate) async fn get_or_spawn_terminal_process(
         broadcast,
     });
     lock(live_terminals()).insert(term_id.to_string(), proc.clone());
-    register_daemon_terminal(term_id, shell_name, &target_cwd);
+    register_daemon_terminal(term_id, &actual_shell, &target_cwd);
     reap_when_exited(proc.clone(), term_id.to_string(), target_cwd);
     Ok(proc)
 }

@@ -24,3 +24,29 @@ test('gitStore subscriber detects listener attachment and detachment', () => {
   assert.equal(gitStore.hasSubscribers(cwd), false);
   assert.equal(notified, false);
 });
+
+test('gitStore setOptimisticState updates state synchronously and notifies subscribers', () => {
+  const cwd = '/test/repo/project-c';
+  let observedState: GitProjectState | null = null;
+  const unsubscribe = gitStore.subscribe(cwd, (s) => {
+    observedState = s;
+  });
+
+  gitStore.setOptimisticState(cwd, (prev) => ({
+    ...prev,
+    gitStatus: {
+      is_repo: true,
+      ahead: 1,
+      behind: 0,
+      staged: [{ path: 'foo.txt', status: 'M', staged: true }],
+      unstaged: [],
+      untracked: [],
+    },
+  }));
+
+  assert.ok(observedState);
+  assert.equal((observedState as any).gitStatus?.ahead, 1);
+  assert.equal((observedState as any).gitStatus?.staged.length, 1);
+  assert.equal((observedState as any).gitStatus?.staged[0]?.path, 'foo.txt');
+  unsubscribe();
+});

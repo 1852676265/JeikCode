@@ -508,7 +508,17 @@ export function GitPanel({
       const res = await gitAction({ action: 'push_branch', target: branch, cwd: effectiveCwd });
       setSuccessMsg(res.message || `Pushed ${branch} to remote`);
       showToast(res.message || `Pushed ${branch} to remote`, 'success');
-      await loadGitData(true);
+      gitStore.setOptimisticState(cwd, (prev) => {
+        if (!prev || !prev.gitStatus) return prev;
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            ahead: 0,
+          },
+        };
+      });
+      void handleFullRefresh();
     } catch (err: any) {
       setError(err?.message || 'Push failed');
     }
@@ -646,11 +656,76 @@ export function GitPanel({
   const handleStage = async (path?: string, all?: boolean) => {
     setActionLoadingPath(path || 'all');
     setError(null);
+
+    // 0ms 瞬间乐观更新：立即从未暂存移至暂存区，体验对齐 VS Code
+    gitStore.setOptimisticState(cwd, (prev) => {
+      if (!prev || !prev.gitStatus) return prev;
+      const curStaged = [...(prev.gitStatus.staged || [])];
+      let curUnstaged = [...(prev.gitStatus.unstaged || [])];
+      let curUntracked = [...(prev.gitStatus.untracked || [])];
+
+      if (all || !path) {
+        // 暂存全部
+        const stagedPaths = new Set(curStaged.map((f) => f.path));
+        for (const item of [...curUnstaged, ...curUntracked]) {
+          if (!stagedPaths.has(item.path)) {
+            stagedPaths.add(item.path);
+            curStaged.push({
+              ...item,
+              status: item.status === '?' ? 'A' : item.status,
+              staged: true,
+            });
+          }
+        }
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: curStaged,
+            unstaged: [],
+            untracked: [],
+          },
+        };
+      } else {
+        // 暂存单个文件
+        const targetFromUnstaged = curUnstaged.find((f) => f.path === path);
+        const targetFromUntracked = curUntracked.find((f) => f.path === path);
+        const target = targetFromUnstaged || targetFromUntracked;
+        if (!target) return prev;
+
+        curUnstaged = curUnstaged.filter((f) => f.path !== path);
+        curUntracked = curUntracked.filter((f) => f.path !== path);
+
+        const existingIdx = curStaged.findIndex((f) => f.path === path);
+        const stagedItem: GitStatusItem = {
+          ...target,
+          status: target.status === '?' ? 'A' : target.status,
+          staged: true,
+        };
+        if (existingIdx !== -1) {
+          curStaged[existingIdx] = stagedItem;
+        } else {
+          curStaged.push(stagedItem);
+        }
+
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: curStaged,
+            unstaged: curUnstaged,
+            untracked: curUntracked,
+          },
+        };
+      }
+    });
+
     try {
       await gitStage({ path, all, cwd: effectiveCwd });
-      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
     } catch (err: any) {
       setError(err?.message || 'Stage failed');
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
     }
@@ -660,11 +735,70 @@ export function GitPanel({
   const handleUnstage = async (path?: string, all?: boolean) => {
     setActionLoadingPath(path || 'all');
     setError(null);
+
+    // 0ms 瞬间乐观更新：立即将文件从暂存区移回未暂存区
+    gitStore.setOptimisticState(cwd, (prev) => {
+      if (!prev || !prev.gitStatus) return prev;
+      let curStaged = [...(prev.gitStatus.staged || [])];
+      const curUnstaged = [...(prev.gitStatus.unstaged || [])];
+      let curUntracked = [...(prev.gitStatus.untracked || [])];
+
+      if (all || !path) {
+        // 取消暂存全部
+        const unstagedPaths = new Set(curUnstaged.map((f) => f.path));
+        for (const item of curStaged) {
+          if (!unstagedPaths.has(item.path)) {
+            unstagedPaths.add(item.path);
+            if (item.status === 'A') {
+              curUntracked.push({ ...item, status: '?', staged: false });
+            } else {
+              curUnstaged.push({ ...item, staged: false });
+            }
+          }
+        }
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: [],
+            unstaged: curUnstaged,
+            untracked: curUntracked,
+          },
+        };
+      } else {
+        // 取消暂存单个文件
+        const target = curStaged.find((f) => f.path === path);
+        if (!target) return prev;
+
+        curStaged = curStaged.filter((f) => f.path !== path);
+        if (target.status === 'A') {
+          if (!curUntracked.some((f) => f.path === path)) {
+            curUntracked.push({ ...target, status: '?', staged: false });
+          }
+        } else {
+          if (!curUnstaged.some((f) => f.path === path)) {
+            curUnstaged.push({ ...target, staged: false });
+          }
+        }
+
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: curStaged,
+            unstaged: curUnstaged,
+            untracked: curUntracked,
+          },
+        };
+      }
+    });
+
     try {
       await gitUnstage({ path, all, cwd: effectiveCwd });
-      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
     } catch (err: any) {
       setError(err?.message || 'Unstage failed');
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
     }
@@ -685,7 +819,7 @@ export function GitPanel({
     setError(null);
 
     // 0ms 瞬间乐观更新：立刻在前端移除该文件，绝不产生滞留视觉
-    setStoreState((prev) => {
+    gitStore.setOptimisticState(cwd, (prev) => {
       if (!prev || !prev.gitStatus) return prev;
       return {
         ...prev,
@@ -726,7 +860,7 @@ export function GitPanel({
     setError(null);
 
     // 0ms 瞬间乐观清空
-    setStoreState((prev) => {
+    gitStore.setOptimisticState(cwd, (prev) => {
       if (!prev || !prev.gitStatus) return prev;
       return {
         ...prev,
@@ -787,11 +921,27 @@ export function GitPanel({
     setError(null);
     try {
       const res = await gitCommit({ message: msg, cwd: effectiveCwd });
+
+      // 0ms 瞬间乐观更新：暂存区立即清空，ahead 立即累加，体验对齐 VS Code 极速体感
+      gitStore.setOptimisticState(cwd, (prev) => {
+        if (!prev || !prev.gitStatus) return prev;
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: [],
+            ahead: (prev.gitStatus.ahead || 0) + 1,
+          },
+        };
+      });
+
       setSuccessMsg(res.message || 'Commit successful');
       setCommitMessage('');
-      await loadGitData(true);
+      // 提交后主动异步触发一次绿色刷新（拉取本地与远程图谱，使提交记录立即可见）
+      void handleFullRefresh();
     } catch (err: any) {
       setError(err?.message || 'Commit failed');
+      void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setIsCommitting(false);
     }
@@ -816,9 +966,25 @@ export function GitPanel({
           setSuccessMsg(res.message || 'Synced successfully');
         }
       }
-      await loadGitData(true);
+
+      // 0ms 乐观重置 ahead / behind
+      gitStore.setOptimisticState(cwd, (prev) => {
+        if (!prev || !prev.gitStatus) return prev;
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            ahead: 0,
+            behind: 0,
+          },
+        };
+      });
+
+      // 主动异步触发完整刷新
+      void handleFullRefresh();
     } catch (err: any) {
       setError(err?.message || 'Sync failed');
+      void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setIsSyncing(false);
     }

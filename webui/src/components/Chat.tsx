@@ -88,7 +88,7 @@ const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPa
 const DiffViewer = lazy(() => import('./DiffViewer').then((m) => ({ default: m.DiffViewer })));
 import { CodeEditorTab } from './CodeEditorTab';
 import { TerminalPanel, getSavedTerminalCount } from './TerminalPanel';
-import { PreviewPanel } from './PreviewPanel';
+import { PreviewPanel, getSavedPreviewCount } from './PreviewPanel';
 import {
   fetchGitFileDiff,
   fetchGitWorkingDiff,
@@ -2176,6 +2176,9 @@ export function Chat({
     if (sig === freshnessSigRef.current) {
       // 文件没变但会话已经停了：上次轮询还在跑，这次不能因为签名相同就留下计时器和画板。
       if (!fresh.running && activeIdRef.current === id && busyRef.current) {
+        if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
+          return true;
+        }
         setBusyAndClock(false);
         busyRef.current = false;
         onLiveRunningChange?.(id, false);
@@ -2208,6 +2211,9 @@ export function Chat({
       messagesRef.current = disk;
       messageCacheRef.current.set(id, disk);
       setMessages(disk);
+    }
+    if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
+      return true;
     }
     // 会话已停就收尾：停表、把本轮勾完的清单冻到尾部。
     // 服务端在空闲时不会再把已完成清单当作活跃画板返回，这里也不能把那份历史清单贴回输入框上方。
@@ -4389,8 +4395,12 @@ export function Chat({
   const [terminalCount, setTerminalCount] = useState<number>(() =>
     getSavedTerminalCount(effectiveWorkingDir || cwd),
   );
+  const [previewCount, setPreviewCount] = useState<number>(() =>
+    getSavedPreviewCount(effectiveWorkingDir || cwd),
+  );
   useEffect(() => {
     setTerminalCount(getSavedTerminalCount(effectiveWorkingDir || cwd));
+    setPreviewCount(getSavedPreviewCount(effectiveWorkingDir || cwd));
   }, [effectiveWorkingDir, cwd]);
   useEffect(() => {
     const handleRemoteUpdate = () => {
@@ -5937,6 +5947,7 @@ export function Chat({
       }
 
       case 'text': {
+        programmaticStopMarkRef.current = null;
         appendToLastAssistant(
           event.content,
           { requireReplayDedup },
@@ -5954,6 +5965,7 @@ export function Chat({
       }
 
       case 'reasoning': {
+        programmaticStopMarkRef.current = null;
         // Thinking / chain-of-thought stream — collapsible block in the UI.
         setMessages((prev) => {
           const next = withAssistantIdentity(
@@ -5977,6 +5989,7 @@ export function Chat({
       }
 
       case 'tool_start': {
+        programmaticStopMarkRef.current = null;
         const argsStr = formatArgs(event.arguments);
         const subtasks =
           event.name === 'task' ? subtasksFromTaskArgs(argsStr) ?? undefined : undefined;
@@ -6248,6 +6261,13 @@ export function Chat({
         break;
 
       case 'done': {
+        const doneSid = event.session_id || activeIdRef.current || sessionId;
+        const isProgrammaticDone = consumesProgrammaticStopMark(
+          programmaticStopMarkRef.current,
+          doneSid,
+          Date.now(),
+        );
+
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         if (event.session_id) {
@@ -6283,11 +6303,39 @@ export function Chat({
           message: event.message,
         });
         if (terminal.discardQueued) {
-          // 异常终端：停止自动向后 drain，但安全保留用户的排队与转向卡片，
-          // 贯彻「真的消息发出去了才从硬盘删除」宗旨，用户仍可手动立即发送或编辑
-          blockQueueDrainRef.current = true;
-          pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+          // 异常终端 / 被取消：程序化停止（立即发送）场景静默放行，严禁弹黄色未完成警告，也不中断后续投递
+          if (isProgrammaticDone) {
+            programmaticStopMarkRef.current = null;
+          } else {
+            blockQueueDrainRef.current = true;
+            pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+            transitionChatRecovery({ type: 'authoritative_terminal' });
+            localTurnSessionsRef.current.delete(event.session_id);
+            backgroundRunningSessionsRef.current.delete(event.session_id);
+            onLiveRunningChange?.(event.session_id, false);
+            turnStartedAtBySessionRef.current.delete(event.session_id);
+            setIsCompacting(false);
+            setBusyAndClock(false);
+            if (event.session_id) {
+              markSessionTerminalSettled(event.session_id);
+            }
+          }
         } else {
+          // ── 正常交互完成 (Normal Turn Completion) ──
+          // 无论是否存在任何标记，只要是正常完成，100% 绝对无条件终结计时器并收尾待办，
+          // 彻底阻断任何“误判结束为假运行计时器一直叠加”的可能！
+          programmaticStopMarkRef.current = null;
+          transitionChatRecovery({ type: 'authoritative_terminal' });
+          localTurnSessionsRef.current.delete(event.session_id);
+          backgroundRunningSessionsRef.current.delete(event.session_id);
+          onLiveRunningChange?.(event.session_id, false);
+          turnStartedAtBySessionRef.current.delete(event.session_id);
+          setIsCompacting(false);
+          setBusyAndClock(false);
+          if (event.session_id) {
+            markSessionTerminalSettled(event.session_id);
+          }
+
           // 未被回合内并入的转向消息，还原为普通排队消息，回合结束后由 drain 自动发送；
           // 但已并入正文（文本/图片命中画布）的卡片必须直接销毁，绝不复活成 queue。
           setQueued((q) => q
@@ -6307,23 +6355,10 @@ export function Chat({
                 : item
             )));
         }
-        transitionChatRecovery({ type: 'authoritative_terminal' });
-        localTurnSessionsRef.current.delete(event.session_id);
-        backgroundRunningSessionsRef.current.delete(event.session_id);
-        onLiveRunningChange?.(event.session_id, false);
-        turnStartedAtBySessionRef.current.delete(event.session_id);
-        if (activeIdRef.current === event.session_id) {
-          saveTokenSnapshot(event.session_id, tokensAuthoritativeRef.current);
-        }
-        setIsCompacting(false);
-        setBusyAndClock(false);
-        if (event.session_id) {
-          markSessionTerminalSettled(event.session_id);
-        }
+
         closeOpenArtifactFence();
         finalizePendingToolsOnCanvas();
         commitActiveTodosIntoLastAssistant();
-        const doneSid = event.session_id || activeIdRef.current;
         const donePh = activeSession?.project_hash || (doneSid ? projectHashBySessionRef.current.get(doneSid) : '') || '';
         if (doneSid && donePh) {
           const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(doneSid) ?? []);
@@ -6334,7 +6369,7 @@ export function Chat({
 
         // 前台正看着这个会话时不发。最小化或窗口不在前台时，即使还选中它也发。
         // 标签与通知坞的完成边一致，守护进程 8 秒内只弹一条。
-        if (shouldOsNotifyTerminal({
+        if (!isProgrammaticDone && shouldOsNotifyTerminal({
           sessionId: event.session_id,
           activeSessionId: activeIdRef.current,
           windowAway: isWindowAway(),
@@ -6360,30 +6395,37 @@ export function Chat({
         break;
       }
 
-      case 'stopped':
-        transitionChatRecovery({ type: 'authoritative_terminal' });
-        setIsCompacting(false);
-        if (activeIdRef.current) {
-          backgroundRunningSessionsRef.current.delete(activeIdRef.current);
-          localTurnSessionsRef.current.delete(activeIdRef.current);
-          onLiveRunningChange?.(activeIdRef.current, false);
-          turnStartedAtBySessionRef.current.delete(activeIdRef.current);
+      case 'stopped': {
+        const stoppedSid = activeIdRef.current ?? sessionId;
+        const isProgrammaticStopped = consumesProgrammaticStopMark(
+          programmaticStopMarkRef.current,
+          stoppedSid,
+          Date.now(),
+        );
+
+        if (isProgrammaticStopped) {
+          // 程序化停止（排队卡「立即发送」）：本次 stopped 是本端为换发新消息而主动触发的，
+          // 其余排队卡片与已投递的转向必须原地保留。新消息紧随其后作为新回合投递，
+          // 绝不能关闭 busy 状态（保持红色正方形可停止按钮），绝不弹任何已停止黄色通知！
+        } else {
+          transitionChatRecovery({ type: 'authoritative_terminal' });
+          setIsCompacting(false);
+          if (activeIdRef.current) {
+            backgroundRunningSessionsRef.current.delete(activeIdRef.current);
+            localTurnSessionsRef.current.delete(activeIdRef.current);
+            onLiveRunningChange?.(activeIdRef.current, false);
+            turnStartedAtBySessionRef.current.delete(activeIdRef.current);
+          }
+          setBusyAndClock(false);
+          restoreQueuedToComposer(); // 用户主动停止：排队内容回到输入框，而不是丢掉
         }
-        setBusyAndClock(false);
         closeOpenArtifactFence();
         finalizePendingToolsOnCanvas();
         commitActiveTodosIntoLastAssistant();
-        if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, activeIdRef.current ?? sessionId, Date.now())) {
-          // 程序化停止（排队卡「立即发送」）：本次 stopped 是本端为换发新消息而主动触发的，
-          // 其余排队卡片与已投递的转向必须原地保留。队首卡片交给紧随其后的 drain 投递，
-          // 绝不整段回吐到输入框（那是用户主动按「停止」的语义）。
-          programmaticStopMarkRef.current = null;
-        } else {
-          restoreQueuedToComposer(); // 用户中止：排队内容回到输入框，而不是丢掉
-        }
         onPermissionResolved?.(null);
         setUserInputReq(null);
         break;
+      }
 
       case 'error':
         closeOpenArtifactFence();
@@ -6679,24 +6721,18 @@ export function Chat({
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
     timelineFollow.jump();
 
-    // 发送聊天后自动判定右侧栏展示模式：
-    // 如果是非 Git 仓库或非多 Git 仓库（repos.length === 0），则默认选择提问历史模式 ('questions')；否则才为 'git'
+    // 后台静默检测 Git 仓库支持情况（更新 hasGitRepos 标识，严格保留用户当前选择的右侧面板游标/Tab，禁止重置）
     if (effectiveWorkingDir) {
-      setRightPanelTab(hasGitReposRef.current ? 'git' : 'questions');
       fetchGitRepos(effectiveWorkingDir)
         .then((res) => {
           const hasGit = Array.isArray(res.repos) && res.repos.length > 0;
           hasGitReposRef.current = hasGit;
           setHasGitRepos(hasGit);
-          setRightPanelTab(hasGit ? 'git' : 'questions');
         })
         .catch(() => {
           hasGitReposRef.current = false;
           setHasGitRepos(false);
-          setRightPanelTab('questions');
         });
-    } else {
-      setRightPanelTab('questions');
     }
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
@@ -7470,17 +7506,24 @@ export function Chat({
     } else if (currentSid) {
       updateQueuedForSession(currentSid, (items) => items.filter((item) => item.id !== q.id));
     }
-    paintSendNowUserBubble(q.text, q.images ?? []);
 
-    // 标记必须用 stopped 处理器比对的那个会话 id，否则终态会把队列回吐到输入框。
+    // 1. 设置程序化停止标记（有效期 15s），涵盖停旧回合 + 启新回合的整个过渡期
     if (viewSid) {
       programmaticStopMarkRef.current = {
         sessionId: viewSid,
         expiresAt: Date.now() + PROGRAMMATIC_STOP_MARK_TTL_MS,
       };
     }
-    abortRef.current?.abort();
 
+    // 2. 关键：立即发送时保持/确立全局运行中（busy）状态，发送按钮立即呈现红色可停止方块
+    setBusyAndClock(true);
+    busyRef.current = true;
+    if (currentSid) {
+      localTurnSessionsRef.current.add(currentSid);
+      onLiveRunningChange?.(currentSid, true);
+    }
+
+    // 3. 取消可能正在内核排队的转向
     if (currentSid && (q.kind === 'steer' || q.kind === 'steering')) {
       try {
         await cancelChatSteer(currentSid, q.text);
@@ -7492,18 +7535,34 @@ export function Chat({
     const text = q.text;
     const images = q.images ?? [];
     const mode = q.approvalMode ?? modeState.confirmedMode;
+
+    // 4. 0ms 瞬间在画布绘制新用户气泡（无需等待停掉旧回合的网络往返）
+    paintSendNowUserBubble(text, images);
+
+    // 5. 停掉旧回合，并确保旧回合的挂起工具/代码块在当前画布上干净收尾
+    await stopRunningTurn(currentSid, requestIdRef.current);
+    closeOpenArtifactFence();
+    finalizePendingToolsOnCanvas();
+
+    // 6. 投递新回合
     for (let attempt = 0; attempt < 5; attempt++) {
-      const released = await stopRunningTurn(currentSid, requestIdRef.current);
-      if (!released) {
-        await new Promise((resolve) => window.setTimeout(resolve, 250));
-        continue;
+      if (attempt > 0) {
+        const released = await stopRunningTurn(currentSid, requestIdRef.current);
+        if (!released) {
+          await new Promise((resolve) => window.setTimeout(resolve, 200));
+          continue;
+        }
       }
       const outcome = await deliver(text, images, mode, undefined, undefined, {
         alreadyOnCanvas: true,
         preserveCanvasOnBusy: true,
       });
-      if (outcome !== 'busy') return;
-      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      if (outcome !== 'busy') {
+        setBusyAndClock(true);
+        busyRef.current = true;
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
     }
     const card: QueuedMessage = { ...q, kind: 'queue', forceSend: true };
     setQueued((current) => (
@@ -9000,7 +9059,7 @@ export function Chat({
                     <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                     <circle cx="12" cy="12" r="3" />
                   </svg>
-                  {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
+                  {previewCount > 0 && <span class="tab-badge">{previewCount}</span>}
                 </button>
 
                 <button
@@ -9119,6 +9178,7 @@ export function Chat({
                   onOpenInMainEditor={(filePath) => {
                     window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
                   }}
+                  onTabsCountChange={setPreviewCount}
                 />
               </div>
             </div>
@@ -9200,7 +9260,7 @@ export function Chat({
                 <circle cx="12" cy="12" r="3" />
               </svg>
               <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
-              {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
+              {previewCount > 0 && <span class="tab-badge">{previewCount}</span>}
             </button>
             <button
               type="button"
@@ -9664,7 +9724,7 @@ export function Chat({
                 <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                 <circle cx="12" cy="12" r="3" />
               </svg>
-              {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
+              {previewCount > 0 && <span class="tab-badge">{previewCount}</span>}
             </button>
           </div>
 
@@ -9766,6 +9826,7 @@ export function Chat({
               onOpenInMainEditor={(filePath) => {
                 window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
               }}
+              onTabsCountChange={setPreviewCount}
             />
           </div>
         </div>
@@ -9846,7 +9907,7 @@ export function Chat({
               <circle cx="12" cy="12" r="3" />
             </svg>
             <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
-            {diffTabs.length > 0 && <span class="tab-badge">{diffTabs.length}</span>}
+            {previewCount > 0 && <span class="tab-badge">{previewCount}</span>}
           </button>
           <button
             type="button"

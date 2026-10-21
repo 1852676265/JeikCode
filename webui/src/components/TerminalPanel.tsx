@@ -77,9 +77,9 @@ export const SHELL_CONFIGS: Record<HostPlatform, ShellOption[]> = {
 };
 
 export function resolveHostPlatform(cwd?: string): HostPlatform {
-  const trimmed = (cwd || '').trim();
-  // 1. 如果路径含有 Windows 盘符特征（例如 E:/code/jeikcode 或 C:\...），100% 确定宿主机为 Windows！
-  if (/^[a-zA-Z]:[/\\]/.test(trimmed) || /^[/\\][a-zA-Z]:/.test(trimmed)) {
+  const trimmed = (cwd || '').trim().replace(/\\/g, '/');
+  // 1. 如果路径含有 Windows 盘符特征（例如 E:/code/jeikcode 或 C:\... 或 /c/...），100% 确定宿主机为 Windows！
+  if (/^[a-zA-Z]:[/\\]/.test(trimmed) || /^[/\\][a-zA-Z]:/.test(trimmed) || /^\/[a-zA-Z]\//.test(trimmed)) {
     return 'windows';
   }
   // 2. 本地持久化缓存的真实宿主机平台 (由后端 API 返回并记住)
@@ -91,19 +91,23 @@ export function resolveHostPlatform(cwd?: string): HostPlatform {
       }
     }
   } catch {}
-  // 3. 常见路径推断
+  // 3. 常见路径推断 (Unix 绝对路径)
   if (trimmed.startsWith('/Users/')) return 'macos';
-  if (trimmed.startsWith('/home/') || trimmed.startsWith('/root/') || trimmed.startsWith('/var/')) return 'linux';
+  // 关键修复：任何以 / 开头的绝对路径（如 /root, /root/..., /home/..., /var/..., /etc/..., /tmp/..., /usr/... 等），
+  // 只要不属于 Windows 虚拟挂载盘符，必然为 Linux / Unix 宿主机！
+  if (trimmed.startsWith('/')) return 'linux';
+
   // 4. 客户端自身判定（仅在桌面浏览器且无盘符时作为弱参考）
   if (typeof navigator !== 'undefined') {
     const ua = navigator.userAgent || '';
     const isMobile = /android|iphone|ipad|ipod|mobile/i.test(ua);
     if (!isMobile) {
-      if (/win/i.test(ua) || /windows/i.test(navigator.platform)) return 'windows';
       if (/mac/i.test(ua) || /macintosh|macintel/i.test(navigator.platform)) return 'macos';
+      if (/linux/i.test(ua) || /linux/i.test(navigator.platform)) return 'linux';
+      if (/win/i.test(ua) || /windows/i.test(navigator.platform)) return 'windows';
     }
   }
-  return 'windows';
+  return 'linux';
 }
 
 export function getPlatformShells(platform: HostPlatform = 'windows'): ShellOption[] {
@@ -183,19 +187,23 @@ export function inferShellFromTab(tab: { name?: string; shell?: string }, platfo
   if (direct) {
     if (direct.includes('git') || (direct.includes('bash') && p === 'windows')) return 'gitbash';
     if (direct.includes('wsl') || direct.includes('ubuntu')) return 'wsl';
-    if (direct.includes('cmd')) return 'cmd';
+    if (direct.includes('cmd')) return p === 'windows' ? 'cmd' : 'bash';
     if (direct.includes('zsh')) return 'zsh';
-    if (direct.includes('power') || direct.includes('pwsh')) return 'powershell';
-    if (direct.includes('bash')) return 'bash';
+    if (direct.includes('power') || direct.includes('pwsh')) {
+      return p === 'windows' ? 'powershell' : (p === 'macos' ? 'zsh' : 'bash');
+    }
+    if (direct.includes('bash')) return p === 'windows' ? 'gitbash' : 'bash';
     if (direct.includes('sh')) return 'sh';
     return direct;
   }
   const name = (tab.name || '').toLowerCase().trim();
   if (name.includes('git') || (name.includes('bash') && p === 'windows')) return 'gitbash';
   if (name.includes('wsl') || name.includes('ubuntu')) return 'wsl';
-  if (name.includes('cmd')) return 'cmd';
+  if (name.includes('cmd')) return p === 'windows' ? 'cmd' : 'bash';
   if (name.includes('zsh')) return 'zsh';
-  if (name.includes('power') || name.includes('pwsh')) return 'powershell';
+  if (name.includes('power') || name.includes('pwsh')) {
+    return p === 'windows' ? 'powershell' : (p === 'macos' ? 'zsh' : 'bash');
+  }
   return getDefaultShellForPlatform(p);
 }
 
@@ -212,10 +220,19 @@ function getSavedSessions(projectCwd?: string): TerminalTab[] | null {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.map((t) => ({
-            ...t,
-            shell: inferShellFromTab(t),
-          }));
+          const plat = resolveHostPlatform(projectCwd);
+          return parsed.map((t) => {
+            const shell = inferShellFromTab(t, plat);
+            let name = t.name;
+            if (plat !== 'windows' && name && name.toLowerCase().includes('powershell')) {
+              name = name.replace(/powershell/gi, shell);
+            }
+            return {
+              ...t,
+              name,
+              shell,
+            };
+          });
         }
       }
     }
@@ -227,9 +244,10 @@ function saveSessions(tabs: TerminalTab[], projectCwd?: string) {
   try {
     if (typeof window !== 'undefined' && window.sessionStorage) {
       const key = getProjectTerminalStorageKey(projectCwd);
+      const plat = resolveHostPlatform(projectCwd);
       const normalized = tabs.map((t) => ({
         ...t,
-        shell: inferShellFromTab(t),
+        shell: inferShellFromTab(t, plat),
       }));
       window.sessionStorage.setItem(key, JSON.stringify(normalized));
     }
@@ -585,7 +603,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
       }
       try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const tabShell = inferShellFromTab(tab);
+        const tabShell = inferShellFromTab(tab, hostPlatform);
         const cols = Math.min(500, Math.max(2, record.term.cols || 80));
         const rows = Math.min(200, Math.max(1, record.term.rows || 24));
         let token = '';
@@ -912,10 +930,21 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           } catch {}
         }
         const activePlat = res.platform || hostPlatform;
-        const enriched = (res.terminals || []).map((t: TerminalTab) => ({
-          ...t,
-          shell: inferShellFromTab(t, activePlat),
-        }));
+        const enriched = (res.terminals || []).map((t: TerminalTab) => {
+          const inferred = inferShellFromTab(t, activePlat);
+          let name = t.name;
+          // 关键修复：如果宿主机是 Linux/macOS，但之前标签名被错误赋为 powershell 1 等，自动更正标签名称
+          if (activePlat !== 'windows' && name && name.toLowerCase().includes('powershell')) {
+            name = name.replace(/powershell/gi, inferred);
+          } else if (activePlat === 'windows' && name && name.toLowerCase().startsWith('bash') && !name.toLowerCase().includes('git')) {
+            name = name.replace(/^bash/gi, 'gitbash');
+          }
+          return {
+            ...t,
+            name,
+            shell: inferred,
+          };
+        });
 
         if (enriched.length > 0) {
           // 以后端真实运行的列表为唯一真值，绝不将本地残留的死尸 merge 回去！
