@@ -423,7 +423,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libsoup-3.0-dev javascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libsoup-3.0-dev javascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev zsync
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -484,9 +484,22 @@ jobs:
 
       - name: Build desktop installers
         working-directory: desktop
+        env:
+          LDAI_UPDATE_INFORMATION: "gh-releases-zsync|${{ github.repository_owner }}|JeikCode|latest|JeikCode.Desktop_*_amd64.AppImage.zsync"
+          UPDATE_INFORMATION: "gh-releases-zsync|${{ github.repository_owner }}|JeikCode|latest|JeikCode.Desktop_*_amd64.AppImage.zsync"
         run: |
           npm ci
           npm run tauri build -- --bundles ${{ matrix.bundles }} ${{ matrix.rust_target != '' && format('--target {0}', matrix.rust_target) || '' }}
+
+      - name: Embed AppImage update info and generate zsync
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          chmod +x scripts/embed-appimage-update-info.sh
+          scripts/embed-appimage-update-info.sh
 
       - name: Upload desktop installers
         uses: softprops/action-gh-release@v2
@@ -497,6 +510,7 @@ jobs:
             desktop/src-tauri/target/**/release/bundle/dmg/*.dmg
             desktop/src-tauri/target/**/release/bundle/deb/*.deb
             desktop/src-tauri/target/**/release/bundle/appimage/*.AppImage
+            desktop/src-tauri/target/**/release/bundle/appimage/*.zsync
           fail_on_unmatched_files: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
