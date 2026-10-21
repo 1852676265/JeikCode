@@ -193,17 +193,6 @@ export function CodeEditorTab({
     };
   }, [filePath, setViewMode, t]);
 
-  // 监听外部保存指令广播 (例如右侧面板顶栏保存图标点击)
-  useEffect(() => {
-    const handleExternalSave = () => {
-      void handleSave();
-    };
-    window.addEventListener(`jeikcode:editor:save:${filePath}`, handleExternalSave);
-    return () => {
-      window.removeEventListener(`jeikcode:editor:save:${filePath}`, handleExternalSave);
-    };
-  }, [filePath, handleSave]);
-
   // 图片预览模式下 Ctrl + 鼠标滚轮缩放图片
   const handleImageWheel = (e: WheelEvent) => {
     if (e.ctrlKey || e.metaKey) {
@@ -554,6 +543,17 @@ export function CodeEditorTab({
       setSaving(false);
     }
   }, [filePath, content, saving, fileName]);
+
+  // 监听外部保存指令广播 (例如右侧面板顶栏保存图标点击)
+  useEffect(() => {
+    const handleExternalSave = () => {
+      void handleSave();
+    };
+    window.addEventListener(`jeikcode:editor:save:${filePath}`, handleExternalSave);
+    return () => {
+      window.removeEventListener(`jeikcode:editor:save:${filePath}`, handleExternalSave);
+    };
+  }, [filePath, handleSave]);
 
   // 快捷键监听：Ctrl+S (保存), Ctrl+F (查找), Ctrl+H (替换), Ctrl+Shift+V (MD切换)
   useEffect(() => {

@@ -9142,7 +9142,7 @@ export function Chat({
                 >
                   <GitPanel
                     cwd={effectiveWorkingDir}
-                    sessionId={activeSession?.id || sessionId}
+                    sessionId={activeSession?.id || sessionId || undefined}
                     refreshTrigger={gitRefreshTrigger}
                     onBranchChanged={(newB) => {
                       setGitRefreshTrigger((n) => n + 1);
@@ -9793,7 +9793,7 @@ export function Chat({
             >
               <GitPanel
                 cwd={effectiveWorkingDir}
-                sessionId={activeSession?.id || sessionId}
+                sessionId={activeSession?.id || sessionId || undefined}
                 refreshTrigger={gitRefreshTrigger}
                 onBranchChanged={(newB) => {
                   setGitRefreshTrigger((n) => n + 1);

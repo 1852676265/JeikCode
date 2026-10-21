@@ -74,7 +74,7 @@ function parseCommitMessage(rawMessage: string): ParsedCommitMessage {
 
 interface GitPanelProps {
   cwd?: string;
-  sessionId?: string;
+  sessionId?: string | null;
   refreshTrigger?: number;
   onBranchChanged?: (newBranch: string) => void;
   onOpenFileDiff?: (commit: GitCommitItem, file: GitCommitFile, repoRoot?: string) => void;
