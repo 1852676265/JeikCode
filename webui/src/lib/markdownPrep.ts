@@ -724,9 +724,30 @@ export function shouldShowCodeLanguage(lang: string): boolean {
  * 5. 未闭合围栏自动补闭合；
  * 6. 脚注、==高亮==。
  */
+/**
+ * 智能折叠或清洗上游代理/模型意外在正文输出的加密思考签名块（Anthropic Redacted Thinking）。
+ * 形如：
+ * [Redacted Thinking: EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+...]
+ * 或被网页自动翻译插件翻出的：
+ * [已遮挡思考：EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+...】
+ */
+export function cleanRedactedThinkingBlocks(source: string): string {
+  if (!source || (!source.includes('Redacted Thinking') && !source.includes('已遮挡思考'))) {
+    return source;
+  }
+  return source.replace(
+    /\[(?:Redacted Thinking|已遮挡思考)[:：]\s*([A-Za-z0-9+/=_\-\s]{20,})\s*[\]】]/g,
+    (_match, data) => {
+      const cleanData = String(data).replace(/\s+/g, '');
+      return `\n\n<details class="redacted-thinking-box notranslate" translate="no"><summary>💭 <i>[Redacted Thinking]</i></summary>\n\n\`\`\`text\n${cleanData}\n\`\`\`\n</details>\n\n`;
+    },
+  );
+}
+
 export function preprocessMarkdown(raw: string): string {
   if (!raw) return '';
-  const prepared = promoteNestedCodeFences(raw);
+  const sanitized = cleanRedactedThinkingBlocks(raw);
+  const prepared = promoteNestedCodeFences(sanitized);
   const lines = prepared.replace(/\r\n/g, '\n').split('\n');
   const result: string[] = [];
   let inFence: FenceState | null = null;

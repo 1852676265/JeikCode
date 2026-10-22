@@ -450,6 +450,18 @@ test('ordered list continuing after code block and paragraph parses as distinct 
   assert.match(out, /<li[^>]*>[\s\S]*?ProjectMcpPool/);
 });
 
+test('cleanRedactedThinkingBlocks collapses raw encrypted thinking blocks into details', () => {
+  const textWithEnglish = '[Redacted Thinking: EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+]\n\nHello world';
+  const out1 = preprocessMarkdown(textWithEnglish);
+  assert.match(out1, /<details class="redacted-thinking-box notranslate" translate="no">/);
+  assert.match(out1, /Hello world/);
+
+  const textWithChinese = '[已遮挡思考：EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+】\n\n用户提供的反馈表明...';
+  const out2 = preprocessMarkdown(textWithChinese);
+  assert.match(out2, /<details class="redacted-thinking-box notranslate" translate="no">/);
+  assert.match(out2, /用户提供的反馈表明/);
+});
+
 
 
 

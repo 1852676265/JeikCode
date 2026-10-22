@@ -806,12 +806,12 @@ function abbreviateArgs(args: string, maxLen = 1000): string {
 function ToolArgPreview({ text }: { text: string }) {
   const spans = colorizeInlineJson(text);
   if (!spans) {
-    return <span class="tool-name-secondary" title={text}>{text}</span>;
+    return <span class="tool-name-secondary notranslate" translate={false} title={text}>{text}</span>;
   }
   return (
-    <span class="tool-name-secondary" title={text}>
+    <span class="tool-name-secondary notranslate" translate={false} title={text}>
       {spans.map((span, i) => (
-        <span key={i} class={'json-tok json-tok-' + span.tone}>{span.text}</span>
+        <span key={i} class={'json-tok json-tok-' + span.tone + ' notranslate'} translate={false}>{span.text}</span>
       ))}
     </span>
   );
@@ -11081,9 +11081,10 @@ function ToolRowView({
     : abbreviateArgs(formatToolDetail(tool.name, tool.args));
 
   return (
-    <div class={'tool-body kind-' + category}>
+    <div class={'tool-body kind-' + category + ' notranslate'} translate={false}>
       <div
-        class="tool-header"
+        class="tool-header notranslate"
+        translate={false}
         onClick={() => {
           if (!hasDetail) return;
           setExpanded((e) => {
