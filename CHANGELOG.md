@@ -21,6 +21,36 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.2 (2026-10-22)
+
+- **[Global Modular i18n & Comprehensive Localization] System-wide modular translation architecture**:
+  - Modularized CodeExplore opening reminder in `code_tools_first.rs` into `crates/jeikcode-config/src/i18n/` message catalogs (`Msg::CodeExploreOpeningReminder`), providing authentic native translations across 11 world languages (`en`, `zh_cn`, `zh_tw`, `ja`, `ko`, `ru`, `fr`, `es`, `de`, `ar`, `vi`).
+  - Decoupled Git review bot options panel copy and review prompt templates from `GitWebhookDialog.tsx` into unified `webui/src/i18n.ts` and `webui/src/locales/` packages.
+  - Added localized confirmation dialogs for rewrite history actions (`confirm.rewriteTitle`, `confirm.rewriteDesc`) in `Chat.tsx`.
+  - Comprehensive localization coverage across dialog defaults (`ConfirmDialog.tsx`), GitPanel views and controls (`git.refreshAndFetch`, `git.goToChangesToCommit`, `git.stageAllAndCommit`), and terminal scratchpad (`terminal.scratchpad`).
+  - Preserved strict technical English terms for reasoning effort levels (`low`, `medium`, `high`, `xhigh`, `max`) and standard protocol names.
+- **[Browser Translation Guard & Redacted Thinking Collapsing] Defensive frontend rendering protection**:
+  - Added `translate="no"` and `notranslate` attributes to all tool call bodies, headers, and parameter previews in `Chat.tsx` to prevent browser full-page auto-translation extensions from corrupting tool names or argument JSON.
+  - Implemented `cleanRedactedThinkingBlocks` in `markdownPrep.ts` to automatically detect and collapse raw protobuf/Base64 encrypted thinking blobs (`[Redacted Thinking: ...]` / `[已遮挡思考：...]`) into collapsible details widgets.
+- **[CI & Cross-Platform Fixes] Strict compiler and integrity test alignment**:
+  - Added full locale matching fallback in `host_service.rs` to satisfy compilation under `distro-pm` features.
+  - Retained module baseline documentation keywords in `code_tools_first.rs` to satisfy capability integrity tests.
+
+---
+
+- **[全栈模块化多语言与深度国际化] 全系统模块化语言包与各处死角清扫**:
+  - 将 `code_tools_first.rs` 中的 CodeExplore 首轮探查提示词收拢至 `crates/jeikcode-config/src/i18n/` 多语言包（`Msg::CodeExploreOpeningReminder`），在全部 11 种主流语言（简中、繁中、英、日、韩、俄、法、西、德、阿、越）中提供母语级纯正翻译。
+  - 将 `GitWebhookDialog.tsx` 中的 Git 审查机器人面板文案及审查提示词模板全面抽离至 `webui/src/i18n.ts` 与 `webui/src/locales/` 独立语言包中集中管理。
+  - 为 `Chat.tsx` 中的改写历史操作增加多语言确认弹窗机制（`confirm.rewriteTitle`、`confirm.rewriteDesc`）。
+  - 全面补全通用弹窗默认值（`ConfirmDialog.tsx`）、GitPanel 控制栏与各子视图（`git.refreshAndFetch`、`git.goToChangesToCommit`、`git.stageAllAndCommit`）及右侧终端代输命令框（`terminal.scratchpad`）的多语言覆盖。
+  - 合理保持思考强度档位（`low`, `medium`, `high`, `xhigh`, `max`）及标准协议类型的原生英文表达。
+- **[防机翻篡改与加密思考折叠] 前端防御性渲染与阅读体验加固**:
+  - 在所有工具卡片容器、头部及参数预览元素上注入 `translate="no"` 与 `notranslate`，防止浏览器网页自动翻译插件误翻篡改工具名称与破坏参数 JSON。
+  - 在 `markdownPrep.ts` 中新增 `cleanRedactedThinkingBlocks` 过滤，将上游代理/模型意外在正文中输出的 Base64 加密思考签名（`[Redacted Thinking: ...]` 或 `[已遮挡思考：...]`）自动转换为优雅折叠块，杜绝乱码刷屏。
+- **[CI 流水线修复与全绿保障] 跨平台编译与静态检查对齐**:
+  - 在 `host_service.rs` 中补全所有语种模式匹配回退，修复开启 `distro-pm` 特性时的非穷举编译报错。
+  - 在 `code_tools_first.rs` 模块注释中保留基准检索词句，满足能力库的静态安全网检查。
+
 ## v7.2.9-beta.1 (2026-10-22)
 
 - **[Global Modular i18n Architecture] "One module per language" independent catalog refactor & global mainstream language matrix**:
