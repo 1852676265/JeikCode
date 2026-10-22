@@ -25,9 +25,9 @@ fn host_msg_for_locale<'a>(
     locale: jeikcode_config::locale::Locale,
 ) -> &'a str {
     match locale {
-        jeikcode_config::locale::Locale::En => en,
-        jeikcode_config::locale::Locale::ZhCn => zh,
+        jeikcode_config::locale::Locale::ZhCn | jeikcode_config::locale::Locale::ZhTw => zh,
         jeikcode_config::locale::Locale::Vi => vi,
+        _ => en,
     }
 }
 use is_terminal::IsTerminal;
