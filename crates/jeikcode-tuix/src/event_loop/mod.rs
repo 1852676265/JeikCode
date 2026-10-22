@@ -164,12 +164,18 @@ pub(crate) fn deactivate_runtime_provider_after_logout(
 
 /// Encode raw RGBA pixel data as a PNG image in memory.
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    let slice = if rgba.len() >= expected {
+        &rgba[..expected]
+    } else {
+        return None;
+    };
     let mut buf = Vec::new();
     let mut encoder = png::Encoder::new(&mut buf, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().ok()?;
-    writer.write_image_data(rgba).ok()?;
+    writer.write_image_data(slice).ok()?;
     drop(writer);
     Some(buf)
 }

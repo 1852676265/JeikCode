@@ -3114,7 +3114,8 @@ impl ImageData {
     fn missing_placeholder() -> Self {
         Self {
             media_type: "image/png".to_string(),
-            data: String::new(),
+            // 采用标准合法 1x1 透明 PNG Base64 占位，彻底杜绝浏览器 Data URI 为空时触发左上角小裂图坏图标
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string(),
             missing: true,
         }
     }
