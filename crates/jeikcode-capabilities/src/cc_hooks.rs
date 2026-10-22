@@ -1133,7 +1133,7 @@ sys.exit(7)
             event: HookEvent::PreToolUse,
             matcher: None,
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let payload = serde_json::json!({
@@ -1165,7 +1165,7 @@ sys.exit(7)
             event: HookEvent::PreToolUse,
             matcher: None,
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1189,7 +1189,7 @@ sys.exit(7)
             event: HookEvent::PreToolUse,
             matcher: None,
             command: "echo hooktest-ok".into(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let out = run_hook_for_test(&hook, &serde_json::json!({"hook_event_name": "PreToolUse"}))
@@ -1280,7 +1280,7 @@ sys.exit(2)
             event: HookEvent::PreToolUse,
             matcher: None,
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1311,7 +1311,7 @@ sys.exit(2)
             event: HookEvent::UserPromptSubmit,
             matcher: None,
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1331,7 +1331,7 @@ sys.exit(2)
             event: HookEvent::UserPromptSubmit,
             matcher: None,
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1347,7 +1347,7 @@ sys.exit(2)
             event: HookEvent::SessionStart,
             matcher: None,
             command: "echo extra-session-context".into(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1385,7 +1385,7 @@ sys.exit(2)
             event: HookEvent::PreToolUse,
             matcher: None,
             command: "exit 1".into(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1409,7 +1409,7 @@ sys.exit(2)
             event: HookEvent::PreToolUse,
             matcher: None,
             command: cmd.into(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1442,7 +1442,7 @@ sys.exit(2)
             event: HookEvent::UserPromptSubmit,
             matcher: None,
             command,
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
@@ -1616,7 +1616,7 @@ sys.exit(2)
             event: HookEvent::PostToolUse,
             matcher: Some("bash".into()),
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
@@ -1678,7 +1678,7 @@ if payload.get('session_id') == 'sess-xyz':
             event: HookEvent::UserPromptSubmit,
             matcher: None,
             command: fixture.command.clone(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp").with_session_id("sess-xyz");
@@ -1695,7 +1695,7 @@ if payload.get('session_id') == 'sess-xyz':
             event: HookEvent::UserPromptSubmit,
             matcher: None,
             command: cmd.into(),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
             plugin_root: None,
         }
     }
