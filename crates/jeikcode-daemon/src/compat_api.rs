@@ -1250,6 +1250,7 @@ async fn collect_compat_response(
     let mut session_id = String::new();
     let mut error: Option<String> = None;
     let mut tokens = 0usize;
+    let mut last_tool_is_todo = false;
     let http_guard = HttpDisconnectGuard::new(cancel, active_conns);
     let mut artifact_open = std::collections::HashMap::new();
 
@@ -1273,6 +1274,7 @@ async fn collect_compat_response(
                 if !current_block.is_empty() {
                     text_blocks.push(std::mem::take(&mut current_block));
                 }
+                last_tool_is_todo = calls.iter().any(|c| jeikcode_capabilities::tools::is_todo_tool_name(&c.name));
                 for c in calls {
                     tool_trace.push_str(&format!(
                         "\n[tool_start] {} ({}) parallel\n{}\n",
@@ -1289,6 +1291,7 @@ async fn collect_compat_response(
                 if !current_block.is_empty() {
                     text_blocks.push(std::mem::take(&mut current_block));
                 }
+                last_tool_is_todo = jeikcode_capabilities::tools::is_todo_tool_name(&name);
                 tool_trace.push_str(&format!("\n[tool_start] {name} ({id})\n{arguments}\n"));
             }
             ChatEvent::ToolOutputChunk { id, chunk } => {
@@ -1341,18 +1344,33 @@ async fn collect_compat_response(
 
     // 非流式只交付最后一段对用户的回答（工具前的中间旁白丢掉），但这一段里的
     // markdown / 代码围栏 / kjson 等混合格式必须原样留下。
+    // 特殊情况（Todo 拦截提醒兜底）：如果该回合以 todo 打勾工具收尾，且打勾前已经有主要业务输出（pre），
+    // 打勾后的文本（post）往往只是客套话（如“草案已核对完毕”），字数显著少于打勾前。此时智能回锚取打勾前的核心正文。
+    let chosen_text = {
+        let valid_blocks: Vec<&String> = text_blocks.iter().filter(|s| !s.trim().is_empty()).collect();
+        if valid_blocks.is_empty() {
+            String::new()
+        } else if valid_blocks.len() == 1 {
+            valid_blocks[0].clone()
+        } else {
+            let post = valid_blocks[valid_blocks.len() - 1];
+            let pre = valid_blocks[valid_blocks.len() - 2];
+            if last_tool_is_todo && (pre.trim().len() > post.trim().len() || post.trim().chars().count() < 150) {
+                pre.clone()
+            } else {
+                post.clone()
+            }
+        }
+    };
+
     let final_text = if let Some(err_msg) = error {
-        if let Some(last) = text_blocks.iter().rev().find(|s| !s.trim().is_empty()) {
-            format!("{last}\n\n[Error / Upstream Details]\n{err_msg}")
+        if !chosen_text.trim().is_empty() {
+            format!("{chosen_text}\n\n[Error / Upstream Details]\n{err_msg}")
         } else {
             format!("[Error / Upstream Details]\n{err_msg}")
         }
     } else {
-        text_blocks
-            .into_iter()
-            .rev()
-            .find(|s| !s.trim().is_empty())
-            .unwrap_or_default()
+        chosen_text
     };
 
     match format {

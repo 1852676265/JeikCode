@@ -9373,12 +9373,15 @@ export function Chat({
             let start = -1;
             let textParts: string[] = [];
             let fallbackParts: string[] = [];
+            let lastToolName: string | null = null;
             for (let i = 0; i < messages.length; i++) {
               if (messages[i].role === 'assistant') {
                 if (start < 0) start = i;
                 for (const p of messages[i].parts) {
                   if (p.kind === 'text' && p.text.trim()) {
                     textParts.push(p.text);
+                  } else if (p.kind === 'tool' && p.tool?.name) {
+                    lastToolName = p.tool.name;
                   }
                 }
                 const raw = messageFullText(messages[i]);
@@ -9387,7 +9390,16 @@ export function Chat({
                 // Only a user message ends the current assistant turn.
                 if (start >= 0) {
                   const targetList = textParts.length > 0 ? textParts : fallbackParts;
-                  const lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
+                  let lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
+                  // Todo 打勾拦截智能回锚：如果该回合最后调用的工具是 TodoWrite，且打勾后的文本明显短于打勾前的成果（或打勾后只是 <150 字的客套话），
+                  // 复制最终回答按钮自动回锚至打勾前的核心业务正文！
+                  if (targetList.length >= 2 && lastToolName && isTodoTool(lastToolName)) {
+                    const post = targetList[targetList.length - 1];
+                    const pre = targetList[targetList.length - 2];
+                    if (pre.trim().length > post.trim().length || post.trim().length < 150) {
+                      lastText = pre;
+                    }
+                  }
                   const allText = targetList.join('\n\n');
                   for (let j = start; j < i; j++) {
                     turnLastTexts.set(j, lastText);
@@ -9396,6 +9408,7 @@ export function Chat({
                   start = -1;
                   textParts = [];
                   fallbackParts = [];
+                  lastToolName = null;
                 }
               }
               // role === 'system': transparent — do not flush the turn.
@@ -9403,7 +9416,14 @@ export function Chat({
             // Flush the last turn
             if (start >= 0) {
               const targetList = textParts.length > 0 ? textParts : fallbackParts;
-              const lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
+              let lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
+              if (targetList.length >= 2 && lastToolName && isTodoTool(lastToolName)) {
+                const post = targetList[targetList.length - 1];
+                const pre = targetList[targetList.length - 2];
+                if (pre.trim().length > post.trim().length || post.trim().length < 150) {
+                  lastText = pre;
+                }
+              }
               const allText = targetList.join('\n\n');
               for (let j = start; j < messages.length; j++) {
                 turnLastTexts.set(j, lastText);
