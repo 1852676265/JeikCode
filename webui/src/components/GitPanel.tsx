@@ -926,7 +926,7 @@ export function GitPanel({
         body: t('git.commitNoStagedPrompt'),
         icon: '📦',
         danger: false,
-        confirmLabel: t('git.stageAll') || '暂存全部并提交',
+        confirmLabel: t('git.stageAllAndCommit'),
         cancelLabel: t('common.cancel'),
       });
       if (!ok) {
@@ -2068,7 +2068,7 @@ export function GitPanel({
           type="button"
           class={'git-refresh-btn' + (loading || isFetching ? ' spinning' : '')}
           onClick={handleFullRefresh}
-          title={isZh ? '刷新本地状态并拉取远程代码 (Refresh & Fetch All)' : 'Refresh local & fetch all remote branches'}
+          title={t('git.refreshAndFetch')}
           aria-label={t('git.refresh')}
         >
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -2090,7 +2090,7 @@ export function GitPanel({
                   style={{ display: 'inline-block', width: 'auto', padding: '2px 8px', fontSize: '11px' }}
                   onClick={() => setSubView('changes')}
                 >
-                  {isZh ? '前往“更改”标签提交或暂存' : 'Go to "Changes" to commit or stash'}
+                  {t('git.goToChangesToCommit')}
                 </button>
               </div>
             )}
@@ -2125,7 +2125,7 @@ export function GitPanel({
             <div
               class="git-split-resizer"
               onMouseDown={handleResizerMouseDown}
-              title={t("common.drag") || "上下拖拽调整大小"}
+              title={t('common.drag')}
             />
           )}
 

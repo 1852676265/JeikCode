@@ -246,6 +246,9 @@ const zh = {
   'git.statDeletions': '{count} 行删除(-)',
   'git.openOnRemote': '在 {platform} 上打开',
   'git.actions': '操作',
+  'git.refreshAndFetch': '刷新本地状态并拉取远程代码',
+  'git.goToChangesToCommit': '前往“更改”标签提交或暂存',
+  'git.stageAllAndCommit': '暂存全部并提交',
   'sidebar.search': '搜索会话',
   'sidebar.searchPlaceholder': '搜索会话…',
   'sidebar.searchHint': '输入关键词搜索会话记录',
@@ -696,6 +699,8 @@ const zh = {
   'confirm.confirmedBtn': '已确认',
   'confirm.initTitle': '构建代码图谱',
   'confirm.initBody': '请确认当前目录不是一个很大的根目录（比如/root、C盘根目录或超级大型混合多个不属于同一项目的根目录中，否则会引起极大的噪音和性能消耗）。',
+  'confirm.rewriteTitle': '确认改写历史？',
+  'confirm.rewriteDesc': '此操作将直接更新该条历史消息的内容，且不中断后续对话。确定要保存改写吗？',
   'common.error': '操作失败',
 
   // Slash commands
@@ -1265,6 +1270,9 @@ export const en: Record<MsgKey, string> = {
   'git.statDeletions': '{count} deletion(s)(-)',
   'git.openOnRemote': 'Open on {platform}',
   'git.actions': 'Actions',
+  'git.refreshAndFetch': 'Refresh local & fetch all remote branches',
+  'git.goToChangesToCommit': 'Go to "Changes" to commit or stash',
+  'git.stageAllAndCommit': 'Stage all and commit',
   'sidebar.search': 'Search sessions',
   'sidebar.searchPlaceholder': 'Search sessions…',
   'sidebar.searchHint': 'Type to search session records',
@@ -1702,6 +1710,8 @@ export const en: Record<MsgKey, string> = {
   'confirm.confirmedBtn': 'Confirmed',
   'confirm.initTitle': 'Build Code Graph',
   'confirm.initBody': 'Please make sure the current directory is not a huge root directory (such as /root, C: drive root, or a massive monorepo containing multiple unrelated projects), otherwise it may cause severe noise and performance overhead.',
+  'confirm.rewriteTitle': 'Confirm Rewrite History?',
+  'confirm.rewriteDesc': 'This will update the content of this past message without interrupting subsequent turns. Save changes?',
   'common.error': 'Operation failed',
 
   // Slash commands
