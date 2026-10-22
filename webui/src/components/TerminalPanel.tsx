@@ -22,9 +22,19 @@ function measureTerminalGrid(term: Terminal, container: HTMLElement): { cols: nu
       };
     };
   })._core;
-  const cellW = core?._renderService?.dimensions?.css?.cell?.width || 0;
-  const cellH = core?._renderService?.dimensions?.css?.cell?.height || 0;
+  let cellW = core?._renderService?.dimensions?.css?.cell?.width || 0;
+  let cellH = core?._renderService?.dimensions?.css?.cell?.height || 0;
+
+  // 兜底与动态校准：若 renderService 尚未刷出 dimensions（或由于隐藏处于 paused），
+  // 按照等宽字体比例基于当前 fontSize 精准推算，确保网格始终铺满且计算可用
+  if (cellW <= 0 || cellH <= 0) {
+    const fs = term.options.fontSize || 12;
+    // Cascadia Mono / Consolas 等宽字体的长宽比通常为 0.605 : 1
+    cellW = Math.round(fs * 0.605 * 100) / 100;
+    cellH = Math.round(fs * (term.options.lineHeight || 1) * 1.25 * 100) / 100;
+  }
   if (cellW <= 0 || cellH <= 0) return null;
+
   const style = window.getComputedStyle(container);
   const padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
   const padY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
@@ -417,7 +427,9 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         container: HTMLElement | null;
         ws: WebSocket | null;
         ro?: ResizeObserver;
-        layoutSync?: (immediate: boolean) => void;
+        layoutSync?: (immediate: boolean, force?: boolean) => void;
+        lastSentCols?: number;
+        lastSentRows?: number;
       }
     >
   >(new Map());
@@ -591,7 +603,9 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         term: Terminal;
         fitAddon: FitAddon;
         ws: WebSocket | null;
-        layoutSync?: (immediate: boolean) => void;
+        layoutSync?: (immediate: boolean, force?: boolean) => void;
+        lastSentCols?: number;
+        lastSentRows?: number;
       },
       isInitial = false
     ) => {
@@ -627,12 +641,14 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         }
         const wsUrl = `${protocol}//${window.location.host}/terminal/ws?id=${encodeURIComponent(tab.id)}&cwd=${encodeURIComponent(cwd || '')}&shell=${encodeURIComponent(tabShell)}&cols=${cols}&rows=${rows}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
         const ws = new WebSocket(wsUrl);
+        record.lastSentCols = 0;
+        record.lastSentRows = 0;
         record.ws = ws;
 
         let receivedAnyData = false;
 
         ws.onopen = () => {
-          record.layoutSync?.(true);
+          record.layoutSync?.(true, true);
           if (isInitial) {
             const initialCmd = pendingCommandsRef.current.get(tab.id);
             if (initialCmd) {
@@ -718,14 +734,13 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
 
         term.open(el);
 
-        let lastSentCols = 0;
-        let lastSentRows = 0;
         let resizeTimer: ReturnType<typeof setTimeout> | null = null;
         let fitting = false;
 
         const measureAndFit = () => {
-          if (!el || el.clientWidth < 40 || el.clientHeight < 24) return;
-          const grid = measureTerminalGrid(term, el);
+          const targetEl = termMap.current.get(tabId)?.container || el;
+          if (!targetEl || targetEl.clientWidth < 40 || targetEl.clientHeight < 24) return;
+          const grid = measureTerminalGrid(term, targetEl);
           if (!grid) {
             try {
               fitAddon.fit();
@@ -742,21 +757,21 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           }
         };
 
-        const sendPtySize = () => {
+        const sendPtySize = (force = false) => {
           const cur = termMap.current.get(tabId);
           if (!cur?.ws || cur.ws.readyState !== WebSocket.OPEN) return;
           const cols = term.cols;
           const rows = term.rows;
           if (cols < 2 || rows < 1) return;
-          if (cols === lastSentCols && rows === lastSentRows) return;
-          lastSentCols = cols;
-          lastSentRows = rows;
+          if (!force && cols === cur.lastSentCols && rows === cur.lastSentRows) return;
+          cur.lastSentCols = cols;
+          cur.lastSentRows = rows;
           cur.ws.send(JSON.stringify({ resize: { cols, rows } }));
         };
 
         // immediate：立刻把格子同步给 PTY（打开、切标签）。
         // 否则防抖，避免字号滚轮每一步都让 ConPTY 重绘并打乱命令对齐。
-        const layoutSync = (immediate: boolean) => {
+        const layoutSync = (immediate: boolean, force = false) => {
           measureAndFit();
           // xterm v6 内部用 IntersectionObserver 在容器不可见时暂停渲染（display:none 会命中），
           // 恢复可见时只有“隐藏期间发生过写入/尺寸变化”才会自愈重绘，否则视口会一直停在空白（黑屏）。
@@ -768,13 +783,13 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           if (immediate) {
             if (resizeTimer) clearTimeout(resizeTimer);
             resizeTimer = null;
-            sendPtySize();
+            sendPtySize(force);
             return;
           }
           if (resizeTimer) clearTimeout(resizeTimer);
           resizeTimer = setTimeout(() => {
             resizeTimer = null;
-            sendPtySize();
+            sendPtySize(force);
           }, 160);
         };
 
@@ -783,7 +798,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         });
         ro.observe(el);
 
-        record = { term, fitAddon, container: el, ws: null, ro, layoutSync };
+        record = { term, fitAddon, container: el, ws: null, ro, layoutSync, lastSentCols: 0, lastSentRows: 0 };
         termMap.current.set(tabId, record);
 
         measureAndFit();
@@ -816,13 +831,29 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
 
         term.focus();
       } else if (record.container !== el) {
+        // 容器 DOM 节点发生变更（如切换 session 重新挂载、tabs 重排等）：
+        // 1. 断开旧容器的 ResizeObserver 监听，并在新容器上重新建立监听
+        try {
+          record.ro?.disconnect();
+        } catch {}
         record.container = el;
+
+        // 2. 将终端 DOM 挂载到新容器
         if (record.term.element && record.term.element.parentElement !== el) {
           el.appendChild(record.term.element);
         } else if (!record.term.element) {
           record.term.open(el);
         }
-        record.layoutSync?.(true);
+
+        // 3. 重新建立 ResizeObserver 监听新的容器 el
+        const ro = new ResizeObserver(() => {
+          record?.layoutSync?.(false);
+        });
+        ro.observe(el);
+        record.ro = ro;
+
+        // 4. 强制执行自适应排版和刷新聚焦
+        record.layoutSync?.(true, true);
         record.term.focus();
       }
     },
@@ -947,6 +978,17 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
         });
 
         if (enriched.length > 0) {
+          // 清理本地已经不在后端运行的无效记录
+          const validIds = new Set(enriched.map((t: TerminalTab) => t.id));
+          for (const [id, rec] of termMap.current.entries()) {
+            if (!validIds.has(id)) {
+              try { rec.ro?.disconnect(); } catch {}
+              try { rec.ws?.close(); } catch {}
+              try { rec.term.dispose(); } catch {}
+              termMap.current.delete(id);
+            }
+          }
+
           // 以后端真实运行的列表为唯一真值，绝不将本地残留的死尸 merge 回去！
           setTabs(enriched);
           saveSessions(enriched, cwd);

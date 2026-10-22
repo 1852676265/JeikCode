@@ -1674,8 +1674,8 @@ export function Sidebar({
         ref={mcpMenuRef}
         style={{
           top: `${mcpMenuPos.top}px`,
-          left: `${mcpMenuPos.left}px`,
-          minWidth: `${Math.max(mcpMenuPos.width, 260)}px`,
+          left: `${Math.max(8, Math.min(mcpMenuPos.left, (typeof window !== 'undefined' ? window.innerWidth : 400) - 340))}px`,
+          minWidth: `${Math.max(mcpMenuPos.width, 280)}px`,
         }}
       >
         <div class="mcp-menu-header">
@@ -1714,21 +1714,34 @@ export function Sidebar({
           return (
             <div
               key={s.id}
-              class={'mcp-menu-row cap-row' + (s.effective_disabled ? ' caps-disabled' : '')}
-              title={s.error || ''}
+              class={'mcp-menu-row' + (s.effective_disabled ? ' caps-disabled' : '')}
+              title={s.error || s.name}
             >
-              <div class="cap-row-main">
-                <span class="mcp-menu-name notranslate" translate={false}>{s.name}</span>
-                <span class="mcp-menu-meta">
-                  {!s.effective_disabled && <span class={statusClass} />}
-                  {!s.effective_disabled && <span class="mcp-menu-status-text">{statusLabel}</span>}
-                  {s.tool_count != null && !s.effective_disabled && (
-                    <span class="mcp-menu-tool-count">{t('sidebar.mcpTools', { n: s.tool_count })}</span>
-                  )}
+              <div class="mcp-row-header">
+                <span class="mcp-menu-name notranslate" translate={false} title={s.name}>
+                  {s.name}
                 </span>
+                <div class="mcp-row-actions">
+                  <CapScopeToggles item={s} busy={capsBusy} onToggle={onToggleCapability} />
+                </div>
               </div>
-              <CapScopeToggles item={s} busy={capsBusy} onToggle={onToggleCapability} />
-              {s.error && !s.effective_disabled && <span class="mcp-menu-error">{s.error}</span>}
+
+              <div class="mcp-row-meta">
+                {!s.effective_disabled && <span class={statusClass} />}
+                {!s.effective_disabled && <span class="mcp-menu-status-text">{statusLabel}</span>}
+                {s.tool_count != null && !s.effective_disabled && (
+                  <span class="mcp-menu-tool-count">{t('sidebar.mcpTools', { n: s.tool_count })}</span>
+                )}
+              </div>
+
+              {s.error && !s.effective_disabled && (
+                <div class="mcp-row-error" title={s.error}>
+                  <svg class="mcp-error-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path d="M8 1a7 7 0 1 0 7 7A7 7 0 0 0 8 1zm0 10.2a.9.9 0 1 1 .9-.9.9.9 0 0 1-.9.9zm.8-3.2H7.2V4.5h1.6z"/>
+                  </svg>
+                  <span class="mcp-error-text">{s.error}</span>
+                </div>
+              )}
             </div>
           );
         })}
