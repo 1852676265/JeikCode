@@ -21,6 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.8-beta.3 (2026-10-22)
+
+- **[Terminal Resiliency & Layout Reflow] Terminal dynamic container reflow and MCP popover redesign**:
+  - Resolved container closure staleness in `TerminalPanel.tsx` that broke xterm dynamic grid resizing and layout sync after session switching or page reloads.
+  - Re-bound `ResizeObserver` and force-pushed terminal dimensions upon DOM re-attachment, preventing frozen 55-column box scaling and ensuring smooth viewport adaptation.
+  - Redesigned the MCP server popover layout in `Sidebar.tsx` into a structured 3-tier vertical card flow (action header, status bar, and independent error diagnostic card), eliminating text collisions and button overlaps on connection errors.
+- **[Task Checklist & Text Anchoring] Silent todo completion nudging and smart proposal anchoring**:
+  - Upgraded the task completion nudge in `todo.rs` to a strict pure-English directive, instructing models to emit only pure tool calls without redundant duplicate summaries or pleasantries when closing out completed tasks.
+  - Implemented smart anchoring in the daemon non-streaming handler (`compat_api.rs`) for OpenAI, Responses, and Anthropic endpoints: when a turn concludes with a `todo_write` status sync followed by brief closing remarks, automatically anchor `final_text` back to the rich pre-tool business proposal.
+  - Aligned the WebUI turn copy action in `Chat.tsx` with identical smart anchoring heuristics, preventing short closing pleasantries from overshadowing complete proposal text.
+
+---
+
+- **[终端弹性重排与布局重构] 终端动态容器重排与 MCP 卡片式浮层重构**:
+  - 修复 `TerminalPanel.tsx` 在切换会话或刷新页面后因闭包引用脱离文档流的旧 DOM 容器而导致 xterm 动态缩放和布局同步失效的问题；
+  - 在 DOM 容器重新挂载时重新绑定 `ResizeObserver` 并在建立 WebSocket 连接时强制同步当前终端尺寸，彻底杜绝列数锁死在 55 列并导致固定框等比缩放的现象；
+  - 重构侧边栏中 MCP 浮层的单项布局为清晰的三层纵向卡片流结构（操作头部、状态栏、独立错误诊断卡片），彻底解决 MCP 加载失败时长文本错误导致的文字重叠与开关按钮错位。
+- **[任务清单与文本智能回锚] 静默任务补勾强指令与核心提案文本智能回锚**:
+  - 将 `todo.rs` 中的任务完成拦截提示词重构为纯英文强约束指令，明确要求模型在补勾已完成任务时仅纯静默发射工具调用，严禁重复输出冗余结语或客套话；
+  - 在 daemon 兼容协议非流式处理器（`compat_api.rs`）中为 OpenAI/Responses/Anthropic 端点引入智能回锚机制：当回合以 `todo_write` 工具打勾收尾且打勾后正文明显偏短时，自动回锚至打勾前的核心业务长文本；
+  - 在 WebUI 前端画布（`Chat.tsx`）的“复制最后回答”计算逻辑中同步引入对齐的智能回锚算法，彻底杜绝打勾后的简短客套语冲刷掉完整草案正文的问题。
+
 ## v7.2.8-beta.2 (2026-10-21)
 
 - **[Git Multi-Repository & Progressive Async Fetch] Sub-repository auto-activation, sticky switcher bar, per-session persistence, and non-blocking fetch**:
