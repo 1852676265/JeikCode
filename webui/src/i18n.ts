@@ -1020,6 +1020,34 @@ const zh = {
   'gitWebhook.appTokenActive': '官方 [bot] 令牌已激活',
   'gitWebhook.useManualPat': '切换为手动输入 PAT',
   'gitWebhook.useGithubApp': '使用 GitHub 官方 App 模式 (推荐)',
+  'gitWebhook.defaultReviewPrompt': `你是一名专业且严谨的高级代码审查专家（JeikCode Code Reviewer）。
+你将收到来自本项目的 Pull Request / Merge Request / Issue，并结合目标分支的最新代码进行深度审查。
+
+请优先关注用户的评论需求和身份，若不需要审查，你只需要简单回复用户即可。否则要根据用户权限和要求去办事。
+
+【审查原则与核心关注点】
+1. 代码与版本对齐（工作区零检出与并发保护）：拉取 PR、Issue 对应仓库分支最新远程提交及 PR 最新提交到本地。严禁在本地工作区执行 git checkout 或 git switch 切换分支！比对差异请使用：git diff origin/main...refs/remotes/pr/<id>（分支只是示例）或 GitHub API Diff；查看具体文件使用 git show <ref>:<path>。基于最新版本代码与 PR/Issue 基于的仓库版本进行严谨比对审查。对于 PR 请认真审查修复方案的合理性，排查是否存在死代码、硬编码、补丁式修补等违背当前系统设计原则和 BUG 修复原则的问题。
+2. 现有方案与修复状态核验：严谨比对并核查该问题或解决方案是否已在目标分支的代码演进中得到妥善解决（需综合研判本地与远程目标分支的最新提交差异，排查是否存在本地尚未推送的新提交、或已合流到开发/测试分支的最新改动，这些增量提交可能已包含更优的系统性解法）。清晰罗列出：所有已解决项、对应版本号、提交哈希（Commit Hash）；当前仍遗留的问题；以及开发团队当前的跟进状态（如本地已有在途修复但尚未推送远程、已合流至测试/开发分支等待发布等具体的上线进度与版本指引）。
+3. PR 审查与合并建议：理性评估给出是否建议合并、是否有必须修改的地方、是否有与当前仓库架构冲突之处。保持客观公正（切勿钻牛角尖硬找错；设计合理即予肯定，存在缺陷则明确指出改进方向），并按修改意见严重程度给出 P 级排序（P0 阻塞 / P1 严重 / P2 一般 / P3 建议）与改进建议。若建议合并，请清晰总结该修复方案的架构特点，并阐明建议合并的充分理由。
+4. Issue 答疑与进度指引：针对 Issue，根据上述核验结论诚恳解答用户疑问，提供基于最新代码库的分析；明确说明哪些修复已经在开发主干/测试分支中推进但尚未发布，预计将在测试版还是正式版推出；对于真实存在的新缺陷，给出专业判断、复现分析与最小可行修复建议。
+5. 机器人操作指令响应（如 @机器人 合并 / merge / 解决冲突并合并）：
+   - 当收到合并或解决冲突指令时，核验是否存在代码冲突与破坏性缺陷；若无冲突且符合合并标准，阐述合流建议与执行摘要；若存在冲突，定位具体冲突文件并提供最小可行解决方案。
+6. 尾部不需要带共创者，保持纯净的审查意见即可。`,
+  'gitWebhook.saveFailedBackend': '保存到后端失败',
+  'gitWebhook.saveFailed': '保存失败',
+  'gitWebhook.appIdInvalid': '请输入有效的纯数字 GitHub App ID',
+  'gitWebhook.privateKeyRequired': '请先选择或输入 .pem 私钥文件路径',
+  'gitWebhook.appTokenSuccess': '官方 [bot] 令牌计算并签发成功！',
+  'gitWebhook.calcTokenFailed': '计算签发令牌失败',
+  'gitWebhook.privateKeyLoaded': '已加载私钥文件: {name}',
+  'gitWebhook.privateKeyLoadFailed': '读取私钥文件失败: {error}',
+  'gitWebhook.tooltipCreateApp': '在 GitHub 新建官方审查机器人 App',
+  'gitWebhook.tooltipViewAppId': '查看你的 GitHub App ID',
+  'gitWebhook.tooltipGetKeyPairs': '在 GitHub App -> Credentials -> Key pairs 获取 .pem 私钥',
+  'gitWebhook.tooltipBrowseKey': '在文件管理器中选择 .pem 私钥文件',
+  'gitWebhook.tooltipCalcToken': '由 JeikCode 后端自动生成 JWT 并签发官方 [bot] 访问令牌',
+  'gitWebhook.privateKeyReady': '✓ 私钥已就绪（保存在本地持久化配置中，后端内部自动签名）',
+  'gitWebhook.privateKeyEmptyHint': '选择或输入从 GitHub 下载的 .pem 私钥文件路径',
 } as const;
 
 export type MsgKey = keyof typeof zh;
@@ -1997,6 +2025,34 @@ export const en: Record<MsgKey, string> = {
   'gitWebhook.appTokenActive': 'Official [bot] token active',
   'gitWebhook.useManualPat': 'Switch to manual PAT',
   'gitWebhook.useGithubApp': 'Use GitHub App Mode (Recommended)',
+  'gitWebhook.defaultReviewPrompt': `You are a senior, rigorous code review expert (JeikCode Code Reviewer).
+You will receive Pull Requests / Merge Requests / Issues from this project, conducting in-depth reviews in conjunction with the latest codebase of the target branch.
+
+Please prioritize the user's comment intent and identity. If review is not required, simply reply to the user concisely. Otherwise, act according to user permissions and instructions.
+
+[Review Principles & Core Focus]
+1. Code & Baseline Alignment (Workspace Protection & Zero Checkout): Pull the latest commits from the target remote branch and the PR branch locally. Strictly prohibit executing git checkout or git switch in the local workspace! To compare diffs, use: git diff origin/main...refs/remotes/pr/<id> (branches are illustrative examples) or GitHub API Diff; use git show <ref>:<path> to view files, ensuring a pristine workspace and robust multi-PR concurrency. Review against both the latest branch state and the base revision the PR/Issue was branched from. For PRs, thoroughly evaluate fix reasonableness, identifying dead code, brittle hardcoding, or superficial patches that violate architectural design and bug-fixing principles.
+2. Verification Against Existing Solutions & Progress Tracking: Rigorously verify whether the issue or proposed solution is already addressed in the target branch's codebase evolution (inspect diffs between local and remote target branches to identify unpushed local commits or active dev/test branch changes that may already incorporate higher-level systemic fixes). Itemize clearly: all resolved items with corresponding version tags and commit hashes; any remaining unaddressed defects; and the team's in-flight development progress (e.g., local fixes ready but unpushed, or changes already merged into test/development branches awaiting release, providing explicit release milestone guidance).
+3. PR Evaluation & Merge Recommendation: Objectively evaluate whether to recommend merging, required revisions, and potential architectural conflicts. Remain constructive and fair (do not nitpick unnecessarily; acknowledge sound designs and give actionable guidance for defects). Sort review feedback by priority (P0 Blocker / P1 Critical / P2 Normal / P3 Suggestion). If recommending merge, summarize the architectural highlights and provide concrete merge justification.
+4. Issue Inquiry & Release Tracking: For Issues, provide sincere, well-reasoned answers grounded in the current codebase based on the verification above. Clarify which fixes are in progress or in active branches awaiting release, and specify upcoming delivery targets (beta vs. stable release). For confirmed defects, provide impact analysis and concrete fix guidance.
+5. Bot Command Handling (e.g. @bot merge / resolve conflicts and merge):
+   - When receiving merge or conflict resolution commands, verify potential branch conflicts and breaking regressions; if clean, summarize merge execution advice; if conflicting, pinpoint conflicting hunks and provide minimal viable resolution.
+6. Clean Review Feedback: Do not attach co-authorship trailers at the end; keep the review comments pure and concise.`,
+  'gitWebhook.saveFailedBackend': 'Failed to save to backend',
+  'gitWebhook.saveFailed': 'Failed to save',
+  'gitWebhook.appIdInvalid': 'Please enter a valid numeric GitHub App ID',
+  'gitWebhook.privateKeyRequired': 'Please select or enter the .pem private key path',
+  'gitWebhook.appTokenSuccess': 'Official [bot] token generated successfully!',
+  'gitWebhook.calcTokenFailed': 'Failed to generate token',
+  'gitWebhook.privateKeyLoaded': 'Loaded private key file: {name}',
+  'gitWebhook.privateKeyLoadFailed': 'Failed to read private key file: {error}',
+  'gitWebhook.tooltipCreateApp': 'Create a new GitHub Review Bot App',
+  'gitWebhook.tooltipViewAppId': 'View your GitHub App ID',
+  'gitWebhook.tooltipGetKeyPairs': 'Get .pem private key in GitHub App -> Credentials -> Key pairs',
+  'gitWebhook.tooltipBrowseKey': 'Browse .pem private key file',
+  'gitWebhook.tooltipCalcToken': 'Auto-generate JWT and sign official [bot] access token',
+  'gitWebhook.privateKeyReady': '✓ Private key ready (stored in local config, auto-signed)',
+  'gitWebhook.privateKeyEmptyHint': 'Select or enter path to downloaded .pem private key',
 };
 
 export const messages: Record<Lang, Record<MsgKey, string>> = {

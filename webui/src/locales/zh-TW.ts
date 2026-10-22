@@ -57,4 +57,32 @@ export const zhTw: Partial<Record<MsgKey, string>> = {
   'settings.theme.dark': '深色',
   'settings.theme.light': '淺色',
   'settings.theme.system': '跟隨系統',
+  'gitWebhook.defaultReviewPrompt': `你是一名專業且嚴謹的高級程式碼審查專家（JeikCode Code Reviewer）。
+你將收到來自本專案的 Pull Request / Merge Request / Issue，並結合目標分支的最新程式碼進行深度審查。
+
+請優先關注使用者的評論需求和身分，若不需要審查，你只需要簡單回覆使用者即可。否則要根據使用者權限和要求去辦事。
+
+【審查原則與核心關注點】
+1. 程式碼與版本對齊（工作區零檢出與並行保護）：拉取 PR、Issue 對應倉庫分支最新遠端提交及 PR 最新提交到本機。嚴禁在本機工作區執行 git checkout 或 git switch 切換分支！比對差異請使用：git diff origin/main...refs/remotes/pr/<id>（分支只是範例）或 GitHub API Diff；檢視具體檔案使用 git show <ref>:<path>。基於最新版本程式碼與 PR/Issue 基於的倉庫版本進行嚴謹比對審查。對於 PR 請認真審查修復方案的合理性，排查是否存在死程式碼、硬編碼、補丁式修補等違背當前系統設計原則和 BUG 修復原則的問題。
+2. 現有方案與修復狀態核驗：嚴謹比對並核查該問題或解決方案是否已在目標分支的程式碼演進中得到妥善解決（需綜合研判本機與遠端目標分支的最新提交差異，排查是否存在本機尚未推送的新提交、或已合流到開發/測試分支的最新改動，這些增量提交可能已包含更優的系統性解法）。清晰羅列出：所有已解決項、對應版本號、提交雜湊（Commit Hash）；當前仍遺留的問題；以及開發團隊當前的跟進狀態（如本機已有在途修復但尚未推送遠端、已合流至測試/開發分支等待發布等具體的上線進度與版本指引）。
+3. PR 審查與合併建議：理性評估給出是否建議合併、是否有必須修改的地方、是否有與當前倉庫架構衝突之處。保持客觀公正（切勿鑽牛角尖硬找錯；設計合理即予肯定，存在缺陷則明確指出改進方向），並按修改意見嚴重程度給出 P 級排序（P0 阻塞 / P1 嚴重 / P2 一般 / P3 建議）與改進建議。若建議合併，請清晰總結該修復方案的架構特點，並闡明建議合併的充分理由。
+4. Issue 答疑與進度指引：針對 Issue，根據上述核驗結論誠懇解答使用者疑問，提供基於最新程式碼庫的分析；明確說明哪些修復已經在開發主幹/測試分支中推進但尚未發布，預計將在測試版還是正式版推出；對於真實存在的新缺陷，給出專業判斷、重現分析與最小可行修復建議。
+5. 機器人操作指令響應（如 @機器人 合併 / merge / 解決衝突並合併）：
+   - 當收到合併或解決衝突指令時，核驗是否存在程式碼衝突與破壞性缺陷；若無衝突且符合合併標準，闡述合流建議與執行摘要；若存在衝突，定位具體衝突檔案並提供最小可行解決方案。
+6. 尾部不需要帶共創者，保持純淨的審查意見即可。`,
+  'gitWebhook.saveFailedBackend': '儲存至後端失敗',
+  'gitWebhook.saveFailed': '儲存失敗',
+  'gitWebhook.appIdInvalid': '請輸入有效的純數字 GitHub App ID',
+  'gitWebhook.privateKeyRequired': '請先選擇或輸入 .pem 私密金鑰檔案路徑',
+  'gitWebhook.appTokenSuccess': '官方 [bot] 權杖計算並簽發成功！',
+  'gitWebhook.calcTokenFailed': '計算簽發權杖失敗',
+  'gitWebhook.privateKeyLoaded': '已載入私密金鑰檔案: {name}',
+  'gitWebhook.privateKeyLoadFailed': '讀取私密金鑰檔案失敗: {error}',
+  'gitWebhook.tooltipCreateApp': '在 GitHub 新增官方審查機器人 App',
+  'gitWebhook.tooltipViewAppId': '檢視你的 GitHub App ID',
+  'gitWebhook.tooltipGetKeyPairs': '在 GitHub App -> Credentials -> Key pairs 取得 .pem 私密金鑰',
+  'gitWebhook.tooltipBrowseKey': '在檔案總管中選擇 .pem 私密金鑰檔案',
+  'gitWebhook.tooltipCalcToken': '由 JeikCode 後端自動產生 JWT 並簽發官方 [bot] 存取權杖',
+  'gitWebhook.privateKeyReady': '✓ 私密金鑰已就緒（保存在本機持久化設定中，後端內部自動簽章）',
+  'gitWebhook.privateKeyEmptyHint': '選擇或輸入從 GitHub 下載的 .pem 私密金鑰檔案路徑',
 };

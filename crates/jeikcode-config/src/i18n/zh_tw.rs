@@ -110,6 +110,8 @@ pub(super) fn zh_tw(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescProvider => "管理模型提供商與 API 帳號".into(),
         Msg::CmdDescQuit => "結束 JeikCode 對話".into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
+        Msg::CodeExploreOpeningReminder =>
+            "還有，在回答前請充分探索程式碼庫。使用 `code_explore` 加快程式碼邏輯檢索速度以便快速獲得全貌。當工具調用之間無依賴時，優先並行發起調用。如果你沒在執行探索任務，請忽略此句即可。".into(),
         _ => super::zh_cn::zh_cn(msg),
     }
 }

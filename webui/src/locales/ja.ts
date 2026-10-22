@@ -64,4 +64,31 @@ export const ja: Partial<Record<MsgKey, string>> = {
   'settings.theme.dark': 'ダーク',
   'settings.theme.light': 'ライト',
   'settings.theme.system': 'システムに従う',
+  'gitWebhook.defaultReviewPrompt': `あなたは専門的で厳格な上級コードレビューエキスパート（JeikCode Code Reviewer）です。
+本プロジェクトから届く Pull Request / Merge Request / Issue を、対象ブランチの最新コードと照合しながら詳細にレビューします。
+
+ユーザーのコメント意図と権限を最優先に考慮してください。レビューが不要な場合は簡潔に返答するだけで構いません。
+
+【レビュー原則と重要確認事項】
+1. コードとベースラインの整合性（作業ツリー保護とゼロチェックアウト）: ローカル作業ディレクトリで git checkout や git switch を実行することは厳禁です！git diff や GitHub API Diff を使用して比較してください。
+2. 既存ソリューションと進行状況の検証: 対象ブランチのコードベースの進化において、この問題が既に解決されているかを厳格に確認してください。
+3. PR レビューとマージ推奨: マージを推奨するかどうか、必須の修正点があるかを客観的に評価し、優先度順（P0 ブロッカー / P1 致命的 / P2 通常 / P3 提案）でフィードバックを提供してください。
+4. Issue への回答とロードマップ案内: 最新のコードベースに基づいて誠実に回答し、今後のリリース予定を明示してください。
+5. ボットコマンドへの応答（@bot merge 等）: 競合の有無を検証し、解決策を提示してください。
+6. レビューコメントの純粋性: 末尾に不要な共同作成者クレジットを付加しないでください。`,
+  'gitWebhook.saveFailedBackend': 'バックエンドへの保存に失敗しました',
+  'gitWebhook.saveFailed': '保存に失敗しました',
+  'gitWebhook.appIdInvalid': '有効な半角数字の GitHub App ID を入力してください',
+  'gitWebhook.privateKeyRequired': '.pem 秘密鍵ファイルのパスを選択または入力してください',
+  'gitWebhook.appTokenSuccess': '公式 [bot] トークンが正常に生成されました！',
+  'gitWebhook.calcTokenFailed': 'トークンの生成に失敗しました',
+  'gitWebhook.privateKeyLoaded': '秘密鍵ファイルを読み込みました: {name}',
+  'gitWebhook.privateKeyLoadFailed': '秘密鍵ファイルの読み込みに失敗しました: {error}',
+  'gitWebhook.tooltipCreateApp': 'GitHub で新しい公式レビューボット App を作成',
+  'gitWebhook.tooltipViewAppId': 'GitHub App ID を確認',
+  'gitWebhook.tooltipGetKeyPairs': 'GitHub App -> Credentials -> Key pairs で .pem 秘密鍵を取得',
+  'gitWebhook.tooltipBrowseKey': 'ファイルマネージャーで .pem 秘密鍵ファイルを選択',
+  'gitWebhook.tooltipCalcToken': 'JeikCode バックエンドで JWT を自動生成して公式 [bot] トークンを発行',
+  'gitWebhook.privateKeyReady': '✓ 秘密鍵の準備完了（ローカル設定に保存され、バックエンドで自動署名）',
+  'gitWebhook.privateKeyEmptyHint': 'GitHub からダウンロードした .pem 秘密鍵ファイルのパスを選択または入力',
 };

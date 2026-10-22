@@ -110,6 +110,8 @@ pub(super) fn es(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescProvider => "Gestionar proveedores y cuentas de API".into(),
         Msg::CmdDescQuit => "Salir de JeikCode".into(),
         Msg::StreamStalled => "presione esc para cancelar".into(),
+        Msg::CodeExploreOpeningReminder =>
+            "Además, explore la base de código exhaustivamente antes de responder. Utilice `code_explore` para acelerar la recuperación de la lógica del código y obtener rápidamente una visión general. Cuando no haya dependencias entre las llamadas a herramientas, ejecútelas en paralelo con prioridad. Si no está realizando una tarea de exploración, ignore esta frase.".into(),
         _ => super::en::en(msg),
     }
 }

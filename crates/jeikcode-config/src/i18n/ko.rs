@@ -110,6 +110,8 @@ pub(super) fn ko(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescProvider => "모델 공급자 및 API 계정 관리".into(),
         Msg::CmdDescQuit => "JeikCode 대화 종료".into(),
         Msg::StreamStalled => "esc를 눌러 취소".into(),
+        Msg::CodeExploreOpeningReminder =>
+            "또한 답변하기 전에 코드베이스를 충분히 탐색해 주세요. `code_explore`를 사용하여 코드 로직 검색 속도를 높이고 전체적인 구조를 빠르게 파악하세요. 도구 호출 간에 종속성이 없을 경우 병렬로 우선 호출하세요. 탐색 작업을 수행하지 않는 경우 이 문장은 무시하셔도 됩니다.".into(),
         _ => super::en::en(msg),
     }
 }

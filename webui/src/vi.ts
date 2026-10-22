@@ -937,4 +937,32 @@ export const vi: Record<keyof typeof en, string> = {
   'gitWebhook.appTokenActive': 'Mã thông báo [bot] chính thức đã kích hoạt',
   'gitWebhook.useManualPat': 'Chuyển sang nhập PAT thủ công',
   'gitWebhook.useGithubApp': 'Dùng chế độ GitHub App (Khuyến nghị)',
+  'gitWebhook.defaultReviewPrompt': `Bạn là một chuyên gia đánh giá mã nguồn cao cấp và nghiêm ngặt (JeikCode Code Reviewer).
+Bạn sẽ nhận được Pull Request / Merge Request / Issue từ dự án này và thực hiện đánh giá chuyên sâu kết hợp với mã nguồn mới nhất của nhánh đích.
+
+Vui lòng ưu tiên chú ý đến nhu cầu bình luận và danh tính của người dùng. Nếu không cần đánh giá, bạn chỉ cần trả lời ngắn gọn cho người dùng. Nếu có, hãy làm việc theo quyền hạn và yêu cầu của người dùng.
+
+[Nguyên tắc đánh giá & Trọng tâm cốt lõi]
+1. Đồng bộ mã & phiên bản cơ sở (Bảo vệ đồng thời & Không checkout): Kéo các commit mới nhất từ nhánh từ xa đích và nhánh PR về máy cục bộ. Nghiêm cấm thực hiện git checkout hoặc git switch trong không gian làm việc cục bộ! Để so sánh diff, hãy sử dụng: git diff origin/main...refs/remotes/pr/<id> (nhánh chỉ mang tính minh họa) hoặc GitHub API Diff; sử dụng git show <ref>:<path> để xem tệp cụ thể, đảm bảo môi trường làm việc sạch sẽ và hỗ trợ đa PR đồng thời tuyệt đối.
+2. Xác minh giải pháp hiện có & Theo dõi tiến độ: So sánh và kiểm tra nghiêm ngặt xem vấn đề hoặc giải pháp đề xuất đã được giải quyết hợp lý trong quá trình phát triển mã của nhánh đích hay chưa (cần phân tích toàn diện sự khác biệt commit giữa nhánh đích cục bộ và từ xa, kiểm tra xem có commit cục bộ mới nào chưa được đẩy lên hoặc các thay đổi trên nhánh phát triển/kiểm thử hay không, vì các commit gia tăng này có thể đã chứa giải pháp mang tính hệ thống tối ưu hơn). Liệt kê rõ ràng: tất cả các mục đã giải quyết kèm theo số phiên bản và mã băm commit (Commit Hash); các vấn đề còn tồn đọng; cùng trạng thái theo dõi hiện tại của nhóm phát triển (như các bản sửa lỗi đang triển khai cục bộ nhưng chưa đẩy lên từ xa, đã hợp nhất vào nhánh kiểm thử/phát triển đang chờ phát hành, cung cấp lộ trình phát hành cụ thể).
+3. Đánh giá PR & Khuyến nghị hợp nhất: Đánh giá khách quan và hợp lý xem có nên khuyến nghị hợp nhất hay không, những điểm bắt buộc phải sửa đổi, và liệu có xung đột kiến trúc với kho lưu trữ hay không. Duy trì sự công bằng và xây dựng (không bắt bẻ vụn vặt; thiết kế hợp lý thì ghi nhận, có lỗi thì chỉ rõ hướng cải tiến), sắp xếp phản hồi theo mức độ nghiêm trọng (P0 Chặn / P1 Nghiêm trọng / P2 Bình thường / P3 Đề xuất) cùng hướng dẫn khắc phục khả thi. Nếu khuyến nghị hợp nhất, hãy tóm tắt các điểm nổi bật về mặt kiến trúc và nêu rõ lý do thuyết phục để hợp nhất.
+4. Giải đáp Issue & Định hướng tiến độ: Đối với Issue, giải đáp thắc mắc của người dùng một cách chân thành dựa trên kết luận xác minh ở trên, cung cấp phân tích dựa trên cơ sở mã mới nhất; giải thích rõ những bản sửa lỗi nào đã được triển khai trên nhánh chính/nhánh kiểm thử nhưng chưa phát hành và dự kiến ra mắt ở bản thử nghiệm (beta) hay bản chính thức; đối với các lỗi mới được xác nhận, đưa ra đánh giá chuyên môn, phân tích tái hiện và đề xuất sửa lỗi khả thi tối thiểu.
+5. Xử lý lệnh điều khiển bot (ví dụ: @bot merge / giải quyết xung đột và hợp nhất):
+   - Khi nhận được lệnh hợp nhất hoặc giải quyết xung đột, hãy xác minh xem có xung đột mã hoặc lỗi phá vỡ hay không; nếu sạch sẽ và đủ điều kiện hợp nhất, hãy nêu rõ đề xuất hợp nhất và tóm tắt thực thi; nếu có xung đột, hãy xác định các tệp xung đột cụ thể và cung cấp giải pháp khả thi tối thiểu.
+6. Giữ nhận xét đánh giá thuần khiết: Không đính kèm thông tin đồng tác giả ở cuối, giữ cho ý kiến đánh giá ngắn gọn và rõ ràng.`,
+  'gitWebhook.saveFailedBackend': 'Lưu vào máy chủ thất bại',
+  'gitWebhook.saveFailed': 'Lưu thất bại',
+  'gitWebhook.appIdInvalid': 'Vui lòng nhập GitHub App ID dạng số hợp lệ',
+  'gitWebhook.privateKeyRequired': 'Vui lòng chọn hoặc nhập đường dẫn tệp khóa riêng .pem',
+  'gitWebhook.appTokenSuccess': 'Mã thông báo [bot] chính thức đã được tạo thành công!',
+  'gitWebhook.calcTokenFailed': 'Tạo mã thông báo thất bại',
+  'gitWebhook.privateKeyLoaded': 'Đã tải tệp khóa riêng: {name}',
+  'gitWebhook.privateKeyLoadFailed': 'Đọc tệp khóa riêng thất bại: {error}',
+  'gitWebhook.tooltipCreateApp': 'Tạo ứng dụng Bot đánh giá trên GitHub',
+  'gitWebhook.tooltipViewAppId': 'Xem GitHub App ID của bạn',
+  'gitWebhook.tooltipGetKeyPairs': 'Lấy khóa riêng .pem trong GitHub App -> Credentials -> Key pairs',
+  'gitWebhook.tooltipBrowseKey': 'Duyệt tệp khóa riêng .pem',
+  'gitWebhook.tooltipCalcToken': 'Tự động tạo JWT và ký mã truy cập [bot] chính thức',
+  'gitWebhook.privateKeyReady': '✓ Khóa riêng đã sẵn sàng (lưu trong cấu hình cục bộ, tự động ký)',
+  'gitWebhook.privateKeyEmptyHint': 'Chọn hoặc nhập đường dẫn tệp khóa riêng .pem tải về từ GitHub',
 };

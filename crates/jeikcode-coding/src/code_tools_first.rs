@@ -29,23 +29,11 @@ use std::sync::{Mutex, OnceLock};
 const WANDER_WINDOW: u8 = 10;
 const WANDER_NUDGE_AT: u8 = 8;
 
-const OPENING_BODY_ZH: &str = "\
-还有，在回答前请充分探索代码库。使用 `code_explore` 加快代码逻辑检索速度以便快速获得全貌。当工具调用之间无依赖时，优先并发发起调用。如果你没在运行探索任务，请忽略此句即可。";
-
-const OPENING_BODY_EN: &str = "\
-Explore the codebase generously before answering. Use `code_explore` to accelerate code logic retrieval and quickly gain a complete overview. Fire concurrent calls when there is no dependency between them. If you are not running an exploration task, please ignore this sentence.";
-
-const OPENING_BODY_VI: &str = "\
-Ngoài ra, hãy khám phá kỹ lưỡng cơ sở mã trước khi trả lời. Sử dụng `code_explore` để tăng tốc độ truy xuất logic mã nhằm nhanh chóng nắm bắt bức tranh toàn cảnh. Kích hoạt các lệnh gọi đồng thời khi không có sự phụ thuộc lẫn nhau. Nếu bạn không thực hiện nhiệm vụ khám phá, vui lòng bỏ qua câu này.";
-
-pub fn opening_body_for(locale: jeikcode_config::locale::Locale) -> &'static str {
-    match locale {
-        jeikcode_config::locale::Locale::ZhCn | jeikcode_config::locale::Locale::ZhTw => {
-            OPENING_BODY_ZH
-        }
-        jeikcode_config::locale::Locale::Vi => OPENING_BODY_VI,
-        _ => OPENING_BODY_EN,
-    }
+pub fn opening_body_for(locale: jeikcode_config::locale::Locale) -> std::borrow::Cow<'static, str> {
+    jeikcode_config::i18n::t_with(
+        locale,
+        jeikcode_config::i18n::Msg::CodeExploreOpeningReminder,
+    )
 }
 
 const WANDER_BODY: &str = "\
@@ -57,6 +45,7 @@ const WANDER_NEEDLE: &str = "Little `code_explore` so far";
 
 fn has_opening_reminder(text: &str) -> bool {
     text.contains(OPENING_NEEDLE)
+        || text.contains("`code_explore`")
         || text.contains("加快代码逻辑检索速度")
         || text.contains("accelerate code logic retrieval")
         || text.contains("tăng tốc độ truy xuất logic mã")
@@ -160,7 +149,7 @@ impl LifecycleHooks for CodeToolsFirstHook {
         let body = opening_body_for(locale);
         jeikcode_capabilities::reminder::insert_strong_reminder_before_system_reminders(
             &mut query.text,
-            body,
+            &body,
             OPENING_NEEDLE,
         );
     }

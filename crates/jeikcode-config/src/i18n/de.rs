@@ -110,6 +110,8 @@ pub(super) fn de(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescProvider => "Modellanbieter und API-Konten verwalten".into(),
         Msg::CmdDescQuit => "JeikCode beenden".into(),
         Msg::StreamStalled => "Esc zum Abbrechen drücken".into(),
+        Msg::CodeExploreOpeningReminder =>
+            "Erkunden Sie außerdem die Codebasis gründlich, bevor Sie antworten. Verwenden Sie `code_explore`, um die Suche nach Codelogik zu beschleunigen und sich schnell einen vollständigen Überblick zu verschaffen. Wenn keine Abhängigkeiten zwischen Tool-Aufrufen bestehen, rufen Sie diese vorrangig parallel auf. Wenn Sie keine Erkundungsaufgabe ausführen, ignorieren Sie diesen Satz.".into(),
         _ => super::en::en(msg),
     }
 }

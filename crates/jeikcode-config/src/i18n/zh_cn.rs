@@ -1293,5 +1293,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 .into(),
         Msg::ServeNoTokenSecurityWarning =>
             "【严重安全警告】检测到你未配置访问令牌 (Token)！\n如果你当前未设置对应防火墙，请向 JeikCode 的 AI 询问让其帮忙设立防火墙和白名单 IP，否则你的服务器很容易被黑客入侵！".into(),
+        Msg::CodeExploreOpeningReminder =>
+            "还有，在回答前请充分探索代码库。使用 `code_explore` 加快代码逻辑检索速度以便快速获得全貌。当工具调用之间无依赖时，优先并发发起调用。如果你没在运行探索任务，请忽略此句即可。".into(),
     }
 }
