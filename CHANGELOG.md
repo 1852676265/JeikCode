@@ -21,6 +21,114 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.8 (2026-10-22)
+
+- **[MCP Enterprise Resilience & Lifecycle Overhaul] Comprehensive MCP self-healing, physical singleton pool, and argument coercion**:
+  - Implemented pre-flight process health inspection and safe initial BrokenPipe recovery, guaranteeing transparent cold-start restarts for reaped, idle, or sleeping MCP subprocesses across read and write operations alike.
+  - Purged accidental global process teardown in `SessionMcpLease::drop`, strictly confining session scope cleanup to session-owned instances.
+  - Introduced `GlobalMcpPool` to provide a true application-wide physical singleton process pool for `scope=global` servers (e.g. `ddg-search`), completely eliminating duplicate subprocess spawns and port clashes across multiple projects.
+  - Added a bounded stderr ring buffer with dual truncation caps (30 lines / 8KB) to surface subprocess crash stacks and eliminate black-box debugging while preventing pipe deadlocks.
+  - Implemented out-of-band `notifications/cancelled` delivery upon request timeout, allowing conforming servers to gracefully release compute resources.
+  - Added Active Ping event-loop probes and zombie timeout teardown to prevent hanging subprocesses from blocking subsequent tool calls.
+  - Introduced exponential backoff throttling (200ms * 2^n, capped at 3s) in HTTP/SSE transport, and enabled idempotent safe retry for `readOnlyHint` tools.
+  - Implemented argument coercion (`coerce_mcp_arguments`) in `McpToolAdapter` to automatically repair LLM type drifts (integers, booleans, stringified arrays/objects) against JSON Schema definitions.
+  - Connected MCP tools to `ArtifactMiddleware` with a dedicated 32KB threshold, storing oversized outputs in `ArtifactStore` with standard `artifact_id` references for pagination via `fetch_output`.
+  - Added active listeners for `notifications/tools/list_changed` to dynamically invalidate tool caches upon live server schema reloads.
+  - Updated shipped `mcp.json` template to retain zero-key `ddg-search` under `scope=global`, and updated bilingual documentation reflecting the three-tier scope model.
+- **[Multi-Repository Architecture & Sticky Switcher] Multi-repo auto-activation and per-session persistence**:
+  - Automatically activates the core sub-repository (e.g. `JeikCode`) on newly created sessions within multi-repo workspaces lacking a root Git repository, and restores previously selected sub-repositories for existing sessions using dual-key memory (path/name match + index fallback).
+  - Hoisted the multi-repo dropdown switcher bar to the sticky top of the Git panel, ensuring it remains permanently accessible across Changes, Commits, and Branches subviews without early empty-state blockage.
+  - Resolved state-merge race conditions in `gitStore.ts` where asynchronously discovered sub-repositories were wiped out by stale snapshot overwrites.
+- **[Progressive Async Fetch & Dual-Ref Caching] Decoupled progressive refresh, single-flight lock, and dual-ref fingerprinting**:
+  - Implemented progressive asynchronous updates for full Git refresh: local staged/unstaged changes and branch info render immediately (<15ms), while remote fetching runs non-blockingly in the background.
+  - Replaced crude boolean fetch locks with a single-flight `Promise<boolean>` sharing pool, merging rapid consecutive clicks and window-focus events into a single in-flight request to eliminate false "Failed to fetch remote branches" error toasts.
+  - Upgraded Git Graph cache verification to a 6ms `HEAD + FETCH_HEAD` dual-ref composite fingerprint; returns 0ms instant cached graph when remote is unchanged, and re-computes graph and writes back to global cache (`GRAPH_CACHE`) only when new remote commits arrive.
+  - Optimized `git_fetch` to target tracking remotes (defaulting to `origin`) rather than blind `--all`, preventing unrelated or broken remote URLs from failing the primary fetch.
+  - Added 0ms optimistic updates for staging, unstaging, discard, commit, and push operations.
+- **[Composer & Keyboard-Driven Steer Workflow] Full keyboard navigation, roving-focus card toolbar, and replay folding**:
+  - Enabled `Ctrl/Cmd+Enter` to queue the current draft as a pending card and immediately steer ongoing turns without reaching for the mouse.
+  - Transformed pending card footers into roving-focus toolbars (`Left/Right` navigation between Steer, Send now, and Cancel; `Enter` execution; `Esc` queue cancellation; smart typing return).
+  - Implemented replay history folding for long conversations above the 48-message cutoff, buffering out-of-view replay frames to prevent duplicate history inverted under new answers on page reload.
+  - Maintained active red square button state during programmatic stop handoffs, eliminating spurious yellow interrupted alerts.
+- **[Authoritative TodoBoard & Session Lifecycle] Deep cleanup, fork continuity, and weak owner live-binding guards**:
+  - Unified all task checklists strictly around the reactive session `TodoBoard` singleton, completely discarding brittle transcript-folded history derivations.
+  - Ensured complete disk and memory purge on session deletion (`.todo`, `pending_permission.json`, and `ActiveChatRegistry` session states).
+  - Implemented full checklist continuity across conversation forks via disk file replication and in-memory board restoration.
+  - Pinned live bindings with weak owners and auto-cleanup drop guards to prevent stale pointer address collision across rapid executions.
+  - Enforced pure-English silent completion nudging and smart text anchoring in non-streaming handlers and canvas copy actions to prevent short pleasantries from shadowing complete proposal text.
+- **[Terminal Shell & Inspector Tabs] Right-panel tab cursor protection, badge counters, and platform normalization**:
+  - Preserved active right-panel tab cursors (terminal, preview, git, questions) when sending chat messages, preventing disruptive auto-switching.
+  - Added live badge counters to panel tabs and floating rails for Git changes, open terminals, and preview tabs.
+  - Resolved terminal container closure staleness in `TerminalPanel.tsx` and re-bound `ResizeObserver` upon DOM re-attachment, ensuring dynamic grid reflow and preventing frozen 55-column box scaling.
+  - Prevented terminal panel layers from bleeding through other active inspector tabs.
+  - Redesigned the MCP server popover layout in `Sidebar.tsx` into a structured 3-tier vertical card flow (action header, status bar, and independent error diagnostic card).
+- **[Preview Panel & Code Editor UX] Editor mode loop resolution, autofocus injection, and one-click saving**:
+  - Fixed an event listener dependency loop in `CodeEditorTab.tsx` where parent re-renders triggered `useEffect` to forcibly reset `viewMode` back to readonly `preview`.
+  - Injected automatic textarea focus on mode toggle so remote browser users can immediately start typing with active cursor visibility.
+  - Added a dedicated quick save button (💾) to the Preview panel header bar during edit mode, enabling seamless mouse-driven saves alongside `Ctrl+S`.
+- **[Git Platform Adapters & Mobile UX] Native multi-platform adapters, mobile bottom sheet, and delimiter parsing**:
+  - Built native git adapters for GitHub, GitLab, and Gitee paired with a background PR/MR polling engine.
+  - Refactored the Git robot configuration modal into a responsive bottom sheet on viewports <= 768px (`max-height: 90dvh`, rounded top corners, touch scrolling).
+  - Supported multi-delimiter wake word keywords (commas and pipes, half-width and full-width) with inline hints and comprehensive i18n catalogs.
+- **[Security & Ecosystem Packaging] Vite 8.3.5 security upgrade, AppImage metadata, and list formatting**:
+  - Upgraded Vite to `8.3.5` to eliminate the high-severity advisory in `launch-editor`, ensuring a clean pass for `npm audit --audit-level=high`.
+  - Embedded AppImage update metadata (`embed-appimage-update-info.sh`) for seamless Linux binary self-updating.
+  - Resolved CommonMark Section 5.2 limitation where ordered list items starting with non-1 digits following code blocks were merged into a single paragraph.
+
+---
+
+- **[MCP 生产级自愈与生命周期治理] 全面自愈机制、物理单例池与智能参数矫正**:
+  - 引入写前探活（Pre-Flight Check）与断管安全恢复机制，子进程闲置超时、休眠或被系统回收后，再次调用时无论读写操作均静默透明冷启动；
+  - 彻底移除 `SessionMcpLease::drop` 中越权调用全局清理的逻辑，严格限制会话租约释放仅回收自身所属子进程；
+  - 新增 `GlobalMcpPool` 物理单例池，真正实现 `scope=global` 服务（如 `ddg-search`）跨所有工程复用单一物理子进程，彻底根治重复拉起与端口冲突；
+  - 增加 Stderr 双重容量截断环形缓冲区（30 行 / 8KB 上限），消除启动崩溃黑盒，避免管道死锁与内存溢出；
+  - 接入 `notifications/cancelled` 协议级取消通知，超时与取消时主动通知服务端释放计算资源；
+  - 引入 Active Ping 探活与超时假死熔断机制，杜绝僵尸进程连环卡死后续请求；
+  - 在 HTTP/SSE 传输层引入指数退避惩罚机制（200ms * 2^n，封顶 3s），并为 `readOnlyHint` 只读工具开启幂等安全重试；
+  - 在 `McpToolAdapter` 中实现参数智能类型矫正（`coerce_mcp_arguments`），自动修复模型针对 JSON Schema 的常见类型漂移（整数、布尔、字符串化数组/对象）；
+  - 将 MCP 工具接入系统原生 `ArtifactMiddleware`（32KB 专属阈值），超限自动落盘并生成标准 `artifact_id` 供 `fetch_output` 分页调阅；
+  - 捕获 `notifications/tools/list_changed` 动态工具变更通知并使工具缓存即时失效；
+  - 更新默认下发的 `mcp.json` 模板，仅保留免 Key 的全局 `ddg-search`，并同步更新中英文双语配置指南。
+- **[多仓库聚合架构与常驻切换栏] 子仓库智能首选激活、顶层常驻切换与会话级记忆**:
+  - 在非 Git 根目录的多仓库聚合工作区下，新建会话自动优先激活核心主力子仓（如 `JeikCode`），历史老会话通过“路径/名称优先匹配 + 索引平滑兜底”精准还原上次选中的子仓；
+  - 将多仓库下拉切换栏提升并常驻置顶于 Git 面板最顶层，彻底解决因根目录非 Git 仓库导致提前退出渲染的空状态死锁问题；
+  - 修复 `gitStore.ts` 中状态合并并发覆写缺陷，彻底杜绝已探测的子仓库列表被旧快照冲成空数组的隐患。
+- **[渐进式异步拉取与双游标缓存] 解耦渐进刷新、单飞共享池与双游标指纹重落缓存**:
+  - 引入渐进式异步分阶段更新架构：本地工作区改动与分支状态毫秒级（<15ms）先到先更，后台定向拉取远程代码完全非阻塞，用户操作零冻结；
+  - 将原有粗暴的布尔拉取锁重构为真正的 Single-Flight `Promise<boolean>` 共享池，用户连击按钮或切屏聚焦时自动复用同一个在飞请求，彻底告别连弹 3 个红标报错的误报尴尬；
+  - 升级后端 Git 图谱缓存为 `HEAD + FETCH_HEAD` 双游标指纹校验（耗时仅 6ms）：远端无新提交时 0ms 瞬间直出缓存（完全零延迟突增）；远端拉到新提交后仅重绘 1 次图谱并重新写入全局缓存 `GRAPH_CACHE`；
+  - 优化 `git_fetch` 默认优先拉取当前分支绑定的 `origin/upstream` 远程主机，避免其他损坏或失效的 Remote 导致拉取全盘报错；
+  - 为暂存、撤销暂存、放弃修改、提交及推送操作接入 0ms 瞬间乐观更新。
+- **[输入台纯键盘流与回放防颠倒] 纯键盘快捷转向、待发卡片漫游焦点与长历史回放折叠**:
+  - 支持 `Ctrl/Cmd+Enter` 在回合运行中直接将输入框草稿转化为待发卡片并立即发送转向（Steer），全程无需动用鼠标；
+  - 待发卡片底部升级为漫游焦点工具栏（`←/→` 在转向、立即发送、取消之间切换，`Enter` 执行，`Esc` 快速撤回队尾卡片，打字无缝切回输入框）；
+  - 实现长对话刷新回放折叠保护：超过 48 条消息分页限制的历史回放帧自动暂存按住，直到遇到当前页第一条消息时丢弃，彻底消除刷新时旧提问和工具行被错误追加到新回答下方的排版颠倒 Bug；
+  - 排队卡片「立即发送」程序化停止期间保持红色停止按钮，消除误报的黄色中断提示框。
+- **[权威任务看板与会话深度回收] 唯一权威 TodoBoard、分叉继承与弱所有者隔离**:
+  - 会话清单全面以单例响应式 `TodoBoard` 为唯一权威源头，彻底剔除已退役的转录折叠推算；
+  - 会话销毁时深度清理磁盘上的 `.todo` 与 `pending_permission.json`，并注销内存中的活跃会话映射；
+  - 对话分叉派生（Fork）时完整继承源会话的任务看板状态，确保内存与磁盘 100% 同步；
+  - 引入弱所有者（Weak Owner）与自动清理 Drop 守卫钉住活跃绑定，杜绝内存地址复用造成的幽灵会话绑定污染；
+  - 执行纯英文静默任务补勾强指令，并在非流式处理器与前端画布复制操作中引入文本智能回锚机制，杜绝简短客套话冲刷掉完整业务提案。
+- **[终端系统与右侧栏多标签] 标签游标智能保护、数字角标徽章联动与终端重排自愈**:
+  - 主面板发送聊天消息时严格保持用户当前选中的标签页游标（终端、预览、Git、提问历史）不变，杜绝未经允许的擅自切页；
+  - 为右侧面板顶栏与悬浮导轨的 Git、终端及预览图标增加实时数字角标，精准联动未提交改动数、终端打开数与预览标签数；
+  - 修复 `TerminalPanel.tsx` 动态缩放重排失效问题，重新挂载自动重绑 `ResizeObserver`，杜绝终端列数锁死在 55 列等比缩放的现象；
+  - 修复终端面板样式层叠穿透至其他活动标签的问题；
+  - 重构侧边栏 MCP 浮层为三层卡片流结构，彻底解决长错误文本导致的重叠错位。
+- **[预览面板与代码编辑体验] 预览区编辑模式死循环阻断、光标自动聚焦与一键保存**:
+  - 彻底斩断 `CodeEditorTab.tsx` 中因父组件函数引用变化导致 `useEffect` 反复把编辑态重置为只读预览态的死锁 Bug；
+  - 切换到编辑模式时自动注入光标聚焦（`textarea.focus()`），解决异地远程浏览器访问时光标无法就位、无法输入的缺陷；
+  - 右侧预览面板顶栏在编辑模式下动态展现保存按钮（💾），支持一键快速落盘，无需受限于异地网络快捷键差异。
+- **[Git 平台生态与移动端适配] 原生多平台适配器、移动端自适应抽屉与多分隔符唤醒词**:
+  - 原生支持 GitHub、GitLab 与 Gitee 平台适配器，内置后台 PR/MR 轮询引擎；
+  - Git 机器人配置弹窗在移动端（<= 768px）全面自适应重构为标准 Native 底部抽屉规范（`max-height: 90dvh`、触控滚动），彻底消除窄屏文字挤压溢出；
+  - 评论区支持逗号、竖线等多分隔符唤醒词解析，并提供轻量提示与完整多语言包覆盖。
+- **[安全审计与生态构建] Vite 8.3.5 安全依赖升级、AppImage 元数据与有序列表排版**:
+  - 升级 Vite 至官方最新修复版本 `8.3.5`，消除 `launch-editor` 高危安全警报，确保 CI 依赖审计（`npm audit`）全绿通过；
+  - 新增 `embed-appimage-update-info.sh` 脚本，为 Linux AppImage 内嵌更新签名信息，打通无缝自升级链路；
+  - 解决 CommonMark 规范中非 1 编号有序列表紧贴代码块时被合并为单一段落的缺陷，自动对齐空行段落。
+
 ## v7.2.8-beta.3 (2026-10-22)
 
 - **[Terminal Resiliency & Layout Reflow] Terminal dynamic container reflow and MCP popover redesign**:
