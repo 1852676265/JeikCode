@@ -35,7 +35,7 @@
   --app-json-key:#60a5fa; --app-json-string:#34d399; --app-json-number:#f59e0b; --app-json-boolean:#a78bfa; --app-json-null:#9ca3af; --app-json-punct:#6b7280;
   --app-spacing-small:4px; --app-spacing-medium:8px; --app-spacing-large:12px; --app-spacing-xlarge:16px;
   --corner-radius-small:6px; --corner-radius-medium:10px; --corner-radius-large:14px;
-  --app-sans-font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+  --app-sans-font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Yu Gothic UI','Meiryo','Malgun Gothic',sans-serif;
   --app-serif-font-family:'Tiempos Text','Source Serif 4','Songti SC',ui-serif,Georgia,Cambria,'Times New Roman',serif;
   --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
   --app-monospace-font-size:13px; --app-monospace-font-size-small:12px;

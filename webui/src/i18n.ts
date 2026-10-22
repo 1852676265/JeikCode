@@ -51,7 +51,7 @@ const zh = {
   'sidebar.dragToResize': '拖拽调整侧栏宽度',
   'sidebar.newChat': '新建对话',
   'sidebar.running': '正在执行',
-  'sidebar.skills': '技能',
+  'sidebar.skills': 'Skills',
   'sidebar.skillsEmpty': '暂无可用技能',
   'sidebar.skillsLoading': '加载中…',
   'sidebar.mcp': 'MCP',

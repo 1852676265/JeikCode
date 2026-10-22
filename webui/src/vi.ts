@@ -18,7 +18,7 @@ export const vi: Record<keyof typeof en, string> = {
   'sidebar.dragToResize': 'Kéo để đổi độ rộng thanh bên',
   'sidebar.newChat': 'Cuộc trò chuyện mới',
   'sidebar.running': 'Đang chạy',
-  'sidebar.skills': 'Kỹ năng',
+  'sidebar.skills': 'Skills',
   'sidebar.skillsEmpty': 'Chưa có kỹ năng nào',
   'sidebar.skillsLoading': 'Đang tải…',
   'sidebar.mcp': 'MCP',

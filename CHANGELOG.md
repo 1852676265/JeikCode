@@ -21,6 +21,30 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.4 (2026-10-22)
+
+- **[Full 955-Key Locale Catalogs Across All Supported Languages] Zero-missing translation across the entire WebUI**:
+  - Populated all 955 i18n keys across all 8 language modules (`zh-TW.ts`, `ja.ts`, `ko.ts`, `ru.ts`, `fr.ts`, `es.ts`, `de.ts`, `ar.ts`), eliminating any partial or missing language fallback.
+  - Fully translated left sidebar tabs: Chats (`チャット`, `대화`, `對話`, `Чаты`, `Discussions`, `Chats`, `المحادثات`) and Explorer (`ファイル`, `탐색기`, `檔案總管`, `Файлы`, `Explorateur`, `Explorador`, `Dateien`, `الملفات`), as well as New Chat (`新しいチャット`, `새 대화`, `新增對話`, etc.).
+  - Strictly preserved native English for `Skills` and `MCP` without localization pollution, while keeping external service and skill descriptions verbatim.
+  - Fully localized GitPanel views (Graph, Branches, Changes, Commits, Sync, Clean, All Branches) and Git Webhook configuration dialog sections, switches, and buttons across all languages.
+  - Fully localized model settings modal actions including Include / Exclude history modes (`settings.historyInclude`, `settings.historyExclude`) and Edit (`settings.edit`).
+- **[Font Rendering & CJK Unified Glyph Stabilization] Eliminating skewed CJK serif brushstrokes**:
+  - Re-ordered sans-serif font stack to prioritize modern CJK Sans-Serif typefaces (`Microsoft YaHei`, `PingFang SC`, `Yu Gothic UI`, `Meiryo`, `Malgun Gothic`), preventing Windows Chromium from defaulting to Japanese Mincho/Serif fonts for Chinese conversation text.
+  - Confined document direction (`dir="rtl"`) to Arabic while preventing destructive `document.documentElement.lang` overrides that triggered foreign CJK glyph substitution.
+
+---
+
+- **[全量 955 词条全语种完整覆盖] 彻底清除 WebUI 所有未翻译与缺失词条**:
+  - 为全部 8 个语言包（`zh-TW.ts`, `ja.ts`, `ko.ts`, `ru.ts`, `fr.ts`, `es.ts`, `de.ts`, `ar.ts`）补齐全部 955 项键值，杜绝任何页面残留英文回退。
+  - 全量多语言化左侧边栏双子胶囊切页：对话（Chats / チャット / 대화 / 對話 等）与资源管理（Explorer / ファイル / 탐색기 / 檔案總管 等），以及新建对话（New chat / 新しいチャット / 새 대话 / 新增對話 等）。
+  - 严格保持 `Skills` 与 `MCP` 的原生英文纯正性，绝不生硬翻译，同时对外部技能与服务的说明描述保持原文输出。
+  - 全面多语言化 GitPanel 侧栏（图形、分支、代码更改、提交历史、同步更改、工作区干净、所有分支）以及 Git Webhook 自动化审查配置弹窗的所有标题、开关、参数与按钮。
+  - 完整多语言化模型配置弹窗中的包含思考/排除思考历史（Include / Exclude）及编辑（Edit）等操作。
+- **[字体渲染与中日韩字形防畸变加固] 彻底解决切语言后正文字体变斜变怪问题**:
+  - 优化全局 Sans-Serif 字体栈，优先加载 `Microsoft YaHei`、`PingFang SC`、`Yu Gothic UI`、`Meiryo` 等平滑无衬线字体，杜绝 Windows Chromium 遇到中文回退到日本明朝体（MS Mincho）带斜笔锋衬线字体的问题。
+  - 仅在阿拉伯语时设置 `dir="rtl"`，移除网页根节点直接覆写 `lang` 属性导致的全局跨语言字形强制替换。
+
 ## v7.2.9-beta.3 (2026-10-22)
 
 - **[WebUI Global Language Switchers & Dialogs Overhaul] Complete coverage across top-nav dropdown, settings modal, and onboarding wizard**:

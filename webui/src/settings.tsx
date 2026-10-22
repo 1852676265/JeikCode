@@ -102,11 +102,13 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
   const [lang, setLangState] = useState<Lang>(readLang);
   const [githubLogo, setGithubLogo] = useState<boolean>(true);
 
-  // Apply document language and direction (RTL for Arabic, LTR for others)
+  // Apply document direction (RTL for Arabic, LTR for others).
+  // Notice: Do NOT force-override document.documentElement.lang with foreign locales (e.g. 'ja'),
+  // because conversation text often contains CJK characters, and forcing 'ja' causes Windows/Chromium
+  // to render Hanzi with Japanese Mincho/Serif fallback fonts with skewed brush-strokes!
   useEffect(() => {
     if (typeof document !== 'undefined') {
       document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
-      document.documentElement.lang = lang;
     }
   }, [lang]);
 
