@@ -6,7 +6,7 @@
     <em>专为大型复杂工程打造的新一代自主编程智能体，告别可配置性差、上下文臃肿、工具报错与缓存雪崩。</em>
   </p>
   <p>
-    <a href="./README.md"><strong>English (Default)</strong></a> · <strong>简体中文</strong>
+    <a href="./README.md"><strong>English (Default)</strong></a> · <strong>简体中文</strong> · <a href="./README.zh-TW.md"><strong>繁體中文</strong></a> · <a href="./README.ja.md"><strong>日本語</strong></a> · <a href="./README.ko.md"><strong>한국어</strong></a> · <a href="./README.ru.md"><strong>Русский</strong></a> · <a href="./README.fr.md"><strong>Français</strong></a> · <a href="./README.es.md"><strong>Español</strong></a> · <a href="./README.de.md"><strong>Deutsch</strong></a> · <a href="./README.ar.md"><strong>العربية</strong></a> · <a href="./README.vi.md"><strong>Tiếng Việt</strong></a>
   </p>
   <p>
     <a href="https://github.com/jeikl/JeikCode/releases" target="_blank">

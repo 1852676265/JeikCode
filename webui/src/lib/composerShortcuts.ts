@@ -134,22 +134,23 @@ export function isComposerTypedKey(event: {
   return event.key !== ' ';
 }
 
-export type ComposerEscapeAction = 'cancel-card' | 'none';
+export type ComposerEscapeAction = 'cancel-card' | 'stop-and-restore' | 'none';
 
 /**
- * Esc inside the composer: cancel the tail pending card.
- *
- * The card's own Esc (while a card button holds the focus) is handled by the
- * card itself; this covers the composer. A popup that already consumed the key
- * (`defaultPrevented`) is never overridden.
+ * Esc inside the composer:
+ * 1. If there is a pending card in the queue, cancel the tail card.
+ * 2. If no card is in the queue and the session is running (playing), stop and restore the last message.
+ * 3. Otherwise, do nothing.
  */
 export function resolveComposerEscapeAction(input: {
   defaultPrevented?: boolean;
   pendingCardCount: number;
+  busy?: boolean;
 }): ComposerEscapeAction {
   if (input.defaultPrevented) return 'none';
-  if (input.pendingCardCount <= 0) return 'none';
-  return 'cancel-card';
+  if (input.pendingCardCount > 0) return 'cancel-card';
+  if (input.busy) return 'stop-and-restore';
+  return 'none';
 }
 
 /**

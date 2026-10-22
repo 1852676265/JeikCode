@@ -21,6 +21,34 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.1 (2026-10-22)
+
+- **[Global Modular i18n Architecture] "One module per language" independent catalog refactor & global mainstream language matrix**:
+  - Refactored backend and TUI translation architecture (`crates/jeikcode-config/src/i18n/`) into modular single-language packages (`en.rs`, `zh_cn.rs`, `zh_tw.rs`, `ja.rs`, `ko.rs`, `ru.rs`, `fr.rs`, `es.rs`, `de.rs`, `ar.rs`, `vi.rs`) with type-safe fallback to English baseline.
+  - Preserved strict Agent Core Purity: kept system prompts, built-in tool definitions and schemas, CodeExplore protocols, and execution traces strictly in native English without translation pollution.
+  - Upgraded TUI `OnboardingWizard` and `LanguagePicker` (`/language`) to dynamically support all 11 mainstream languages with boundary protection.
+  - Refactored WebUI frontend localization architecture (`webui/src/locales/`), implementing independent modules (`zh-TW.ts`, `ja.ts`, `ko.ts`, `ru.ts`, `fr.ts`, `es.ts`, `de.ts`, `ar.ts`), automatic browser preferred language detection (`navigator.languages`), English baseline fallback, and international RTL layout support for Arabic (`dir="rtl"`).
+- **[Keyboard-Driven Esc Dismissal & Lossless Message Recovery] Seamless card cancellation and mid-turn stop recovery**:
+  - Implemented lossless message restore on Escape in the WebUI composer: pressing Esc with a pending/steer card cancels the card and restores its text and image attachments back to the composer textarea.
+  - Implemented stop-and-restore on Escape during active turn generation: halts assistant stream, safely truncates session, and restores user prompt text and images to the composer with auto-focus.
+- **[Comprehensive Multi-Language README Matrix] Global multilingual documentation ecosystem**:
+  - Created complete localized README documents across all 11 mainstream languages (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.ru.md`, `README.fr.md`, `README.es.md`, `README.de.md`, `README.ar.md`, `README.vi.md`).
+  - Standardized header navigation bar: English default, Simplified Chinese second, followed by all remaining languages with bidirectional hyperlinks.
+
+---
+
+- **[全栈模块化多语言架构] “一个模块一种语言”独立语言包重构与全球主流语言全面支持**:
+  - 将后端与 TUI 国际化架构（`crates/jeikcode-config/src/i18n/`）重构为独立语言包设计（`en.rs`, `zh_cn.rs`, `zh_tw.rs`, `ja.rs`, `ko.rs`, `ru.rs`, `fr.rs`, `es.rs`, `de.rs`, `ar.rs`, `vi.rs`），提供类型安全与优雅回退机制。
+  - 严格保持智能体核心纯正（Agent Core Purity）：系统提示词、内置工具定义/参数 Schema、CodeExplore 协议与执行轨迹严格保留原生英文，杜绝翻译污染。
+  - 升级 TUI 初始化向导（`OnboardingWizard`）与语言切换器（`LanguagePicker`），全面动态支持 11 种主流语言自称与快捷键越界保护。
+  - 重构 WebUI 前端多语言架构（`webui/src/locales/`），新增繁体中文、日、韩、俄、法、西、德、阿独立模块，支持浏览器首选语言自动探测、英语基准兜底与阿拉伯语 RTL（从右至左）国际标准排版。
+- **[键盘 Esc 撤销与无损回退工作流] 待发卡片撤回与运行中断消息回落**:
+  - WebUI 输入框全面支持 Esc 键盘撤回：有待发/转向卡片时，按 Esc 取消内核排队并将文本与图片附件完整回填输入框。
+  - 支持纯生成状态下按 Esc 停止并无损回退：中断模型流式生成、安全截断本轮次并将用户上一轮提问内容与附件回退至输入框自动聚焦。
+- **[全语言 README 文档生态] 全球化多语言文档矩阵建设**:
+  - 新增并覆盖全球 11 大主流语言完整说明文档（`README.md`, `README.zh-CN.md`, `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.ru.md`, `README.fr.md`, `README.es.md`, `README.de.md`, `README.ar.md`, `README.vi.md`）。
+  - 统一顶部导航栏标准：默认英文、简体中文第二、其余主流语言依次跟进且支持互通跳转。
+
 ## v7.2.8 (2026-10-22)
 
 - **[MCP Enterprise Resilience & Lifecycle Overhaul] Comprehensive MCP self-healing, physical singleton pool, and argument coercion**:

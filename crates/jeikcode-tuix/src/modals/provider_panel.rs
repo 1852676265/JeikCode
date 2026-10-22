@@ -1778,7 +1778,8 @@ impl Modal for ProviderPanel {
                         };
                         // Leading "+ 添加自定义 provider" affordance placed at TOP (also Ctrl+A).
                         items.push((
-                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAddProviderRow).into_owned(),
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAddProviderRow)
+                                .into_owned(),
                             empty_description,
                         ));
                         for id in &ids {
@@ -1935,7 +1936,10 @@ impl Modal for ProviderPanel {
                     // preset rows lock only the protocol.
                     let locked_label = crate::i18n::t(crate::i18n::Msg::ProviderPanelLocked);
                     items.push((
-                        format!("  {protocol_label}: {} {locked_label}", form.protocol_label()),
+                        format!(
+                            "  {protocol_label}: {} {locked_label}",
+                            form.protocol_label()
+                        ),
                         String::new(),
                     ));
                 } else {
@@ -1966,7 +1970,8 @@ impl Modal for ProviderPanel {
                     ));
                 }
                 hint = if form.protocol_locked {
-                    crate::i18n::t(crate::i18n::Msg::ProviderPanelEditAccountLockedHint).into_owned()
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelEditAccountLockedHint)
+                        .into_owned()
                 } else {
                     crate::i18n::t(crate::i18n::Msg::ProviderPanelEditAccountHint).into_owned()
                 };

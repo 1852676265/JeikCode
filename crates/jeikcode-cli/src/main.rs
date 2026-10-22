@@ -2369,8 +2369,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     // Locale was already pre-resolved above (before clap parse) so --help
     // could be localised. Re-resolve with the full config (which may specify
     // a language key) to honour config-over-env priority.
-    let locale =
-        jeikcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+    let locale = jeikcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
     jeikcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──

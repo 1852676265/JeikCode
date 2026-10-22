@@ -133,7 +133,7 @@ export function QueuedCardActions({
     title: labels.cancelTitle,
     className: 'queued-btn-cancel',
     icon: <CancelIcon />,
-    disabled: kind === 'steering',
+    disabled: false,
     onClick: onCancel,
   });
 

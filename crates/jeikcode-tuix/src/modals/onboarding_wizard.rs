@@ -318,6 +318,20 @@ pub struct OnboardingWizard {
     pub(super) needs_confirm: bool,
 }
 
+pub const ONBOARDING_LANGUAGES: &[jeikcode_config::locale::Locale] = &[
+    jeikcode_config::locale::Locale::En,
+    jeikcode_config::locale::Locale::Vi,
+    jeikcode_config::locale::Locale::ZhCn,
+    jeikcode_config::locale::Locale::ZhTw,
+    jeikcode_config::locale::Locale::Ja,
+    jeikcode_config::locale::Locale::Ko,
+    jeikcode_config::locale::Locale::Ru,
+    jeikcode_config::locale::Locale::Fr,
+    jeikcode_config::locale::Locale::Es,
+    jeikcode_config::locale::Locale::De,
+    jeikcode_config::locale::Locale::Ar,
+];
+
 impl OnboardingWizard {
     /// Standard constructor — `/welcome` with empty body. The 3-step
     /// (Intro → Language → Setup) flow is shared with first-launch.
@@ -359,12 +373,9 @@ impl OnboardingWizard {
         mut self,
         config_lang: Option<jeikcode_config::locale::Locale>,
     ) -> Self {
-        self.language_idx = match config_lang {
-            None => 0,
-            Some(jeikcode_config::locale::Locale::En) => 0,
-            Some(jeikcode_config::locale::Locale::Vi) => 1,
-            Some(jeikcode_config::locale::Locale::ZhCn) => 2,
-        };
+        self.language_idx = config_lang
+            .and_then(|lang| ONBOARDING_LANGUAGES.iter().position(|&l| l == lang))
+            .unwrap_or(0);
         self
     }
 
@@ -407,26 +418,21 @@ impl OnboardingWizard {
                 PureOutcome::Redraw
             }
             (Language, KeyCode::Down) => {
-                if self.language_idx < 2 {
+                let max_idx = ONBOARDING_LANGUAGES.len().saturating_sub(1);
+                if self.language_idx < max_idx {
                     self.language_idx += 1;
                 }
                 PureOutcome::Redraw
             }
-            // Number keys are shortcuts: pick AND commit in one
-            // keystroke. The arrow-key path still requires Enter,
-            // but typing a digit is unambiguous — the user already
-            // expressed intent, no second confirmation needed.
-            (Language, KeyCode::Char('1')) => {
-                self.language_idx = 0;
-                PureOutcome::ApplyLanguageThenAdvance
-            }
-            (Language, KeyCode::Char('2')) => {
-                self.language_idx = 1;
-                PureOutcome::ApplyLanguageThenAdvance
-            }
-            (Language, KeyCode::Char('3')) => {
-                self.language_idx = 2;
-                PureOutcome::ApplyLanguageThenAdvance
+            // Number keys are shortcuts: pick AND commit in one keystroke.
+            (Language, KeyCode::Char(c @ '1'..='9')) => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < ONBOARDING_LANGUAGES.len() {
+                    self.language_idx = idx;
+                    PureOutcome::ApplyLanguageThenAdvance
+                } else {
+                    PureOutcome::Noop
+                }
             }
             (Language, KeyCode::Enter) => PureOutcome::ApplyLanguageThenAdvance,
             (Language, KeyCode::Left) => {
@@ -565,17 +571,15 @@ impl OnboardingWizard {
         out.push(String::new());
 
         // Native labels let users pick their preferred language before the UI is translated.
-        let options = ["English", "Tiếng Việt", "简体中文"];
-
         let mut content: Vec<String> = Vec::new();
         content.push(String::new());
         content.push(t(Msg::OnboardingLanguageTitleBilingual).into_owned());
         content.push(String::new());
         content.push(t(Msg::OnboardingLanguagePrompt).into_owned());
         content.push(String::new());
-        for (i, label) in options.iter().enumerate() {
+        for (i, loc) in ONBOARDING_LANGUAGES.iter().enumerate() {
             let bullet = if i == self.language_idx { '●' } else { '○' };
-            content.push(format!("{bullet}  [{}] {}", i + 1, label));
+            content.push(format!("{bullet}  [{}] {}", i + 1, loc.native_name()));
         }
         content.push(String::new());
         content.push(t(Msg::OnboardingNavHint).into_owned());
@@ -602,12 +606,10 @@ impl OnboardingWizard {
         store: &jeikcode_config::ConfigStore,
     ) -> anyhow::Result<jeikcode_config::locale::Locale> {
         use jeikcode_config::locale::Locale;
-        let new_locale = match self.language_idx {
-            0 => Locale::En,
-            1 => Locale::Vi,
-            2 => Locale::ZhCn,
-            _ => unreachable!("language_idx is bounded 0..=2"),
-        };
+        let new_locale = ONBOARDING_LANGUAGES
+            .get(self.language_idx)
+            .copied()
+            .unwrap_or(Locale::En);
         // Only update active running state after config persistence succeeds.
         store.update(|latest| {
             latest.language = Some(new_locale);
@@ -1006,14 +1008,17 @@ mod tests {
     fn language_up_down_moves_idx() {
         let mut w = make_wizard();
         w.step = Step::Language;
-        w.language_idx = 1;
+        let last_idx = ONBOARDING_LANGUAGES.len() - 1;
+        w.language_idx = last_idx - 1;
         w.handle_key_for_test(KeyCode::Down);
-        assert_eq!(w.language_idx, 2);
+        assert_eq!(w.language_idx, last_idx);
         w.handle_key_for_test(KeyCode::Down);
-        assert_eq!(w.language_idx, 2, "should not exceed last index");
+        assert_eq!(w.language_idx, last_idx, "should not exceed last index");
         w.handle_key_for_test(KeyCode::Up);
-        assert_eq!(w.language_idx, 1);
-        w.handle_key_for_test(KeyCode::Up);
+        assert_eq!(w.language_idx, last_idx - 1);
+        while w.language_idx > 0 {
+            w.handle_key_for_test(KeyCode::Up);
+        }
         w.handle_key_for_test(KeyCode::Up);
         assert_eq!(w.language_idx, 0, "saturating_sub keeps idx at 0");
     }
@@ -1226,10 +1231,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = jeikcode_config::ConfigStore::new(tmp.path().join("config.toml"));
         let mut cfg = blank_config_for_test();
-        for (idx, locale) in [Locale::En, Locale::Vi, Locale::ZhCn]
-            .into_iter()
-            .enumerate()
-        {
+        for (idx, &locale) in ONBOARDING_LANGUAGES.iter().enumerate() {
             let mut w = OnboardingWizard::new();
             w.language_idx = idx;
             assert_eq!(w.apply_language(&mut cfg, &store).unwrap(), locale);

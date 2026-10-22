@@ -13894,11 +13894,7 @@ pub(crate) fn save_language_and_reload(
             }
         };
         ctx.observed_config_revision = Some(commit.snapshot.revision);
-        let label = match locale {
-            jeikcode_config::locale::Locale::En => "English",
-            jeikcode_config::locale::Locale::Vi => "Tiếng Việt",
-            jeikcode_config::locale::Locale::ZhCn => "简体中文",
-        };
+        let label = locale.native_name();
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
                 label,
@@ -18389,9 +18385,11 @@ fn install_pending_rewind_modal(app: &mut App, ctx: &mut LoopCtx, renderer: &mut
         Ok(catalog) if catalog.points.is_empty() => {
             renderer.render(UiLine::CommandOutput(
                 match crate::i18n::current_locale() {
-                    crate::i18n::Locale::ZhCn => "当前会话还没有可回退的回合。",
-                    crate::i18n::Locale::En => "This session has no Rewind points yet.",
+                    crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw => {
+                        "当前会话还没有可回退的回合。"
+                    }
                     crate::i18n::Locale::Vi => "Phiên này chưa có điểm quay lại.",
+                    _ => "This session has no Rewind points yet.",
                 }
                 .to_string(),
             ));
@@ -18407,9 +18405,9 @@ fn install_pending_rewind_modal(app: &mut App, ctx: &mut LoopCtx, renderer: &mut
             renderer.render(UiLine::Error(format!(
                 "{}: {error}",
                 match crate::i18n::current_locale() {
-                    crate::i18n::Locale::ZhCn => "加载回退点失败",
-                    crate::i18n::Locale::En => "Failed to load Rewind points",
+                    crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw => "加载回退点失败",
                     crate::i18n::Locale::Vi => "Không tải được điểm quay lại",
+                    _ => "Failed to load Rewind points",
                 }
             )));
             renderer.flush();
@@ -18980,9 +18978,10 @@ fn handle_runtime_event(
                             renderer.render(UiLine::Error(format!(
                                 "{}: {error}",
                                 match crate::i18n::current_locale() {
-                                    crate::i18n::Locale::ZhCn => "回退失败",
-                                    crate::i18n::Locale::En => "Rewind failed",
+                                    crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw =>
+                                        "回退失败",
                                     crate::i18n::Locale::Vi => "Quay lại thất bại",
+                                    _ => "Rewind failed",
                                 }
                             )));
                             renderer.flush();
@@ -19251,11 +19250,7 @@ fn handle_runtime_event(
                     } else {
                         if language_change_notice.should_render(language_changed) {
                             let locale = crate::i18n::current_locale();
-                            let label = match locale {
-                                jeikcode_config::locale::Locale::En => "English",
-                                jeikcode_config::locale::Locale::Vi => "Tiếng Việt",
-                                jeikcode_config::locale::Locale::ZhCn => "简体中文",
-                            };
+                            let label = locale.native_name();
                             renderer.render(UiLine::CommandOutput(
                                 crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
                                     label,
@@ -19995,16 +19990,21 @@ fn handle_rewind_success(
         (crate::i18n::Locale::Vi, jeikcode_coding::RewindScope::ConversationAndCode) => {
             "hội thoại và mã"
         }
-        (crate::i18n::Locale::ZhCn, jeikcode_coding::RewindScope::Conversation) => "对话",
-        (crate::i18n::Locale::ZhCn, jeikcode_coding::RewindScope::Code) => "代码",
-        (crate::i18n::Locale::ZhCn, jeikcode_coding::RewindScope::ConversationAndCode) => {
-            "对话和代码"
-        }
-        (crate::i18n::Locale::En, jeikcode_coding::RewindScope::Conversation) => "conversation",
-        (crate::i18n::Locale::En, jeikcode_coding::RewindScope::Code) => "code",
-        (crate::i18n::Locale::En, jeikcode_coding::RewindScope::ConversationAndCode) => {
-            "conversation and code"
-        }
+        (
+            crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw,
+            jeikcode_coding::RewindScope::Conversation,
+        ) => "对话",
+        (
+            crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw,
+            jeikcode_coding::RewindScope::Code,
+        ) => "代码",
+        (
+            crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw,
+            jeikcode_coding::RewindScope::ConversationAndCode,
+        ) => "对话和代码",
+        (_, jeikcode_coding::RewindScope::Conversation) => "conversation",
+        (_, jeikcode_coding::RewindScope::Code) => "code",
+        (_, jeikcode_coding::RewindScope::ConversationAndCode) => "conversation and code",
     };
     let message = match crate::i18n::current_locale() {
         crate::i18n::Locale::Vi => format!(
@@ -20016,7 +20016,7 @@ fn handle_rewind_success(
                 format!(" (đã khôi phục {} tệp)", result.restored_files.len())
             }
         ),
-        crate::i18n::Locale::ZhCn => format!(
+        crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw => format!(
             "↩ 已将{scope}回退到“{}”之前{}。",
             result.point.prompt_preview,
             if result.restored_files.is_empty() {
@@ -20025,7 +20025,7 @@ fn handle_rewind_success(
                 format!("（恢复 {} 个文件）", result.restored_files.len())
             }
         ),
-        crate::i18n::Locale::En => format!(
+        _ => format!(
             "↩ Rewound {scope} to before “{}”{}.",
             result.point.prompt_preview,
             if result.restored_files.is_empty() {

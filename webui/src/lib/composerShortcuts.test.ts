@@ -90,6 +90,13 @@ test('Esc cancels the tail pending card', () => {
   assert.equal(resolveComposerEscapeAction({ pendingCardCount: 2, defaultPrevented: true }), 'none');
 });
 
+test('Esc in pure playing state stops and restores message', () => {
+  assert.equal(resolveComposerEscapeAction({ pendingCardCount: 0, busy: true }), 'stop-and-restore');
+  assert.equal(resolveComposerEscapeAction({ pendingCardCount: 1, busy: true }), 'cancel-card');
+  assert.equal(resolveComposerEscapeAction({ pendingCardCount: 0, busy: false }), 'none');
+  assert.equal(resolveComposerEscapeAction({ pendingCardCount: 0, busy: true, defaultPrevented: true }), 'none');
+});
+
 test('the tail card is the most recently queued one', () => {
   const cards = [{ id: 1 }, { id: 2 }, { id: 3 }];
   assert.deepEqual(tailQueuedCard(cards), { id: 3 });

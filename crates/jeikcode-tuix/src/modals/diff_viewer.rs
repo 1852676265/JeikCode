@@ -92,9 +92,11 @@ impl DiffViewer {
             DiffPanelRow::new(vec![
                 DiffPanelSpan::new(
                     match current_locale() {
-                        Locale::ZhCn => format!("{} 个文件有变更  ", snapshot.files_changed),
-                        Locale::En => format!("{} files changed  ", snapshot.files_changed),
+                        Locale::ZhCn | Locale::ZhTw => {
+                            format!("{} 个文件有变更  ", snapshot.files_changed)
+                        }
                         Locale::Vi => format!("{} tệp đã thay đổi  ", snapshot.files_changed),
+                        _ => format!("{} files changed  ", snapshot.files_changed),
                     },
                     DiffPanelTone::Muted,
                 ),
@@ -153,9 +155,9 @@ impl DiffViewer {
         if let Some(old_path) = &file.old_path {
             rows.push(DiffPanelRow::new(vec![DiffPanelSpan::new(
                 match current_locale() {
-                    Locale::ZhCn => format!("重命名前：{}", display_path(old_path)),
-                    Locale::En => format!("renamed from {}", display_path(old_path)),
+                    Locale::ZhCn | Locale::ZhTw => format!("重命名前：{}", display_path(old_path)),
                     Locale::Vi => format!("đổi tên từ {}", display_path(old_path)),
+                    _ => format!("renamed from {}", display_path(old_path)),
                 },
                 DiffPanelTone::Muted,
             )]));
@@ -563,8 +565,8 @@ fn status_label(status: DiffFileStatus) -> &'static str {
 
 fn l(en: &'static str, zh: &'static str, vi: &'static str) -> &'static str {
     match current_locale() {
-        Locale::En => en,
-        Locale::ZhCn => zh,
+        Locale::ZhCn | Locale::ZhTw => zh,
         Locale::Vi => vi,
+        _ => en,
     }
 }

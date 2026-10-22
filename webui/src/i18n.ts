@@ -7,12 +7,28 @@
 // 我们愿意根据再审意见继续优化。
 
 import { vi } from './vi';
+import { zhTw } from './locales/zh-TW';
+import { ja } from './locales/ja';
+import { ko } from './locales/ko';
+import { ru } from './locales/ru';
+import { fr } from './locales/fr';
+import { es } from './locales/es';
+import { de } from './locales/de';
+import { ar } from './locales/ar';
 
-export type Lang = 'zh' | 'en' | 'vi';
+export type Lang = 'zh' | 'en' | 'vi' | 'zh-TW' | 'ja' | 'ko' | 'ru' | 'fr' | 'es' | 'de' | 'ar';
 export const languageOptions: { value: Lang; label: string }[] = [
   { value: 'en', label: 'English' },
   { value: 'vi', label: 'Tiếng Việt' },
   { value: 'zh', label: '简体中文' },
+  { value: 'zh-TW', label: '繁體中文' },
+  { value: 'ja', label: '日本語' },
+  { value: 'ko', label: '한국어' },
+  { value: 'ru', label: 'Русский' },
+  { value: 'fr', label: 'Français' },
+  { value: 'es', label: 'Español' },
+  { value: 'de', label: 'Deutsch' },
+  { value: 'ar', label: 'العربية' },
 ];
 
 const zh = {
@@ -1983,4 +1999,16 @@ export const en: Record<MsgKey, string> = {
   'gitWebhook.useGithubApp': 'Use GitHub App Mode (Recommended)',
 };
 
-export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en, vi };
+export const messages: Record<Lang, Record<MsgKey, string>> = {
+  zh,
+  en,
+  vi,
+  'zh-TW': { ...zh, ...zhTw } as Record<MsgKey, string>,
+  ja: { ...en, ...ja } as Record<MsgKey, string>,
+  ko: { ...en, ...ko } as Record<MsgKey, string>,
+  ru: { ...en, ...ru } as Record<MsgKey, string>,
+  fr: { ...en, ...fr } as Record<MsgKey, string>,
+  es: { ...en, ...es } as Record<MsgKey, string>,
+  de: { ...en, ...de } as Record<MsgKey, string>,
+  ar: { ...en, ...ar } as Record<MsgKey, string>,
+};

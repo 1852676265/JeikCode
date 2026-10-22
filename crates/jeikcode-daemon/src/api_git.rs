@@ -1851,7 +1851,11 @@ pub async fn git_fetch(
             .and_then(|o| {
                 if o.status.success() {
                     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() || s == "HEAD" { None } else { Some(s) }
+                    if s.is_empty() || s == "HEAD" {
+                        None
+                    } else {
+                        Some(s)
+                    }
                 } else {
                     None
                 }
@@ -1865,7 +1869,11 @@ pub async fn git_fetch(
                 .and_then(|o| {
                     if o.status.success() {
                         let r = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if r.is_empty() { None } else { Some(r) }
+                        if r.is_empty() {
+                            None
+                        } else {
+                            Some(r)
+                        }
                     } else {
                         None
                     }

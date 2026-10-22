@@ -7992,18 +7992,22 @@ export function Chat({
       return;
     }
     if (e.key === 'Escape') {
-      // 输入框里的 Esc：等同按一次队尾待发卡片的「取消」——不论该卡片是否已转向，
-      // 都把这条待发消息收回输入框。
       const escapeAction = resolveComposerEscapeAction({
         defaultPrevented: e.defaultPrevented,
         pendingCardCount: queuedRef.current.length,
+        busy: busyRef.current || busy,
       });
       if (escapeAction === 'cancel-card') {
         const tail = tailQueuedCard(queuedRef.current);
-        if (tail && tail.kind !== 'steering') {
+        if (tail) {
           e.preventDefault();
           handleCancelQueuedMessage(tail);
+          return;
         }
+      } else if (escapeAction === 'stop-and-restore') {
+        e.preventDefault();
+        void handleStopAndRestoreLastUserMessage();
+        return;
       }
     }
   }
@@ -8051,7 +8055,8 @@ export function Chat({
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  async function handleStop() {
+  async function handleStop(options?: { skipDiskCatchUp?: boolean } | unknown) {
+    const skipCatchUp = Boolean(options && typeof options === 'object' && 'skipDiskCatchUp' in options && (options as { skipDiskCatchUp?: boolean }).skipDiskCatchUp);
     const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
     const requestAlias = requestIdRef.current;
     // 用户主动停止：无论此前是否发生过程序化停止，都复位抑制标记，保证排队内容照常回吐输入框。
@@ -8116,13 +8121,88 @@ export function Chat({
         (currentSid ? projectHashBySessionRef.current.get(currentSid) : undefined) ||
         '';
       const loadGeneration = sessionGenerationRef.current;
-      if (projectHash && currentSid) {
+      if (projectHash && currentSid && !skipCatchUp) {
         startIdleWatch(projectHash, currentSid, loadGeneration);
         // 停止通道已 await 后端真实释放（快照已落盘）：立刻磁盘对账一次，
         // 把被 abort 掉的那条流可能丢掉的最后一段正文补回画布（无需刷新/失焦）。
         settleDiskCatchUp(projectHash, currentSid);
       }
     }
+  }
+
+  /**
+   * 纯播放状态下按 Esc 取消：停止当前回合，并将本轮用户消息（正文/转向消息及附件）无损回落到输入框。
+   */
+  async function handleStopAndRestoreLastUserMessage() {
+    const currentMsgs = messagesRef.current;
+    let lastUserIdx = -1;
+    for (let i = currentMsgs.length - 1; i >= 0; i--) {
+      if (currentMsgs[i].role === 'user') {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx < 0) {
+      void handleStop();
+      return;
+    }
+
+    const lastUserMsg = currentMsgs[lastUserIdx];
+    const userText = stripSteerEnvelopeForDisplay(messageText(lastUserMsg));
+    const userImages = lastUserMsg.images ?? [];
+    const sourceIndex = lastUserMsg.sourceIndex ?? lastUserIdx;
+
+    // 1. 停止当前正在发送/播放的消息（跳过自动磁盘补回，防止刚撤回的消息被重新读出）
+    await handleStop({ skipDiskCatchUp: true });
+
+    // 2. 从画布与缓存中移除未完成的这轮
+    const rolledBackMsgs = messagesRef.current.slice(0, lastUserIdx);
+    messagesRef.current = rolledBackMsgs;
+    setMessages(rolledBackMsgs);
+
+    const sid = activeIdRef.current || sessionId || activeSession?.id;
+    const effectiveHash =
+      projectHashBySessionRef.current.get(sid || '') ||
+      viewedProjectHashRef.current ||
+      activeSession?.project_hash ||
+      '';
+    if (sid && effectiveHash) {
+      messageCacheRef.current.set(sid, rolledBackMsgs);
+      const filteredOutline = turnOutlineRef.current.filter(
+        (t) => t.index !== sourceIndex && t.index < sourceIndex,
+      );
+      turnOutlineRef.current = filteredOutline;
+      turnOutlineBySessionRef.current.set(sid, filteredOutline);
+      setTurnOutline(filteredOutline);
+      void saveSessionCache(
+        effectiveHash,
+        sid,
+        rolledBackMsgs,
+        activeTodosRef.current,
+        undefined,
+        filteredOutline,
+        tokensAuthoritativeRef.current,
+      );
+      void truncateSession(effectiveHash, sid, {
+        target_index: sourceIndex,
+        inclusive: false,
+      }).catch(() => {});
+    }
+
+    // 3. 消息无损回落到输入框
+    if (userText) {
+      setInput((current) => (current.trim() ? `${userText}\n${current}` : userText));
+    }
+    if (userImages.length > 0) {
+      setPendingAttach((current) => [...current, ...imagesToPending(userImages)]);
+    }
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.style.height = 'auto';
+        textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 240)}px`;
+      }
+    }, 0);
   }
 
   // 从光标前的 / 替换为选中的技能名。
@@ -8454,9 +8534,34 @@ export function Chat({
         setSearchOpen(true);
         // 下一帧再聚焦,等 input 挂载。
         requestAnimationFrame(() => searchInputRef.current?.focus());
-      } else if (e.key === 'Escape' && searchOpen) {
-        e.preventDefault();
-        closeSearch();
+      } else if (e.key === 'Escape') {
+        if (searchOpen) {
+          e.preventDefault();
+          closeSearch();
+          return;
+        }
+        if (confirmModal.open || editingSourceIndex != null) return;
+        const target = e.target as HTMLElement | null;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+        if (activeMainTabId !== 'chat') return;
+
+        const escapeAction = resolveComposerEscapeAction({
+          defaultPrevented: e.defaultPrevented,
+          pendingCardCount: queuedRef.current.length,
+          busy: busyRef.current || busy,
+        });
+        if (escapeAction === 'cancel-card') {
+          const tail = tailQueuedCard(queuedRef.current);
+          if (tail) {
+            e.preventDefault();
+            handleCancelQueuedMessage(tail);
+            return;
+          }
+        } else if (escapeAction === 'stop-and-restore') {
+          e.preventDefault();
+          void handleStopAndRestoreLastUserMessage();
+          return;
+        }
       }
     };
     window.addEventListener('keydown', onKey);
@@ -8898,7 +9003,7 @@ export function Chat({
                     ↑
                   </button>
                 )}
-                <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+                <button class="btn-stop" onClick={() => void handleStop()} title={t('chat.stop')} aria-label={t('chat.stop')}>
                   <span class="stop-square" />
                 </button>
               </>

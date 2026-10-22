@@ -18,7 +18,25 @@ function load(file, dependencies = {}, globals = {}) {
   return exports;
 }
 const { vi } = load('./vi.ts');
-const { messages, languageOptions } = load('./i18n.ts', { './vi': { vi } });
+const { zhTw } = load('./locales/zh-TW.ts');
+const { ja } = load('./locales/ja.ts');
+const { ko } = load('./locales/ko.ts');
+const { ru } = load('./locales/ru.ts');
+const { fr } = load('./locales/fr.ts');
+const { es } = load('./locales/es.ts');
+const { de } = load('./locales/de.ts');
+const { ar } = load('./locales/ar.ts');
+const { messages, languageOptions } = load('./i18n.ts', {
+  './vi': { vi },
+  './locales/zh-TW': { zhTw },
+  './locales/ja': { ja },
+  './locales/ko': { ko },
+  './locales/ru': { ru },
+  './locales/fr': { fr },
+  './locales/es': { es },
+  './locales/de': { de },
+  './locales/ar': { ar },
+});
 const placeholders = (text) => [...text.matchAll(/\{(\w+)\}/g)].map(m => m[1]).sort();
 
 test('all three catalogs mirror English keys and placeholder occurrences', () => {
@@ -55,10 +73,13 @@ test('Chat and diagram accessibility labels use translated catalog keys', () => 
 });
 
 test('language selectors share native self-names in English-first order', () => {
-  assert.equal(JSON.stringify(languageOptions), JSON.stringify([
+  assert.equal(JSON.stringify(languageOptions.slice(0, 3)), JSON.stringify([
     { value: 'en', label: 'English' }, { value: 'vi', label: 'Tiếng Việt' },
     { value: 'zh', label: '简体中文' },
   ]));
+  assert.ok(languageOptions.some(o => o.value === 'zh-TW'));
+  assert.ok(languageOptions.some(o => o.value === 'ja'));
+  assert.ok(languageOptions.some(o => o.value === 'ar'));
 });
 
 function deferred() {
@@ -125,7 +146,7 @@ test('unconfigured first run without browser language falls back to English', ()
 });
 
 test('unconfigured first run detects supported browser language with English fallback', () => {
-  for (const [nav, expected] of [['zh-CN', 'zh'], ['zh', 'zh'], ['vi-VN', 'vi'], ['vi', 'vi'], ['en-US', 'en'], ['fr-FR', 'en'], ['de', 'en']]) {
+  for (const [nav, expected] of [['zh-CN', 'zh'], ['zh', 'zh'], ['vi-VN', 'vi'], ['vi', 'vi'], ['en-US', 'en'], ['it-IT', 'en'], ['nl', 'en']]) {
     const h = harness(undefined, false, nav);
     assert.equal(h.context().lang, expected);
   }
@@ -133,14 +154,14 @@ test('unconfigured first run detects supported browser language with English fal
 
 test('Google-style navigator.languages chain matching respects first supported candidate', () => {
   // Candidate list has unsupported first, then supported:
-  const hZh = harness(undefined, false, undefined, ['ja', 'zh-TW', 'en']);
-  assert.equal(hZh.context().lang, 'zh');
+  const hZh = harness(undefined, false, undefined, ['pl', 'zh-TW', 'en']);
+  assert.equal(hZh.context().lang, 'zh-TW');
 
   const hVi = harness(undefined, false, undefined, ['ko', 'vi-VN', 'en-US']);
-  assert.equal(hVi.context().lang, 'vi');
+  assert.equal(hVi.context().lang, 'ko');
 
   // Candidate list with only unsupported languages falls back cleanly to English baseline:
-  const hFallback = harness(undefined, false, undefined, ['de', 'es', 'it']);
+  const hFallback = harness(undefined, false, undefined, ['it', 'pt', 'nl']);
   assert.equal(hFallback.context().lang, 'en');
 
   // User explicit storage overrides browser languages:

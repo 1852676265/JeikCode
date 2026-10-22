@@ -40,9 +40,11 @@ Ngoài ra, hãy khám phá kỹ lưỡng cơ sở mã trước khi trả lời. 
 
 pub fn opening_body_for(locale: jeikcode_config::locale::Locale) -> &'static str {
     match locale {
-        jeikcode_config::locale::Locale::ZhCn => OPENING_BODY_ZH,
+        jeikcode_config::locale::Locale::ZhCn | jeikcode_config::locale::Locale::ZhTw => {
+            OPENING_BODY_ZH
+        }
         jeikcode_config::locale::Locale::Vi => OPENING_BODY_VI,
-        jeikcode_config::locale::Locale::En => OPENING_BODY_EN,
+        _ => OPENING_BODY_EN,
     }
 }
 

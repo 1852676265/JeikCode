@@ -1,5 +1,6 @@
 // Task 12 — API client for jeikcode webui
 
+import type { Lang } from './i18n';
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
 
 // Serve / webui bootstrap: `/?token=<uuid>` is handed off via HttpOnly cookie
@@ -1182,9 +1183,16 @@ export async function getConfig(): Promise<ConfigInfo> {
   return readApiJson<ConfigInfo>(resp);
 }
 
-/** Persist the global language switch (`en`, `vi`, or `zh`). */
-export async function postLanguage(lang: 'en' | 'zh' | 'vi'): Promise<void> {
-  const language = lang === 'zh' ? 'zh-CN' : lang === 'vi' ? 'vi-VN' : 'en';
+/** Persist the global language switch. */
+export async function postLanguage(lang: Lang): Promise<void> {
+  const language =
+    lang === 'zh'
+      ? 'zh-CN'
+      : lang === 'zh-TW'
+        ? 'zh-TW'
+        : lang === 'vi'
+          ? 'vi-VN'
+          : lang;
   const resp = await apiFetch('/config/language', {
     method: 'POST',
     headers: {

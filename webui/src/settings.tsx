@@ -76,7 +76,24 @@ export function normalizeServerLang(value: string | undefined): Lang | null {
   const norm = value.trim().toLowerCase().replace('_', '-');
   if (norm === 'en' || norm.startsWith('en-')) return 'en';
   if (norm === 'vi' || norm.startsWith('vi-')) return 'vi';
+  if (
+    norm === 'zh-tw' ||
+    norm.startsWith('zh-tw') ||
+    norm === 'zh-hk' ||
+    norm.startsWith('zh-hk') ||
+    norm === 'zh-hant' ||
+    norm.startsWith('zh-hant')
+  ) {
+    return 'zh-TW';
+  }
   if (norm === 'zh' || norm.startsWith('zh-')) return 'zh';
+  if (norm === 'ja' || norm.startsWith('ja-')) return 'ja';
+  if (norm === 'ko' || norm.startsWith('ko-')) return 'ko';
+  if (norm === 'ru' || norm.startsWith('ru-')) return 'ru';
+  if (norm === 'fr' || norm.startsWith('fr-')) return 'fr';
+  if (norm === 'es' || norm.startsWith('es-')) return 'es';
+  if (norm === 'de' || norm.startsWith('de-')) return 'de';
+  if (norm === 'ar' || norm.startsWith('ar-')) return 'ar';
   return null;
 }
 
@@ -84,6 +101,14 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [lang, setLangState] = useState<Lang>(readLang);
   const [githubLogo, setGithubLogo] = useState<boolean>(true);
+
+  // Apply document language and direction (RTL for Arabic, LTR for others)
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+      document.documentElement.lang = lang;
+    }
+  }, [lang]);
 
   const selectionVersion = useRef(0);
   const pendingSave = useRef(Promise.resolve());

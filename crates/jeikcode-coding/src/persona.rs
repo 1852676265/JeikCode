@@ -96,6 +96,46 @@ pub fn commit_language_guidance(language: Option<jeikcode_config::locale::Locale
 Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
 or project commit-message rule takes precedence."
         }
+        Some(Locale::ZhTw) => {
+            "Write the natural-language parts of the commit subject and body in Traditional Chinese. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::Ja) => {
+            "Write the natural-language parts of the commit subject and body in Japanese. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::Ko) => {
+            "Write the natural-language parts of the commit subject and body in Korean. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::Ru) => {
+            "Write the natural-language parts of the commit subject and body in Russian. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::Fr) => {
+            "Write the natural-language parts of the commit subject and body in French. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::Es) => {
+            "Write the natural-language parts of the commit subject and body in Spanish. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::De) => {
+            "Write the natural-language parts of the commit subject and body in German. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
+        Some(Locale::Ar) => {
+            "Write the natural-language parts of the commit subject and body in Arabic. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+or project commit-message rule takes precedence."
+        }
         Some(Locale::Vi) => {
             "Write the natural-language parts of the commit subject and body in Vietnamese. \
 Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \

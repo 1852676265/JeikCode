@@ -28,6 +28,14 @@ impl LanguagePicker {
             (Locale::En, "English".to_string(), "en".to_string()),
             (Locale::Vi, "Tiếng Việt".to_string(), "vi-VN".to_string()),
             (Locale::ZhCn, "简体中文".to_string(), "zh_CN".to_string()),
+            (Locale::ZhTw, "繁體中文".to_string(), "zh_TW".to_string()),
+            (Locale::Ja, "日本語".to_string(), "ja".to_string()),
+            (Locale::Ko, "한국어".to_string(), "ko".to_string()),
+            (Locale::Ru, "Русский".to_string(), "ru".to_string()),
+            (Locale::Fr, "Français".to_string(), "fr".to_string()),
+            (Locale::Es, "Español".to_string(), "es".to_string()),
+            (Locale::De, "Deutsch".to_string(), "de".to_string()),
+            (Locale::Ar, "العربية".to_string(), "ar".to_string()),
         ];
         let selected = options
             .iter()
@@ -113,7 +121,7 @@ mod tests {
         crate::i18n::set_locale(Locale::Vi);
         let picker = LanguagePicker::open();
         assert_eq!(picker.selected, 1);
-        assert_eq!(picker.options.len(), 3);
+        assert_eq!(picker.options.len(), 11);
         assert_eq!(picker.options[1].1, "Tiếng Việt");
         assert_eq!(picker.options[1].2, "vi-VN");
         let msg = crate::i18n::t(crate::i18n::Msg::LanguageSwitched {

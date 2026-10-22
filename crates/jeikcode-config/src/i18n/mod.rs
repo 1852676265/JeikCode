@@ -1,11 +1,19 @@
+mod ar;
+mod de;
 mod en;
+mod es;
+mod fr;
+mod ja;
+mod ko;
 mod messages;
+mod ru;
 #[cfg(test)]
 mod terminal_tests;
 mod vi;
 #[cfg(test)]
 mod vi_tests;
 mod zh_cn;
+mod zh_tw;
 
 pub use crate::locale::Locale;
 pub use messages::{ConfigSyncChange, Msg};
@@ -30,6 +38,14 @@ pub fn t_with(locale: Locale, msg: Msg<'_>) -> Cow<'static, str> {
         Locale::En => en::en(msg),
         Locale::Vi => vi::vi(msg),
         Locale::ZhCn => zh_cn::zh_cn(msg),
+        Locale::ZhTw => zh_tw::zh_tw(msg),
+        Locale::Ja => ja::ja(msg),
+        Locale::Ko => ko::ko(msg),
+        Locale::Ru => ru::ru(msg),
+        Locale::Fr => fr::fr(msg),
+        Locale::Es => es::es(msg),
+        Locale::De => de::de(msg),
+        Locale::Ar => ar::ar(msg),
     }
 }
 
@@ -232,14 +248,62 @@ fn get_native_os_locale() -> Option<String> {
 
 fn classify_env_locale(value: &str) -> Locale {
     let lower = value.to_ascii_lowercase();
-    // Chinese variants (zh_CN, zh_TW, zh_HK, ...)
-    if lower == "zh"
+    if lower.starts_with("zh_tw")
+        || lower.starts_with("zh-tw")
+        || lower.starts_with("zh_hk")
+        || lower.starts_with("zh-hk")
+        || lower.starts_with("zh_hant")
+        || lower.starts_with("zh-hant")
+    {
+        Locale::ZhTw
+    } else if lower == "zh"
         || lower.starts_with("zh_")
         || lower.starts_with("zh-")
         || lower.starts_with("zh.")
     {
         Locale::ZhCn
-    // Vietnamese variants (vi_VN, vi, ...)
+    } else if lower == "ja"
+        || lower.starts_with("ja_")
+        || lower.starts_with("ja-")
+        || lower.starts_with("ja.")
+    {
+        Locale::Ja
+    } else if lower == "ko"
+        || lower.starts_with("ko_")
+        || lower.starts_with("ko-")
+        || lower.starts_with("ko.")
+    {
+        Locale::Ko
+    } else if lower == "ru"
+        || lower.starts_with("ru_")
+        || lower.starts_with("ru-")
+        || lower.starts_with("ru.")
+    {
+        Locale::Ru
+    } else if lower == "fr"
+        || lower.starts_with("fr_")
+        || lower.starts_with("fr-")
+        || lower.starts_with("fr.")
+    {
+        Locale::Fr
+    } else if lower == "es"
+        || lower.starts_with("es_")
+        || lower.starts_with("es-")
+        || lower.starts_with("es.")
+    {
+        Locale::Es
+    } else if lower == "de"
+        || lower.starts_with("de_")
+        || lower.starts_with("de-")
+        || lower.starts_with("de.")
+    {
+        Locale::De
+    } else if lower == "ar"
+        || lower.starts_with("ar_")
+        || lower.starts_with("ar-")
+        || lower.starts_with("ar.")
+    {
+        Locale::Ar
     } else if lower == "vi"
         || lower.starts_with("vi_")
         || lower.starts_with("vi-")
@@ -486,7 +550,7 @@ mod tests {
         let env_empty = |_: &str| None;
         let os_zh = || Some("zh-CN".to_string());
         let os_vi = || Some("vi-VN".to_string());
-        let os_unsupported = || Some("de-DE".to_string());
+        let os_unsupported = || Some("it-IT".to_string());
 
         assert_eq!(
             resolve_initial_locale_with_sources(None, None, &env_empty, &os_zh),
@@ -503,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn env_zh_tw_maps_to_zh_cn() {
+    fn env_zh_tw_resolves_to_zh_tw() {
         let env = |k: &str| {
             if k == "LANG" {
                 Some("zh_TW".into())
@@ -513,7 +577,7 @@ mod tests {
         };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
-            Locale::ZhCn
+            Locale::ZhTw
         );
     }
 
@@ -536,7 +600,7 @@ mod tests {
     fn env_unsupported_falls_back_to_en() {
         let env = |k: &str| {
             if k == "LANG" {
-                Some("fr_FR.UTF-8".into())
+                Some("it_IT.UTF-8".into())
             } else {
                 None
             }
@@ -669,11 +733,11 @@ mod tests {
     fn cli_flag_unparseable_falls_through() {
         let env = |_: &str| None;
         assert_eq!(
-            resolve_initial_locale_with_env(Some("fr"), Some(Locale::ZhCn), &env),
+            resolve_initial_locale_with_env(Some("xx_unsupported"), Some(Locale::ZhCn), &env),
             Locale::ZhCn
         );
         assert_eq!(
-            resolve_initial_locale_with_env(Some("fr"), None, &env),
+            resolve_initial_locale_with_env(Some("xx_unsupported"), None, &env),
             Locale::En
         );
     }
@@ -789,14 +853,8 @@ mod tests {
             t_with(Locale::ZhCn, Msg::ProviderPanelFieldProtocol),
             "协议"
         );
-        assert_eq!(
-            t_with(Locale::En, Msg::ProviderPanelRequired),
-            "(required)"
-        );
-        assert_eq!(
-            t_with(Locale::ZhCn, Msg::ProviderPanelRequired),
-            "(必填)"
-        );
+        assert_eq!(t_with(Locale::En, Msg::ProviderPanelRequired), "(required)");
+        assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelRequired), "(必填)");
         assert_eq!(t_with(Locale::En, Msg::ProviderPanelLocked), "(locked)");
         assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelLocked), "(锁定)");
         assert_eq!(

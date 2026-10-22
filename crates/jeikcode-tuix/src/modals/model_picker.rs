@@ -298,10 +298,8 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
         } else if p.query.is_empty() {
             crate::i18n::t(crate::i18n::Msg::ModelPickerNoModelsMatch).into_owned()
         } else {
-            crate::i18n::t(crate::i18n::Msg::ModelPickerNoModelsMatchQuery {
-                query: &p.query,
-            })
-            .into_owned()
+            crate::i18n::t(crate::i18n::Msg::ModelPickerNoModelsMatchQuery { query: &p.query })
+                .into_owned()
         };
         return MenuPayload {
             items: vec![(label, String::new())],

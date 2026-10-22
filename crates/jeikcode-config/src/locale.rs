@@ -11,6 +11,22 @@ pub enum Locale {
     Vi,
     #[serde(rename = "zh_CN")]
     ZhCn,
+    #[serde(rename = "zh_TW")]
+    ZhTw,
+    #[serde(rename = "ja")]
+    Ja,
+    #[serde(rename = "ko")]
+    Ko,
+    #[serde(rename = "ru")]
+    Ru,
+    #[serde(rename = "fr")]
+    Fr,
+    #[serde(rename = "es")]
+    Es,
+    #[serde(rename = "de")]
+    De,
+    #[serde(rename = "ar")]
+    Ar,
 }
 
 /// Compatibility name for callers referring to the UI language as `Lang`.
@@ -26,6 +42,14 @@ impl Locale {
             Self::ZhCn => 0,
             Self::En => 1,
             Self::Vi => 2,
+            Self::ZhTw => 3,
+            Self::Ja => 4,
+            Self::Ko => 5,
+            Self::Ru => 6,
+            Self::Fr => 7,
+            Self::Es => 8,
+            Self::De => 9,
+            Self::Ar => 10,
         }
     }
 
@@ -33,6 +57,14 @@ impl Locale {
         match val {
             0 => Self::ZhCn,
             2 => Self::Vi,
+            3 => Self::ZhTw,
+            4 => Self::Ja,
+            5 => Self::Ko,
+            6 => Self::Ru,
+            7 => Self::Fr,
+            8 => Self::Es,
+            9 => Self::De,
+            10 => Self::Ar,
             _ => Self::En,
         }
     }
@@ -42,6 +74,14 @@ impl Locale {
             Self::En => "English",
             Self::Vi => "Tiếng Việt",
             Self::ZhCn => "简体中文",
+            Self::ZhTw => "繁體中文",
+            Self::Ja => "日本語",
+            Self::Ko => "한국어",
+            Self::Ru => "Русский",
+            Self::Fr => "Français",
+            Self::Es => "Español",
+            Self::De => "Deutsch",
+            Self::Ar => "العربية",
         }
     }
 
@@ -51,6 +91,14 @@ impl Locale {
             Self::En => "en",
             Self::Vi => "vi-VN",
             Self::ZhCn => "zh-CN",
+            Self::ZhTw => "zh-TW",
+            Self::Ja => "ja",
+            Self::Ko => "ko",
+            Self::Ru => "ru",
+            Self::Fr => "fr",
+            Self::Es => "es",
+            Self::De => "de",
+            Self::Ar => "ar",
         }
     }
 }
@@ -93,6 +141,14 @@ impl fmt::Display for Locale {
             Locale::En => write!(f, "en"),
             Locale::Vi => write!(f, "vi-VN"),
             Locale::ZhCn => write!(f, "zh_CN"),
+            Locale::ZhTw => write!(f, "zh_TW"),
+            Locale::Ja => write!(f, "ja"),
+            Locale::Ko => write!(f, "ko"),
+            Locale::Ru => write!(f, "ru"),
+            Locale::Fr => write!(f, "fr"),
+            Locale::Es => write!(f, "es"),
+            Locale::De => write!(f, "de"),
+            Locale::Ar => write!(f, "ar"),
         }
     }
 }
@@ -105,13 +161,41 @@ impl FromStr for Locale {
         match normalized.as_str() {
             "vi" | "vi_vn" => Ok(Locale::Vi),
             "en" | "english" | "en_us" | "en_gb" | "en_ca" | "en_au" => Ok(Locale::En),
-            "zh" | "zh_cn" | "zh_hans" | "chinese" | "简体中文" | "zh_tw" | "zh_hk" | "zh_hant"
-            | "繁體中文" => Ok(Locale::ZhCn),
+            "zh" | "zh_cn" | "zh_hans" | "chinese" | "简体中文" => Ok(Locale::ZhCn),
+            "zh_tw" | "zh_hk" | "zh_mo" | "zh_hant" | "繁體中文" | "繁体中文" => {
+                Ok(Locale::ZhTw)
+            }
+            "ja" | "ja_jp" | "japanese" | "日本語" => Ok(Locale::Ja),
+            "ko" | "ko_kr" | "korean" | "한국어" => Ok(Locale::Ko),
+            "ru" | "ru_ru" | "russian" | "русский" => Ok(Locale::Ru),
+            "fr" | "fr_fr" | "fr_ca" | "french" | "français" | "francais" => Ok(Locale::Fr),
+            "es" | "es_es" | "es_mx" | "spanish" | "español" | "espanol" => Ok(Locale::Es),
+            "de" | "de_de" | "de_at" | "de_ch" | "german" | "deutsch" => Ok(Locale::De),
+            "ar" | "ar_sa" | "ar_eg" | "ar_ae" | "arabic" | "العربية" => Ok(Locale::Ar),
             other => {
                 if other.starts_with("en") {
                     Ok(Locale::En)
+                } else if other.starts_with("zh_tw")
+                    || other.starts_with("zh_hk")
+                    || other.starts_with("zh_hant")
+                {
+                    Ok(Locale::ZhTw)
                 } else if other.starts_with("zh") || other.contains("中文") {
                     Ok(Locale::ZhCn)
+                } else if other.starts_with("ja") {
+                    Ok(Locale::Ja)
+                } else if other.starts_with("ko") {
+                    Ok(Locale::Ko)
+                } else if other.starts_with("ru") {
+                    Ok(Locale::Ru)
+                } else if other.starts_with("fr") {
+                    Ok(Locale::Fr)
+                } else if other.starts_with("es") {
+                    Ok(Locale::Es)
+                } else if other.starts_with("de") {
+                    Ok(Locale::De)
+                } else if other.starts_with("ar") {
+                    Ok(Locale::Ar)
                 } else {
                     Err(format!("unsupported locale: {s}"))
                 }
@@ -141,14 +225,38 @@ mod tests {
         for invalid in ["vi-VN-extra", "vietnamese", "vi_US"] {
             assert!(invalid.parse::<Locale>().is_err());
         }
-        for locale in [Locale::En, Locale::Vi, Locale::ZhCn] {
+        for locale in [
+            Locale::En,
+            Locale::Vi,
+            Locale::ZhCn,
+            Locale::ZhTw,
+            Locale::Ja,
+            Locale::Ko,
+            Locale::Ru,
+            Locale::Fr,
+            Locale::Es,
+            Locale::De,
+            Locale::Ar,
+        ] {
             assert_eq!(locale.to_string().parse::<Locale>().unwrap(), locale);
         }
     }
 
     #[test]
     fn locale_u8_encoding_roundtrips() {
-        for locale in [Locale::ZhCn, Locale::En, Locale::Vi] {
+        for locale in [
+            Locale::ZhCn,
+            Locale::En,
+            Locale::Vi,
+            Locale::ZhTw,
+            Locale::Ja,
+            Locale::Ko,
+            Locale::Ru,
+            Locale::Fr,
+            Locale::Es,
+            Locale::De,
+            Locale::Ar,
+        ] {
             assert_eq!(Locale::from_u8(locale.as_u8()), locale);
         }
         assert_eq!(Locale::from_u8(99), Locale::En);
@@ -179,9 +287,9 @@ mod tests {
             Locale::Vi
         );
         // Unsupported OS locale falls back to English baseline
-        let env_fr = |_: &str| Some("fr_FR.UTF-8".to_string());
+        let env_unsupported = |_: &str| Some("it_IT.UTF-8".to_string());
         assert_eq!(
-            i18n::resolve_initial_locale_with_env(None, None, &env_fr),
+            i18n::resolve_initial_locale_with_env(None, None, &env_unsupported),
             Locale::En
         );
     }
@@ -206,17 +314,24 @@ mod tests {
         assert_eq!("zh_CN".parse::<Locale>().unwrap(), Locale::ZhCn);
         assert_eq!("zh-cn".parse::<Locale>().unwrap(), Locale::ZhCn);
         assert_eq!("简体中文".parse::<Locale>().unwrap(), Locale::ZhCn);
-        // zh_TW / zh_HK fall back to ZhCn (no separate Traditional variant yet)
-        assert_eq!("zh_TW".parse::<Locale>().unwrap(), Locale::ZhCn);
-        assert_eq!("zh-tw".parse::<Locale>().unwrap(), Locale::ZhCn);
-        assert_eq!("zh_HK".parse::<Locale>().unwrap(), Locale::ZhCn);
-        assert_eq!("zh-hk".parse::<Locale>().unwrap(), Locale::ZhCn);
-        assert_eq!("繁體中文".parse::<Locale>().unwrap(), Locale::ZhCn);
+        // zh_TW / zh_HK parse to ZhTw
+        assert_eq!("zh_TW".parse::<Locale>().unwrap(), Locale::ZhTw);
+        assert_eq!("zh-tw".parse::<Locale>().unwrap(), Locale::ZhTw);
+        assert_eq!("zh_HK".parse::<Locale>().unwrap(), Locale::ZhTw);
+        assert_eq!("zh-hk".parse::<Locale>().unwrap(), Locale::ZhTw);
+        assert_eq!("繁體中文".parse::<Locale>().unwrap(), Locale::ZhTw);
+        assert_eq!("ja".parse::<Locale>().unwrap(), Locale::Ja);
+        assert_eq!("ko".parse::<Locale>().unwrap(), Locale::Ko);
+        assert_eq!("ru".parse::<Locale>().unwrap(), Locale::Ru);
+        assert_eq!("fr".parse::<Locale>().unwrap(), Locale::Fr);
+        assert_eq!("es".parse::<Locale>().unwrap(), Locale::Es);
+        assert_eq!("de".parse::<Locale>().unwrap(), Locale::De);
+        assert_eq!("ar".parse::<Locale>().unwrap(), Locale::Ar);
     }
 
     #[test]
     fn from_str_rejects_unknown() {
-        assert!("fr".parse::<Locale>().is_err());
+        assert!("xx_unsupported".parse::<Locale>().is_err());
         assert!("".parse::<Locale>().is_err());
     }
 
@@ -247,8 +362,6 @@ mod tests {
             "zh",
             "ZH",
             "简体中文",
-            "zh-TW",
-            "zh_TW",
         ] {
             let toml_doc: toml::Value = toml::from_str(&format!(r#"language = "{val}""#)).unwrap();
             let parsed_lang: Option<Locale> = toml_doc
@@ -258,6 +371,17 @@ mod tests {
                 .try_into()
                 .unwrap();
             assert_eq!(parsed_lang, Some(Locale::ZhCn), "failed for {val}");
+        }
+
+        for val in &["zh-TW", "zh_TW"] {
+            let toml_doc: toml::Value = toml::from_str(&format!(r#"language = "{val}""#)).unwrap();
+            let parsed_lang: Option<Locale> = toml_doc
+                .get("language")
+                .unwrap()
+                .clone()
+                .try_into()
+                .unwrap();
+            assert_eq!(parsed_lang, Some(Locale::ZhTw), "failed for {val}");
         }
 
         for val in &[

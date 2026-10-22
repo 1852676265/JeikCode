@@ -1274,7 +1274,9 @@ async fn collect_compat_response(
                 if !current_block.is_empty() {
                     text_blocks.push(std::mem::take(&mut current_block));
                 }
-                last_tool_is_todo = calls.iter().any(|c| jeikcode_capabilities::tools::is_todo_tool_name(&c.name));
+                last_tool_is_todo = calls
+                    .iter()
+                    .any(|c| jeikcode_capabilities::tools::is_todo_tool_name(&c.name));
                 for c in calls {
                     tool_trace.push_str(&format!(
                         "\n[tool_start] {} ({}) parallel\n{}\n",
@@ -1347,7 +1349,10 @@ async fn collect_compat_response(
     // 特殊情况（Todo 拦截提醒兜底）：如果该回合以 todo 打勾工具收尾，且打勾前已经有主要业务输出（pre），
     // 打勾后的文本（post）往往只是客套话（如“草案已核对完毕”），字数显著少于打勾前。此时智能回锚取打勾前的核心正文。
     let chosen_text = {
-        let valid_blocks: Vec<&String> = text_blocks.iter().filter(|s| !s.trim().is_empty()).collect();
+        let valid_blocks: Vec<&String> = text_blocks
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
         if valid_blocks.is_empty() {
             String::new()
         } else if valid_blocks.len() == 1 {
