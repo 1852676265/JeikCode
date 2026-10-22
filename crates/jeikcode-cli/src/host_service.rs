@@ -485,7 +485,14 @@ fn prompt_launchd_setup(opts: &HostServiceSetupOptions<'_>) -> Result<bool> {
         input
     };
     if !valid_service_name(&label, "com.jeikcode-") {
-        bail!("launchd 服务名必须以 com.jeikcode- 开头，且只能包含字母、数字、点、横线或下划线")
+        bail!(
+            "{}",
+            host_msg(
+                "launchd service name must begin with 'com.jeikcode-' and contain only letters, digits, dots, dashes, or underscores",
+                "launchd 服务名必须以 com.jeikcode- 开头，且只能包含字母、数字、点、横线或下划线",
+                "Tên dịch vụ launchd phải bắt đầu bằng 'com.jeikcode-' và chỉ chứa chữ cái, chữ số, dấu chấm, dấu gạch nối hoặc dấu gạch dưới",
+            )
+        );
     }
 
     let home = dirs::home_dir().context("cannot resolve home directory for LaunchAgents")?;
@@ -525,14 +532,49 @@ fn prompt_launchd_setup(opts: &HostServiceSetupOptions<'_>) -> Result<bool> {
         .output();
 
     println!("\n========================================================================");
-    println!("✨ launchd 服务 [{label}] 配置成功并已在后台运行！");
+    println!(
+        "{}",
+        host_msg(
+            &format!("launchd service [{label}] is configured and running in the background."),
+            &format!("✨ launchd 服务 [{label}] 配置成功并已在后台运行！"),
+            &format!("Dịch vụ launchd [{label}] đã được định cấu hình và đang chạy nền."),
+        )
+    );
     println!("------------------------------------------------------------------------");
     print_banner(opts.banner);
     println!("------------------------------------------------------------------------");
-    println!("📌 服务管理命令:");
-    println!("  查看状态: launchctl print {target}");
-    println!("  重启服务: launchctl kickstart -k {target}");
-    println!("  卸载服务: jeikcode server uninstall <ID>");
+    println!(
+        "{}",
+        host_msg(
+            "Service management commands:",
+            "📌 服务管理命令:",
+            "Các lệnh quản lý dịch vụ:"
+        )
+    );
+    println!(
+        "  {}",
+        host_msg(
+            &format!("View status: launchctl print {target}"),
+            &format!("查看状态: launchctl print {target}"),
+            &format!("Xem trạng thái: launchctl print {target}"),
+        )
+    );
+    println!(
+        "  {}",
+        host_msg(
+            &format!("Restart service: launchctl kickstart -k {target}"),
+            &format!("重启服务: launchctl kickstart -k {target}"),
+            &format!("Khởi động lại: launchctl kickstart -k {target}"),
+        )
+    );
+    println!(
+        "  {}",
+        host_msg(
+            "Uninstall service: jeikcode server uninstall <ID>",
+            "卸载服务: jeikcode server uninstall <ID>",
+            "Gỡ cài đặt: jeikcode server uninstall <ID>",
+        )
+    );
     println!("========================================================================\n");
     Ok(true)
 }

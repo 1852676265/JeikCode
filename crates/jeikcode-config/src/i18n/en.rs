@@ -176,7 +176,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("Default set to {name}.").into(),
         Msg::ProviderAdded { name } =>
-            format!("Added account \"{name}\". Opened its model list; press Ctrl+A to add a model.").into(),
+            format!("Added provider \"{name}\". Opened its model list; press Ctrl+A to add a model.").into(),
         Msg::ProviderUpdated { name } =>
             format!("Updated \"{name}\".").into(),
         Msg::ProviderStepName => "Provider name?".into(),
@@ -228,8 +228,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelTabAccounts => "Accounts".into(),
         Msg::ProviderPanelTabModels => "Models".into(),
         Msg::ProviderPanelEmptyAccounts =>
-            "(No provider accounts yet — press Ctrl+A to add one)".into(),
-        Msg::ProviderPanelNoMatchingAccounts => "(No matching provider accounts)".into(),
+            "(No providers yet — press Ctrl+A to add one)".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "(No matching providers)".into(),
         Msg::ProviderPanelEmptyModels =>
             "(No models yet — press Ctrl+A to add one; fetches upstream /models)".into(),
         Msg::ProviderPanelNoMatchingModels => "(No matching models)".into(),
@@ -238,6 +238,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelModelCount { count } =>
             format!("{count} model{}", if count == 1 { "" } else { "s" }).into(),
         Msg::ProviderPanelAddModelRow => "+ Add model".into(),
+        Msg::ProviderPanelAddProviderRow => "+ Add custom provider".into(),
         Msg::ProviderPanelAccountsHint =>
             "Filter · ↑↓ select · ↵ models · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
         Msg::ProviderPanelModelsHint =>
@@ -248,13 +249,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelImageDirectWhileVlSet => {
             "Images go to this model; turn off image input to use VL.".into()
         }
-        Msg::ProviderPanelAddTitle => "[Add provider account]".into(),
+        Msg::ProviderPanelAddTitle => "[Add provider]".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
             format!("[Edit account {account}]").into(),
         Msg::ProviderPanelAddModelTitle => "[Add model]".into(),
         Msg::ProviderPanelEditModelTitle => "[Edit model]".into(),
         Msg::ProviderPanelFieldVendor => "Provider".into(),
         Msg::ProviderPanelFieldAccount => "Account".into(),
+        Msg::ProviderPanelFieldName => "Name".into(),
+        Msg::ProviderPanelFieldProtocol => "Protocol".into(),
+        Msg::ProviderPanelRequired => "(required)".into(),
+        Msg::ProviderPanelLocked => "(locked)".into(),
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API key".into(),
         Msg::ProviderPanelFieldModel => "Model".into(),
@@ -273,6 +278,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelProviderFormHint =>
             "Tab Next  ←→ Switch provider  Space Toggle  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelAddAccountHint =>
+            "Tab Next  ←→ Switch protocol  ↵ Save  Esc Back  (Name required; add models on Models tab)".into(),
+        Msg::ProviderPanelEditAccountLockedHint =>
+            "Tab Next  ↵ Save  Esc Back  (Vendor protocol locked)".into(),
+        Msg::ProviderPanelEditAccountHint =>
+            "Tab Next  ←→ Switch protocol  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelAccountNeedsKeyHint => "(provider not yet configured)".into(),
         Msg::ProviderPanelModelFormHint =>
             "Opens with upstream list  Type to filter  ↑↓ select  Tab/↵ fill  ←→ account (empty model)  Space toggle  Esc back".into(),
         Msg::ProviderPanelModelPlaceholder => "(type to filter upstream list)".into(),
@@ -288,6 +300,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelUpstreamNoUrl =>
             "No upstream URL — type a model id".into(),
         // ── Model picker ──
+        Msg::ModelPickerNoModelsConfigured =>
+            "(no models configured — use /provider to add)".into(),
+        Msg::ModelPickerNoModelsMatch => "(no models match)".into(),
+        Msg::ModelPickerNoModelsMatchQuery { query } =>
+            format!("(no models match \"{query}\" — Backspace to clear)").into(),
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
         Msg::ModelSwitchedAndDefault { provider, model } =>

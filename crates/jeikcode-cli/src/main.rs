@@ -727,6 +727,13 @@ fn scan_config_language() -> Option<jeikcode_tuix::i18n::Locale> {
         Ok(c) => c,
         Err(_) => return None,
     };
+    if let Ok(val) = toml::from_str::<toml::Value>(&content) {
+        if let Some(lang_val) = val.get("language") {
+            if let Ok(loc) = lang_val.clone().try_into::<jeikcode_tuix::i18n::Locale>() {
+                return Some(loc);
+            }
+        }
+    }
     let cfg: jeikcode_config::config::Config = match toml::from_str(&content) {
         Ok(c) => c,
         Err(_) => return None,
@@ -2362,11 +2369,9 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     // Locale was already pre-resolved above (before clap parse) so --help
     // could be localised. Re-resolve with the full config (which may specify
     // a language key) to honour config-over-env priority.
-    if config.language.is_some() {
-        let locale =
-            jeikcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
-        jeikcode_tuix::i18n::set_locale(locale);
-    }
+    let locale =
+        jeikcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+    jeikcode_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //

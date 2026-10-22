@@ -12540,35 +12540,63 @@ pub async fn ensure_webui(
         local_url.push_str(&short);
     }
     let opened = open_browser && jeikcode_auth::oauth::open_browser(&local_url).is_ok();
+    let (started_msg, opened_msg, manual_msg) = match jeikcode_config::i18n::current_locale() {
+        jeikcode_config::locale::Locale::ZhCn => (
+            format!("webui 已启动：{local_url}"),
+            format!("已在浏览器打开 webui：{local_url}"),
+            format!("请手动在浏览器打开：{local_url}"),
+        ),
+        jeikcode_config::locale::Locale::Vi => (
+            format!("webui đã khởi động: {local_url}"),
+            format!("Đã mở webui trong trình duyệt: {local_url}"),
+            format!("Vui lòng mở thủ công trong trình duyệt: {local_url}"),
+        ),
+        _ => (
+            format!("webui started: {local_url}"),
+            format!("Opened webui in browser: {local_url}"),
+            format!("Please open manually in browser: {local_url}"),
+        ),
+    };
     let mut msg = if !open_browser {
-        format!("webui 已启动：{local_url}")
+        started_msg
     } else if opened {
-        format!("已在浏览器打开 webui：{local_url}")
+        opened_msg
     } else {
-        format!("请手动在浏览器打开：{local_url}")
+        manual_msg
     };
 
     // 复用了一个绑定地址不同的运行实例：提示如何换绑。
     if bound_host.as_str() != host {
-        msg.push_str(&format!(
-            "\n（webui 已在运行，绑定 {bound_host}；如需改绑 {host}，请先 /webui stop 再重试）"
-        ));
+        let rebind_hint = match jeikcode_config::i18n::current_locale() {
+            jeikcode_config::locale::Locale::ZhCn => format!(
+                "\n（webui 已在运行，绑定 {bound_host}；如需改绑 {host}，请先 /webui stop 再重试）"
+            ),
+            jeikcode_config::locale::Locale::Vi => format!(
+                "\n(webui đang chạy, liên kết {bound_host}; để liên kết lại {host}, vui lòng chạy /webui stop trước)"
+            ),
+            _ => format!(
+                "\n(webui is already running on {bound_host}; to bind to {host}, run /webui stop first)"
+            ),
+        };
+        msg.push_str(&rebind_hint);
     }
 
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
-        if is_wildcard {
-            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
-            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
-            msg.push_str(
-                "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
-            );
+        let warn = if is_wildcard {
+            match jeikcode_config::i18n::current_locale() {
+                jeikcode_config::locale::Locale::ZhCn => "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
+                jeikcode_config::locale::Locale::Vi => "\n⚠️ Địa chỉ chính là IP mạng cục bộ, chỉ các thiết bị trong cùng mạng mới có thể truy cập; dùng tunnel (như cloudflared / Tailscale) để truy cập Internet. Không có TLS, bất kỳ ai truy cập được đều có thể vào bằng token.",
+                _ => "\n⚠️ Primary address is a LAN IP, accessible only to devices on the same network; use a tunnel (e.g. cloudflared / Tailscale) for public access. No TLS, anyone with network access and the token can enter.",
+            }
         } else {
-            // 显式指定了具体地址：local_url 已是该地址，这里仅补安全提示。
-            msg.push_str(
-                "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
-            );
-        }
+            match jeikcode_config::i18n::current_locale() {
+                jeikcode_config::locale::Locale::ZhCn => "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
+                jeikcode_config::locale::Locale::Vi => "\n⚠️ Đã liên kết địa chỉ không phải loopback: bất kỳ ai truy cập được địa chỉ này đều có thể vào bằng token, vui lòng chỉ sử dụng trên mạng đáng tin cậy (không có TLS).",
+                _ => "\n⚠️ Bound to a non-loopback address: anyone who can reach this address can enter with this token, use only on trusted networks (no TLS).",
+            }
+        };
+        msg.push_str(warn);
     }
 
     msg
@@ -12579,9 +12607,17 @@ pub fn stop_server() -> String {
     let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         handle.abort.abort();
-        "已停止 webui server".to_string()
+        match jeikcode_config::i18n::current_locale() {
+            jeikcode_config::locale::Locale::ZhCn => "已停止 webui server".to_string(),
+            jeikcode_config::locale::Locale::Vi => "Đã dừng webui server".to_string(),
+            _ => "Stopped webui server".to_string(),
+        }
     } else {
-        "webui server 未在运行".to_string()
+        match jeikcode_config::i18n::current_locale() {
+            jeikcode_config::locale::Locale::ZhCn => "webui server 未在运行".to_string(),
+            jeikcode_config::locale::Locale::Vi => "webui server không chạy".to_string(),
+            _ => "webui server is not running".to_string(),
+        }
     }
 }
 

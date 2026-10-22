@@ -353,6 +353,14 @@ pub async fn run(
     let RuntimeEndpoint { native: runtime } = endpoint;
     let mut caps = TerminalCaps::probe();
 
+    // Ensure the i18n subsystem reflects the loaded configuration's language choice.
+    if config.language.is_some() {
+        crate::i18n::set_locale(jeikcode_config::i18n::resolve_initial_locale(
+            None,
+            config.language,
+        ));
+    }
+
     // Decide force_plain BEFORE activating TerminalGuard. Plain mode
     // is incompatible with raw-mode setup: PlainRenderer emits `\n`
     // (LF only) via `writeln!`, but raw mode disables the kernel's

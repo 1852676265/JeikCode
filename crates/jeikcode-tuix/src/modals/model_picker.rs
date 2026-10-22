@@ -294,11 +294,14 @@ fn build_menu_payload(p: &ModelPicker, ctx: &LoopCtx) -> MenuPayload {
     // renders as blank space and looks like the modal hung).
     if p.filtered.is_empty() {
         let label = if p.providers.is_empty() {
-            "(no models configured — use /provider add)".to_string()
+            crate::i18n::t(crate::i18n::Msg::ModelPickerNoModelsConfigured).into_owned()
         } else if p.query.is_empty() {
-            "(no models match)".to_string()
+            crate::i18n::t(crate::i18n::Msg::ModelPickerNoModelsMatch).into_owned()
         } else {
-            format!("(no models match \"{}\" — Backspace to clear)", p.query)
+            crate::i18n::t(crate::i18n::Msg::ModelPickerNoModelsMatchQuery {
+                query: &p.query,
+            })
+            .into_owned()
         };
         return MenuPayload {
             items: vec![(label, String::new())],

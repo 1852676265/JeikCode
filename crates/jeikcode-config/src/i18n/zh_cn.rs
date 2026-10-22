@@ -173,7 +173,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("默认已设为 {name}。").into(),
         Msg::ProviderAdded { name } =>
-            format!("已添加账号 \"{name}\"。已进入其模型列表，按 Ctrl+A 添加模型。").into(),
+            format!("已添加 Provider “{name}”。已进入其模型列表，按 Ctrl+A 添加模型。").into(),
         Msg::ProviderUpdated { name } =>
             format!("已更新 \"{name}\"。").into(),
         Msg::ProviderStepName => "Provider 名称？".into(),
@@ -225,8 +225,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelTabAccounts => "账号".into(),
         Msg::ProviderPanelTabModels => "模型".into(),
         Msg::ProviderPanelEmptyAccounts =>
-            "（尚无 Provider 账号 — 按 Ctrl+A 添加）".into(),
-        Msg::ProviderPanelNoMatchingAccounts => "（无匹配的 Provider 账号）".into(),
+            "（尚无 Provider — 按 Ctrl+A 添加）".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "（无匹配的 Provider）".into(),
         Msg::ProviderPanelEmptyModels =>
             "（尚无模型 — 按 Ctrl+A 添加，将拉取上游 /models）".into(),
         Msg::ProviderPanelNoMatchingModels => "（无匹配的模型）".into(),
@@ -234,23 +234,28 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelDefaultBadge => "默认".into(),
         Msg::ProviderPanelModelCount { count } => format!("{count} 个模型").into(),
         Msg::ProviderPanelAddModelRow => "＋ 添加模型".into(),
+        Msg::ProviderPanelAddProviderRow => "＋ 添加自定义 provider".into(),
         Msg::ProviderPanelAccountsHint =>
             "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelModelsHint =>
-            "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+            "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加模型并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
-            format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A加模型并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
+            format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A添加模型并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
         Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
         Msg::ProviderPanelImageDirectWhileVlSet => {
             "贴图将直发本模型；要用 VL 请关闭「支持图片输入」。".into()
         }
-        Msg::ProviderPanelAddTitle => "【添加 Provider 账号】".into(),
+        Msg::ProviderPanelAddTitle => "【添加 Provider】".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
             format!("【编辑账号 {account}】").into(),
         Msg::ProviderPanelAddModelTitle => "【添加模型】".into(),
         Msg::ProviderPanelEditModelTitle => "【编辑模型】".into(),
         Msg::ProviderPanelFieldVendor => "厂商".into(),
         Msg::ProviderPanelFieldAccount => "账号".into(),
+        Msg::ProviderPanelFieldName => "名称".into(),
+        Msg::ProviderPanelFieldProtocol => "协议".into(),
+        Msg::ProviderPanelRequired => "(必填)".into(),
+        Msg::ProviderPanelLocked => "(锁定)".into(),
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API 密钥".into(),
         Msg::ProviderPanelFieldModel => "模型".into(),
@@ -269,6 +274,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelProviderFormHint =>
             "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelAddAccountHint =>
+            "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回  （名称必填；模型到模型页加）".into(),
+        Msg::ProviderPanelEditAccountLockedHint =>
+            "Tab 下一项  ↵ 保存  Esc 返回  （厂商协议已锁定）".into(),
+        Msg::ProviderPanelEditAccountHint =>
+            "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelAccountNeedsKeyHint => "(该 provider 尚未配置)".into(),
         Msg::ProviderPanelModelFormHint =>
             "打开即拉取上游列表  输入筛选  ↑↓选择  Tab/↵填入  ←→切账号（模型框为空时）  空格切换  Esc返回".into(),
         Msg::ProviderPanelModelPlaceholder => "(输入筛选上游列表)".into(),
@@ -281,6 +293,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelUpstreamFailed { error } =>
             format!("上游列表请求失败（{error}），可直接输入模型 id").into(),
         Msg::ProviderPanelUpstreamNoUrl => "无可用上游地址，可直接输入模型 id".into(),
+        // ── Model picker ──
+        Msg::ModelPickerNoModelsConfigured =>
+            "(未配置模型 — 请使用 /provider 添加)".into(),
+        Msg::ModelPickerNoModelsMatch => "(无匹配模型)".into(),
+        Msg::ModelPickerNoModelsMatchQuery { query } =>
+            format!("(无匹配 “{query}” 的模型 — 按 Backspace 清除)").into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),

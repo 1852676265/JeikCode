@@ -200,6 +200,7 @@ pub enum Msg<'a> {
         count: usize,
     },
     ProviderPanelAddModelRow,
+    ProviderPanelAddProviderRow,
     ProviderPanelAccountsHint,
     ProviderPanelModelsHint,
     ProviderPanelFilteredModelsHint {
@@ -219,6 +220,10 @@ pub enum Msg<'a> {
     ProviderPanelEditModelTitle,
     ProviderPanelFieldVendor,
     ProviderPanelFieldAccount,
+    ProviderPanelFieldName,
+    ProviderPanelFieldProtocol,
+    ProviderPanelRequired,
+    ProviderPanelLocked,
     ProviderPanelFieldBaseUrl,
     ProviderPanelFieldApiKey,
     ProviderPanelFieldModel,
@@ -244,6 +249,10 @@ pub enum Msg<'a> {
     ProviderPanelKeepOriginal,
     ProviderPanelProviderFormHint,
     ProviderPanelAccountFormHint,
+    ProviderPanelAddAccountHint,
+    ProviderPanelEditAccountLockedHint,
+    ProviderPanelEditAccountHint,
+    ProviderPanelAccountNeedsKeyHint,
     ProviderPanelModelFormHint,
     /// Empty model-id field placeholder while the upstream catalog loads/filters.
     ProviderPanelModelPlaceholder,
@@ -262,6 +271,11 @@ pub enum Msg<'a> {
     },
     ProviderPanelUpstreamNoUrl,
     // ── Model picker ──
+    ModelPickerNoModelsConfigured,
+    ModelPickerNoModelsMatch,
+    ModelPickerNoModelsMatchQuery {
+        query: &'a str,
+    },
     ModelSwitched {
         provider: &'a str,
         model: &'a str,

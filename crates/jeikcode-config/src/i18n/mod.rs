@@ -771,6 +771,50 @@ mod tests {
             t_with(Locale::ZhCn, Msg::ProviderPanelAddModelRow),
             "＋ 添加模型"
         );
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelAddProviderRow),
+            "+ Add custom provider"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelAddProviderRow),
+            "＋ 添加自定义 provider"
+        );
+        assert_eq!(t_with(Locale::En, Msg::ProviderPanelFieldName), "Name");
+        assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelFieldName), "名称");
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelFieldProtocol),
+            "Protocol"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelFieldProtocol),
+            "协议"
+        );
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelRequired),
+            "(required)"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelRequired),
+            "(必填)"
+        );
+        assert_eq!(t_with(Locale::En, Msg::ProviderPanelLocked), "(locked)");
+        assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelLocked), "(锁定)");
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelAddTitle),
+            "[Add provider]"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelAddTitle),
+            "【添加 Provider】"
+        );
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelEmptyAccounts),
+            "(No providers yet — press Ctrl+A to add one)"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelEmptyAccounts),
+            "（尚无 Provider — 按 Ctrl+A 添加）"
+        );
 
         assert_eq!(
             t_with(Locale::En, Msg::ProviderPanelEmptyModels),

@@ -2562,7 +2562,11 @@ fn execute_slash_command_impl(
             // 没有自己中继的部署可设 JEIKCODE_ENABLE_RELAY=0 关掉整条链路。
             if !jeikcode_config::endpoints::relay_enabled() {
                 renderer.render(UiLine::CommandOutput(
-                    "远程访问在本部署中未启用（JEIKCODE_ENABLE_RELAY=0）。".to_string(),
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "远程访问在本部署中未启用（JEIKCODE_ENABLE_RELAY=0）。".to_string(),
+                        crate::i18n::Locale::Vi => "Truy cập từ xa chưa được bật trong bản triển khai này (JEIKCODE_ENABLE_RELAY=0).".to_string(),
+                        _ => "Remote access is not enabled in this deployment (JEIKCODE_ENABLE_RELAY=0).".to_string(),
+                    }
                 ));
                 renderer.flush();
                 return Ok(());
@@ -2619,12 +2623,25 @@ fn execute_slash_command_impl(
                     .is_some();
                 let server_stopped = jeikcode_daemon::stop_app_server();
                 let mut output = if killed || server_stopped {
-                    "已停止 App 远程访问".to_string()
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "已停止 App 远程访问".to_string(),
+                        crate::i18n::Locale::Vi => "Đã dừng truy cập từ xa cho App".to_string(),
+                        _ => "Stopped App remote access".to_string(),
+                    }
                 } else {
-                    "App 远程访问未在运行".to_string()
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "App 远程访问未在运行".to_string(),
+                        crate::i18n::Locale::Vi => "Truy cập từ xa cho App không chạy".to_string(),
+                        _ => "App remote access is not running".to_string(),
+                    }
                 };
                 if let Some(error) = detach_error {
-                    output.push_str(&format!("\n{error}；TUI 暂时保持同步"));
+                    let sync_hint = match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "TUI 暂时保持同步",
+                        crate::i18n::Locale::Vi => "TUI tạm thời duy trì đồng bộ",
+                        _ => "TUI temporarily stays synced",
+                    };
+                    output.push_str(&format!("\n{error}; {sync_hint}"));
                 }
                 output
             } else {
@@ -2637,7 +2654,11 @@ fn execute_slash_command_impl(
                 };
                 match relay_base.filter(|s| !s.is_empty()) {
                     // 仅在显式给了空参数（如 `/app --relay`）时可达。
-                    None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
+                    None => match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
+                        crate::i18n::Locale::Vi => "Cách dùng: /app (mặc định relay chính thức), hoặc /app <địa chỉ relay> để ghi đè".to_string(),
+                        _ => "Usage: /app (default official relay), or /app <relay-url> to override".to_string(),
+                    },
                     Some(relay) => {
                         // 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
                         //    每次 /app 都重建 server。
@@ -2655,7 +2676,11 @@ fn execute_slash_command_impl(
                             )
                         });
                         match started {
-                            Err(e) => format!("App server 启动失败：{e}"),
+                            Err(e) => match crate::i18n::current_locale() {
+                                crate::i18n::Locale::ZhCn => format!("App server 启动失败：{e}"),
+                                crate::i18n::Locale::Vi => format!("Khởi động App server thất bại: {e}"),
+                                _ => format!("Failed to start App server: {e}"),
+                            },
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
                                 // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。

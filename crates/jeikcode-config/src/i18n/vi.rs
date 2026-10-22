@@ -171,7 +171,7 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("Đã đặt mặc định thành {name}.").into(),
         Msg::ProviderAdded { name } =>
-            format!("Đã thêm tài khoản \"{name}\" và mở danh sách mô hình; nhấn Ctrl+A để thêm mô hình.").into(),
+            format!("Đã thêm nhà cung cấp \"{name}\" và mở danh sách mô hình; nhấn Ctrl+A để thêm mô hình.").into(),
         Msg::ProviderUpdated { name } =>
             format!("Đã cập nhật \"{name}\".").into(),
         Msg::ProviderStepName => "Tên nhà cung cấp?".into(),
@@ -222,8 +222,8 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelTabAccounts => "Tài khoản".into(),
         Msg::ProviderPanelTabModels => "Mô hình".into(),
         Msg::ProviderPanelEmptyAccounts =>
-            "(Chưa có tài khoản nhà cung cấp — nhấn Ctrl+A để thêm)".into(),
-        Msg::ProviderPanelNoMatchingAccounts => "(Không có tài khoản nhà cung cấp phù hợp)".into(),
+            "(Chưa có nhà cung cấp — nhấn Ctrl+A để thêm)".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "(Không có nhà cung cấp phù hợp)".into(),
         Msg::ProviderPanelEmptyModels =>
             "(Chưa có mô hình — nhấn Ctrl+A để thêm; lấy danh sách /models từ nhà cung cấp)".into(),
         Msg::ProviderPanelNoMatchingModels => "(Không có mô hình phù hợp)".into(),
@@ -232,6 +232,7 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelModelCount { count } =>
             format!("{count} mô hình{}", if count == 1 { "" } else { "" }).into(),
         Msg::ProviderPanelAddModelRow => "+ Thêm mô hình".into(),
+        Msg::ProviderPanelAddProviderRow => "+ Thêm nhà cung cấp tùy chỉnh".into(),
         Msg::ProviderPanelAccountsHint =>
             "Lọc · ↑↓ chọn · ↵ mô hình · Ctrl+A thêm · Ctrl+E sửa · Ctrl+Dx2 xóa · Tab chuyển · Esc đóng".into(),
         Msg::ProviderPanelModelsHint =>
@@ -242,13 +243,17 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelImageDirectWhileVlSet => {
             "Ảnh được gửi đến mô hình này; tắt đầu vào ảnh để dùng VL.".into()
         }
-        Msg::ProviderPanelAddTitle => "[Thêm tài khoản nhà cung cấp]".into(),
+        Msg::ProviderPanelAddTitle => "[Thêm nhà cung cấp]".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
             format!("[Sửa tài khoản {account}]").into(),
         Msg::ProviderPanelAddModelTitle => "[Thêm mô hình]".into(),
         Msg::ProviderPanelEditModelTitle => "[Sửa mô hình]".into(),
         Msg::ProviderPanelFieldVendor => "Nhà cung cấp".into(),
         Msg::ProviderPanelFieldAccount => "Tài khoản".into(),
+        Msg::ProviderPanelFieldName => "Tên".into(),
+        Msg::ProviderPanelFieldProtocol => "Giao thức".into(),
+        Msg::ProviderPanelRequired => "(bắt buộc)".into(),
+        Msg::ProviderPanelLocked => "(đã khóa)".into(),
         Msg::ProviderPanelFieldBaseUrl => "URL gốc".into(),
         Msg::ProviderPanelFieldApiKey => "Khóa API".into(),
         Msg::ProviderPanelFieldModel => "Mô hình".into(),
@@ -267,6 +272,13 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelProviderFormHint =>
             "Tab Tiếp  ←→ Đổi nhà cung cấp  Space Bật/tắt  ↵ Lưu  Esc Quay lại".into(),
         Msg::ProviderPanelAccountFormHint => "Tab Chuyển  ↵ Lưu  Esc Quay lại".into(),
+        Msg::ProviderPanelAddAccountHint =>
+            "Tab Tiếp  ←→ Đổi giao thức  ↵ Lưu  Esc Quay lại  (Tên bắt buộc; thêm mô hình ở tab Mô hình)".into(),
+        Msg::ProviderPanelEditAccountLockedHint =>
+            "Tab Tiếp  ↵ Lưu  Esc Quay lại  (Giao thức nhà cung cấp đã khóa)".into(),
+        Msg::ProviderPanelEditAccountHint =>
+            "Tab Tiếp  ←→ Đổi giao thức  ↵ Lưu  Esc Quay lại".into(),
+        Msg::ProviderPanelAccountNeedsKeyHint => "(nhà cung cấp này chưa được định cấu hình)".into(),
         Msg::ProviderPanelModelFormHint =>
             "Mở danh sách từ nhà cung cấp  Gõ để lọc  ↑↓ chọn  Tab/↵ điền  ←→ tài khoản (mô hình trống)  Space bật/tắt  Esc quay lại".into(),
         Msg::ProviderPanelModelPlaceholder => "(gõ để lọc danh sách từ nhà cung cấp)".into(),
@@ -280,8 +292,13 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelUpstreamFailed { error } =>
             format!("Không lấy được danh sách từ nhà cung cấp ({error}) — nhập mã mô hình").into(),
         Msg::ProviderPanelUpstreamNoUrl =>
-            "Chưa có URL nhà cung cấp — nhập mã mô hình".into(),
-
+            "Không có URL của nhà cung cấp — nhập mã mô hình".into(),
+        // ── Model picker ──
+        Msg::ModelPickerNoModelsConfigured =>
+            "(chưa cấu hình mô hình — dùng /provider để thêm)".into(),
+        Msg::ModelPickerNoModelsMatch => "(không có mô hình phù hợp)".into(),
+        Msg::ModelPickerNoModelsMatchQuery { query } =>
+            format!("(không có mô hình khớp với \"{query}\" — nhấn Backspace để xóa)").into(),
         Msg::ModelSwitched { provider, model } =>
             format!("  Đã chuyển sang {provider} · {model} cho phiên này\n").into(),
         Msg::ModelSwitchedAndDefault { provider, model } =>

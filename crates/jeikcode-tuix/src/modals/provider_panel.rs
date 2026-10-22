@@ -1766,8 +1766,21 @@ impl Modal for ProviderPanel {
                 match self.tab {
                     Tab::Accounts => {
                         let ids = self.filtered_ids(&ctx.config);
+                        let empty_description = if ids.is_empty() {
+                            let msg = if self.query.trim().is_empty() {
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelEmptyAccounts)
+                            } else {
+                                crate::i18n::t(crate::i18n::Msg::ProviderPanelNoMatchingAccounts)
+                            };
+                            msg.into_owned()
+                        } else {
+                            String::new()
+                        };
                         // Leading "+ 添加自定义 provider" affordance placed at TOP (also Ctrl+A).
-                        items.push(("＋ 添加自定义 provider".to_string(), String::new()));
+                        items.push((
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAddProviderRow).into_owned(),
+                            empty_description,
+                        ));
                         for id in &ids {
                             let a = accounts.get(id);
                             let count = models.values().filter(|m| m.account == *id).count();
@@ -1859,13 +1872,17 @@ impl Modal for ProviderPanel {
                 ));
                 items.push((String::new(), String::new()));
                 let name = if form.name.is_empty() {
-                    "(必填)".to_string()
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelRequired).into_owned()
                 } else {
                     form.name.clone()
                 };
-                items.push(field_row("名称", name, form.focus == FormField::Name));
                 items.push(field_row(
-                    "协议",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldName),
+                    name,
+                    form.focus == FormField::Name,
+                ));
+                items.push(field_row(
+                    &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldProtocol),
                     format!(
                         "‹ {} ›   ({})",
                         form.protocol_label(),
@@ -1896,8 +1913,7 @@ impl Modal for ProviderPanel {
                     ));
                 }
                 // Account-only form — model/window/default moved to the 模型 tab.
-                hint =
-                    "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回  （名称必填；模型到模型页加）".into();
+                hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelAddAccountHint).into_owned();
             }
             Mode::EditAccount(form) => {
                 let field_row = |label: &str, value: String, focused: bool| {
@@ -1913,16 +1929,18 @@ impl Modal for ProviderPanel {
                 ));
                 items.push((String::new(), String::new()));
                 let p = form.preset();
+                let protocol_label = crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldProtocol);
                 if form.vendor_locked || form.protocol_locked {
                     // Gateway-managed accounts lock protocol + key; curated
                     // preset rows lock only the protocol.
+                    let locked_label = crate::i18n::t(crate::i18n::Msg::ProviderPanelLocked);
                     items.push((
-                        format!("  协议: {} (锁定)", form.protocol_label()),
+                        format!("  {protocol_label}: {} {locked_label}", form.protocol_label()),
                         String::new(),
                     ));
                 } else {
                     items.push(field_row(
-                        "协议",
+                        &protocol_label,
                         format!(
                             "‹ {} ›   ({})",
                             form.protocol_label(),
@@ -1948,9 +1966,9 @@ impl Modal for ProviderPanel {
                     ));
                 }
                 hint = if form.protocol_locked {
-                    "Tab 下一项  ↵ 保存  Esc 返回  （厂商协议已锁定）".into()
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelEditAccountLockedHint).into_owned()
                 } else {
-                    "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into()
+                    crate::i18n::t(crate::i18n::Msg::ProviderPanelEditAccountHint).into_owned()
                 };
             }
             Mode::Model(form) => {
@@ -1988,9 +2006,11 @@ impl Modal for ProviderPanel {
                     // This provider has no api_key yet — collect it once here.
                     if form.account_needs_key() {
                         let masked = "•".repeat(form.api_key.chars().count());
+                        let unconfigured =
+                            crate::i18n::t(crate::i18n::Msg::ProviderPanelAccountNeedsKeyHint);
                         items.push(field_row(
-                            "api_key",
-                            format!("{masked}   (该 provider 尚未配置)"),
+                            &crate::i18n::t(crate::i18n::Msg::ProviderPanelFieldApiKey),
+                            format!("{masked}   {unconfigured}"),
                             form.focus == ModelField::ApiKey,
                         ));
                     }
