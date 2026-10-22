@@ -60,7 +60,8 @@ export function OnboardingWizard({
                   disabled={saving}
                   onClick={() => { setChoice(value); void saveChoice(value); }}
                 >
-                  {label}
+                  <span class="lang-btn-name">{label}</span>
+                  {choice === value && <span class="lang-btn-check">✓</span>}
                 </button>
               ))}
             </div>

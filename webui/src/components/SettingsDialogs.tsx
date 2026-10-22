@@ -178,16 +178,17 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
     <SettingsModal title={t('settings.menuLang')} onClose={onClose}>
       <div class="field-group">
         <span class="modal-label">{t('settings.language')}</span>
-        <div class="segmented">
+        <div class="segmented-language-grid">
           {options.map((o) => (
             <button
               key={o.value}
-              class={'segmented-btn' + (lang === o.value ? ' active' : '')}
+              class={'segmented-language-btn' + (lang === o.value ? ' active' : '')}
               onClick={() => void chooseLanguage(o.value)}
               disabled={saving}
               type="button"
             >
-              {o.label}
+              <span class="lang-btn-name">{o.label}</span>
+              {lang === o.value && <span class="lang-btn-check">✓</span>}
             </button>
           ))}
         </div>

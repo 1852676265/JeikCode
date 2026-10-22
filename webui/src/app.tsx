@@ -15,6 +15,7 @@ import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
 import { ConfirmModalHost } from './components/ConfirmDialog';
 import { parseFilePathAndLines } from './lib/displayPath';
+import { languageOptions } from './i18n';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销
 const ThemeDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ThemeDialog })));
@@ -1355,44 +1356,39 @@ export function App() {
                 aria-label={t('settings.menuLang')}
                 aria-expanded={langMenuOpen}
               >
-                <span>{lang === 'zh' ? '简' : lang === 'vi' ? 'VI' : 'EN'}</span>
+                <span>{(() => {
+                  switch (lang) {
+                    case 'zh': return '简';
+                    case 'zh-TW': return '繁';
+                    case 'ja': return 'JA';
+                    case 'ko': return 'KO';
+                    case 'ru': return 'RU';
+                    case 'fr': return 'FR';
+                    case 'es': return 'ES';
+                    case 'de': return 'DE';
+                    case 'ar': return 'AR';
+                    case 'vi': return 'VI';
+                    default: return 'EN';
+                  }
+                })()}</span>
               </button>
 
               {langMenuOpen && (
                 <div class="top-nav-lang-menu" role="menu">
-                  <button
-                    type="button"
-                    class={'lang-menu-item' + (lang === 'zh' ? ' active' : '')}
-                    onClick={() => {
-                      setLang('zh');
-                      setLangMenuOpen(false);
-                    }}
-                  >
-                    <span class="lang-item-name">简体中文</span>
-                    {lang === 'zh' && <span class="lang-item-check">✓</span>}
-                  </button>
-                  <button
-                    type="button"
-                    class={'lang-menu-item' + (lang === 'en' ? ' active' : '')}
-                    onClick={() => {
-                      setLang('en');
-                      setLangMenuOpen(false);
-                    }}
-                  >
-                    <span class="lang-item-name">English</span>
-                    {lang === 'en' && <span class="lang-item-check">✓</span>}
-                  </button>
-                  <button
-                    type="button"
-                    class={'lang-menu-item' + (lang === 'vi' ? ' active' : '')}
-                    onClick={() => {
-                      setLang('vi');
-                      setLangMenuOpen(false);
-                    }}
-                  >
-                    <span class="lang-item-name">Tiếng Việt</span>
-                    {lang === 'vi' && <span class="lang-item-check">✓</span>}
-                  </button>
+                  {languageOptions.map(({ value: v, label }) => (
+                    <button
+                      key={v}
+                      type="button"
+                      class={'lang-menu-item' + (lang === v ? ' active' : '')}
+                      onClick={() => {
+                        setLang(v);
+                        setLangMenuOpen(false);
+                      }}
+                    >
+                      <span class="lang-item-name">{label}</span>
+                      {lang === v && <span class="lang-item-check">✓</span>}
+                    </button>
+                  ))}
                 </div>
               )}
             </div>
@@ -1467,7 +1463,7 @@ export function App() {
                       <path d="M12 3a15 15 0 0 0 0 18" />
                     </svg>
                     <span>{t('header.language')}</span>
-                    <span class="top-nav-more-trailing">{lang === 'zh' ? '简体中文' : lang === 'vi' ? 'Tiếng Việt' : 'English'}</span>
+                    <span class="top-nav-more-trailing">{languageOptions.find((o) => o.value === lang)?.label ?? 'English'}</span>
                   </button>
 
                   <button

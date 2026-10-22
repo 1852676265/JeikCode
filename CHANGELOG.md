@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.3 (2026-10-22)
+
+- **[WebUI Global Language Switchers & Dialogs Overhaul] Complete coverage across top-nav dropdown, settings modal, and onboarding wizard**:
+  - Dynamically rendered all 11 supported languages in the desktop top-right header language dropdown (`top-nav-lang-menu`), replacing previous hardcoded three-button markup with interactive selection and checkmarks.
+  - Upgraded `LanguageDialog` in `SettingsDialogs.tsx` and `OnboardingWizard.tsx` with responsive grid layouts (`segmented-language-grid`, `onboarding-lang-row`), ensuring all 11 languages are fully selectable without horizontal clipping.
+  - Updated language indicator badge in the top navigation bar and mobile overflow drawer to accurately display localized language codes and names.
+
+---
+
+- **[WebUI 语言切换控件与配置弹窗全面升级] 顶栏常驻下拉、设置弹窗与首开向导完整支持全语种**:
+  - 重构电脑端右上角顶栏常驻语言下拉菜单（`top-nav-lang-menu`），由 `languageOptions` 动态渲染全部 11 种主流语言选项与选中状态，彻底替换此前遗留的硬编码 3 选项结构。
+  - 升级 `SettingsDialogs.tsx` 中的 `LanguageDialog` 与 `OnboardingWizard.tsx` 首开向导，采用响应式网格布局（`segmented-language-grid`），使全球 11 种语言在弹窗中一目了然且点击即生效。
+  - 同步更新顶栏胶囊与移动端折叠菜单中的语言简称与全称展示。
+
 ## v7.2.9-beta.2 (2026-10-22)
 
 - **[Global Modular i18n & Comprehensive Localization] System-wide modular translation architecture**:
