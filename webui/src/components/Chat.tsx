@@ -9391,12 +9391,15 @@ export function Chat({
                 if (start >= 0) {
                   const targetList = textParts.length > 0 ? textParts : fallbackParts;
                   let lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
-                  // Todo 打勾拦截智能回锚：如果该回合最后调用的工具是 TodoWrite，且打勾后的文本明显短于打勾前的成果（或打勾后只是 <150 字的客套话），
-                  // 复制最终回答按钮自动回锚至打勾前的核心业务正文！
+                  // Todo 打勾拦截智能回锚（防误杀严密判定）：
+                  // 1. 本轮以 TodoWrite 工具收尾；
+                  // 2. 打勾前正文长度严格大于打勾后；
+                  // 3. 打勾前正文达到实质性规模（>= 150 字符）或字数是后者的 2 倍以上。
                   if (targetList.length >= 2 && lastToolName && isTodoTool(lastToolName)) {
                     const post = targetList[targetList.length - 1];
                     const pre = targetList[targetList.length - 2];
-                    if (pre.trim().length > post.trim().length || post.trim().length < 150) {
+                    const isAsymmetric = pre.trim().length > post.trim().length && (pre.trim().length >= 150 || pre.trim().length >= post.trim().length * 2);
+                    if (isAsymmetric) {
                       lastText = pre;
                     }
                   }
@@ -9420,7 +9423,8 @@ export function Chat({
               if (targetList.length >= 2 && lastToolName && isTodoTool(lastToolName)) {
                 const post = targetList[targetList.length - 1];
                 const pre = targetList[targetList.length - 2];
-                if (pre.trim().length > post.trim().length || post.trim().length < 150) {
+                const isAsymmetric = pre.trim().length > post.trim().length && (pre.trim().length >= 150 || pre.trim().length >= post.trim().length * 2);
+                if (isAsymmetric) {
                   lastText = pre;
                 }
               }

@@ -1355,7 +1355,15 @@ async fn collect_compat_response(
         } else {
             let post = valid_blocks[valid_blocks.len() - 1];
             let pre = valid_blocks[valid_blocks.len() - 2];
-            if last_tool_is_todo && (pre.trim().len() > post.trim().len() || post.trim().chars().count() < 150) {
+            // 防误杀严密判定：必须同时满足以下条件才触发回锚：
+            // 1. 最后一个调用的工具是待办工具（last_tool_is_todo）；
+            // 2. 打勾前的正文长度严格大于打勾后的正文长度（pre > post）；
+            // 3. 打勾前的正文达到实质性规模（>= 150 字符）或者字数是后者的 2 倍以上（表明前段是核心成果，后段只是客套附言）。
+            // 这样对于日常用户主动说“帮我勾掉任务1”等两段都很短的普通对话，绝不会误杀！
+            let is_asymmetric_todo_nudge = last_tool_is_todo
+                && pre.trim().chars().count() > post.trim().chars().count()
+                && (pre.trim().chars().count() >= 150 || pre.trim().len() >= post.trim().len() * 2);
+            if is_asymmetric_todo_nudge {
                 pre.clone()
             } else {
                 post.clone()
