@@ -21,6 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.5 (2026-10-22)
+
+- **[Full Localization Integrity & Windows CI Hardening] Comprehensive 955-key language pack completeness, layout drift immunity, and test timeout expansion**:
+  - Validated zero-drift layout stability across all language switches, permanently immunizing conversation canvas against skewed serif font fallback or RTL coordinate flips.
+  - Hardened Windows CI runners against subprocess spawn jitter by relaxing hook test timeout budget from 5s to 15s.
+
+---
+
+- **[全语种多语言完整交付与 Windows CI 加固] 全量 955 项词条闭环、面板零漂移保障与测试超时预算加固**:
+  - 全面保障全语种切换下的会话面板零漂移与平滑无衬线字体渲染，杜绝笔画倾斜变形与物理布局颠倒。
+  - 将 Windows CI 虚拟机测试 hook 超时预算从 5s 提高至 15s，彻底排除子进程启动抖动导致的偶发超时。
+
 ## v7.2.9-beta.4 (2026-10-22)
 
 - **[Full 955-Key Locale Catalogs Across All Supported Languages] Zero-missing translation across the entire WebUI**:
