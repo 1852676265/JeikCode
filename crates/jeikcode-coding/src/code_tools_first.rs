@@ -3,7 +3,8 @@
 //! 1. **Opening tail** — on the first real user query, inject a
 //!    `<strong-reminder>` to that same user block (placed cleanly before any
 //!    `<system-reminder>` date block). On the wire, `<strong-reminder>` tags
-//!    are unwrapped, presenting a clean user prompt tail to the model.
+//!    are unwrapped, presenting a clean user prompt tail to the model:
+//!    "Explore the codebase generously before answering. Use `code_explore` to accelerate code logic retrieval and quickly gain a complete overview."
 //!    TUI / WebUI / IDEs strip it completely via
 //!    [`jeikcode_capabilities::session::user_text_for_display`].
 //! 2. **Wander meter** — a per-session counter over `grep` + `glob` +
