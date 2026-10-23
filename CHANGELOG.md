@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.6 (2026-10-23)
+
+- **[Cumulative Steer Timer & Completed Todo Turn Freeze Resolution] Accurate chained steer turn duration tracking, phantom active turn elimination, and canvas freeze fixes**:
+  - Preserved cumulative execution duration across mid-turn steer requests and send-immediately steer cards, retaining root user prompt timestamps in snapshot persistence and aggregating full composite turn elapsed times.
+  - Resolved canvas freezing and remote browser spinning loop when all todo list items are marked completed before the final stop frame, validating runtime phase to eliminate phantom active statuses in `/chat/active`.
+  - Added `replay_last` tagging for stream head replay frames and released fold gates on open user turns, preventing remote client disconnects and deadlock on incomplete history.
+  - Upgraded `dompurify` to 3.4.17 to remediate critical security vulnerability GHSA-cg2g-xh64-v4q7 in WebUI dependency audit.
+
+---
+
+- **[Steer 累计计时与 TodoList 完结卡死修复] 链式转向时长精准累加、消除幽灵活跃态与画布冻结修复**:
+  - 全面支持中途 steer 转向与立即发送 steer 卡片的累计计时流转与落盘，在快照中持续保留根提问起始时间戳，彻底解决多次转向后仅记录最后一小段轮次耗时的问题。
+  - 修复任务停止前提前勾完所有 todolist 时导致的画布冻结与异地浏览器转圈卡死问题，通过严密校验底层运行时相位，彻底消除 `/chat/active` 中的幽灵活跃态。
+  - 服务端推流尾帧补充 `replay_last` 标识并在存在开放用户提问时及时释放折叠闸门，防止异地端持续等待未来直播帧导致白屏卡顿。
+  - 升级 `dompurify` 依赖至 3.4.17，修复 WebUI 安全审计中的 GHSA-cg2g-xh64-v4q7 严重安全漏洞。
+
 ## v7.2.9-beta.5 (2026-10-22)
 
 - **[Full Localization Integrity & Windows CI Hardening] Comprehensive 955-key language pack completeness, layout drift immunity, and test timeout expansion**:
