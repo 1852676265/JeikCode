@@ -979,6 +979,70 @@ fn take_windows_path_token(s: &str) -> Option<(String, usize)> {
     Some((s[..end].to_string(), end))
 }
 
+/// 跨平台自动转义双引号内包含的孤立反引号（`），阻断 Bash 命令替换引发的
+/// `unexpected EOF while looking for matching ``'` 致命语法错误。
+///
+/// 在 POSIX Bash 规范中，双引号 `"..."` 内部单引号失去保护作用，而反引号仍会强制触发命令替换。
+/// 当内联脚本（如 `python -c "..."` 或 `node -e "..."`）包含 Markdown 围栏或正则反引号时，
+/// 必须在双引号内将未转义的反引号安全转义为 \`，让子进程接收原样字面量。
+pub(crate) fn escape_unquoted_backticks_in_inline_script(cmd: &str) -> Option<String> {
+    if !cmd.contains('`') {
+        return None;
+    }
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    let mut changed = false;
+    let mut out = String::with_capacity(cmd.len() + 8);
+
+    let chars: Vec<char> = cmd.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let ch = chars[i];
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            out.push('\\');
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        // 当处于双引号包裹内，遇到孤立的反引号（`）时，Bash 会将其解析为命令替换触发点
+        // 将其转义为 \`，让 Bash 将其视为普通字面量传给子程序（如 python -c / node -e）
+        if in_double && ch == '`' {
+            out.push('\\');
+            out.push('`');
+            changed = true;
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn rewrite_tool_heads(command: &str, names: &[&str], replacement: &str) -> String {
     let mut out = String::with_capacity(command.len() + replacement.len());
     let mut i = 0usize;

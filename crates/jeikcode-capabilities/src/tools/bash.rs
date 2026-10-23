@@ -917,9 +917,9 @@ impl Tool for BashTool {
                                 ),
                             )));
                         }
-                    } else if elapsed >= Duration::from_secs(3) && !is_network_or_download_workload(&effective_command) {
+                    } else if elapsed >= Duration::from_secs(15) && !is_network_or_download_workload(&effective_command) {
                         // 陌生脚本 / 阻塞式命令自适应收网：
-                        // 排除网络下载类任务（apt/npm/curl等），屏幕已静默超过 3 秒，且整棵子进程树 CPU 已经彻底归零（处于内核输入等待态）
+                        // 排除网络下载类任务（apt/npm/curl等），屏幕已静默超过 15 秒，且整棵子进程树 CPU 已经彻底归零（处于内核输入等待态）
                         #[cfg(windows)]
                         let busy = tree_is_busy(child_pid, &job_guard).await;
                         #[cfg(not(windows))]
@@ -1857,6 +1857,8 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
     let shell = "sh";
     #[cfg(not(target_env = "ohos"))]
     let shell = detect_unix_shell();
+    let command = crate::process_utils::escape_unquoted_backticks_in_inline_script(&command)
+        .unwrap_or(command);
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c").arg(&command);
     apply_shell_env(&mut cmd);
@@ -2762,6 +2764,8 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
             .map(std::path::Path::to_path_buf);
         let command = rewrite_msys_arg_conventions(command.as_ref(), git_root.as_deref());
         let command = crate::process_utils::rewrite_python3_for_windows_shell(command.as_ref());
+        let command = crate::process_utils::escape_unquoted_backticks_in_inline_script(&command)
+            .unwrap_or(command);
         let mut cmd = tokio::process::Command::new(&bash);
 
         // Grok-Build hardening: prevent MSYS2 from rewriting /flags (e.g. /NOLOGO, /DEBUG, /t:Build) into pseudo paths
@@ -4538,6 +4542,12 @@ pub(crate) fn is_network_or_download_workload(cmd: &str) -> bool {
                 | "go"
                 | "mvn"
                 | "gradle"
+                | "jeik"
+                | "playwright"
+                | "puppeteer"
+                | "pytest"
+                | "scrapy"
+                | "httpx"
         ) {
             return true;
         }

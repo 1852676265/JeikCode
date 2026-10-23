@@ -304,9 +304,17 @@ fn repair_and_route_shell_args(tool_name: &str, args: &str) -> String {
 
     // 2. 引号平衡自愈：自动修复如 python -c "... 尾部缺失闭合引号，阻断 Bash unexpected EOF
     if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
-        if let Some(healed_cmd) = heal_unclosed_quotes(command) {
-            object.insert("command".into(), serde_json::Value::String(healed_cmd));
+        let mut cur = command.to_string();
+        if let Some(healed_cmd) = heal_unclosed_quotes(&cur) {
+            cur = healed_cmd;
             changed = true;
+        }
+        if let Some(healed_cmd) = heal_inline_script_backticks(&cur) {
+            cur = healed_cmd;
+            changed = true;
+        }
+        if changed {
+            object.insert("command".into(), serde_json::Value::String(cur));
         }
     }
 
@@ -400,6 +408,11 @@ fn heal_unclosed_quotes(cmd: &str) -> Option<String> {
         return Some(fixed);
     }
     None
+}
+
+/// 自动转义双引号内包含的孤立反引号（`），阻断 Bash 命令替换引发的 `unexpected EOF while looking for matching ``'`
+fn heal_inline_script_backticks(cmd: &str) -> Option<String> {
+    crate::process_utils::escape_unquoted_backticks_in_inline_script(cmd)
 }
 
 fn looks_unmistakably_powershell(command: &str) -> bool {
@@ -2842,6 +2855,27 @@ mod tests {
         assert_eq!(
             val_single["command"],
             "python -c 'import json; print(\"ok\")'"
+        );
+    }
+
+    #[test]
+    fn shell_repair_heals_inline_script_backticks_preventing_bash_substitution_eof() {
+        // 双引号内部未转义的 Markdown 三反引号 ``` 阻断 Bash EOF
+        let raw = r#"{"command":"python -c \"content = '```'; print(len(content))\""}"#;
+        let out = repair_and_route_shell_args("run_command", raw);
+        let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            val["command"],
+            r#"python -c "content = '\`\`\`'; print(len(content))""#
+        );
+
+        // 已经转义过的反引号不重复转义 (JSON 中字面量反斜杠为 \\)
+        let already_escaped = r#"{"command":"python -c \"content = '\\`\\`\\`'; print(len(content))\""}"#;
+        let out_escaped = repair_and_route_shell_args("run_command", already_escaped);
+        let val_escaped: serde_json::Value = serde_json::from_str(&out_escaped).unwrap();
+        assert_eq!(
+            val_escaped["command"],
+            r#"python -c "content = '\`\`\`'; print(len(content))""#
         );
     }
 
