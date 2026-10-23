@@ -3413,10 +3413,28 @@ body {
   color: #f87171;
   border: 1px solid rgba(239, 68, 68, 0.3);
 }
+:root[data-theme='light'] .git-alert-error {
+  background: #fef2f2 !important;
+  color: #b91c1c !important;
+  border: 1px solid #fca5a5 !important;
+  font-weight: 500;
+}
+:root[data-theme='light'] .git-alert-error button {
+  color: #b91c1c !important;
+}
 .git-alert-success {
   background: rgba(16, 185, 129, 0.15);
   color: #34d399;
   border: 1px solid rgba(16, 185, 129, 0.3);
+}
+:root[data-theme='light'] .git-alert-success {
+  background: #ecfdf5 !important;
+  color: #065f46 !important;
+  border: 1px solid #6ee7b7 !important;
+  font-weight: 500;
+}
+:root[data-theme='light'] .git-alert-success button {
+  color: #047857 !important;
 }
 .git-alert-banner button {
   background: transparent;
@@ -4650,12 +4668,17 @@ body {
 }
 
 .tool-name {
-  font-weight: 600;
+  font-weight: 650;
   font-size: 13px;
   color: var(--app-tool-name-color, var(--app-link-color));
   /* No text-transform: `displayToolName` already cases names correctly
      (PascalCase for builtins, lowercase `mcp · server · tool` for MCP). */
   flex-shrink: 0;
+}
+:root[data-theme='light'] .tool-name {
+  color: #1d4ed8 !important;
+  font-weight: 650 !important;
+  letter-spacing: -0.01em;
 }
 
 .tool-glyph {
@@ -4664,8 +4687,12 @@ body {
   text-align: center;
   font-family: var(--app-monospace-font-family);
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
   color: var(--app-tool-name-color, var(--app-link-color));
+}
+:root[data-theme='light'] .tool-glyph {
+  color: #1d4ed8 !important;
+  font-weight: 700 !important;
 }
 
 .tool-name-secondary {
@@ -4680,6 +4707,9 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+:root[data-theme='light'] .tool-name-secondary {
+  color: #334155 !important;
 }
 
 .json-tok-key { color: var(--app-json-key); font-weight: 600; }
@@ -11991,6 +12021,21 @@ body {
 .remote-access-live {
   color: #10b981;
   border-color: rgba(16, 185, 129, 0.45);
+}
+:root[data-theme='light'] .remote-access-live {
+  color: #047857 !important;
+  background: #ecfdf5 !important;
+  border-color: #059669 !important;
+  box-shadow: 0 1px 3px rgba(4, 120, 87, 0.12);
+}
+:root[data-theme='light'] .remote-access-live svg {
+  color: #047857 !important;
+  stroke: #047857 !important;
+}
+:root[data-theme='light'] .remote-access-live .remote-access-port-text {
+  color: #047857 !important;
+  font-weight: 650 !important;
+  opacity: 1 !important;
 }
 .remote-access-modal-card {
   width: min(440px, 94vw);
