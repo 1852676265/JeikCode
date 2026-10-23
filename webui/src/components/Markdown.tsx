@@ -202,10 +202,8 @@ export function Markdown({
   onMatchCountChange?: (count: number) => void;
   targetContext?: 'main' | 'right' | 'chat';
 }) {
-  const { theme, lang, t } = useSettings();
-  const isDark = (theme === 'dark') ||
-    (theme === 'system' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) ||
-    (typeof document !== 'undefined' && document.documentElement.dataset.theme === 'dark');
+  const { theme, effectiveTheme, lang, t } = useSettings();
+  const isDark = effectiveTheme ? effectiveTheme === 'dark' : (theme === 'dark');
 
   const rootRef = useRef<HTMLDivElement>(null);
 

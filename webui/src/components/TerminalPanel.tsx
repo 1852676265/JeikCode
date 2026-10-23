@@ -285,13 +285,8 @@ function saveActiveTab(tabId: string, projectCwd?: string) {
 
 export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelProps) {
   const t = useT();
-  const { theme } = useSettings();
-  const isDark =
-    theme === 'dark' ||
-    (theme === 'system' &&
-      typeof window !== 'undefined' &&
-      window.matchMedia('(prefers-color-scheme: dark)').matches) ||
-    (typeof document !== 'undefined' && document.documentElement.dataset.theme !== 'light');
+  const { theme, effectiveTheme } = useSettings();
+  const isDark = effectiveTheme ? effectiveTheme === 'dark' : (theme === 'dark');
 
   const sessionScopeKey = cwd || 'default';
 

@@ -2965,6 +2965,112 @@ body {
   opacity: 0.6;
 }
 
+/* ==========================================================================
+   Diff Viewer & Editor Tabs - Light Theme Adaptations
+   ========================================================================== */
+:root[data-theme='light'] .vscode-diff-view-stage {
+  background: #ffffff;
+  color: #0f172a;
+}
+:root[data-theme='light'] .diff-viewer-root {
+  background: #ffffff;
+  color: #0f172a;
+}
+:root[data-theme='light'] .diff-viewer-toolbar {
+  background: #f1f5f9;
+  border-bottom-color: #e2e8f0;
+}
+:root[data-theme='light'] .diff-hash-pill {
+  background: rgba(37, 99, 235, 0.1);
+  color: #2563eb;
+}
+:root[data-theme='light'] .diff-meta-msg {
+  color: #0f172a;
+}
+:root[data-theme='light'] .diff-meta-divider {
+  color: #94a3b8;
+}
+:root[data-theme='light'] .diff-meta-path {
+  color: #475569;
+}
+:root[data-theme='light'] .diff-code-table {
+  color: #0f172a;
+}
+:root[data-theme='light'] .diff-row:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+:root[data-theme='light'] .diff-gutter-num {
+  color: #94a3b8;
+}
+:root[data-theme='light'] .diff-row-add {
+  background-color: #dcfce7;
+  color: #15803d;
+}
+:root[data-theme='light'] .diff-row-add .diff-gutter-marker {
+  color: #16a34a;
+}
+:root[data-theme='light'] .diff-row-del {
+  background-color: #fee2e2;
+  color: #b91c1c;
+}
+:root[data-theme='light'] .diff-row-del .diff-gutter-marker {
+  color: #dc2626;
+}
+:root[data-theme='light'] .diff-row-hunk {
+  background-color: #f3e8ff;
+  color: #6b21a8;
+}
+:root[data-theme='light'] .diff-row-hunk .hunk-header {
+  color: #7c3aed;
+}
+:root[data-theme='light'] .diff-row-header {
+  background-color: #f8fafc;
+}
+:root[data-theme='light'] .diff-row-header .file-header {
+  color: #64748b;
+}
+:root[data-theme='light'] .diff-loading-wrap {
+  color: #475569;
+}
+
+:root[data-theme='light'] .vscode-editor-tabs-bar {
+  background: #eaecee;
+  border-bottom-color: #d2d6dc;
+}
+:root[data-theme='light'] .vscode-editor-tab {
+  background: #e2e5e9;
+  border-right-color: #d2d6dc;
+  color: #64748b;
+}
+:root[data-theme='light'] .vscode-editor-tab:hover {
+  background: #d8dce2;
+  color: #0f172a;
+}
+:root[data-theme='light'] .vscode-editor-tab.active {
+  background: #ffffff;
+  color: #0f172a;
+  border-top-color: #2563eb;
+}
+:root[data-theme='light'] .vscode-tab-close {
+  color: #64748b;
+}
+:root[data-theme='light'] .vscode-tab-close:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: #0f172a;
+}
+:root[data-theme='light'] .vscode-tab-badge.status-m {
+  background: rgba(217, 119, 6, 0.15);
+  color: #b45309;
+}
+:root[data-theme='light'] .vscode-tab-badge.status-a {
+  background: rgba(22, 163, 74, 0.15);
+  color: #15803d;
+}
+:root[data-theme='light'] .vscode-tab-badge.status-d {
+  background: rgba(220, 38, 38, 0.15);
+  color: #b91c1c;
+}
+
 
 .right-inspector-backdrop {
   display: none;
@@ -7833,6 +7939,32 @@ body {
 }
 .diff-line.diff-ctx .diff-sign {
   opacity: 0;
+}
+
+:root[data-theme='light'] .diff-line.diff-meta {
+  color: #0284c7;
+  background: rgba(2, 132, 199, 0.08);
+}
+:root[data-theme='light'] .diff-line.diff-add {
+  color: #15803d;
+  background: #dcfce7;
+}
+:root[data-theme='light'] .diff-line.diff-add .diff-sign {
+  color: #16a34a;
+}
+:root[data-theme='light'] .diff-line.diff-del {
+  color: #b91c1c;
+  background: #fee2e2;
+}
+:root[data-theme='light'] .diff-line.diff-del .diff-sign {
+  color: #dc2626;
+}
+:root[data-theme='light'] .diff-line.diff-ctx {
+  color: #0f172a;
+}
+:root[data-theme='light'] .diff-ln {
+  color: #64748b;
+  border-right-color: #d2d6dc;
 }
 .code-line {
   display: grid;
@@ -14727,21 +14859,33 @@ body {
 }
 
 /* ==========================================================================
-   Markdown Light Theme Adaptations (Tables, Quotes, Codeblocks)
+   Markdown Light Theme Adaptations (Tables, Quotes, Codeblocks, Badges)
    ========================================================================== */
 :root[data-theme='light'] .markdown-root :not(pre) > code,
 :root[data-theme='light'] .markdown-root code:not(pre code) {
   color: #0f172a !important;
   background: rgba(15, 23, 42, 0.07) !important;
-  border: none !important;
+  border: 1px solid rgba(15, 23, 42, 0.08) !important;
   font-weight: 600;
+}
+
+:root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge {
+  color: #0369a1 !important;
+  background: rgba(2, 132, 199, 0.08) !important;
+  border: 1px solid rgba(2, 132, 199, 0.2) !important;
 }
 
 :root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge:hover,
 :root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge:focus,
 :root[data-theme='light'] .markdown-root :not(pre) > code.file-path-badge:focus-visible {
-  background: rgba(15, 23, 42, 0.13) !important;
-  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.09), 0 0 0 1px rgba(15, 23, 42, 0.15);
+  background: rgba(2, 132, 199, 0.16) !important;
+  color: #0284c7 !important;
+  box-shadow: 0 4px 10px rgba(2, 132, 199, 0.12), 0 0 0 1px rgba(2, 132, 199, 0.25);
+}
+
+:root[data-theme='light'] .markdown-root a[href],
+:root[data-theme='light'] .markdown-root a.markdown-link-pill {
+  color: #2563eb !important;
 }
 
 :root[data-theme='light'] .markdown-root a[href]:hover,
@@ -14781,6 +14925,29 @@ body {
 :root[data-theme='light'] .code-block-toolbar {
   background: #f1f5f9 !important;
   border-bottom-color: #e2e8f0 !important;
+  color: #64748b !important;
+}
+:root[data-theme='light'] .code-block-lang {
+  color: #64748b !important;
+}
+:root[data-theme='light'] .code-block-toolbar .copy-button {
+  color: #64748b !important;
+}
+:root[data-theme='light'] .code-block-toolbar .copy-button:hover {
+  background: rgba(0, 0, 0, 0.06) !important;
+  color: #0f172a !important;
+}
+:root[data-theme='light'] .code-block-wrapper pre code {
+  color: #0f172a;
+}
+:root[data-theme='light'] .markdown-root mark {
+  background: #fef08a !important;
+  color: #854d0e !important;
+}
+:root[data-theme='light'] .markdown-root mark.is-current-match {
+  background: #fde047 !important;
+  color: #713f12 !important;
+  outline: 2px solid #eab308 !important;
 }
 
 /* ==========================================================================
@@ -15170,9 +15337,55 @@ body {
   color: #0f172a;
 }
 
+.preview-action-btn.active {
+  background: rgba(59, 130, 246, 0.2);
+  color: #60a5fa;
+}
+
+:root[data-theme='light'] .preview-action-btn.active {
+  background: rgba(37, 99, 235, 0.12);
+  color: #2563eb;
+}
+
+:root[data-theme='light'] .preview-tabs-empty-hint {
+  color: #64748b;
+}
+
+:root[data-theme='light'] .preview-tabs-scroll {
+  scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+}
+:root[data-theme='light'] .preview-tabs-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.2);
+}
+:root[data-theme='light'] .preview-tabs-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.35);
+}
+
 :root[data-theme='light'] .preview-empty-box {
   border-color: rgba(0, 0, 0, 0.15);
   background: rgba(0, 0, 0, 0.02);
+}
+:root[data-theme='light'] .preview-empty-box:hover {
+  border-color: #2563eb;
+  background: rgba(37, 99, 235, 0.04);
+}
+:root[data-theme='light'] .preview-empty-icon {
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.08));
+}
+:root[data-theme='light'] .preview-empty-title {
+  color: #0f172a;
+}
+:root[data-theme='light'] .preview-empty-desc {
+  color: #64748b;
+}
+
+:root[data-theme='light'] .preview-retry-btn {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+:root[data-theme='light'] .preview-retry-btn:hover {
+  background: #f1f5f9;
 }
 
 :root[data-theme='light'] .preview-image-stage {
@@ -15188,6 +15401,11 @@ body {
   color: #38bdf8 !important;
   transform: scale(1.1);
   box-shadow: 0 0 12px rgba(56, 189, 248, 0.45);
+}
+:root[data-theme='light'] .right-panel-tab-btn.is-drag-over-eye {
+  background: rgba(37, 99, 235, 0.16) !important;
+  color: #2563eb !important;
+  box-shadow: 0 0 12px rgba(37, 99, 235, 0.25);
 }
 
 /* AI 对话画布与文档中文件引用/路径的蓝色超链接感知与悬浮交互 */

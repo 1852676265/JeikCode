@@ -6,8 +6,10 @@ import { createContext, ComponentChildren } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { messages, Lang, MsgKey } from './i18n';
 import { getConfig, postLanguage } from './api';
+import { Theme, EffectiveTheme, resolveEffectiveTheme } from './lib/theme';
 
-export type Theme = 'light' | 'dark' | 'system';
+export type { Theme, EffectiveTheme };
+export { resolveEffectiveTheme };
 
 /** Which settings dialog to open from the sidebar settings menu. */
 export type SettingsSection = 'theme' | 'language' | 'model';
@@ -16,6 +18,7 @@ export type TParams = Record<string, string | number>;
 
 interface SettingsCtx {
   theme: Theme;
+  effectiveTheme: EffectiveTheme;
   setTheme: (t: Theme) => void;
   lang: Lang;
   setLang: (l: Lang) => Promise<void>;
@@ -99,6 +102,7 @@ export function normalizeServerLang(value: string | undefined): Lang | null {
 
 export function SettingsProvider({ children }: { children: ComponentChildren }) {
   const [theme, setThemeState] = useState<Theme>(readTheme);
+  const [effectiveTheme, setEffectiveTheme] = useState<EffectiveTheme>(() => resolveEffectiveTheme(readTheme()));
   const [lang, setLangState] = useState<Lang>(readLang);
   const [githubLogo, setGithubLogo] = useState<boolean>(true);
 
@@ -158,13 +162,36 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
     return save;
   }
 
-  // Apply theme to <html data-theme>; theme.css keys light/dark off this.
+  // Apply theme to <html data-theme>; theme.css and app.css key light/dark off this.
+  // When theme is 'system', dynamically resolve to 'light' or 'dark' and listen to system preference changes.
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
+    const applyResolved = () => {
+      const eff = resolveEffectiveTheme(theme);
+      setEffectiveTheme(eff);
+      document.documentElement.setAttribute('data-theme', eff);
+      document.documentElement.setAttribute('data-theme-preference', theme);
+    };
+
+    applyResolved();
+
     try {
       localStorage.setItem(THEME_KEY, theme);
     } catch {
       /* ignore */
+    }
+
+    if (theme === 'system' && typeof window !== 'undefined' && window.matchMedia) {
+      const media = window.matchMedia('(prefers-color-scheme: dark)');
+      const listener = () => {
+        applyResolved();
+      };
+      if (typeof media.addEventListener === 'function') {
+        media.addEventListener('change', listener);
+        return () => media.removeEventListener('change', listener);
+      } else if (typeof (media as any).addListener === 'function') {
+        (media as any).addListener(listener);
+        return () => (media as any).removeListener(listener);
+      }
     }
   }, [theme]);
 
@@ -191,7 +218,7 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
 
   return (
     <Ctx.Provider
-      value={{ theme, setTheme: setThemeState, lang, setLang, t, githubLogo }}
+      value={{ theme, effectiveTheme, setTheme: setThemeState, lang, setLang, t, githubLogo }}
     >
       {children}
     </Ctx.Provider>
