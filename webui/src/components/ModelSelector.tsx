@@ -59,7 +59,7 @@ function HighlightText({ text, query }: { text: string; query: string }) {
 /** 各思考等级的默认预算数值（单位 Tokens）。 */
 const DEFAULT_EFFORT_BUDGETS: Record<string, number> = {
   low: 2048,
-  medium: 5120, // 5 * 1024 = 5120
+  medium: 8192,
   high: 16384,
   xhigh: 32768,
   max: 65536,
@@ -213,8 +213,8 @@ export function ModelSelector({
   useEffect(() => {
     setEffortOverride(undefined);
     setBudgetOverride(undefined);
-    // 初始化当前模型的 budget 状态
-    if (current?.thinking_budget) {
+    // 初始化当前模型的 budget 状态：仅当模型确实配置了大于 0 的 thinking_budget 时才标记为 checked
+    if (current?.thinking_budget && current.thinking_budget > 0) {
       const eff = current.reasoning_effort?.toLowerCase() || 'medium';
       setBudgetChecked({ [eff]: true });
       setBudgetInputs({ [eff]: current.thinking_budget });
@@ -222,7 +222,7 @@ export function ModelSelector({
       setBudgetChecked({});
       setBudgetInputs({});
     }
-  }, [current?.provider, current?.thinking_budget]);
+  }, [current?.provider, current?.thinking_budget, current?.reasoning_effort]);
 
   const effort =
     effortOverride !== undefined
@@ -379,12 +379,16 @@ export function ModelSelector({
   const handleToggleBudgetCheck = (lvl: string, e: MouseEvent) => {
     e.stopPropagation();
     const nextChecked = !budgetChecked[lvl];
-    setBudgetChecked((prev) => ({ ...prev, [lvl]: nextChecked }));
     if (nextChecked) {
-      const budgetVal = budgetInputs[lvl] || DEFAULT_EFFORT_BUDGETS[lvl] || 2048;
+      // 勾选预算：独占勾选当前等级，并填入计算机二进制默认值，同时支持用户在弹出框中手动输入
+      const defaultVal = DEFAULT_EFFORT_BUDGETS[lvl] || 16384;
+      const budgetVal = budgetInputs[lvl] || defaultVal;
+      setBudgetChecked({ [lvl]: true });
       setBudgetInputs((prev) => ({ ...prev, [lvl]: budgetVal }));
       handleSelectEffort(lvl, budgetVal, false, true);
     } else {
+      // 取消勾选预算：清空预算，向后端显式传递 clearThinkingBudget，不填预算字段
+      setBudgetChecked({});
       handleSelectEffort(lvl, null, true, true);
     }
   };
@@ -396,10 +400,11 @@ export function ModelSelector({
   };
 
   const handleBudgetInputCommit = (lvl: string, overrideVal?: number) => {
+    const defaultVal = DEFAULT_EFFORT_BUDGETS[lvl] || 16384;
     const budgetVal =
       overrideVal !== undefined
         ? overrideVal
-        : (budgetInputs[lvl] !== undefined ? budgetInputs[lvl] : DEFAULT_EFFORT_BUDGETS[lvl] || 2048);
+        : (budgetInputs[lvl] !== undefined ? budgetInputs[lvl] : defaultVal);
     handleSelectEffort(lvl, budgetVal, false, true);
   };
 
@@ -425,12 +430,17 @@ export function ModelSelector({
               class="effort-row-main-btn"
               onClick={() => {
                 if (o.val === 'off') {
+                  setBudgetChecked({});
                   handleSelectEffort('off', 0, true);
                 } else if (o.val === null) {
+                  setBudgetChecked({});
                   handleSelectEffort(null, null, true);
                 } else if (isChecked) {
+                  // 如果已勾选预算，保留当前预算并选择
                   handleSelectEffort(o.val, currentInputVal, false);
                 } else {
+                  // 如果只选择了思考强度没勾选预算，清空预算，不填预算字段
+                  setBudgetChecked({});
                   handleSelectEffort(o.val, null, true);
                 }
               }}
