@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'preact/hooks';
 import { useT, useSettings } from '../settings';
-import { fetchFsRead } from '../api';
 import { Markdown } from './Markdown';
 import { CodeEditorTab } from './CodeEditorTab';
 import { showToast } from './Toast';
@@ -87,6 +86,8 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
     setActiveViewMode('preview');
   }, [activeTabId]);
 
+  const hydratedKeyRef = useRef<string>('');
+
   // 当项目/工作目录切换时，自动同步对应项目的独立预览标签列表，彻底杜绝跨项目同名文件混淆
   useEffect(() => {
     try {
@@ -100,10 +101,13 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
       setTabs([]);
       setActiveTabId('');
     }
+    hydratedKeyRef.current = storageKeyTabs;
   }, [storageKeyTabs, storageKeyActive]);
 
   // 持久化保存当前项目的标签与当前激活项
   useEffect(() => {
+    // 只有在当前 key 已经从本地存储水合完成后，才允许回写持久化，避免未就绪时空列表冲掉原有项目标签
+    if (hydratedKeyRef.current !== storageKeyTabs) return;
     try {
       localStorage.setItem(storageKeyTabs, JSON.stringify(tabs));
     } catch {}
@@ -128,58 +132,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
   }, [tabs, activeTabId]);
 
   const activeTab = useMemo(() => tabs.find((t) => t.id === activeTabId), [tabs, activeTabId]);
-
-  // 预览文件内容状态
-  const [content, setContent] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshTrigger, setRefreshTrigger] = useState<number>(0);
-
-  const activeExt = useMemo(() => {
-    if (!activeTab) return '';
-    return (activeTab.filePath.split('.').pop() || '').toLowerCase();
-  }, [activeTab]);
-
-  const isImage = useMemo(() => IMAGE_EXTS.has(activeExt), [activeExt]);
-  const isMarkdown = useMemo(
-    () => activeExt === 'md' || activeExt === 'markdown' || activeExt === 'mdx',
-    [activeExt],
-  );
-
-  // 加载当前文件内容
-  useEffect(() => {
-    if (!activeTab || isImage) {
-      setContent('');
-      setLoading(false);
-      setLoadError(null);
-      return;
-    }
-
-    let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
-
-    fetchFsRead(activeTab.filePath, cwd)
-      .then((res) => {
-        if (cancelled) return;
-        if (res.success) {
-          setContent(res.content || '');
-        } else {
-          setLoadError(t('common.loadError') || '读取文件失败');
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setLoadError(err?.message || String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab?.filePath, refreshTrigger, isImage]);
 
   // 打开或追加一个标签页
   const openTab = useCallback(
@@ -650,6 +603,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor, onTabsCountChange }: Pre
             defaultViewMode="preview"
             onViewModeChange={handleViewModeChange}
             hideHeaderToolbar={true}
+            onClose={() => handleCloseTab(activeTab.id)}
           />
         )}
       </div>

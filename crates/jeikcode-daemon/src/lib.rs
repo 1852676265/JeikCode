@@ -9958,16 +9958,43 @@ async fn update_chat_queue(Json(req): Json<ChatQueueUpdateRequest>) -> impl Into
 #[derive(Debug, Deserialize)]
 struct RevealPathRequest {
     path: String,
+    cwd: Option<String>,
 }
 
-async fn reveal_file_or_folder(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
-    let p = std::path::PathBuf::from(req.path.trim());
+async fn reveal_file_or_folder(
+    State(state): State<AppState>,
+    Json(req): Json<RevealPathRequest>,
+) -> impl IntoResponse {
+    let raw = req.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        if let Some(ref cwd_str) = req.cwd {
+            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
+            if candidate_cwd.exists() {
+                p = candidate_cwd;
+            } else {
+                let candidate = state.bind_working_dir.join(raw);
+                if candidate.exists() {
+                    p = candidate;
+                }
+            }
+        } else {
+            let candidate = state.bind_working_dir.join(raw);
+            if candidate.exists() {
+                p = candidate;
+            }
+        }
+    }
+    let p = p.canonicalize().unwrap_or(p);
+    let p = jeikcode_capabilities::pathnorm::strip_verbatim_path(&p);
+
     if !p.exists() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
         );
     }
+    let is_dir = p.is_dir();
     // 异步后台线程拉起系统文件管理器，无桌面环境或异地请求时静默忽略，杜绝挂起卡死
     tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "windows")]
@@ -9993,11 +10020,39 @@ async fn reveal_file_or_folder(Json(req): Json<RevealPathRequest>) -> impl IntoR
             }
         }
     });
-    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "is_dir": is_dir })),
+    )
 }
 
-async fn open_file_with_os(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
-    let p = std::path::PathBuf::from(req.path.trim());
+async fn open_file_with_os(
+    State(state): State<AppState>,
+    Json(req): Json<RevealPathRequest>,
+) -> impl IntoResponse {
+    let raw = req.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        if let Some(ref cwd_str) = req.cwd {
+            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
+            if candidate_cwd.exists() {
+                p = candidate_cwd;
+            } else {
+                let candidate = state.bind_working_dir.join(raw);
+                if candidate.exists() {
+                    p = candidate;
+                }
+            }
+        } else {
+            let candidate = state.bind_working_dir.join(raw);
+            if candidate.exists() {
+                p = candidate;
+            }
+        }
+    }
+    let p = p.canonicalize().unwrap_or(p);
+    let p = jeikcode_capabilities::pathnorm::strip_verbatim_path(&p);
+
     if !p.exists() {
         return (
             StatusCode::BAD_REQUEST,

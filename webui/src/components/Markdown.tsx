@@ -7,6 +7,7 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { useSettings } from '../settings';
 import { showToast } from './Toast';
 import { parseFilePathAndLines } from '../lib/displayPath';
+import { revealInFileExplorer } from '../api';
 
 export { preprocessMarkdown, markdownToHtml } from '../lib/markdownRender';
 
@@ -119,7 +120,7 @@ export function isCommandSnippet(text: string): boolean {
 }
 
 /**
- * 智能识别一段文本是否是项目源码/资源文件路径（支持健壮提取附带的行号与行范围）
+ * 智能识别一段文本是否是项目源码/资源文件或目录路径（支持末尾带或不带斜杠，支持相对与绝对路径）
  */
 export function isFilePathSnippet(text: string): boolean {
   if (isCommandSnippet(text)) return false;
@@ -132,14 +133,55 @@ export function isFilePathSnippet(text: string): boolean {
   // 1. 标准扩展名匹配 (全语言源码、脚本、配置、文本及资源)
   if (EXT_REGEX.test(t)) return true;
 
-  // 2. 绝对路径特征
-  if (/^[a-zA-Z]:[\\/][\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t)) return true;
-  if (/^\/[\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t)) return true;
+  // 2. 绝对路径特征 (Windows盘符路径 如 C:/, D:\, POSIX绝对路径 如 /home/..., /var/...)
+  if (/^[a-zA-Z]:[\\/][\w.\-\\/ ]*$/i.test(t)) return true;
+  if (/^\/[\w.\-\\/]+$/i.test(t)) return true;
 
-  // 3. 常见工程目录层级结构
+  // 3. 相对路径前缀特征 (./ 或 ../ 或 .\ 或 ..\)
+  if (/^\.{1,2}[\\/][\w.\-\\/ ]*$/i.test(t)) return true;
+
+  // 4. 显式以斜杠结尾的目录特征 (如 src/, webui/src/, crates/)
+  if (/[\\/]$/.test(t) && /[\w.\-\\/]/.test(t)) return true;
+
+  // 5. 常见工程目录层级结构 (如 crates/jeikcode-daemon, src/components, webui/src 等)
   if (ROOT_DIRS_REGEX.test(t)) return true;
 
   return false;
+}
+
+/**
+ * 智能判断路径是否是目录 (支持末尾带/不带/，支持绝对和相对路径)
+ */
+export function isLikelyDirPath(pathStr: string): boolean {
+  const clean = pathStr.trim().replace(/^['"`]|['"`]$/g, '');
+  if (!clean) return false;
+  // 1. 显式末尾带斜杠或反斜杠必定为目录
+  if (clean.endsWith('/') || clean.endsWith('\\')) return true;
+  // 2. 纯盘符根目录 (如 C:, D:)
+  if (/^[a-zA-Z]:$/i.test(clean)) return true;
+  // 3. 检查路径的最后一段
+  const segs = clean.split(/[\\/]/).filter(Boolean);
+  if (segs.length === 0) return false;
+  const lastSeg = segs[segs.length - 1]!;
+  // 若包含标准文件扩展名则为文件
+  if (EXT_REGEX.test(lastSeg)) return false;
+  // 过滤常见的无后缀单文件名
+  if (/^(dockerfile|containerfile|makefile|license|gemfile|procfile|vagrantfile|cargofile)$/i.test(lastSeg)) {
+    return false;
+  }
+  // 包含层级分隔符且无扩展名，即为目录
+  return clean.includes('/') || clean.includes('\\');
+}
+
+// 转换为项目相对路径
+function toRelativePath(absPath: string, cwd?: string): string {
+  const normAbs = absPath.trim().replace(/\\/g, '/');
+  if (!cwd) return normAbs;
+  const normCwd = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normAbs.toLowerCase().startsWith(normCwd.toLowerCase() + '/')) {
+    return normAbs.slice(normCwd.length + 1);
+  }
+  return normAbs;
 }
 
 // 解析目标文件路径 (全面支持 Windows/POSIX 绝对路径与基于 basePath / cwd 的相对路径)
@@ -287,7 +329,24 @@ export function Markdown({
         code.setAttribute('role', 'link');
       } else if (isFilePathSnippet(text)) {
         code.classList.add('file-path-badge');
-        code.setAttribute('title', `${text} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`);
+        const isDir = isLikelyDirPath(text);
+        if (isDir) {
+          code.classList.add('dir-path-badge');
+          code.setAttribute(
+            'title',
+            t('preview.dirBadgeTooltip', { text, action: t('preview.clickToOpenDir') }) ||
+              `${text} (${t('preview.clickToOpenDir')})`,
+          );
+        } else {
+          code.setAttribute(
+            'title',
+            t('preview.fileBadgeTooltip', {
+              text,
+              preview: t('preview.clickToPreview'),
+              main: t('preview.openInMain'),
+            }) || `${text} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`,
+          );
+        }
         code.setAttribute('tabindex', '0');
         code.setAttribute('role', 'button');
       }
@@ -296,8 +355,29 @@ export function Markdown({
     const links = rootRef.current.querySelectorAll<HTMLElement>('a[href]');
     links.forEach((a) => {
       a.classList.add('markdown-link-pill');
+      const href = a.getAttribute('href') || '';
+      if (!href.startsWith('#') && !/^(https?:|mailto:|\/\/)/i.test(href)) {
+        const isDir = isLikelyDirPath(href);
+        if (isDir) {
+          a.classList.add('dir-path-badge');
+          a.setAttribute(
+            'title',
+            t('preview.dirBadgeTooltip', { text: href, action: t('preview.clickToOpenDir') }) ||
+              `${href} (${t('preview.clickToOpenDir')})`,
+          );
+        } else {
+          a.setAttribute(
+            'title',
+            t('preview.fileBadgeTooltip', {
+              text: href,
+              preview: t('preview.clickToPreview'),
+              main: t('preview.openInMain'),
+            }) || `${href} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`,
+          );
+        }
+      }
     });
-  }, [renderedHtml]);
+  }, [renderedHtml, lang, t]);
 
   // 监听鼠标长按拖拽划词事件：拖选文字时光标自适应切换为点击形 (text)，松开即恢复
   useEffect(() => {
@@ -425,6 +505,19 @@ export function Markdown({
         const { filePath: cleanHref, startLine, endLine } = parseFilePathAndLines(href);
         const resolved = resolveTargetFile(cleanHref, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
+        const isDir = isLikelyDirPath(cleanHref);
+
+        // (B.1) 目录路径点击：无论是绝对路径还是相对路径，末尾带不带 /，直接在系统资源管理器中打开！
+        if (isDir) {
+          revealInFileExplorer(resolved, cwd)
+            .then(() => {
+              showToast(t('preview.revealDirSuccess', { path: cleanHref }), 'success');
+            })
+            .catch((err) => {
+              showToast(t('preview.revealDirFailed', { error: err?.message || String(err) }), 'error');
+            });
+          return;
+        }
 
         if (e.ctrlKey || e.metaKey || e.altKey) {
           // 按住 Ctrl / Cmd / Alt 点击：直接在中间主编辑区打开并定位行号！
@@ -458,14 +551,14 @@ export function Markdown({
     }
 
     // 2. 处理代码块 Copy 按钮
-    const t = targetEl?.closest('.copy-button') as HTMLElement | null;
-    if (t?.dataset.copy) {
-      const text = decodeURIComponent(t.dataset.copy);
-      const prev = t.textContent;
+    const copyBtn = targetEl?.closest('.copy-button') as HTMLElement | null;
+    if (copyBtn?.dataset.copy) {
+      const text = decodeURIComponent(copyBtn.dataset.copy);
+      const prev = copyBtn.textContent;
       const mark = (ok: boolean) => {
-        t.textContent = ok ? 'Copied' : 'Failed';
+        copyBtn.textContent = ok ? 'Copied' : 'Failed';
         setTimeout(() => {
-          t.textContent = prev;
+          copyBtn.textContent = prev;
         }, 1200);
       };
       void (async () => {
@@ -509,7 +602,9 @@ export function Markdown({
     x: number;
     y: number;
     filePath: string;
+    relPath: string;
     fileName: string;
+    isDir: boolean;
     startLine?: number;
     endLine?: number;
   } | null>(null);
@@ -532,7 +627,8 @@ export function Markdown({
 
   function onContextMenu(e: MouseEvent) {
     const targetEl = e.target as HTMLElement;
-    const clickable = targetEl?.closest('.file-path-badge, .file-preview-link') as HTMLElement | null;
+    // 无论是文件/目录胶囊、文件链接、还是 Markdown 文本中的相对/绝对路径，均完整支持右键上下文菜单
+    const clickable = targetEl?.closest('a[href], .file-path-badge, .file-preview-link, code') as HTMLElement | null;
     if (clickable) {
       let href = clickable.getAttribute('href') || clickable.dataset.filePath || '';
       if (!href && clickable.tagName?.toLowerCase() === 'code') {
@@ -547,11 +643,22 @@ export function Markdown({
         const { filePath: cleanHref, startLine, endLine } = parseFilePathAndLines(href);
         const resolved = resolveTargetFile(cleanHref, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
+        const isDir = isLikelyDirPath(cleanHref);
+        const relPath = toRelativePath(resolved, cwd);
+
+        // 视口边界保护，防止菜单溢出到屏幕可视区域外
+        const menuWidth = 195;
+        const menuHeight = isDir ? 120 : 190;
+        const posX = Math.max(8, Math.min(e.clientX, (window.innerWidth || 1024) - menuWidth - 10));
+        const posY = Math.max(8, Math.min(e.clientY, (window.innerHeight || 768) - menuHeight - 10));
+
         setFileBadgeMenu({
-          x: e.clientX,
-          y: e.clientY,
+          x: posX,
+          y: posY,
           filePath: resolved,
+          relPath,
           fileName,
+          isDir,
           startLine,
           endLine,
         });
@@ -575,53 +682,127 @@ export function Markdown({
           style={{ top: `${fileBadgeMenu.y}px`, left: `${fileBadgeMenu.x}px` }}
           onClick={(e) => e.stopPropagation()}
         >
-          <button
-            type="button"
-            class="context-menu-btn"
-            onClick={() => {
-              window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
-                detail: {
-                  filePath: fileBadgeMenu.filePath,
-                  fileName: fileBadgeMenu.fileName,
-                  startLine: fileBadgeMenu.startLine,
-                  endLine: fileBadgeMenu.endLine,
-                }
-              }));
-              window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
-                detail: 'preview'
-              }));
-              setFileBadgeMenu(null);
-            }}
-          >
-            <span>👁️ {t('preview.openInRight')}</span>
-          </button>
-          <button
-            type="button"
-            class="context-menu-btn"
-            onClick={() => {
-              window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
-                detail: {
-                  path: fileBadgeMenu.filePath,
-                  startLine: fileBadgeMenu.startLine,
-                  endLine: fileBadgeMenu.endLine,
-                }
-              }));
-              setFileBadgeMenu(null);
-            }}
-          >
-            <span>📑 {t('preview.openInMain')}</span>
-          </button>
-          <button
-            type="button"
-            class="context-menu-btn"
-            onClick={() => {
-              navigator.clipboard?.writeText(fileBadgeMenu.filePath);
-              showToast(t('explorer.copyFullPath'), 'success');
-              setFileBadgeMenu(null);
-            }}
-          >
-            <span>📋 {t('explorer.copyFullPath')}</span>
-          </button>
+          {fileBadgeMenu.isDir ? (
+            <>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  revealInFileExplorer(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('preview.revealDirSuccess', { path: fileBadgeMenu.fileName }), 'success');
+                    })
+                    .catch((err) => {
+                      showToast(t('preview.revealDirFailed', { error: err?.message || String(err) }), 'error');
+                    });
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📁 {t('preview.openDirInExplorer')}</span>
+              </button>
+              <div class="context-menu-divider" />
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.relPath);
+                  showToast(t('explorer.copyRelativePath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyRelativePath')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.filePath);
+                  showToast(t('explorer.copyFullPath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyFullPath')}</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
+                    detail: {
+                      filePath: fileBadgeMenu.filePath,
+                      fileName: fileBadgeMenu.fileName,
+                      startLine: fileBadgeMenu.startLine,
+                      endLine: fileBadgeMenu.endLine,
+                    }
+                  }));
+                  window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
+                    detail: 'preview'
+                  }));
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>👁️ {t('preview.openInRight')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
+                    detail: {
+                      path: fileBadgeMenu.filePath,
+                      startLine: fileBadgeMenu.startLine,
+                      endLine: fileBadgeMenu.endLine,
+                    }
+                  }));
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📑 {t('preview.openInMain')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  revealInFileExplorer(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('explorer.revealInOs'), 'success');
+                    })
+                    .catch((err) => {
+                      showToast(String(err?.message || err), 'error');
+                    });
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📁 {t('preview.revealFileInExplorer')}</span>
+              </button>
+              <div class="context-menu-divider" />
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.relPath);
+                  showToast(t('explorer.copyRelativePath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyRelativePath')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.filePath);
+                  showToast(t('explorer.copyFullPath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyFullPath')}</span>
+              </button>
+            </>
+          )}
         </div>,
         document.body
       )}

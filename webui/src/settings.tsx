@@ -106,16 +106,6 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
   const [lang, setLangState] = useState<Lang>(readLang);
   const [githubLogo, setGithubLogo] = useState<boolean>(true);
 
-  // Apply document direction (RTL for Arabic, LTR for others).
-  // Notice: Do NOT force-override document.documentElement.lang with foreign locales (e.g. 'ja'),
-  // because conversation text often contains CJK characters, and forcing 'ja' causes Windows/Chromium
-  // to render Hanzi with Japanese Mincho/Serif fallback fonts with skewed brush-strokes!
-  useEffect(() => {
-    if (typeof document !== 'undefined') {
-      document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
-    }
-  }, [lang]);
-
   const selectionVersion = useRef(0);
   const pendingSave = useRef(Promise.resolve());
 
@@ -195,9 +185,14 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
     }
   }, [theme]);
 
+  // Apply document direction (RTL for Arabic, LTR for others) and record active app language.
   useEffect(() => {
-    document.documentElement.setAttribute('lang', lang === 'zh' ? 'zh-CN' : lang);
-    document.documentElement.setAttribute('dir', 'ltr');
+    if (typeof document !== 'undefined') {
+      document.documentElement.setAttribute('lang', lang === 'zh' ? 'zh-CN' : lang);
+      document.documentElement.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
+      document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+      document.documentElement.setAttribute('data-app-lang', lang);
+    }
     try {
       localStorage.setItem(LANG_KEY, lang);
     } catch {

@@ -439,20 +439,30 @@ export async function cancelChatSteer(
   }
 }
 
-export async function revealInFileExplorer(path: string): Promise<void> {
-  await apiFetch('/fs/reveal', {
+export async function revealInFileExplorer(path: string, cwd?: string): Promise<{ success: boolean; is_dir?: boolean }> {
+  const resp = await apiFetch('/fs/reveal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ path }),
-  }).catch(() => {});
+    body: JSON.stringify({ path, cwd }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
-export async function openFileWithOs(path: string): Promise<void> {
-  await apiFetch('/fs/open', {
+export async function openFileWithOs(path: string, cwd?: string): Promise<{ success: boolean }> {
+  const resp = await apiFetch('/fs/open', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ path }),
-  }).catch(() => {});
+    body: JSON.stringify({ path, cwd }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
 export function getFsRawUrl(filePath: string): string {

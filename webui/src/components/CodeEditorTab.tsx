@@ -54,6 +54,8 @@ export function CodeEditorTab({
   const [loading, setLoading] = useState<boolean>(!isImage && !isBinary);
   const [saving, setSaving] = useState<boolean>(false);
   const [isDirty, setIsDirty] = useState<boolean>(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadTrigger, setReloadTrigger] = useState<number>(0);
 
   // 跨行完备 Undo / Redo 历史快照栈 (彻底解决原生 textarea 跨行回车后无法撤回的痛点)
   const historyRef = useRef<Array<{ text: string; cursor: number }>>([]);
@@ -490,8 +492,18 @@ export function CodeEditorTab({
     let cancelled = false;
     if ((isImage && !isSvg) || isBinary) {
       setLoading(false);
+      setLoadError(null);
       return;
     }
+
+    const norm = (filePath || '').trim().replace(/\\/g, '/');
+    const isAbs = /^[a-zA-Z]:\//.test(norm) || norm.startsWith('/');
+    // 若为相对路径且 cwd 尚未就绪（如页面刷新首帧等待项目异步就绪），暂缓发起请求避免误报 404
+    if (!isAbs && !cwd) {
+      return;
+    }
+
+    setLoadError(null);
 
     // 优先从 L1/L2 IndexedDB 异步直出已缓存内容（1~2ms），杜绝白屏等待与加载中闪烁
     void getCachedFileContent(filePath).then((cached) => {
@@ -512,12 +524,15 @@ export function CodeEditorTab({
           historyRef.current = [{ text: loaded, cursor: 0 }];
           historyIndexRef.current = 0;
           setIsDirty(false);
+          setLoadError(null);
           void saveCachedFileContent(filePath, loaded);
         }
       })
       .catch((err) => {
         if (!cancelled) {
-          showToast(t('editor.readFailed', { error: err?.message || String(err) }), 'error');
+          const errMsg = err?.message || String(err);
+          setLoadError(errMsg);
+          // 在编辑器内部以专业内联卡片展示错误状态与恢复选项，绝不以全局浮动 Toast 骚扰用户
         }
       })
       .finally(() => {
@@ -526,7 +541,7 @@ export function CodeEditorTab({
     return () => {
       cancelled = true;
     };
-  }, [filePath, isImage, isSvg, isBinary]);
+  }, [filePath, cwd, reloadTrigger, isImage, isSvg, isBinary]);
 
   // 保存文件
   const handleSave = useCallback(async () => {
@@ -1115,7 +1130,43 @@ export function CodeEditorTab({
         onDragOver={handleEditorDragOver}
         onDrop={handleEditorDrop}
       >
-        {loading ? (
+        {loadError ? (
+          <div class="editor-error-stage">
+            <div class="editor-error-card">
+              <div class="editor-error-icon">⚠️</div>
+              <div class="editor-error-title">{t('editor.readFailedTitle')}</div>
+              <div class="editor-error-desc">
+                {loadError.toLowerCase().includes('not found')
+                  ? t('editor.fileNotFoundDesc')
+                  : `${t('editor.readFailedDesc')}: ${loadError}`}
+              </div>
+              <div class="editor-error-path" title={filePath}>{filePath}</div>
+              <div class="editor-error-actions">
+                <button
+                  type="button"
+                  class="editor-error-retry-btn"
+                  onClick={() => {
+                    setLoadError(null);
+                    setReloadTrigger((n) => n + 1);
+                  }}
+                  title={t('common.retry')}
+                >
+                  <span>🔄 {t('common.retry')}</span>
+                </button>
+                {onClose && (
+                  <button
+                    type="button"
+                    class="editor-error-close-btn"
+                    onClick={onClose}
+                    title={t('editor.closeTab')}
+                  >
+                    <span>✕ {t('editor.closeTab')}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : loading ? (
           <div class="diff-loading-wrap">
             <div class="git-spinner" />
             <span>{t('editor.loading')}</span>
