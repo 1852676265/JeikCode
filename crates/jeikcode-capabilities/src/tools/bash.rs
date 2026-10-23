@@ -1859,7 +1859,11 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
     let shell = detect_unix_shell();
     let command = crate::process_utils::escape_unquoted_backticks_in_inline_script(&command)
         .unwrap_or(command);
+    let (command, inline_envs) = crate::process_utils::extract_inline_scripts_to_env(&command);
     let mut cmd = tokio::process::Command::new(shell);
+    for (k, v) in inline_envs {
+        cmd.env(k, v);
+    }
     cmd.arg("-c").arg(&command);
     apply_shell_env(&mut cmd);
     Ok(cmd)
@@ -2766,7 +2770,11 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
         let command = crate::process_utils::rewrite_python3_for_windows_shell(command.as_ref());
         let command = crate::process_utils::escape_unquoted_backticks_in_inline_script(&command)
             .unwrap_or(command);
+        let (command, inline_envs) = crate::process_utils::extract_inline_scripts_to_env(&command);
         let mut cmd = tokio::process::Command::new(&bash);
+        for (k, v) in inline_envs {
+            cmd.env(k, v);
+        }
 
         // Grok-Build hardening: prevent MSYS2 from rewriting /flags (e.g. /NOLOGO, /DEBUG, /t:Build) into pseudo paths
         cmd.env("MSYS_NO_PATHCONV", "1");

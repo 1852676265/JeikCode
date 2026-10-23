@@ -1043,6 +1043,257 @@ pub(crate) fn escape_unquoted_backticks_in_inline_script(cmd: &str) -> Option<St
     }
 }
 
+/// 跨语言常见内联脚本解释器与编译器清单（支持小写比较，允许路径前缀与 .exe 后缀）
+pub(crate) const INLINE_INTERPRETERS: &[&str] = &[
+    // Python 生态
+    "python", "python3", "py", "ipython",
+    // JavaScript / TypeScript / Vue / 前端生态
+    "node", "bun", "deno", "ts-node", "npx",
+    // C / C++ 编译与即时解释
+    "gcc", "clang", "g++", "clang++", "c++", "tcc", "cling",
+    // Java 生态 (单文件源码运行 / JShell 评估)
+    "java", "jshell", "javac",
+    // C# / .NET 生态
+    "dotnet-script", "csi", "dotnet",
+    // Rust 与 Go
+    "rustc", "cargo-eval", "cargo", "go",
+    // 其他常用系统与脚本语言
+    "ruby", "perl", "php", "lua", "rscript", "julia",
+    "bash", "sh", "zsh",
+];
+
+/// 跨语言常见内联执行/求值参数标志
+pub(crate) const INLINE_FLAGS: &[&str] = &[
+    "-c", "-e", "--eval", "eval", "-r", "-p", "--print", "-run", "<<<",
+    "--source",
+];
+
+/// 判断单词是否属于支持的内联解释器
+fn is_matching_interpreter(word: &str) -> bool {
+    let clean = word
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .strip_suffix(".exe")
+        .unwrap_or(word)
+        .to_ascii_lowercase();
+    INLINE_INTERPRETERS.iter().any(|&item| item == clean)
+}
+
+/// 跨语言自动修复脚本解释器（Python, Node.js, C/C++, C#, Rust, Go, Vue 等）内联单引号参数中的 `\'` 转义。
+///
+/// 在 POSIX Bash 规范中，单引号 `'...'` 内部不允许使用 `\` 转义自身。
+/// 当模型在单引号内编写包含单引号（如 Python 字符串、C/Rust 字符字面量 `'c'`、Node/Vue 模板属性等）的代码并写成 `\'` 时，
+/// Bash 会在 `\'` 处提前闭合单引号，导致严重的语法解析失败。
+/// 本函数智能识别各类语言解释器与内联执行器的单引号参数区域，将单引号区域内非法出现的 `\'` 自动重写为 POSIX Bash 标准的 `'\'''`。
+pub(crate) fn heal_inline_script_single_quotes(cmd: &str) -> Option<String> {
+    if !cmd.contains(r"\'") {
+        return None;
+    }
+
+    let mut out = String::with_capacity(cmd.len() + 16);
+    let mut changed = false;
+    let chars: Vec<char> = cmd.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    let mut in_inline_single = false;
+    let mut last_word = String::new();
+    let mut saw_flag = false;
+
+    while i < n {
+        let ch = chars[i];
+
+        if in_inline_single {
+            // 在内联单引号脚本中遇到 \'，在 Bash 中单引号不能转义单引号，必须升格为标准 POSIX '\''（闭合前引号+转义单引号+开启后引号，共 4 字符）
+            if ch == '\\' && i + 1 < n && chars[i + 1] == '\'' {
+                out.push_str(r#"'\''"#);
+                changed = true;
+                i += 2;
+                continue;
+            }
+            // 遇到孤立的单引号，标志着内联单引号脚本的结束
+            if ch == '\'' {
+                in_inline_single = false;
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // 普通词法模式下追踪解释器与内联 flag
+        if ch == '\'' {
+            if saw_flag {
+                in_inline_single = true;
+                saw_flag = false;
+            }
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+
+        if ch.is_whitespace() || ch == ';' || ch == '|' || ch == '&' || ch == '(' {
+            if !last_word.is_empty() {
+                if INLINE_FLAGS.iter().any(|&f| f.eq_ignore_ascii_case(&last_word)) {
+                    saw_flag = true;
+                } else if is_matching_interpreter(&last_word) {
+                    // 保留解释器上下文
+                } else if !saw_flag {
+                    saw_flag = false;
+                }
+                last_word.clear();
+            }
+            if ch == ';' || ch == '|' || ch == '&' || ch == '(' {
+                saw_flag = false;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        last_word.push(ch);
+        out.push(ch);
+        i += 1;
+    }
+
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 跨语言复杂内联脚本安全中转机制（Environment Variable Delivery）。
+///
+/// 当内联解释器脚本包含多行、Python/Go 三引号 `"""` / `'''` 或复杂嵌套引号时，
+/// 在 Windows 平台直接作为命令行参数传递会遭受 Win32 CommandLineToArgvW 的连续引号折叠与反斜杠破坏。
+/// 本函数将复杂内联脚本提取为独立的环境变量（如 `JEIK_INLINE_SCRIPT`），并将命令行参数重写为 `"$JEIK_INLINE_SCRIPT"`。
+/// 子进程 Bash 启动时直接通过环境变量展开，完全免疫 Windows 命令行转义失真。
+pub(crate) fn extract_inline_scripts_to_env(command: &str) -> (String, Vec<(String, String)>) {
+    let mut env_vars = Vec::new();
+    let mut out = String::with_capacity(command.len());
+    let chars: Vec<char> = command.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    let mut last_word = String::new();
+    let mut saw_interpreter = false;
+    let mut saw_flag = false;
+
+    while i < n {
+        let ch = chars[i];
+
+        if ch.is_whitespace() || ch == ';' || ch == '|' || ch == '&' || ch == '(' {
+            if !last_word.is_empty() {
+                if is_matching_interpreter(&last_word) {
+                    saw_interpreter = true;
+                } else if saw_interpreter && INLINE_FLAGS.iter().any(|&f| f.eq_ignore_ascii_case(&last_word)) {
+                    saw_flag = true;
+                } else {
+                    saw_interpreter = false;
+                    saw_flag = false;
+                }
+                last_word.clear();
+            }
+            if ch == ';' || ch == '|' || ch == '&' || ch == '(' {
+                saw_interpreter = false;
+                saw_flag = false;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // 当检测到解释器 + flag 且遇到了单引号或双引号包裹的脚本参数
+        if saw_flag && (ch == '\'' || ch == '"') {
+            let quote_char = ch;
+            let start = i + 1;
+            let mut end = start;
+            let mut escaped = false;
+            let mut script_raw = String::new();
+
+            while end < n {
+                let sc = chars[end];
+                if quote_char == '\'' {
+                    // 单引号脚本处理：识别并折叠 '\'' 组合
+                    if sc == '\'' {
+                        // 检查是否是 '\''' 模式
+                        if end + 3 < n && chars[end + 1] == '\\' && chars[end + 2] == '\'' && chars[end + 3] == '\'' {
+                            script_raw.push('\'');
+                            end += 4;
+                            continue;
+                        }
+                        break;
+                    }
+                    script_raw.push(sc);
+                    end += 1;
+                } else {
+                    // 双引号脚本处理
+                    if escaped {
+                        if sc == '"' || sc == '\\' {
+                            script_raw.push(sc);
+                        } else {
+                            script_raw.push('\\');
+                            script_raw.push(sc);
+                        }
+                        escaped = false;
+                        end += 1;
+                        continue;
+                    }
+                    if sc == '\\' {
+                        escaped = true;
+                        end += 1;
+                        continue;
+                    }
+                    if sc == '"' {
+                        break;
+                    }
+                    script_raw.push(sc);
+                    end += 1;
+                }
+            }
+
+            if end < n && chars[end] == quote_char {
+                // 评估是否属于需要环境变量隔离的高危复杂脚本：
+                // 1. 包含三引号 """ 或 '''
+                // 2. 包含真实换行符
+                // 3. 包含转义嵌套引号且长度 > 15
+                let is_complex = script_raw.contains("\"\"\"")
+                    || script_raw.contains("'''")
+                    || script_raw.contains('\n')
+                    || (quote_char == '"' && script_raw.contains('"') && script_raw.len() > 15);
+
+                // 双引号下如果包含未经转义的 $ 或 `，保留给 shell 动态展开，不进行中转
+                let has_shell_expansion = quote_char == '"' && (script_raw.contains('$') || script_raw.contains('`'));
+
+                if is_complex && !has_shell_expansion {
+                    let var_name = if env_vars.is_empty() {
+                        "JEIK_INLINE_SCRIPT".to_string()
+                    } else {
+                        format!("JEIK_INLINE_SCRIPT_{}", env_vars.len() + 1)
+                    };
+                    out.push_str(&format!("\"${var_name}\""));
+                    env_vars.push((var_name, script_raw));
+                    i = end + 1;
+                    saw_flag = false;
+                    saw_interpreter = false;
+                    continue;
+                }
+            }
+        }
+
+        last_word.push(ch);
+        out.push(ch);
+        i += 1;
+    }
+
+    (out, env_vars)
+}
+
 pub(crate) fn rewrite_tool_heads(command: &str, names: &[&str], replacement: &str) -> String {
     let mut out = String::with_capacity(command.len() + replacement.len());
     let mut i = 0usize;
@@ -1859,5 +2110,84 @@ mod tests {
                 "capture_login_shell_env must not steal or alter foreground process group (TPGID)"
             );
         }
+    }
+
+    #[test]
+    fn test_heal_inline_script_single_quotes_cross_languages() {
+        let q = r#"'\''"#;
+
+        // 1. Python 单引号转义自愈
+        let py_cmd = r#"python -c 'print(\'hello\')'"#;
+        assert_eq!(
+            heal_inline_script_single_quotes(py_cmd),
+            Some(format!("python -c 'print({q}hello{q})'"))
+        );
+
+        // 2. Node.js / Vue 模板内联单引号自愈
+        let node_cmd = r#"node -e 'const v = \'<div>{{ msg }}</div>\'; console.log(v);'"#;
+        assert_eq!(
+            heal_inline_script_single_quotes(node_cmd),
+            Some(format!("node -e 'const v = {q}<div>{{{{ msg }}}}</div>{q}; console.log(v);'"))
+        );
+
+        // 3. C 语言 (tcc/gcc 内联) 字符单引号自愈
+        let c_cmd = r#"tcc -run - <<< 'int main() { char c = \'a\'; return 0; }'"#;
+        assert_eq!(
+            heal_inline_script_single_quotes(c_cmd),
+            Some(format!("tcc -run - <<< 'int main() {{ char c = {q}a{q}; return 0; }}'"))
+        );
+
+        // 4. Rust (rustc 内联) 字符字面量自愈
+        let rust_cmd = r#"rustc - -o main <<< 'fn main() { let ch = \'x\'; }'"#;
+        assert_eq!(
+            heal_inline_script_single_quotes(rust_cmd),
+            Some(format!("rustc - -o main <<< 'fn main() {{ let ch = {q}x{q}; }}'"))
+        );
+
+        // 5. C# (dotnet-script eval)
+        let cs_cmd = r#"dotnet-script eval 'var s = \'test\';'"#;
+        assert_eq!(
+            heal_inline_script_single_quotes(cs_cmd),
+            Some(format!("dotnet-script eval 'var s = {q}test{q};'"))
+        );
+
+        // 6. Go (go run)
+        let go_cmd = r#"go run - <<< 'package main; func main() { ch := \'g\' }'"#;
+        assert_eq!(
+            heal_inline_script_single_quotes(go_cmd),
+            Some(format!("go run - <<< 'package main; func main() {{ ch := {q}g{q} }}'"))
+        );
+
+        // 7. 已经包含正确 POSIX '\'' 的命令保持不变
+        let valid_cmd = format!("python -c 'print({q}valid{q})'");
+        assert_eq!(heal_inline_script_single_quotes(&valid_cmd), None);
+
+        // 8. 非内联命令不触发
+        let normal_cmd = r#"echo 'hello world'"#;
+        assert_eq!(heal_inline_script_single_quotes(normal_cmd), None);
+    }
+
+    #[test]
+    fn test_extract_inline_scripts_to_env() {
+        // 1. Python 复杂三双引号脚本提取到环境变量
+        let complex_py = r#"python -c "import json; s = \"\"\"triple-double\"\"\"; print(s)""#;
+        let (cmd, envs) = extract_inline_scripts_to_env(complex_py);
+        assert_eq!(cmd, r#"python -c "$JEIK_INLINE_SCRIPT""#);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].0, "JEIK_INLINE_SCRIPT");
+        assert!(envs[0].1.contains(r#""""triple-double""""#));
+
+        // 2. Node.js 多行复杂脚本提取
+        let multiline_node = "node -e '\nconst a = 1;\nconst b = 2;\nconsole.log(a + b);\n'";
+        let (cmd, envs) = extract_inline_scripts_to_env(multiline_node);
+        assert_eq!(cmd, r#"node -e "$JEIK_INLINE_SCRIPT""#);
+        assert_eq!(envs.len(), 1);
+        assert!(envs[0].1.contains("const a = 1;"));
+
+        // 3. 普通简单单行命令不提取（保持零开销）
+        let simple_cmd = r#"python -c "print(123)""#;
+        let (cmd, envs) = extract_inline_scripts_to_env(simple_cmd);
+        assert_eq!(cmd, simple_cmd);
+        assert!(envs.is_empty());
     }
 }

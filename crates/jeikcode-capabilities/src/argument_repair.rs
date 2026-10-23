@@ -302,14 +302,21 @@ fn repair_and_route_shell_args(tool_name: &str, args: &str) -> String {
         }
     }
 
-    // 2. 引号平衡自愈：自动修复如 python -c "... 尾部缺失闭合引号，阻断 Bash unexpected EOF
+    // 2. 引号平衡与跨语言内联脚本转义自愈：
+    //    a) 自动自愈内联解释器脚本（Python, Node/Vue, C/C++, Java, C#, Rust, Go 等）单引号内的非合规 \' 转义为标准 '\''
+    //    b) 自动自愈双引号内的孤立反引号（`），阻断 Bash 命令替换 EOF 错误
+    //    c) 自动修复尾部缺失的闭合引号，阻断 Bash unexpected EOF
     if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
         let mut cur = command.to_string();
-        if let Some(healed_cmd) = heal_unclosed_quotes(&cur) {
+        if let Some(healed_cmd) = crate::process_utils::heal_inline_script_single_quotes(&cur) {
             cur = healed_cmd;
             changed = true;
         }
         if let Some(healed_cmd) = heal_inline_script_backticks(&cur) {
+            cur = healed_cmd;
+            changed = true;
+        }
+        if let Some(healed_cmd) = heal_unclosed_quotes(&cur) {
             cur = healed_cmd;
             changed = true;
         }
@@ -2876,6 +2883,38 @@ mod tests {
         assert_eq!(
             val_escaped["command"],
             r#"python -c "content = '\`\`\`'; print(len(content))""#
+        );
+    }
+
+    #[test]
+    fn shell_repair_heals_inline_script_single_quotes_cross_languages() {
+        let q = r#"'\''"#;
+
+        // Python 单引号错误转义被自动修复为 POSIX '\''
+        let raw_py = r#"{"command":"python -c 'import json; print(\\'hello\\')'"}"#;
+        let out_py = repair_and_route_shell_args("run_command", raw_py);
+        let val_py: serde_json::Value = serde_json::from_str(&out_py).unwrap();
+        assert_eq!(
+            val_py["command"],
+            format!("python -c 'import json; print({q}hello{q})'")
+        );
+
+        // Node.js / Vue 单引号错误转义被自动修复
+        let raw_node = r#"{"command":"node -e 'console.log(\\'vue-template\\')'"}"#;
+        let out_node = repair_and_route_shell_args("run_command", raw_node);
+        let val_node: serde_json::Value = serde_json::from_str(&out_node).unwrap();
+        assert_eq!(
+            val_node["command"],
+            format!("node -e 'console.log({q}vue-template{q})'")
+        );
+
+        // C / C++ 内联源码字符字面量自愈
+        let raw_c = r#"{"command":"gcc -x c - <<< 'int main() { char c = \\'z\\'; return 0; }'"}"#;
+        let out_c = repair_and_route_shell_args("run_command", raw_c);
+        let val_c: serde_json::Value = serde_json::from_str(&out_c).unwrap();
+        assert_eq!(
+            val_c["command"],
+            format!("gcc -x c - <<< 'int main() {{ char c = {q}z{q}; return 0; }}'")
         );
     }
 
