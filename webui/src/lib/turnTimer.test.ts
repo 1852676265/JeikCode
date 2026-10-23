@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  composeSteerWireText,
   formatTurnElapsed,
   isSteerUserMessage,
   resumeTurnClockEpoch,
@@ -177,5 +178,23 @@ test('rootTurnUserTs preserves continuation across disk-restored messages where 
   assert.equal(rootTs, t0, '落盘恢复后的消息必须成功穿透中途 steer 提问，找回 t0');
   assert.equal(turnTotalElapsedMs(rootTs, tEnd, undefined), 300_000, '总用时必须是延续后的 300 秒');
 });
+
+test('stampLastAssistantElapsed with overwrite updates cumulative duration at final stop', () => {
+  const msgs = [
+    { role: 'user' as const, ts: 1_000_000 },
+    { role: 'assistant' as const, elapsedMs: 15_000, ts: 1_015_000 },
+  ];
+  const updated = stampLastAssistantElapsed(msgs, 120_000, 1_120_000, { overwrite: true });
+  assert.equal(updated[1]!.elapsedMs, 120_000);
+  assert.equal(updated[1]!.ts, 1_120_000);
+  assert.equal(turnTotalElapsedMs(1_000_000, updated[1]!.ts, updated[1]!.elapsedMs), 120_000);
+});
+
+test('composeSteerWireText attaches steer marker idempotently for send-immediately steer cards', () => {
+  const wire = composeSteerWireText('立即发送的转向卡片');
+  assert.equal(isSteerUserMessage({ role: 'user', content: wire }), true);
+  assert.equal(composeSteerWireText(wire), wire);
+});
+
 
 

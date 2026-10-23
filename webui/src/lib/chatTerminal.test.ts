@@ -102,6 +102,15 @@ test('disk catch-up keeps a send-now user bubble that is not on disk yet', () =>
   assert.equal(merged.length, 4);
   assert.equal(merged[2]?.parts[0]?.text, '立刻发出去');
   assert.equal(mergeDiskWithUnpersistedTail(canvas, canvas).length, canvas.length);
+
+  // 当画布末尾已经是结算完成的回复（例如分页截断了中途 steer，导致 disk 钉住的是根提问而 canvas 末尾是 steer + 最终回复），
+  // 绝不能把已结算的 steer 尾巴重复拼接到 disk 后面（否则 keptUnpersistedTail 为 true 会锁死 busy 状态）
+  const settledCanvasWithSteer = [
+    ...disk,
+    { role: 'user', parts: [{ kind: 'text', text: '中途转向' }] },
+    { role: 'assistant', parts: [{ kind: 'text', text: '最终回复正文' }] },
+  ];
+  assert.deepEqual(mergeDiskWithUnpersistedTail(disk, settledCanvasWithSteer), disk);
 });
 
 test('user echo already on canvas is not appended again', () => {

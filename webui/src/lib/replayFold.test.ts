@@ -165,3 +165,40 @@ test('没有更早历史时不按住，短会话的回放仍整段落笔', () =>
   assert.deepEqual(painted.placeUsers, []);
   assert.equal(fold.held.length, 0);
 });
+
+test('异地浏览器刷新：当画布末尾是本轮开放提问（尚无助手落盘）时，立即打开闸门渲染本轮全部回放帧', () => {
+  const canvas: ReplayFoldMessage[] = [
+    assistant('m-old'),
+    { role: 'user', parts: [{ kind: 'text', text: '最新提问' }] },
+    { role: 'assistant', parts: [] },
+  ];
+  const fold = createReplayFold();
+  const onCanvas = (event: SSEEvent) => replayFrameOnCanvas(canvas, event);
+  const user = seq({ type: 'user', content: '最新提问' }, 1);
+  const tool = seq(
+    { type: 'tool_start', id: 'tool-live-1', name: 'todo_write', arguments: {}, message_id: 'm-live' },
+    2,
+  );
+  const seenUser = acceptReplayFrame(fold, user, 25, onCanvas, true);
+  assert.deepEqual(seenUser.paint, [user]);
+  assert.equal(fold.overlapped, true);
+
+  const seenTool = acceptReplayFrame(fold, tool, 25, onCanvas, true);
+  assert.deepEqual(seenTool.paint, [tool]);
+  assert.equal(fold.held.length, 0);
+});
+
+test('异地浏览器刷新：回放缓冲尾帧（replay_last）仍未与旧画布重叠时，立即全量释放而非死等未来直播帧', () => {
+  const canvas = [assistant('m-old')];
+  const fold = createReplayFold();
+  const onCanvas = (event: SSEEvent) => replayFrameOnCanvas(canvas, event);
+  const user = seq({ type: 'user', content: '新的提问' }, 1);
+  const text = { ...seq({ type: 'text', content: '生成中的回复', message_id: 'm-new' }, 2), replay_last: true };
+
+  assert.deepEqual(acceptReplayFrame(fold, user, 40, onCanvas).paint, []);
+  const flushed = acceptReplayFrame(fold, text, 40, onCanvas);
+  assert.deepEqual(flushed.paint, [user, text]);
+  assert.equal(fold.held.length, 0);
+  assert.equal(fold.overlapped, true);
+});
+

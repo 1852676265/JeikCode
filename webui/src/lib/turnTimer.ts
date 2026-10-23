@@ -44,29 +44,47 @@ export function turnTotalElapsedMs(
   elapsedMs?: number,
 ): number | undefined {
   const fromUser = turnDurationMs(userTs, endTs);
-  if (fromUser && fromUser > 0) return fromUser;
+  if (fromUser && fromUser > 0) {
+    if (elapsedMs != null && Number.isFinite(elapsedMs) && elapsedMs > fromUser) {
+      return elapsedMs;
+    }
+    return fromUser;
+  }
   return elapsedMs;
 }
 
 /** Stamp `elapsedMs` (and optional completion time) onto the latest assistant
- *  message that does not already have a duration. */
+ *  message that does not already have a duration (or overwrite with cumulative duration when `opts.overwrite` is true). */
 export function stampLastAssistantElapsed<T extends { role: string; elapsedMs?: number; ts?: number }>(
   msgs: T[],
   elapsedMs: number,
   finishedAt?: number,
+  opts?: { overwrite?: boolean },
 ): T[] {
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i]!.role !== 'assistant') continue;
-    if (msgs[i]!.elapsedMs != null) return msgs;
+    const prevElapsed = msgs[i]!.elapsedMs;
+    if (prevElapsed != null && !opts?.overwrite) return msgs;
     const next = msgs.slice();
     next[i] = {
       ...msgs[i]!,
-      elapsedMs,
+      elapsedMs: prevElapsed != null ? Math.max(prevElapsed, elapsedMs) : elapsedMs,
       ts: finishedAt ?? Date.now(),
     };
     return next;
   }
   return msgs;
+}
+
+/**
+ * 为中途「立即发送」或跨轮延续的 Steer 卡片附加转向标记，确保后端落盘与刷新后仍能识别为 Steer 延续。
+ */
+export function composeSteerWireText(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.includes('[jeikcode-steer]') || /<user-query>[\s\S]*?<\/user-query>/i.test(trimmed)) {
+    return text;
+  }
+  return trimmed ? `${trimmed}\n\n[jeikcode-steer]` : '[jeikcode-steer]';
 }
 
 /**

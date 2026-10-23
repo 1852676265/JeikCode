@@ -1101,7 +1101,13 @@ export function Chat({
     turnStartedAtRef.current = null;
     setTurnStartedAt(null);
     if (started == null || opts?.stamp === false) return;
-    setMessages((prev) => stampLastAssistantElapsed(prev, Date.now() - started, Date.now()));
+    const totalElapsed = Date.now() - started;
+    const stamped = stampLastAssistantElapsed(messagesRef.current, totalElapsed, Date.now(), { overwrite: true });
+    messagesRef.current = stamped;
+    if (targetId) {
+      messageCacheRef.current.set(targetId, stamped);
+    }
+    setMessages(stamped);
   }
   function setBusyAndClock(next: boolean, explicitStartTs?: number) {
     if (next) {
@@ -2066,6 +2072,7 @@ export function Chat({
                 event,
                 watchReplayOffset(loadId),
                 (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
+                transcriptHasOpenUserTurn(watchReplayCanvas(loadId)),
               );
               placeReplayUsers(loadId, accepted);
               for (const frame of accepted.paint) {
@@ -2279,15 +2286,20 @@ export function Chat({
       );
       if (activeIdRef.current === sid) {
         messagesRef.current = merged;
-        setMessages(merged);
+        commitActiveTodosIntoLastAssistant();
+        setMessages(messagesRef.current);
         if (detail.turns && detail.turns.length > 0) {
           turnOutlineBySessionRef.current.set(sid, detail.turns);
           setTurnOutline(detail.turns);
         }
         if (detail.token_usage) {
-          applySessionTokens(sid, merged, detail.token_usage);
+          applySessionTokens(sid, messagesRef.current, detail.token_usage);
         }
-        if (!keptUnpersistedTail) {
+        const hasLocalSend =
+          abortRef.current !== null ||
+          activeStreamRequestIdRef.current !== null ||
+          localTurnSessionsRef.current.has(sid);
+        if (!keptUnpersistedTail || !hasLocalSend) {
           setBusyAndClock(false);
           busyRef.current = false;
         }
@@ -2468,6 +2480,7 @@ export function Chat({
           event,
           watchReplayOffset(loadId),
           (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
+          transcriptHasOpenUserTurn(watchReplayCanvas(loadId)),
         );
         placeReplayUsers(loadId, accepted);
         for (const frame of accepted.paint) {
@@ -2651,9 +2664,13 @@ export function Chat({
             backgroundRunningSessionsRef.current.delete(targetSid);
             localTurnSessionsRef.current.delete(targetSid);
             onLiveRunningChange?.(targetSid, false);
-            sessionWatchersRef.current.get(targetSid)?.abort();
-            sessionWatchersRef.current.delete(targetSid);
-            localActiveStreamsBySessionRef.current.delete(targetSid);
+            // 只有当目标不是当前前台展示的会话时才关闭其 watcher，
+            // 严禁掐断前台正在接收 Done/终态帧的活跃推流通道！
+            if (activeIdRef.current !== targetSid) {
+              sessionWatchersRef.current.get(targetSid)?.abort();
+              sessionWatchersRef.current.delete(targetSid);
+              localActiveStreamsBySessionRef.current.delete(targetSid);
+            }
 
             const ph =
               projectHashBySessionRef.current.get(targetSid) ||
@@ -2792,7 +2809,7 @@ export function Chat({
         // destination session's messages.
         if (turnStartedAtRef.current != null) {
           turnStartedAtBySessionRef.current.set(prevId, turnStartedAtRef.current);
-          cached = stampLastAssistantElapsed(cached, Date.now() - turnStartedAtRef.current);
+          cached = stampLastAssistantElapsed(cached, Date.now() - turnStartedAtRef.current, undefined, { overwrite: true });
         }
         messageCacheRef.current.set(prevId, cached);
       } else if (prevId) {
@@ -7471,7 +7488,7 @@ export function Chat({
   }
 
   /** 立即发送：点击当下就把卡片画成用户气泡，不等停止和投递的网络往返。 */
-  function paintSendNowUserBubble(text: string, images: ImageData[]) {
+  function paintSendNowUserBubble(text: string, images: ImageData[], isSteer = false) {
     const clean = visibleUserText(text).trim();
     if (clean && messagesRef.current.some((m) => (
       m.role === 'user'
@@ -7490,6 +7507,7 @@ export function Chat({
         parts: [{ kind: 'text', text }],
         images: images.length ? images : undefined,
         ts: now,
+        isSteer: isSteer || isSteerUserMessage({ content: text }) ? true : undefined,
         sourceIndex: turnIndex,
         turnNavOrdinal: turnOrdinal,
       },
@@ -7546,12 +7564,13 @@ export function Chat({
       }
     }
 
-    const text = q.text;
+    const isSteerCard = q.kind === 'steer' || q.kind === 'steering' || isSteerUserMessage({ content: q.text });
+    const text = isSteerCard ? composeSteerWireText(q.text) : q.text;
     const images = q.images ?? [];
     const mode = q.approvalMode ?? modeState.confirmedMode;
 
-    // 4. 0ms 瞬间在画布绘制新用户气泡（无需等待停掉旧回合的网络往返）
-    paintSendNowUserBubble(text, images);
+    // 4. 0ms 瞬间在画布绘制新用户气泡（带上 isSteer 标记，确保计时器向后穿透继承）
+    paintSendNowUserBubble(text, images, isSteerCard);
 
     // 5. 停掉旧回合，并确保旧回合的挂起工具/代码块在当前画布上干净收尾
     await stopRunningTurn(currentSid, requestIdRef.current);

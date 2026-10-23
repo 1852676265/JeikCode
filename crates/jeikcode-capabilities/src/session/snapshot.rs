@@ -781,13 +781,53 @@ impl CompactionCheckpoint for SnapshotHook {
     }
 }
 
+fn is_steer_message_text(text: &str) -> bool {
+    text.contains("[jeikcode-steer]")
+        || (text.contains("<user-query>") && text.contains("</user-query>"))
+}
+
+/// Find the root user prompt's `created_at_ms` when the latest user turn chain
+/// contains one or more mid-turn steer messages. Returns `None` when the turn
+/// had no steers so ordinary single-turn accounting is untouched.
+fn root_user_start_ms_for_steered_chain(convo: &Conversation) -> Option<u64> {
+    use jeikcode_kernel::message::Role;
+
+    let mut saw_steer = false;
+    let mut fallback_ts = None;
+    for msg in convo.messages.iter().rev() {
+        if msg.role != Role::User || msg.synthetic {
+            continue;
+        }
+        if fallback_ts.is_none() && msg.created_at_ms > 0 {
+            fallback_ts = Some(msg.created_at_ms);
+        }
+        if is_steer_message_text(&msg.text) {
+            saw_steer = true;
+            continue;
+        }
+        return if saw_steer {
+            (msg.created_at_ms > 0)
+                .then_some(msg.created_at_ms)
+                .or(fallback_ts)
+        } else {
+            None
+        };
+    }
+    saw_steer.then_some(fallback_ts).flatten()
+}
+
 #[async_trait]
 impl LifecycleHooks for SnapshotHook {
     /// Mark the turn's wall-clock start (for `duration_ms`) and reset per-turn counters.
-    async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
+    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
         let mut a = self.lock();
+        let started_ms = if is_steer_message_text(text) && a.started_ms > 0 {
+            a.started_ms
+        } else {
+            now_ms()
+        };
         *a = TurnAccum {
-            started_ms: now_ms(),
+            started_ms,
             ..Default::default()
         };
         Ok(())
@@ -936,7 +976,7 @@ impl LifecycleHooks for SnapshotHook {
         snap.request_counter = snap.request_counter.max(ctx.request_id);
         let now = now_ms();
         let (
-            duration_ms,
+            mut duration_ms,
             round_count,
             tool_call_count,
             total_tokens,
@@ -955,6 +995,12 @@ impl LifecycleHooks for SnapshotHook {
                 a.tokens,
             )
         };
+        if let Some(root_start_ms) = root_user_start_ms_for_steered_chain(convo) {
+            let now_u64 = u64::try_from(now.max(0)).unwrap_or(0);
+            if now_u64 > root_start_ms {
+                duration_ms = duration_ms.max(now_u64 - root_start_ms);
+            }
+        }
         let attribution = self
             .attribution
             .lock()

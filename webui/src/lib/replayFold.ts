@@ -120,9 +120,10 @@ const EMPTY: AcceptedReplay = { paint: [], placeUsers: [] };
  */
 export function acceptReplayFrame(
   state: ReplayFoldState,
-  event: SSEEvent & { seq?: number },
+  event: SSEEvent & { seq?: number; replay_last?: boolean },
   historyOffset: number,
   onCanvas: (candidate: SSEEvent) => boolean,
+  canvasHasOpenTurn = false,
 ): AcceptedReplay {
   const hasSeq = typeof event.seq === 'number';
   const terminal = TERMINAL.has(event.type);
@@ -137,9 +138,13 @@ export function acceptReplayFrame(
   }
 
   if (onCanvas(event)) {
-    // 提问已经在页上，不能把它当成折叠线。它后面、页尾之前的工具仍是前缀，
-    // 一旦在这里打开闸门，那些工具会接到回答下面。
+    // 提问已经在页上：若该提问后面尚无任何已落盘的助手内容（canvasHasOpenTurn），说明这一轮
+    // 正处于画布末尾（非页顶截断），立即打开闸门放行后续所有工具/思考/正文；
+    // 否则它后面、页尾之前的工具仍是前缀，不在此处打开闸门。
     if (isTurnUser(event)) {
+      if (canvasHasOpenTurn) {
+        state.overlapped = true;
+      }
       return { paint: [event], placeUsers: [] };
     }
     state.overlapped = true;
@@ -154,6 +159,13 @@ export function acceptReplayFrame(
     };
   }
   if (state.overlapped) return { paint: [event], placeUsers: [] };
+  if (event.replay_last === true) {
+    // 服务端回放缓冲已到最后一帧但仍未与当前页发生重叠，说明整段回放均属于尚未落盘的新内容，
+    // 立即全量释放上屏，杜绝异地浏览器进入或刷新时因等待未来直播帧而卡在空白转圈。
+    state.overlapped = true;
+    const flushed = state.held.splice(0, state.held.length);
+    return { paint: [...flushed, event], placeUsers: [] };
+  }
   state.held.push(event);
   return EMPTY;
 }

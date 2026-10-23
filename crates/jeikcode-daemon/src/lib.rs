@@ -2604,6 +2604,8 @@ pub(crate) fn fanout_chat_events_for_session(
         let mut current_sid = session_id;
         let current_wd = working_dir;
         while let Some(event) = rx.recv().await {
+            let mut deferred_activity: Option<GlobalWireEvent> = None;
+            let mut deferred_upsert_sid: Option<String> = None;
             match &event {
                 ChatEvent::ToolCallStarted {
                     name, arguments, ..
@@ -2661,22 +2663,20 @@ pub(crate) fn fanout_chat_events_for_session(
                     if current_sid.is_none() {
                         current_sid = Some(session_id.clone());
                     }
-                    publish_global(GlobalWireEvent::Activity {
+                    deferred_activity = Some(GlobalWireEvent::Activity {
                         session_id: session_id.clone(),
                         running: false,
                         terminal: Some(chat_done_terminal_label(stop_reason.as_deref())),
                         status: None,
                     });
-                    if let Some(wd) = current_wd.clone() {
-                        publish_session_upsert(&wd, session_id);
-                    }
+                    deferred_upsert_sid = Some(session_id.clone());
                 }
                 ChatEvent::Stopped | ChatEvent::Error { .. } => {
                     if matches!(event, ChatEvent::Stopped) {
                         tracing::info!("chat: turn stopped");
                     }
                     if let Some(sid) = current_sid.clone() {
-                        publish_global(GlobalWireEvent::Activity {
+                        deferred_activity = Some(GlobalWireEvent::Activity {
                             session_id: sid,
                             running: false,
                             terminal: Some("stopped"),
@@ -2692,9 +2692,7 @@ pub(crate) fn fanout_chat_events_for_session(
                     if current_sid.is_none() {
                         current_sid = Some(session_id.clone());
                     }
-                    if let Some(wd) = current_wd.clone() {
-                        publish_session_upsert(&wd, session_id);
-                    }
+                    deferred_upsert_sid = Some(session_id.clone());
                 }
                 _ => {}
             }
@@ -2717,6 +2715,14 @@ pub(crate) fn fanout_chat_events_for_session(
                 let _ = bus.send(event.clone());
             }
             let _ = primary.send(event);
+            // 终态必须先写入 replay 并投递到 /chat/watch 总线，随后才能在全局 /events 上广播
+            // running: false 与执行磁盘扫描，避免前端收到 Activity 信号时 /chat/watch 尚未收到 Done。
+            if let Some(activity) = deferred_activity {
+                publish_global(activity);
+            }
+            if let (Some(wd), Some(sid)) = (current_wd.as_deref(), deferred_upsert_sid.as_deref()) {
+                publish_session_upsert(wd, sid);
+            }
         }
     });
     tx
@@ -4883,6 +4889,11 @@ pub(crate) fn stamp_turn_elapsed_on_last_assistants(
     messages: &mut [MessageInfo],
     turn_stats: &[jeikcode_capabilities::session::TurnStat],
 ) {
+    let total_root_turns = messages
+        .iter()
+        .filter(|m| is_visible_user_turn_start(m))
+        .count();
+    let mut extra_stats = turn_stats.len().saturating_sub(total_root_turns);
     let mut i = 0usize;
     let mut turn_i = 0usize;
     while i < messages.len() {
@@ -4892,27 +4903,44 @@ pub(crate) fn stamp_turn_elapsed_on_last_assistants(
         }
         let user_ts = messages[i].created_at;
         let mut last_asst = None;
+        let mut steer_count = 0usize;
         let mut j = i + 1;
         while j < messages.len() && !is_visible_user_turn_start(&messages[j]) {
+            if is_steer_user_message(&messages[j]) {
+                steer_count += 1;
+            }
             if is_visible_assistant_reply(&messages[j]) {
                 last_asst = Some(j);
             }
             j += 1;
         }
+        let consumed_extra = steer_count.min(extra_stats);
+        extra_stats -= consumed_extra;
+        let stats_for_turn = 1 + consumed_extra;
         if let Some(ai) = last_asst {
             let from_ts = match (user_ts, messages[ai].created_at) {
                 (Some(user), Some(asst)) if asst > user => Some(asst - user),
                 _ => None,
             };
-            let from_stat = turn_stats
-                .get(turn_i)
-                .map(|stat| stat.duration_ms)
-                .filter(|ms| *ms > 0);
-            if let Some(total) = from_stat.or(from_ts) {
+            let slice_end = (turn_i + stats_for_turn).min(turn_stats.len());
+            let from_stat = if turn_i < slice_end {
+                let sum: u64 = turn_stats[turn_i..slice_end]
+                    .iter()
+                    .map(|stat| stat.duration_ms)
+                    .sum();
+                (sum > 0).then_some(sum)
+            } else {
+                None
+            };
+            let total = match (from_stat, from_ts) {
+                (Some(stat_ms), Some(ts_ms)) if steer_count > 0 => Some(stat_ms.max(ts_ms)),
+                (stat_ms, ts_ms) => stat_ms.or(ts_ms),
+            };
+            if let Some(total) = total {
                 messages[ai].elapsed_ms = Some(total);
             }
         }
-        turn_i += 1;
+        turn_i += stats_for_turn;
         i = j;
     }
 }
@@ -9010,13 +9038,21 @@ pub(crate) async fn process_chat_request(
                 data: i.data.clone(),
             })
             .collect();
+        let base_message = if req.message.contains("[jeikcode-steer]")
+            && !steer_prompt::is_steer_wrapped(&req.message)
+        {
+            let clean = req.message.replace("[jeikcode-steer]", "");
+            steer_prompt::compose_steer_text(&clean)
+        } else {
+            req.message.clone()
+        };
         let runtime_text = live_api::preprocess_image_caption(
             &config,
             &provider_config.model,
             &working_dir,
             telemetry.clone(),
             Some(&session_id),
-            &req.message,
+            &base_message,
             &images,
         )
         .await;
@@ -9325,6 +9361,15 @@ struct StopChatResponse {
 /// sends it back as `after_seq` on reconnect, so a reconnect never re-paints what
 /// is already on screen (and never has to guess by content).
 fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) -> String {
+    chat_watch_frame_json_with_tail(event, session_id, seq, false)
+}
+
+fn chat_watch_frame_json_with_tail(
+    event: &ChatEvent,
+    session_id: &str,
+    seq: Option<u64>,
+    replay_last: bool,
+) -> String {
     let mut val = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = val {
         if !map.contains_key("session_id") {
@@ -9335,6 +9380,9 @@ fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) 
         }
         if let Some(seq) = seq {
             map.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+        }
+        if replay_last {
+            map.insert("replay_last".to_string(), serde_json::Value::Bool(true));
         }
     }
     serde_json::to_string(&val).unwrap_or_default()
@@ -9670,13 +9718,17 @@ async fn chat_watch(
     let live_session_id = session_id.clone();
     // 只有补发帧带 seq。实时帧不带：直播序号和缓冲下标不是同一套，写进游标后
     // 刷新会以为自己已经越过缓冲，服务端整段重放，前端又当成新 token 往上接。
+    let replay_len = replay_head.len();
     let head_json: Vec<String> = handshake
         .into_iter()
-        .chain(
-            replay_head
-                .iter()
-                .map(|(seq, event)| chat_watch_frame_json(event, &head_session_id, Some(*seq))),
-        )
+        .chain(replay_head.iter().enumerate().map(|(idx, (seq, event))| {
+            chat_watch_frame_json_with_tail(
+                event,
+                &head_session_id,
+                Some(*seq),
+                idx + 1 == replay_len,
+            )
+        }))
         .collect();
     let head_stream = futures::stream::iter(head_json).map(|json| {
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
@@ -17119,6 +17171,72 @@ mod tests {
         assert_eq!(messages[1].elapsed_ms, Some(5_000));
         // messages[3]（最终回复）必须是穿透 steer 后的整轮回合总耗时 120s！
         assert_eq!(messages[3].elapsed_ms, Some(120_000));
+    }
+
+    #[test]
+    fn stamp_turn_elapsed_accumulates_multi_subturn_steers_instead_of_last_subturn() {
+        use jeikcode_capabilities::session::TurnStat;
+
+        // 模拟中途多次 steer / 立即发送 steer 卡片产生多个小轮次 TurnStat，
+        // 最终 stop 结束落盘时必须取叠加后的总耗时 (180s)，绝不能退化为最后一个小轮次的 25s。
+        let mut messages = vec![
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_000_000);
+                m.content = "初始大任务".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(12_000));
+                m.created_at = Some(1_060_000);
+                m
+            },
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_060_000);
+                m.content =
+                    "<user-query>\n第一个 steer\n</user-query>\n\n[jeikcode-steer]\n".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(15_000));
+                m.created_at = Some(1_155_000);
+                m
+            },
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_155_000);
+                m.content =
+                    "<user-query>\n立即发送的第二个 steer\n</user-query>\n\n[jeikcode-steer]\n"
+                        .into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(8_000));
+                m.created_at = Some(1_180_000);
+                m
+            },
+        ];
+        // 即使 turn_stats 里只有某一个小轮次的统计（比如最后一个小轮次 25s），或者拆成了多段 (60s + 95s + 25s)
+        let stats_single_last = vec![TurnStat {
+            after_message: 6,
+            position_valid: true,
+            turn_id: 3,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 25_000,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1,
+            model_usage: vec![],
+        }];
+        stamp_turn_elapsed_on_last_assistants(&mut messages, &stats_single_last);
+        assert_eq!(
+            messages[5].elapsed_ms,
+            Some(180_000),
+            "must stamp cumulative 180s from root user, not the last 25s sub-turn"
+        );
     }
 
     #[test]

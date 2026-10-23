@@ -77,6 +77,7 @@ function lastTailUser(messages: TailMessage[]): string {
  * 已经落盘（刷新能看见）时原样采用磁盘，避免乐观气泡和权威历史各画一条。
  */
 export function mergeDiskWithUnpersistedTail<T extends TailMessage>(disk: T[], canvas: T[]): T[] {
+  if (!transcriptHasOpenUserTurn(canvas)) return disk;
   const canvasUser = visibleUserText(lastTailUser(canvas));
   if (!canvasUser) return disk;
   const diskUser = visibleUserText(lastTailUser(disk));
