@@ -356,7 +356,8 @@ fn bind_spawned_foreground(
     bind_telemetry_to_session(ctx, &ctx.current_session);
     state.on_turn_complete();
     state.on_session_replaced();
-    state.active_todos = None;
+    state.active_todos = crate::event_loop::todo_progress_from_board(&ctx.current_session.id)
+        .filter(|p| p.total > 0 && p.completed < p.total);
     crate::event_loop::sync_todo_titles(state);
     state.approval_panel = None;
     ctx.pending_runtime_request_id = None;

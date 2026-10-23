@@ -1693,6 +1693,15 @@ impl UiState {
         self.user_input_batch = None;
         self.pending_steers.clear();
         self.round_cap_panel = None;
+        // 对齐 WebUI 的 settleLiveTodo / closeCompletedTurnTodos 逻辑：
+        // 轮次结束结算时，如果所有任务均已 completed，则自动清空 active_todos 活跃面板；
+        // 如果仍有未完成任务（completed < total），则保留以供后续轮次继续推进。
+        if let Some(ref p) = self.active_todos {
+            if p.total > 0 && p.completed >= p.total {
+                self.active_todos = None;
+                self.todo_titles.clear();
+            }
+        }
         // The interactive `/usage` tab panel is streaming-only. Drop it (but keep
         // the rendered text) so its tab keys can't bleed into idle or across into
         // the next streaming turn; a fresh `/usage` re-arms it.
@@ -2894,6 +2903,37 @@ mod tests {
         });
         s.on_turn_complete();
         assert!(s.active_todos.is_some(), "panel must survive turn end");
+    }
+
+    #[test]
+    fn completed_todos_cleared_on_turn_complete() {
+        let mut s = UiState::new();
+        s.active_todos = Some(crate::render::TodoProgress {
+            current: None,
+            completed: 2,
+            in_progress: 0,
+            total: 2,
+            items: vec![
+                (
+                    jeikcode_capabilities::tools::todo::TodoStatus::Completed,
+                    "done 1".into(),
+                ),
+                (
+                    jeikcode_capabilities::tools::todo::TodoStatus::Completed,
+                    "done 2".into(),
+                ),
+            ],
+        });
+        s.todo_titles.insert(1, "done 1".to_string());
+        s.on_turn_complete();
+        assert!(
+            s.active_todos.is_none(),
+            "fully completed todos must be cleared on turn complete"
+        );
+        assert!(
+            s.todo_titles.is_empty(),
+            "titles must be cleared when all tasks are complete"
+        );
     }
 
     #[test]

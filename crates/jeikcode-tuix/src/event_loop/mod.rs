@@ -164,7 +164,9 @@ pub(crate) fn deactivate_runtime_provider_after_logout(
 
 /// Encode raw RGBA pixel data as a PNG image in memory.
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
-    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
     let slice = if rgba.len() >= expected {
         &rgba[..expected]
     } else {
@@ -8205,6 +8207,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
     // Draw welcome + initial prompt
     let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    // 水合初始会话的活跃待办（对齐 WebUI 的 session load 水合）
+    app.state.active_todos = todo_progress_from_board(&ctx.current_session.id)
+        .filter(|p| p.total > 0 && p.completed < p.total);
+    sync_todo_titles(&mut app.state);
     renderer.render(UiLine::Welcome {
         model: ctx.model_name.clone(),
         working_dir: dir_display.clone(),
@@ -19786,7 +19792,8 @@ fn commit_native_session_changed(
     state.thinking_idx = 0;
     state.on_turn_complete();
     state.on_session_replaced();
-    state.active_todos = None;
+    state.active_todos =
+        todo_progress_from_board(&session_id).filter(|p| p.total > 0 && p.completed < p.total);
     state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
@@ -20819,7 +20826,7 @@ fn handle_agent_event(
             // generic tool path). Unlike a full-list plan we do NOT suppress the row; the compact
             // `#N → status` line is a useful marker.
             if is_todo_action {
-                patch_live_todos_from_action(state, &arguments);
+                patch_live_todos_from_action(state, &ctx.current_session.id, &arguments);
             }
 
             // A full-list PLAN (`{todos:[…]}`) must populate the footer panel HERE —
@@ -21036,7 +21043,17 @@ fn handle_agent_event(
             // never clears, so it can't clobber the derived titles (a delta result yields no
             // matching lines and is a no-op).
             if is_todo_tool_name(&name) {
+                if success {
+                    if let Some(board) =
+                        jeikcode_capabilities::tools::read_todo_board(&ctx.current_session.id)
+                    {
+                        if !board.items.is_empty() {
+                            state.active_todos = Some(todo_progress_from_items(&board.items));
+                        }
+                    }
+                }
                 parse_todo_titles_into(&mut state.todo_titles, &output);
+                sync_todo_titles(state);
             }
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
@@ -22301,6 +22318,14 @@ fn handle_agent_event(
                     state.call_id_to_batch.remove(&cid);
                 }
             }
+            if let Some(board) =
+                jeikcode_capabilities::tools::read_todo_board(&ctx.current_session.id)
+            {
+                if !board.items.is_empty() {
+                    state.active_todos = Some(todo_progress_from_items(&board.items));
+                    sync_todo_titles(state);
+                }
+            }
         }
         AgentEvent::SubAgentDispatchStart { tasks } => {
             let n = tasks.len();
@@ -23377,13 +23402,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
         });
-    // Todo panel source: the persistent `active_todos` cache. Hidden when the
-    // list is empty (`total == 0`) or fully done (`completed == total`) so a
-    // finished panel disappears — otherwise it stands across turns and resume.
-    let todo = state
-        .active_todos
-        .clone()
-        .filter(|p| p.total > 0 && p.completed < p.total);
+    // Todo panel source: the persistent `active_todos` cache.
+    // 对齐 WebUI：在轮次运行期间，展示完整的待办进度（包括全部勾选完成的 5/5 态）。
+    // 只有在 total == 0 时才不展示。全完成态将在 TurnComplete 阶段自动收敛。
+    let todo = state.active_todos.clone().filter(|p| p.total > 0);
     let approval = state
         .approval_panel
         .as_ref()
@@ -24957,9 +24979,13 @@ pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
 
 /// Fold ONE incremental `todo` action into the live footer panel + title cache, mirroring the
 /// canonical `reduce_todos`. Called for EVERY dispatch path so the panel never goes stale. A
-/// `todo update` while the panel is empty is a no-op (unknown id); a `todo add` from empty
+/// `todo update` while the panel is empty reads baseline from the session TodoBoard; a `todo add`
 /// creates the panel.
-pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
+pub(crate) fn patch_live_todos_from_action(
+    state: &mut crate::state::UiState,
+    session_id: &str,
+    args: &str,
+) {
     use jeikcode_capabilities::tools::todo::{apply_todo_action, TodoItem};
     let mut items: Vec<TodoItem> = state
         .active_todos
@@ -24972,6 +24998,13 @@ pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, ar
                     content: c.clone(),
                 })
                 .collect()
+        })
+        .or_else(|| {
+            if session_id.is_empty() {
+                None
+            } else {
+                jeikcode_capabilities::tools::read_todo_board(session_id).map(|b| b.items)
+            }
         })
         .unwrap_or_default();
     apply_todo_action(&mut items, args);
