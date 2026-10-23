@@ -56,6 +56,11 @@ test('app.css contains full light-theme adaptations for DiffViewer, tabs, previe
   // Right preview panel & eye icon
   assert.match(css, /:root\[data-theme=['"]light['"]\]\s+\.preview-panel-root/);
   assert.match(css, /:root\[data-theme=['"]light['"]\]\s+\.right-panel-tab-btn\.is-drag-over-eye/);
+
+  // Native select & mini model dropdown options
+  assert.match(css, /select\s*option\s*\{\s*background-color:/);
+  assert.match(css, /\.inline-bubble-mini-model-select\s+option/);
+  assert.match(css, /:root\[data-theme=['"]light['"]\]\s+\.inline-bubble-mini-model-select\s+option/);
 });
 
 test('index.html initializes data-theme with prefers-color-scheme fallback for system preference', () => {

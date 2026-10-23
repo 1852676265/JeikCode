@@ -321,6 +321,13 @@ function AccountFormDialog({
   );
 }
 
+function notifyConfigChange() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('jeikcode:config-reloaded'));
+    window.dispatchEvent(new CustomEvent('jeikcode:reload-models'));
+  }
+}
+
 export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const { t } = useSettings();
   const [config, setConfig] = useState<ConfigInfo | null>(null);
@@ -339,9 +346,14 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [deleteAccountTarget, setDeleteAccountTarget] = useState<string | null>(null);
 
-  const reload = () =>
+  const reload = (notify = false) =>
     getConfig()
-      .then(setConfig)
+      .then((cfg) => {
+        setConfig(cfg);
+        if (notify) {
+          notifyConfigChange();
+        }
+      })
       .catch((e: unknown) => {
         const raw = e instanceof Error ? e.message : String(e);
         const auth = /401|unauthorized|access token/i.test(raw);
@@ -657,7 +669,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                                         type="button"
                                         onClick={async () => {
                                           await setDefaultProvider(p.name);
-                                          reload();
+                                          reload(true);
                                         }}
                                         title={t('settings.setAsDefault')}
                                       >
@@ -734,7 +746,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         onSaved={() => {
           setShowAddModel(false);
           setAddModelDefaultAccount(undefined);
-          reload();
+          reload(true);
         }}
       />
     )}
@@ -747,7 +759,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         onClose={() => setEditModelTarget(null)}
         onSaved={() => {
           setEditModelTarget(null);
-          reload();
+          reload(true);
         }}
       />
     )}
@@ -758,7 +770,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         onClose={() => setShowAddAccount(false)}
         onSaved={() => {
           setShowAddAccount(false);
-          reload();
+          reload(true);
         }}
       />
     )}
@@ -770,7 +782,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         onClose={() => setEditAccountTarget(null)}
         onSaved={() => {
           setEditAccountTarget(null);
-          reload();
+          reload(true);
         }}
       />
     )}
@@ -783,7 +795,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         cancelLabel={t('common.cancel')}
         onConfirm={async () => {
           await deleteProvider(deleteModelTarget);
-          reload();
+          reload(true);
         }}
         onClose={() => setDeleteModelTarget(null)}
       />
@@ -797,7 +809,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
         cancelLabel={t('common.cancel')}
         onConfirm={async () => {
           await deleteAccount(deleteAccountTarget);
-          reload();
+          reload(true);
         }}
         onClose={() => setDeleteAccountTarget(null)}
       />

@@ -1575,8 +1575,22 @@ export function Chat({
 
   useEffect(() => {
     let active = true;
-    getModels().then((m) => { if (active) setModelCatalog(m); }).catch(() => {});
-    return () => { active = false; };
+    const fetchCatalog = () => {
+      getModels()
+        .then((m) => {
+          if (active) setModelCatalog(m);
+        })
+        .catch(() => {});
+    };
+    fetchCatalog();
+
+    window.addEventListener('jeikcode:config-reloaded', fetchCatalog);
+    window.addEventListener('jeikcode:reload-models', fetchCatalog);
+    return () => {
+      active = false;
+      window.removeEventListener('jeikcode:config-reloaded', fetchCatalog);
+      window.removeEventListener('jeikcode:reload-models', fetchCatalog);
+    };
   }, [provider]);
 
   const activeModelMeta = modelCatalog.find((m) => m.provider === provider)
