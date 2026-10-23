@@ -4719,10 +4719,17 @@ async fn get_session_detail(
                     .live_turn_session_ids()
                     .iter()
                     .any(|sid| sid == &id);
-            let _ = turn_running;
-            let todos = jeikcode_capabilities::tools::read_todo_board(&id)
-                .map(|board| board.items)
-                .unwrap_or_default();
+            let todos = if let Some(board) = jeikcode_capabilities::tools::read_todo_board(&id) {
+                if jeikcode_capabilities::tools::list_fully_completed(&board.items) && !turn_running
+                {
+                    let _ = jeikcode_capabilities::tools::close_todo_board_if_complete(&id);
+                    Vec::new()
+                } else {
+                    board.items
+                }
+            } else {
+                Vec::new()
+            };
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,

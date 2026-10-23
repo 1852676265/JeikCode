@@ -710,6 +710,24 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             Arc::clone(&mcp_tool_names),
         )));
     }
+    // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
+    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
+    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
+    // JEIKCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
+    // references tools that aren't mounted). This is the ONLY production registration of
+    // TodoHook — every real entrypoint (CLI, daemon, clix) goes through prepare()/assemble()
+    // here; `assemble.rs::build_coding_agent` (which also registers it) is reachable only
+    // from tests + examples, so there is no double-registration.
+    //
+    // CRITICAL: Registered BEFORE SnapshotHook so that on turn_complete, TodoHook's
+    // close_todo_board_if_complete runs first, allowing SnapshotHook to observe the converged
+    // board closure and delete completed .todo sidecars during commit_native_runtime_mutation.
+    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
+        hooks.push(Arc::new(match todo_live {
+            Some(live) => crate::todo::TodoHook::with_live(live),
+            None => crate::todo::TodoHook::new(),
+        }));
+    }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
@@ -737,20 +755,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     hooks.push(Arc::new(
         jeikcode_capabilities::session::WriteStateHook::new(),
     ));
-    // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
-    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
-    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
-    // JEIKCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
-    // references tools that aren't mounted). This is the ONLY production registration of
-    // TodoHook — every real entrypoint (CLI, daemon, clix) goes through prepare()/assemble()
-    // here; `assemble.rs::build_coding_agent` (which also registers it) is reachable only
-    // from tests + examples, so there is no double-registration.
-    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
-        hooks.push(Arc::new(match todo_live {
-            Some(live) => crate::todo::TodoHook::with_live(live),
-            None => crate::todo::TodoHook::new(),
-        }));
-    }
     // Opening-turn code_explore tail (appended to the first real user block, like
     // the date reminder) + wander-meter middleware registered in `assemble`.
     let code_tools_first = Arc::new(crate::code_tools_first::CodeToolsFirstHook::new(

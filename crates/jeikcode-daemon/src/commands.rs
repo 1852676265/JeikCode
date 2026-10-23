@@ -626,9 +626,14 @@ fn exec_todo(
 
 fn todo_items_from_board(session_id: &str) -> Vec<TodoItemJson> {
     use jeikcode_capabilities::tools::todo::TodoStatus;
-    let todos = jeikcode_capabilities::tools::read_todo_board(session_id)
-        .map(|board| board.items)
-        .unwrap_or_default();
+    let todos = match jeikcode_capabilities::tools::read_todo_board(session_id) {
+        Some(board) if jeikcode_capabilities::tools::list_fully_completed(&board.items) => {
+            let _ = jeikcode_capabilities::tools::close_todo_board_if_complete(session_id);
+            Vec::new()
+        }
+        Some(board) => board.items,
+        None => Vec::new(),
+    };
 
     todos
         .into_iter()

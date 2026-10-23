@@ -739,7 +739,7 @@ pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
     list
 }
 
-fn list_fully_completed(list: &[TodoItem]) -> bool {
+pub fn list_fully_completed(list: &[TodoItem]) -> bool {
     !list.is_empty() && list.iter().all(|item| item.status == TodoStatus::Completed)
 }
 
@@ -1000,7 +1000,7 @@ pub fn todo_session_is_closed(session_id: &str) -> bool {
 
 /// Install a board loaded from disk, unless this process already has a newer slot.
 pub fn restore_todo_board(session_id: &str, board: TodoBoard) {
-    if session_id.is_empty() || board.items.is_empty() {
+    if session_id.is_empty() || board.items.is_empty() || list_fully_completed(&board.items) {
         return;
     }
     let mut guard = todo_registry()
@@ -1351,9 +1351,17 @@ impl Tool for TodoTool {
             v.get("actions").and_then(|a| a.as_array()).map(Vec::as_slice),
             Some([only]) if action_kind(only) == Some("list")
         ) {
+            let items = self.board_items();
+            if list_fully_completed(&items) {
+                if let Some(session_id) = todo_session_of(&self.live) {
+                    let _ = close_todo_board_if_complete(&session_id);
+                }
+                *self.lock_live() = Vec::new();
+                return ok("Current task list:\n\n(no tasks)".to_string());
+            }
             return ok(format!(
                 "Current task list:\n\n{}",
-                render_todos_numbered(&self.board_items(), false)
+                render_todos_numbered(&items, false)
             ));
         }
 

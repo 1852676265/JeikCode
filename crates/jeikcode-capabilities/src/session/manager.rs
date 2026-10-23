@@ -1111,7 +1111,9 @@ impl SessionManager {
             return Ok(());
         }
         match crate::tools::read_todo_board(id) {
-            Some(board) if !board.items.is_empty() => {
+            Some(board)
+                if !board.items.is_empty() && !crate::tools::list_fully_completed(&board.items) =>
+            {
                 let bytes =
                     serde_json::to_vec(&board).map_err(|error| SessionStoreError::Corrupt {
                         kind: "todo board",
@@ -1129,6 +1131,14 @@ impl SessionManager {
     }
 
     fn restore_todo_board(&self, id: &str) {
+        self.restore_todo_board_with_messages(id, None);
+    }
+
+    fn restore_todo_board_with_messages(
+        &self,
+        id: &str,
+        messages: Option<&[jeikcode_kernel::message::Message]>,
+    ) {
         if crate::tools::todo_session_is_closed(id) || crate::tools::read_todo_board(id).is_some() {
             return;
         }
@@ -1139,6 +1149,27 @@ impl SessionManager {
             return;
         };
         if let Ok(board) = serde_json::from_slice::<crate::tools::TodoBoard>(&bytes) {
+            // 防线 1：如果磁盘上的 board 本身为空或全部项已是 Completed，说明是完成态，绝不能复活
+            if board.items.is_empty() || crate::tools::list_fully_completed(&board.items) {
+                let _ = fs::remove_file(&path);
+                crate::tools::clear_todo_board(id);
+                return;
+            }
+            // 防线 2：若传入了转录消息历史，校验历史中的最新 todo 状态。
+            // 若转录历史中曾经有 todo 调用，但最终 derive_current_todos 为空（说明在历史中已全部完成关闭），
+            // 则磁盘上的 .todo 文件是过期的历史幽灵数据，必须删除并拒绝复活。
+            if let Some(msgs) = messages {
+                let had_todo_calls = msgs.iter().any(|m| {
+                    m.tool_calls
+                        .iter()
+                        .any(|c| crate::tools::is_todo_tool_name(&c.name))
+                });
+                if had_todo_calls && crate::tools::derive_current_todos(msgs).is_empty() {
+                    let _ = fs::remove_file(&path);
+                    crate::tools::clear_todo_board(id);
+                    return;
+                }
+            }
             crate::tools::restore_todo_board(id, board);
         }
     }
@@ -1611,7 +1642,7 @@ impl SessionManager {
             read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
         validate_snapshot(&snapshot)?;
-        self.restore_todo_board(id);
+        self.restore_todo_board_with_messages(id, Some(&snapshot.messages));
         Ok(snapshot)
     }
 
@@ -2846,6 +2877,7 @@ impl SessionManager {
                 });
             }
             self.commit_replacements_with_rollback(lease.id(), &replacements)?;
+            self.persist_todo_board(lease.id())?;
             Ok(result)
         })
     }
@@ -6383,6 +6415,155 @@ mod tests {
         mgr.delete(&source_lease).unwrap();
         assert!(!mgr.todo_board_path("source_cold").unwrap().exists());
         assert!(crate::tools::read_todo_board("source_cold").is_none());
+    }
+
+    #[test]
+    fn native_runtime_mutation_persists_and_clears_todo_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let session_id = "test_mutation_todo";
+        let lease = mgr.acquire_lease(session_id).unwrap();
+        let snapshot = snap(&["turn 1"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![],
+        };
+        let mut meta = SessionMeta::new(session_id, "/project", 10);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+
+        // 1. Commit active task, then commit_native_runtime_mutation -> .todo should be persisted on disk
+        let task = crate::tools::TodoItem {
+            content: "task in progress".into(),
+            status: crate::tools::TodoStatus::InProgress,
+        };
+        crate::tools::commit_todo_board(session_id, &[task]);
+        mgr.commit_native_runtime_mutation(&lease, &snapshot, |_, _, _| Ok(()))
+            .unwrap();
+        assert!(
+            mgr.todo_board_path(session_id).unwrap().is_file(),
+            "active todo must be persisted by commit_native_runtime_mutation"
+        );
+
+        // 2. Mark completed and closed -> commit_native_runtime_mutation must delete the .todo file
+        assert!(crate::tools::close_todo_board_if_complete(session_id).is_none()); // only 1 task and it's in_progress
+        let completed_task = crate::tools::TodoItem {
+            content: "task in progress".into(),
+            status: crate::tools::TodoStatus::Completed,
+        };
+        crate::tools::commit_todo_board(session_id, &[completed_task]);
+        let closed = crate::tools::close_todo_board_if_complete(session_id);
+        assert!(closed.is_some(), "all items completed must close the board");
+
+        mgr.commit_native_runtime_mutation(&lease, &snapshot, |_, _, _| Ok(()))
+            .unwrap();
+        assert!(
+            !mgr.todo_board_path(session_id).unwrap().exists(),
+            "completed and closed todo file must be deleted by commit_native_runtime_mutation"
+        );
+
+        mgr.delete(&lease).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_does_not_resurrect_completed_or_stale_todo_board() {
+        use jeikcode_kernel::message::Message;
+        use jeikcode_kernel::tool::ToolCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let session_id = "test_stale_resurrect";
+
+        // Case 1: Disk has a .todo file where all items are completed -> load_snapshot must delete it and NOT resurrect
+        let completed_board = crate::tools::TodoBoard {
+            id: "todo-done".into(),
+            seq: 1,
+            items: vec![crate::tools::TodoItem {
+                content: "already done task".into(),
+                status: crate::tools::TodoStatus::Completed,
+            }],
+        };
+        let bytes = serde_json::to_vec(&completed_board).unwrap();
+        std::fs::write(mgr.todo_board_path(session_id).unwrap(), bytes).unwrap();
+        let empty_snap = SessionSnapshot::new(Vec::new());
+        mgr.save_snapshot(session_id, &empty_snap).unwrap();
+
+        // Ensure memory is clean
+        crate::tools::purge_todo_board(session_id);
+        assert!(crate::tools::read_todo_board(session_id).is_none());
+
+        // load_snapshot should NOT restore completed board and should remove the file
+        let loaded = mgr.load_snapshot(session_id).unwrap();
+        assert_eq!(loaded.messages.len(), 0);
+        assert!(
+            crate::tools::read_todo_board(session_id).is_none(),
+            "completed todo board must NOT be resurrected into memory"
+        );
+        assert!(
+            !mgr.todo_board_path(session_id).unwrap().exists(),
+            "completed todo file on disk must be cleaned up"
+        );
+
+        // Case 2: Disk has an old .todo file with an InProgress task, but transcript shows it was already completed
+        let stale_board = crate::tools::TodoBoard {
+            id: "todo-stale".into(),
+            seq: 1,
+            items: vec![crate::tools::TodoItem {
+                content: "step 1".into(),
+                status: crate::tools::TodoStatus::InProgress,
+            }],
+        };
+        let stale_bytes = serde_json::to_vec(&stale_board).unwrap();
+        std::fs::write(mgr.todo_board_path(session_id).unwrap(), stale_bytes).unwrap();
+
+        // Create transcript where step 1 was added then completed
+        let transcript_msgs = vec![
+            Message::user("do work"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "todo_write".into(),
+                    arguments: r#"{"actions":[{"action":"add","content":"step 1"}]}"#.into(),
+                }],
+            ),
+            Message::tool_result("c1", "Added task: step 1", false),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c2".into(),
+                    name: "todo_write".into(),
+                    arguments: r#"{"actions":[{"id":1,"status":"completed"}]}"#.into(),
+                }],
+            ),
+            Message::tool_result("c2", "#1 -> completed", false),
+        ];
+        let mut snap_with_history = SessionSnapshot::new(transcript_msgs);
+        snap_with_history
+            .messages
+            .push(Message::user("is todo empty?"));
+
+        // Save snapshot without triggering persist_todo_board overwrite by writing directly or save_snapshot
+        let snap_bytes =
+            serialize_bounded(&snap_with_history, "snapshot", MAX_SNAPSHOT_BYTES).unwrap();
+        atomic_write(&mgr.snapshot_path(session_id).unwrap(), &snap_bytes).unwrap();
+
+        // Memory clean
+        crate::tools::purge_todo_board(session_id);
+        assert!(crate::tools::read_todo_board(session_id).is_none());
+        assert!(mgr.todo_board_path(session_id).unwrap().is_file());
+
+        // load_snapshot should detect transcript is completed, delete the stale disk file and NOT restore
+        let _ = mgr.load_snapshot(session_id).unwrap();
+        assert!(
+            crate::tools::read_todo_board(session_id).is_none(),
+            "stale todo board must NOT be resurrected when transcript is completed"
+        );
+        assert!(
+            !mgr.todo_board_path(session_id).unwrap().exists(),
+            "stale todo file on disk must be cleaned up"
+        );
     }
 
     #[test]
