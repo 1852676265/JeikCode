@@ -21,6 +21,46 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.7 (2026-10-24)
+
+- **[Bash Script Resiliency & Idle Timeout Optimization] Inline backtick escaping self-healing and expanded idle harvest window**:
+  - Automatically healed unescaped backticks in double-quoted inline scripts (e.g., `python -c` and `node -e`) across execution pipelines, eliminating fatal syntax errors from premature command substitution.
+  - Relaxed the 0% CPU silent process timeout window from 3s to 15s and whitelisted network scrapers and test suites (`jeik`, `playwright`, `puppeteer`, `pytest`, `scrapy`, `httpx`) to prevent premature termination during legitimate network I/O.
+- **[Provider Reasoning Protocols & Session Title Isolation] Standardized thinking effort dispatch and lightweight session naming**:
+  - Aligned reasoning effort and thinking budget dispatch across Anthropic, Gemini, OpenAI, Responses, and Ollama providers, respecting explicit budget overrides without force-injecting numbers when selecting standard effort gears.
+  - Isolated AI session title generation with a dedicated non-reasoning provider configuration to eliminate reasoning token exhaustion and timeouts during session initiation.
+  - Linked model selector and settings dialogs to automatically set reasoning history to include mode when enabling reasoning models, with refined budget sliders and responsive theme styling.
+- **[TUI Todo Board Real-time Convergence & Lifecycle Alignment] Terminal-WebUI todo board parity**:
+  - Synchronized TUI todo board updates with authoritative daemon state upon tool completion, falling back to persisted baselines to prevent incremental action drops.
+  - Rendered full 100% completion states during streaming turns, auto-clearing completed items on turn completion while preserving unfinished tasks across turns and hydrating on startup or session switches.
+- **[WebUI Markdown Directory Navigation & Sans-Serif Font Stabilization] Directory explorer integration and font stack unification**:
+  - Supported clicking and right-clicking directory paths in Markdown to open them directly in the system file explorer, with full and relative path copy actions and daemon path resolution against working directories.
+  - Replaced invasive reload error toasts with inline recovery cards in CodeEditorTab, deferring reads when working directory is unset.
+  - Unified sans-serif font family fallbacks across all supported languages to prevent font degradation into SimSun serif typefaces.
+- **[TodoBoard Resurrection Elimination] Multi-layered cleanup and lifecycle synchronization**:
+  - Synchronized TodoBoard disk persistence with runtime mutations, registering TodoHook prior to SnapshotHook so completed `.todo` sidecars are purged before snapshot writes.
+  - Added multi-layered defenses during session restore and read-only queries to permanently purge legacy zombie todo boards on restart.
+
+---
+
+- **[Bash 脚本自愈与静默收网优化] 内联脚本反引号转义自愈与放宽收网宽限度**:
+  - 在跨平台执行链路中自动将双引号内联脚本（如 `python -c`、`node -e`）中的未转义反引号转义为 `\`，彻底杜绝意外命令替换引发的语法崩溃。
+  - 将未知进程 0% CPU 静默收网时间由 3 秒放宽至 15 秒，并将爬虫与网络测试工具（`jeik`、`playwright`、`puppeteer`、`pytest`、`scrapy`、`httpx`）纳入下载与 I/O 豁免白名单，避免正常网络等待被误杀。
+- **[供应商思考协议对齐与会话命名隔离] 思考强度协议下发规范化与轻量化会话命名**:
+  - 全面规范 Anthropic、Gemini、OpenAI、Responses 与 Ollama 等供应商的思考强度与思考预算下发逻辑，在仅选择档位时避免强推数字预算，尊重模型原生推理机制。
+  - 为 AI 会话命名配置独立的无推理轻量通道，彻底杜绝首轮会话因思考 Token 耗尽导致的超时与截断。
+  - 联动模型选择与设置弹窗，开启思考模型时默认将思考历史设为包含（include），优化思考预算滑动条并完善亮暗主题自适应排版。
+- **[TUI 待办清单实时同步与生命周期对齐] 终端与 WebUI 待办状态严格收敛**:
+  - 在工具调用与批处理完成后即时向 daemon 权威底座刷新待办清单，基准为空时自动回退捞取持久化任务，杜绝增量操作丢失。
+  - 对齐 WebUI 实时渲染全完成态（打绿勾），轮次收敛结束时自动清空已完成列表并保留未完成项，并在启动入口与会话切换时正确水合。
+- **[WebUI Markdown 目录导航与无衬线字体防畸变] 目录跳转系统资源管理器与字体栈统一**:
+  - 在 Markdown 中原生支持点击与右键点击目录路径直接在系统资源管理器中定位，提供复制绝对/相对路径能力，并强化 daemon 相对路径解析。
+  - 消除文件重新加载时的侵入式全局错误 Toast，改用 CodeEditorTab 内联恢复卡片并在工作区就绪前平滑等待。
+  - 统一跨语言无衬线字体栈配置，消除切换语言时界面文字退化为宋体衬线体的问题。
+- **[待办清单彻底防复活治理] 持久化与快照生命周期对齐**:
+  - 在运行时提交中补齐 TodoBoard 持久化，先由 TodoHook 闭环清理磁盘 `.todo` 文件再执行快照提交。
+  - 在恢复会话与只读查询中增加多重防线，识别并彻底删除已完结历史留存的幽灵待办文件。
+
 ## v7.2.9-beta.6 (2026-10-23)
 
 - **[Cumulative Steer Timer & Completed Todo Turn Freeze Resolution] Accurate chained steer turn duration tracking, phantom active turn elimination, and canvas freeze fixes**:
