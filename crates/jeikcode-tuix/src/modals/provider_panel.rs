@@ -1230,7 +1230,7 @@ impl ProviderPanel {
                         model.context_window = context_window;
                         model.supports_vision = Some(supports_vision);
                         model.reasoning_model = Some(signed_thinking || reasoning_model);
-                        if signed_thinking {
+                        if signed_thinking || reasoning_model {
                             if model.reasoning_levels.as_ref().is_none_or(|l| l.is_empty()) {
                                 model.reasoning_levels =
                                     Some(default_reasoning_levels_for(&model_name));
@@ -1247,7 +1247,7 @@ impl ProviderPanel {
                         provider.context_window = context_window;
                         provider.supports_vision = Some(supports_vision);
                         provider.reasoning_model = Some(signed_thinking || reasoning_model);
-                        if signed_thinking {
+                        if signed_thinking || reasoning_model {
                             if provider
                                 .reasoning_levels
                                 .as_ref()
@@ -1303,7 +1303,8 @@ impl ProviderPanel {
                             capable_model: None,
                             thinking_type: None,
                             thinking_keep: None,
-                            reasoning_history: signed_thinking.then(|| "include".to_string()),
+                            reasoning_history: (signed_thinking || reasoning_model)
+                                .then(|| "include".to_string()),
                             reasoning_effort: default_reasoning_effort_for(&model_name),
                             reasoning_levels: persist_reasoning
                                 .then(|| default_reasoning_levels_for(&model_name)),

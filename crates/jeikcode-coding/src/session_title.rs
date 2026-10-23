@@ -324,6 +324,20 @@ mod tests {
         assert!(should_accept_ai_name(false, false));
         assert!(!should_accept_ai_name(true, false));
         assert!(!should_accept_ai_name(false, true));
+        assert!(!should_accept_ai_name(true, true));
+    }
+
+    #[test]
+    fn fallback_name_detection_distinguishes_placeholders_from_named_titles() {
+        use jeikcode_capabilities::session::SessionMeta;
+        assert!(SessionMeta::name_needs_fallback("session-123", "123"));
+        assert!(SessionMeta::name_needs_fallback(
+            "session-1718000000",
+            "456"
+        ));
+        assert!(SessionMeta::name_needs_fallback("default", "456"));
+        assert!(!SessionMeta::name_needs_fallback("快速排序算法实现", "456"));
+        assert!(!SessionMeta::name_needs_fallback("Git commit flow", "456"));
     }
 
     #[test]

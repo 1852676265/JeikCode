@@ -62,23 +62,26 @@ impl ReasoningPolicy {
     }
 
     /// Resolve policy given optional explicit `reasoning_model` bool, optional `reasoning_history` string, model and base_url.
+    ///
+    /// Turning on the reasoning switch (`reasoning_model: true`) does NOT mean history
+    /// must be echoed (e.g. DeepSeek-R1 strictly forbids it and 400s if sent).
+    /// Explicit `reasoning_history` always takes highest precedence.
     pub fn resolve(
         reasoning_model: Option<bool>,
         reasoning_history: Option<&str>,
         model: &str,
         base_url: &str,
     ) -> Result<Self, String> {
-        // Explicit `reasoning_history` override ("include" | "exclude") wins over `reasoning_model` flag
+        // 1. Explicit `reasoning_history` override ("include" | "exclude") always wins.
         if let Some(parsed) = Self::from_config(reasoning_history)? {
             return Ok(parsed);
         }
-        if let Some(explicit) = reasoning_model {
-            return Ok(if explicit {
-                ReasoningPolicy::Include
-            } else {
-                ReasoningPolicy::Exclude
-            });
+        // 2. If the user explicitly disabled reasoning (reasoning_model = false), never echo.
+        if reasoning_model == Some(false) {
+            return Ok(ReasoningPolicy::Exclude);
         }
+        // 3. When reasoning_model is Some(true) or None (unset), defer to derive(model, base_url).
+        // A reasoning model does not automatically echo history unless its wire protocol specifies it.
         Ok(Self::derive(model, base_url))
     }
 
@@ -94,9 +97,6 @@ impl ReasoningPolicy {
             ReasoningPolicy::Exclude
         } else if m.contains("deepseek-v4") || m.contains("grok") {
             // DeepSeek V4 thinking mode / Grok 4.5/4.6: REQUIRES/expects reasoning_content on tool-call turns.
-            ReasoningPolicy::Include
-        } else if jeikcode_config::config::provider::gemini_defaults_thinking(model) {
-            // Gemini 2.5+ thinking / Gemini 3+ function calling: echo thoughtSignature.
             ReasoningPolicy::Include
         } else if m.starts_with("kimi-")
             || m.starts_with("moonshot")
@@ -139,19 +139,19 @@ mod tests {
         );
         assert_eq!(
             ReasoningPolicy::derive("gemini-2.5-flash", ""),
-            ReasoningPolicy::Include
+            ReasoningPolicy::Exclude
         );
         assert_eq!(
             ReasoningPolicy::derive("gemini-3-pro", ""),
-            ReasoningPolicy::Include
+            ReasoningPolicy::Exclude
         );
         assert_eq!(
             ReasoningPolicy::derive("gemini-3.8-flash", ""),
-            ReasoningPolicy::Include
+            ReasoningPolicy::Exclude
         );
         assert_eq!(
             ReasoningPolicy::derive("gemini-4-pro", ""),
-            ReasoningPolicy::Include
+            ReasoningPolicy::Exclude
         );
         assert_eq!(
             ReasoningPolicy::derive("gemini-2.0-flash", ""),
@@ -231,9 +231,15 @@ mod tests {
             ReasoningPolicy::resolve(Some(false), Some("include"), "grok-4.6", ""),
             Ok(ReasoningPolicy::Include)
         );
-        // Explicit reasoning_model = Some(true) forces Include when reasoning_history is None
+        // Turning on reasoning_model (Some(true)) does NOT blindly force Include:
+        // DeepSeek-R1 is a reasoning model but strictly forbids echoing (HTTP 400).
         assert_eq!(
             ReasoningPolicy::resolve(Some(true), None, "deepseek-r1", ""),
+            Ok(ReasoningPolicy::Exclude)
+        );
+        // But for DeepSeek-V4/Grok, derive correctly yields Include.
+        assert_eq!(
+            ReasoningPolicy::resolve(Some(true), None, "deepseek-v4-flash", ""),
             Ok(ReasoningPolicy::Include)
         );
         // Explicit reasoning_model = Some(false) forces Exclude when reasoning_history is None

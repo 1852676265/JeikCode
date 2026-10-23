@@ -136,23 +136,15 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn resolve_policy(cfg: &AnthropicConfig) -> ReasoningPolicy {
-        cfg.reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| {
-                if cfg.thinking {
-                    ReasoningPolicy::Include
-                } else {
-                    ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
-                }
-            })
+        cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else if cfg.thinking {
+                ReasoningPolicy::Include
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        })
     }
 
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {

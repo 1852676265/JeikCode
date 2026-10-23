@@ -99,18 +99,13 @@ pub struct ResponsesProvider {
 
 impl ResponsesProvider {
     pub fn new(cfg: ResponsesConfig) -> Result<Self, ProviderError> {
-        let policy = cfg
-            .reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
+        let policy = cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        });
         let connect_timeout = cfg.connect_timeout;
         let skip_tls_verify = cfg.skip_tls_verify;
         let user_agent = cfg.user_agent.clone();
@@ -499,26 +494,47 @@ fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: boo
             }
             Role::Assistant => {
                 if echo_reasoning {
+                    let mut echoed_block = false;
                     for block in &m.reasoning_blocks {
                         if block.provider.as_deref() != Some(RESPONSES_PROVIDER) {
                             continue;
                         }
-                        let Some(enc) = block.opaque.as_deref().filter(|s| !s.is_empty()) else {
-                            continue;
-                        };
                         let mut item = Map::new();
                         item.insert("type".into(), json!("reasoning"));
                         if let Some(id) = block.id.as_deref().filter(|s| !s.is_empty()) {
                             item.insert("id".into(), json!(id));
                         }
-                        item.insert("encrypted_content".into(), json!(enc));
-                        if !block.text.is_empty() {
+                        if let Some(enc) = block.opaque.as_deref().filter(|s| !s.is_empty()) {
+                            // OpenAI / Grok ciphertext replay flow
+                            item.insert("encrypted_content".into(), json!(enc));
+                            if !block.text.is_empty() {
+                                item.insert(
+                                    "summary".into(),
+                                    json!([{ "type": "summary_text", "text": block.text }]),
+                                );
+                            }
+                            out.push(Value::Object(item));
+                            echoed_block = true;
+                        } else if !block.text.is_empty() {
+                            // DeepSeek Responses API plain reasoning_text content parts flow
                             item.insert(
-                                "summary".into(),
-                                json!([{ "type": "summary_text", "text": block.text }]),
+                                "content".into(),
+                                json!([{ "type": "reasoning_text", "text": block.text }]),
                             );
+                            out.push(Value::Object(item));
+                            echoed_block = true;
                         }
-                        out.push(Value::Object(item));
+                    }
+                    if !echoed_block {
+                        if let Some(reasoning) = m.reasoning.as_deref().filter(|s| !s.is_empty()) {
+                            out.push(json!({
+                                "type": "reasoning",
+                                "content": [{
+                                    "type": "reasoning_text",
+                                    "text": reasoning,
+                                }]
+                            }));
+                        }
                     }
                 }
                 if !m.text.is_empty() {
@@ -962,6 +978,18 @@ mod tests {
         assert_eq!(out[1]["type"], "reasoning");
         assert_eq!(out[1]["id"], "rs_6820f383d7c9a1b2");
         assert_eq!(out[1]["encrypted_content"], "cipher");
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[2]["content"], "done");
+    }
+
+    #[test]
+    fn format_input_replays_plain_reasoning_text_for_deepseek_responses() {
+        let mut a = Message::assistant("done", vec![]);
+        a.reasoning = Some("deep thinking steps".into());
+        let out = format_input(&[Message::user("q"), a], false, true);
+        assert_eq!(out[1]["type"], "reasoning");
+        assert_eq!(out[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(out[1]["content"][0]["text"], "deep thinking steps");
         assert_eq!(out[2]["role"], "assistant");
         assert_eq!(out[2]["content"], "done");
     }

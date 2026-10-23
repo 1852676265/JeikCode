@@ -1481,16 +1481,22 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::SessionNameSuggested { name } => {
-                if let Err(error) = crate::legacy_convert::apply_ai_catalog_name_in_project(
+                let applied = match crate::legacy_convert::apply_ai_catalog_name_in_project(
                     &naming_project_bucket,
                     &naming_session_id,
                     &name,
                 ) {
-                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
-                        "session naming failed: {error}"
-                    )));
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                            "session naming failed: {error}"
+                        )));
+                        false
+                    }
+                };
+                if applied {
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::SessionNameSuggested { name });
                 }
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::SessionNameSuggested { name });
             }
             CodingRuntimeEvent::SessionTitleSeeded { name } => {
                 // Disk title was already seeded at publish; forward so live views see the provisional title.

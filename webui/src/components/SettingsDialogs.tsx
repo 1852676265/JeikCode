@@ -1272,7 +1272,13 @@ function ProviderFormDialog({
           <button
             type="button"
             class={'capsule-toggle-pill' + (reasoningModel ? ' active' : '')}
-            onClick={() => setReasoningModel((v) => !v)}
+            onClick={() => {
+              const next = !reasoningModel;
+              setReasoningModel(next);
+              if (next) {
+                setReasoningHistory('include');
+              }
+            }}
           >
             <span class="pill-dot" />
             <span class="pill-icon">🧠</span>

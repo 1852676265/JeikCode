@@ -720,14 +720,28 @@ fn try_spawn_ai_session_title(
         .manager
         .read_meta(&binding.id)
         .ok()
-        .map(|meta| crate::session_title::should_accept_ai_name(meta.user_renamed, meta.ai_named))
+        .map(|meta| {
+            crate::session_title::should_accept_ai_name(meta.user_renamed, meta.ai_named)
+                && (meta.turn_count <= 1
+                    || jeikcode_capabilities::session::SessionMeta::name_needs_fallback(
+                        &meta.name, &meta.id,
+                    ))
+        })
         .unwrap_or(false);
     if !accept || !ai_session_naming_enabled_for(runtime) {
         return false;
     }
+    // Dedicated lightweight, non-reasoning configuration for title generation.
+    // Avoids runaway reasoning token explosion, timeouts, or output truncation
+    // on thinking models configured with high thinking_budget.
+    let mut title_cfg = runtime.config.clone();
+    title_cfg.thinking_budget = None;
+    title_cfg.thinking_enabled = Some(false);
+    title_cfg.thinking_type = Some("disabled".to_string());
+    title_cfg.chat_options.reasoning_effort = Some(jeikcode_kernel::provider::ReasoningEffort::Low);
     let Ok(provider) = runtime
         .provider_factory
-        .build(&runtime.config, Some(binding.id.as_str()))
+        .build(&title_cfg, Some(binding.id.as_str()))
     else {
         return false;
     };
@@ -735,9 +749,32 @@ fn try_spawn_ai_session_title(
         return false;
     };
     let tx = session_name_tx.clone();
+    let manager = binding.manager.clone();
+    let session_id = binding.id.clone();
     tokio::spawn(async move {
         let name = crate::session_title::generate_session_title(provider, conversation).await;
-        let _ = tx.send((generation, name, guard));
+        // If the runtime owner loop is still alive, deliver via channel so it can
+        // update metadata and broadcast SessionNameSuggested. If the runtime shut down
+        // early (e.g. single-turn webui /chat completed), directly persist to metadata
+        // so `ai_named: true` and the generated title are never lost to a closed channel.
+        if let Some(ref generated_name) = name {
+            if tx.send((generation, name.clone(), guard)).is_err() {
+                let _ = manager.update_meta(&session_id, |meta| {
+                    if !crate::session_title::should_accept_ai_name(
+                        meta.user_renamed,
+                        meta.ai_named,
+                    ) {
+                        return None;
+                    }
+                    let old_name = std::mem::replace(&mut meta.name, generated_name.clone());
+                    meta.ai_named = true;
+                    meta.updated_at = jeikcode_capabilities::session::now_ms();
+                    Some(old_name)
+                });
+            }
+        } else {
+            let _ = tx.send((generation, None, guard));
+        }
     });
     true
 }
@@ -2938,9 +2975,10 @@ fn spawn_runtime_owner_with_optional_agent(
                     };
                     let Some(name) = maybe_name else { continue };
                     if name_generation == generation {
+                        let mut applied = false;
                         if let Some(runtime) = resources.as_mut() {
                             if let Some(binding) = runtime.parts.session.as_mut() {
-                                let _ = binding.manager.update_meta(&binding.id, |meta| {
+                                let update_res = binding.manager.update_meta(&binding.id, |meta| {
                                     if !crate::session_title::should_accept_ai_name(
                                         meta.user_renamed,
                                         meta.ai_named,
@@ -2952,11 +2990,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                     meta.updated_at = jeikcode_capabilities::session::now_ms();
                                     Some(old_name)
                                 });
+                                applied = matches!(update_res, Ok(Some(_)));
                             }
                         }
-                        let _ = runtime_event_tx.send(
-                            CodingRuntimeEvent::SessionNameSuggested { name },
-                        );
+                        if applied {
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::SessionNameSuggested { name },
+                            );
+                        }
                     }
                 }
                 suggestion = next_prompt_rx.recv(), if native_protocol => {
@@ -3328,6 +3369,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // `user` titles stay pinned via user_renamed.
                         let starting_new_turn = active_turn.is_none();
                         let title_seed_text = input.text.clone();
+                        let mut is_fresh_staged_session = false;
                         if let Some(runtime) = resources.as_mut() {
                             let seed_input = (!input.text.trim().is_empty())
                                 .then_some(input.text.as_str());
@@ -3336,6 +3378,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 .publish_staged_session_with_first_input(seed_input)
                             {
                                 Ok(Some(name)) => {
+                                    is_fresh_staged_session = true;
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::SessionTitleSeeded { name },
                                     );
@@ -3352,7 +3395,25 @@ fn spawn_runtime_owner_with_optional_agent(
                         // Kick AI naming as soon as the first turn starts — do not
                         // wait for the model reply. Per-session flight gate ensures
                         // /chat early spawn, live, and TUI never overlap.
-                        if starting_new_turn {
+                        let is_session_opening = is_fresh_staged_session
+                            || resources.as_ref().is_some_and(|runtime| {
+                                runtime.parts.session.as_ref().is_some_and(|binding| {
+                                    binding
+                                        .manager
+                                        .read_meta(&binding.id)
+                                        .map(|meta| {
+                                            crate::session_title::should_accept_ai_name(
+                                                meta.user_renamed,
+                                                meta.ai_named,
+                                            ) && (meta.turn_count == 0
+                                                || jeikcode_capabilities::session::SessionMeta::name_needs_fallback(
+                                                    &meta.name, &meta.id,
+                                                ))
+                                        })
+                                        .unwrap_or(false)
+                                })
+                            });
+                        if starting_new_turn && is_session_opening {
                             if let Some(conversation) = resources.as_ref().and_then(|runtime| {
                                 user_prompt_title_conversation(
                                     runtime.config.working_dir.as_path(),

@@ -88,18 +88,13 @@ pub struct GeminiProvider {
 
 impl GeminiProvider {
     pub fn new(cfg: GeminiConfig) -> Result<Self, ProviderError> {
-        let policy = cfg
-            .reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
+        let policy = cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        });
         let connect_timeout = cfg.connect_timeout;
         let skip_tls_verify = cfg.skip_tls_verify;
         let user_agent = cfg.user_agent.clone();
