@@ -234,6 +234,7 @@ import {
   type ChatRecoveryState,
 } from '../lib/chatTerminal';
 import {
+  composeSteerWireText,
   formatTurnElapsed,
   isSteerUserMessage,
   resumeTurnClockEpoch,

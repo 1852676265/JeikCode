@@ -117,6 +117,7 @@ function harness(stored, blocked = false, navigatorLang = undefined, navigatorLa
     preact: { createContext: () => ({ Provider: 'provider' }) },
     'preact/hooks': hooks, './i18n': { messages },
     './api': { getConfig: () => config.promise, postLanguage: async lang => { writes.push(lang); } },
+    './lib/theme': { resolveEffectiveTheme: (t) => t === 'system' ? 'dark' : t },
   }, {
     h: (_type, props) => { context = props.value; },
     document: { documentElement: { setAttribute: (key, value) => { attrs[key] = value; } } },

@@ -86,16 +86,19 @@ test('saveSessionActiveRepo and getSessionActiveRepo restore binding with fallba
     { root: '/root/src-dev/JeikCode', name: 'JeikCode', relative_path: 'JeikCode', is_root: false },
   ];
 
-  // Mock localStorage in Node.js test environment if absent
-  if (typeof globalThis.localStorage === 'undefined') {
-    const store = new Map<string, string>();
-    (globalThis as any).localStorage = {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => store.set(k, String(v)),
-      removeItem: (k: string) => store.delete(k),
-      clear: () => store.clear(),
-    };
-  }
+  // Mock localStorage in Node.js test environment
+  const store = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+    clear: () => store.clear(),
+  };
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: mockStorage,
+    configurable: true,
+    writable: true,
+  });
 
   const sid = 'test-session-123';
   saveSessionActiveRepo(sid, '/root/src-dev/JeikCode', dummyRepos as any);
