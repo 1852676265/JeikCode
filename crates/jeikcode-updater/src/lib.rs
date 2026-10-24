@@ -266,16 +266,25 @@ pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
 /// Clean up orphaned legacy copies in `~/.local/bin` left by older dropper versions.
 pub fn cleanup_legacy_dropper_file(running: &Path) {
     if let Some(home) = jeikcode_config::util::real_home_dir() {
-        let legacy = home.join(".local").join("bin").join(if cfg!(windows) {
-            "jeikcode.exe"
-        } else {
-            "jeikcode"
-        });
-        if legacy.is_file() && !same_exe(&legacy, running) {
-            let _ = std::fs::remove_file(&legacy);
-            let local_bin = home.join(".local").join("bin");
-            let _ = std::fs::remove_dir(&local_bin);
+        let local_bin = home.join(".local").join("bin");
+        if let Ok(entries) = std::fs::read_dir(&local_bin) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if (name.starts_with("jeikcode") || name.starts_with("atomcode"))
+                        && !same_exe(&path, running)
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
         }
+        let _ = std::fs::remove_dir(&local_bin);
     }
 }
 
@@ -312,10 +321,12 @@ pub fn migrate_legacy_environment() {
                 if trimmed.is_empty() {
                     return false;
                 }
-                if let Some(ref leg) = legacy_dir {
-                    if trimmed.eq_ignore_ascii_case(leg) {
-                        return false;
-                    }
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.contains(".local\\bin")
+                    || lower.contains(".local/bin")
+                    || lower.contains("atomcode")
+                {
+                    return false;
                 }
                 true
             })

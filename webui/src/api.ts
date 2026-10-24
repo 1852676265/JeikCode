@@ -1270,6 +1270,42 @@ export async function postRemoteAccess(
   return resp.json();
 }
 
+export interface ZombieProcessInfo {
+  pid: number;
+  name: string;
+  path?: string | null;
+  reason: string;
+}
+
+export interface LegacyStatusResponse {
+  has_legacy_files: boolean;
+  legacy_files: string[];
+  has_dirty_path: boolean;
+  zombie_count: number;
+  zombies: ZombieProcessInfo[];
+  needs_migration: boolean;
+}
+
+export async function getLegacyStatus(): Promise<LegacyStatusResponse> {
+  const resp = await apiFetch('/api/system/legacy-status', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`failed to get legacy status: ${resp.status}`);
+  return resp.json();
+}
+
+export async function postMigrateLegacy(killZombies: boolean): Promise<{
+  success: boolean;
+  cleaned_files_count: number;
+  killed_zombies_count: number;
+}> {
+  const resp = await apiFetch('/api/system/migrate-legacy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ kill_zombies: killZombies }),
+  });
+  if (!resp.ok) throw new Error(`failed to migrate legacy: ${resp.status}`);
+  return resp.json();
+}
+
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
 export async function postConfigReload(): Promise<void> {
   const resp = await apiFetch('/config/reload', {

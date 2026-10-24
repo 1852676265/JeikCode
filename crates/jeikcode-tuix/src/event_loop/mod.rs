@@ -22537,15 +22537,13 @@ fn handle_agent_event(
         }
         AgentEvent::Steered { count: _, inputs } => {
             let confirmed = state.on_steered(&inputs);
-            if ctx.live_binding.is_none() {
-                for pending in confirmed {
-                    renderer.render(UiLine::UserWithAttachments {
-                        text: pending.message.text,
-                        attachments: pending.message.image_markers,
-                    });
-                }
-                renderer.flush();
+            for pending in confirmed {
+                renderer.render(UiLine::UserWithAttachments {
+                    text: pending.message.text,
+                    attachments: pending.message.image_markers,
+                });
             }
+            renderer.flush();
         }
     }
 }

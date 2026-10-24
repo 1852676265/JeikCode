@@ -73,6 +73,15 @@ fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkActi
     if is_shell_internal_url(url) {
         return LinkAction::StayInWebview;
     }
+    // 回环地址上的内部重载、端口变更或携带 desktop=1 标志的均保留在窗口内，绝不弹出到系统浏览器
+    if let Some(host) = url.host_str() {
+        if is_loopback_host(host) {
+            let (_h, saved_port, _t) = saved_webui_listen();
+            if url.port() == Some(saved_port) || url.query().is_some_and(|q| q.contains("desktop=")) {
+                return LinkAction::StayInWebview;
+            }
+        }
+    }
     if origin.is_some_and(|origin| is_launched_webui(url, origin)) {
         return LinkAction::StayInWebview;
     }
@@ -606,7 +615,7 @@ fn supervise_webui(
     window: tauri::WebviewWindow,
     origin: Arc<Mutex<Option<WebuiOrigin>>>,
     mut url: String,
-    launch: WebuiLaunch,
+    mut launch: WebuiLaunch,
 ) {
     std::thread::spawn(move || {
         let mut relaunched = false;
@@ -621,7 +630,19 @@ fn supervise_webui(
             if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return;
             }
+
+            // 子进程退出后（无论是自更新还是用户在地球面板立即重启），动态重新读取配置，
+            // 确保接管的是最新配置的 host、port 和 token，绝不二次拉起旧端口僵尸进程
+            let (latest_host, latest_port, latest_token) = saved_webui_listen();
+            let effective_port = if latest_port != 0 { latest_port } else { launch.port };
+            let effective_token = latest_token.unwrap_or_else(|| launch.token.clone());
+            launch.host = latest_host;
+            launch.port = effective_port;
+            launch.token = effective_token.clone();
+            let target_url = format!("http://127.0.0.1:{effective_port}/?token={effective_token}&desktop=1");
+
             if wait_until_health(launch.port, Duration::from_secs(20)) {
+                url = target_url;
                 open_webui_in_shell(&window, &origin, &url);
                 return;
             }
@@ -715,16 +736,34 @@ fn window_url(url: &str) -> String {
 }
 
 fn bundled_cli(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let dir = app.path().resource_dir().ok()?;
     let exe_name = cli_file_name();
-    let path = dir.join(exe_name);
-    if path.is_file() {
-        return Some(path);
+    // 1. app.path().resource_dir() 及其 resources 子目录
+    if let Ok(dir) = app.path().resource_dir() {
+        for candidate in [
+            dir.join(exe_name),
+            dir.join("resources").join(exe_name),
+            dir.join("cli-bin"),
+            dir.join("resources").join("cli-bin"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
-    // 兼容历史老版本或开发构建时的未带后缀资源
-    let fallback = dir.join("cli-bin");
-    if fallback.is_file() {
-        return Some(fallback);
+    // 2. 当前运行 exe (jeikcode-desktop.exe) 自身所在目录及其 resources 子目录
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            for candidate in [
+                parent.join(exe_name),
+                parent.join("resources").join(exe_name),
+                parent.join("cli-bin"),
+                parent.join("resources").join("cli-bin"),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
     }
     None
 }
@@ -813,23 +852,28 @@ fn mint_desktop_token(host: &str, port: u16) -> String {
 }
 
 fn resolve_desktop_cli(bundled: Option<&Path>) -> PathBuf {
-    // 异步执行老版本残留迁移清理（不阻塞主启动）
-    std::thread::spawn(|| {
-        cleanup_legacy_dropper_install();
-    });
+    // 同步执行老版本残留迁移清理（立即清理 ~/.local/bin 并注册当前安装目录到 PATH）
+    cleanup_legacy_dropper_install();
 
     if let Some(src) = bundled {
         set_executable(src);
         return src.to_path_buf();
     }
 
-    // 开发环境或 fallback：尝试同级可执行文件或 PATH
+    // 开发环境或 fallback：尝试同级可执行文件、resources 子目录或 PATH
     let name = cli_file_name();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let candidate = parent.join(name);
-            if candidate.is_file() {
-                return candidate;
+            for candidate in [
+                parent.join(name),
+                parent.join("resources").join(name),
+                parent.join("cli-bin"),
+                parent.join("resources").join("cli-bin"),
+            ] {
+                if candidate.is_file() {
+                    set_executable(&candidate);
+                    return candidate;
+                }
             }
         }
     }
@@ -838,32 +882,65 @@ fn resolve_desktop_cli(bundled: Option<&Path>) -> PathBuf {
 
 #[cfg(windows)]
 fn cleanup_legacy_dropper_install() {
-    let legacy_exe = home_dir().join(".local").join("bin").join("jeikcode.exe");
-    if legacy_exe.is_file() {
-        let _ = std::fs::remove_file(&legacy_exe);
-        let local_bin = home_dir().join(".local").join("bin");
-        let _ = std::fs::remove_dir(&local_bin);
+    let local_bin = home_dir().join(".local").join("bin");
+    if let Ok(entries) = std::fs::read_dir(&local_bin) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if name.starts_with("jeikcode") || name.starts_with("atomcode") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
     }
+    let _ = std::fs::remove_dir(&local_bin);
 
     use winreg::enums::*;
     use winreg::RegKey;
-    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE) else {
+    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+        "Environment",
+        KEY_READ | KEY_WRITE,
+    ) else {
         return;
     };
     let current: String = env.get_value("Path").unwrap_or_default();
-    let legacy_dir = home_dir().join(".local").join("bin").display().to_string();
     let install_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let mut parts: Vec<String> = current
         .split(';')
-        .filter(|p| !p.trim().is_empty() && !p.trim().eq_ignore_ascii_case(&legacy_dir))
+        .filter(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains(".local\\bin")
+                || lower.contains(".local/bin")
+                || lower.contains("atomcode")
+            {
+                return false;
+            }
+            true
+        })
         .map(|s| s.to_string())
         .collect();
 
     if let Some(dir) = install_dir {
         let dir_str = dir.display().to_string();
+        let res_dir = dir.join("resources");
+        if res_dir.is_dir() {
+            let res_str = res_dir.display().to_string();
+            if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(&res_str)) {
+                parts.insert(0, res_str);
+            }
+        }
         if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(&dir_str)) {
             parts.insert(0, dir_str);
         }

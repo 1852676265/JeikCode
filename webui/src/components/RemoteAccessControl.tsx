@@ -185,9 +185,16 @@ export function RemoteAccessControl() {
         if (resp.ok) {
           window.clearInterval(pollInterval);
           if (typeof window !== 'undefined') {
+            const currentToken = token || sessionStorage.getItem('jeikcode_token') || localStorage.getItem('jeikcode_token') || '';
+            const nextUrl = new URL(window.location.href);
+            nextUrl.port = String(targetPortNum);
+            if (currentToken && !nextUrl.searchParams.has('token')) {
+              nextUrl.searchParams.set('token', currentToken);
+            }
+            if (window.location.search.includes('desktop=') && !nextUrl.searchParams.has('desktop')) {
+              nextUrl.searchParams.set('desktop', '1');
+            }
             if (targetPortNum !== Number(window.location.port || '13457')) {
-              const nextUrl = new URL(window.location.href);
-              nextUrl.port = String(targetPortNum);
               window.location.href = nextUrl.toString();
             } else {
               window.location.reload();

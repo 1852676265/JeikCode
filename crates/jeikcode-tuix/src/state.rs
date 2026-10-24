@@ -1765,15 +1765,16 @@ impl UiState {
     ) -> Vec<PendingSteer> {
         let mut confirmed = Vec::new();
         for input in inputs {
-            let matches_front = self.pending_steers.front().is_some_and(|pending| {
-                pending.message.text == input.text && pending.message.images == input.images
+            let input_clean = strip_steer_envelope_for_tui(&input.text);
+            let found_idx = self.pending_steers.iter().position(|pending| {
+                let pending_clean = strip_steer_envelope_for_tui(&pending.message.text);
+                (pending_clean == input_clean
+                    || pending.message.text.trim() == input.text.trim()
+                    || input.text.contains(pending_clean))
+                    && (input.images.is_empty() || pending.message.images == input.images)
             });
-            if matches_front {
-                confirmed.push(
-                    self.pending_steers
-                        .pop_front()
-                        .expect("front was checked above"),
-                );
+            if let Some(i) = found_idx {
+                confirmed.push(self.pending_steers.remove(i).expect("valid index"));
             }
         }
         confirmed
@@ -2091,6 +2092,19 @@ impl UiState {
         }
         frames[self.spinner_frame]
     }
+}
+
+pub(crate) fn strip_steer_envelope_for_tui(text: &str) -> &str {
+    if let Some(start) = text.find("<user-query>") {
+        if let Some(end) = text.find("</user-query>") {
+            let inner = &text[start + "<user-query>".len()..end];
+            return inner.trim();
+        }
+    }
+    if let Some(idx) = text.find("[jeikcode-steer]") {
+        return text[..idx].trim();
+    }
+    text.trim()
 }
 
 #[cfg(test)]

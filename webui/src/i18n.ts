@@ -541,6 +541,22 @@ const zh = {
   'remote.connecting': '正在连接新服务，请稍候…',
   'remote.connectTimeout': '等待服务响应超时，请确认新端口或防火墙设置后手动刷新。',
 
+  // Legacy architecture migration modal
+  'migration.title': '全新安装架构升级与老版本环境迁移',
+  'migration.titleDone': '环境迁移完成',
+  'migration.desc': '检测到您的操作系统存在旧版本安装架构残留（旧版 ~/.local/bin 镜像、历史注册表脏路径或脱离托管的孤儿进程）。新版本已全面重构安装体系，彻底解决杀毒软件误报拦截问题。请一键完成新架构环境迁移：',
+  'migration.step1': '清理旧版 ~/.local/bin 残留文件与多重备份',
+  'migration.step2': '净化系统 PATH 环境变量，移除历史污染条目并注册当前独立安装目录',
+  'migration.step3': '扫描并终止后台残留的孤儿僵尸进程（检测到 {count} 个）',
+  'migration.itemsPending': '项待清理',
+  'migration.dirtyDetected': '已检测到污染',
+  'migration.zombiesPending': '个僵尸进程',
+  'migration.startBtn': '立即执行环境迁移与清理',
+  'migration.running': '正在执行环境迁移，请稍候…',
+  'migration.successSummary': '已成功清理 {files} 个历史文件与 {zombies} 个残留进程',
+  'migration.failed': '迁移过程中出现异常，请稍后重试',
+  'migration.completeNotice': '系统环境已完全净化并对接新架构',
+
   // Provider add/delete
   'settings.accounts': '提供商',
   'settings.addAccount': '添加提供商',
@@ -1575,6 +1591,22 @@ export const en: Record<MsgKey, string> = {
   'remote.restartSuccess': 'Saved! Restarting service…',
   'remote.connecting': 'Connecting to service, please wait…',
   'remote.connectTimeout': 'Connection timed out. Please check firewall or port settings and refresh.',
+
+  // Legacy architecture migration modal
+  'migration.title': 'Architecture Upgrade & Environment Migration',
+  'migration.titleDone': 'Migration Completed',
+  'migration.desc': 'Legacy installation artifacts detected on your system (deprecated ~/.local/bin copies, polluted PATH entries, or detached orphan processes). The new version establishes an independent installation source and resolves antivirus false-positives. Please run migration to clean up:',
+  'migration.step1': 'Purge legacy ~/.local/bin binaries and backup files',
+  'migration.step2': 'Clean system PATH environment variables and register standalone install directory',
+  'migration.step3': 'Scan and terminate detached orphan processes ({count} detected)',
+  'migration.itemsPending': 'items pending',
+  'migration.dirtyDetected': 'polluted PATH detected',
+  'migration.zombiesPending': 'orphan processes',
+  'migration.startBtn': 'Migrate and Clean Up Environment',
+  'migration.running': 'Migrating environment, please wait…',
+  'migration.successSummary': 'Successfully cleaned {files} legacy file(s) and {zombies} orphan process(es)',
+  'migration.failed': 'Migration encountered an error, please try again later',
+  'migration.completeNotice': 'System environment is completely sanitized and migrated',
 
   // Provider add/delete
   'settings.accounts': 'Providers',

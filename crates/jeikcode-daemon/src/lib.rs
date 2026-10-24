@@ -13985,6 +13985,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/api/remote-access",
             get(api_config::get_remote_access).post(api_config::post_remote_access),
         )
+        .route(
+            "/api/system/legacy-status",
+            get(api_config::get_legacy_status),
+        )
+        .route(
+            "/api/system/migrate-legacy",
+            post(api_config::post_migrate_legacy),
+        )
         // Provider API (P0)
         .route(
             "/providers",

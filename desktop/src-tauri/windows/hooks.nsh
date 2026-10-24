@@ -32,12 +32,23 @@ FunctionEnd
   ; Refresh shell icon cache so existing cached placeholders/icons are cleared
   System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
-  ; Register $INSTDIR into user PATH environment variable (idempotent, official install standard)
+  ; Register $INSTDIR and $INSTDIR\resources into user PATH environment variable
   ReadRegStr $0 HKCU "Environment" "Path"
   ${If} $0 == ""
-    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
+    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$INSTDIR"
     SendMessage ${HWND_BROADCAST} 0x001A 0 "STR:Environment" /TIMEOUT=5000
   ${Else}
+    ; Append $INSTDIR\resources if not already present
+    Push "$0"
+    Push "$INSTDIR\resources"
+    Call StrStr
+    Pop $1
+    ${If} $1 == ""
+      WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$0"
+      SendMessage ${HWND_BROADCAST} 0x001A 0 "STR:Environment" /TIMEOUT=5000
+      ReadRegStr $0 HKCU "Environment" "Path"
+    ${EndIf}
+
     ; Append $INSTDIR if not already present
     Push "$0"
     Push "$INSTDIR"
@@ -49,9 +60,16 @@ FunctionEnd
     ${EndIf}
   ${EndIf}
 
-  ; Clean up legacy ~/.local/bin/jeikcode.exe if left by older dropper versions
+  ; Clean up legacy ~/.local/bin files if left by older dropper versions
   IfFileExists "$PROFILE\.local\bin\jeikcode.exe" 0 +2
     Delete "$PROFILE\.local\bin\jeikcode.exe"
+  IfFileExists "$PROFILE\.local\bin\jeikcode.bak.exe" 0 +2
+    Delete "$PROFILE\.local\bin\jeikcode.bak.exe"
+  IfFileExists "$PROFILE\.local\bin\atomcode.exe" 0 +2
+    Delete "$PROFILE\.local\bin\atomcode.exe"
+  IfFileExists "$PROFILE\.local\bin\atomcode.bak.exe" 0 +2
+    Delete "$PROFILE\.local\bin\atomcode.bak.exe"
+  RMDir "$PROFILE\.local\bin"
 !macroend
 
 !macro NSIS_HOOK_UNINSTALL

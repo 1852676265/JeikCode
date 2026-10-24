@@ -24,6 +24,7 @@ const ModelConfigDialog = lazy(() => import('./components/SettingsDialogs').then
 const OnboardingWizard = lazy(() => import('./components/OnboardingWizard').then((m) => ({ default: m.OnboardingWizard })));
 const UpdateDialog = lazy(() => import('./components/UpdateDialog').then((m) => ({ default: m.UpdateDialog })));
 const ConfigSyncModal = lazy(() => import('./components/ConfigSyncModal').then((m) => ({ default: m.ConfigSyncModal })));
+const LegacyMigrationModal = lazy(() => import('./components/LegacyMigrationModal').then((m) => ({ default: m.LegacyMigrationModal })));
 import {
   getProject,
   getConfig,
@@ -1660,6 +1661,7 @@ export function App() {
             }}
           />
         )}
+        <LegacyMigrationModal />
       </Suspense>
       <ConfirmModalHost />
       <ToastHost />

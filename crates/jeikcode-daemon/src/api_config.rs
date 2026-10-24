@@ -253,6 +253,10 @@ struct RemoteAccessStatus {
     /// is listening now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_port: Option<u16>,
+    /// Host saved for the next launch when it differs from the socket that
+    /// is listening now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_host: Option<String>,
 }
 
 fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccessStatus {
@@ -292,6 +296,7 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
         urls,
         firewall: None,
         next_port: saved_listen_port().filter(|saved| *saved != port),
+        next_host: None,
     }
 }
 
@@ -1049,6 +1054,9 @@ fn apply_launch_settings(
         if port_changed {
             status.next_port = Some(body.port);
         }
+        if host_changed {
+            status.next_host = Some(body.host.clone());
+        }
         if !body.no_token {
             if let Some(pref) = load_webui_listen_pref() {
                 status.token = pref.token;
@@ -1287,6 +1295,245 @@ pub(crate) async fn post_remote_access(
     });
 
     Json(with_firewall(remote_status(&state, minted)).await).into_response()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ZombieProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub path: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LegacyStatusResponse {
+    pub has_legacy_files: bool,
+    pub legacy_files: Vec<String>,
+    pub has_dirty_path: bool,
+    pub zombie_count: usize,
+    pub zombies: Vec<ZombieProcessInfo>,
+    pub needs_migration: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MigrateLegacyRequest {
+    #[serde(default)]
+    pub kill_zombies: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MigrateLegacyResponse {
+    pub success: bool,
+    pub cleaned_files_count: usize,
+    pub killed_zombies_count: usize,
+}
+
+pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let my_pid = sysinfo::get_current_pid().ok().map(|p| p.as_u32());
+    let mut out = Vec::new();
+
+    // 收集所有当前活跃的桌面壳 PID (jeikcode-desktop)
+    let mut active_desktop_pids = std::collections::HashSet::new();
+    for (pid, proc_) in sys.processes() {
+        let name = proc_.name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("desktop") || name.contains("tauri") {
+            active_desktop_pids.insert(pid.as_u32());
+        }
+    }
+
+    for (pid, proc_) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        if Some(pid_u32) == my_pid {
+            continue;
+        }
+        let name = proc_.name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("desktop") || name.contains("tauri") {
+            continue;
+        }
+
+        let is_jeik_family = name.starts_with("jeikcode") || name.starts_with("atomcode");
+        if !is_jeik_family {
+            continue;
+        }
+
+        let exe_path_str = proc_
+            .exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let exe_path_lower = exe_path_str.to_ascii_lowercase();
+
+        // 1. 判定是否为老旧 Dropper 目录残存
+        let is_legacy_path = exe_path_lower.contains(".local\\bin")
+            || exe_path_lower.contains(".local/bin")
+            || exe_path_lower.contains("atomcode");
+
+        // 2. 检查环境变量是否包含 JEIKCODE_DESKTOP=1
+        let is_desktop_env = proc_.environ().iter().any(|env_str| {
+            let s = env_str.to_string_lossy();
+            s.starts_with("JEIKCODE_DESKTOP=") || s.starts_with("JEIKCODE_DESKTOP_CLI_BIN=")
+        });
+
+        // 3. 检查父进程状态
+        let parent_pid = proc_.parent().map(|p| p.as_u32());
+        let parent_alive =
+            parent_pid.is_some_and(|ppid| sys.process(sysinfo::Pid::from_u32(ppid)).is_some());
+        let parent_is_desktop = parent_pid.is_some_and(|ppid| active_desktop_pids.contains(&ppid));
+
+        // 判定准则（严格保护普通终端/开发/TUI 实例）：
+        // - 如果是运行在旧目录 .local\bin 下的实例 -> 100% 历史遗留僵尸
+        // - 如果原本是桌面端子进程 (is_desktop_env)，但父进程已死或者父进程不再是桌面壳 -> 100% 孤儿僵尸
+        let mut zombie_reason = None;
+        if is_legacy_path {
+            zombie_reason = Some("旧版 ~/.local/bin 遗留运行实例".to_string());
+        } else if is_desktop_env && (!parent_alive || !parent_is_desktop) {
+            zombie_reason = Some("父级桌面壳已退出，脱离托管的孤儿子进程".to_string());
+        }
+
+        if let Some(reason) = zombie_reason {
+            out.push(ZombieProcessInfo {
+                pid: pid_u32,
+                name: name.clone(),
+                path: if exe_path_str.is_empty() {
+                    None
+                } else {
+                    Some(exe_path_str)
+                },
+                reason,
+            });
+        }
+    }
+    out
+}
+
+pub fn kill_zombie_processes_all() -> usize {
+    let zombies = scan_zombie_processes();
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let mut killed = 0;
+    for z in zombies {
+        if let Some(proc_) = sys.process(Pid::from_u32(z.pid)) {
+            if proc_.kill() {
+                killed += 1;
+            }
+        }
+    }
+    killed
+}
+
+pub(crate) async fn get_legacy_status() -> impl IntoResponse {
+    let mut legacy_files = Vec::new();
+    let current_exe = std::env::current_exe().ok();
+    if let Some(home) = jeikcode_config::util::real_home_dir() {
+        let local_bin = home.join(".local").join("bin");
+        if let Ok(entries) = std::fs::read_dir(&local_bin) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let is_current = current_exe.as_ref().map_or(false, |c| c == &path);
+                    if (name.starts_with("jeikcode") || name.starts_with("atomcode")) && !is_current
+                    {
+                        legacy_files.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut has_dirty_path = false;
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
+            let path_val: String = env.get_value("Path").unwrap_or_default();
+            for item in path_val.split(';') {
+                let lower = item.trim().to_ascii_lowercase();
+                if lower.contains(".local\\bin")
+                    || lower.contains(".local/bin")
+                    || lower.contains("atomcode")
+                {
+                    has_dirty_path = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let zombies = scan_zombie_processes();
+    let zombie_count = zombies.len();
+    let has_legacy_files = !legacy_files.is_empty();
+    let needs_migration = has_legacy_files || has_dirty_path || zombie_count > 0;
+
+    Json(LegacyStatusResponse {
+        has_legacy_files,
+        legacy_files,
+        has_dirty_path,
+        zombie_count,
+        zombies,
+        needs_migration,
+    })
+}
+
+pub(crate) async fn post_migrate_legacy(
+    Json(payload): Json<MigrateLegacyRequest>,
+) -> impl IntoResponse {
+    let mut cleaned_files_count = 0;
+    let current_exe = std::env::current_exe().ok();
+    if let Some(ref running) = current_exe {
+        if let Some(home) = jeikcode_config::util::real_home_dir() {
+            let local_bin = home.join(".local").join("bin");
+            if let Ok(entries) = std::fs::read_dir(&local_bin) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if (name.starts_with("jeikcode") || name.starts_with("atomcode"))
+                            && running != &path
+                        {
+                            if std::fs::remove_file(&path).is_ok() {
+                                cleaned_files_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&local_bin);
+        }
+    }
+
+    jeikcode_updater::migrate_legacy_environment();
+
+    let mut killed_zombies_count = 0;
+    if payload.kill_zombies {
+        killed_zombies_count = kill_zombie_processes_all();
+    }
+
+    Json(MigrateLegacyResponse {
+        success: true,
+        cleaned_files_count,
+        killed_zombies_count,
+    })
 }
 
 /// POST /config/reload - Reloads config.toml from disk, remounts MCP/skills on

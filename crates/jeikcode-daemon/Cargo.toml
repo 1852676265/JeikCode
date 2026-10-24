@@ -25,6 +25,10 @@ jeikcode-kernel = { path = "../jeikcode-kernel" }
 jeikcode-coding = { path = "../jeikcode-coding" }
 jeikcode-telemetry = { path = "../jeikcode-telemetry" }
 jeikcode-updater = { path = "../jeikcode-updater" }
+sysinfo = "0.33"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 # HTTP
 axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
