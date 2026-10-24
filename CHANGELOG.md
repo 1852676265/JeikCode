@@ -21,6 +21,40 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.3 (2026-10-25)
+
+- **[Artifact Retrieval & Read Tool Integration] Seamless virtual URI inspection and prompt simplification**:
+  - Integrated folded tool output retrieval into the `read` tool via virtual URI `artifact://<artifact_id>`, enabling line numbering, range pagination, and keyword anchoring (`key_string` with `keyword` alias) across large outputs.
+  - Replaced raw byte counts in truncation and folding banners with position-sensitive, scenario-specific elided line indicators.
+  - Retired the obsolete `fetch_output` tool and updated exploration strategy prompts and system teachings to emphasize keyword-first artifact inspection.
+- **[WebUI History Pagination & PowerShell Guidance] Chronological transcript sorting and shell syntax tips**:
+  - Introduced `mergeOlderMessages` to strictly order older session history by `sourceIndex` ascending order during pagination and deduplication, preventing pinned user prompts from being displaced beneath tool calls.
+  - Aligned session cache diff criteria in `Chat.tsx` so partial history slices do not overwrite full historical conversation transcripts.
+  - Added self-healing syntax guidance in `bash.rs` for PowerShell unterminated quotes, advising single-quoted literals when handling backslashes or paths.
+- **[Desktop Process Supervision & Lifecycle Fixes] Anti-orphan child process termination and window restoration**:
+  - Hardened desktop management detection in `jeikcode-updater` so parameter-change restarts exit with dedicated code `75`, eliminating orphaned background daemon processes.
+  - Added triple-layer process termination in the desktop supervisor (`child.kill()`, `/shutdown` HTTP endpoint dispatch, and Win32 parent PID process tree scan) to guarantee complete cleanup on exit.
+  - Fixed unresponsive close (X) button after shortcut-based single-instance reactivation by dispatching window restoration on the main UI thread and aligning internal visibility flags.
+- **[Offline & Air-Gapped Environments] Network request suppression**:
+  - Suppressed background update checks, model catalog sync, and network polling when running in offline or air-gapped environments (`--offline` or environment flags).
+
+---
+
+- **[Artifact 取回与 Read 工具统一] 虚拟 URI 统一检索与提示词轻量化**:
+  - 将大输出折叠取回全面收敛集成至 `read` 工具（通过虚拟 URI `artifact://<artifact_id>`），完整继承真实行号、范围分页与关键字检索能力（`key_string`，支持 `keyword` 别名）。
+  - 重构截断与折叠提示为按位置区分的省略行数通知，去除冗余的原始字节数。
+  - 彻底下线并物理清理废弃的 `fetch_output` 工具，同步更新探索策略提示词与文档教学，引导优先使用关键字匹配查阅折叠信息。
+- **[WebUI 历史消息排序与 PowerShell 引导] 历史消息绝对时序保序与语法自愈**:
+  - 在前端引入 `mergeOlderMessages`，在向前翻页与去重合并时强制按 `sourceIndex` 绝对索引升序排列，彻底根治首屏置顶提问在加载更早历史时被工具调用倒插的问题。
+  - 修复会话切换与后台轮询时的缓存截断隐患，避免单页切片将已加载的前序历史全量缓存误判覆盖。
+  - 在 `bash.rs` 中补充 PowerShell 单双引号转义陷阱说明，并在命令报错时增加未闭合引号的自愈引导提示。
+- **[桌面端监管加固与孤儿进程消除] 三重终结兜底与单实例唤起关闭修复**:
+  - 强化桌面托管判定，确保改参重启始终以专用退出码 `75` 由桌面壳接管，杜绝脱管孤儿子进程。
+  - 在桌面端引入三重终结兜底（子进程句柄终结、`/shutdown` 优雅停机请求、Win32 父进程树快照扫描），确保托盘退出时 100% 销毁后台实例。
+  - 修复快捷方式单实例唤起桌面端后点击右上角关闭按钮无响应的缺陷，在主 UI 线程规范还原窗口并对齐底层可见性状态。
+- **[离线隔离环境适配] 静默后台网络轮询与外联请求**:
+  - 在离线隔离环境（`--offline` 或对应环境变量）下彻底静默后台版本检查、模型目录同步及网络外联轮询。
+
 ## v7.3.0-beta.2 (2026-10-24)
 
 - **[Desktop Process Supervision & Lifecycle Hardening] Event-driven supervision, anti-orphan guarantee, and close-to-tray restoration**:
