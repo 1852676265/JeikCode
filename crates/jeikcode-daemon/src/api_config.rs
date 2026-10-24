@@ -257,6 +257,9 @@ struct RemoteAccessStatus {
     /// is listening now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_host: Option<String>,
+    /// How this process was started: `desktop` / `systemd` / `procd` /
+    /// `launchd` / `windows-logon` / `foreground`. Restarts follow this mode.
+    launch_mode: &'static str,
 }
 
 fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccessStatus {
@@ -279,7 +282,10 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
     let token = token.or(active_token);
     let no_token = state
         .token_optional
-        .load(std::sync::atomic::Ordering::Relaxed);
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || !state
+            .enforce_token
+            .load(std::sync::atomic::Ordering::Relaxed);
     let urls = if active {
         access_urls(&host, port, token.as_deref(), no_token)
     } else {
@@ -297,6 +303,7 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
         firewall: None,
         next_port: saved_listen_port().filter(|saved| *saved != port),
         next_host: None,
+        launch_mode: jeikcode_updater::detect_launch_mode().as_str(),
     }
 }
 
@@ -971,6 +978,13 @@ fn saved_listen_port() -> Option<u16> {
         .filter(|port| *port != 0)
 }
 
+pub(crate) fn saved_listen_token() -> Option<String> {
+    load_webui_listen_pref()
+        .and_then(|pref| pref.token)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// Write the next desktop launch. `token: None` keeps the token already on disk.
 pub(crate) fn save_webui_listen_pref(
     host: Option<String>,
@@ -1094,43 +1108,53 @@ pub(crate) async fn post_remote_access(
     // daemon into a network-reachable/no-token daemon. Explicit `serve --no-token`
     // startup semantics remain unchanged; this only constrains the runtime expansion API.
     if body.no_token {
-        let affected_host = if body.apply_launch {
-            state.bind_host.as_str()
-        } else {
-            body.host.trim()
-        };
-        if !crate::auth_token::is_loopback_bind_host(affected_host) {
-            return json_error(
-                axum::http::StatusCode::BAD_REQUEST,
-                "non-loopback remote access requires an access token",
-            )
-            .into_response();
+        let already_unauthenticated_remote = !state.initial_enforce_token
+            && !crate::auth_token::is_loopback_bind_host(&state.bind_host);
+        if !already_unauthenticated_remote {
+            let target = body.host.trim();
+            let affected_host = if body.apply_launch && !body.restart && target.is_empty() {
+                state.bind_host.as_str()
+            } else if !target.is_empty() {
+                target
+            } else {
+                state.bind_host.as_str()
+            };
+            if !crate::auth_token::is_loopback_bind_host(affected_host) {
+                return json_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "non-loopback remote access requires an access token",
+                )
+                .into_response();
+            }
         }
     }
     if body.apply_launch {
         let should_restart = body.restart;
+        let old_port = state.bind_port;
         let restart_host = body.host.trim().to_string();
         let restart_port = body.port;
-        let restart_token = body.token.trim().to_string();
+        let no_token = body.no_token;
         return match apply_launch_settings(&state, &body) {
             Ok(status) => {
                 if should_restart {
+                    let effective_token = status.token.clone().or_else(|| {
+                        let t = body.token.trim();
+                        (!t.is_empty()).then(|| t.to_string())
+                    });
                     tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = jeikcode_updater::restart_process_with_options(
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        if let Ok(exe) = jeikcode_updater::current_exe_path() {
+                            let _ = jeikcode_updater::restart_process_with_config(
                                 &exe,
+                                old_port,
                                 if restart_host.is_empty() {
                                     None
                                 } else {
                                     Some(&restart_host)
                                 },
                                 restart_port,
-                                if restart_token.is_empty() {
-                                    None
-                                } else {
-                                    Some(&restart_token)
-                                },
+                                effective_token.as_deref(),
+                                Some(no_token),
                             );
                         }
                     });
@@ -1377,22 +1401,31 @@ pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
         // 2. 检查环境变量是否包含 JEIKCODE_DESKTOP=1
         let is_desktop_env = proc_.environ().iter().any(|env_str| {
             let s = env_str.to_string_lossy();
-            s.starts_with("JEIKCODE_DESKTOP=") || s.starts_with("JEIKCODE_DESKTOP_CLI_BIN=")
+            s.starts_with("JEIKCODE_DESKTOP=")
+                || s.starts_with("JEIKCODE_DESKTOP_CLI_BIN=")
+                || s.starts_with("JEIKCODE_DESKTOP_PID=")
         });
 
-        // 3. 检查父进程状态
+        let declared_desktop_pid = proc_.environ().iter().find_map(|env_str| {
+            let s = env_str.to_string_lossy();
+            s.strip_prefix("JEIKCODE_DESKTOP_PID=")
+                .and_then(|val| val.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 0)
+        });
+
+        // 3. 检查父进程与绑定的桌面壳状态
         let parent_pid = proc_.parent().map(|p| p.as_u32());
-        let parent_alive =
-            parent_pid.is_some_and(|ppid| sys.process(sysinfo::Pid::from_u32(ppid)).is_some());
-        let parent_is_desktop = parent_pid.is_some_and(|ppid| active_desktop_pids.contains(&ppid));
+        let desktop_owner_alive = parent_pid
+            .is_some_and(|ppid| active_desktop_pids.contains(&ppid))
+            || declared_desktop_pid.is_some_and(|dpid| active_desktop_pids.contains(&dpid));
 
         // 判定准则（严格保护普通终端/开发/TUI 实例）：
         // - 如果是运行在旧目录 .local\bin 下的实例 -> 100% 历史遗留僵尸
-        // - 如果原本是桌面端子进程 (is_desktop_env)，但父进程已死或者父进程不再是桌面壳 -> 100% 孤儿僵尸
+        // - 如果原本是桌面端子进程 (is_desktop_env)，但绑定的父级桌面壳已不再存活 -> 100% 孤儿僵尸
         let mut zombie_reason = None;
         if is_legacy_path {
             zombie_reason = Some("旧版 ~/.local/bin 遗留运行实例".to_string());
-        } else if is_desktop_env && (!parent_alive || !parent_is_desktop) {
+        } else if is_desktop_env && !desktop_owner_alive {
             zombie_reason = Some("父级桌面壳已退出，脱离托管的孤儿子进程".to_string());
         }
 

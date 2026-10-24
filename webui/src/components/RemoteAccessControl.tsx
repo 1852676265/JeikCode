@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { getRemoteAccess, postRemoteAccess, type RemoteAccessStatus } from '../api';
+import { getRemoteAccess, postRemoteAccess, WEBUI_TOKEN_STORAGE_KEY, type RemoteAccessStatus } from '../api';
 import { useT } from '../settings';
 
 export function RemoteAccessControl() {
@@ -61,6 +61,13 @@ export function RemoteAccessControl() {
 
   // Once, so the globe and the token are filled before the panel opens.
   useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.location.search.includes('desktop=')) {
+        sessionStorage.setItem('jeikcode_desktop', '1');
+      }
+    } catch {
+      /* ignore */
+    }
     const seen = revision.current;
     let cancelled = false;
     getRemoteAccess()
@@ -104,10 +111,10 @@ export function RemoteAccessControl() {
     };
   }, [open]);
 
-  async function apply(shouldRestart: boolean = false) {
+  async function apply(shouldRestart: boolean = false): Promise<boolean> {
     revision.current += 1;
     const seen = revision.current;
-    if (applyingRef.current) return;
+    if (applyingRef.current) return false;
     applyingRef.current = true;
     setApplying(true);
     setCopied(false);
@@ -127,18 +134,20 @@ export function RemoteAccessControl() {
       if (!shouldRestart) {
         setOpen(false);
       }
+      return true;
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError';
       const message = err instanceof Error && !aborted ? err.message : t('remote.applyFailed');
       try {
         const fresh = await getRemoteAccess();
-        if (revision.current !== seen) return;
+        if (revision.current !== seen) return false;
         showStatus(fresh);
       } catch {
-        if (revision.current !== seen) return;
+        if (revision.current !== seen) return false;
       }
-      if (revision.current !== seen) return;
+      if (revision.current !== seen) return false;
       setNote(message);
+      return false;
     } finally {
       window.clearTimeout(timer);
       applyingRef.current = false;
@@ -163,55 +172,89 @@ export function RemoteAccessControl() {
   async function triggerImmediateRestart() {
     setRestarting(true);
     const targetPortNum = Number(port) || 13457;
+    const livePortNum = Number(listenPort) || 0;
+    const samePort = targetPortNum === livePortNum;
+    const targetToken = noToken ? '' : token;
 
-    // 1. 发起后端保存并安全重启
-    await apply(true);
-
-    // 2. 异地探活轮询：保留浏览器当前实际访问的主机名（禁止重定向至 0.0.0.0）
-    let probeHost = (typeof window !== 'undefined' && window.location.hostname) ? window.location.hostname : '127.0.0.1';
-    if (probeHost === '0.0.0.0') {
-      probeHost = '127.0.0.1';
+    // 1. 发起后端保存并安全重启；后端拒绝（例如非回环地址关闭 Token）时不再转圈
+    const accepted = await apply(true);
+    if (!accepted) {
+      setRestarting(false);
+      return;
     }
-    const proto = (typeof window !== 'undefined' && window.location.protocol) ? window.location.protocol : 'http:';
-    const probeUrl = `${proto}//${probeHost}:${targetPortNum}/health`;
 
-    // 3. 轮询探活（最多等待 30 秒）
-    const deadline = Date.now() + 30000;
-    await new Promise((r) => window.setTimeout(r, 800));
+    // 2. 探活地址：端口不变时走同源 /health（兼容反向代理 / 域名 / 默认 80、443 端口）；
+    //    换端口时保留浏览器当前访问的主机名（禁止重定向到 0.0.0.0），只替换端口。
+    let probeHost = window.location.hostname || '127.0.0.1';
+    if (probeHost === '0.0.0.0') probeHost = '127.0.0.1';
+    const proto = window.location.protocol || 'http:';
+    const hostPart = probeHost.includes(':') && !probeHost.startsWith('[') ? `[${probeHost}]` : probeHost;
+    const probeUrl = samePort ? '/health' : `${proto}//${hostPart}:${targetPortNum}/health`;
 
-    const pollInterval = window.setInterval(async () => {
+    // 跨端口即跨源，公网 IP / 域名访问时 CORS 会拦下普通 fetch；
+    // no-cors 只关心「连得上」，服务起来后返回 opaque 响应，连不上则直接报错。
+    const probeOnce = async (): Promise<boolean> => {
       try {
         const resp = await fetch(probeUrl, {
           signal: AbortSignal.timeout(1500),
-          credentials: 'include',
+          cache: 'no-store',
+          mode: samePort ? 'same-origin' : 'no-cors',
         });
-        if (resp.ok) {
-          window.clearInterval(pollInterval);
-          if (typeof window !== 'undefined') {
-            const currentToken = token || sessionStorage.getItem('jeikcode_token') || localStorage.getItem('jeikcode_token') || '';
-            const nextUrl = new URL(window.location.href);
-            nextUrl.port = String(targetPortNum);
-            if (currentToken && !nextUrl.searchParams.has('token')) {
-              nextUrl.searchParams.set('token', currentToken);
-            }
-            if (window.location.search.includes('desktop=') && !nextUrl.searchParams.has('desktop')) {
-              nextUrl.searchParams.set('desktop', '1');
-            }
-            if (targetPortNum !== Number(window.location.port || '13457')) {
-              window.location.href = nextUrl.toString();
-            } else {
-              window.location.reload();
-            }
+        return resp.ok || resp.type === 'opaque';
+      } catch {
+        return false;
+      }
+    };
+    const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms));
+
+    // 3. 同端口重启时先等旧进程下线（最多 5 秒），避免探到即将退出的旧实例就提前刷新
+    await sleep(500);
+    if (samePort) {
+      const downDeadline = Date.now() + 5000;
+      while (Date.now() < downDeadline && (await probeOnce())) {
+        await sleep(300);
+      }
+    }
+
+    // 4. 等新实例上线（最多 45 秒，覆盖 systemd RestartSec / procd respawn 的延迟）
+    const upDeadline = Date.now() + 45000;
+    while (Date.now() < upDeadline) {
+      if (await probeOnce()) {
+        let currentToken = targetToken;
+        if (!currentToken && !noToken) {
+          try {
+            currentToken =
+              sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY)
+              || localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY)
+              || '';
+          } catch {
+            /* ignore */
           }
         }
-      } catch {
-        if (Date.now() > deadline) {
-          window.clearInterval(pollInterval);
-          setRestarting(false);
-          setNote(t('remote.connectTimeout'));
+        const nextUrl = new URL(window.location.href);
+        if (!samePort) nextUrl.port = String(targetPortNum);
+        if (currentToken) {
+          // Token 可能已更换，始终用新值覆盖
+          nextUrl.searchParams.set('token', currentToken);
+        } else {
+          nextUrl.searchParams.delete('token');
         }
+        let isDesktop = window.location.search.includes('desktop=');
+        if (!isDesktop) {
+          try {
+            isDesktop = sessionStorage.getItem('jeikcode_desktop') === '1';
+          } catch {
+            /* ignore */
+          }
+        }
+        if (isDesktop) nextUrl.searchParams.set('desktop', '1');
+        window.location.href = nextUrl.toString();
+        return;
       }
-    }, 600);
+      await sleep(600);
+    }
+    setRestarting(false);
+    setNote(t('remote.connectTimeout'));
   }
 
   async function copyLink() {

@@ -1228,6 +1228,8 @@ export interface RemoteAccessStatus {
   next_port?: number | null;
   /** Saved host that differs from the socket listening now. */
   next_host?: string | null;
+  /** `desktop` | `systemd` | `procd` | `launchd` | `windows-logon` | `foreground` */
+  launch_mode?: string;
 }
 
 export async function getRemoteAccess(): Promise<RemoteAccessStatus> {

@@ -461,6 +461,7 @@ async fn run_serve_mode(
         } else {
             store.mint()
         };
+        store.set_display(&display);
         (Some(store), Some(display))
     };
     // Passed to either the native-service success summary or the foreground
@@ -487,38 +488,42 @@ async fn run_serve_mode(
     }
 
     // Native service wizard BEFORE bind and BEFORE any address/token output.
-    // Linux uses systemd, macOS launchd, and Windows Task Scheduler.
-    let setup = jeikcode::host_service::HostServiceSetupOptions {
-        host: &host,
-        port,
-        workdir: &workdir,
-        no_token,
-        fixed_token: fixed_token.as_deref(),
-        display_token: display_token.as_deref(),
-        yolo,
-        no_telemetry,
-        banner: &startup_footer,
-    };
-    match jeikcode::host_service::prompt_host_service_setup(&setup) {
-        Ok(true) => return 0,
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!(
-                "{}",
-                jeikcode::host_service::host_msg(
-                    &format!("Could not install the host service: {e:#}"),
-                    &format!("系统服务配置失败: {e:#}"),
-                    &format!("Không thể cài đặt dịch vụ hệ thống: {e:#}"),
-                )
-            );
-            eprintln!(
-                "{}",
-                jeikcode::host_service::host_msg(
-                    "Continuing in the foreground.",
-                    "改为前台运行。",
-                    "Tiếp tục chạy ở chế độ foreground.",
-                )
-            );
+    // Linux uses systemd/procd, macOS launchd, and Windows logon autostart.
+    // Skip interactive wizard when this process is an in-place restart successor
+    // (e.g. triggered remotely via WebUI update or port/host change).
+    if !jeikcode_updater::is_restarted_process() {
+        let setup = jeikcode::host_service::HostServiceSetupOptions {
+            host: &host,
+            port,
+            workdir: &workdir,
+            no_token,
+            fixed_token: fixed_token.as_deref(),
+            display_token: display_token.as_deref(),
+            yolo,
+            no_telemetry,
+            banner: &startup_footer,
+        };
+        match jeikcode::host_service::prompt_host_service_setup(&setup) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    jeikcode::host_service::host_msg(
+                        &format!("Could not install the host service: {e:#}"),
+                        &format!("系统服务配置失败: {e:#}"),
+                        &format!("Không thể cài đặt dịch vụ hệ thống: {e:#}"),
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    jeikcode::host_service::host_msg(
+                        "Continuing in the foreground.",
+                        "改为前台运行。",
+                        "Tiếp tục chạy ở chế độ foreground.",
+                    )
+                );
+            }
         }
     }
 
@@ -1542,6 +1547,35 @@ const INTERNAL_PREPARE_UPGRADE_ENV: &str = "JEIKCODE_INTERNAL_PREPARE_UPGRADE";
 /// process has no console. `ctrl_c()` then fails, and returning would drop
 /// the listener before the window connects.
 async fn wait_until_webui_stopped() {
+    if jeikcode_updater::is_desktop_managed() {
+        // 纯事件驱动生命线（0 轮询、0% CPU）：
+        // 桌面壳持有子进程 stdin 管道写端；一旦桌面壳以任何方式退出，OS 内核立即关闭管道，
+        // 阻塞式 stdin.read 瞬间收到 EOF (Ok(0)) 并唤醒退出，配合 Windows Job Object 双重防孤儿。
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = std::thread::Builder::new()
+            .name("desktop-lifeline-eof".into())
+            .spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                let _ = std::io::stdin().read(&mut buf);
+                let _ = eof_tx.send(());
+            });
+        #[cfg(windows)]
+        if !process_has_console() {
+            let _ = eof_rx.await;
+            return;
+        }
+        tokio::select! {
+            _ = eof_rx => return,
+            res = tokio::signal::ctrl_c() => {
+                if res.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                return;
+            }
+        }
+    }
+
     #[cfg(windows)]
     {
         if !process_has_console() {
@@ -1574,6 +1608,9 @@ fn main() {
     // Successor after an in-place WebUI/serve upgrade waits here until the
     // old process has exited and released the listen port.
     jeikcode_updater::wait_for_predecessor_if_requested();
+
+    // 在任何线程/子进程创建前收走启动方式标记，避免 bash 工具里的子 jeikcode 继承后误判。
+    jeikcode_updater::capture_launch_markers();
 
     // Before any thread or child process exists: a Git-Bash launch leaves TMP/TEMP/TMPDIR
     // as POSIX paths, which native children spawned directly (not via the bash tool) would
@@ -2007,13 +2044,20 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::Daemon {
-                host,
-                port,
+                mut host,
+                mut port,
                 token,
                 client,
                 idle_timeout,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited_host) = jeikcode_updater::restart_listen_host_from_env() {
+                    host = inherited_host;
+                }
+                if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
+                    port = inherited;
+                }
+                let token = token.or_else(|| inherited_token.clone());
                 let webui_tokens = match jeikcode_daemon::auth_token::standalone_daemon_tokens(
                     &host,
                     token.as_deref(),
@@ -2102,7 +2146,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 mut port,
                 dir,
                 token,
-                no_token,
+                mut no_token,
                 yolo,
                 idle_timeout,
             } => {
@@ -2113,7 +2157,14 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }
-                let token = token.or_else(|| inherited_token.clone());
+                if let Some(inherited_nt) = jeikcode_updater::take_restart_no_token() {
+                    no_token = inherited_nt;
+                }
+                let token = if no_token {
+                    None
+                } else {
+                    token.or_else(|| inherited_token.clone())
+                };
                 let code = run_serve_mode(
                     host,
                     port,
@@ -2285,14 +2336,29 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     // so a lone flag cannot accidentally start a network server.
     if cli.host.is_some() || cli.port.is_some() {
         HEADLESS_MODE.store(true, Ordering::Relaxed);
-        let host = cli.host.clone().unwrap_or_else(|| "0.0.0.0".to_string());
-        let port = cli.port.unwrap_or(4096);
+        let mut host = cli.host.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+        let mut port = cli.port.unwrap_or(4096);
+        let mut no_token = cli.no_token;
+        if let Some(inherited_host) = jeikcode_updater::restart_listen_host_from_env() {
+            host = inherited_host;
+        }
+        if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
+            port = inherited;
+        }
+        if let Some(inherited_nt) = jeikcode_updater::take_restart_no_token() {
+            no_token = inherited_nt;
+        }
+        let token = if no_token {
+            None
+        } else {
+            cli.token.clone().or_else(|| inherited_token.clone())
+        };
         let code = run_serve_mode(
             host,
             port,
             cli.dir.clone(),
-            cli.no_token,
-            cli.token.clone(),
+            no_token,
+            token,
             cli.yolo,
             0,
             cli.no_telemetry,

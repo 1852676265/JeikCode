@@ -234,8 +234,32 @@ pub fn binary_url(version: &str, target: &str) -> String {
 
 /// Path of the running `jeikcode` executable. Resolved once at the
 /// start of an upgrade so we know what to replace.
+/// Normalizes away `.rolling` or `.bak` suffixes if the process image was
+/// previously renamed in-place on Windows.
 pub fn current_exe_path() -> Result<PathBuf> {
-    std::env::current_exe().context("could not resolve current executable path")
+    let exe = std::env::current_exe().context("could not resolve current executable path")?;
+    Ok(normalize_live_exe_path(exe))
+}
+
+pub fn normalize_live_exe_path(exe: PathBuf) -> PathBuf {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return exe;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower == ".jeikcode.rolling" || lower == "jeikcode.rolling" {
+        return exe.with_file_name(if cfg!(windows) {
+            "jeikcode.exe"
+        } else {
+            "jeikcode"
+        });
+    }
+    if lower.ends_with(".bak") {
+        let trimmed = &name[..name.len() - 4];
+        if !trimmed.is_empty() {
+            return exe.with_file_name(trimmed);
+        }
+    }
+    exe
 }
 
 fn same_exe(a: &Path, b: &Path) -> bool {
@@ -776,6 +800,9 @@ pub async fn run_upgrade_for_channel(
 /// Child waits for this parent pid to exit before binding the listen port.
 pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
 
+/// Old listen port of the predecessor process being replaced (used to wait for socket release).
+pub const RESTART_WAIT_PORT_ENV: &str = "JEIKCODE_RESTART_WAIT_PORT";
+
 /// Target listen host of the replacement process.
 pub const RESTART_LISTEN_HOST_ENV: &str = "JEIKCODE_RESTART_LISTEN_HOST";
 
@@ -790,7 +817,26 @@ pub const RESTART_EXACT_PORT_ENV: &str = "JEIKCODE_RESTART_EXACT_PORT";
 /// Token the browser already stored. Set only when argv has no `--token`.
 pub const RESTART_TOKEN_ENV: &str = "JEIKCODE_RESTART_TOKEN";
 
-fn pid_is_alive(pid: u32) -> bool {
+/// Explicit no-token mode indicator across restarts (`"1"` or `"0"`).
+pub const RESTART_NO_TOKEN_ENV: &str = "JEIKCODE_RESTART_NO_TOKEN";
+
+/// Marks that the current process is a restarted successor so interactive setup wizards are skipped.
+pub const RESTARTED_ENV: &str = "JEIKCODE_RESTARTED";
+
+/// Indicates the daemon/webui is directly supervised by `jeikcode-desktop`,
+/// which will immediately respawn the process upon exit.
+pub const DESKTOP_MANAGED_ENV: &str = "JEIKCODE_DESKTOP_MANAGED";
+
+/// PID of the supervising `jeikcode-desktop` process.
+pub const DESKTOP_PID_ENV: &str = "JEIKCODE_DESKTOP_PID";
+
+/// Dedicated exit code used by a desktop-managed child to signal an intentional
+/// restart (e.g. after self-upgrade or remote-access port/host/token change).
+/// Distinguishes intentional restarts from normal termination (`0`) or crashes,
+/// eliminating unconditional respawn loops in the desktop supervisor.
+pub const RESTART_REQUESTED_EXIT_CODE: i32 = 75;
+
+pub fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         extern "C" {
@@ -878,6 +924,24 @@ pub fn take_restart_token() -> Option<String> {
     token
 }
 
+/// Read and remove the explicit `no_token` override across restarts.
+pub fn take_restart_no_token() -> Option<bool> {
+    let val = std::env::var(RESTART_NO_TOKEN_ENV).ok()?;
+    std::env::remove_var(RESTART_NO_TOKEN_ENV);
+    match val.trim() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Returns true if the current process is an in-place restart successor.
+pub fn is_restarted_process() -> bool {
+    std::env::var_os(RESTARTED_ENV).is_some()
+        || std::env::var_os("JEIKCODE_SKIP_PENDING_UPGRADE").is_some()
+        || std::env::var_os(RESTART_EXACT_PORT_ENV).is_some()
+}
+
 /// `Some(port)` means this start is the successor of an in-place upgrade and
 /// must bind that port only.
 pub fn planned_restart_port(
@@ -917,7 +981,13 @@ pub fn wait_for_predecessor_if_requested() {
         return;
     };
     std::env::remove_var(RESTART_WAIT_PID_ENV);
-    let port = restart_listen_port_from_env()
+    let wait_port = std::env::var(RESTART_WAIT_PORT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|p| *p > 0);
+    std::env::remove_var(RESTART_WAIT_PORT_ENV);
+    let port = wait_port
+        .or_else(restart_listen_port_from_env)
         .or_else(|| listen_port_from_args(std::env::args_os().skip(1)));
     let Some(port) = port else {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -928,8 +998,19 @@ pub fn wait_for_predecessor_if_requested() {
         return;
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut waited_for_non_loopback_pid = false;
     while std::time::Instant::now() < deadline {
         if predecessor_socket_released(tcp_port_accepting(port)) {
+            // If predecessor bound a specific non-loopback LAN IP, 127.0.0.1:port is not
+            // accepting even while the predecessor is still alive. Wait briefly for the
+            // predecessor PID to exit so we do not race its socket teardown.
+            if !waited_for_non_loopback_pid && pid_is_alive(pid) {
+                waited_for_non_loopback_pid = true;
+                let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < pid_deadline && pid_is_alive(pid) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(150));
             return;
         }
@@ -951,12 +1032,130 @@ fn supervised_by_service_manager() -> bool {
         return true;
     }
     #[cfg(target_os = "linux")]
-    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
-        if cgroup.lines().any(|l| l.contains(".service")) {
+    {
+        if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+            if cgroup.lines().any(|l| l.contains(".service")) {
+                return true;
+            }
+        }
+        if parent_is_procd() {
             return true;
         }
     }
     false
+}
+
+/// OpenWrt procd 托管判定：父进程为 `/sbin/procd`。
+#[cfg(target_os = "linux")]
+fn parent_is_procd() -> bool {
+    let ppid = std::os::unix::process::parent_id();
+    if ppid <= 1 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .map(|comm| comm.trim() == "procd")
+        .unwrap_or(false)
+}
+
+/// 由向导生成的服务定义统一写入此环境变量，值为服务名，
+/// 用于在重启时精确定位「正在托管自己」的那一个服务文件。
+pub const HOST_SERVICE_ENV: &str = "JEIKCODE_HOST_SERVICE";
+
+static DESKTOP_MANAGED_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static HOST_SERVICE_MARKER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// 进程启动时尽早调用（任何子进程/线程创建之前）：读取并从环境中移除
+/// `JEIKCODE_DESKTOP_MANAGED` 与 `JEIKCODE_HOST_SERVICE`，避免 Agent 在 bash 工具里
+/// 启动的另一个 jeikcode 继承到这两个标记，误判自己的启动方式并改写父服务文件。
+pub fn capture_launch_markers() {
+    let _ = is_desktop_managed();
+    let _ = host_service_marker();
+}
+
+/// 当前进程是否由桌面壳直接托管。
+pub fn is_desktop_managed() -> bool {
+    *DESKTOP_MANAGED_FLAG.get_or_init(|| {
+        let managed = std::env::var_os(DESKTOP_MANAGED_ENV).is_some();
+        std::env::remove_var(DESKTOP_MANAGED_ENV);
+        managed
+    })
+}
+
+fn host_service_marker() -> Option<String> {
+    HOST_SERVICE_MARKER
+        .get_or_init(|| {
+            let marker = std::env::var(HOST_SERVICE_ENV)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            std::env::remove_var(HOST_SERVICE_ENV);
+            marker
+        })
+        .clone()
+}
+
+/// 当前进程的启动方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// 桌面壳托管的子进程（由桌面壳负责重启）。
+    Desktop,
+    /// Linux systemd 服务。
+    Systemd,
+    /// OpenWrt procd 服务。
+    Procd,
+    /// macOS launchd 代理。
+    Launchd,
+    /// Windows 登录自启（HKCU Run + `.cmd` 启动器）。
+    WindowsLogon,
+    /// 终端前台运行。
+    Foreground,
+}
+
+impl LaunchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Systemd => "systemd",
+            Self::Procd => "procd",
+            Self::Launchd => "launchd",
+            Self::WindowsLogon => "windows-logon",
+            Self::Foreground => "foreground",
+        }
+    }
+}
+
+/// 识别当前进程是通过什么方式启动的。只看进程自身可确认的信号
+/// （环境变量 / 父进程 / cgroup），不按「磁盘上存在某个服务文件」去猜。
+pub fn detect_launch_mode() -> LaunchMode {
+    if is_desktop_managed() {
+        return LaunchMode::Desktop;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if parent_is_procd() {
+            return LaunchMode::Procd;
+        }
+        if std::env::var_os("INVOCATION_ID").is_some() {
+            return LaunchMode::Systemd;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let xpc = std::env::var("XPC_SERVICE_NAME").unwrap_or_default();
+        if xpc.starts_with("com.jeikcode-") || std::env::var_os("LAUNCH_JOBNAME").is_some() {
+            return LaunchMode::Launchd;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if host_service_marker()
+            .map(|v| v.to_ascii_lowercase().starts_with("jeikcode-"))
+            .unwrap_or(false)
+        {
+            return LaunchMode::WindowsLogon;
+        }
+    }
+    LaunchMode::Foreground
 }
 
 /// Patch CLI argv to inject updated host, port, and token parameters upon restart.
@@ -970,19 +1169,71 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    patch_restart_args_with_auth(args, new_host, new_port, new_token, None)
+}
+
+/// Patch CLI argv to inject updated host, port, token, and `--no-token` parameters upon restart,
+/// automatically resolving mutual exclusion between `--token` and `--no-token`.
+pub fn patch_restart_args_with_auth<I, S>(
+    args: I,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let orig: Vec<std::ffi::OsString> = args
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
     let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(orig.len() + 6);
     let mut i = 0;
+    let effective_token = if no_token == Some(true) {
+        None
+    } else {
+        new_token.map(str::trim).filter(|t| !t.is_empty())
+    };
+    let want_no_token = no_token == Some(true);
+    let strip_no_token = no_token == Some(false) || effective_token.is_some();
+
+    let first_subcmd = orig
+        .first()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let is_daemon_subcmd = first_subcmd == "daemon";
+
     let mut host_patched = new_host.is_none();
     let mut port_patched = new_port.map_or(true, |p| p == 0);
-    let mut token_patched = new_token.is_none();
+    let mut token_patched = effective_token.is_none();
+    let mut has_no_token_flag = false;
 
     while i < orig.len() {
         let arg = &orig[i];
         let arg_str = arg.to_string_lossy();
+
+        if arg_str == "--no-token" {
+            if strip_no_token {
+                i += 1;
+                continue;
+            }
+            has_no_token_flag = true;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if want_no_token {
+            if arg_str == "--token" {
+                i += if i + 1 < orig.len() { 2 } else { 1 };
+                continue;
+            } else if arg_str.starts_with("--token=") {
+                i += 1;
+                continue;
+            }
+        }
 
         if let Some(h) = new_host {
             if arg_str == "--host" {
@@ -1018,7 +1269,7 @@ where
             }
         }
 
-        if let Some(t) = new_token {
+        if let Some(t) = effective_token {
             if arg_str == "--token" {
                 out.push(arg.clone());
                 out.push(std::ffi::OsString::from(t));
@@ -1051,7 +1302,9 @@ where
             out.push(std::ffi::OsString::from(p.to_string()));
         }
     }
-    if let Some(t) = new_token {
+    if want_no_token && !has_no_token_flag && !is_daemon_subcmd && first_subcmd != "webui" {
+        out.push(std::ffi::OsString::from("--no-token"));
+    } else if let Some(t) = effective_token {
         if !token_patched {
             out.push(std::ffi::OsString::from("--token"));
             out.push(std::ffi::OsString::from(t));
@@ -1059,6 +1312,545 @@ where
     }
 
     out
+}
+
+/// Tokenize a command-line string preserving quoted segments.
+fn tokenize_command_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+        } else if ch.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn format_flag_val(val: &str, quote: bool) -> String {
+    if quote || val.chars().any(|c| c.is_whitespace()) {
+        format!("\"{}\"", val.trim_matches('"'))
+    } else {
+        val.trim_matches('"').to_string()
+    }
+}
+
+/// Rewrite `--host`, `--port`, `--token`, and `--no-token` flags in a single command line
+/// (used for systemd `ExecStart=`, OpenWrt `procd_set_param command`, and Windows `.cmd` launchers).
+pub fn rewrite_service_command_line(
+    line: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+    quote_values: bool,
+) -> String {
+    let tokens = tokenize_command_line(line);
+    if tokens.is_empty() {
+        return line.to_string();
+    }
+    let effective_token = if no_token == Some(true) {
+        None
+    } else {
+        new_token.map(str::trim).filter(|t| !t.is_empty())
+    };
+    let want_no_token = no_token == Some(true);
+    let strip_no_token = no_token == Some(false) || effective_token.is_some();
+
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len() + 4);
+    let mut i = 0;
+    let mut host_patched = new_host.is_none();
+    let mut port_patched = new_port.map_or(true, |p| p == 0);
+    let mut token_patched = effective_token.is_none();
+    let mut has_no_token = false;
+
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok == "--no-token" {
+            if strip_no_token {
+                i += 1;
+                continue;
+            }
+            has_no_token = true;
+            out.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        if want_no_token {
+            if tok == "--token" {
+                i += if i + 1 < tokens.len() { 2 } else { 1 };
+                continue;
+            } else if tok.starts_with("--token=") {
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(h) = new_host.map(str::trim).filter(|h| !h.is_empty()) {
+            if tok == "--host" && i + 1 < tokens.len() {
+                let was_quoted = tokens[i + 1].starts_with('"');
+                out.push("--host".to_string());
+                out.push(format_flag_val(h, quote_values || was_quoted));
+                host_patched = true;
+                i += 2;
+                continue;
+            } else if tok.starts_with("--host=") {
+                out.push(format!("--host={}", format_flag_val(h, quote_values)));
+                host_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(p) = new_port.filter(|p| *p > 0) {
+            if tok == "--port" && i + 1 < tokens.len() {
+                out.push("--port".to_string());
+                out.push(p.to_string());
+                port_patched = true;
+                i += 2;
+                continue;
+            } else if tok.starts_with("--port=") {
+                out.push(format!("--port={p}"));
+                port_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(t) = effective_token {
+            if tok == "--token" && i + 1 < tokens.len() {
+                let was_quoted = tokens[i + 1].starts_with('"');
+                out.push("--token".to_string());
+                out.push(format_flag_val(t, quote_values || was_quoted));
+                token_patched = true;
+                i += 2;
+                continue;
+            } else if tok.starts_with("--token=") {
+                out.push(format!("--token={}", format_flag_val(t, quote_values)));
+                token_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+
+    if let Some(h) = new_host.map(str::trim).filter(|h| !h.is_empty()) {
+        if !host_patched {
+            out.push("--host".to_string());
+            out.push(format_flag_val(h, quote_values));
+        }
+    }
+    if let Some(p) = new_port.filter(|p| *p > 0) {
+        if !port_patched {
+            out.push("--port".to_string());
+            out.push(p.to_string());
+        }
+    }
+    if want_no_token && !has_no_token {
+        out.push("--no-token".to_string());
+    } else if let Some(t) = effective_token {
+        if !token_patched {
+            out.push("--token".to_string());
+            out.push(format_flag_val(t, quote_values));
+        }
+    }
+
+    out.join(" ")
+}
+
+/// Rewrite systemd unit content (`ExecStart=...`) with updated listen options.
+pub fn rewrite_systemd_unit_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("ExecStart=") {
+            let updated =
+                rewrite_service_command_line(rest, new_host, new_port, new_token, no_token, false);
+            lines.push(format!("ExecStart={updated}"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Rewrite OpenWrt procd script content (`procd_set_param command ...`) with updated listen options.
+pub fn rewrite_procd_script_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("procd_set_param command ") {
+            let indent = &line[..line.len() - trimmed.len()];
+            let updated =
+                rewrite_service_command_line(rest, new_host, new_port, new_token, no_token, true);
+            lines.push(format!("{indent}procd_set_param command {updated}"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Rewrite Windows `.cmd` logon launcher content with updated listen options.
+pub fn rewrite_windows_cmd_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if !trimmed.is_empty()
+            && !trimmed.starts_with('@')
+            && !lower.starts_with("cd ")
+            && !lower.starts_with("set ")
+            && (trimmed.contains("--host") || trimmed.contains("--port"))
+        {
+            lines.push(rewrite_service_command_line(
+                trimmed, new_host, new_port, new_token, no_token, false,
+            ));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\r\n");
+    if content.ends_with('\n') {
+        out.push_str("\r\n");
+    }
+    out
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape_str(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Rewrite macOS launchd `.plist` `<key>ProgramArguments</key>` with updated listen options.
+pub fn rewrite_launchd_plist_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> Option<String> {
+    let key_idx = content.find("<key>ProgramArguments</key>")?;
+    let after_key = &content[key_idx..];
+    let array_start_rel = after_key.find("<array>")?;
+    let array_end_rel = after_key.find("</array>")?;
+    if array_start_rel >= array_end_rel {
+        return None;
+    }
+    let array_inner = &after_key[array_start_rel + "<array>".len()..array_end_rel];
+    let mut items = Vec::new();
+    let mut cursor = array_inner;
+    while let Some(s_idx) = cursor.find("<string>") {
+        let after_s = &cursor[s_idx + "<string>".len()..];
+        let e_idx = after_s.find("</string>")?;
+        items.push(xml_unescape(&after_s[..e_idx]));
+        cursor = &after_s[e_idx + "</string>".len()..];
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let exe_item = items[0].clone();
+    let patched =
+        patch_restart_args_with_auth(&items[1..], new_host, new_port, new_token, no_token);
+    let mut new_array = String::from("<array>\n");
+    new_array.push_str(&format!(
+        "    <string>{}</string>\n",
+        xml_escape_str(&exe_item)
+    ));
+    for arg in patched {
+        new_array.push_str(&format!(
+            "    <string>{}</string>\n",
+            xml_escape_str(&arg.to_string_lossy())
+        ));
+    }
+    new_array.push_str("  </array>");
+
+    let abs_array_start = key_idx + array_start_rel;
+    let abs_array_end = key_idx + array_end_rel + "</array>".len();
+    let mut out = String::with_capacity(content.len() + 64);
+    out.push_str(&content[..abs_array_start]);
+    out.push_str(&new_array);
+    out.push_str(&content[abs_array_end..]);
+    Some(out)
+}
+
+#[cfg(target_os = "linux")]
+fn write_system_file_with_sudo_fallback(target: &Path, content: &str) -> bool {
+    if std::fs::write(target, content).is_ok() {
+        return true;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        ".jeikcode-svc-{}-{}",
+        std::process::id(),
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unit")
+    ));
+    if std::fs::write(&tmp, content).is_err() {
+        return false;
+    }
+    let ok = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "cp",
+            tmp.to_str().unwrap_or_default(),
+            target.to_str().unwrap_or_default(),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&tmp);
+    ok
+}
+
+/// 在 `dir` 中定位正在托管当前进程的服务定义文件：
+/// 1. `JEIKCODE_HOST_SERVICE` 标记命中直接使用（标记已在启动时从环境移除，不会被子进程冒用）；
+/// 2. 来自 cgroup / `XPC_SERVICE_NAME` 的候选名，必须同时声明了当前端口才采用；
+/// 3. 否则只按「当前正在监听的端口」精确匹配，不做「只有一个就用它」的猜测，
+///    避免前台实例误改不相干的开机自启服务。
+fn locate_service_file(
+    dir: &Path,
+    marker_name: Option<String>,
+    hinted_name: Option<String>,
+    is_candidate: impl Fn(&str) -> bool,
+    old_port: u16,
+) -> Option<PathBuf> {
+    if let Some(name) = marker_name {
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if old_port == 0 {
+        return None;
+    }
+    if let Some(name) = hinted_name {
+        let candidate = dir.join(&name);
+        if std::fs::read_to_string(&candidate)
+            .map(|text| service_text_declares_port(&text, old_port))
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_candidate(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if service_text_declares_port(&text, old_port) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 服务定义里是否声明了该端口（按数字边界匹配，`4096` 不会命中 `40960`）。
+/// 兼容 `--port 4096`、`--port=4096`、`--port "4096"` 以及 launchd 的
+/// `<string>--port</string> <string>4096</string>`。
+pub fn service_text_declares_port(text: &str, port: u16) -> bool {
+    let want = port.to_string();
+    let mut rest = text;
+    while let Some(idx) = rest.find("--port") {
+        let after = &rest[idx + "--port".len()..];
+        let value = if let Some(v) = after.strip_prefix('=') {
+            v
+        } else if let Some(v) = after.strip_prefix("</string>") {
+            v.trim_start().strip_prefix("<string>").unwrap_or("")
+        } else {
+            after.trim_start_matches([' ', '\t'])
+        };
+        let value = value.trim_start_matches('"');
+        let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits == want {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// 按当前进程的启动方式，把新的 host/port/token 写回托管它的服务定义文件
+/// （systemd unit / procd init 脚本 / launchd plist / Windows 登录自启 `.cmd`），
+/// 保证异地换端口或更新后，下次开机/服务重拉仍是新配置。
+/// 桌面壳子进程与普通前台进程不改任何服务文件。返回实际更新的文件。
+pub fn sync_host_service_on_restart(
+    old_port: u16,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> Option<PathBuf> {
+    let mode = detect_launch_mode();
+    let marker = host_service_marker();
+    let _ = (&marker, old_port, new_host, new_port, new_token, no_token);
+
+    match mode {
+        LaunchMode::Desktop => None,
+
+        #[cfg(target_os = "linux")]
+        LaunchMode::Systemd => {
+            let dir = Path::new("/etc/systemd/system");
+            let hinted = std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|cgroup| {
+                    cgroup
+                        .lines()
+                        .flat_map(|line| line.rsplit('/'))
+                        .map(str::trim)
+                        .find(|seg| {
+                            seg.starts_with("jeikcode")
+                                && !seg.starts_with("jeikcode-schedule-")
+                                && seg.ends_with(".service")
+                        })
+                        .map(str::to_string)
+                });
+            let path = locate_service_file(
+                dir,
+                marker.map(|m| format!("{m}.service")),
+                hinted,
+                |n| {
+                    n.starts_with("jeikcode")
+                        && !n.starts_with("jeikcode-schedule-")
+                        && n.ends_with(".service")
+                },
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_systemd_unit_content(&content, new_host, new_port, new_token, no_token);
+            if updated == content || !write_system_file_with_sudo_fallback(&path, &updated) {
+                return None;
+            }
+            let reloaded = std::process::Command::new("systemctl")
+                .arg("daemon-reload")
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !reloaded {
+                let _ = std::process::Command::new("sudo")
+                    .args(["-n", "systemctl", "daemon-reload"])
+                    .status();
+            }
+            Some(path)
+        }
+
+        #[cfg(target_os = "linux")]
+        LaunchMode::Procd => {
+            let path = locate_service_file(
+                Path::new("/etc/init.d"),
+                marker,
+                None,
+                |n| {
+                    (n == "jeikcode" || n.starts_with("jeikcode-"))
+                        && !n.starts_with("jeikcode-schedule-")
+                },
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_procd_script_content(&content, new_host, new_port, new_token, no_token);
+            (updated != content && write_system_file_with_sudo_fallback(&path, &updated))
+                .then_some(path)
+        }
+
+        #[cfg(target_os = "macos")]
+        LaunchMode::Launchd => {
+            let dir = jeikcode_config::util::real_home_dir()?.join("Library/LaunchAgents");
+            let hinted = std::env::var("XPC_SERVICE_NAME")
+                .ok()
+                .filter(|x| x.starts_with("com.jeikcode-"))
+                .map(|label| format!("{label}.plist"));
+            let path = locate_service_file(
+                &dir,
+                marker.map(|label| format!("{label}.plist")),
+                hinted,
+                |n| n.starts_with("com.jeikcode-") && n.ends_with(".plist"),
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_launchd_plist_content(&content, new_host, new_port, new_token, no_token)?;
+            (updated != content && std::fs::write(&path, updated).is_ok()).then_some(path)
+        }
+
+        #[cfg(target_os = "windows")]
+        LaunchMode::WindowsLogon | LaunchMode::Foreground => {
+            // Foreground 仅用于兼容早期未写入 JEIKCODE_HOST_SERVICE 标记的登录自启项：
+            // 同一端口不可能同时被两个进程监听，端口精确命中即视为同一服务。
+            let dir = jeikcode_config::util::real_home_dir()?
+                .join(".jeikcode")
+                .join("services");
+            let path = locate_service_file(
+                &dir,
+                marker.map(|m| format!("{m}.cmd")),
+                None,
+                |n| {
+                    let lower = n.to_ascii_lowercase();
+                    lower.starts_with("jeikcode-") && lower.ends_with(".cmd")
+                },
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_windows_cmd_content(&content, new_host, new_port, new_token, no_token);
+            (updated != content && std::fs::write(&path, updated).is_ok()).then_some(path)
+        }
+
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
 }
 
 /// After an in-place swap or configuration change, restart the binary inheriting
@@ -1078,7 +1870,33 @@ pub fn restart_process_with_options(
     listen_port: u16,
     token: Option<&str>,
 ) -> Result<std::convert::Infallible> {
+    restart_process_with_config(exe, listen_port, host, listen_port, token, None)
+}
+
+/// Full-featured restart entrypoint supporting port change (`old_port` -> `listen_port`),
+/// host change, token update, `--no-token` toggle, and automatic host-service persistence sync.
+pub fn restart_process_with_config(
+    exe: &Path,
+    old_port: u16,
+    host: Option<&str>,
+    listen_port: u16,
+    token: Option<&str>,
+    no_token: Option<bool>,
+) -> Result<std::convert::Infallible> {
+    let clean_exe = normalize_live_exe_path(exe.to_path_buf());
+    let exe = clean_exe.as_path();
+
+    // 按启动方式把新的 host/port/token 同步到托管自己的服务定义文件（桌面壳/前台进程不改）
+    let _ = sync_host_service_on_restart(
+        old_port,
+        host,
+        (listen_port > 0).then_some(listen_port),
+        token,
+        no_token,
+    );
+
     std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    std::env::set_var(RESTARTED_ENV, "1");
     if let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) {
         std::env::set_var(RESTART_LISTEN_HOST_ENV, h);
     }
@@ -1086,28 +1904,51 @@ pub fn restart_process_with_options(
         std::env::set_var(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
     }
     std::env::set_var(RESTART_EXACT_PORT_ENV, "1");
-    let token = token.map(str::trim).filter(|value| !value.is_empty());
-    if let Some(token) = token {
-        std::env::set_var(RESTART_TOKEN_ENV, token);
-    }
+    let token = if no_token == Some(true) {
+        std::env::remove_var(RESTART_TOKEN_ENV);
+        std::env::set_var(RESTART_NO_TOKEN_ENV, "1");
+        None
+    } else {
+        if no_token == Some(false) {
+            std::env::set_var(RESTART_NO_TOKEN_ENV, "0");
+        }
+        let tok = token.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(tok) = tok {
+            std::env::set_var(RESTART_TOKEN_ENV, tok);
+        }
+        tok
+    };
 
     let orig_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let patched_args = patch_restart_args(
+    let patched_args = patch_restart_args_with_auth(
         orig_args,
         host,
         (listen_port > 0).then_some(listen_port),
         token,
+        no_token,
     );
+
+    // 桌面壳托管模式下，以专用重启退出码 75 退出当前子进程，
+    // 由桌面壳事件驱动唤醒后读取最新 webui-listen.json 重新拉起子进程并写入 ChildSlot。
+    if is_desktop_managed() {
+        std::process::exit(RESTART_REQUESTED_EXIT_CODE);
+    }
+
+    // 启动时已从环境移除服务标记；后继进程（re-exec 或新进程）仍由同一服务托管，需要归还标记
+    if let Some(marker) = host_service_marker() {
+        std::env::set_var(HOST_SERVICE_ENV, marker);
+    }
 
     #[cfg(unix)]
     {
         let is_supervised = supervised_by_service_manager();
-        // 优先原地 re-exec：保留 PID、终端前台及 supervisor 纳管关系
+        // 优先原地 re-exec：保留 PID、终端前台及 systemd/procd/launchd 纳管关系，0 秒无缝切换
         match re_exec_self_with_args(Some(exe), Some(&patched_args)) {
             Ok(infallible) => return Ok(infallible),
             Err(_) => {
                 if is_supervised {
-                    std::process::exit(0);
+                    // 非 0 退出码确保 systemd (Restart=always) 与 OpenWrt procd (respawn) 必然触发重拉
+                    std::process::exit(1);
                 }
             }
         }
@@ -1117,15 +1958,32 @@ pub fn restart_process_with_options(
     cmd.args(&patched_args)
         .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
         .env(RESTART_EXACT_PORT_ENV, "1")
+        .env(RESTARTED_ENV, "1")
         .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if old_port > 0 {
+        cmd.env(RESTART_WAIT_PORT_ENV, old_port.to_string());
+    }
     if let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) {
         cmd.env(RESTART_LISTEN_HOST_ENV, h);
     }
     if listen_port > 0 {
         cmd.env(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
     }
-    if let Some(token) = token {
-        cmd.env(RESTART_TOKEN_ENV, token);
+    if no_token == Some(true) {
+        cmd.env_remove(RESTART_TOKEN_ENV);
+        cmd.env(RESTART_NO_TOKEN_ENV, "1");
+    } else {
+        if no_token == Some(false) {
+            cmd.env(RESTART_NO_TOKEN_ENV, "0");
+        }
+        if let Some(token) = token {
+            cmd.env(RESTART_TOKEN_ENV, token);
+        }
+    }
+    if let Ok(desktop_pid) = std::env::var(DESKTOP_PID_ENV) {
+        if !desktop_pid.trim().is_empty() {
+            cmd.env(DESKTOP_PID_ENV, desktop_pid);
+        }
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -3017,5 +3875,169 @@ mod tests {
             strings,
             vec!["webui", "--host", "0.0.0.0", "--port", "4096", "--token", "sk-token"]
         );
+    }
+
+    #[test]
+    fn patch_restart_args_with_auth_toggles_between_token_and_no_token() {
+        // Switching from --no-token to --token strips --no-token so `serve` does not abort
+        let orig = vec!["--host", "0.0.0.0", "--port", "4096", "--no-token"];
+        let patched = patch_restart_args_with_auth(
+            orig,
+            Some("0.0.0.0"),
+            Some(5000),
+            Some("new-secret"),
+            Some(false),
+        );
+        let strings: Vec<String> = patched
+            .into_iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "5000",
+                "--token",
+                "new-secret"
+            ]
+        );
+
+        // Switching from --token to --no-token strips --token and appends --no-token
+        let orig2 = vec![
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "5000",
+            "--token",
+            "new-secret",
+        ];
+        let patched2 =
+            patch_restart_args_with_auth(orig2, Some("127.0.0.1"), Some(5001), None, Some(true));
+        let strings2: Vec<String> = patched2
+            .into_iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strings2,
+            vec!["--host", "127.0.0.1", "--port", "5001", "--no-token"]
+        );
+    }
+
+    #[test]
+    fn service_port_match_respects_digit_boundaries() {
+        assert!(service_text_declares_port("x --port 4096 --dir /", 4096));
+        assert!(service_text_declares_port("x --port=4096", 4096));
+        assert!(service_text_declares_port("x --port \"4096\"", 4096));
+        assert!(service_text_declares_port(
+            "<string>--port</string>\n    <string>4096</string>",
+            4096
+        ));
+        assert!(!service_text_declares_port("x --port 40960", 4096));
+        assert!(!service_text_declares_port("x --port 409", 4096));
+        assert!(!service_text_declares_port("x --host 4096", 4096));
+    }
+
+    #[test]
+    fn live_exe_path_strips_windows_swap_suffixes() {
+        let dir = std::path::Path::new("/opt/jc");
+        let expected = if cfg!(windows) {
+            "jeikcode.exe"
+        } else {
+            "jeikcode"
+        };
+        assert_eq!(
+            normalize_live_exe_path(dir.join(".jeikcode.rolling")),
+            dir.join(expected)
+        );
+        assert_eq!(
+            normalize_live_exe_path(dir.join("jeikcode.exe.bak")),
+            dir.join("jeikcode.exe")
+        );
+        assert_eq!(
+            normalize_live_exe_path(dir.join("jeikcode")),
+            dir.join("jeikcode")
+        );
+    }
+
+    #[test]
+    fn windows_cmd_rewrite_leaves_marker_line_untouched() {
+        let cmd = "@echo off\r\ncd /d E:\\w\r\nset \"JEIKCODE_HOST_SERVICE=JeikCode-jeikcode\"\r\njeikcode.exe --host 0.0.0.0 --port 4096 --token a\r\n";
+        let out = rewrite_windows_cmd_content(cmd, None, Some(5000), Some("b"), Some(false));
+        assert!(out.contains("set \"JEIKCODE_HOST_SERVICE=JeikCode-jeikcode\""));
+        assert!(out.contains("jeikcode.exe --host 0.0.0.0 --port 5000 --token b"));
+    }
+
+    #[test]
+    fn rewrites_systemd_procd_launchd_and_windows_service_configs() {
+        // 1. Linux systemd unit
+        let unit = "[Service]\nExecStart=/usr/local/bin/jeikcode --host 0.0.0.0 --port 4096 --token oldtok --dir \"/root\"\nRestart=always\n";
+        let updated_unit = rewrite_systemd_unit_content(
+            unit,
+            Some("192.168.1.10"),
+            Some(8080),
+            Some("newtok"),
+            Some(false),
+        );
+        assert!(updated_unit.contains(
+            "ExecStart=/usr/local/bin/jeikcode --host 192.168.1.10 --port 8080 --token newtok --dir \"/root\""
+        ));
+
+        // 2. OpenWrt procd script
+        let procd = "start_service() {\n    procd_open_instance\n    procd_set_param command \"$PROG\" --host \"0.0.0.0\" --port 4096 --dir \"/root\" --token \"oldtok\"\n}\n";
+        let updated_procd = rewrite_procd_script_content(
+            procd,
+            Some("0.0.0.0"),
+            Some(9090),
+            Some("openwrt-tok"),
+            Some(false),
+        );
+        assert!(updated_procd.contains(
+            "    procd_set_param command \"$PROG\" --host \"0.0.0.0\" --port 9090 --dir \"/root\" --token \"openwrt-tok\""
+        ));
+
+        // 3. macOS launchd plist
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jeikcode-4096</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/jeikcode</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>4096</string>
+    <string>--token</string>
+    <string>oldtok</string>
+  </array>
+</dict>
+</plist>"#;
+        let updated_plist = rewrite_launchd_plist_content(
+            plist,
+            Some("127.0.0.1"),
+            Some(7070),
+            Some("mactok"),
+            Some(false),
+        )
+        .unwrap();
+        assert!(updated_plist.contains("<string>127.0.0.1</string>"));
+        assert!(updated_plist.contains("<string>7070</string>"));
+        assert!(updated_plist.contains("<string>mactok</string>"));
+
+        // 4. Windows logon .cmd
+        let win_cmd = "@echo off\r\ncd /d E:\\code\r\n\"C:\\Program Files\\JeikCode\\jeikcode.exe\" --host 0.0.0.0 --port 4096 --token oldtok\r\n";
+        let updated_cmd = rewrite_windows_cmd_content(
+            win_cmd,
+            Some("0.0.0.0"),
+            Some(6060),
+            Some("wintok"),
+            Some(false),
+        );
+        assert!(updated_cmd.contains(
+            "\"C:\\Program Files\\JeikCode\\jeikcode.exe\" --host 0.0.0.0 --port 6060 --token wintok"
+        ));
     }
 }

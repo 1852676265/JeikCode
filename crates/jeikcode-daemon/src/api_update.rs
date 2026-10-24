@@ -552,6 +552,12 @@ pub async fn execute_update(
     let listen_host = state.bind_host.clone();
     let listen_port = state.bind_port;
     let restart_token = state.webui_tokens.display();
+    let no_token = state
+        .token_optional
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || !state
+            .enforce_token
+            .load(std::sync::atomic::Ordering::Relaxed);
 
     tokio::spawn(async move {
         set_update_status(UpdateStatus {
@@ -573,6 +579,7 @@ pub async fn execute_update(
             Some(listen_host),
             listen_port,
             restart_token,
+            no_token,
         )
         .await
         {
@@ -601,6 +608,7 @@ async fn run_cli_update(
     listen_host: Option<String>,
     listen_port: u16,
     restart_token: Option<String>,
+    no_token: bool,
 ) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
@@ -678,13 +686,22 @@ async fn run_cli_update(
                 // serve picks up the new image (Unix exec; Windows delayed spawn).
                 let restart_token = restart_token.clone();
                 let restart_host = listen_host.clone();
+                if listen_port > 0 {
+                    let _ = crate::api_config::save_webui_listen_pref(
+                        restart_host.clone(),
+                        listen_port,
+                        restart_token.clone(),
+                    );
+                }
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    let Err(err) = jeikcode_updater::restart_process_with_options(
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    let Err(err) = jeikcode_updater::restart_process_with_config(
                         &exe,
+                        listen_port,
                         restart_host.as_deref(),
                         listen_port,
                         restart_token.as_deref(),
+                        Some(no_token),
                     );
                     tracing::error!("in-place upgrade restart failed: {err}");
                     set_update_status(UpdateStatus {

@@ -104,11 +104,17 @@ pub fn render_procd_script(opts: &ProcdServiceOpts, env: &crate::systemd::Captur
 
     let command_args = args.join(" ");
 
-    let jeikcode_home_env = if let Ok(val) = std::env::var("JEIKCODE_HOME") {
-        format!("    procd_set_param env JEIKCODE_HOME=\"{}\"\n", val)
-    } else {
-        String::new()
-    };
+    // procd 的 `procd_set_param env` 重复调用会生成多个 env 表，后者可能覆盖前者，
+    // 因此所有环境变量合并到同一次调用里。
+    let mut env_pairs = vec![
+        format!("PATH=\"{}\"", env.path),
+        format!("HOME=\"{}\"", env.home),
+        format!("JEIKCODE_HOST_SERVICE=\"{}\"", opts.service_name),
+    ];
+    if let Ok(val) = std::env::var("JEIKCODE_HOME") {
+        env_pairs.push(format!("JEIKCODE_HOME=\"{val}\""));
+    }
+    let env_line = env_pairs.join(" ");
 
     format!(
         r#"#!/bin/sh /etc/rc.common
@@ -122,9 +128,8 @@ PROG="{exe_str}"
 start_service() {{
     procd_open_instance
     procd_set_param command "$PROG" {command_args}
-    procd_set_param env PATH="{path}"
-    procd_set_param env HOME="{home}"
-{jeikcode_home_env}    procd_set_param respawn 3600 5 0
+    procd_set_param env {env_line}
+    procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param user {user}
@@ -137,9 +142,7 @@ stop_service() {{
 "#,
         exe_str = exe_str,
         command_args = command_args,
-        path = env.path,
-        home = env.home,
-        jeikcode_home_env = jeikcode_home_env,
+        env_line = env_line,
         user = env.user,
     )
 }
@@ -546,6 +549,8 @@ mod tests {
         assert!(script.contains("--token \"anhuang520\""));
         assert!(script.contains("--no-telemetry"));
         assert!(script.contains("procd_set_param respawn"));
+        assert!(script.contains("JEIKCODE_HOST_SERVICE=\"jeikcode-13457\""));
+        assert_eq!(script.matches("procd_set_param env").count(), 1);
         assert!(script.contains("user root"));
     }
 

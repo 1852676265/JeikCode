@@ -427,6 +427,8 @@ fn render_launchd_plist(label: &str, executable: &Path, args: &[String], workdir
     <string>{home}</string>
     <key>PATH</key>
     <string>{path}</string>
+    <key>JEIKCODE_HOST_SERVICE</key>
+    <string>{label}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -712,11 +714,20 @@ fn windows_task_command(executable: &Path, args: &[String]) -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn render_windows_launcher(executable: &Path, workdir: &Path, args: &[String]) -> String {
+fn render_windows_launcher(
+    executable: &Path,
+    workdir: &Path,
+    args: &[String],
+    service_name: Option<&str>,
+) -> String {
     let mut body = String::from("@echo off\r\n");
     body.push_str("cd /d ");
     body.push_str(&quote_windows_arg(&workdir.display().to_string()));
     body.push_str("\r\n");
+    // 标记自己由哪个登录自启项拉起，异地换端口/Token 时据此精确回写本文件
+    if let Some(name) = service_name {
+        body.push_str(&format!("set \"JEIKCODE_HOST_SERVICE={name}\"\r\n"));
+    }
     body.push_str(&quote_windows_arg(&executable.display().to_string()));
     for arg in args {
         body.push(' ');
@@ -750,7 +761,12 @@ fn install_windows_logon(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let cmd_path = dir.join(format!("{task_name}.cmd"));
     let executable = crate::systemd::resolve_service_exe();
-    let body = render_windows_launcher(&executable, opts.workdir, &serve_args(opts));
+    let body = render_windows_launcher(
+        &executable,
+        opts.workdir,
+        &serve_args(opts),
+        Some(task_name),
+    );
     std::fs::write(&cmd_path, body).with_context(|| format!("writing {}", cmd_path.display()))?;
 
     // Drop a previous Task Scheduler entry. It did not start on logon, and
@@ -1177,8 +1193,10 @@ mod tests {
                 "--token".into(),
                 "secret".into(),
             ],
+            Some("JeikCode-4096"),
         );
         assert!(body.starts_with("@echo off\r\ncd /d E:\\code\\jeikcode\r\n"));
+        assert!(body.contains("set \"JEIKCODE_HOST_SERVICE=JeikCode-4096\"\r\n"));
         assert!(body.contains(r#""C:\Program Files\JeikCode\jeikcode.exe""#));
         assert!(body.contains("--host 0.0.0.0 --port 4096 --token secret"));
     }

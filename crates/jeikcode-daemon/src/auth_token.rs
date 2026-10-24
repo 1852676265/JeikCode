@@ -83,7 +83,11 @@ impl WebuiTokenStore {
         if token.is_empty() {
             return false;
         }
-        self.inner.write().unwrap().values.insert(token.to_string());
+        let mut guard = self.inner.write().unwrap();
+        guard.values.insert(token.to_string());
+        if guard.display.is_none() {
+            guard.display = Some(token.to_string());
+        }
         true
     }
 

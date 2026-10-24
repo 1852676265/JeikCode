@@ -224,6 +224,7 @@ Environment=HOME={home}
 Environment=SHELL={shell}
 Environment=LANG={lang}
 Environment=PATH={path}
+Environment=JEIKCODE_HOST_SERVICE={service_name}
 
 [Install]
 WantedBy=multi-user.target

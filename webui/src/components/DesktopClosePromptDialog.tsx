@@ -20,18 +20,17 @@ export function DesktopClosePromptDialog() {
 
   async function handleAction(action: 'tray' | 'quit') {
     setOpen(false);
-    if (remember) {
+    if (action === 'tray') {
+      if (remember) {
+        void postDesktopSettings({ close_action: action }).catch(() => {});
+      }
+      // 触发桌面壳隐藏到托盘（通过受控伪窗口跳转拦截与原生桥接双通道）
+      window.dispatchEvent(new CustomEvent('jeikcode:desktop:hide_to_tray'));
       try {
-        await postDesktopSettings({ close_action: action });
+        window.open('http://tauri.localhost/__desktop_action/hide_to_tray', '_blank');
       } catch {
         /* ignore */
       }
-    }
-
-    if (action === 'tray') {
-      // 触发桌面壳隐藏到托盘
-      window.dispatchEvent(new CustomEvent('jeikcode:desktop:hide_to_tray'));
-      // 尝试调用 Tauri 原生窗口隐藏
       try {
         const tauriWindow = (window as any).__TAURI__?.window?.getCurrentWindow?.();
         tauriWindow?.hide?.();
@@ -39,14 +38,27 @@ export function DesktopClosePromptDialog() {
         /* ignore */
       }
     } else {
+      if (remember) {
+        try {
+          await postDesktopSettings({ close_action: action });
+        } catch {
+          /* ignore */
+        }
+      }
       // 触发桌面壳安全退出程序
       window.dispatchEvent(new CustomEvent('jeikcode:desktop:quit_app'));
+      try {
+        window.open('http://tauri.localhost/__desktop_action/quit_app', '_blank');
+      } catch {
+        /* ignore */
+      }
       try {
         const tauriApp = (window as any).__TAURI__?.process?.exit;
         tauriApp?.(0);
       } catch {
         /* ignore */
       }
+      window.location.href = 'http://tauri.localhost/__desktop_action/quit_app';
     }
   }
 

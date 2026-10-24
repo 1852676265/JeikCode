@@ -18,6 +18,11 @@ use tauri::{Listener, Manager};
 
 static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
+/// 与 `jeikcode_updater::RESTART_REQUESTED_EXIT_CODE` 对齐的显式重启退出码。
+/// 仅当子进程因「软件更新」或「小地球更换端口/地址立即重启」主动以该退出码退出时，
+/// 桌面壳才重新拉起新实例，避免异常崩溃时陷入无条件死循环。
+const RESTART_REQUESTED_EXIT_CODE: i32 = 75;
+
 /// 这次桌面壳拉起的 WebUI。端口可能因占用从 13457 顺延。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WebuiOrigin {
@@ -76,9 +81,14 @@ fn navigation_action(url: &tauri::Url, origin: Option<&WebuiOrigin>) -> LinkActi
     // 回环地址上的内部重载、端口变更或携带 desktop=1 标志的均保留在窗口内，绝不弹出到系统浏览器
     if let Some(host) = url.host_str() {
         if is_loopback_host(host) {
-            let (_h, saved_port, _t) = saved_webui_listen();
-            if url.port() == Some(saved_port) || url.query().is_some_and(|q| q.contains("desktop=")) {
+            if url.query().is_some_and(|q| q.contains("desktop=")) {
                 return LinkAction::StayInWebview;
+            }
+            if origin.is_some() {
+                let (_h, saved_port, _t) = saved_webui_listen();
+                if url.port() == Some(saved_port) {
+                    return LinkAction::StayInWebview;
+                }
             }
         }
     }
@@ -125,6 +135,71 @@ fn read_host_away(window: &tauri::WebviewWindow) -> Option<bool> {
 
 fn publish_host_away(window: &tauri::WebviewWindow, away: bool) {
     let _ = window.eval(format!("window.__jeikcodeHostAway={away};"));
+}
+
+fn show_main_window(window: &tauri::WebviewWindow) {
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        #[link(name = "user32")]
+        extern "system" {
+            fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
+            fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
+        }
+        unsafe {
+            ShowWindow(hwnd.0 as *mut std::ffi::c_void, 5);
+            ShowWindow(hwnd.0 as *mut std::ffi::c_void, 9);
+            SetForegroundWindow(hwnd.0 as *mut std::ffi::c_void);
+        }
+    }
+    publish_host_away(window, false);
+}
+
+fn hide_window_to_tray(window: &tauri::WebviewWindow) {
+    let _ = window.hide();
+    // 兜底直接调用 Win32 ShowWindow(SW_HIDE)：防止外部快捷方式曾直接操作 HWND 导致
+    // tao 内部 WindowFlags::VISIBLE 标志位与真实窗口显隐状态失步而忽略 hide()。
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        #[link(name = "user32")]
+        extern "system" {
+            fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
+        }
+        unsafe {
+            ShowWindow(hwnd.0 as *mut std::ffi::c_void, 0);
+        }
+    }
+    publish_host_away(window, true);
+}
+
+fn terminate_managed_child(app: &tauri::AppHandle) {
+    DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    if let Some(slot) = app.try_state::<ChildSlot>() {
+        let taken = slot.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut child) = taken {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn handle_desktop_shell_action(url: &tauri::Url, app: &tauri::AppHandle) -> bool {
+    match url.path() {
+        "/__desktop_action/hide_to_tray" => {
+            if let Some(window) = app.get_webview_window("main") {
+                hide_window_to_tray(&window);
+            }
+            true
+        }
+        "/__desktop_action/quit_app" => {
+            terminate_managed_child(app);
+            app.exit(0);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The page's document.hidden / hasFocus miss a minimized WebView. Push the
@@ -249,6 +324,14 @@ fn ensure_single_instance_windows() -> bool {
             bInitialOwner: i32,
             lpName: *const u16,
         ) -> *mut std::ffi::c_void;
+        fn CreateEventW(
+            lpEventAttributes: *mut std::ffi::c_void,
+            bManualReset: i32,
+            bInitialState: i32,
+            lpName: *const u16,
+        ) -> *mut std::ffi::c_void;
+        fn SetEvent(hEvent: *mut std::ffi::c_void) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
         fn GetLastError() -> u32;
     }
 
@@ -257,6 +340,7 @@ fn ensure_single_instance_windows() -> bool {
         fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> *mut std::ffi::c_void;
         fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
         fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
+        fn AllowSetForegroundWindow(dwProcessId: u32) -> i32;
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -267,25 +351,81 @@ fn ensure_single_instance_windows() -> bool {
     }
 
     let mutex_name = wide("Local\\JeikCode_Desktop_SingleInstance_Mutex");
+    let event_name = wide("Local\\JeikCode_Desktop_Activate_Event");
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const SW_RESTORE: i32 = 9;
     const SW_SHOW: i32 = 5;
+    const ASFW_ANY: u32 = 0xFFFF_FFFF;
 
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 1, mutex_name.as_ptr()) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let win_title = wide("JeikCode Desktop");
-        let hwnd = unsafe { FindWindowW(std::ptr::null(), win_title.as_ptr()) };
-        if !hwnd.is_null() {
-            unsafe {
-                ShowWindow(hwnd, SW_SHOW);
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
+        unsafe {
+            AllowSetForegroundWindow(ASFW_ANY);
+            // 通知主实例在进程内执行 window.show()，同步 tao 的 WindowFlags::VISIBLE 状态，
+            // 确保唤醒后再次点击右上角 X 关闭按钮依然能够正常触发隐藏到托盘。
+            let ev = CreateEventW(std::ptr::null_mut(), 0, 0, event_name.as_ptr());
+            if !ev.is_null() {
+                SetEvent(ev);
+                CloseHandle(ev);
+            }
+            for title in ["JeikCode Desktop", "JeikCode - Open-Source AI Coding Agent"] {
+                let win_title = wide(title);
+                let hwnd = FindWindowW(std::ptr::null(), win_title.as_ptr());
+                if !hwnd.is_null() {
+                    ShowWindow(hwnd, SW_SHOW);
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                    break;
+                }
             }
         }
         return true;
     }
-    std::mem::forget(handle);
+    let _ = handle;
     false
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateEventW(
+            lpEventAttributes: *mut std::ffi::c_void,
+            bManualReset: i32,
+            bInitialState: i32,
+            lpName: *const u16,
+        ) -> *mut std::ffi::c_void;
+        fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+
+    let event_name: Vec<u16> = std::ffi::OsStr::new("Local\\JeikCode_Desktop_Activate_Event")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ev = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, event_name.as_ptr()) };
+    if ev.is_null() {
+        return;
+    }
+    let ev_addr = ev as usize;
+    std::thread::spawn(move || {
+        let handle = ev_addr as *mut std::ffi::c_void;
+        const WAIT_OBJECT_0: u32 = 0;
+        loop {
+            if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            let rc = unsafe { WaitForSingleObject(handle, 400) };
+            if rc == WAIT_OBJECT_0 {
+                show_main_window(&window);
+            }
+        }
+        unsafe {
+            CloseHandle(handle);
+        }
+    });
 }
 
 fn desktop_settings_path() -> PathBuf {
@@ -319,6 +459,8 @@ fn main() {
         .setup(|app| {
             let webui_origin = Arc::new(Mutex::new(None));
             let nav_origin = Arc::clone(&webui_origin);
+            let nav_app_handle = app.handle().clone();
+            let new_win_app_handle = app.handle().clone();
             let window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -328,19 +470,30 @@ fn main() {
             .inner_size(1280.0, 800.0)
             .resizable(true)
             .on_navigation(move |url| {
+                if handle_desktop_shell_action(url, &nav_app_handle) {
+                    return false;
+                }
                 let action = {
                     let guard = nav_origin.lock().unwrap_or_else(|e| e.into_inner());
                     navigation_action(url, guard.as_ref())
                 };
                 match action {
-                    LinkAction::StayInWebview => true,
+                    LinkAction::StayInWebview => {
+                        if !is_shell_internal_url(url) {
+                            remember_webui_origin(&nav_origin, url.as_str());
+                        }
+                        true
+                    }
                     LinkAction::OpenExternal => {
                         open_in_external_browser(&external_browser_url(url));
                         false
                     }
                 }
             })
-            .on_new_window(|url, _features| {
+            .on_new_window(move |url, _features| {
+                if handle_desktop_shell_action(&url, &new_win_app_handle) {
+                    return tauri::webview::NewWindowResponse::Deny;
+                }
                 if new_window_action(&url) == LinkAction::OpenExternal {
                     open_in_external_browser(&external_browser_url(&url));
                 }
@@ -354,24 +507,22 @@ fn main() {
             let window_builder = window_builder.disable_drag_drop_handler().drag_and_drop(false);
             let window = window_builder.build()?;
 
+            #[cfg(target_os = "windows")]
+            spawn_single_instance_activation_listener(window.clone());
+
             watch_host_presence(window.clone());
             let drop_window = window.clone();
             let close_window = window.clone();
             let hide_window = window.clone();
             let app_handle_for_event = app.handle().clone();
+            let app_handle_for_close = app.handle().clone();
 
             let _ = window.listen("jeikcode:desktop:hide_to_tray", move |_| {
-                let _ = hide_window.hide();
-                publish_host_away(&hide_window, true);
+                hide_window_to_tray(&hide_window);
             });
 
             let _ = window.listen("jeikcode:desktop:quit_app", move |_| {
-                DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
-                if let Some(slot) = app_handle_for_event.try_state::<ChildSlot>() {
-                    if let Some(child) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                        let _ = child.kill();
-                    }
-                }
+                terminate_managed_child(&app_handle_for_event);
                 app_handle_for_event.exit(0);
             });
 
@@ -382,11 +533,10 @@ fn main() {
                     match action.as_str() {
                         "tray" => {
                             api.prevent_close();
-                            let _ = close_window.hide();
-                            publish_host_away(&close_window, true);
+                            hide_window_to_tray(&close_window);
                         }
                         "quit" => {
-                            DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                            terminate_managed_child(&app_handle_for_close);
                         }
                         _ => {
                             api.prevent_close();
@@ -416,7 +566,7 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {
-                    Ok((url, child, launch)) => {
+                    Ok((url, child, eof_rx, launch)) => {
                         if let Some(slot) = handle.try_state::<ChildSlot>() {
                             *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
                         }
@@ -426,7 +576,13 @@ fn main() {
                             url.parse()
                                 .unwrap_or_else(|_| "about:blank".parse().expect("about:blank")),
                         );
-                        supervise_webui(handle.clone(), window.clone(), webui_origin.clone(), url, launch);
+                        supervise_webui(
+                            handle.clone(),
+                            window.clone(),
+                            webui_origin.clone(),
+                            eof_rx,
+                            launch,
+                        );
                     }
                     Err(err) => {
                         let text =
@@ -443,12 +599,7 @@ fn main() {
         .expect("启动 JeikCode Desktop 失败")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
-                if let Some(slot) = app.try_state::<ChildSlot>() {
-                    if let Some(child) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                        let _ = child.kill();
-                    }
-                }
+                terminate_managed_child(app);
             }
         });
 }
@@ -553,19 +704,11 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                    publish_host_away(&window, false);
+                    show_main_window(&window);
                 }
             }
             "quit" => {
-                DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
-                if let Some(slot) = app.try_state::<ChildSlot>() {
-                    if let Some(child) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                        let _ = child.kill();
-                    }
-                }
+                terminate_managed_child(app);
                 app.exit(0);
             }
             _ => {}
@@ -583,13 +726,9 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
                     let is_minimized = window.is_minimized().unwrap_or(false);
                     let is_focused = window.is_focused().unwrap_or(false);
                     if is_visible && !is_minimized && is_focused {
-                        let _ = window.hide();
-                        publish_host_away(&window, true);
+                        hide_window_to_tray(&window);
                     } else {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                        publish_host_away(&window, false);
+                        show_main_window(&window);
                     }
                 }
             }
@@ -612,7 +751,15 @@ struct WebuiLaunch {
 
 fn start_webui(
     app: &tauri::AppHandle,
-) -> Result<(String, std::process::Child, WebuiLaunch), String> {
+) -> Result<
+    (
+        String,
+        std::process::Child,
+        std::sync::mpsc::Receiver<()>,
+        WebuiLaunch,
+    ),
+    String,
+> {
     let bundled = bundled_cli(app);
     let bin = resolve_desktop_cli(bundled.as_deref());
     let home = home_dir();
@@ -626,7 +773,7 @@ fn start_webui(
         home,
         bundled,
     };
-    let (url, child) = spawn_desktop_server(&launch, false, Duration::from_secs(90))?;
+    let (url, child, eof_rx) = spawn_desktop_server(&launch, false, Duration::from_secs(90))?;
     let probe_port = url
         .parse::<tauri::Url>()
         .ok()
@@ -638,19 +785,112 @@ fn start_webui(
         let _ = std::fs::create_dir_all(&dir);
         let body = format!(
             "{{\n  \"host\": \"{}\",\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
-            launch.host,
-            launch.token
+            launch.host, launch.token
         );
         let _ = std::fs::write(dir.join("webui-listen.json"), body);
     }
-    Ok((url, child, launch))
+    Ok((url, child, eof_rx, launch))
 }
+
+#[cfg(windows)]
+fn assign_child_to_desktop_job(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(
+            lpJobAttributes: *mut std::ffi::c_void,
+            lpName: *const u16,
+        ) -> *mut std::ffi::c_void;
+        fn SetInformationJobObject(
+            hJob: *mut std::ffi::c_void,
+            JobObjectInfoClass: u32,
+            lpJobObjectInfo: *const std::ffi::c_void,
+            cbJobObjectInfoLength: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(
+            hJob: *mut std::ffi::c_void,
+            hProcess: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    static JOB_HANDLE: OnceLock<usize> = OnceLock::new();
+    let job_ptr = *JOB_HANDLE.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+        const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+
+        let mut info = JobObjectExtendedLimitInformation::default();
+        info.basic_limit_information.limit_flags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        let _ = SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+        );
+        job as usize
+    });
+
+    if job_ptr != 0 {
+        unsafe {
+            let _ = AssignProcessToJobObject(
+                job_ptr as *mut std::ffi::c_void,
+                child.as_raw_handle() as *mut std::ffi::c_void,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn assign_child_to_desktop_job(_child: &std::process::Child) {}
 
 fn spawn_desktop_server(
     launch: &WebuiLaunch,
     exact_port: bool,
     url_timeout: Duration,
-) -> Result<(String, std::process::Child), String> {
+) -> Result<(String, std::process::Child, std::sync::mpsc::Receiver<()>), String> {
     let mut cmd = Command::new(&launch.bin);
     cmd.arg("webui")
         .arg("--host")
@@ -661,6 +901,8 @@ fn spawn_desktop_server(
         .arg("--token")
         .arg(&launch.token);
     cmd.env("JEIKCODE_DESKTOP", "1");
+    cmd.env("JEIKCODE_DESKTOP_MANAGED", "1");
+    cmd.env("JEIKCODE_DESKTOP_PID", std::process::id().to_string());
     if exact_port {
         // 与 jeikcode-updater 的同名变量一致：只绑定这个端口，不顺延，也不关闭别的进程。
         cmd.env("JEIKCODE_RESTART_EXACT_PORT", "1");
@@ -669,18 +911,24 @@ fn spawn_desktop_server(
     if let Some(ref bundled) = launch.bundled {
         cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
     }
+    // 开启 stdin 管道作为跨平台生命线（ChildSlot 持有 ChildStdin 写端；一旦桌面壳退出，
+    // OS 内核立即关闭管道，子进程阻塞 read 瞬间收到 EOF 退出，0 轮询）。
     cmd.current_dir(&launch.home)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     suppress_console(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("无法启动 {}：{e}", launch.bin.display()))?;
+    assign_child_to_desktop_job(&child);
     let stderr = child.stderr.take();
-    let url_result = match stderr {
+    let (url_result, eof_rx) = match stderr {
         Some(pipe) => read_url(pipe, url_timeout),
-        None => Ok(None),
+        None => {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            (Ok(None), rx)
+        }
     };
     let mut url = match url_result {
         Ok(Some(url)) => url,
@@ -711,58 +959,103 @@ fn spawn_desktop_server(
     while Instant::now() < ready_deadline && !health_ready(probe_port) {
         std::thread::sleep(Duration::from_millis(40));
     }
-    Ok((url, child))
+    Ok((url, child, eof_rx))
 }
 
-/// 只回收桌面壳自己拉起的子进程。升级后的新进程是脱离的后继，不在这个句柄里。
-/// 端口恢复后在壳内打开原来的地址；不要按进程名清理，也不要打开系统浏览器。
+/// 纯事件驱动的子进程监管（0 轮询、0 死循环）：
+/// 线程平时完全阻塞在子进程 `stderr` 管道的内核 EOF 信号（`eof_rx.recv()`）上，0% CPU 占用；
+/// 仅当子进程因「自更新升级」或「小地球修改端口/地址立即重启」以显式退出码 `75` 退出（或首次闪退自愈）时，
+/// 才由桌面壳读取最新配置重新拉起并写回 `ChildSlot`，彻底消除状态失步与无限重启死循环。
 fn supervise_webui(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     origin: Arc<Mutex<Option<WebuiOrigin>>>,
-    mut url: String,
+    mut eof_rx: std::sync::mpsc::Receiver<()>,
     mut launch: WebuiLaunch,
 ) {
     std::thread::spawn(move || {
-        let mut relaunched = false;
+        let mut crash_recovered = false;
         loop {
+            // 阻塞等待当前子进程退出导致的管道 EOF 事件（0 轮询）
+            let _ = eof_rx.recv();
             if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return;
             }
-            if !take_exited_child(&app) {
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
-            }
+            let Some(exit_code) = reap_exited_child(&app) else {
+                return;
+            };
             if DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return;
             }
 
-            // 子进程退出后（无论是自更新还是用户在地球面板立即重启），动态重新读取配置，
-            // 确保接管的是最新配置的 host、port 和 token，绝不二次拉起旧端口僵尸进程
+            let intentional_restart = exit_code == Some(RESTART_REQUESTED_EXIT_CODE);
+            if !intentional_restart {
+                // 若子进程是正常退出（exit 0，例如旧版自派生重启），检查目标端口是否已有后继进程在线
+                let (latest_host, latest_port, latest_token) = saved_webui_listen();
+                let check_port = if latest_port != 0 {
+                    latest_port
+                } else {
+                    launch.port
+                };
+                if exit_code == Some(0) && wait_until_health(check_port, Duration::from_secs(8)) {
+                    let effective_token = latest_token.unwrap_or_else(|| launch.token.clone());
+                    launch.host = latest_host;
+                    launch.port = check_port;
+                    launch.token = effective_token.clone();
+                    let target_url =
+                        format!("http://127.0.0.1:{check_port}/?token={effective_token}&desktop=1");
+                    open_webui_in_shell(&window, &origin, &target_url);
+                    return;
+                }
+                // 非主动请求重启的异常退出：仅允许最多一次自愈拉起，绝不陷入死循环
+                if crash_recovered {
+                    return;
+                }
+                crash_recovered = true;
+            } else {
+                // 主动重启成功后重置自愈计数
+                crash_recovered = false;
+            }
+
+            // 动态读取最新配置与二进制路径，由桌面壳直接重新拉起并存入 ChildSlot
             let (latest_host, latest_port, latest_token) = saved_webui_listen();
-            let effective_port = if latest_port != 0 { latest_port } else { launch.port };
+            let effective_port = if latest_port != 0 {
+                latest_port
+            } else {
+                launch.port
+            };
             let effective_token = latest_token.unwrap_or_else(|| launch.token.clone());
+            launch.bin = resolve_desktop_cli(launch.bundled.as_deref());
             launch.host = latest_host;
             launch.port = effective_port;
-            launch.token = effective_token.clone();
-            let target_url = format!("http://127.0.0.1:{effective_port}/?token={effective_token}&desktop=1");
+            launch.token = effective_token;
 
-            if wait_until_health(launch.port, Duration::from_secs(20)) {
-                url = target_url;
-                open_webui_in_shell(&window, &origin, &url);
-                return;
-            }
-            if relaunched || DESKTOP_SHUTTING_DOWN.load(Ordering::SeqCst) {
-                return;
-            }
-            relaunched = true;
-            match spawn_desktop_server(&launch, true, Duration::from_secs(30)) {
-                Ok((next_url, child)) => {
+            let spawned = spawn_desktop_server(&launch, true, Duration::from_secs(30))
+                .or_else(|_| spawn_desktop_server(&launch, false, Duration::from_secs(30)));
+
+            match spawned {
+                Ok((next_url, child, next_eof_rx)) => {
+                    let probe_port = next_url
+                        .parse::<tauri::Url>()
+                        .ok()
+                        .and_then(|parsed| parsed.port())
+                        .unwrap_or(launch.port);
+                    if probe_port != launch.port {
+                        launch.port = probe_port;
+                        let dir = jeikcode_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let body = format!(
+                            "{{\n  \"host\": \"{}\",\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
+                            launch.host,
+                            launch.token
+                        );
+                        let _ = std::fs::write(dir.join("webui-listen.json"), body);
+                    }
                     if let Some(slot) = app.try_state::<ChildSlot>() {
                         *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
                     }
-                    url = next_url;
-                    open_webui_in_shell(&window, &origin, &url);
+                    eof_rx = next_eof_rx;
+                    open_webui_in_shell(&window, &origin, &next_url);
                 }
                 Err(err) => {
                     let text =
@@ -777,24 +1070,16 @@ fn supervise_webui(
     });
 }
 
-fn take_exited_child(app: &tauri::AppHandle) -> bool {
-    let Some(slot) = app.try_state::<ChildSlot>() else {
-        return false;
-    };
-    let mut guard = slot.0.lock().unwrap_or_else(|err| err.into_inner());
-    let Some(child) = guard.as_mut() else {
-        return false;
-    };
-    match child.try_wait() {
-        Ok(Some(_)) => {
-            guard.take();
-            true
-        }
-        Ok(None) => false,
-        Err(_) => {
-            guard.take();
-            true
-        }
+fn reap_exited_child(app: &tauri::AppHandle) -> Option<Option<i32>> {
+    let slot = app.try_state::<ChildSlot>()?;
+    let mut child = slot
+        .0
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()?;
+    match child.wait() {
+        Ok(status) => Some(status.code()),
+        Err(_) => Some(None),
     }
 }
 
@@ -877,8 +1162,12 @@ fn bundled_cli(app: &tauri::AppHandle) -> Option<PathBuf> {
 fn read_url(
     pipe: impl std::io::Read + Send + 'static,
     timeout: Duration,
-) -> Result<Option<String>, String> {
+) -> (
+    Result<Option<String>, String>,
+    std::sync::mpsc::Receiver<()>,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (eof_tx, eof_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
         let mut pending = String::new();
@@ -907,12 +1196,15 @@ fn read_url(
                 }
             }
         }
+        // 子进程已退出，stderr 管道关闭（EOF），立即事件通知 supervise_webui
+        let _ = eof_tx.send(());
     });
-    match rx.recv_timeout(timeout) {
+    let res = match rx.recv_timeout(timeout) {
         Ok(url) => Ok(Some(url)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("等待 WebUI 启动超时".into()),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
-    }
+    };
+    (res, eof_rx)
 }
 
 pub fn extract_webui_url(text: &str) -> Option<String> {
@@ -952,7 +1244,8 @@ fn mint_desktop_token(host: &str, port: u16) -> String {
     let token = format!("sk-{:x}-{:x}", std::process::id(), nanos);
     let dir = jeikcode_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let body = format!("{{\n  \"host\": \"{host}\",\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
+    let body =
+        format!("{{\n  \"host\": \"{host}\",\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
     let _ = std::fs::write(dir.join("webui-listen.json"), body);
     token
 }
@@ -1008,10 +1301,9 @@ fn cleanup_legacy_dropper_install() {
 
     use winreg::enums::*;
     use winreg::RegKey;
-    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
-        "Environment",
-        KEY_READ | KEY_WRITE,
-    ) else {
+    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+    else {
         return;
     };
     let current: String = env.get_value("Path").unwrap_or_default();
@@ -1043,11 +1335,17 @@ fn cleanup_legacy_dropper_install() {
         let res_dir = dir.join("resources");
         if res_dir.is_dir() {
             let res_str = res_dir.display().to_string();
-            if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(&res_str)) {
+            if !parts
+                .iter()
+                .any(|p| p.trim().eq_ignore_ascii_case(&res_str))
+            {
                 parts.insert(0, res_str);
             }
         }
-        if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(&dir_str)) {
+        if !parts
+            .iter()
+            .any(|p| p.trim().eq_ignore_ascii_case(&dir_str))
+        {
             parts.insert(0, dir_str);
         }
     }
@@ -1191,9 +1489,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        external_browser_url, extract_webui_url, host_window_away,
-        navigation_action, new_window_action, parse_webui_listen, remember_webui_origin,
-        resolve_desktop_cli, window_url, LinkAction, WebuiOrigin,
+        external_browser_url, extract_webui_url, host_window_away, navigation_action,
+        new_window_action, parse_webui_listen, remember_webui_origin, resolve_desktop_cli,
+        window_url, LinkAction, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
@@ -1244,7 +1542,10 @@ mod tests {
             parse_webui_listen(r#"{"port":0,"token":"  "}"#),
             ("127.0.0.1".to_string(), 13457, None)
         );
-        assert_eq!(parse_webui_listen("not json"), ("127.0.0.1".to_string(), 13457, None));
+        assert_eq!(
+            parse_webui_listen("not json"),
+            ("127.0.0.1".to_string(), 13457, None)
+        );
     }
 
     #[test]

@@ -12224,7 +12224,11 @@ async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
             if let Ok(text) = resp.text().await {
                 if text.contains("jeikcode-daemon") {
                     let shutdown_url = format!("http://127.0.0.1:{port}/shutdown");
-                    let _ = client.post(&shutdown_url).send().await;
+                    let mut req = client.post(&shutdown_url);
+                    if let Some(token) = api_config::saved_listen_token() {
+                        req = req.bearer_auth(token);
+                    }
+                    let _ = req.send().await;
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     return true;
                 }
@@ -12317,6 +12321,13 @@ async fn bind_scanning_ports(
     u16,
 )> {
     if reclaim_stale && start_port > 0 {
+        // 桌面端启动时，若存在之前脱离桌面壳的孤儿子进程占用持久化端口，先行清理回收，
+        // 避免新启动的桌面端因旧孤儿进程霸占端口而被迫将端口 +1 顺延覆盖用户配置。
+        if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
+            if api_config::kill_zombie_processes_all() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
         let _ = try_terminate_stale_daemon_on_port(start_port).await;
     }
     let mut last_err: Option<std::io::Error> = None;
@@ -13716,6 +13727,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let project_store = Arc::new(RwLock::new(project_state));
     *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
 
+    let inherited_no_token = jeikcode_updater::take_restart_no_token() == Some(true);
+    let initial_enforce_token = webui_tokens.is_some() && !inherited_no_token;
     let state = AppState {
         project: project_store,
         active_chats: ActiveChatRegistry::default(),
@@ -13727,8 +13740,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         shutdown_tx: shutdown_tx.clone(),
         last_activity: last_activity.clone(),
         active_connections: active_connections.clone(),
-        enforce_token: Arc::new(std::sync::atomic::AtomicBool::new(webui_tokens.is_some())),
-        initial_enforce_token: webui_tokens.is_some(),
+        enforce_token: Arc::new(std::sync::atomic::AtomicBool::new(initial_enforce_token)),
+        initial_enforce_token,
         webui_tokens: webui_tokens.unwrap_or_default(),
         app_user_id: app_user_id.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
@@ -13741,7 +13754,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // instances get distinct cookie names.
         webui_cookie_name: auth_token::webui_cookie_name(port),
         yolo,
-        token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        token_optional: Arc::new(std::sync::atomic::AtomicBool::new(inherited_no_token)),
         http_router: Arc::new(std::sync::OnceLock::new()),
         extra_remote: Arc::new(std::sync::Mutex::new(None)),
     };
