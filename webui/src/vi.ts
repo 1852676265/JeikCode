@@ -68,6 +68,10 @@ export const vi: Record<keyof typeof en, string> = {
   'preview.revealDirFailed': 'Không thể mở thư mục: {error}',
   'preview.openDirInExplorer': 'Mở thư mục trong trình quản lý tệp',
   'preview.revealFileInExplorer': 'Hiển thị trong trình quản lý tệp',
+  'preview.openWithDefaultApp': 'Mở bằng ứng dụng mặc định của hệ thống',
+  'preview.openWithDefaultAppSuccess': 'Đã mở {path} bằng ứng dụng mặc định của hệ thống',
+  'preview.openWithDefaultAppFailed': 'Không thể mở bằng ứng dụng mặc định của hệ thống: {error}',
+  'preview.systemAppBadgeTooltip': '{text} ({action})',
   'preview.closeTab': 'Đóng tab',
   'preview.clearAll': 'Đóng tất cả',
   'panel.collapse': 'Thu gọn bảng',
@@ -998,7 +1002,10 @@ export const vi: Record<keyof typeof en, string> = {
   'gitWebhook.browsePrivateKey': '📂 Duyệt tệp...',
   'gitWebhook.calcAppToken': '⚡ Tạo Token',
   'gitWebhook.appTokenActive': 'Mã thông báo [bot] chính thức đã kích hoạt',
-  'gitWebhook.useManualPat': 'Chuyển sang nhập PAT thủ công',
+  'gitWebhook.useManualPat': 'Cảnh báo: Chế độ PAT cá nhân rất dễ bị khóa tài khoản, vui lòng dùng GitHub App để đánh giá mã. Chế độ một App cho nhiều kho sẽ ra mắt sau; hiện tạm ngừng mở PAT.',
+  'gitWebhook.patDisabledWarning': 'Cảnh báo: Chế độ PAT cá nhân rất dễ bị khóa tài khoản, vui lòng dùng GitHub App để đánh giá mã. Chế độ một App cho nhiều kho sẽ ra mắt sau; hiện tạm ngừng mở PAT.',
+  'gitWebhook.patStatusPill': '⚠️ Tạm ngừng PAT (Dễ khóa)',
+  'gitWebhook.onlyGithubAppAllowed': 'Chỉ hỗ trợ bật đánh giá tự động ở chế độ GitHub App. Chế độ PAT đã bị bắt buộc vô hiệu hóa.',
   'gitWebhook.useGithubApp': 'Dùng chế độ GitHub App (Khuyến nghị)',
   'gitWebhook.defaultReviewPrompt': `Bạn là một chuyên gia đánh giá mã nguồn cao cấp và nghiêm ngặt (JeikCode Code Reviewer).
 Bạn sẽ nhận được Pull Request / Merge Request / Issue từ dự án này và thực hiện đánh giá chuyên sâu kết hợp với mã nguồn mới nhất của nhánh đích.
