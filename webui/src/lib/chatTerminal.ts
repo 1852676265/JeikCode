@@ -218,35 +218,32 @@ export function userMessageAlreadyOnCanvas(
     }
   }
 
-  // 2. 查找画布上最靠后的匹配项
+  // 2. 查找画布上最靠后的匹配项与最靠后的 user 消息
   let matchIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (matches(messages[i])) {
-      matchIndex = i;
-      break;
-    }
-  }
-  if (matchIndex === -1) return false;
-
-  // 3. 查找画布上最靠后的 user 消息
   let lastUserIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role === 'user') {
-      lastUserIndex = i;
-      break;
+      if (lastUserIndex === -1) lastUserIndex = i;
+      if (matchIndex === -1 && matches(messages[i])) {
+        matchIndex = i;
+      }
     }
   }
-
-  // 若最后一条 user 消息就是该提问，毫无疑问已在画布上
+  if (matchIndex === -1) return false;
   if (matchIndex === lastUserIndex) return true;
 
-  // 4. 若 matchIndex 之后存在后续的 user 消息：
-  // 检查后续 user 消息是否是全新的、已独立结算完毕的轮次：
-  // 如果画布最末尾存在一个没有任何助手响应的纯 user 提问（开放提问，如 [older, assistant, latest]），
-  // 且 matchIndex 之后的对应助手已经结算完结，则说明 matchIndex 属于过去的旧轮次。
+  // 3. 若 matchIndex 之后存在后续的 user 消息：
+  // 仅当末尾的用户提问内容与当前检查的完全不同，且中间的助手已经产生最终回答时，
+  // 才说明 matchIndex 属于过去的旧轮次（例如用户又输入了全新的后续问题）。
+  // 关键防线：如果当前检查的消息内容与末尾开放提问是一样的，绝对判定为已在画布上（true），杜绝重放追加克隆！
+  const trailingUser = messages[lastUserIndex];
+  const trailingUserText = visibleUserText(canvasUserText(trailingUser) ?? '');
+  if (trailingUserText === want || userTextsMatch(trailingUserText, want)) {
+    return true;
+  }
+
   const hasOpenTrailingUser = messages.length > 0 && messages[messages.length - 1]?.role === 'user';
   if (hasOpenTrailingUser && lastUserIndex === messages.length - 1) {
-    // 检查 matchIndex 对应的助手是否已经生成了内容
     const nextAssistant = messages.slice(matchIndex + 1, lastUserIndex).find((m) => m.role === 'assistant');
     const nextAssistantSettled = nextAssistant && nextAssistant.parts.some(
       (part) => part.kind === 'text' && (part.text || '').trim().length > 0,
@@ -256,8 +253,6 @@ export function userMessageAlreadyOnCanvas(
     }
   }
 
-  // 5. 其余场景（包括正在执行中的中途 steer：[originalUser, assistant, steerUser, assistant_in_flight]），
-  // 原始提问与 steer 均属于当前未结算的同一轮次，绝对判定为已在画布上，杜绝重放追加！
   return true;
 }
 

@@ -3885,6 +3885,15 @@ export function Chat({
           ),
         );
         if (!visible && !(msg.images && msg.images.length)) continue;
+        // 关键防御去重：检测前面相邻的是否已经是完全相同的 User 消息（防重放与脏缓存重复渲染）
+        const lastLoaded = loaded[loaded.length - 1];
+        if (
+          lastLoaded &&
+          lastLoaded.role === 'user' &&
+          lastLoaded.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', visible))
+        ) {
+          continue;
+        }
         const turnNavOrdinal = userTurnOrdinal++;
         loaded.push({
           role: 'user',
