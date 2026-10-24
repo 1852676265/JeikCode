@@ -3387,17 +3387,19 @@ export function Chat({
                 messagesRef.current = loaded;
                 messageCacheRef.current.set(loadId, loaded);
                 setMessages(loaded);
-                if (scrollRef.current) {
+                if (scrollRef.current && atBottomRef.current) {
                   scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+                  timelineFollow.jump();
                 }
-                timelineFollow.jump();
               } else {
                 displayMessages = currentCached;
                 // 仅当当前画布尚未与缓存对齐时才更新，杜绝重复 setMessages 造成的 DOM 重绘与跳动
                 if (messagesRef.current !== currentCached) {
                   messagesRef.current = currentCached;
                   setMessages(currentCached);
-                  timelineFollow.jump();
+                  if (atBottomRef.current) {
+                    timelineFollow.jump();
+                  }
                 }
                 const effectiveOlder = diskOffset > 0;
                 historyOffsetRef.current = diskOffset;
@@ -9466,6 +9468,7 @@ export function Chat({
         {/* Message timeline */}
         <div
           class="messages-container"
+          tabIndex={-1}
           ref={attachTimeline}
           style={activeMainTabId !== 'chat' ? { display: 'none' } : undefined}
           onScroll={syncTurnNavFromScroll}

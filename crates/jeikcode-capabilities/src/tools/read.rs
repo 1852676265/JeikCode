@@ -1752,6 +1752,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_sibling_file_resolves_without_dotdot_and_suggests_exact_relative_path() {
+        let d = tempfile::tempdir().unwrap();
+        let my_project = d.path().join("my-project");
+        let sibling_project = d.path().join("other-app").join("src").join("config");
+        std::fs::create_dir_all(&my_project).unwrap();
+        std::fs::create_dir_all(&sibling_project).unwrap();
+        std::fs::write(sibling_project.join("appConfig.tsx"), "export const a = 1;").unwrap();
+
+        // Model attempts to read non-existent appConfig.ts via relative sibling path
+        let r = ReadFileTool::default()
+            .execute(
+                r#"{"path":"../other-app/src/config/appConfig.ts"}"#,
+                &ctx(&my_project),
+            )
+            .await;
+        assert!(r.is_error);
+        // 1. Resolved path in error message MUST NOT contain /../
+        assert!(
+            !r.content.contains("/../") && !r.content.contains(r"\..\"),
+            "resolved path in error must be lexically folded: {}",
+            r.content
+        );
+        // 2. Suggestion MUST preserve the caller's relative path directory prefix and be singular
+        assert!(
+            r.content
+                .contains("Did you mean ../other-app/src/config/appConfig.tsx?"),
+            "suggestion must keep directory prefix and match single extension variant: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
     async fn directory_lists_directories_first_and_supports_pagination() {
         let d = tempfile::tempdir().unwrap();
         // 创建文件 a_file.txt, m_file.txt 和目录 z_dir, b_dir

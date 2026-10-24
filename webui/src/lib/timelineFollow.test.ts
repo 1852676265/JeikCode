@@ -418,3 +418,61 @@ test('keyboard reader intent ignores editable controls and pauses timeline navig
     assert.equal(s.element.scrollTop, 800);
   } finally { s.cleanup(); }
 });
+
+test('Home key moves to top and pauses follow; End key jumps to bottom and resumes follow', () => {
+  const s = setup();
+  class KeyEvent extends Event {
+    key: string;
+    constructor(key: string) { super('keydown', { cancelable: true }); this.key = key; }
+  }
+  try {
+    s.attach(); s.flush();
+    assert.equal(s.element.scrollTop, 800);
+    assert.equal(s.following.current, true);
+
+    // Press Home
+    s.element.dispatchEvent(new KeyEvent('Home'));
+    assert.equal(s.element.scrollTop, 0);
+    assert.equal(s.following.current, false);
+    assert.equal(s.jump, true);
+
+    // Streaming updates while at top must not move viewport
+    s.element.scrollHeight = 1400;
+    s.follow.changed(); s.flush();
+    assert.equal(s.element.scrollTop, 0);
+
+    // Press End
+    s.element.dispatchEvent(new KeyEvent('End'));
+    s.flush();
+    assert.equal(s.element.scrollTop, 1200);
+    assert.equal(s.following.current, true);
+    assert.equal(s.jump, false);
+  } finally { s.cleanup(); }
+});
+
+test('streaming content growth while scrolled to middle stays completely stationary', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    assert.equal(s.element.scrollTop, 800);
+
+    // User scrolls up to middle (scrollTop = 400)
+    s.element.top = 400;
+    s.element.emit('scroll');
+    assert.equal(s.following.current, false);
+    assert.equal(s.jump, true);
+
+    // Multiple content growths (streaming text tokens)
+    s.element.scrollHeight = 1600;
+    s.follow.changed(); s.flush();
+    assert.equal(s.element.scrollTop, 400);
+
+    s.element.scrollHeight = 2000;
+    s.follow.changed(); s.flush();
+    assert.equal(s.element.scrollTop, 400);
+
+    // Still in middle, remains stable
+    assert.equal(s.element.scrollTop, 400);
+    assert.equal(s.following.current, false);
+  } finally { s.cleanup(); }
+});

@@ -18,7 +18,7 @@
 //! `process_utils`, `proxy`).
 
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Strip the Windows verbatim prefix (`\\?\`) / verbatim-UNC prefix (`\\?\UNC\`).
 ///
@@ -140,6 +140,46 @@ pub fn to_display(path: &Path) -> String {
     }
 }
 
+/// Lexically normalize a path by collapsing `.` and `..` without querying the filesystem.
+///
+/// Handles:
+/// - Stripping Windows verbatim `\\?\` prefix
+/// - Collapsing `.` (current directory)
+/// - Collapsing `..` with preceding normal components: `/a/b/../c` -> `/a/c`
+/// - Absorbing `..` at root on Unix (`/..` -> `/`) and Windows drive root (`C:\..` -> `C:\`)
+/// - Preserving leading `..` on relative paths (`../foo/../bar` -> `../bar`)
+/// - Preserving Windows prefix (`C:`, `\\server\share`) and root (`\`)
+pub fn lexical_normalize(path: &Path) -> PathBuf {
+    let stripped = strip_verbatim_path(path);
+    let mut out = PathBuf::new();
+    for comp in stripped.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match out.components().next_back() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    Some(Component::RootDir) | Some(Component::Prefix(_)) => {
+                        // At root or drive root — absorb the `..`
+                    }
+                    Some(Component::ParentDir) | Some(Component::CurDir) | None => {
+                        out.push(comp.as_os_str());
+                    }
+                }
+            }
+            other => {
+                out.push(other.as_os_str());
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +281,57 @@ mod tests {
             r"C:/日本語フォルダ"
         );
         assert_eq!(strip_verbatim(r"//?/D:\مجلد\مشروع"), r"D:\مجلد\مشروع");
+    }
+
+    #[test]
+    fn lexical_normalize_collapses_relative_and_absolute_dotdot() {
+        assert_eq!(to_display(&lexical_normalize(Path::new("a/b/../c"))), "a/c");
+        assert_eq!(
+            to_display(&lexical_normalize(Path::new("./src/./main.rs"))),
+            "src/main.rs"
+        );
+        assert_eq!(
+            to_display(&lexical_normalize(Path::new("../sibling/file.txt"))),
+            "../sibling/file.txt"
+        );
+        assert_eq!(
+            to_display(&lexical_normalize(Path::new("../../foo/../bar"))),
+            "../../bar"
+        );
+        assert_eq!(to_display(&lexical_normalize(Path::new("."))), ".");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                to_display(&lexical_normalize(Path::new(
+                    "E:/code/jeikcode/../cc-switch/src/config/appConfig.ts"
+                ))),
+                "E:/code/cc-switch/src/config/appConfig.ts"
+            );
+            assert_eq!(
+                to_display(&lexical_normalize(Path::new(r"C:\foo\bar\..\..\baz"))),
+                "C:/baz"
+            );
+            assert_eq!(
+                to_display(&lexical_normalize(Path::new(r"C:\..\..\baz"))),
+                "C:/baz"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                to_display(&lexical_normalize(Path::new(
+                    "/code/jeikcode/../cc-switch/src/config/appConfig.ts"
+                ))),
+                "/code/cc-switch/src/config/appConfig.ts"
+            );
+            assert_eq!(
+                to_display(&lexical_normalize(Path::new("/foo/bar/../../baz"))),
+                "/baz"
+            );
+            assert_eq!(
+                to_display(&lexical_normalize(Path::new("/../../baz"))),
+                "/baz"
+            );
+        }
     }
 }

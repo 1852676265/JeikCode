@@ -31,6 +31,11 @@ export function createTimelineFollow(
     // position before overwriting a scrollbar move that has not fired yet.
     scroll();
     if (!following.current) return;
+    // If user has scrolled upward away from bottom, do not yank their view down!
+    if (!nearBottom() && upwardIntentSuspended) {
+      pause();
+      return;
+    }
     element.scrollTop = element.scrollHeight;
     writtenTop = element.scrollTop;
     lastTop = element.scrollTop;
@@ -53,13 +58,20 @@ export function createTimelineFollow(
     if (!ownWrite && top !== lastTop) {
       // Moving away is reading intent even inside the bottom 80px. Only a
       // subsequent downward movement into that zone may resume following.
-      if (top < lastTop && element.scrollHeight - top - element.clientHeight > 0) {
+      if (top < lastTop) {
         upwardIntentSuspended = true;
-      } else if (top > lastTop && nearBottom()) {
-        upwardIntentSuspended = false;
+        following.current = false;
+        showJump(true);
+      } else if (top > lastTop) {
+        if (nearBottom()) {
+          upwardIntentSuspended = false;
+          following.current = true;
+          showJump(false);
+        } else {
+          following.current = false;
+          showJump(true);
+        }
       }
-      following.current = !upwardIntentSuspended && nearBottom();
-      showJump(!following.current);
     }
     writtenTop = null;
     lastTop = top;
@@ -94,7 +106,33 @@ export function createTimelineFollow(
       target = target.parentElement;
     }
     if (event.defaultPrevented) return;
-    if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) ||
+
+    if (event.key === 'Home') {
+      if (!canConsumeScroll(event.target, -1) && element) {
+        event.preventDefault();
+        pause();
+        if (typeof element.scrollTo === 'function') {
+          element.scrollTo({ top: 0, behavior: 'smooth' });
+        } else {
+          element.scrollTop = 0;
+        }
+        lastTop = 0;
+      }
+      return;
+    }
+
+    if (event.key === 'End') {
+      if (!canConsumeScroll(event.target, 1) && element) {
+        event.preventDefault();
+        jump();
+        if (typeof element.scrollTo === 'function') {
+          element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' });
+        }
+      }
+      return;
+    }
+
+    if (['ArrowUp', 'PageUp'].includes(event.key) ||
         (event.key === ' ' && event.shiftKey)) {
       if (!canConsumeScroll(event.target, -1) && element && element.scrollTop > 0) pause();
     }
@@ -128,6 +166,20 @@ export function createTimelineFollow(
     next.addEventListener('touchmove', touchMove, { passive: true });
     // Captured resource load covers late images even without ResizeObserver.
     next.addEventListener('load', changed, true);
+
+    const onWindowKey = (e: KeyboardEvent) => {
+      if (!element || element.style.display === 'none') return;
+      const active = (typeof document !== 'undefined' ? document.activeElement : null) as HTMLElement | null;
+      if (active && (/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName ?? '') ||
+          active.isContentEditable || active.getAttribute?.('contenteditable') === 'true')) {
+        return;
+      }
+      key(e);
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('keydown', onWindowKey);
+    }
+
     const observer = typeof ResizeObserver !== 'undefined'
       ? new ResizeObserver(changed) : null;
     observer?.observe(next);
@@ -145,6 +197,9 @@ export function createTimelineFollow(
       next.removeEventListener('touchstart', touchStart);
       next.removeEventListener('touchmove', touchMove);
       next.removeEventListener('load', changed, true);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('keydown', onWindowKey);
+      }
     };
     changed();
   };

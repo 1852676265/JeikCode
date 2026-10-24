@@ -43,6 +43,48 @@ pub(crate) fn expand_tilde(raw: &str) -> Option<PathBuf> {
     expand_tilde_with_home(raw, home_dir().as_deref())
 }
 
+/// Clean model-supplied path variations:
+/// - Leading/trailing whitespace and newlines
+/// - Balanced quotes, backticks, or angle brackets (`"path"`, `'path'`, `` `path` ``, `<path>`)
+/// - `file://` and `file://localhost/` schemes
+/// - Windows leading slash before drive letter (`/C:/path` -> `C:/path`, `\C:\path` -> `C:\path`)
+/// - URL percent-encoded spaces (`%20` -> ` `)
+pub(crate) fn clean_model_path_input(raw: &str) -> String {
+    let mut s = raw.trim();
+    for _ in 0..2 {
+        let trimmed = s.trim();
+        if (trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() >= 2)
+            || (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+            || (trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 2)
+        {
+            s = trimmed[1..trimmed.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        s = rest;
+    }
+
+    if cfg!(windows) && s.len() >= 3 && (s.starts_with('/') || s.starts_with('\\')) {
+        let mut chars = s[1..].chars();
+        if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
+            if first.is_ascii_alphabetic() && (second == ':' || second == '\u{FF1A}') {
+                s = &s[1..];
+            }
+        }
+    }
+
+    if s.contains("%20") {
+        return s.replace("%20", " ");
+    }
+
+    s.to_string()
+}
+
 /// Resolve a model-supplied path on every platform: `$VAR`/`${VAR}` (and `%VAR%`
 /// on Windows) expanded FIRST — against the very values the `bash` tool exports to
 /// shell children, so `"$TMPDIR/x"` resolves identically in a shell and in a tool
@@ -52,24 +94,28 @@ pub(crate) fn expand_tilde(raw: &str) -> Option<PathBuf> {
 /// On Windows, Git-Bash POSIX forms (`/tmp/foo`, `/c/Users/foo`) are mapped to the
 /// native location so they do not become `{cwd_drive}:\tmp\foo`. On Unix those
 /// strings are already native absolute paths and are left unchanged.
+///
+/// Finally, the resulting path is lexically normalized via [`crate::pathnorm::lexical_normalize`]
+/// to resolve `.` and `..` segments across relative and absolute forms without filesystem lookups.
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
+    let cleaned = clean_model_path_input(raw);
+    let raw = &cleaned;
     // Env expansion runs BEFORE the tilde/absolute tests so a variable holding a
     // `~` form still expands, and a prompt-quoted `"$TMPDIR/x"` still resolves.
     // Undefined names stay verbatim (`special_dirs::expand`), leaving the
     // relative-join path below exactly as it was.
     let expanded = crate::special_dirs::expand(raw);
     let raw = expanded.as_deref().unwrap_or(raw);
-    if let Some(home) = expand_tilde(raw) {
-        return home;
-    }
-    if let Some(translated) = maybe_translate_posix_absolute(raw) {
-        return translated;
-    }
-    if is_absolute_path(raw) {
+    let base = if let Some(home) = expand_tilde(raw) {
+        home
+    } else if let Some(translated) = maybe_translate_posix_absolute(raw) {
+        translated
+    } else if is_absolute_path(raw) {
         PathBuf::from(raw)
     } else {
         working_dir.join(raw)
-    }
+    };
+    crate::pathnorm::lexical_normalize(&base)
 }
 
 /// Cross-platform absolute-path test for model-supplied paths.
@@ -518,5 +564,34 @@ mod tests {
             // With no process `HOME`, the special-dir fallback uses the same home as `~`.
             _ => assert_eq!(via_env, home.join("x")),
         }
+    }
+
+    #[test]
+    fn resolve_path_normalizes_dotdot_and_model_quirks() {
+        let wd = Path::new("E:/code/jeikcode");
+        let sibling = resolve_path("../cc-switch/src/config/appConfig.ts", wd);
+        assert_eq!(
+            crate::pathnorm::to_display(&sibling),
+            "E:/code/cc-switch/src/config/appConfig.ts"
+        );
+
+        // Backticks, whitespace, quotes, file://
+        let quoted = resolve_path(" `../cc-switch/src/config/appConfig.ts` \n", wd);
+        assert_eq!(
+            crate::pathnorm::to_display(&quoted),
+            "E:/code/cc-switch/src/config/appConfig.ts"
+        );
+
+        let file_uri = resolve_path("file:///E:/code/cc-switch/src/config/appConfig.ts", wd);
+        assert_eq!(
+            crate::pathnorm::to_display(&file_uri),
+            "E:/code/cc-switch/src/config/appConfig.ts"
+        );
+
+        let space_encoded = resolve_path("my%20folder/note.md", Path::new("/work"));
+        assert_eq!(
+            crate::pathnorm::to_display(&space_encoded),
+            "/work/my folder/note.md"
+        );
     }
 }
