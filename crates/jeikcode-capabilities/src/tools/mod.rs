@@ -88,8 +88,8 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use jeikcode_config_guide::{JeikcodeConfigGuideTool, JeikcodeConfigTool};
 pub use output_artifact::{
-    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
-    ARTIFACT_TRUNCATION_MARKER_PREFIX, TERMINAL_THRESHOLD_BYTES, THRESHOLD_BYTES,
+    artifact_id, ArtifactMiddleware, ArtifactStore, ARTIFACT_TRUNCATION_MARKER_PREFIX,
+    TERMINAL_THRESHOLD_BYTES, THRESHOLD_BYTES,
 };
 pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
@@ -127,7 +127,6 @@ pub fn coding_tool_names() -> &'static [&'static str] {
         "glob",
         "todo_write",
         "jeikcode_config",
-        "fetch_output",
         "request_user_input",
     ]
 }
@@ -896,18 +895,16 @@ mod tests {
             names.contains(&"request_user_input"),
             "coding_tool_names() must include 'request_user_input'"
         );
-        // "fetch_output" is always in coding_tool_names() — mount() drops it when the
-        // session-gated FetchOutputTool is not registered; the name itself is unconditional.
         assert!(
-            names.contains(&"fetch_output"),
-            "coding_tool_names() must include 'fetch_output'"
+            !names.contains(&"fetch_output"),
+            "coding_tool_names() must not include deleted 'fetch_output'"
         );
         assert!(
             !names.contains(&"memory"),
             "coding_tool_names() must not include 'memory'"
         );
         // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + the gated extras.
-        let extras: &[&str] = &["request_user_input", "fetch_output"];
+        let extras: &[&str] = &["request_user_input"];
         let expected_full: Vec<&str> = EXPECTED_TOOL_NAMES
             .iter()
             .copied()
@@ -919,7 +916,7 @@ mod tests {
         sorted_expected.sort();
         assert_eq!(
             sorted_names, sorted_expected,
-            "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input + fetch_output"
+            "coding_tool_names() must match EXPECTED_TOOL_NAMES + request_user_input"
         );
     }
 

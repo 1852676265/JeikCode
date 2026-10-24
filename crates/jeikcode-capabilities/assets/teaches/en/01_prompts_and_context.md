@@ -10,9 +10,6 @@ Configuration directory path: `~/.jeikcode/prompts/` (or `$JEIKCODE_HOME/prompts
 | :--- | :--- | :--- |
 | **`init.yaml`** | 🔥 **Dynamic Hot-Reload** | **Identity definition, precedence, and environment prefix**. Reloaded dynamically on save based on file mtime; takes effect on the next turn immediately without restarting. |
 | **`rules.yaml`** | 🔥 **Dynamic Hot-Reload** | **Workflow & execution discipline**. Completely replaces embedded default rules. Reloaded dynamically on save based on file mtime; takes effect on the next turn immediately without restarting. |
-| `root_docs_prompts.md` | 📖 Reference Only | Reference documentation; not loaded into model context window. |
-| `root_docs_内置工具.yaml` | 📖 Reference Only | Built-in tools catalog reference; not loaded into context (tools are natively provided by code). |
-| `root_docs_内置技能.yaml` | 📖 Reference Only | Built-in skills reference; not loaded into context (skills mount directly from `skills/`). |
 
 ---
 

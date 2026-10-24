@@ -36,8 +36,8 @@ use jeikcode_capabilities::skills::{
 };
 use jeikcode_capabilities::tools::{
     register_coding_tools_with_vision_and_bash_state, ApprovalMiddleware, ArtifactMiddleware,
-    ArtifactStore, BashRuntimeState, BashWorkspaceGate, FetchOutputTool, ReadFileTool,
-    RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    ArtifactStore, BashRuntimeState, BashWorkspaceGate, ReadFileTool, RepairToolArgsMiddleware,
+    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use jeikcode_kernel::agent::Agent;
 use jeikcode_kernel::checkpoint::CompactionCheckpoint;
@@ -1399,20 +1399,18 @@ pub fn assemble(
     // likewise counted.
     let summary_provider = metered_provider;
 
-    // When a session is present, wire the artifact store: register the fetch_output tool
-    // so the model can retrieve large outputs, and prepare the middleware that intercepts
-    // oversized tool results and spills them to disk.  No session → no artifact I/O.
+    // When a session is present, wire the artifact store into ReadFileTool so the model
+    // can retrieve large outputs via `artifact://<artifact_id>`, and prepare the middleware
+    // that intercepts oversized tool results and spills them to disk. No session → no artifact I/O.
     let artifact_store: Option<Arc<ArtifactStore>> = parts.session.as_ref().and_then(|b| {
         b.manager
             .artifacts_dir(&b.id)
             .ok()
             .map(|dir| Arc::new(ArtifactStore::new(dir)))
     });
-    if let Some(store) = &artifact_store {
-        parts
-            .registry
-            .register(Arc::new(FetchOutputTool::new(store.clone())));
-    }
+    parts.registry.register(Arc::new(
+        ReadFileTool::new(cfg.supports_vision).with_optional_artifact_store(artifact_store.clone()),
+    ));
 
     // Must pass cfg.working_dir: the live/WebUI path never std::env::set_current_dir,
     // so falling back to process cwd leaves Block 1 stuck on the launch directory
@@ -3239,12 +3237,10 @@ mod tests {
     }
 
     /// Unit-test the artifact wiring as `assemble` would build it:
-    /// big tool result → preview+handle stored → fetch_output retrieves full bytes.
+    /// big tool result → preview+handle stored → read(path="artifact://...") retrieves full bytes.
     #[tokio::test]
-    async fn artifact_wiring_store_middleware_and_fetch_roundtrip() {
-        use jeikcode_capabilities::tools::{
-            ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
-        };
+    async fn artifact_wiring_store_middleware_and_read_roundtrip() {
+        use jeikcode_capabilities::tools::{ArtifactMiddleware, ArtifactStore, ReadFileTool};
         use jeikcode_kernel::middleware::ToolMiddleware;
         use jeikcode_kernel::tool::Tool as _;
         use jeikcode_kernel::tool::{ToolContext, ToolResult};
@@ -3253,10 +3249,13 @@ mod tests {
         let artifacts_tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(ArtifactStore::new(artifacts_tmp.path()));
         let mw = ArtifactMiddleware::new(store.clone());
-        let fetch = FetchOutputTool::new(store.clone());
+        let reader = ReadFileTool::new(false).with_artifact_store(store.clone());
 
         // (a) a big result gets spilled and the content is replaced with a preview+handle
-        let big = "Z".repeat(THRESHOLD_BYTES * 2);
+        let mut big = String::new();
+        for i in 1..=1000 {
+            big.push_str(&format!("Line {i}: dummy text for artifact payload\n"));
+        }
         let mut result = ToolResult {
             call_id: "t1".into(),
             content: big.clone(),
@@ -3269,8 +3268,8 @@ mod tests {
             "middleware must shorten the content"
         );
         assert!(
-            result.content.contains("fetch_output"),
-            "middleware must embed fetch_output hint"
+            result.content.contains("read(path=\"artifact://"),
+            "middleware must embed read artifact hint"
         );
 
         // (b) artifact file exists on disk
@@ -3281,78 +3280,31 @@ mod tests {
             "artifact file must be present at {artifact_path:?}"
         );
 
-        // (c) fetch_output retrieves the full bytes
+        // (c) read retrieves the full bytes with line numbers
         let ctx = ToolContext {
             working_dir: artifacts_tmp.path().to_path_buf(),
             cancel: CancellationToken::new(),
             progress: jeikcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         };
-        let fetch_result = fetch
+        let read_result = reader
             .execute(
-                &format!(
-                    "{{\"artifact_id\":\"{id}\",\"offset\":0,\"limit\":{}}}",
-                    big.len()
-                ),
+                &format!("{{\"path\":\"artifact://{id}\",\"offset\":1,\"limit\":1000}}"),
                 &ctx,
             )
             .await;
         assert!(
-            !fetch_result.is_error,
-            "fetch_output must succeed: {}",
-            fetch_result.content
+            !read_result.is_error,
+            "read artifact must succeed: {}",
+            read_result.content
         );
         assert!(
-            fetch_result.content.starts_with('Z'),
-            "fetched bytes must start with the original content"
+            read_result.content.contains("Line 1: dummy text"),
+            "read content must start with the original content"
         );
-    }
-
-    /// When no session is present, fetch_output must NOT appear in the assembled tools.
-    #[tokio::test]
-    #[serial_test::serial(jeikcode_home)]
-    async fn no_session_means_no_fetch_output_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
-        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        // Disabled session: no artifact store, so fetch_output must not be mounted.
-        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
-        // After assemble(), parts.mounted_tools is populated by the mount() call inside.
-        let mounted = parts
-            .mounted_tools
-            .as_ref()
-            .expect("mounted_tools must be set after assemble");
         assert!(
-            mounted.get("fetch_output").is_none(),
-            "fetch_output must not be mounted when no session is present"
-        );
-    }
-
-    /// When a session IS present, fetch_output must appear in the assembled tools.
-    #[tokio::test]
-    #[serial_test::serial(jeikcode_home)]
-    async fn session_presence_mounts_fetch_output_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
-        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        let mut opts = io_free_opts();
-        opts.session = SessionMode::Fresh;
-        let mut parts = prepare(&cfg, opts).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
-        let mounted = parts
-            .mounted_tools
-            .as_ref()
-            .expect("mounted_tools must be set after assemble");
-        assert!(
-            mounted.get("fetch_output").is_some(),
-            "fetch_output must be mounted when a session is present"
+            read_result.content.contains("1→Line 1: dummy text"),
+            "read content must include line numbers"
         );
     }
 }

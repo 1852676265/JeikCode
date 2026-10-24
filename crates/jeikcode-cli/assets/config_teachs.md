@@ -252,7 +252,7 @@ idle_ttl_secs = 600             # 默认 10 分钟
 [tools.tool_output]
 max_bytes = 65536               # 通用压缩阈值（64KiB；0 禁用）
 terminal_max_bytes = 24576      # 终端更早的压缩线（24KiB；0 跟随 max_bytes）
-no_fold_tools = ["fetch_output", "code_explore", "web_fetch", "web_search"]
+no_fold_tools = ["code_explore", "web_fetch", "web_search"]
 
 # =============================================================================
 # 网络代理 [network.proxy]

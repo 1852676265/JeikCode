@@ -248,6 +248,7 @@ code_explore operates on a semantic code graph using 'path' and 'query' paramete
 ### 4.2 key_string Context Anchor Mode
 
 Typical Sub-scenarios:
+- Folded Output Inspection: Locating root-cause errors or trace IDs inside large folded tool outputs (e.g. read(path='artifact://9a84...', key_string='error', upward=20, downward=60)). Prioritize keyword matching over paging when inspecting folded artifacts.
 - Logs & Diagnostics: Capturing exact error messages, exceptions, trace IDs, IPs, or security tokens in massive log outputs.
 - Documents & Configuration: Rapidly locating configuration sections, protocol chapters, field descriptions, and domain rules.
 - Code Structures & Branches: Locating specific functions, classes, structs, enums, conditional branches, or error handlers.
@@ -267,6 +268,7 @@ Examples:
 ### 4.3 offset/limit Range Pagination Mode
 
 Typical Sub-scenarios:
+- Paging Folded Output: Reading sequential folded command output with line numbers (e.g. read(path='artifact://9a84...', offset=1, limit=200)).
 - Reading Context from Known Line: When line numbers are known via 'code_explore', 'grep', 'glob', error traces, or context, read generous context centered on that line.
 - Sequential Paging: Advancing multi-turn generous page reading.
 - Tailing Recent Additions: Inspecting latest appended content at the end of running logs.

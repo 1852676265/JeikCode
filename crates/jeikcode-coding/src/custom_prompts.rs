@@ -178,18 +178,6 @@ fn strip_utf8_bom(content: &str) -> &str {
 const PROMPT_SEEDS: &[(&str, &str)] = &[
     ("init.yaml", include_str!("../assets/prompts/init.yaml")),
     ("rules.yaml", include_str!("../assets/prompts/rules.yaml")),
-    (
-        "root_docs_prompts.md",
-        include_str!("../assets/prompts/root_docs_prompts.md"),
-    ),
-    (
-        "root_docs_内置工具.yaml",
-        include_str!("../assets/prompts/root_docs_内置工具.yaml"),
-    ),
-    (
-        "root_docs_内置技能.yaml",
-        include_str!("../assets/prompts/root_docs_内置技能.yaml"),
-    ),
 ];
 
 /// Idempotent first-run seed of `~/.jeikcode/prompts/` (or `$JEIKCODE_HOME/prompts/`).
@@ -1007,26 +995,9 @@ doing_tasks:
     }
 
     #[test]
-    fn prompt_seeds_are_live_yaml_or_root_docs() {
+    fn prompt_seeds_are_live_yaml() {
         let names: Vec<&str> = PROMPT_SEEDS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(
-            names,
-            vec![
-                "init.yaml",
-                "rules.yaml",
-                "root_docs_prompts.md",
-                "root_docs_内置工具.yaml",
-                "root_docs_内置技能.yaml",
-            ]
-        );
-        for (name, _) in PROMPT_SEEDS {
-            if *name != "init.yaml" && *name != "rules.yaml" {
-                assert!(
-                    name.starts_with("root_docs_"),
-                    "non-live seed must be named root_docs_*: {name}"
-                );
-            }
-        }
+        assert_eq!(names, vec!["init.yaml", "rules.yaml"]);
     }
 
     #[test]

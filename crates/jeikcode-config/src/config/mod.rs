@@ -389,8 +389,8 @@ impl ToolTimeoutsConfig {
 }
 
 /// `[tools.tool_output]` — where oversized tool results are compressed into a
-/// head+tail preview plus an artifact handle (the full text stays on disk and
-/// is recoverable via fetch_output). Tools listed in `no_fold_tools` (or
+/// preview plus an artifact handle (the full text stays on disk and
+/// is recoverable via read(path="artifact://<id>")). Tools listed in `no_fold_tools` (or
 /// declaring `never_truncate_result()`) bypass this entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -434,7 +434,7 @@ fn default_tool_output_terminal_max_bytes() -> Option<usize> {
 }
 
 fn default_no_fold_tools() -> Vec<String> {
-    ["fetch_output", "code_explore", "web_fetch", "web_search"]
+    ["code_explore", "web_fetch", "web_search"]
         .into_iter()
         .map(str::to_string)
         .collect()

@@ -144,9 +144,7 @@ mod tests {
         assert!(is_user_custom_mcp_or_skill("skills"));
         assert!(!is_user_custom_mcp_or_skill("teaches/03_mcp_and_skills.md"));
         assert!(!is_user_custom_mcp_or_skill("prompts/init.yaml"));
-        assert!(!is_user_custom_mcp_or_skill(
-            "prompts/root_docs_内置技能.yaml"
-        ));
+        assert!(!is_user_custom_mcp_or_skill("prompts/rules.yaml"));
         assert!(!is_user_custom_mcp_or_skill("config.toml"));
     }
 

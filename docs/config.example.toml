@@ -230,8 +230,8 @@ max_rounds = 100
 enabled = true
 eager = "auto"
 
-# 工具输出折叠阈值（字节）。超过该大小的工具输出会被折叠为「头部+尾部预览」并存成 artifact，
-# 模型可用 fetch_output 工具按片段取回全文（全量不丢失）。
+# 工具输出折叠阈值（字节）。超过该大小的工具输出会被折叠并存成 artifact，
+# 模型可用 read(path="artifact://<id>") 工具按行/关键词取回全文（全量不丢失）。
 # 默认 65536（64 KiB）。bash/grep 等大输出在此折叠；read_file 自带 256 KiB 页并跳过折叠。
 # 内核工具结果上限默认 256 KiB。
 # 设为 0 完全禁用折叠（所有工具输出原样进入上下文，超大输出会占用上下文窗口）。
@@ -267,7 +267,6 @@ idle_ttl_secs = 600       # 默认 10 分钟
 [tools.tool_output]
 max_bytes = 65536
 no_fold_tools = [
-    "fetch_output",
     "repo_map",
     "code_explore",
     "web_fetch",

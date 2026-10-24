@@ -4,12 +4,14 @@
 
 use super::{err, looks_binary, not_found_hint, ok, ok_with_images, resolve_path};
 use crate::tool_feedback::{format_path_not_found, parse_tool_args};
+use crate::tools::output_artifact::ArtifactStore;
 use async_trait::async_trait;
 use base64::Engine;
 use jeikcode_kernel::message::ImageContent;
 use jeikcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
 /// Hard safety ceiling for the current in-memory decoder. Default pagination
 /// controls model-visible output, but decoding still needs the complete file for
@@ -57,14 +59,28 @@ const MAX_LINE_LEN: usize = 2000;
 /// cannot display" text dead-end. The capability is decided at the coding layer
 /// and passed in as a plain flag — this crate stays model-agnostic (and core-free).
 /// Default `false` (text-only).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ReadFileTool {
     vision: bool,
+    artifact_store: Option<Arc<ArtifactStore>>,
 }
 
 impl ReadFileTool {
     pub fn new(vision: bool) -> Self {
-        Self { vision }
+        Self {
+            vision,
+            artifact_store: None,
+        }
+    }
+
+    pub fn with_artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    pub fn with_optional_artifact_store(mut self, store: Option<Arc<ArtifactStore>>) -> Self {
+        self.artifact_store = store;
+        self
     }
 }
 
@@ -315,7 +331,9 @@ struct Args {
         alias = "KeyString",
         alias = "keystring",
         alias = "focus",
-        alias = "anchor"
+        alias = "anchor",
+        alias = "keyword",
+        alias = "query"
     )]
     key_string: Option<String>,
     /// Number of context lines above the matched anchor (default 25). Only provide when key_string is specified.
@@ -443,7 +461,7 @@ impl Tool for ReadFileTool {
         &[READ_TOOL_ALIAS]
     }
     fn description(&self) -> &str {
-        "Read file content generously (reading several hundred lines or the whole file in one call is safe and expected), view images, or list directories."
+        "Read file content generously (reading several hundred lines or the whole file in one call is safe and expected), view images, list directories, or inspect truncated output via 'artifact://<artifact_id>'."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -451,7 +469,7 @@ impl Tool for ReadFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file or directory to inspect."
+                    "description": "Path to the file, directory, or virtual output URI ('artifact://<artifact_id>') to inspect."
                 },
                 "offset": {
                     "type": "integer",
@@ -503,6 +521,33 @@ impl Tool for ReadFileTool {
         if a.limit == Some(0) {
             return err("read: `limit` must be at least 1.");
         }
+
+        // Virtual artifact URI path: `artifact://<artifact_id>`
+        if let Some(artifact_id) = a.path.strip_prefix("artifact://") {
+            let store = match &self.artifact_store {
+                Some(s) => s,
+                None => {
+                    return err(
+                        "Artifact storage is unavailable (session not initialized or no active session).",
+                    );
+                }
+            };
+            let bytes = match store.get(artifact_id, 0, usize::MAX) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    return err(format!(
+                        "Artifact '{artifact_id}' is no longer available (truncated captures don't survive across machines or after cleanup). \
+                         Re-run the original command to regenerate its output."
+                    ));
+                }
+                Err(e) => return err(format!("Failed to retrieve artifact '{artifact_id}': {e}")),
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let total_bytes = bytes.len() as u64;
+            let display_path = format!("artifact://{artifact_id}");
+            return self.slice_text_response(&a, &text, total_bytes, &display_path, None, false);
+        }
+
         let resolved = resolve_path(&a.path, &ctx.working_dir);
         let meta = match tokio::fs::metadata(&resolved).await {
             Ok(m) => m,
@@ -679,6 +724,21 @@ impl Tool for ReadFileTool {
                 }
             },
         };
+        let skill_md = path.file_name().is_some_and(|n| n == "SKILL.md");
+        self.slice_text_response(&a, &text, meta.len(), &display_path, Some(&path), skill_md)
+    }
+}
+
+impl ReadFileTool {
+    fn slice_text_response(
+        &self,
+        a: &Args,
+        text: &str,
+        total_bytes: u64,
+        display_path: &str,
+        record_path: Option<&std::path::Path>,
+        skill_md: bool,
+    ) -> ToolResult {
         // Count and page with iterators instead of collecting `Vec<&str>`: a file
         // containing millions of tiny lines would otherwise spend far more memory
         // on line pointers than on the bounded source bytes themselves.
@@ -697,13 +757,13 @@ impl Tool for ReadFileTool {
 
             // Silent absorption: offset and limit are ignored in key_string mode
             let (matched_indices, snippet_lines, clean_needle) =
-                find_key_string_matches_robust(&text, target, false, 0);
+                find_key_string_matches_robust(text, target, false, 0);
 
             if matched_indices.is_empty() {
                 // 4D: 无匹配
                 let km = KeyStringMeta {
                     total_lines: total,
-                    total_bytes: meta.len(),
+                    total_bytes,
                     key_string: target.clone(),
                     total_matches: 0,
                     shown_matches: 0,
@@ -714,8 +774,10 @@ impl Tool for ReadFileTool {
                     fallback_offset: None,
                     fallback_limit: None,
                 };
-                let footer = km.build_footer(&display_path);
-                crate::tools::write_state::record_read(&path);
+                let footer = km.build_footer(display_path);
+                if let Some(p) = record_path {
+                    crate::tools::write_state::record_read(p);
+                }
                 let result = if footer.is_empty() {
                     format!("[KeyString: no matches found for `{target}`]\n")
                 } else {
@@ -844,7 +906,7 @@ impl Tool for ReadFileTool {
 
             let km = KeyStringMeta {
                 total_lines: total,
-                total_bytes: meta.len(),
+                total_bytes,
                 key_string: target.clone(),
                 total_matches,
                 shown_matches: if truncated_by_bytes {
@@ -859,8 +921,10 @@ impl Tool for ReadFileTool {
                 fallback_offset,
                 fallback_limit,
             };
-            let footer = km.build_footer(&display_path);
-            crate::tools::write_state::record_read(&path);
+            let footer = km.build_footer(display_path);
+            if let Some(p) = record_path {
+                crate::tools::write_state::record_read(p);
+            }
             return ok(finish_read_text(out, &footer));
         }
 
@@ -888,21 +952,22 @@ impl Tool for ReadFileTool {
         if start_idx >= total && total > 0 {
             let rm = RangeMeta {
                 total_lines: total,
-                total_bytes: meta.len(),
+                total_bytes,
                 start_line: start,
                 end_line: total,
                 truncated: false,
                 truncated_by: None,
                 next_offset: None,
             };
-            let footer = rm.build_footer(&display_path);
-            crate::tools::write_state::record_read(&path);
+            let footer = rm.build_footer(display_path);
+            if let Some(p) = record_path {
+                crate::tools::write_state::record_read(p);
+            }
             return ok(finish_read_text(
                 format!("[no lines in requested range (start={start}, total={total})]\n"),
                 &footer,
             ));
         }
-        let skill_md = path.file_name().is_some_and(|n| n == "SKILL.md");
         let effective_limit = if skill_md {
             a.limit.unwrap_or(usize::MAX)
         } else {
@@ -965,15 +1030,17 @@ impl Tool for ReadFileTool {
 
         let rm = RangeMeta {
             total_lines: total,
-            total_bytes: meta.len(),
+            total_bytes,
             start_line: if total == 0 { 0 } else { start },
             end_line: if total == 0 { 0 } else { end_idx },
             truncated,
             truncated_by,
             next_offset,
         };
-        let footer = rm.build_footer(&display_path);
-        crate::tools::write_state::record_read(&path);
+        let footer = rm.build_footer(display_path);
+        if let Some(p) = record_path {
+            crate::tools::write_state::record_read(p);
+        }
         ok(finish_read_text(out, &footer))
     }
 }
@@ -2192,32 +2259,6 @@ mod tests {
             );
         }
 
-        let root_docs_path =
-            manifest_dir.join("../jeikcode-coding/assets/prompts/root_docs_内置工具.yaml");
-        if root_docs_path.exists() {
-            let root_docs_content = std::fs::read_to_string(&root_docs_path).unwrap();
-            assert!(
-                root_docs_content.contains("1500"),
-                "root_docs must contain 1500"
-            );
-            assert!(
-                root_docs_content.contains("25"),
-                "root_docs must contain 25"
-            );
-            assert!(
-                root_docs_content.contains("75"),
-                "root_docs must contain 75"
-            );
-            assert!(
-                root_docs_content.contains("safe and expected"),
-                "root_docs must contain 'safe and expected'"
-            );
-            assert!(
-                root_docs_content.contains("path:"),
-                "root_docs read_file parameter must be 'path:'"
-            );
-        }
-
         let first_turn_path = manifest_dir.join("../jeikcode-coding/src/code_tools_first.rs");
         if first_turn_path.exists() {
             let first_turn_content = std::fs::read_to_string(&first_turn_path).unwrap();
@@ -2533,5 +2574,57 @@ mod tests {
             t.never_truncate_result(),
             "read_file pages must not be folded by the 64 KiB artifact cap"
         );
+    }
+
+    #[tokio::test]
+    async fn read_virtual_artifact_uri_supports_paging_and_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ArtifactStore::new(dir.path()));
+        let mut sample = String::new();
+        for i in 1..=50 {
+            sample.push_str(&format!("Line {i}: message content\n"));
+        }
+        sample.push_str("Line 51: ERROR critical failure in service\n");
+        for i in 52..=100 {
+            sample.push_str(&format!("Line {i}: trailing detail\n"));
+        }
+        let id = store.put(sample.as_bytes()).unwrap();
+
+        let tool = ReadFileTool::new(false).with_artifact_store(store.clone());
+
+        // 1. Range paging
+        let r_range = tool
+            .execute(
+                &format!(r#"{{"path":"artifact://{id}","offset":10,"limit":5}}"#),
+                &ctx(dir.path()),
+            )
+            .await;
+        assert!(!r_range.is_error, "{}", r_range.content);
+        assert!(r_range.content.contains("10→Line 10: message content"));
+        assert!(r_range.content.contains("14→Line 14: message content"));
+        assert!(r_range.content.contains(&format!("File: artifact://{id}")));
+
+        // 2. Keyword search via `keyword` alias
+        let r_kw = tool
+            .execute(
+                &format!(r#"{{"path":"artifact://{id}","keyword":"ERROR critical"}}"#),
+                &ctx(dir.path()),
+            )
+            .await;
+        assert!(!r_kw.is_error, "{}", r_kw.content);
+        assert!(r_kw.content.contains("[KeyString matched at line 51]"));
+        assert!(r_kw
+            .content
+            .contains("51→Line 51: ERROR critical failure in service"));
+
+        // 3. Missing artifact
+        let r_missing = tool
+            .execute(
+                r#"{"path":"artifact://0000000000000000","offset":1,"limit":10}"#,
+                &ctx(dir.path()),
+            )
+            .await;
+        assert!(r_missing.is_error);
+        assert!(r_missing.content.contains("no longer available"));
     }
 }

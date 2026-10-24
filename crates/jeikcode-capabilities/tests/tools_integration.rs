@@ -29,8 +29,7 @@ fn full_toolset_registers_and_mounts() {
     let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
 
     // `coding_tool_names()` is deliberately a SUPERSET of what `register_coding_tools`
-    // installs: `fetch_output` is wired only when a session exists (never by this
-    // function), and `todowrite` / `request_user_input` / `memory` sit behind env gates.
+    // installs: and `todowrite` / `request_user_input` / `memory` sit behind env gates.
     // `mount()` silently drops names with no registration, so the invariant is
     // "mounted == the registered subset", not "mounted == every name".
     let registered: Vec<&str> = coding_tool_names()

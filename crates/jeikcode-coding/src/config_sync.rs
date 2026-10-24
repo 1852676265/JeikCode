@@ -37,21 +37,6 @@ pub const BUNDLED_ASSETS: &[BundledFileEntry] = &[
         description: "工作流与执行规范 (rules.yaml)",
     },
     BundledFileEntry {
-        relative_path: "prompts/root_docs_prompts.md",
-        content: include_str!("../assets/prompts/root_docs_prompts.md"),
-        description: "提示词指南（不加载进模型） (root_docs_prompts.md)",
-    },
-    BundledFileEntry {
-        relative_path: "prompts/root_docs_内置工具.yaml",
-        content: include_str!("../assets/prompts/root_docs_内置工具.yaml"),
-        description: "内置工具说明文档（不加载进模型） (root_docs_内置工具.yaml)",
-    },
-    BundledFileEntry {
-        relative_path: "prompts/root_docs_内置技能.yaml",
-        content: include_str!("../assets/prompts/root_docs_内置技能.yaml"),
-        description: "内置技能说明文档（不加载进模型） (root_docs_内置技能.yaml)",
-    },
-    BundledFileEntry {
         relative_path: "config.toml",
         content: include_str!("../assets/default-config.toml"),
         description: "系统与工具通用配置 (config.toml — 保留用户模型/账号)",
@@ -198,6 +183,9 @@ pub const STALE_HOME_FILES: &[&str] = &[
     "prompts/prompts.md",
     "prompts/内置工具.yaml",
     "prompts/内置技能.yaml",
+    "prompts/root_docs_内置工具.yaml",
+    "prompts/root_docs_内置技能.yaml",
+    "prompts/root_docs_prompts.md",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,11 +239,6 @@ pub fn localized_asset_description(relative_path: &str, zh_fallback: &str) -> St
     let en = match relative_path {
         "prompts/init.yaml" => "Identity and system prompt prefix (init.yaml)",
         "prompts/rules.yaml" => "Workflow and tool rules (rules.yaml)",
-        "prompts/root_docs_prompts.md" => {
-            "Prompt guide, not loaded into the model (root_docs_prompts.md)"
-        }
-        "prompts/root_docs_内置工具.yaml" => "Built-in tool notes, not loaded into the model",
-        "prompts/root_docs_内置技能.yaml" => "Built-in skill notes, not loaded into the model",
         "config.toml" => "Shared settings (config.toml — your models and accounts stay)",
         "config_teachs.md" => "Config guide for agents (config_teachs.md)",
         "builtin-tools.txt" => "Built-in tool list (builtin-tools.txt)",
@@ -524,4 +507,37 @@ pub fn apply_all_bundled_assets(jeikcode_home: &Path, force: bool) -> Result<usi
     }
 
     Ok(applied_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_root_docs_are_detected_as_obsolete() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let prompts_dir = home.join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        std::fs::write(prompts_dir.join("root_docs_内置工具.yaml"), "stale").unwrap();
+        std::fs::write(prompts_dir.join("root_docs_内置技能.yaml"), "stale").unwrap();
+        std::fs::write(prompts_dir.join("root_docs_prompts.md"), "stale").unwrap();
+
+        let diffs = scan_jeikcode_config_diffs(home);
+        let obsolete: Vec<&str> = diffs
+            .iter()
+            .filter(|d| d.kind == DiffKind::Obsolete)
+            .map(|d| d.relative_path.as_str())
+            .collect();
+
+        assert!(obsolete.contains(&"prompts/root_docs_内置工具.yaml"));
+        assert!(obsolete.contains(&"prompts/root_docs_内置技能.yaml"));
+        assert!(obsolete.contains(&"prompts/root_docs_prompts.md"));
+
+        remove_stale_home_files(home);
+        assert!(!prompts_dir.join("root_docs_内置工具.yaml").exists());
+        assert!(!prompts_dir.join("root_docs_内置技能.yaml").exists());
+        assert!(!prompts_dir.join("root_docs_prompts.md").exists());
+    }
 }

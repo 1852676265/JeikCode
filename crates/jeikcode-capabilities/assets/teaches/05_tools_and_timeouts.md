@@ -64,14 +64,13 @@ idle_ttl_secs = 600         # scope="session" 的 MCP 进程闲置回收超时�
 
 ## 3. 工具输出压缩策略 (`[tools.tool_output]`)
 
-防止大输出占满上下文窗口。非豁免工具超过阈值即压缩为「头 1500 + 尾 2200 字节」预览 + `artifact` 钥匙；完整文本落盘，模型按需调用 `fetch_output` 取回：
+防止大输出占满上下文窗口。非豁免工具超过阈值即折叠并存为 `artifact`；完整文本落盘，模型按需调用 `read(path="artifact://<id>")` 按行或关键字取回：
 
 ```toml
 [tools.tool_output]
 max_bytes = 65536               # 通用压缩阈值（字节，默认 65536 = 64KiB；0 完全禁用压缩）
 terminal_max_bytes = 24576      # 终端（run_command/bash）更早的压缩线（字节，默认 24KiB；0 表示跟随 max_bytes）
 no_fold_tools = [               # 白名单工具列表：输出直接原样返回，绝不压缩
-    "fetch_output",
     "code_explore",
     "web_fetch",
     "web_search"

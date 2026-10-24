@@ -59,14 +59,13 @@ idle_ttl_secs = 600         # Idle reclamation timeout for scope="session" MCP p
 
 ## 3. Tool Output Compression Policy (`[tools.tool_output]`)
 
-Prevents massive tool outputs from exhausting context windows. Non-exempt tools exceeding the threshold are folded into a "head 1500 + tail 2200 bytes" preview accompanied by an `artifact` retrieval token; full output is saved to disk, retrieved on demand via `fetch_output`:
+Prevents massive tool outputs from exhausting context windows. Non-exempt tools exceeding the threshold are folded and saved as an `artifact`; full output is saved to disk, retrieved on demand via `read(path="artifact://<id>")`:
 
 ```toml
 [tools.tool_output]
 max_bytes = 65536               # General compression threshold (bytes, default 65536 = 64KiB; 0 disables compression completely)
 terminal_max_bytes = 24576      # Earlier compression threshold for terminal (run_command/bash) (bytes, default 24KiB; 0 follows max_bytes)
 no_fold_tools = [               # Whitelist tools: returned raw and never compressed
-    "fetch_output",
     "code_explore",
     "web_fetch",
     "web_search"

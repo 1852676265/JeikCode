@@ -934,8 +934,8 @@ fn sort_json_object_keys(value: Value) -> Value {
 /// (e.g. `ArtifactMiddleware` in jeikcode-capabilities). When present, the
 /// content is ALREADY a bounded head+marker+tail preview, so the kernel cap
 /// must not truncate it again — re-capping would cut the embedded artifact id
-/// and turn the fetch_output recovery handle into a dead link.
-pub const ARTIFACT_PREVIEW_MARKER: &str = "[jeikcode: output truncated";
+/// and turn the artifact recovery handle into a dead link.
+pub const ARTIFACT_PREVIEW_MARKER: &str = "section of output folded";
 fn cap_tool_result(result: &mut ToolResult, max: usize) {
     if max == 0 {
         return; // unbounded
@@ -5465,10 +5465,10 @@ mod cap_tests {
         // A bounded artifact preview (head + marker + tail, as produced by
         // ArtifactMiddleware) is ALREADY small. A tiny kernel cap must NOT
         // truncate it again — re-capping would cut the embedded artifact id
-        // and turn fetch_output into a dead link.
+        // and turn artifact recovery into a dead link.
         let preview = format!(
-            "HEAD{}\n[jeikcode: output truncated — 20000 bytes total, showing first 4096 + last 4096 bytes. \
-Full output saved as artifact 7450efc5941c8ce0. To read more: fetch_output(artifact_id=\"7450efc5941c8ce0\", offset, limit).]\n{}TAIL",
+            "HEAD{}\n[Middle section of output folded (50 lines elided), saved as artifact 7450efc5941c8ce0. \
+If current information is insufficient to resolve the issue, call `read(path=\"artifact://7450efc5941c8ce0\")` to inspect more.]\n{}TAIL",
             "h".repeat(4000),
             "t".repeat(4000)
         );

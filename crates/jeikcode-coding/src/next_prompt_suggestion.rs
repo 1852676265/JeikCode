@@ -398,9 +398,12 @@ fn truncate_tool_result(text: &str) -> String {
     if text.chars().count() <= MAX_TOOL_RESULT_CHARS {
         return text.to_string();
     }
-    let Some(marker_start) = text.find(ARTIFACT_TRUNCATION_MARKER_PREFIX) else {
+    let Some(raw_marker_start) = text.find(ARTIFACT_TRUNCATION_MARKER_PREFIX) else {
         return truncate_middle_chars(text, MAX_TOOL_RESULT_CHARS);
     };
+    let marker_start = text[..raw_marker_start]
+        .rfind('[')
+        .unwrap_or(raw_marker_start);
     let Some(marker_end_offset) = text[marker_start..].find(']') else {
         return truncate_middle_chars(text, MAX_TOOL_RESULT_CHARS);
     };
@@ -622,7 +625,7 @@ mod tests {
     #[test]
     fn tool_result_reuses_bounded_artifact_preview() {
         let artifact_marker = format!(
-            "{ARTIFACT_TRUNCATION_MARKER_PREFIX} — 20000 bytes total. Full output saved as artifact 0123456789abcdef.]"
+            "[{ARTIFACT_TRUNCATION_MARKER_PREFIX} (50 lines elided), saved as artifact 0123456789abcdef.]"
         );
         let result = format!(
             "HEAD{}\n{}\n{}TAIL",

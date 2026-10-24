@@ -471,7 +471,7 @@ impl Conversation {
     ///
     /// NOTE: No compression happens here. Oversized tool results were already
     /// rewritten at EXECUTION time by the artifact middleware (capabilities):
-    /// head/tail preview + `fetch_output` artifact handle. The stored message —
+    /// preview + `read(path="artifact://...")` artifact handle. The stored message —
     /// and therefore this wire view — already carries that compressed text, so
     /// the kernel must not rewrite it a second time.
     pub fn model_history(&self) -> Vec<Message> {

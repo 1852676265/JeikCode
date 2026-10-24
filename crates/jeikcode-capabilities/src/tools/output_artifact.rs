@@ -94,9 +94,9 @@ pub const MCP_THRESHOLD_BYTES: usize = 32 * 1024;
 /// Uniform preview kept from each end of a compressed result (bytes).
 const PREVIEW_HEAD_BYTES: usize = 1500;
 const PREVIEW_TAIL_BYTES: usize = 2200;
-/// Stable prefix embedded in a conversation-visible result when the complete
-/// tool output was replaced by an artifact-backed head/tail preview.
-pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[jeikcode: output truncated";
+/// Stable marker substring embedded in a conversation-visible result when the complete
+/// tool output was replaced by an artifact-backed preview.
+pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "section of output folded";
 /// Max bytes an artifact may store; larger results are inline-truncated only.
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -269,31 +269,49 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
 
+        let elided_content = if tail_begin >= head_end {
+            &result.content[head_end..tail_begin]
+        } else {
+            ""
+        };
+        let elided_lines = elided_content.lines().count();
+
         if new_total > MAX_ARTIFACT_BYTES {
             // Too large to store; inline-truncate only.
+            let position_desc = if !head.is_empty() && !tail.is_empty() {
+                format!("Middle section of output folded ({elided_lines} lines elided)")
+            } else {
+                format!("Subsequent section of output folded ({elided_lines} lines truncated)")
+            };
             let marker = format!(
-                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
-Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n",
-                head.len(),
-                tail.len()
+                "\n\n[{position_desc}. Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n"
             );
             result.content = format!("{head}{marker}{tail}");
             return jeikcode_kernel::middleware::AfterOutcome::Proceed;
         }
 
         let marker = match artifact_id.or_else(|| self.store.put(result.content.as_bytes()).ok()) {
-            Some(id) => format!(
-                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
-Full output saved as artifact {id}. To read more: fetch_output(artifact_id=\"{id}\", offset, limit).]\n\n",
-                head.len(),
-                tail.len()
-            ),
-            None => format!(
-                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
-Full output unavailable (could not be saved).]\n\n",
-                head.len(),
-                tail.len()
-            ),
+            Some(id) => {
+                let position_desc = if !head.is_empty() && !tail.is_empty() {
+                    format!("Middle section of output folded ({elided_lines} lines elided)")
+                } else {
+                    format!("Subsequent section of output folded ({elided_lines} lines truncated)")
+                };
+                format!(
+                    "\n\n[{position_desc}, saved as artifact {id}. \
+If current information is insufficient to resolve the issue, \
+call `read(path=\"artifact://{id}\", key_string=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
+Prefer key_string match over sequential reading to quickly retrieve target details.]\n\n"
+                )
+            }
+            None => {
+                let position_desc = if !head.is_empty() && !tail.is_empty() {
+                    format!("Middle section of output folded ({elided_lines} lines elided)")
+                } else {
+                    format!("Subsequent section of output folded ({elided_lines} lines truncated)")
+                };
+                format!("\n\n[{position_desc}. Full output unavailable (could not be saved).]\n\n")
+            }
         };
         result.content = format!("{head}{marker}{tail}");
         jeikcode_kernel::middleware::AfterOutcome::Proceed
@@ -388,9 +406,9 @@ mod tests {
 
         let mut r1 = mk();
         mw.after(&mut r1, None).await;
-        // rewritten: smaller, has head+tail+marker, names fetch_output + the id
+        // rewritten: smaller, has head+tail+marker, names artifact and read
         assert!(r1.content.len() < big.len());
-        assert!(r1.content.contains("fetch_output"));
+        assert!(r1.content.contains("read(path=\"artifact://"));
         let id = super::artifact_id(big.as_bytes());
         assert!(r1.content.contains(&id));
         // artifact holds the FULL original
@@ -502,8 +520,8 @@ mod tests {
             "must fold under a lowered threshold"
         );
         assert!(
-            r.content.contains("fetch_output"),
-            "must carry the fetch hint"
+            r.content.contains("read(path=\"artifact://"),
+            "must carry the read hint"
         );
         // The default instance leaves the same 20 KiB untouched.
         let mw2 = super::ArtifactMiddleware::new(store.clone());
@@ -590,12 +608,14 @@ mod tests {
             };
             mw.after(&mut r, Some(&probe)).await;
             assert!(
-                r.content.contains("output truncated"),
+                r.content.contains("section of output folded"),
                 "{} must compress above the 24 KiB terminal line",
                 probe.0
             );
-            assert!(r.content.contains("showing first 1500 + last 2200"));
-            assert!(r.content.contains("fetch_output"), "must carry the handle");
+            assert!(
+                r.content.contains("read(path=\"artifact://"),
+                "must carry the handle"
+            );
             // The handle resolves: the full text is in the artifact store.
             let id = super::artifact_id(mid.as_bytes());
             assert!(r.content.contains(&id));
@@ -740,205 +760,8 @@ mod tests {
             "MCP tool output exceeding 32 KB must generate standard artifact truncation marker"
         );
         assert!(
-            r.content.contains("fetch_output(artifact_id="),
-            "MCP truncation must instruct LLM to use fetch_output with the generated artifact ID"
-        );
-    }
-}
-
-pub struct FetchOutputTool {
-    store: Arc<ArtifactStore>,
-}
-
-impl FetchOutputTool {
-    pub fn new(store: Arc<ArtifactStore>) -> Self {
-        Self { store }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct FetchArgs {
-    artifact_id: String,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-const FETCH_MAX_LIMIT: usize = 256 * 1024;
-
-#[async_trait::async_trait]
-impl jeikcode_kernel::tool::Tool for FetchOutputTool {
-    fn name(&self) -> &str {
-        "fetch_output"
-    }
-
-    fn description(&self) -> &str {
-        "Fetch remaining chunks of truncated tool output. \
-         Use when a previous tool result ends with an `artifact_id` truncation marker."
-    }
-
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "artifact_id": {"type": "string", "description": "The artifact_id from the truncation marker."},
-                "offset": {"type": "integer", "description": "Byte offset to start reading from."},
-                "limit": {"type": "integer", "description": "Maximum bytes to return (default/max 262144)."}
-            },
-            "required": ["artifact_id"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        args: &str,
-        _ctx: &jeikcode_kernel::tool::ToolContext,
-    ) -> jeikcode_kernel::tool::ToolResult {
-        let parsed: FetchArgs = match serde_json::from_str(args) {
-            Ok(a) => a,
-            Err(e) => return super::err(format!("invalid fetch_output args: {e}")),
-        };
-
-        let limit = parsed.limit.unwrap_or(FETCH_MAX_LIMIT).min(FETCH_MAX_LIMIT);
-
-        match self.store.get(&parsed.artifact_id, parsed.offset, limit) {
-            Ok(Some(bytes)) => {
-                // Total via an O(1) metadata stat, not a full re-read.
-                let total = self
-                    .store
-                    .size(&parsed.artifact_id)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0) as usize;
-                // Clamp the reported window to the artifact so an offset past the
-                // end yields a coherent "at end" hint (never "5000–5000 of 3000").
-                // `start <= total` holds, so `end` lands in `[start, total]`.
-                let start = parsed.offset.min(total);
-                let end = start.saturating_add(bytes.len()).min(total);
-                let body = String::from_utf8_lossy(&bytes);
-                let hint = if end < total {
-                    format!(
-                        "\n\n[showing bytes {start}–{end} of {total}; omit `limit` and call fetch_output(artifact_id=\"{}\", offset={end}) for more]",
-                        parsed.artifact_id
-                    )
-                } else {
-                    format!("\n\n[showing bytes {start}–{end} of {total} (end)]")
-                };
-                super::ok(format!("{body}{hint}"))
-            }
-            Ok(None) => super::err(format!(
-                "Artifact {} is no longer available (truncated captures don't survive across machines or after cleanup). \
-Re-run the original command to regenerate its output.",
-                parsed.artifact_id
-            )),
-            Err(e) => super::err(format!("fetch_output failed: {e}")),
-        }
-    }
-}
-
-#[cfg(test)]
-mod fetch_output_tests {
-    use super::*;
-    use jeikcode_kernel::tool::{Tool, ToolContext};
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext {
-            working_dir: dir.to_path_buf(),
-            cancel: CancellationToken::new(),
-            progress: jeikcode_kernel::tool::ProgressSink::noop(),
-            requester: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn fetch_slices_paginates_and_reports_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(ArtifactStore::new(dir.path()));
-        let id = store.put(&b"A".repeat(100_000)).unwrap();
-        let tool = FetchOutputTool::new(store.clone());
-        let test_ctx = ctx(dir.path());
-
-        // slice with explicit offset/limit
-        let r = tool
-            .execute(
-                &format!(r#"{{"artifact_id":"{}","offset":0,"limit":10}}"#, id),
-                &test_ctx,
-            )
-            .await;
-        assert!(!r.is_error, "first fetch should succeed: {}", r.content);
-        assert!(
-            r.content.starts_with("AAAAAAAAAA"),
-            "content should start with 10 As: {}",
-            r.content
-        );
-        assert!(
-            r.content.contains("of 100000"),
-            "pagination hint should mention total: {}",
-            r.content
-        );
-
-        // limit hard-capped at 256 KiB even if bigger requested
-        let r = tool
-            .execute(
-                &format!(r#"{{"artifact_id":"{}","offset":0,"limit":999999}}"#, id),
-                &test_ctx,
-            )
-            .await;
-        assert!(
-            !r.is_error,
-            "fetch with huge limit should succeed (get capped): {}",
-            r.content
-        );
-        assert!(
-            r.content.contains("100000") || r.content.contains(&FETCH_MAX_LIMIT.to_string()),
-            "pagination hint should show the hard cap or total: {}",
-            r.content
-        );
-
-        // missing artifact → terminal, actionable error, no "fetch" retry wording
-        let r = tool
-            .execute(
-                r#"{"artifact_id":"0000000000000000","offset":0,"limit":10}"#,
-                &test_ctx,
-            )
-            .await;
-        assert!(
-            r.is_error,
-            "missing artifact should be an error: {}",
-            r.content
-        );
-        assert!(
-            r.content.to_lowercase().contains("re-run"),
-            "error should tell user to re-run: {}",
-            r.content
-        );
-        assert!(
-            !r.content.to_lowercase().contains("try fetch again"),
-            "error should not suggest fetching again: {}",
-            r.content
-        );
-
-        // offset PAST the end → coherent "at end" hint, not "N–N of <smaller>".
-        let small = std::sync::Arc::new(ArtifactStore::new(dir.path()));
-        let sid = small.put(b"abc").unwrap(); // 3 bytes
-        let tool2 = FetchOutputTool::new(small);
-        let r = tool2
-            .execute(
-                &format!(r#"{{"artifact_id":"{}","offset":5000,"limit":10}}"#, sid),
-                &test_ctx,
-            )
-            .await;
-        assert!(!r.is_error, "past-end fetch is not an error: {}", r.content);
-        assert!(
-            r.content.contains("3–3 of 3 (end)"),
-            "past-end window clamps to total, coherent hint: {}",
-            r.content
+            r.content.contains("read(path=\"artifact://"),
+            "MCP truncation must instruct LLM to use read with the generated artifact ID"
         );
     }
 }

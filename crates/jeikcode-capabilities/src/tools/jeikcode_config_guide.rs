@@ -488,7 +488,6 @@ mod tests {
         assert!(!res.is_error);
         assert!(res.content.contains("init.yaml"));
         assert!(res.content.contains("rules.yaml"));
-        assert!(res.content.contains("root_docs_"));
         assert!(
             res.content.contains("动态热重载")
                 || res.content.contains("Dynamic Hot-Reload")

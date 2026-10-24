@@ -869,9 +869,7 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
             parts.extend(receipts);
             if let Some(id) = extract_artifact_id(output) {
                 parts.push(format!("artifact={id}"));
-                parts.push(format!(
-                    "fetch_output(artifact_id=\"{id}\", offset=0) to read more"
-                ));
+                parts.push(format!("read(path=\"artifact://{id}\") to read more"));
             }
             return format!("[{}]", parts.join(" | "));
         }
@@ -921,9 +919,7 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
     }
     if let Some(id) = extract_artifact_id(output) {
         parts.push(format!("artifact={id}"));
-        parts.push(format!(
-            "fetch_output(artifact_id=\"{id}\", offset=0) to read more"
-        ));
+        parts.push(format!("read(path=\"artifact://{id}\") to read more"));
     } else {
         parts.push(
             "full output compacted from history; re-run the original tool if you need every row"
@@ -1094,15 +1090,16 @@ mod tests {
     #[test]
     fn stub_preserves_artifact_id_for_fetch_output() {
         let out = format!(
-            "{}\n\n[jeikcode: output truncated — 20000 bytes total, showing first 4096 + last 4096 bytes. \
-Full output saved as artifact ae50a6f1c4d2e3f5. To read more: fetch_output(artifact_id=\"ae50a6f1c4d2e3f5\", offset, limit).]\n\n{}",
+            "{}\n\n[Middle section of output folded (50 lines elided), saved as artifact ae50a6f1c4d2e3f5. \
+If current information is insufficient to resolve the issue, call `read(path=\"artifact://ae50a6f1c4d2e3f5\", key_string=\"<keyword>\")` or `read(path=\"artifact://ae50a6f1c4d2e3f5\", offset=1, limit=200)` to inspect more. \
+Prefer key_string match over sequential reading to quickly retrieve target details.]\n\n{}",
             "H".repeat(100),
             "T".repeat(100)
         );
         let s = build_compact_stub("bash", &out, true);
         assert!(s.contains("artifact=ae50a6f1c4d2e3f5"), "{s}");
         assert!(
-            s.contains("fetch_output(artifact_id=\"ae50a6f1c4d2e3f5\""),
+            s.contains("read(path=\"artifact://ae50a6f1c4d2e3f5\")"),
             "{s}"
         );
     }
@@ -1148,8 +1145,8 @@ Dependencies verified.
              <task_result>\n\
              [Worker touched: src/auth/login.rs, ran: cargo check (ok)]\n\
              {}\n\
-             [jeikcode: output truncated — 20000 bytes total, showing first 4096 + last 4096 bytes. \
-             Full output saved as artifact cd01ef45ba890123. To read more: fetch_output(artifact_id=\"cd01ef45ba890123\", offset, limit).]\n\
+             [Middle section of output folded (50 lines elided), saved as artifact cd01ef45ba890123. \
+             If current information is insufficient to resolve the issue, call `read(path=\"artifact://cd01ef45ba890123\")` to inspect more.]\n\
              {}\n\
              </task_result>\n\
              </task>",
@@ -1164,14 +1161,14 @@ Dependencies verified.
         );
         assert!(s.contains("artifact=cd01ef45ba890123"), "{s}");
         assert!(
-            s.contains("fetch_output(artifact_id=\"cd01ef45ba890123\", offset=0)"),
+            s.contains("read(path=\"artifact://cd01ef45ba890123\") to read more"),
             "{s}"
         );
     }
 
     #[test]
     fn task_compact_stub_is_idempotent() {
-        let already_compacted = "[task ok: 42 lines | [Worker touched: src/lib.rs, ran: cargo check (ok)] | artifact=1234567890abcdef | fetch_output(artifact_id=\"1234567890abcdef\", offset=0) to read more]";
+        let already_compacted = "[task ok: 42 lines | [Worker touched: src/lib.rs, ran: cargo check (ok)] | artifact=1234567890abcdef | read(path=\"artifact://1234567890abcdef\") to read more]";
         let second_pass = build_compact_stub("task", already_compacted, true);
         assert_eq!(second_pass, already_compacted);
 
