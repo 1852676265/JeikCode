@@ -21,6 +21,26 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.1 (2026-10-24)
+
+- **[Installer & Desktop Reliability] Unblocked installation completion and graceful process lifecycle**:
+  - Replaced blocking synchronous environment broadcast with `user32::SendMessageTimeoutW` using `SMTO_ABORTIFHUNG (0x0002)`, eliminating 2-3 minute installer hangs on "Completed".
+  - Enhanced `NSIS_HOOK_PREINSTALL` to terminate running desktop, daemon, and helper instances and pre-clear locked binaries, resolving file-in-use errors during reinstallation.
+  - Added dedicated close `(X)` button, backdrop click dismissal, and `Esc` key handling to the remote access restart modal for reliable cancellation.
+  - Localized the System Settings "About & Version" section across 11 languages with dynamic active version badge.
+- **[Remote Access UI & Port Scaling Fix] Stabilized target port display across adjustments**:
+  - Removed erroneous `pending < livePort` auto-increment override in `RemoteAccessControl.tsx`, ensuring target port displays consistently when scaling down to lower port numbers.
+
+---
+
+- **[安装器与桌面可靠性加固] 消除安装完成阻塞与优雅进程生命周期管理**:
+  - 使用 Win32 `user32::SendMessageTimeoutW` 配合 `SMTO_ABORTIFHUNG (0x0002)` 替换同步广播，瞬间跳过无响应顶级窗口，彻底消除安装程序卡在 "Completed" 界面 2-3 分钟的问题。
+  - 增强 `NSIS_HOOK_PREINSTALL` 安装前钩子：强制终止运行中的桌面端、守护进程与后台残留，并预先清理安装目录旧二进制，解决覆盖安装时文件被占用的报错。
+  - 小地球远程访问重启确认弹窗增加右上角叉叉关闭按钮，并支持点击背景遮罩与 `Esc` 键直接取消退出。
+  - 系统设置「关于与版本」模块全面接入 11 种语言国际化并支持动态显示当前运行版本号。
+- **[远程访问面板端口调节修复] 稳定目标端口显示**:
+  - 移除 `RemoteAccessControl.tsx` 中低于当前端口误判为自动递增的旧逻辑，保证端口调小或调大时修改目标均稳定显示。
+
 ## v7.3.0-beta.0 (2026-10-24)
 
 - **[Desktop Architecture & Antivirus False-Positive Resolution] In-place execution, dropper elimination, and modular settings**:
