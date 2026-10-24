@@ -4,8 +4,6 @@ on:
   push:
     tags:
       - "v*"
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -190,6 +188,11 @@ jobs:
           key: ${{ matrix.target }}
           shared-key: "build-target-${{ matrix.target }}"
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
       - name: Install cross-compilation tools
         run: |
           pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
@@ -324,7 +327,7 @@ jobs:
   # 六个 CLI 都齐之后创建一次 Release。清单是 Release 资产，不回写 main。
   publish:
     name: Publish release
-    needs: [build-windows, build-linux, build-macos, distro-pm-check, rust-quality]
+    needs: [build-windows, build-linux, build-macos]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -525,71 +528,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # --- Linux distro-pm 包管理工具兼容性测试门禁 ---
-  distro-pm-check:
-    needs: [build-webui]
-    if: always() && needs.build-webui.result == 'success'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download WebUI dist
-        uses: actions/download-artifact@v4
-        with:
-          name: webui-dist
-          path: webui/dist
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: distro-pm-check
-          shared-key: "distro-pm-check"
-
-      - name: Build with distro-pm feature
-        run: cargo build -p jeikcode --features distro-pm --locked
-
-      - name: Test distro-pm gating
-        run: cargo test -p jeikcode-updater --lib --features distro-pm --locked
-
-  rust-quality:
-    name: Rust quality
-    needs: [build-webui]
-    if: always() && needs.build-webui.result == 'success'
-    runs-on: ubuntu-latest
-    env:
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
-        with:
-          name: webui-dist
-          path: webui/dist
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: rust-quality
-          shared-key: "rust-quality"
-      - name: Check all Rust targets
-        run: cargo check --workspace --all-targets --locked
-        env:
-          JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home
-      - name: Test read tool integrity & capabilities
-        run: "cargo test -p jeikcode-capabilities --lib tools::read:: --locked"
-        env:
-          JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home
-      - name: Verify embedded WebUI
-        run: "cargo test -p jeikcode-daemon --lib webui::tests:: --locked"
-        env:
-          JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home

@@ -3,8 +3,20 @@ name: Beta native portability
 on:
   pull_request:
     branches: [beta]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'docs-site/**'
+      - '.vscode/**'
+      - 'LICENSE*'
   push:
     branches: [beta]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'docs-site/**'
+      - '.vscode/**'
+      - 'LICENSE*'
   workflow_dispatch:
 
 permissions:
@@ -41,6 +53,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "portability-native-${{ matrix.os }}"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -93,6 +109,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "portability-feature-subsets-${{ matrix.features }}"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
