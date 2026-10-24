@@ -21,6 +21,30 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.2 (2026-10-24)
+
+- **[Desktop Process Supervision & Lifecycle Hardening] Event-driven supervision, anti-orphan guarantee, and close-to-tray restoration**:
+  - Replaced polling loops in the desktop supervisor with blocking kernel-level pipe EOF signals (0% idle CPU) and explicit restart intent exit codes (`75`), eliminating unbounded respawn loops and process decoupling during restarts or in-place upgrades.
+  - Enforced dual anti-orphan protection on Windows via Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) and cross-platform stdin pipe EOF lifelines, guaranteeing all background daemon processes terminate instantly when the desktop shell exits.
+  - Fixed single-instance desktop shortcut reactivation where closing the restored window was unresponsive by synchronizing internal `tao` window visibility states.
+- **[Launch Mode Self-Identification & Multi-Platform Service Sync] Cross-platform daemon restart and persistent autostart configuration**:
+  - Implemented launch mode self-identification across Linux systemd, OpenWrt procd, macOS launchd, Windows logon tasks, desktop shells, and foreground terminals.
+  - Automatically synchronized and rewrote service definitions with updated host, port, and token parameters upon remote configuration changes or self-upgrades, preventing settings rollback after system reboots.
+  - Automatically skipped interactive service setup wizards on restart successors to eliminate background process hangs.
+  - Upgraded remote access health probing using `no-cors` mode to bypass cross-port CORS restrictions, ensuring reliable reconnection for remote LAN/WAN browsers.
+
+---
+
+- **[桌面端进程监管与生命周期加固] 纯事件驱动监管、内核级防孤儿保障与托盘唤醒修复**:
+  - 桌面壳废除轮询循环，重构为阻塞监听子进程管道的内核级 EOF 事件（空闲时 0% CPU 占用），并引入显式重启退出码 `75`，消除升级与换端口后的实例脱节与无限重拉死循环。
+  - 在 Windows 上通过 Win32 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）与跨平台 stdin 管道 EOF 双保险绑定子进程，确保桌面壳退出或崩溃时内核级瞬间终结所有子进程，彻底消除孤儿进程。
+  - 修复通过快捷方式单实例唤起桌面端后点击关闭无反应的缺陷，在唤醒时同步对齐 `tao` 底层窗口可见性状态。
+- **[启动方式全平台自识别与服务配置同步] 多平台服务无缝重启与自启配置持久化**:
+  - 实现启动模式全平台自识别（Linux systemd、OpenWrt procd、macOS launchd、Windows 登录自启、桌面壳托管及前台终端）。
+  - 在异地访问修改端口/主机/Token 或升级重启时，自动识别当前启动方式并同步重写对应的系统服务定义文件，确保系统重启后依然加载最新配置。
+  - 重启后继进程自动跳过交互式服务引导向导，防止后台服务被卡在终端输入导致假死。
+  - 优化前端远程访问面板健康检查，采用 `no-cors` 探活绕过跨端口 CORS 拦截，确保局域网/公网异地访问平滑重连。
+
 ## v7.3.0-beta.1 (2026-10-24)
 
 - **[Installer & Desktop Reliability] Unblocked installation completion and graceful process lifecycle**:
