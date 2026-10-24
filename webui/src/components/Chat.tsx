@@ -266,6 +266,7 @@ import {
   ensureWorkingAssistant,
   paintUserMessage,
   placeRecoveredTurnUsers,
+  mergeOlderMessages,
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
@@ -1881,7 +1882,9 @@ export function Chat({
           if (activeIdRef.current === id) continue;
           if (!session || !Array.isArray(session.messages)) continue;
           const loaded = sessionMessagesToDisplay(session.messages, session.offset ?? 0, session.pinned_user_index);
-          messageCacheRef.current.set(id, loaded);
+          const cached = messageCacheRef.current.get(id) ?? [];
+          const merged = cached.length > loaded.length ? mergeOlderMessages(loaded, cached) : loaded;
+          messageCacheRef.current.set(id, merged);
           const surface = hydrateSession(
             loaded,
             session.todos,
@@ -2230,9 +2233,10 @@ export function Chat({
       diskHasUser,
     });
     if (adoptSettledDisk) {
-      messagesRef.current = disk;
-      messageCacheRef.current.set(id, disk);
-      setMessages(disk);
+      const merged = canvas.length > disk.length ? mergeOlderMessages(disk, canvas) : disk;
+      messagesRef.current = merged;
+      messageCacheRef.current.set(id, merged);
+      setMessages(merged);
     }
     if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
       return true;
@@ -2273,7 +2277,8 @@ export function Chat({
         : (messageCacheRef.current.get(sid) ?? []);
       // 立即发送会先把用户气泡画上。停止触发的这次对账往往早于落盘，
       // 直接覆盖会把气泡抹掉，直到刷新才从磁盘重新出现。
-      const merged = mergeDiskWithUnpersistedTail(loaded, canvas);
+      const baseCanvas = canvas.length > loaded.length ? mergeOlderMessages(loaded, canvas) : loaded;
+      const merged = mergeDiskWithUnpersistedTail(baseCanvas, canvas);
       const keptUnpersistedTail = merged.length !== loaded.length;
       messageCacheRef.current.set(sid, merged);
       void saveSessionCache(
@@ -3161,14 +3166,18 @@ export function Chat({
               const hasUnfinishedTool = lastCur?.parts?.some(
                 (p) => p.kind === 'tool' && p.tool?.status === 'pending'
               );
+              const diskCountDiffer = diskOffset === 0 && loaded.length !== messagesRef.current.length;
               const shouldUpdate =
-                loaded.length !== messagesRef.current.length ||
+                diskCountDiffer ||
                 hasUnfinishedTool ||
                 JSON.stringify(lastLoaded?.parts) !== JSON.stringify(lastCur?.parts);
               if (shouldUpdate) {
-                messageCacheRef.current.set(sessionId, loaded);
-                messagesRef.current = loaded;
-                setMessages(loaded);
+                const updated = messagesRef.current.length > loaded.length
+                  ? mergeOlderMessages(loaded, messagesRef.current)
+                  : loaded;
+                messageCacheRef.current.set(sessionId, updated);
+                messagesRef.current = updated;
+                setMessages(updated);
                 if (res.turns && res.turns.length > 0) {
                   turnOutlineBySessionRef.current.set(sessionId, res.turns);
                   setTurnOutline(res.turns);
@@ -3369,13 +3378,14 @@ export function Chat({
               // 切走时留下的残缺缓存缺少了后台跑完后落盘的最终正文消息
               const cacheMissingSettled = (!turnActive || serverActive === false) && diskHasUser && cacheMissingSettledAssistant(currentCached, loaded);
               // 关键修复：当会话未处于活跃轮次时，如果磁盘与缓存的消息结构或内容不一致（例如发生删除、改写或截断），以磁盘持久化为最高真相源！
-              const diskCountDiffer = (!turnActive || serverActive === false) && !cacheInFlight && loaded.length !== currentCached.length;
-              const diskUserDiffer = (!turnActive || serverActive === false) && !cacheInFlight && loadedUserCount !== cachedUserCount;
+              // 注意：当 diskOffset > 0 时，loaded 只是尾部 HISTORY_PAGE 窗口，不能拿切片长度去误判已翻看过更早历史的全量缓存！
+              const diskCountDiffer = (!turnActive || serverActive === false) && !cacheInFlight && diskOffset === 0 && loaded.length !== currentCached.length;
+              const diskUserDiffer = (!turnActive || serverActive === false) && !cacheInFlight && diskOffset === 0 && loadedUserCount !== cachedUserCount;
               // 上下文压缩会把硬盘上的老消息换成一条摘要 → 硬盘比画布**更短**。
               // 显示只增不减：这种情况绝不能用硬盘覆盖画布（否则显示被阑割）。
               const diskShrank = diskHasUser && transcriptTextLen(loaded) < transcriptTextLen(currentCached);
               const cacheContentStale = !diskShrank && (!turnActive || serverActive === false) && !cacheInFlight && (
-                diskCountDiffer || diskUserDiffer || (diskHasUser && transcriptTextLen(loaded) !== transcriptTextLen(currentCached))
+                diskCountDiffer || diskUserDiffer || (diskOffset === 0 && diskHasUser && transcriptTextLen(loaded) !== transcriptTextLen(currentCached))
               );
 
               // 仅当缓存落后于磁盘最新状态，或磁盘内容被改写/删除产生结构差异时采用磁盘覆盖；
@@ -3383,10 +3393,13 @@ export function Chat({
               const shouldAdoptDisk = !cacheHasInFlightUser && !diskShrank && (cacheMissingUser || cacheMissingSettled || (!turnActive && !cacheInFlight && diskHasUser && diskHasNewContent) || cacheContentStale);
 
               if (shouldAdoptDisk) {
-                displayMessages = loaded;
-                messagesRef.current = loaded;
-                messageCacheRef.current.set(loadId, loaded);
-                setMessages(loaded);
+                const adoptingMessages = currentCached.length > loaded.length
+                  ? mergeOlderMessages(loaded, currentCached)
+                  : loaded;
+                displayMessages = adoptingMessages;
+                messagesRef.current = adoptingMessages;
+                messageCacheRef.current.set(loadId, adoptingMessages);
+                setMessages(adoptingMessages);
                 if (scrollRef.current && atBottomRef.current) {
                   scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
                   timelineFollow.jump();
@@ -4031,18 +4044,9 @@ export function Chat({
     return loaded;
   }
 
-  /** 往前补页时，首屏钉住的那条提问已经在画布上，按 id / 绝对下标去掉重复。 */
+  /** 往前补页时，首屏钉住的那条提问已经在画布上，按 id / 绝对下标严格去重并按时序升序对齐。 */
   function prependOlderMessages(prev: Message[], older: Message[]): Message[] {
-    const seenId = new Set(prev.map((m) => m.id).filter((id): id is string => !!id));
-    const seenIndex = new Set(
-      prev.map((m) => m.sourceIndex).filter((n): n is number => typeof n === 'number'),
-    );
-    const fresh = older.filter((m) => {
-      if (m.id && seenId.has(m.id)) return false;
-      if (typeof m.sourceIndex === 'number' && seenIndex.has(m.sourceIndex)) return false;
-      return true;
-    });
-    return [...fresh, ...prev];
+    return mergeOlderMessages(prev, older);
   }
 
   // ── Live SSE adapter: map LiveWireEvent → SSEEvent (for variants that overlap) ──

@@ -12,6 +12,7 @@ import {
   paintCachedAssistantDelta,
   paintUserMessage,
   placeRecoveredTurnUsers,
+  mergeOlderMessages,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -913,5 +914,49 @@ test('这一轮还没落盘时，补回的提问作为新回合追加并带上 W
   assert.equal(placed[1]?.role, 'user');
   assert.equal(placed[2]?.role, 'assistant');
   assert.equal(placed[2]?.parts.length, 0);
+});
+
+test('mergeOlderMessages 解决首屏 pinned 提问在加载更早历史时被工具调用倒插问题', () => {
+  // 模拟首屏仅加载 tail:48，其中第一条是 pinned 用户提问 (sourceIndex: 31)，第二条是截断线后的工具输出 (sourceIndex: 132)
+  const prev = [
+    { role: 'user', id: 'u-31', sourceIndex: 31, parts: [{ kind: 'text' as const, text: '为什么出错了？' }] },
+    { role: 'assistant', id: 'a-132', sourceIndex: 132, parts: [{ kind: 'tool' as const, tool: { id: 'call_132', name: 'read', args: '', status: 'done' as const } }] },
+  ];
+
+  // 模拟向前翻页加载了包括 30(上一轮回答), 31(本轮提问), 32(本轮工具1), 33(本轮工具2) 等历史
+  const older = [
+    { role: 'assistant', id: 'a-30', sourceIndex: 30, parts: [{ kind: 'text' as const, text: '上一轮回答' }] },
+    { role: 'user', id: 'u-31', sourceIndex: 31, parts: [{ kind: 'text' as const, text: '为什么出错了？' }] },
+    { role: 'assistant', id: 'a-32', sourceIndex: 32, parts: [{ kind: 'tool' as const, tool: { id: 'call_32', name: 'code_explore', args: '', status: 'done' as const } }] },
+    { role: 'assistant', id: 'a-33', sourceIndex: 33, parts: [{ kind: 'tool' as const, tool: { id: 'call_33', name: 'grep', args: '', status: 'done' as const } }] },
+  ];
+
+  const merged = mergeOlderMessages(prev, older);
+
+  // 校验：消息必须按 sourceIndex 严格排列：30 -> 31 -> 32 -> 33 -> 132
+  // 提问 31 必须稳稳落在上一轮回答 30 之后，本轮工具 32 之前！
+  assert.equal(merged.length, 5);
+  assert.equal(merged[0]?.sourceIndex, 30);
+  assert.equal(merged[1]?.sourceIndex, 31);
+  assert.equal(merged[1]?.role, 'user');
+  assert.equal(merged[2]?.sourceIndex, 32);
+  assert.equal(merged[3]?.sourceIndex, 33);
+  assert.equal(merged[4]?.sourceIndex, 132);
+});
+
+test('mergeOlderMessages 正确处理在途/无 sourceIndex 的实时末尾消息', () => {
+  const prev = [
+    { role: 'user', id: 'u-1', sourceIndex: 10 },
+    { role: 'assistant', id: 'a-live', parts: [{ kind: 'text' as const, text: '正在输出中...' }] },
+  ];
+  const older = [
+    { role: 'user', id: 'u-0', sourceIndex: 5 },
+  ];
+
+  const merged = mergeOlderMessages(prev, older);
+  assert.equal(merged.length, 3);
+  assert.equal(merged[0]?.sourceIndex, 5);
+  assert.equal(merged[1]?.sourceIndex, 10);
+  assert.equal(merged[2]?.id, 'a-live');
 });
 

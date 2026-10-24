@@ -173,7 +173,7 @@ impl Tool for BashTool {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The command in the selected shell's native syntax. On Windows, send PowerShell cmdlets directly with shell=powershell; never nest powershell -Command inside the default shell." },
+                "command": { "type": "string", "description": "The command in the selected shell's native syntax. On Windows, send PowerShell cmdlets directly with shell=powershell; never nest powershell -Command inside the default shell. In PowerShell, prefer single quotes ('...') for paths and strings with backslashes to avoid unterminated quote syntax errors." },
                 "cwd": {
                     "type": "string",
                     "description": "Optional working directory for the command. Relative paths resolve against the workspace root. If omitted, defaults to the current workspace root directory."
@@ -1275,7 +1275,10 @@ fn shell_tool_description(
              `powershell -Command` inside cmd.exe. Native PowerShell mode uses EncodedCommand, so \
              UNC backslashes and a trailing `$` reach PowerShell unchanged. Quote the path inside \
              the script and use `-LiteralPath`, for example \
-             `Get-ChildItem -LiteralPath '\\\\server\\share$'`. Always quote paths \
+             `Get-ChildItem -LiteralPath '\\\\server\\share$'`. In PowerShell, prefer single quotes \
+             (`'...'`) for paths or literals with backslashes (e.g. `TrimEnd('\\\\')`); in double \
+             quotes, a trailing `\\\"` is parsed as an escaped quote and triggers an unclosed-string \
+             syntax error. Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
              The dedicated file tools above (read / grep / glob) also \
@@ -1294,7 +1297,10 @@ fn shell_tool_description(
              bash-native `//server/share$`, or set this tool's `shell` argument to `powershell` \
              and run `Get-ChildItem -LiteralPath '\\\\server\\share$'`. Native PowerShell mode \
              uses EncodedCommand and does not pass through Bash, so backslashes and `$` are not \
-             consumed by an outer shell. Do NOT nest `pwsh -Command` inside Bash.\n\
+             consumed by an outer shell. In PowerShell, prefer single quotes (`'...'`) for paths or \
+             literals with backslashes (e.g. `TrimEnd('\\\\')`); in double quotes, a trailing `\\\"` \
+             is parsed as an escaped quote and triggers an unclosed-string syntax error. \
+             Do NOT nest `pwsh -Command` inside Bash.\n\
              Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
              NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
              equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above.\n\
@@ -3366,6 +3372,10 @@ fn format_streams(
         s.push_str(&stderr);
         if stderr.contains("unexpected EOF while looking for matching") {
             s.push_str("\n[Self-Healing Guidance: Shell command failed with an unmatched quote or quote escaping conflict. For complex inline Python/Node scripts on Windows, consider: 1. Pass `shell: \"powershell\"`; 2. Write the code to a file via `write_file` and execute it; 3. Ensure balanced quotes.]\n");
+        } else if stderr.contains("字符串缺少终止符")
+            || stderr.contains("The string is missing the terminator")
+        {
+            s.push_str("\n[Self-Healing Guidance: PowerShell command failed with an unterminated string. In PowerShell, `\\\"` inside double quotes is treated as an escaped quote rather than string closing; prefer single quotes `'...'` for strings/paths with backslashes (e.g. `TrimEnd('\\\\')`).]\n");
         }
     }
     match exit {

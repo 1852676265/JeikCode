@@ -658,3 +658,60 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
   }
   return [...messages, { role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T];
 }
+
+/**
+ * 往前补页时，首屏钉住的那条提问可能已经在画布上。
+ * 合并更早历史与现有画布时：
+ * 1. 按 id 和 sourceIndex 严格去重，避免重复渲染；
+ * 2. 保证所有具备 sourceIndex 的历史消息严格按照服务端绝对索引升序排列；
+ *    彻底防止因首屏 pinned 置顶提问在向前翻页拼接时被挤到后续工具调用下方的倒插 BUG！
+ * 3. 无 sourceIndex 的在途/实时消息保持在末尾原有相对顺序。
+ */
+export function mergeOlderMessages<T extends { id?: string; sourceIndex?: number }>(
+  prev: T[],
+  older: T[],
+): T[] {
+  if (!older || older.length === 0) return prev;
+  if (!prev || prev.length === 0) return older;
+
+  const seenIds = new Set<string>();
+  const seenIndices = new Set<number>();
+  const merged: T[] = [];
+
+  // 先把 older 依次放入（older 是更早的历史，其内部自然有序）
+  for (const m of older) {
+    if (m.id) seenIds.add(m.id);
+    if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
+    merged.push(m);
+  }
+
+  // 检查 prev 中的消息
+  for (const m of prev) {
+    if (m.id && seenIds.has(m.id)) continue;
+    if (typeof m.sourceIndex === 'number' && seenIndices.has(m.sourceIndex)) continue;
+    if (m.id) seenIds.add(m.id);
+    if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
+    merged.push(m);
+  }
+
+  // 对所有包含 sourceIndex 的历史消息进行稳定升序排序，无 sourceIndex 的在途实时消息排在末尾
+  const indexed = merged.map((item, originalIdx) => ({ item, originalIdx }));
+  indexed.sort((a, b) => {
+    const aIdx = typeof a.item.sourceIndex === 'number' ? a.item.sourceIndex : null;
+    const bIdx = typeof b.item.sourceIndex === 'number' ? b.item.sourceIndex : null;
+
+    if (aIdx !== null && bIdx !== null) {
+      if (aIdx !== bIdx) return aIdx - bIdx;
+      return a.originalIdx - b.originalIdx;
+    }
+    if (aIdx !== null && bIdx === null) {
+      return -1;
+    }
+    if (aIdx === null && bIdx !== null) {
+      return 1;
+    }
+    return a.originalIdx - b.originalIdx;
+  });
+
+  return indexed.map((x) => x.item);
+}
