@@ -75,13 +75,19 @@ export function RemoteAccessControl() {
   }, []);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open && !showRestartModal) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key === 'Escape') {
+        if (showRestartModal && !restarting) {
+          setShowRestartModal(false);
+        } else if (open) {
+          setOpen(false);
+        }
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open]);
+  }, [open, showRestartModal, restarting]);
 
   useEffect(() => {
     if (!open) return;
@@ -346,6 +352,7 @@ export function RemoteAccessControl() {
         class="modal-card remote-access-restart-card"
         onClick={(e) => e.stopPropagation()}
         style={{
+          position: 'relative',
           maxWidth: '440px',
           padding: '24px',
           borderRadius: '16px',
@@ -355,6 +362,27 @@ export function RemoteAccessControl() {
           boxShadow: '0 20px 40px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.1)',
         }}
       >
+        {!restarting && (
+          <button
+            type="button"
+            class="btn btn-ghost modal-close"
+            onClick={() => setShowRestartModal(false)}
+            aria-label={t('settings.close') || 'Close'}
+            style={{
+              position: 'absolute',
+              top: '16px',
+              right: '16px',
+              padding: '6px',
+              borderRadius: '8px',
+              color: 'var(--text-muted, #9ca3af)',
+              cursor: 'pointer',
+            }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        )}
         <div style={{ textAlign: 'center', marginBottom: '18px' }}>
           <div
             style={{

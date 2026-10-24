@@ -27,10 +27,18 @@ FunctionEnd
 !endif
 
 !macro NSIS_HOOK_PREINSTALL
-  ; Terminate any existing running instances of desktop or daemon before extracting/overwriting files
+  ; Terminate all existing running instances of desktop and daemon before extracting files
   nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
   nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
-  Sleep 600
+  nsExec::Exec 'taskkill /F /IM "jeikcode-daemon.exe" /T'
+  nsExec::Exec 'taskkill /F /IM "cli-bin.exe" /T'
+  Sleep 800
+
+  ; Clean up potentially locked old binaries in installation directory
+  IfFileExists "$INSTDIR\resources\jeikcode.exe" 0 +2
+    Delete "$INSTDIR\resources\jeikcode.exe"
+  IfFileExists "$INSTDIR\resources\cli-bin" 0 +2
+    Delete "$INSTDIR\resources\cli-bin"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -41,9 +49,11 @@ FunctionEnd
 
   ; Register $INSTDIR and $INSTDIR\resources into user PATH environment variable
   ReadRegStr $0 HKCU "Environment" "Path"
+  StrCpy $2 0 ; $2 tracks whether PATH was modified
+
   ${If} $0 == ""
     WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$INSTDIR"
-    SendMessage ${HWND_BROADCAST} 0x001A 0 "STR:Environment" /TIMEOUT=5000
+    StrCpy $2 1
   ${Else}
     ; Append $INSTDIR\resources if not already present
     Push "$0"
@@ -52,8 +62,8 @@ FunctionEnd
     Pop $1
     ${If} $1 == ""
       WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\resources;$0"
-      SendMessage ${HWND_BROADCAST} 0x001A 0 "STR:Environment" /TIMEOUT=5000
       ReadRegStr $0 HKCU "Environment" "Path"
+      StrCpy $2 1
     ${EndIf}
 
     ; Append $INSTDIR if not already present
@@ -63,8 +73,14 @@ FunctionEnd
     Pop $1
     ${If} $1 == ""
       WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
-      SendMessage ${HWND_BROADCAST} 0x001A 0 "STR:Environment" /TIMEOUT=5000
+      StrCpy $2 1
     ${EndIf}
+  ${EndIf}
+
+  ; Broadcast WM_SETTINGCHANGE with SMTO_ABORTIFHUNG (0x0002) to skip hung windows immediately
+  ; This prevents the installer from blocking 2-3 minutes at "Completed" waiting for hung processes.
+  ${If} $2 == 1
+    System::Call 'user32::SendMessageTimeoutW(p 0xFFFF, i 0x001A, p 0, w "Environment", i 0x0002, i 1000, *p 0)'
   ${EndIf}
 
   ; Clean up legacy ~/.local/bin files if left by older dropper versions
@@ -83,7 +99,8 @@ FunctionEnd
   ; Terminate any running instances before uninstalling
   nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
   nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
-  Sleep 600
+  nsExec::Exec 'taskkill /F /IM "jeikcode-daemon.exe" /T'
+  Sleep 800
 !macroend
 
 !macro NSIS_HOOK_UNINSTALL

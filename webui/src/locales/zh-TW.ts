@@ -695,6 +695,8 @@ export const zhTw: Record<keyof typeof en, string> = {
   'settings.closeActionAsk': '每次詢問我',
   'settings.savedSuccess': '設定已儲存',
   'settings.aboutTitle': '關於 JeikCode',
+  'settings.aboutDesc': '高效能智慧程式設計助理',
+  'settings.aboutFeatures': '獨立安裝與執行架構 · 防毒軟體零誤報 · 原生跨平台',
   'desktop.closePromptTitle': '關閉 JeikCode',
   'desktop.closePromptDesc': '是否最小化到系統匣並保持背景執行？',
   'desktop.rememberChoice': '記住我的選擇（可隨時在系統設定中修改）',

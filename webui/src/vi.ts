@@ -508,6 +508,8 @@ export const vi: Record<keyof typeof en, string> = {
   'settings.closeActionAsk': 'Hỏi tôi mỗi lần đóng',
   'settings.savedSuccess': 'Đã lưu cài đặt',
   'settings.aboutTitle': 'Giới thiệu JeikCode',
+  'settings.aboutDesc': 'Trợ lý lập trình thông minh hiệu năng cao',
+  'settings.aboutFeatures': 'Kiến trúc cài đặt và chạy độc lập · Không báo động giả chống virus · Đa nền tảng nguyên bản',
   'desktop.closePromptTitle': 'Đóng JeikCode',
   'desktop.closePromptDesc': 'Thu nhỏ vào khay hệ thống và tiếp tục chạy nền?',
   'desktop.rememberChoice': 'Ghi nhớ lựa chọn của tôi (có thể thay đổi trong Cài đặt hệ thống)',

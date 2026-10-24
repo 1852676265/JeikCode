@@ -695,6 +695,8 @@ export const ar: Record<keyof typeof en, string> = {
   'settings.closeActionAsk': 'Ask me every time',
   'settings.savedSuccess': 'Settings saved',
   'settings.aboutTitle': 'About JeikCode',
+  'settings.aboutDesc': 'High-performance intelligent coding assistant',
+  'settings.aboutFeatures': 'Standalone installation and runtime · Zero antivirus false-positives · Native cross-platform',
   'desktop.closePromptTitle': 'Close JeikCode',
   'desktop.closePromptDesc': 'Minimize to system tray and keep running in background?',
   'desktop.rememberChoice': 'Remember my choice (can be changed in System Settings anytime)',

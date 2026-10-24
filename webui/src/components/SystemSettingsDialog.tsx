@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { getDesktopSettings, postDesktopSettings, type DesktopSettings } from '../api';
+import { getDesktopSettings, postDesktopSettings, getHealth, type DesktopSettings } from '../api';
+import { bakedAppVersion, normalizeAppVersion } from '../lib/appVersion';
 import { useT } from '../settings';
 
 interface SystemSettingsDialogProps {
@@ -23,6 +24,7 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [appVersion, setAppVersion] = useState(bakedAppVersion());
 
   const tabs: ModuleTab[] = [
     { key: 'desktop', labelKey: 'settings.tabDesktop', defaultLabel: '桌面与系统', icon: '🖥️' },
@@ -41,6 +43,20 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
         if (!cancelled) setLoading(false);
       });
 
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getHealth()
+      .then((info) => {
+        if (cancelled) return;
+        const running = normalizeAppVersion(info.version);
+        if (running) setAppVersion(running);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -247,7 +263,7 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
             {activeTab === 'about' && (
               <div>
                 <h4 style={{ margin: '0 0 16px', fontSize: '15px', fontWeight: 600 }}>
-                  {t('settings.aboutTitle') || '关于 JeikCode'}
+                  {t('settings.aboutTitle')}
                 </h4>
                 <div
                   style={{
@@ -259,9 +275,29 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
                     lineHeight: '1.8',
                   }}
                 >
-                  <div><strong>JeikCode</strong> — 高性能智能编程助手</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                    <strong style={{ fontSize: '15px' }}>JeikCode</strong>
+                    {appVersion && (
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          fontFamily: 'monospace',
+                          padding: '1px 7px',
+                          borderRadius: '4px',
+                          background: 'var(--app-accent-subtle, rgba(59, 130, 246, 0.15))',
+                          color: 'var(--accent-color, #3b82f6)',
+                          fontWeight: 600,
+                        }}
+                      >
+                        v{appVersion}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ color: 'var(--app-primary-foreground, #fff)', marginBottom: '4px', fontWeight: 500 }}>
+                    {t('settings.aboutDesc')}
+                  </div>
                   <div style={{ color: 'var(--text-muted, #9ca3af)', fontSize: '12.5px' }}>
-                    独立安装与运行架构 · 杀毒软件零误报 · 原生跨平台
+                    {t('settings.aboutFeatures')}
                   </div>
                 </div>
               </div>
