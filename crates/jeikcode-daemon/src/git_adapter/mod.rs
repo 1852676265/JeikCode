@@ -293,6 +293,45 @@ pub struct GitAdapterConfig {
     pub token_expires_at: Option<u64>,
 }
 
+impl GitAdapterConfig {
+    /// 检查当前配置是否为合法的 GitHub App 模式。
+    /// 目前仅 GitHub App 模式允许启用自动化审查，PAT 模式已被强制永久禁用。
+    pub fn is_github_app_mode(&self) -> bool {
+        if self.channel.to_lowercase().trim() != "github" {
+            return false;
+        }
+        let has_app_id = self
+            .github_app_id
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_key = self
+            .github_app_private_key
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+            || self
+                .github_app_private_key_path
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+        has_app_id && has_key
+    }
+
+    /// 规范化与安全约束：如果启用了但不是 GitHub App 模式（即使用了 PAT 模式），强制禁用
+    pub fn sanitize_security_constraints(&mut self) {
+        if self.enabled && !self.is_github_app_mode() {
+            tracing::warn!(
+                "[git_adapter] Project `{}` attempted to enable automation in PAT mode (channel: `{}`). Forcibly disabling per security policy.",
+                self.project_hash,
+                self.channel
+            );
+            self.enabled = false;
+            self.last_enabled_state = false;
+        }
+    }
+}
+
 fn default_keyword() -> String {
     "@bot".to_string()
 }
@@ -467,7 +506,24 @@ fn load_from_disk() -> HashMap<String, GitAdapterConfig> {
     let Ok(bytes) = std::fs::read(&path) else {
         return HashMap::new();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    let mut map: HashMap<String, GitAdapterConfig> =
+        serde_json::from_slice(&bytes).unwrap_or_default();
+    let mut modified = false;
+    for cfg in map.values_mut() {
+        if cfg.enabled && !cfg.is_github_app_mode() {
+            tracing::warn!(
+                "[git_adapter] Forcibly disabling project `{}` which was previously enabled with PAT mode",
+                cfg.project_hash
+            );
+            cfg.enabled = false;
+            cfg.last_enabled_state = false;
+            modified = true;
+        }
+    }
+    if modified {
+        save_to_disk(&map);
+    }
+    map
 }
 
 fn save_to_disk(map: &HashMap<String, GitAdapterConfig>) {
@@ -502,10 +558,12 @@ pub fn find_binding_by_repo(repo_full_name: &str) -> Option<GitAdapterConfig> {
 }
 
 /// 保存或更新项目绑定配置
-pub fn save_binding(config: GitAdapterConfig) {
+pub fn save_binding(mut config: GitAdapterConfig) {
     if config.project_hash.is_empty() {
         return;
     }
+    // 强制执行安全策略：PAT 模式一律强制禁用
+    config.sanitize_security_constraints();
     if let Ok(mut lock) = get_cache().lock() {
         lock.insert(config.project_hash.clone(), config);
         save_to_disk(&lock);
@@ -529,7 +587,8 @@ pub fn disable_binding_for_project(project_hash: &str) {
 pub fn restore_binding_for_project(project_hash: &str) {
     if let Ok(mut lock) = get_cache().lock() {
         if let Some(cfg) = lock.get_mut(project_hash) {
-            if cfg.last_enabled_state && !cfg.enabled {
+            // 仅在合法 GitHub App 模式下才允许恢复启用
+            if cfg.last_enabled_state && !cfg.enabled && cfg.is_github_app_mode() {
                 cfg.enabled = true;
                 save_to_disk(&lock);
             }
@@ -543,6 +602,14 @@ pub fn get_all_bindings() -> Vec<GitAdapterConfig> {
         return Vec::new();
     };
     lock.values().cloned().collect()
+}
+
+/// 检查系统中是否存在任何处于开启状态且配置为合法 GitHub App 模式的项目
+pub fn is_any_git_automation_active() -> bool {
+    let Ok(lock) = get_cache().lock() else {
+        return false;
+    };
+    lock.values().any(|c| c.enabled && c.is_github_app_mode())
 }
 
 #[cfg(test)]

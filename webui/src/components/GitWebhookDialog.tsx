@@ -307,8 +307,17 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
         payloadUrl = getLastWebhookHost();
       }
 
-      const isEnabled = parsed.enabled ?? false;
-      const lastEnabled = parsed.lastEnabledState ?? parsed.last_enabled_state ?? isEnabled;
+      const ch = parsed.channel || defaultConfig.channel;
+      const isGithub = ch === 'github';
+      // 核心安全防线：只有在 GitHub App 模式下才允许开启，PAT 模式强制禁用且无法开启
+      const hasAppCreds = Boolean(
+        parsed.githubAppId || parsed.github_app_id ||
+        parsed.githubAppPrivateKey || parsed.github_app_private_key ||
+        parsed.githubAppPrivateKeyPath || parsed.github_app_private_key_path
+      );
+      const isAppMode = isGithub && hasAppCreds;
+      const isEnabled = isAppMode ? (parsed.enabled ?? false) : false;
+      const lastEnabled = isAppMode ? (parsed.lastEnabledState ?? parsed.last_enabled_state ?? isEnabled) : false;
 
       return {
         ...defaultConfig,
@@ -351,10 +360,18 @@ export function toCleanApiPayload(config: GitAdapterConfig, projectHash: string)
     ? normalizeWebhookHost(config.webhook.payloadUrl).replace(/\/+$/, '')
     : '';
 
+  const isGithub = (config.channel || 'github') === 'github';
+  const hasAppCreds = Boolean(
+    config.githubAppId?.trim() || config.githubAppPrivateKey || config.githubAppPrivateKeyPath?.trim()
+  );
+  const isAppMode = isGithub && hasAppCreds;
+  const safeEnabled = isAppMode ? Boolean(config.enabled) : false;
+  const safeLastEnabled = isAppMode ? Boolean(config.lastEnabledState) : false;
+
   return {
     projectHash,
-    enabled: Boolean(config.enabled),
-    lastEnabledState: Boolean(config.lastEnabledState),
+    enabled: safeEnabled,
+    lastEnabledState: safeLastEnabled,
     channel: config.channel || 'github',
     syncMode: config.syncMode || 'webhook',
     repoIdentifier: (config.repoIdentifier || '').trim(),
@@ -420,7 +437,6 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [calcLoading, setCalcLoading] = useState(false);
-  const [showManualPat, setShowManualPat] = useState(false);
 
   // 动态响应页面/浏览器缩放与视口尺寸变动，自适应计算弹窗最大高度与居中边界，彻底防止大比例缩放下被遮挡
   const [modalAdaptiveStyle, setModalAdaptiveStyle] = useState<{ maxHeight?: string; width?: string }>({});
@@ -514,9 +530,20 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                                   (remote.review_prompt_template && remote.review_prompt_template.trim()) ||
                                   prev.reviewPromptTemplate;
 
+          const ch = remote.channel || prev.channel || 'github';
+          const isGithub = ch === 'github';
+          const hasAppCreds = Boolean(
+            effectiveAppId || effectiveKeyPath || effectiveKey
+          );
+          const isAppMode = isGithub && hasAppCreds;
+          const safeEnabled = isAppMode ? (remote.enabled ?? prev.enabled ?? false) : false;
+          const safeLastEnabled = isAppMode ? (remote.lastEnabledState ?? remote.last_enabled_state ?? prev.lastEnabledState ?? false) : false;
+
           return {
             ...prev,
             ...remote,
+            enabled: safeEnabled,
+            lastEnabledState: safeLastEnabled,
             accessToken: effectiveToken,
             repoIdentifier: effectiveRepo,
             githubAppId: effectiveAppId,
@@ -566,7 +593,17 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   };
 
   const handleSave = async () => {
-    const configToSave = { ...config, lang };
+    const isGithub = config.channel === 'github';
+    const hasAppCreds = Boolean(
+      config.githubAppId?.trim() || config.githubAppPrivateKey || config.githubAppPrivateKeyPath?.trim()
+    );
+    const isAppMode = isGithub && hasAppCreds;
+    const configToSave = {
+      ...config,
+      enabled: isAppMode ? config.enabled : false,
+      lastEnabledState: isAppMode ? config.lastEnabledState : false,
+      lang,
+    };
     try {
       const res = await saveProjectGitConfig(project.hash, configToSave);
       if (res && res.success === false) {
@@ -731,6 +768,8 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     },
   ];
 
+  const isGithubApp = config.channel === 'github';
+
   return (
     <div class="modal-overlay git-webhook-modal-overlay" onClick={onClose}>
       <div
@@ -775,10 +814,15 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
             </div>
           </div>
 
-          {/* 总启用开关横幅：现代工业美学设计（关闭红色氛围，开启绿色氛围） */}
+          {/* 总启用开关横幅：仅在 GitHub App 模式下允许开启，非 App 模式（如 PAT 模式）强制禁用 */}
           <div
             class={`git-enable-hero-banner ${config.enabled ? 'is-enabled' : 'is-disabled'}`}
+            style={!isGithubApp ? { cursor: 'not-allowed', opacity: 0.75 } : {}}
             onClick={() => {
+              if (!isGithubApp) {
+                showToast(t('gitWebhook.onlyGithubAppAllowed'), 'error');
+                return;
+              }
               const next = !config.enabled;
               setConfig({
                 ...config,
@@ -802,7 +846,11 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
             <div class={`git-enable-status-chip ${config.enabled ? 'active' : 'disabled'}`}>
               <span class="git-status-dot" />
               <span class="git-status-text">
-                {config.enabled ? t('gitWebhook.statusActive') : t('gitWebhook.statusInactive')}
+                {!isGithubApp
+                  ? t('gitWebhook.statusInactive')
+                  : config.enabled
+                  ? t('gitWebhook.statusActive')
+                  : t('gitWebhook.statusInactive')}
               </span>
             </div>
           </div>
@@ -852,7 +900,15 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                   class="git-adapter-select"
                   value={config.channel}
                   options={channelOptions}
-                  onChange={(ch) => setConfig({ ...config, channel: ch })}
+                  onChange={(ch) => {
+                    const isApp = ch === 'github';
+                    setConfig({
+                      ...config,
+                      channel: ch,
+                      enabled: isApp ? config.enabled : false,
+                      lastEnabledState: isApp ? config.lastEnabledState : false,
+                    });
+                  }}
                 />
                 <span class="git-input-hint">
                   {t(activeChannelMeta.descKey as any)}
@@ -1026,21 +1082,49 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
 
           {/* 适配器第 3 区：动态绑定的仓库标识与平台认证凭据 */}
           <div class="git-form-section">
-            <div class="git-section-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+            <div class="git-section-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
               <span>3. {t('gitWebhook.secAuthTitle')}</span>
-              {config.channel === 'github' && (
-                <button
-                  type="button"
-                  class="git-text-action-btn"
-                  onClick={() => setShowManualPat(!showManualPat)}
-                  style={{ fontSize: '11px' }}
-                >
-                  {showManualPat ? t('gitWebhook.useGithubApp') : t('gitWebhook.useManualPat')}
-                </button>
-              )}
+              <span
+                class="git-pat-status-pill"
+                style={{
+                  fontSize: '11px',
+                  fontWeight: 600,
+                  color: '#fbbf24',
+                  background: 'rgba(245, 158, 11, 0.15)',
+                  border: '1px solid rgba(245, 158, 11, 0.35)',
+                  borderRadius: '4px',
+                  padding: '2px 8px',
+                  whiteSpace: 'nowrap',
+                  flexShrink: 0,
+                }}
+              >
+                {t('gitWebhook.patStatusPill')}
+              </span>
             </div>
 
-            {config.channel === 'github' && !showManualPat ? (
+            {/* 独立全宽警告横幅：自适应折行，彻底杜绝穿模与挤压 */}
+            <div
+              class="git-pat-warning-banner"
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '8px',
+                background: 'rgba(245, 158, 11, 0.08)',
+                border: '1px solid rgba(245, 158, 11, 0.28)',
+                borderRadius: '6px',
+                padding: '8px 12px',
+                margin: '6px 0 12px 0',
+                fontSize: '12px',
+                lineHeight: '1.5',
+                color: '#fbbf24',
+                wordBreak: 'break-word',
+              }}
+            >
+              <span style={{ fontSize: '14px', flexShrink: 0, lineHeight: '1.2' }}>⚠️</span>
+              <div>{t('gitWebhook.patDisabledWarning')}</div>
+            </div>
+
+            {config.channel === 'github' ? (
               <div class="git-form-grid" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 <div class="git-form-grid">
                   {/* GitHub 仓库全名 */}

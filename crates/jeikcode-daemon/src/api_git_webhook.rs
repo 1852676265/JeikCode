@@ -36,7 +36,8 @@ pub async fn get_git_binding_api(Query(q): Query<BindingQuery>) -> impl IntoResp
         return (StatusCode::BAD_REQUEST, "Missing project_hash").into_response();
     };
 
-    if let Some(config) = get_binding_by_project(&hash) {
+    if let Some(mut config) = get_binding_by_project(&hash) {
+        config.sanitize_security_constraints();
         Json(config).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
@@ -44,10 +45,11 @@ pub async fn get_git_binding_api(Query(q): Query<BindingQuery>) -> impl IntoResp
 }
 
 /// POST /api/git/binding
-pub async fn save_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl IntoResponse {
+pub async fn save_git_binding_api(Json(mut config): Json<GitAdapterConfig>) -> impl IntoResponse {
     if config.project_hash.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing project_hash in payload").into_response();
     }
+    config.sanitize_security_constraints();
     save_binding(config);
     Json(serde_json::json!({ "success": true })).into_response()
 }
@@ -254,8 +256,20 @@ pub async fn generate_app_token_api(Json(req): Json<GenerateAppTokenRequest>) ->
 }
 
 /// GET /api/webhooks/git & GET /api/webhooks/github
-/// 当用户或浏览器直接以 GET 方式访问该链接时，返回友好的就绪状态提示（替代冰冷的 HTTP 405 Method Not Allowed）
+/// 当用户或浏览器直接以 GET 方式访问该链接时：若未开启自动化审查则阻断探测返回 404；若已开启则返回友好的就绪状态提示
 pub async fn get_git_webhook_info_api() -> impl IntoResponse {
+    if !crate::git_adapter::is_any_git_automation_active() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "Not Found",
+        )
+            .into_response();
+    }
+
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -279,6 +293,11 @@ pub async fn handle_git_webhook_api(
     headers: HeaderMap,
     body_bytes: Bytes,
 ) -> impl IntoResponse {
+    // 0. 全局阻断门禁：若当前未启用任何 Git 自动化审查，直接阻断外部一切探测与 Hook 请求，返回 404 Not Found
+    if !crate::git_adapter::is_any_git_automation_active() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
     let Ok(payload) = serde_json::from_slice::<Value>(&body_bytes) else {
         return (StatusCode::BAD_REQUEST, "Invalid JSON payload").into_response();
     };
@@ -290,7 +309,7 @@ pub async fn handle_git_webhook_api(
         .trim();
 
     if repo_full_name.is_empty() {
-        // ping 事件可能没有具体 repo
+        // ping 事件：若没有具体 repo 且全局有启用的 App，响应 Pong，否则阻断
         if headers.get("x-github-event").and_then(|v| v.to_str().ok()) == Some("ping") {
             return (StatusCode::OK, "Pong").into_response();
         }
@@ -299,15 +318,31 @@ pub async fn handle_git_webhook_api(
 
     // 2. 匹配该项目绑定配置
     let Some(binding_config) = find_binding_by_repo(repo_full_name) else {
-        // 未绑定该仓库，安全忽略
-        return (StatusCode::OK, "Repository not bound to any local project").into_response();
+        // 未绑定该仓库，直接阻断并返回 404，不泄漏内部状态
+        return (
+            StatusCode::NOT_FOUND,
+            "Repository not found or automation disabled",
+        )
+            .into_response();
     };
 
-    // 检查项目是否启用了自动化联动（默认关闭）
+    // 检查项目是否启用了自动化联动（默认关闭），关闭时必须直接阻断返回 403 Forbidden
     if !binding_config.enabled {
         return (
-            StatusCode::OK,
+            StatusCode::FORBIDDEN,
             "Git automation is disabled for this project",
+        )
+            .into_response();
+    }
+
+    // 安全铁律：强制永久禁用 PAT 模式，仅允许 GitHub App 模式运行自动化审查
+    if !binding_config.is_github_app_mode() {
+        tracing::warn!(
+            "[git_webhook] Rejecting webhook for `{repo_full_name}`: PAT mode is permanently disabled."
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "PAT mode is permanently disabled. Only GitHub App mode is supported.",
         )
             .into_response();
     }
