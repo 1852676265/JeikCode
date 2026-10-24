@@ -23,6 +23,11 @@ export function DesktopClosePromptDialog() {
     if (action === 'tray') {
       if (remember) {
         void postDesktopSettings({ close_action: action }).catch(() => {});
+        try {
+          window.open('http://tauri.localhost/__desktop_action/set_close_action?action=tray', '_blank');
+        } catch {
+          /* ignore */
+        }
       }
       // 触发桌面壳隐藏到托盘（通过受控伪窗口跳转拦截与原生桥接双通道）
       window.dispatchEvent(new CustomEvent('jeikcode:desktop:hide_to_tray'));
@@ -41,6 +46,11 @@ export function DesktopClosePromptDialog() {
       if (remember) {
         try {
           await postDesktopSettings({ close_action: action });
+        } catch {
+          /* ignore */
+        }
+        try {
+          window.open('http://tauri.localhost/__desktop_action/set_close_action?action=quit', '_blank');
         } catch {
           /* ignore */
         }

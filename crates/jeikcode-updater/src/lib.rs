@@ -1092,7 +1092,12 @@ pub fn capture_launch_markers() {
 /// 当前进程是否由桌面壳直接托管。
 pub fn is_desktop_managed() -> bool {
     *DESKTOP_MANAGED_FLAG.get_or_init(|| {
-        let managed = std::env::var_os(DESKTOP_MANAGED_ENV).is_some();
+        let managed = std::env::var_os(DESKTOP_MANAGED_ENV).is_some()
+            || std::env::var_os("JEIKCODE_DESKTOP").is_some()
+            || std::env::var(DESKTOP_PID_ENV)
+                .ok()
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                .is_some_and(|pid| pid > 0);
         std::env::remove_var(DESKTOP_MANAGED_ENV);
         managed
     })
@@ -2026,7 +2031,11 @@ pub fn restart_process_with_config(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        let mut flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        if !is_desktop_managed() && std::env::var_os("JEIKCODE_DESKTOP").is_none() {
+            flags |= CREATE_BREAKAWAY_FROM_JOB;
+        }
+        cmd.creation_flags(flags);
     }
 
     cmd.spawn()

@@ -138,8 +138,8 @@ fn publish_host_away(window: &tauri::WebviewWindow, away: bool) {
 }
 
 fn show_main_window(window: &tauri::WebviewWindow) {
-    let _ = window.show();
     let _ = window.unminimize();
+    let _ = window.show();
     let _ = window.set_focus();
     #[cfg(target_os = "windows")]
     if let Ok(hwnd) = window.hwnd() {
@@ -149,7 +149,7 @@ fn show_main_window(window: &tauri::WebviewWindow) {
             fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
         }
         unsafe {
-            ShowWindow(hwnd.0 as *mut std::ffi::c_void, 5);
+            // SW_RESTORE (9) 确保从隐藏/最小化状态恢复到正常窗口大小并展示，避免 SW_SHOW 与 SW_RESTORE 重复调用导致状态失步
             ShowWindow(hwnd.0 as *mut std::ffi::c_void, 9);
             SetForegroundWindow(hwnd.0 as *mut std::ffi::c_void);
         }
@@ -174,6 +174,102 @@ fn hide_window_to_tray(window: &tauri::WebviewWindow) {
     publish_host_away(window, true);
 }
 
+fn send_desktop_shutdown(port: u16, token: Option<&str>) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    let auth_header = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    };
+    let req = format!(
+        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(req.as_bytes());
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_desktop_owned_children_windows() {
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
+        fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
+        fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+
+    let my_pid = std::process::id();
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot == -1isize as *mut std::ffi::c_void {
+        return;
+    }
+
+    let mut entry = ProcessEntry32W {
+        dwSize: std::mem::size_of::<ProcessEntry32W>() as u32,
+        cntUsage: 0,
+        th32ProcessID: 0,
+        th32DefaultHeapID: 0,
+        th32ModuleID: 0,
+        cntThreads: 0,
+        th32ParentProcessID: 0,
+        pcPriClassBase: 0,
+        dwFlags: 0,
+        szExeFile: [0; 260],
+    };
+
+    if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+        loop {
+            if entry.th32ParentProcessID == my_pid && entry.th32ProcessID != my_pid {
+                let name = String::from_utf16_lossy(&entry.szExeFile)
+                    .trim_matches('\0')
+                    .to_ascii_lowercase();
+                if name.starts_with("jeikcode") || name.starts_with("cli-bin") {
+                    let h_proc = unsafe { OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID) };
+                    if !h_proc.is_null() {
+                        unsafe {
+                            TerminateProcess(h_proc, 1);
+                            CloseHandle(h_proc);
+                        }
+                    }
+                }
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+}
+
 fn terminate_managed_child(app: &tauri::AppHandle) {
     DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
     if let Some(slot) = app.try_state::<ChildSlot>() {
@@ -183,6 +279,14 @@ fn terminate_managed_child(app: &tauri::AppHandle) {
             let _ = child.wait();
         }
     }
+    // 兜底 1：读取当前配置端口，向 /shutdown 发送优雅关停请求（即使子进程句柄丢失也能通知关停）
+    let (_host, port, token) = saved_webui_listen();
+    if port > 0 {
+        send_desktop_shutdown(port, token.as_deref());
+    }
+    // 兜底 2：在 Windows 上，强力清理属于本桌面壳 PID 的后台子进程，彻底消除改参数重启后脱离的孤儿子进程
+    #[cfg(target_os = "windows")]
+    cleanup_desktop_owned_children_windows();
 }
 
 fn handle_desktop_shell_action(url: &tauri::Url, app: &tauri::AppHandle) -> bool {
@@ -196,6 +300,18 @@ fn handle_desktop_shell_action(url: &tauri::Url, app: &tauri::AppHandle) -> bool
         "/__desktop_action/quit_app" => {
             terminate_managed_child(app);
             app.exit(0);
+            true
+        }
+        "/__desktop_action/set_close_action" => {
+            let action = url
+                .query_pairs()
+                .find(|(k, _)| k == "action")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_else(|| "ask".to_string());
+            let dir = jeikcode_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let body = format!("{{\n  \"close_action\": \"{action}\"\n}}\n");
+            let _ = std::fs::write(desktop_settings_path(), body);
             true
         }
         _ => false,
@@ -337,9 +453,6 @@ fn ensure_single_instance_windows() -> bool {
 
     #[link(name = "user32")]
     extern "system" {
-        fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> *mut std::ffi::c_void;
-        fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
-        fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
         fn AllowSetForegroundWindow(dwProcessId: u32) -> i32;
     }
 
@@ -353,30 +466,18 @@ fn ensure_single_instance_windows() -> bool {
     let mutex_name = wide("Local\\JeikCode_Desktop_SingleInstance_Mutex");
     let event_name = wide("Local\\JeikCode_Desktop_Activate_Event");
     const ERROR_ALREADY_EXISTS: u32 = 183;
-    const SW_RESTORE: i32 = 9;
-    const SW_SHOW: i32 = 5;
     const ASFW_ANY: u32 = 0xFFFF_FFFF;
 
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 1, mutex_name.as_ptr()) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
             AllowSetForegroundWindow(ASFW_ANY);
-            // 通知主实例在进程内执行 window.show()，同步 tao 的 WindowFlags::VISIBLE 状态，
-            // 确保唤醒后再次点击右上角 X 关闭按钮依然能够正常触发隐藏到托盘。
+            // 触发激活命名事件，由主实例主线程规范执行窗口还原与激活，
+            // 绝不在外部进程跨进程直接调用 ShowWindow 篡改 HWND 导致 tao 内部 WindowFlags 失步。
             let ev = CreateEventW(std::ptr::null_mut(), 0, 0, event_name.as_ptr());
             if !ev.is_null() {
                 SetEvent(ev);
                 CloseHandle(ev);
-            }
-            for title in ["JeikCode Desktop", "JeikCode - Open-Source AI Coding Agent"] {
-                let win_title = wide(title);
-                let hwnd = FindWindowW(std::ptr::null(), win_title.as_ptr());
-                if !hwnd.is_null() {
-                    ShowWindow(hwnd, SW_SHOW);
-                    ShowWindow(hwnd, SW_RESTORE);
-                    SetForegroundWindow(hwnd);
-                    break;
-                }
             }
         }
         return true;
@@ -410,6 +511,7 @@ fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
         return;
     }
     let ev_addr = ev as usize;
+    let window_for_thread = window.clone();
     std::thread::spawn(move || {
         let handle = ev_addr as *mut std::ffi::c_void;
         const WAIT_OBJECT_0: u32 = 0;
@@ -419,7 +521,11 @@ fn spawn_single_instance_activation_listener(window: tauri::WebviewWindow) {
             }
             let rc = unsafe { WaitForSingleObject(handle, 400) };
             if rc == WAIT_OBJECT_0 {
-                show_main_window(&window);
+                // 必须调度到主事件循环线程执行还原与聚焦，确保 tao 内部 WindowFlags::VISIBLE 100% 同步恢复
+                let win = window_for_thread.clone();
+                let _ = window_for_thread.run_on_main_thread(move || {
+                    show_main_window(&win);
+                });
             }
         }
         unsafe {
@@ -526,6 +632,9 @@ fn main() {
                 app_handle_for_event.exit(0);
             });
 
+            let last_close_time = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10)));
+            let last_close_for_event = Arc::clone(&last_close_time);
+
             // 窗口关闭拦截与 HTML5 拖放事件处理
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -540,9 +649,20 @@ fn main() {
                         }
                         _ => {
                             api.prevent_close();
-                            let _ = close_window.eval(
-                                "window.dispatchEvent(new CustomEvent('jeikcode:desktop:close_prompt'));",
-                            );
+                            // 连点容错兜底：若 1.2 秒内再次点击 X，说明弹窗未能正常捕获或用户强行关闭，立即最小化到托盘
+                            let mut last = last_close_for_event
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let now = Instant::now();
+                            if now.duration_since(*last) < Duration::from_millis(1200) {
+                                *last = now - Duration::from_secs(10);
+                                hide_window_to_tray(&close_window);
+                            } else {
+                                *last = now;
+                                let _ = close_window.eval(
+                                    "window.dispatchEvent(new CustomEvent('jeikcode:desktop:close_prompt'));",
+                                );
+                            }
                         }
                     }
                 }
@@ -990,23 +1110,6 @@ fn supervise_webui(
 
             let intentional_restart = exit_code == Some(RESTART_REQUESTED_EXIT_CODE);
             if !intentional_restart {
-                // 若子进程是正常退出（exit 0，例如旧版自派生重启），检查目标端口是否已有后继进程在线
-                let (latest_host, latest_port, latest_token) = saved_webui_listen();
-                let check_port = if latest_port != 0 {
-                    latest_port
-                } else {
-                    launch.port
-                };
-                if exit_code == Some(0) && wait_until_health(check_port, Duration::from_secs(8)) {
-                    let effective_token = latest_token.unwrap_or_else(|| launch.token.clone());
-                    launch.host = latest_host;
-                    launch.port = check_port;
-                    launch.token = effective_token.clone();
-                    let target_url =
-                        format!("http://127.0.0.1:{check_port}/?token={effective_token}&desktop=1");
-                    open_webui_in_shell(&window, &origin, &target_url);
-                    return;
-                }
                 // 非主动请求重启的异常退出：仅允许最多一次自愈拉起，绝不陷入死循环
                 if crash_recovered {
                     return;
@@ -1083,6 +1186,7 @@ fn reap_exited_child(app: &tauri::AppHandle) -> Option<Option<i32>> {
     }
 }
 
+#[allow(dead_code)]
 fn wait_until_health(port: u16, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
