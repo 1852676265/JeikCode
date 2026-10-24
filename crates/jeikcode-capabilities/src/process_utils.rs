@@ -1046,26 +1046,52 @@ pub(crate) fn escape_unquoted_backticks_in_inline_script(cmd: &str) -> Option<St
 /// 跨语言常见内联脚本解释器与编译器清单（支持小写比较，允许路径前缀与 .exe 后缀）
 pub(crate) const INLINE_INTERPRETERS: &[&str] = &[
     // Python 生态
-    "python", "python3", "py", "ipython",
+    "python",
+    "python3",
+    "py",
+    "ipython",
     // JavaScript / TypeScript / Vue / 前端生态
-    "node", "bun", "deno", "ts-node", "npx",
+    "node",
+    "bun",
+    "deno",
+    "ts-node",
+    "npx",
     // C / C++ 编译与即时解释
-    "gcc", "clang", "g++", "clang++", "c++", "tcc", "cling",
+    "gcc",
+    "clang",
+    "g++",
+    "clang++",
+    "c++",
+    "tcc",
+    "cling",
     // Java 生态 (单文件源码运行 / JShell 评估)
-    "java", "jshell", "javac",
+    "java",
+    "jshell",
+    "javac",
     // C# / .NET 生态
-    "dotnet-script", "csi", "dotnet",
+    "dotnet-script",
+    "csi",
+    "dotnet",
     // Rust 与 Go
-    "rustc", "cargo-eval", "cargo", "go",
+    "rustc",
+    "cargo-eval",
+    "cargo",
+    "go",
     // 其他常用系统与脚本语言
-    "ruby", "perl", "php", "lua", "rscript", "julia",
-    "bash", "sh", "zsh",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "rscript",
+    "julia",
+    "bash",
+    "sh",
+    "zsh",
 ];
 
 /// 跨语言常见内联执行/求值参数标志
 pub(crate) const INLINE_FLAGS: &[&str] = &[
-    "-c", "-e", "--eval", "eval", "-r", "-p", "--print", "-run", "<<<",
-    "--source",
+    "-c", "-e", "--eval", "eval", "-r", "-p", "--print", "-run", "<<<", "--source",
 ];
 
 /// 判断单词是否属于支持的内联解释器
@@ -1138,7 +1164,10 @@ pub(crate) fn heal_inline_script_single_quotes(cmd: &str) -> Option<String> {
 
         if ch.is_whitespace() || ch == ';' || ch == '|' || ch == '&' || ch == '(' {
             if !last_word.is_empty() {
-                if INLINE_FLAGS.iter().any(|&f| f.eq_ignore_ascii_case(&last_word)) {
+                if INLINE_FLAGS
+                    .iter()
+                    .any(|&f| f.eq_ignore_ascii_case(&last_word))
+                {
                     saw_flag = true;
                 } else if is_matching_interpreter(&last_word) {
                     // 保留解释器上下文
@@ -1191,7 +1220,11 @@ pub(crate) fn extract_inline_scripts_to_env(command: &str) -> (String, Vec<(Stri
             if !last_word.is_empty() {
                 if is_matching_interpreter(&last_word) {
                     saw_interpreter = true;
-                } else if saw_interpreter && INLINE_FLAGS.iter().any(|&f| f.eq_ignore_ascii_case(&last_word)) {
+                } else if saw_interpreter
+                    && INLINE_FLAGS
+                        .iter()
+                        .any(|&f| f.eq_ignore_ascii_case(&last_word))
+                {
                     saw_flag = true;
                 } else {
                     saw_interpreter = false;
@@ -1222,7 +1255,11 @@ pub(crate) fn extract_inline_scripts_to_env(command: &str) -> (String, Vec<(Stri
                     // 单引号脚本处理：识别并折叠 '\'' 组合
                     if sc == '\'' {
                         // 检查是否是 '\''' 模式
-                        if end + 3 < n && chars[end + 1] == '\\' && chars[end + 2] == '\'' && chars[end + 3] == '\'' {
+                        if end + 3 < n
+                            && chars[end + 1] == '\\'
+                            && chars[end + 2] == '\''
+                            && chars[end + 3] == '\''
+                        {
                             script_raw.push('\'');
                             end += 4;
                             continue;
@@ -1268,7 +1305,8 @@ pub(crate) fn extract_inline_scripts_to_env(command: &str) -> (String, Vec<(Stri
                     || (quote_char == '"' && script_raw.contains('"') && script_raw.len() > 15);
 
                 // 双引号下如果包含未经转义的 $ 或 `，保留给 shell 动态展开，不进行中转
-                let has_shell_expansion = quote_char == '"' && (script_raw.contains('$') || script_raw.contains('`'));
+                let has_shell_expansion =
+                    quote_char == '"' && (script_raw.contains('$') || script_raw.contains('`'));
 
                 if is_complex && !has_shell_expansion {
                     let var_name = if env_vars.is_empty() {
@@ -2127,21 +2165,27 @@ mod tests {
         let node_cmd = r#"node -e 'const v = \'<div>{{ msg }}</div>\'; console.log(v);'"#;
         assert_eq!(
             heal_inline_script_single_quotes(node_cmd),
-            Some(format!("node -e 'const v = {q}<div>{{{{ msg }}}}</div>{q}; console.log(v);'"))
+            Some(format!(
+                "node -e 'const v = {q}<div>{{{{ msg }}}}</div>{q}; console.log(v);'"
+            ))
         );
 
         // 3. C 语言 (tcc/gcc 内联) 字符单引号自愈
         let c_cmd = r#"tcc -run - <<< 'int main() { char c = \'a\'; return 0; }'"#;
         assert_eq!(
             heal_inline_script_single_quotes(c_cmd),
-            Some(format!("tcc -run - <<< 'int main() {{ char c = {q}a{q}; return 0; }}'"))
+            Some(format!(
+                "tcc -run - <<< 'int main() {{ char c = {q}a{q}; return 0; }}'"
+            ))
         );
 
         // 4. Rust (rustc 内联) 字符字面量自愈
         let rust_cmd = r#"rustc - -o main <<< 'fn main() { let ch = \'x\'; }'"#;
         assert_eq!(
             heal_inline_script_single_quotes(rust_cmd),
-            Some(format!("rustc - -o main <<< 'fn main() {{ let ch = {q}x{q}; }}'"))
+            Some(format!(
+                "rustc - -o main <<< 'fn main() {{ let ch = {q}x{q}; }}'"
+            ))
         );
 
         // 5. C# (dotnet-script eval)
@@ -2155,7 +2199,9 @@ mod tests {
         let go_cmd = r#"go run - <<< 'package main; func main() { ch := \'g\' }'"#;
         assert_eq!(
             heal_inline_script_single_quotes(go_cmd),
-            Some(format!("go run - <<< 'package main; func main() {{ ch := {q}g{q} }}'"))
+            Some(format!(
+                "go run - <<< 'package main; func main() {{ ch := {q}g{q} }}'"
+            ))
         );
 
         // 7. 已经包含正确 POSIX '\'' 的命令保持不变

@@ -2877,7 +2877,8 @@ mod tests {
         );
 
         // 已经转义过的反引号不重复转义 (JSON 中字面量反斜杠为 \\)
-        let already_escaped = r#"{"command":"python -c \"content = '\\`\\`\\`'; print(len(content))\""}"#;
+        let already_escaped =
+            r#"{"command":"python -c \"content = '\\`\\`\\`'; print(len(content))\""}"#;
         let out_escaped = repair_and_route_shell_args("run_command", already_escaped);
         let val_escaped: serde_json::Value = serde_json::from_str(&out_escaped).unwrap();
         assert_eq!(
