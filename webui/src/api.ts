@@ -1243,6 +1243,8 @@ export async function postRemoteAccess(
     stop?: boolean;
     /** Save port and token for the next 0.0.0.0 launch. Same port updates the token now. */
     apply_launch?: boolean;
+    /** Immediately restart the daemon process to apply new host/port. */
+    restart?: boolean;
   },
   signal?: AbortSignal,
 ): Promise<RemoteAccessStatus> {

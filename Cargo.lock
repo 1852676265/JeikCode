@@ -2202,6 +2202,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "winreg 0.55.0",
  "wiremock",
 ]
 

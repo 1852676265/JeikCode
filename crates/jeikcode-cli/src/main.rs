@@ -1604,6 +1604,11 @@ fn main() {
 }
 
 fn real_main() {
+    // 异步执行老版本残留环境清理与迁移（不阻塞主流程）
+    std::thread::spawn(|| {
+        jeikcode_updater::migrate_legacy_environment();
+    });
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
@@ -1686,6 +1691,9 @@ fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
 async fn async_main() {
     let inherited_token = jeikcode_updater::take_restart_token();
     if let Some(mut launch) = desktop_webui_fast_launch() {
+        if let Some(h) = jeikcode_updater::restart_listen_host_from_env() {
+            launch.host = h;
+        }
         if let Some(port) = jeikcode_updater::restart_listen_port_from_env() {
             launch.port = port;
         }
@@ -2065,11 +2073,14 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             }
             Commands::Webui {
                 mut port,
-                host,
+                mut host,
                 no_open,
                 token,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited_host) = jeikcode_updater::restart_listen_host_from_env() {
+                    host = inherited_host;
+                }
                 if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }
@@ -2087,7 +2098,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 return Ok(0);
             }
             Commands::Serve {
-                host,
+                mut host,
                 mut port,
                 dir,
                 token,
@@ -2096,6 +2107,9 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 idle_timeout,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited_host) = jeikcode_updater::restart_listen_host_from_env() {
+                    host = inherited_host;
+                }
                 if let Some(inherited) = jeikcode_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }

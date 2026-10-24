@@ -5,12 +5,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 use jeikcode_coding::config_sync::{
@@ -409,6 +406,21 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         _ => UpdateChannel::default(),
     };
 
+    // 离线/内网隔离模式下，直接返回当前版本且无新版，绝不产生外网探测请求
+    if jeikcode_config::config::offline::is_offline_active() {
+        return Json(UpdateCheckResponse {
+            current_version: current_version.clone(),
+            latest_version: current_version,
+            has_update: false,
+            is_desktop,
+            release_notes: None,
+            download_url: None,
+            released_at: None,
+            channel: channel.as_str().to_string(),
+            versions: Vec::new(),
+        });
+    }
+
     let client = create_update_client();
 
     let mut latest_version = String::new();
@@ -537,6 +549,7 @@ pub async fn execute_update(
     }
 
     let req = payload.map(|Json(p)| p).unwrap_or_default();
+    let listen_host = state.bind_host.clone();
     let listen_port = state.bind_port;
     let restart_token = state.webui_tokens.display();
 
@@ -557,6 +570,7 @@ pub async fn execute_update(
             req.channel,
             req.download_url,
             req.force.unwrap_or(false),
+            Some(listen_host),
             listen_port,
             restart_token,
         )
@@ -579,148 +593,12 @@ pub async fn execute_update(
     }))
 }
 
-#[allow(dead_code)]
-async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<String>) -> Result<()> {
-    let manifest_opt = if direct_url.is_none() {
-        jeikcode_updater::fetch_manifest().await.ok()
-    } else {
-        None
-    };
-
-    let download_url = if let Some(u) = direct_url {
-        u
-    } else if let Some(ref m) = manifest_opt {
-        resolve_desktop_installer_url(&m.version)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("未找到匹配当前系统的桌面安装包"))?
-    } else {
-        anyhow::bail!("无法获取桌面端安装包下载地址");
-    };
-
-    let version_str = version_opt
-        .or_else(|| manifest_opt.map(|m| m.version))
-        .unwrap_or_else(|| "latest".to_string());
-
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-        .build()?;
-
-    let response = client.get(&download_url).send().await?;
-    if !response.status().is_success() {
-        anyhow::bail!("下载安装包失败，HTTP 状态码: {}", response.status());
-    }
-
-    let total_bytes = response.content_length().unwrap_or(0);
-    let temp_dir = std::env::temp_dir();
-
-    #[cfg(target_os = "windows")]
-    let installer_filename = format!("JeikCode-Desktop-Setup-{}.exe", version_str);
-    #[cfg(target_os = "macos")]
-    let installer_filename = format!("JeikCode-Desktop-{}.dmg", version_str);
-    #[cfg(target_os = "linux")]
-    let installer_filename = format!("JeikCode-Desktop-{}.AppImage", version_str);
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let installer_filename = format!("JeikCode-Desktop-{}", version_str);
-
-    let installer_path = temp_dir.join(installer_filename);
-
-    let mut file = tokio::fs::File::create(&installer_path).await?;
-    let mut downloaded_bytes: u64 = 0;
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res?;
-        file.write_all(&chunk).await?;
-        downloaded_bytes += chunk.len() as u64;
-
-        let pct = if total_bytes > 0 {
-            ((downloaded_bytes * 100) / total_bytes) as u32
-        } else {
-            0
-        };
-
-        set_update_status(UpdateStatus {
-            status: "downloading".to_string(),
-            progress: pct.min(100),
-            bytes: downloaded_bytes,
-            total: total_bytes,
-            error: None,
-        });
-    }
-
-    file.flush().await?;
-    drop(file);
-
-    set_update_status(UpdateStatus {
-        status: "ready".to_string(),
-        progress: 100,
-        bytes: downloaded_bytes,
-        total: total_bytes,
-        error: None,
-    });
-
-    // 触发安装包重新安装并退出当前进程
-    trigger_installer_and_exit(installer_path).await?;
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
-    set_update_status(UpdateStatus {
-        status: "installing".to_string(),
-        progress: 100,
-        bytes: 0,
-        total: 0,
-        error: None,
-    });
-
-    #[cfg(target_os = "windows")]
-    {
-        // 1. 启动下载好的 setup.exe 安装包
-        let _ = std::process::Command::new(&installer_path).spawn();
-
-        // 2. 终止桌面端前端进程 JeikCode Desktop.exe，防止覆盖安装时被文件锁定
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "JeikCode Desktop.exe"])
-            .spawn();
-
-        // 3. 延时片刻退出当前后台子进程
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        std::process::exit(0);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg(&installer_path)
-            .spawn();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        std::process::exit(0);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&installer_path, std::fs::Permissions::from_mode(0o755));
-        }
-        let _ = std::process::Command::new(&installer_path).spawn();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        std::process::exit(0);
-    }
-
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
 async fn run_cli_update(
     version_opt: Option<String>,
     channel_opt: Option<String>,
     _direct_url: Option<String>,
     force: bool,
+    listen_host: Option<String>,
     listen_port: u16,
     restart_token: Option<String>,
 ) -> Result<()> {
@@ -799,10 +677,12 @@ async fn run_cli_update(
                 // File is already swapped in place. Restart so remote WebUI /
                 // serve picks up the new image (Unix exec; Windows delayed spawn).
                 let restart_token = restart_token.clone();
+                let restart_host = listen_host.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    let Err(err) = jeikcode_updater::restart_replaced_process(
+                    let Err(err) = jeikcode_updater::restart_process_with_options(
                         &exe,
+                        restart_host.as_deref(),
                         listen_port,
                         restart_token.as_deref(),
                     );

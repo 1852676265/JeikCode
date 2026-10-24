@@ -228,6 +228,9 @@ pub(crate) struct RemoteAccessBody {
     /// the next start. `no_token` is never written to disk.
     #[serde(default)]
     apply_launch: bool,
+    /// Immediately restart the daemon to apply changed host or port.
+    #[serde(default)]
+    restart: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -941,6 +944,8 @@ fn wait_child(child: &mut std::process::Child, limit: std::time::Duration) -> bo
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WebuiListenPref {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
     port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -962,7 +967,11 @@ fn saved_listen_port() -> Option<u16> {
 }
 
 /// Write the next desktop launch. `token: None` keeps the token already on disk.
-pub(crate) fn save_webui_listen_pref(port: u16, token: Option<String>) -> Result<(), String> {
+pub(crate) fn save_webui_listen_pref(
+    host: Option<String>,
+    port: u16,
+    token: Option<String>,
+) -> Result<(), String> {
     if port == 0 {
         return Err("port must be 1-65535".to_string());
     }
@@ -970,8 +979,18 @@ pub(crate) fn save_webui_listen_pref(port: u16, token: Option<String>) -> Result
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     }
-    let mut pref = load_webui_listen_pref().unwrap_or(WebuiListenPref { port, token: None });
+    let mut pref = load_webui_listen_pref().unwrap_or(WebuiListenPref {
+        host: None,
+        port,
+        token: None,
+    });
     pref.port = port;
+    if let Some(h) = host {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            pref.host = Some(trimmed.to_string());
+        }
+    }
     if token.is_some() {
         pref.token = token;
     }
@@ -989,12 +1008,21 @@ fn apply_launch_settings(
     if body.port == 0 {
         return Err("port must be 1-65535".to_string());
     }
+    let target_host = body.host.trim();
+    let host_opt = if !target_host.is_empty() {
+        Some(target_host.to_string())
+    } else {
+        None
+    };
     let port_changed = body.port != state.bind_port;
+    let host_changed =
+        !target_host.is_empty() && !target_host.eq_ignore_ascii_case(&state.bind_host);
+
     if body.no_token {
-        if !port_changed {
+        if !port_changed && !host_changed {
             apply_remote_auth(state, true);
         } else {
-            save_webui_listen_pref(body.port, None)?;
+            save_webui_listen_pref(host_opt, body.port, None)?;
             apply_remote_auth(state, true);
         }
     } else {
@@ -1010,15 +1038,17 @@ fn apply_launch_settings(
             }
             token.to_string()
         };
-        if !port_changed {
+        if !port_changed && !host_changed {
             state.webui_tokens.set_display(&token);
             apply_remote_auth(state, false);
         }
-        save_webui_listen_pref(body.port, Some(token))?;
+        save_webui_listen_pref(host_opt, body.port, Some(token))?;
     }
     let mut status = remote_status(state, None);
-    if port_changed {
-        status.next_port = Some(body.port);
+    if port_changed || host_changed {
+        if port_changed {
+            status.next_port = Some(body.port);
+        }
         if !body.no_token {
             if let Some(pref) = load_webui_listen_pref() {
                 status.token = pref.token;
@@ -1070,8 +1100,35 @@ pub(crate) async fn post_remote_access(
         }
     }
     if body.apply_launch {
+        let should_restart = body.restart;
+        let restart_host = body.host.trim().to_string();
+        let restart_port = body.port;
+        let restart_token = body.token.trim().to_string();
         return match apply_launch_settings(&state, &body) {
-            Ok(status) => Json(status).into_response(),
+            Ok(status) => {
+                if should_restart {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = jeikcode_updater::restart_process_with_options(
+                                &exe,
+                                if restart_host.is_empty() {
+                                    None
+                                } else {
+                                    Some(&restart_host)
+                                },
+                                restart_port,
+                                if restart_token.is_empty() {
+                                    None
+                                } else {
+                                    Some(&restart_token)
+                                },
+                            );
+                        }
+                    });
+                }
+                Json(status).into_response()
+            }
             Err(err) => json_error(axum::http::StatusCode::BAD_REQUEST, err).into_response(),
         };
     }

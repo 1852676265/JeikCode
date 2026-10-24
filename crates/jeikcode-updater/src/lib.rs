@@ -248,6 +248,7 @@ fn same_exe(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Returns true if `path` has the product binary name.
 fn looks_like_jeikcode_binary(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -256,97 +257,130 @@ fn looks_like_jeikcode_binary(path: &Path) -> bool {
     lower == "jeikcode" || lower == "jeikcode.exe"
 }
 
-fn looks_like_desktop_cli_payload(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("cli-bin"))
-}
-
-fn desktop_cli_bin_candidates() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let local = PathBuf::from(local);
-        dirs.push(local.join("JeikCode Desktop"));
-        dirs.push(local.join("Programs").join("JeikCode Desktop"));
-    }
-    for key in ["ProgramFiles", "ProgramFiles(x86)", "PROGRAMFILES"] {
-        if let Some(pf) = std::env::var_os(key) {
-            dirs.push(PathBuf::from(pf).join("JeikCode Desktop"));
-        }
-    }
-    if let Some(home) = jeikcode_config::util::real_home_dir() {
-        dirs.push(
-            home.join("Applications")
-                .join("JeikCode Desktop.app")
-                .join("Contents")
-                .join("Resources"),
-        );
-        dirs.push(home.join(".local").join("share").join("jeikcode-desktop"));
-    }
-    dirs.push(PathBuf::from(
-        "/Applications/JeikCode Desktop.app/Contents/Resources",
-    ));
-    dirs.push(PathBuf::from("/usr/lib/jeikcode-desktop"));
-    dirs.push(PathBuf::from("/usr/lib/JeikCode Desktop"));
-    dirs.push(PathBuf::from("/opt/JeikCode Desktop"));
-
-    let mut out = Vec::new();
-    for dir in dirs {
-        out.push(dir.join("cli-bin"));
-        out.push(dir.join("resources").join("cli-bin"));
-    }
-    out
-}
-
-/// Every CLI image we should overwrite: the running process, `~/.local/bin`,
-/// PATH copies, and the desktop installer's bundled `cli-bin`. Desktop copies
-/// `cli-bin` into `~/.local/bin` on launch; replacing only one side leaves
-/// either PATH or the next desktop start on the old build.
+/// Single authoritative install target: the running process binary.
+/// Replaces the legacy multi-candidate traversal across PATH and ProgramFiles.
 pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf, allow_payload: bool| {
-        if !(looks_like_jeikcode_binary(&p)
-            || (allow_payload && looks_like_desktop_cli_payload(&p)))
-        {
-            return;
-        }
-        if out.iter().any(|e| same_exe(e, &p)) {
-            return;
-        }
-        if p.exists() || same_exe(&p, running) {
-            out.push(p);
-        }
-    };
-    push(running.to_path_buf(), true);
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            push(dir.join("jeikcode"), false);
-            #[cfg(windows)]
-            push(dir.join("jeikcode.exe"), false);
-        }
-    }
+    vec![running.to_path_buf()]
+}
+
+/// Clean up orphaned legacy copies in `~/.local/bin` left by older dropper versions.
+pub fn cleanup_legacy_dropper_file(running: &Path) {
     if let Some(home) = jeikcode_config::util::real_home_dir() {
-        push(home.join(".local/bin/jeikcode"), false);
-        #[cfg(windows)]
-        push(home.join(".local/bin/jeikcode.exe"), false);
+        let legacy = home.join(".local").join("bin").join(if cfg!(windows) {
+            "jeikcode.exe"
+        } else {
+            "jeikcode"
+        });
+        if legacy.is_file() && !same_exe(&legacy, running) {
+            let _ = std::fs::remove_file(&legacy);
+            let local_bin = home.join(".local").join("bin");
+            let _ = std::fs::remove_dir(&local_bin);
+        }
     }
+}
+
+/// Migrate legacy installations on Windows/Unix for direct binary update users:
+/// 1. Remove legacy `~/.local/bin/jeikcode(.exe)` if not the running executable.
+/// 2. On Windows, clean legacy `.local\bin` from `HKCU\Environment\Path` and
+///    ensure the running binary's directory is registered in `Path`.
+pub fn migrate_legacy_environment() {
     #[cfg(windows)]
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        push(
-            PathBuf::from(local).join("JeikCode").join("jeikcode.exe"),
-            false,
+    {
+        let Ok(running) = current_exe_path() else {
+            return;
+        };
+        cleanup_legacy_dropper_file(&running);
+
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+        else {
+            return;
+        };
+        let current: String = env.get_value("Path").unwrap_or_default();
+        let home = jeikcode_config::util::real_home_dir();
+        let legacy_dir = home
+            .as_ref()
+            .map(|h| h.join(".local").join("bin").display().to_string());
+        let install_dir = running.parent().map(|d| d.display().to_string());
+
+        let mut parts: Vec<String> = current
+            .split(';')
+            .filter(|p| {
+                let trimmed = p.trim();
+                if trimmed.is_empty() {
+                    return false;
+                }
+                if let Some(ref leg) = legacy_dir {
+                    if trimmed.eq_ignore_ascii_case(leg) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|s| s.to_string())
+            .collect();
+
+        // 仅在当前运行目录包含有效可执行文件且非临时目录时加入 PATH
+        if let Some(ref dir_str) = install_dir {
+            let lower = dir_str.to_ascii_lowercase();
+            if !lower.contains("temp") && !lower.contains("staged") && !lower.contains("target\\") {
+                if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(dir_str)) {
+                    parts.insert(0, dir_str.clone());
+                }
+            }
+        }
+
+        let new_path = parts.join(";");
+        if new_path != current {
+            let _ = env.set_value("Path", &new_path);
+            broadcast_setting_change();
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(running) = current_exe_path() {
+            cleanup_legacy_dropper_file(&running);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn broadcast_setting_change() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut std::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: *const u16,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let env_wide: Vec<u16> = std::ffi::OsStr::new("Environment")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let hwnd_broadcast = 0xffff as *mut std::ffi::c_void;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    let mut res = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd_broadcast,
+            WM_SETTINGCHANGE,
+            0,
+            env_wide.as_ptr(),
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut res,
         );
     }
-    for candidate in ["/usr/local/bin/jeikcode", "/usr/bin/jeikcode"] {
-        push(PathBuf::from(candidate), false);
-    }
-    if let Some(p) = std::env::var_os("JEIKCODE_DESKTOP_CLI_BIN") {
-        push(PathBuf::from(p), true);
-    }
-    for p in desktop_cli_bin_candidates() {
-        push(p, true);
-    }
-    out
 }
 
 fn file_sha256_hex(path: &Path) -> Result<String> {
@@ -731,6 +765,9 @@ pub async fn run_upgrade_for_channel(
 /// Child waits for this parent pid to exit before binding the listen port.
 pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
 
+/// Target listen host of the replacement process.
+pub const RESTART_LISTEN_HOST_ENV: &str = "JEIKCODE_RESTART_LISTEN_HOST";
+
 /// Actual listen port of the process that is being replaced.
 /// argv `--port` can still be the first choice from before a cold-start scan.
 pub const RESTART_LISTEN_PORT_ENV: &str = "JEIKCODE_RESTART_LISTEN_PORT";
@@ -810,6 +847,15 @@ pub fn restart_listen_port_from_env() -> Option<u16> {
         .filter(|port: &u16| *port > 0)
 }
 
+pub fn restart_listen_host_from_env() -> Option<String> {
+    let host = std::env::var(RESTART_LISTEN_HOST_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    std::env::remove_var(RESTART_LISTEN_HOST_ENV);
+    host
+}
+
 /// Read and remove the inherited webui token so later child processes do not
 /// see it.
 pub fn take_restart_token() -> Option<String> {
@@ -887,32 +933,144 @@ pub fn wait_for_predecessor_if_requested() {
 
 #[cfg(unix)]
 fn supervised_by_service_manager() -> bool {
-    std::env::var_os("INVOCATION_ID").is_some()
+    if std::env::var_os("INVOCATION_ID").is_some()
         || std::env::var_os("LAUNCH_JOBNAME").is_some()
         || std::env::var_os("XPC_SERVICE_NAME").is_some()
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+        if cgroup.lines().any(|l| l.contains(".service")) {
+            return true;
+        }
+    }
+    false
 }
 
-/// After an in-place swap, start the new binary with the current argv, then
-/// exit this process so the listen port is released.
-///
-/// The successor is this same server, not a second port. It inherits argv
-/// (`--port`, `--token`) plus the actual listen port, and it binds only that
-/// port. No other jeikcode process is signaled.
-///
-/// Spawn a detached successor that waits until this process stops accepting
-/// on `listen_port`. Do not use `cmd.exe`: the helper is killed when this
-/// process exits. Under systemd/launchd, `exec` keeps the supervised pid.
-///
-/// If the successor cannot be started, returns `Err` and the caller MUST keep
-/// serving so a remote browser is not left with a dead port.
+/// Patch CLI argv to inject updated host, port, and token parameters upon restart.
+pub fn patch_restart_args<I, S>(
+    args: I,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let orig: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(orig.len() + 6);
+    let mut i = 0;
+    let mut host_patched = new_host.is_none();
+    let mut port_patched = new_port.map_or(true, |p| p == 0);
+    let mut token_patched = new_token.is_none();
+
+    while i < orig.len() {
+        let arg = &orig[i];
+        let arg_str = arg.to_string_lossy();
+
+        if let Some(h) = new_host {
+            if arg_str == "--host" {
+                out.push(arg.clone());
+                out.push(std::ffi::OsString::from(h));
+                host_patched = true;
+                if i + 1 < orig.len() {
+                    i += 2;
+                    continue;
+                }
+            } else if arg_str.starts_with("--host=") {
+                out.push(std::ffi::OsString::from(format!("--host={h}")));
+                host_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        if let Some(p) = new_port.filter(|p| *p > 0) {
+            if arg_str == "--port" {
+                out.push(arg.clone());
+                out.push(std::ffi::OsString::from(p.to_string()));
+                port_patched = true;
+                if i + 1 < orig.len() {
+                    i += 2;
+                    continue;
+                }
+            } else if arg_str.starts_with("--port=") {
+                out.push(std::ffi::OsString::from(format!("--port={p}")));
+                port_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        if let Some(t) = new_token {
+            if arg_str == "--token" {
+                out.push(arg.clone());
+                out.push(std::ffi::OsString::from(t));
+                token_patched = true;
+                if i + 1 < orig.len() {
+                    i += 2;
+                    continue;
+                }
+            } else if arg_str.starts_with("--token=") {
+                out.push(std::ffi::OsString::from(format!("--token={t}")));
+                token_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(arg.clone());
+        i += 1;
+    }
+
+    if let Some(h) = new_host {
+        if !host_patched {
+            out.push(std::ffi::OsString::from("--host"));
+            out.push(std::ffi::OsString::from(h));
+        }
+    }
+    if let Some(p) = new_port.filter(|p| *p > 0) {
+        if !port_patched {
+            out.push(std::ffi::OsString::from("--port"));
+            out.push(std::ffi::OsString::from(p.to_string()));
+        }
+    }
+    if let Some(t) = new_token {
+        if !token_patched {
+            out.push(std::ffi::OsString::from("--token"));
+            out.push(std::ffi::OsString::from(t));
+        }
+    }
+
+    out
+}
+
+/// After an in-place swap or configuration change, restart the binary inheriting
+/// host, port, and token parameters.
 pub fn restart_replaced_process(
     exe: &Path,
     listen_port: u16,
     token: Option<&str>,
 ) -> Result<std::convert::Infallible> {
-    // The binary on disk is already the selected release. A staged
-    // pending.json must not replace it again on the next start.
+    restart_process_with_options(exe, None, listen_port, token)
+}
+
+/// Restart the process explicitly applying latest host, port, and token options.
+pub fn restart_process_with_options(
+    exe: &Path,
+    host: Option<&str>,
+    listen_port: u16,
+    token: Option<&str>,
+) -> Result<std::convert::Infallible> {
     std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        std::env::set_var(RESTART_LISTEN_HOST_ENV, h);
+    }
     if listen_port > 0 {
         std::env::set_var(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
     }
@@ -921,17 +1079,37 @@ pub fn restart_replaced_process(
     if let Some(token) = token {
         std::env::set_var(RESTART_TOKEN_ENV, token);
     }
+
+    let orig_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let patched_args = patch_restart_args(
+        orig_args,
+        host,
+        (listen_port > 0).then_some(listen_port),
+        token,
+    );
+
     #[cfg(unix)]
-    if supervised_by_service_manager() {
-        return re_exec_self(Some(exe));
+    {
+        let is_supervised = supervised_by_service_manager();
+        // 优先原地 re-exec：保留 PID、终端前台及 supervisor 纳管关系
+        match re_exec_self_with_args(Some(exe), Some(&patched_args)) {
+            Ok(infallible) => return Ok(infallible),
+            Err(_) => {
+                if is_supervised {
+                    std::process::exit(0);
+                }
+            }
+        }
     }
 
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(&args)
+    cmd.args(&patched_args)
         .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
         .env(RESTART_EXACT_PORT_ENV, "1")
         .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        cmd.env(RESTART_LISTEN_HOST_ENV, h);
+    }
     if listen_port > 0 {
         cmd.env(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
     }
@@ -959,9 +1137,9 @@ pub fn restart_replaced_process(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
     }
 
@@ -1421,26 +1599,8 @@ pub async fn run_upgrade_with_manifest(
             exe.display()
         ));
     }
-    for extra in discover_install_exes(&exe)
-        .into_iter()
-        .filter(|p| !same_exe(p, &exe))
-    {
-        if ensure_writable(&extra).is_err() {
-            eprintln!(
-                "Note: skipped extra install copy {} (not writable). PATH may still hit the old binary.",
-                extra.display()
-            );
-            continue;
-        }
-        if let Err(e) = atomic_copy_replace(&exe, &extra) {
-            eprintln!(
-                "Note: could not update extra install copy {}: {e}",
-                extra.display()
-            );
-            continue;
-        }
-        eprintln!("    also updated {}", extra.display());
-    }
+    // 顺带清理可能遗留的历史老版本 ~/.local/bin/jeikcode 孤儿副本
+    cleanup_legacy_dropper_file(&exe);
 
     // Manual `/upgrade` just installed whatever the current manifest
     // advertises. Any staged upgrade sitting in `staged_dir()` is now
@@ -1863,6 +2023,13 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
 /// constraints); caller should surface the error and keep running with
 /// the old binary rather than exiting silently.
 pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infallible> {
+    re_exec_self_with_args(override_exe, None)
+}
+
+pub fn re_exec_self_with_args(
+    override_exe: Option<&Path>,
+    override_args: Option<&[std::ffi::OsString]>,
+) -> Result<std::convert::Infallible> {
     let exe = override_exe.map(|p| p.to_path_buf()).unwrap_or_else(|| {
         current_exe_path().unwrap_or_else(|_| {
             // Fallback: if we can't resolve current_exe AND no override,
@@ -1873,7 +2040,10 @@ pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infalli
                 .unwrap_or_default()
         })
     });
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<std::ffi::OsString> = match override_args {
+        Some(a) => a.to_vec(),
+        None => std::env::args_os().skip(1).collect(),
+    };
 
     #[cfg(unix)]
     {
@@ -2216,11 +2386,6 @@ mod tests {
         assert!(looks_like_jeikcode_binary(Path::new("jeikcode.exe")));
         assert!(!looks_like_jeikcode_binary(Path::new("jeikcode.cmd")));
         assert!(!looks_like_jeikcode_binary(Path::new("other.exe")));
-        assert!(looks_like_desktop_cli_payload(Path::new("cli-bin")));
-        assert!(looks_like_desktop_cli_payload(Path::new(
-            "C:/app/resources/cli-bin"
-        )));
-        assert!(!looks_like_desktop_cli_payload(Path::new("jeikcode.exe")));
     }
 
     #[test]
@@ -2827,5 +2992,19 @@ mod tests {
     fn zombie_pid_does_not_block_once_the_listen_socket_is_gone() {
         assert!(predecessor_socket_released(false));
         assert!(!predecessor_socket_released(true));
+    }
+
+    #[test]
+    fn patch_restart_args_replaces_and_injects_options() {
+        let orig = vec!["webui", "--host", "127.0.0.1", "--port", "13457"];
+        let patched = patch_restart_args(orig, Some("0.0.0.0"), Some(4096), Some("sk-token"));
+        let strings: Vec<String> = patched
+            .into_iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strings,
+            vec!["webui", "--host", "0.0.0.0", "--port", "4096", "--token", "sk-token"]
+        );
     }
 }

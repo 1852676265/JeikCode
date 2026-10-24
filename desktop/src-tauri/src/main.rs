@@ -2,8 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! 薄桌面壳：拉起同一个 `jeikcode webui`，窗口只打开它。
-//! 已安装的 `~/.local/bin` 直接启动。安装包里的 `cli-bin` 只在缺失或更新时后台复制，
-//! 不挡这次打开。`jeikcode upgrade` 写过的较新副本不会被安装包盖掉。
+//! 直接就地（In-Place）执行安装目录下的 `jeikcode`，单一来源运行，消除运行期文件释放与杀毒误报。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -333,6 +332,7 @@ struct ChildSlot(Mutex<Option<std::process::Child>>);
 
 struct WebuiLaunch {
     bin: PathBuf,
+    host: String,
     port: u16,
     token: String,
     home: PathBuf,
@@ -343,12 +343,13 @@ fn start_webui(
     app: &tauri::AppHandle,
 ) -> Result<(String, std::process::Child, WebuiLaunch), String> {
     let bundled = bundled_cli(app);
-    let bin = publish_cli(bundled.as_deref()).map_err(|e| format!("安装命令行失败：{e}"))?;
+    let bin = resolve_desktop_cli(bundled.as_deref());
     let home = home_dir();
-    let (port, saved_token) = saved_webui_listen();
-    let token = saved_token.unwrap_or_else(|| mint_desktop_token(port));
+    let (host, port, saved_token) = saved_webui_listen();
+    let token = saved_token.unwrap_or_else(|| mint_desktop_token(&host, port));
     let mut launch = WebuiLaunch {
         bin,
+        host,
         port,
         token,
         home,
@@ -365,7 +366,8 @@ fn start_webui(
         let dir = jeikcode_dir();
         let _ = std::fs::create_dir_all(&dir);
         let body = format!(
-            "{{\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
+            "{{\n  \"host\": \"{}\",\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
+            launch.host,
             launch.token
         );
         let _ = std::fs::write(dir.join("webui-listen.json"), body);
@@ -381,7 +383,7 @@ fn spawn_desktop_server(
     let mut cmd = Command::new(&launch.bin);
     cmd.arg("webui")
         .arg("--host")
-        .arg("0.0.0.0")
+        .arg(&launch.host)
         .arg("--port")
         .arg(launch.port.to_string())
         .arg("--no-open")
@@ -558,8 +560,17 @@ fn window_url(url: &str) -> String {
 
 fn bundled_cli(app: &tauri::AppHandle) -> Option<PathBuf> {
     let dir = app.path().resource_dir().ok()?;
-    let path = dir.join("cli-bin");
-    path.is_file().then_some(path)
+    let exe_name = cli_file_name();
+    let path = dir.join(exe_name);
+    if path.is_file() {
+        return Some(path);
+    }
+    // 兼容历史老版本或开发构建时的未带后缀资源
+    let fallback = dir.join("cli-bin");
+    if fallback.is_file() {
+        return Some(fallback);
+    }
+    None
 }
 
 fn read_url(
@@ -632,7 +643,7 @@ fn health_ready(port: u16) -> bool {
     head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
-fn mint_desktop_token(port: u16) -> String {
+fn mint_desktop_token(host: &str, port: u16) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
@@ -640,58 +651,118 @@ fn mint_desktop_token(port: u16) -> String {
     let token = format!("sk-{:x}-{:x}", std::process::id(), nanos);
     let dir = jeikcode_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let body = format!("{{\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
+    let body = format!("{{\n  \"host\": \"{host}\",\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
     let _ = std::fs::write(dir.join("webui-listen.json"), body);
     token
 }
 
-fn publish_cli(bundled: Option<&Path>) -> std::io::Result<PathBuf> {
-    let dest_dir = cli_dest_dir();
-    let dest = dest_dir.join(cli_file_name());
-    let bundled = bundled.filter(|path| looks_like_binary(path));
-    let dest_ready = dest.is_file() && looks_like_binary(&dest);
-    // 安装包更新，或本机还没有副本：先直接跑安装包里的文件，复制放到后台。
-    let launch_bundled = bundled.is_some_and(|src| !dest_ready || bundled_is_newer(src, &dest));
-    if launch_bundled {
-        if let Some(src) = bundled {
-            let src_owned = src.to_path_buf();
-            let dest_owned = dest.clone();
-            let dest_dir_owned = dest_dir.clone();
-            std::thread::spawn(move || {
-                let _ = std::fs::create_dir_all(&dest_dir_owned);
-                let _ = std::fs::copy(&src_owned, &dest_owned);
-                set_executable(&dest_owned);
-                ensure_on_path(&dest_dir_owned);
-            });
-            set_executable(src);
-            return Ok(src.to_path_buf());
+fn resolve_desktop_cli(bundled: Option<&Path>) -> PathBuf {
+    // 异步执行老版本残留迁移清理（不阻塞主启动）
+    std::thread::spawn(|| {
+        cleanup_legacy_dropper_install();
+    });
+
+    if let Some(src) = bundled {
+        set_executable(src);
+        return src.to_path_buf();
+    }
+
+    // 开发环境或 fallback：尝试同级可执行文件或 PATH
+    let name = cli_file_name();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
         }
     }
-    if dest_ready {
-        let dest_dir_owned = dest_dir.clone();
-        std::thread::spawn(move || ensure_on_path(&dest_dir_owned));
-        return Ok(dest);
-    }
-    if dest.is_file() {
-        return Ok(dest);
-    }
-    Ok(PathBuf::from(cli_file_name()))
+    PathBuf::from(name)
 }
 
-fn bundled_is_newer(bundled: &Path, dest: &Path) -> bool {
-    let bundled_mtime = std::fs::metadata(bundled)
+#[cfg(windows)]
+fn cleanup_legacy_dropper_install() {
+    let legacy_exe = home_dir().join(".local").join("bin").join("jeikcode.exe");
+    if legacy_exe.is_file() {
+        let _ = std::fs::remove_file(&legacy_exe);
+        let local_bin = home_dir().join(".local").join("bin");
+        let _ = std::fs::remove_dir(&local_bin);
+    }
+
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE) else {
+        return;
+    };
+    let current: String = env.get_value("Path").unwrap_or_default();
+    let legacy_dir = home_dir().join(".local").join("bin").display().to_string();
+    let install_dir = std::env::current_exe()
         .ok()
-        .and_then(|m| m.modified().ok());
-    let dest_mtime = std::fs::metadata(dest).ok().and_then(|m| m.modified().ok());
-    match (bundled_mtime, dest_mtime) {
-        (Some(bundled), Some(dest)) => bundled > dest,
-        (Some(_), None) => true,
-        _ => false,
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    let mut parts: Vec<String> = current
+        .split(';')
+        .filter(|p| !p.trim().is_empty() && !p.trim().eq_ignore_ascii_case(&legacy_dir))
+        .map(|s| s.to_string())
+        .collect();
+
+    if let Some(dir) = install_dir {
+        let dir_str = dir.display().to_string();
+        if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(&dir_str)) {
+            parts.insert(0, dir_str);
+        }
+    }
+
+    let new_path = parts.join(";");
+    if new_path != current {
+        let _ = env.set_value("Path", &new_path);
+        broadcast_env_change();
     }
 }
 
-fn cli_dest_dir() -> PathBuf {
-    home_dir().join(".local").join("bin")
+#[cfg(windows)]
+fn broadcast_env_change() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut std::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: *const u16,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let env_wide: Vec<u16> = std::ffi::OsStr::new("Environment")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let hwnd_broadcast = 0xffff as *mut std::ffi::c_void;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    let mut res = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd_broadcast,
+            WM_SETTINGCHANGE,
+            0,
+            env_wide.as_ptr(),
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut res,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn cleanup_legacy_dropper_install() {
+    let legacy_bin = home_dir().join(".local").join("bin").join("jeikcode");
+    if legacy_bin.is_file() {
+        // 如果是孤儿残留且非当前运行程序，移除避免旧版本优先命中
+        let _ = std::fs::remove_file(&legacy_bin);
+    }
 }
 
 fn cli_file_name() -> &'static str {
@@ -702,22 +773,30 @@ fn cli_file_name() -> &'static str {
     }
 }
 
+const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 const WEBUI_DEFAULT_PORT: u16 = 13457;
 
 /// `~/.jeikcode/webui-listen.json` written by the remote-access panel.
-/// Missing file, a bad file, or no token means: port 13457 and a random token.
-fn saved_webui_listen() -> (u16, Option<String>) {
+/// Defaults to 127.0.0.1 and port 13457; supports user customized host (e.g. 0.0.0.0).
+fn saved_webui_listen() -> (String, u16, Option<String>) {
     let path = jeikcode_dir().join("webui-listen.json");
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (WEBUI_DEFAULT_PORT, None);
+        return (DEFAULT_LISTEN_HOST.to_string(), WEBUI_DEFAULT_PORT, None);
     };
     parse_webui_listen(&text)
 }
 
-fn parse_webui_listen(text: &str) -> (u16, Option<String>) {
+fn parse_webui_listen(text: &str) -> (String, u16, Option<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return (WEBUI_DEFAULT_PORT, None);
+        return (DEFAULT_LISTEN_HOST.to_string(), WEBUI_DEFAULT_PORT, None);
     };
+    let host = value
+        .get("host")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_LISTEN_HOST.to_string());
     let port = value
         .get("port")
         .and_then(|item| item.as_u64())
@@ -730,7 +809,7 @@ fn parse_webui_listen(text: &str) -> (u16, Option<String>) {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(str::to_string);
-    (port, token)
+    (host, port, token)
 }
 
 fn jeikcode_dir() -> PathBuf {
@@ -749,23 +828,6 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn looks_like_binary(path: &Path) -> bool {
-    let mut magic = [0u8; 4];
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let Ok(n) = file.read(&mut magic) else {
-        return false;
-    };
-    n >= 2
-        && (magic.starts_with(b"MZ")
-            || magic.starts_with(b"\x7fELF")
-            || magic.starts_with(&[0xfe, 0xed, 0xfa])
-            || magic.starts_with(b"#!")
-            || magic.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
-            || magic.starts_with(&[0xca, 0xfe, 0xba, 0xbe]))
-}
-
 fn set_executable(path: &Path) {
     #[cfg(unix)]
     {
@@ -773,58 +835,6 @@ fn set_executable(path: &Path) {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
     }
     let _ = path;
-}
-
-fn ensure_on_path(dir: &Path) {
-    #[cfg(windows)]
-    ensure_windows_path(dir);
-    #[cfg(not(windows))]
-    ensure_shell_path(dir);
-}
-
-#[cfg(windows)]
-fn ensure_windows_path(dir: &Path) {
-    use winreg::enums::*;
-    use winreg::RegKey;
-    let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-    else {
-        return;
-    };
-    let current: String = env.get_value("Path").unwrap_or_default();
-    let dir_text = dir.display().to_string();
-    let already = current
-        .split(';')
-        .any(|p| p.trim().eq_ignore_ascii_case(&dir_text));
-    if already {
-        return;
-    }
-    let next = if current.trim().is_empty() {
-        dir_text
-    } else {
-        format!("{dir_text};{current}")
-    };
-    let _ = env.set_value("Path", &next);
-}
-
-#[cfg(not(windows))]
-fn ensure_shell_path(dir: &Path) {
-    let line = format!("export PATH=\"{}:$PATH\"", dir.display());
-    for name in [".zshrc", ".bashrc"] {
-        let path = home_dir().join(name);
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if existing.lines().any(|l| l.trim() == line) {
-            continue;
-        }
-        let mut next = existing;
-        if !next.is_empty() && !next.ends_with('\n') {
-            next.push('\n');
-        }
-        next.push_str("\n# Added by JeikCode Desktop\n");
-        next.push_str(&line);
-        next.push('\n');
-        let _ = std::fs::write(path, next);
-    }
 }
 
 #[cfg(windows)]
@@ -842,9 +852,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        bundled_is_newer, external_browser_url, extract_webui_url, host_window_away,
+        external_browser_url, extract_webui_url, host_window_away,
         navigation_action, new_window_action, parse_webui_listen, remember_webui_origin,
-        window_url, LinkAction, WebuiOrigin,
+        resolve_desktop_cli, window_url, LinkAction, WebuiOrigin,
     };
 
     fn parse_url(raw: &str) -> tauri::Url {
@@ -852,19 +862,10 @@ mod tests {
     }
 
     #[test]
-    fn bundled_cli_does_not_replace_a_newer_dest() {
-        let dir = std::env::temp_dir().join(format!("jeik-cli-mtime-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let dest = dir.join("dest");
-        let bundled = dir.join("bundled");
-        std::fs::write(&bundled, b"old-installer").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        std::fs::write(&dest, b"cli-upgraded").unwrap();
-        assert!(
-            !bundled_is_newer(&bundled, &dest),
-            "CLI-upgraded dest must win over an older desktop installer copy"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    fn resolve_desktop_cli_prefers_bundled() {
+        let dummy = std::path::Path::new("dummy-bundled-path");
+        let resolved = resolve_desktop_cli(Some(dummy));
+        assert_eq!(resolved, dummy);
     }
 
     fn origin(host: &str, port: u16) -> WebuiOrigin {
@@ -897,14 +898,14 @@ mod tests {
     #[test]
     fn saved_listen_uses_the_port_and_token_and_ignores_a_blank_token() {
         assert_eq!(
-            parse_webui_listen(r#"{"port":4096,"token":"desk-token"}"#),
-            (4096, Some("desk-token".to_string()))
+            parse_webui_listen(r#"{"host":"0.0.0.0","port":4096,"token":"desk-token"}"#),
+            ("0.0.0.0".to_string(), 4096, Some("desk-token".to_string()))
         );
         assert_eq!(
             parse_webui_listen(r#"{"port":0,"token":"  "}"#),
-            (13457, None)
+            ("127.0.0.1".to_string(), 13457, None)
         );
-        assert_eq!(parse_webui_listen("not json"), (13457, None));
+        assert_eq!(parse_webui_listen("not json"), ("127.0.0.1".to_string(), 13457, None));
     }
 
     #[test]

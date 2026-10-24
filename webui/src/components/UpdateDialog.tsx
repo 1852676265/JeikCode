@@ -118,10 +118,13 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         if (!isMounted.current || stopped) return;
         misses = 0;
         setStatus(s);
-        const progressed =
-          s.status === 'installing' ||
-          s.status === 'done' ||
-          (s.status === 'downloading' && (s.progress ?? 0) >= 90);
+        if (s.status === 'error') {
+          stopped = true;
+          window.clearInterval(timer);
+          setUpdating(false);
+          return;
+        }
+        const progressed = s.status === 'installing' || s.status === 'done';
         if (progressed) sawInstallProgress.current = true;
         const restarted =
           s.status === 'done' ||

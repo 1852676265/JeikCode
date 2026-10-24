@@ -12603,7 +12603,11 @@ pub async fn ensure_webui(
     };
     // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），同步写回配置，
     // 确保 webui-listen.json 里的端口与实际绑定的端口一致，界面输入框不会残留冲突前的旧端口。
-    let _ = api_config::save_webui_listen_pref(actual_port, Some(token.clone()));
+    let _ = api_config::save_webui_listen_pref(
+        Some(bound_host.clone()),
+        actual_port,
+        Some(token.clone()),
+    );
     // 选择自动打开浏览器用的本机地址：
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在

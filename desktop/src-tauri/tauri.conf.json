@@ -25,9 +25,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "resources/cli-bin": "cli-bin"
-    },
+    "resources": [
+      "resources/*"
+    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
