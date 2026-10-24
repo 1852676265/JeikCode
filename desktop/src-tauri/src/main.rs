@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 
 static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
@@ -271,8 +273,14 @@ fn main() {
 
             watch_host_presence(window.clone());
             let drop_window = window.clone();
+            let close_window = window.clone();
             // 仅原生拖放还开着的平台会收到这些事件（Windows 已关掉，改由页面 HTML5 处理）。
             window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = close_window.hide();
+                    publish_host_away(&close_window, true);
+                }
                 if let tauri::WindowEvent::DragDrop(drop_event) = event {
                     if let tauri::DragDropEvent::Drop { paths, .. } = drop_event {
                         for path in paths {
@@ -288,6 +296,8 @@ fn main() {
                     }
                 }
             });
+            setup_system_tray(app).expect("初始化系统托盘图标失败");
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match start_webui(&handle) {
@@ -326,6 +336,152 @@ fn main() {
                 }
             }
         });
+}
+
+struct TrayTexts {
+    tooltip: &'static str,
+    show_window: &'static str,
+    quit: &'static str,
+}
+
+fn resolve_tray_texts() -> TrayTexts {
+    let lang = detect_user_language();
+    if lang.starts_with("zh") {
+        TrayTexts {
+            tooltip: "JeikCode Desktop - AI 编程助手",
+            show_window: "显示主界面",
+            quit: "退出",
+        }
+    } else if lang.starts_with("vi") {
+        TrayTexts {
+            tooltip: "JeikCode Desktop - Trợ lý lập trình AI",
+            show_window: "Hiển thị giao diện",
+            quit: "Thoát",
+        }
+    } else {
+        TrayTexts {
+            tooltip: "JeikCode Desktop - AI Coding Agent",
+            show_window: "Show Window",
+            quit: "Quit",
+        }
+    }
+}
+
+fn detect_user_language() -> String {
+    let config_path = jeikcode_dir().join("config.toml");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                break;
+            }
+            if let Some(rest) = trimmed.strip_prefix("language") {
+                let rest = rest.trim_start();
+                if let Some(val) = rest.strip_prefix('=') {
+                    let clean = val
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim()
+                        .to_lowercase();
+                    if !clean.is_empty() {
+                        return clean;
+                    }
+                }
+            }
+        }
+    }
+
+    for var in ["JEIKCODE_LANGUAGE", "JEIKCODE_LANG", "LANG", "LC_ALL"] {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim().to_lowercase();
+            if !val.is_empty() {
+                return val;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(hkcu) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+            .open_subkey("Control Panel\\International")
+        {
+            if let Ok(locale_name) = hkcu.get_value::<String, _>("LocaleName") {
+                return locale_name.to_lowercase();
+            }
+        }
+    }
+
+    "en".to_string()
+}
+
+fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let texts = resolve_tray_texts();
+    let show_item = MenuItemBuilder::with_id("show", texts.show_window).build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", texts.quit).build(app)?;
+    let menu = MenuBuilder::new(app)
+        .item(&show_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .expect("未在 tauri.conf.json 中找到应用默认图标");
+
+    let _tray = TrayIconBuilder::with_id("main-tray")
+        .tooltip(texts.tooltip)
+        .icon(icon)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    publish_host_away(&window, false);
+                }
+            }
+            "quit" => {
+                DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                if let Some(slot) = app.try_state::<ChildSlot>() {
+                    if let Some(child) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let is_visible = window.is_visible().unwrap_or(false);
+                    let is_minimized = window.is_minimized().unwrap_or(false);
+                    let is_focused = window.is_focused().unwrap_or(false);
+                    if is_visible && !is_minimized && is_focused {
+                        let _ = window.hide();
+                        publish_host_away(&window, true);
+                    } else {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                        publish_host_away(&window, false);
+                    }
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
 }
 
 struct ChildSlot(Mutex<Option<std::process::Child>>);
