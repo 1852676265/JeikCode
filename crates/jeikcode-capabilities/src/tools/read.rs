@@ -515,7 +515,8 @@ impl Tool for ReadFileTool {
             }
         };
         // Fold `.` / `..` so the header and later edits see one physical path.
-        let path = crate::pathnorm::canonicalize(&resolved).unwrap_or(resolved);
+        let path = crate::pathnorm::canonicalize(&resolved)
+            .unwrap_or_else(|_| crate::pathnorm::lexical_normalize(&resolved));
         let display_path = crate::pathnorm::to_display(&path);
 
         if meta.is_dir() {

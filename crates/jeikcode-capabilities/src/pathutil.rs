@@ -69,7 +69,7 @@ pub(crate) fn clean_model_path_input(raw: &str) -> String {
         s = rest;
     }
 
-    if cfg!(windows) && s.len() >= 3 && (s.starts_with('/') || s.starts_with('\\')) {
+    if s.len() >= 3 && (s.starts_with('/') || s.starts_with('\\')) {
         let mut chars = s[1..].chars();
         if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
             if first.is_ascii_alphabetic() && (second == ':' || second == '\u{FF1A}') {
@@ -94,9 +94,6 @@ pub(crate) fn clean_model_path_input(raw: &str) -> String {
 /// On Windows, Git-Bash POSIX forms (`/tmp/foo`, `/c/Users/foo`) are mapped to the
 /// native location so they do not become `{cwd_drive}:\tmp\foo`. On Unix those
 /// strings are already native absolute paths and are left unchanged.
-///
-/// Finally, the resulting path is lexically normalized via [`crate::pathnorm::lexical_normalize`]
-/// to resolve `.` and `..` segments across relative and absolute forms without filesystem lookups.
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     let cleaned = clean_model_path_input(raw);
     let raw = &cleaned;
@@ -106,16 +103,17 @@ pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     // relative-join path below exactly as it was.
     let expanded = crate::special_dirs::expand(raw);
     let raw = expanded.as_deref().unwrap_or(raw);
-    let base = if let Some(home) = expand_tilde(raw) {
-        home
-    } else if let Some(translated) = maybe_translate_posix_absolute(raw) {
-        translated
-    } else if is_absolute_path(raw) {
+    if let Some(home) = expand_tilde(raw) {
+        return home;
+    }
+    if let Some(translated) = maybe_translate_posix_absolute(raw) {
+        return translated;
+    }
+    if is_absolute_path(raw) {
         PathBuf::from(raw)
     } else {
         working_dir.join(raw)
-    };
-    crate::pathnorm::lexical_normalize(&base)
+    }
 }
 
 /// Cross-platform absolute-path test for model-supplied paths.
@@ -567,31 +565,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_normalizes_dotdot_and_model_quirks() {
-        let wd = Path::new("E:/code/jeikcode");
-        let sibling = resolve_path("../cc-switch/src/config/appConfig.ts", wd);
+    fn clean_model_path_handles_quirks() {
+        assert_eq!(clean_model_path_input(" `src/main.rs` \n"), "src/main.rs");
+        assert_eq!(clean_model_path_input("\"src/main.rs\""), "src/main.rs");
         assert_eq!(
-            crate::pathnorm::to_display(&sibling),
-            "E:/code/cc-switch/src/config/appConfig.ts"
+            clean_model_path_input("file:///E:/code/file.rs"),
+            "E:/code/file.rs"
         );
-
-        // Backticks, whitespace, quotes, file://
-        let quoted = resolve_path(" `../cc-switch/src/config/appConfig.ts` \n", wd);
         assert_eq!(
-            crate::pathnorm::to_display(&quoted),
-            "E:/code/cc-switch/src/config/appConfig.ts"
+            clean_model_path_input("/C:/code/file.rs"),
+            "C:/code/file.rs"
         );
-
-        let file_uri = resolve_path("file:///E:/code/cc-switch/src/config/appConfig.ts", wd);
         assert_eq!(
-            crate::pathnorm::to_display(&file_uri),
-            "E:/code/cc-switch/src/config/appConfig.ts"
-        );
-
-        let space_encoded = resolve_path("my%20folder/note.md", Path::new("/work"));
-        assert_eq!(
-            crate::pathnorm::to_display(&space_encoded),
-            "/work/my folder/note.md"
+            clean_model_path_input("my%20folder/note.md"),
+            "my folder/note.md"
         );
     }
 }
