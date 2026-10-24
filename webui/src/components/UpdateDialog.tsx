@@ -58,6 +58,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const sawInstallProgress = useRef(false);
   const targetVersionRef = useRef('');
   const currentVersionRef = useRef('');
+  const initialInstanceIdRef = useRef('');
   const reloadAfterRestartRef = useRef<() => void>(() => {});
 
   useEffect(() => {
@@ -176,20 +177,34 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     reloadStarted.current = true;
     const want = targetVersionRef.current;
     const from = currentVersionRef.current;
+    const initialInstanceId = initialInstanceIdRef.current;
     const timeoutMessage = t('update.restartTimeout');
     void (async () => {
       let misses = 0;
+      // 类似小地球机制：先给 500ms 让后端完成最后的数据帧并进入平滑停机与重启流程
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
       const deadline = Date.now() + 45000;
       while (Date.now() < deadline) {
         try {
-          const resp = await fetch('/health', {
+          const resp = await fetch(`/health?_t=${Date.now()}`, {
             credentials: 'include',
             signal: AbortSignal.timeout(1500),
+            cache: 'no-store',
           });
           if (resp.ok) {
             const body = await resp.json();
             const got = String(body?.version ?? '');
-            if (shouldReloadUpgradedPage({ want, from, got, consecutiveMisses: misses })) {
+            const currentInstanceId = String(body?.instance_id ?? '');
+            if (
+              shouldReloadUpgradedPage({
+                want,
+                from,
+                got,
+                consecutiveMisses: misses,
+                initialInstanceId,
+                currentInstanceId,
+              })
+            ) {
               window.location.reload();
               return;
             }
@@ -220,6 +235,20 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     reloadStarted.current = false;
     sawInstallProgress.current = false;
     setUpdating(true);
+    // 启动更新前记录当前实例代际 ID，用于重启后瞬间感知新进程上线
+    try {
+      const probe = await fetch(`/health?_t=${Date.now()}`, {
+        credentials: 'include',
+        signal: AbortSignal.timeout(1000),
+        cache: 'no-store',
+      });
+      if (probe.ok) {
+        const body = await probe.json();
+        initialInstanceIdRef.current = String(body?.instance_id ?? '');
+      }
+    } catch {
+      /* 忽略前置失败 */
+    }
     try {
       await executeUpdate({
         channel,

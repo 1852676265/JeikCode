@@ -200,7 +200,7 @@ impl KeyStringMeta {
                  Matched {} occurrence(s) of \"{key_string}\" (case-insensitive).\n\
                  Showing first {} matches.\n\
                  Window: {} lines above / {} lines below each match.\n\
-                 To see more: increase `max_matches`, or narrow `key_string` to a more specific snippet.\n",
+                 To see more: increase `max_matches`, or narrow `keyword` to a more specific snippet.\n",
                 self.total_matches,
                 self.shown_matches,
                 self.upward,
@@ -216,7 +216,7 @@ impl KeyStringMeta {
 pub enum ReadMeta {
     #[serde(rename = "range")]
     Range(RangeMeta),
-    #[serde(rename = "key_string")]
+    #[serde(rename = "keyword", alias = "key_string")]
     KeyString(KeyStringMeta),
 }
 
@@ -239,7 +239,7 @@ impl ReadResponse {
     pub fn new(path: String, content: String, footer: String, meta: ReadMeta) -> Self {
         let mode = match &meta {
             ReadMeta::Range(_) => "range".to_string(),
-            ReadMeta::KeyString(_) => "key_string".to_string(),
+            ReadMeta::KeyString(_) => "keyword".to_string(),
         };
         Self {
             path,
@@ -328,21 +328,23 @@ struct Args {
     /// Keyword or code snippet to focus on (case-insensitive, centers window around match).
     #[serde(
         default,
-        alias = "KeyString",
+        alias = "keywords",
         alias = "keystring",
+        alias = "key_string",
+        alias = "key_word",
+        alias = "KeyString",
         alias = "focus",
         alias = "anchor",
-        alias = "keyword",
         alias = "query"
     )]
-    key_string: Option<String>,
-    /// Number of context lines above the matched anchor (default 25). Only provide when key_string is specified.
+    keyword: Option<String>,
+    /// Number of context lines above the matched anchor (default 25). Only provide when keyword is specified.
     #[serde(default, deserialize_with = "lenient_usize")]
     upward: Option<usize>,
-    /// Number of context lines below the matched anchor (default 75). Only provide when key_string is specified.
+    /// Number of context lines below the matched anchor (default 75). Only provide when keyword is specified.
     #[serde(default, deserialize_with = "lenient_usize")]
     downward: Option<usize>,
-    /// Maximum number of matches to display when key_string multiple matches exist.
+    /// Maximum number of matches to display when multiple matches exist.
     #[serde(
         default,
         alias = "match_count",
@@ -473,27 +475,27 @@ impl Tool for ReadFileTool {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "1-based starting line. Supports negative values to read from tail (e.g. -200). Use with `limit` to page large files. Ignored when key_string is provided."
+                    "description": "1-based starting line. Supports negative values to read from tail (e.g. -200). Use with `limit` to page large files. Ignored when keyword is provided."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Number of lines to read from `offset` (defaults to 1500). Reading several hundred lines or the whole file in one call is safe and expected. Ignored when key_string is provided."
+                    "description": "Number of lines to read from `offset` (defaults to 1500). Reading several hundred lines or the whole file in one call is safe and expected. Ignored when keyword is provided."
                 },
-                "key_string": {
+                "keyword": {
                     "type": "string",
                     "description": "Optional snippet to center the reading window around (case-insensitive). When provided, `offset` and `limit` are ignored; use `upward`, `downward`, and `max_matches` instead."
                 },
                 "upward": {
                     "type": "integer",
-                    "description": "Context lines above each key_string match (default 25). Used only when key_string is specified; ignored otherwise."
+                    "description": "Context lines above each keyword match (default 25). Used only when keyword is specified; ignored otherwise."
                 },
                 "downward": {
                     "type": "integer",
-                    "description": "Context lines below each key_string match (default 75). Used only when key_string is specified; ignored otherwise."
+                    "description": "Context lines below each keyword match (default 75). Used only when keyword is specified; ignored otherwise."
                 },
                 "max_matches": {
                     "type": "integer",
-                    "description": "Maximum matches to show for key_string. Used only when key_string is specified; ignored otherwise. If omitted, all matches are shown."
+                    "description": "Maximum matches to show for keyword. Used only when keyword is specified; ignored otherwise. If omitted, all matches are shown."
                 }
             },
             "required": ["path"]
@@ -746,16 +748,16 @@ impl ReadFileTool {
         let total = file_lines.len();
 
         // ─────────────────────────────────────────────────────────────────────────────
-        // Window slicing: Anchor Search (key_string) vs Direct Offset (positive / tail)
+        // Window slicing: Anchor Search (keyword) vs Direct Offset (positive / tail)
         // ─────────────────────────────────────────────────────────────────────────────
         // Leave room for the plain-text footer appended after the page is cut.
         const FOOTER_RESERVE_BYTES: usize = 2048;
 
-        if let Some(ref target) = a.key_string {
+        if let Some(ref target) = a.keyword {
             let up = a.upward.unwrap_or(READ_UPWARD_DEFAULT);
             let down = a.downward.unwrap_or(READ_DOWNWARD_DEFAULT);
 
-            // Silent absorption: offset and limit are ignored in key_string mode
+            // Silent absorption: offset and limit are ignored in keyword mode
             let (matched_indices, snippet_lines, clean_needle) =
                 find_key_string_matches_robust(text, target, false, 0);
 
@@ -779,7 +781,7 @@ impl ReadFileTool {
                     crate::tools::write_state::record_read(p);
                 }
                 let result = if footer.is_empty() {
-                    format!("[KeyString: no matches found for `{target}`]\n")
+                    format!("[Keyword: no matches found for `{target}`]\n")
                 } else {
                     footer
                 };
@@ -803,7 +805,7 @@ impl ReadFileTool {
                 let cur_offset = s_idx + 1;
                 let cur_limit = e_idx.saturating_sub(s_idx);
 
-                out.push_str(&format!("[KeyString matched at line {}]\n", found + 1));
+                out.push_str(&format!("[Keyword matched at line {}]\n", found + 1));
                 for line_idx in s_idx..e_idx {
                     let line = file_lines[line_idx];
                     let n = line_idx + 1;
@@ -828,7 +830,7 @@ impl ReadFileTool {
                 }
             } else {
                 out.push_str(&format!(
-                    "[Found {} matches for key_string {:?} (showing {}):]\n",
+                    "[Found {} matches for keyword {:?} (showing {}):]\n",
                     total_matches,
                     clean_needle,
                     chosen.len()
@@ -2194,7 +2196,7 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(
-            r.content.contains("[KeyString matched at line 50]"),
+            r.content.contains("[Keyword matched at line 50]"),
             "{}",
             r.content
         );
@@ -2225,7 +2227,8 @@ mod tests {
             "25",
             "75",
             "safe and expected",
-            "Ignored when key_string",
+            "Ignored when keyword",
+            "\"keyword\"",
         ];
         for kw in keywords {
             assert!(
@@ -2233,6 +2236,10 @@ mod tests {
                 "schema must contain keyword '{kw}': {schema_str}"
             );
         }
+        assert!(
+            !schema_str.contains("\"key_string\""),
+            "external schema must not expose key_string: {schema_str}"
+        );
 
         // Schema properties must not contain any "default" keys (defaults live at execution layer)
         if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
@@ -2396,7 +2403,7 @@ mod tests {
             .await;
         assert!(!r4a.is_error, "{}", r4a.content);
         assert!(
-            r4a.content.contains("[KeyString matched at line 1]"),
+            r4a.content.contains("[Keyword matched at line 1]"),
             "{}",
             r4a.content
         );
@@ -2507,19 +2514,19 @@ mod tests {
             "upward/downward/max_matches must stay in range mode: {}",
             r_range.content
         );
-        assert!(!r_range.content.contains("[KeyString"));
+        assert!(!r_range.content.contains("[Keyword"));
 
-        // key_string 模式：传入 offset, limit，全部被静默吸收，依然是 key_string 模式
+        // keyword 模式：传入 offset, limit，全部被静默吸收，依然是 keyword 模式
         let r_key = ReadFileTool::default()
             .execute(
-                r#"{"path":"file.rs","key_string":"hello","offset":5,"limit":1}"#,
+                r#"{"path":"file.rs","keyword":"hello","offset":5,"limit":1}"#,
                 &ctx(d.path()),
             )
             .await;
         assert!(!r_key.is_error, "{}", r_key.content);
         assert!(
-            r_key.content.contains("[KeyString matched"),
-            "offset/limit must not switch key_string into range mode: {}",
+            r_key.content.contains("[Keyword matched"),
+            "offset/limit must not switch keyword into range mode: {}",
             r_key.content
         );
         assert!(r_key.content.contains("fn hello"));
@@ -2558,7 +2565,7 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(
-            r.content.contains("[KeyString matched at line 2]"),
+            r.content.contains("[Keyword matched at line 2]"),
             "应通过去转义自愈在 Tier 2 成功匹配：{}",
             r.content
         );
@@ -2612,7 +2619,7 @@ mod tests {
             )
             .await;
         assert!(!r_kw.is_error, "{}", r_kw.content);
-        assert!(r_kw.content.contains("[KeyString matched at line 51]"));
+        assert!(r_kw.content.contains("[Keyword matched at line 51]"));
         assert!(r_kw
             .content
             .contains("51→Line 51: ERROR critical failure in service"));
@@ -2626,5 +2633,40 @@ mod tests {
             .await;
         assert!(r_missing.is_error);
         assert!(r_missing.content.contains("no longer available"));
+    }
+
+    #[tokio::test]
+    async fn all_keyword_aliases_work_compatibly() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("aliases.rs"),
+            "line1\nline2\nfn target_alias() {}\nline4\n",
+        )
+        .unwrap();
+
+        let tool = ReadFileTool::default();
+        let test_aliases = ["keyword", "keywords", "keystring", "key_string", "key_word"];
+
+        for alias in test_aliases {
+            let json_arg = format!(
+                r#"{{"path":"aliases.rs","{alias}":"target_alias","upward":1,"downward":1}}"#
+            );
+            let res = tool.execute(&json_arg, &ctx(d.path())).await;
+            assert!(
+                !res.is_error,
+                "alias '{alias}' execution failed: {}",
+                res.content
+            );
+            assert!(
+                res.content.contains("[Keyword matched at line 3]"),
+                "alias '{alias}' failed to trigger keyword anchor mode: {}",
+                res.content
+            );
+            assert!(
+                res.content.contains("3→fn target_alias() {}"),
+                "alias '{alias}' must output matched line: {}",
+                res.content
+            );
+        }
     }
 }

@@ -1133,8 +1133,21 @@ fn supervise_webui(
             launch.port = effective_port;
             launch.token = effective_token;
 
-            let spawned = spawn_desktop_server(&launch, true, Duration::from_secs(30))
-                .or_else(|_| spawn_desktop_server(&launch, false, Duration::from_secs(30)));
+            let spawned = if intentional_restart {
+                // 原地重启交接：锁定原端口并支持退避重试，绝不随意误判漂移端口导致异地失联
+                let mut res = spawn_desktop_server(&launch, true, Duration::from_secs(30));
+                for _ in 0..3 {
+                    if res.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(400));
+                    res = spawn_desktop_server(&launch, true, Duration::from_secs(30));
+                }
+                res
+            } else {
+                spawn_desktop_server(&launch, true, Duration::from_secs(30))
+                    .or_else(|_| spawn_desktop_server(&launch, false, Duration::from_secs(30)))
+            };
 
             match spawned {
                 Ok((next_url, child, next_eof_rx)) => {

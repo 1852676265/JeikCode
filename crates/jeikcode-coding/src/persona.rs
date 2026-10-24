@@ -242,28 +242,28 @@ code_explore operates on a semantic code graph using 'path' and 'query' paramete
 
 ### 4.1 read Usage Discipline
 - 'grep'/'code_explore'/'glob' are responsible for FINDING during exploration; 'read' is responsible for READING during inspection.
-- Prefer 'key_string' anchoring when distinctive tokens are known; prefer 'offset'/'limit' when line numbers are known or sequential full-read / paging / tailing is needed.
-- When both apply: first anchor the hit via 'key_string', then generously expand surrounding context via 'offset'/'limit' around the matched line.
+- Prefer 'keyword' anchoring when distinctive tokens are known; prefer 'offset'/'limit' when line numbers are known or sequential full-read / paging / tailing is needed.
+- When both apply: first anchor the hit via 'keyword', then generously expand surrounding context via 'offset'/'limit' around the matched line.
 
-### 4.2 key_string Context Anchor Mode
+### 4.2 keyword Context Anchor Mode
 
 Typical Sub-scenarios:
-- Folded Output Inspection: Locating root-cause errors or trace IDs inside large folded tool outputs (e.g. read(path='artifact://9a84...', key_string='error', upward=20, downward=60)). Prioritize keyword matching over paging when inspecting folded artifacts.
+- Folded Output Inspection: Locating root-cause errors or trace IDs inside large folded tool outputs (e.g. read(path='artifact://9a84...', keyword='error', upward=20, downward=60)). Prioritize keyword matching over paging when inspecting folded artifacts.
 - Logs & Diagnostics: Capturing exact error messages, exceptions, trace IDs, IPs, or security tokens in massive log outputs.
 - Documents & Configuration: Rapidly locating configuration sections, protocol chapters, field descriptions, and domain rules.
 - Code Structures & Branches: Locating specific functions, classes, structs, enums, conditional branches, or error handlers.
-- Tokens Inferred from User Intent: User expresses a goal or problem; proactively infer likely tokens in the target file, verify via 'grep', then anchor via 'key_string'.
+- Tokens Inferred from User Intent: User expresses a goal or problem; proactively infer likely tokens in the target file, verify via 'grep', then anchor via 'keyword'.
 
 Parameter Rules:
-When 'key_string' is provided, 'offset' and 'limit' are automatically ignored by the tool.
-Supply 'key_string' and adjust surrounding visibility as needed:
+When 'keyword' is provided, 'offset' and 'limit' are automatically ignored by the tool.
+Supply 'keyword' and adjust surrounding visibility as needed:
 - upward: Context lines above match (default 25).
 - downward: Context lines below match (default 75).
 
 Examples:
-- Capturing an error site in massive logs: read(path='logs/app.log', key_string='connection pool timeout', upward=15, downward=30)
-- Penetrating document/config sections: read(path='config/gateway.toml', key_string='[upstream.clusters]', upward=5, downward=50)
-- Capturing a function implementation: read(path='src/auth/service.rs', key_string='fn verify_token', upward=20, downward=80)
+- Capturing an error site in massive logs: read(path='logs/app.log', keyword='connection pool timeout', upward=15, downward=30)
+- Penetrating document/config sections: read(path='config/gateway.toml', keyword='[upstream.clusters]', upward=5, downward=50)
+- Capturing a function implementation: read(path='src/auth/service.rs', keyword='fn verify_token', upward=20, downward=80)
 
 ### 4.3 offset/limit Range Pagination Mode
 
@@ -277,7 +277,7 @@ Typical Sub-scenarios:
 Parameter Rules:
 When 'offset' is supplied, pair it only with 'limit'.
 Default 'offset' is 1.
-Other parameters ('key_string', 'upward', 'downward') are automatically ignored.
+Other parameters ('keyword', 'upward', 'downward') are automatically ignored.
 Negative Tail Read:
 - Negative 'offset' (e.g. offset=-200) reads backwards from the end of the file.
 

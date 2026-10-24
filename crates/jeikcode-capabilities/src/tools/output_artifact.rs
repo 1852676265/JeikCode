@@ -2,6 +2,7 @@
 //! sha256 hash, one directory per session. Conversation carries only previews;
 //! full outputs live on disk, deduplicated by content.
 
+use crate::tools::artifact_watchdog::{ArtifactWatchdog, GLOBAL_MAX_CAPACITY};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,11 +27,29 @@ fn is_valid_id(id: &str) -> bool {
 /// Content-addressed store for full tool outputs, one directory per session.
 pub struct ArtifactStore {
     dir: PathBuf,
+    watchdog: Option<Arc<ArtifactWatchdog>>,
 }
 
 impl ArtifactStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            watchdog: Some(ArtifactWatchdog::global()),
+        }
+    }
+
+    pub fn new_standalone(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            watchdog: None,
+        }
+    }
+
+    pub fn with_watchdog(dir: impl Into<PathBuf>, watchdog: Arc<ArtifactWatchdog>) -> Self {
+        Self {
+            dir: dir.into(),
+            watchdog: Some(watchdog),
+        }
     }
 
     pub fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
@@ -42,6 +61,9 @@ impl ArtifactStore {
             let tmp = self.dir.join(format!("{id}.tmp"));
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, &path)?;
+            if let Some(wd) = &self.watchdog {
+                wd.record_addition(bytes.len() as u64);
+            }
         }
         Ok(id)
     }
@@ -56,6 +78,9 @@ impl ArtifactStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+        // Touch mtime on access so this artifact is marked recently used (true cross-platform LRU).
+        touch_mtime(&path);
+
         let start = offset.min(bytes.len());
         let end = start.saturating_add(limit).min(bytes.len());
         Ok(Some(bytes[start..end].to_vec()))
@@ -73,6 +98,14 @@ impl ArtifactStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Touch mtime to current timestamp on access (best effort, zero fail impact).
+fn touch_mtime(path: &std::path::Path) {
+    if let Ok(file) = std::fs::File::options().write(true).open(path) {
+        let times = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
+        let _ = file.set_times(times);
     }
 }
 
@@ -97,8 +130,6 @@ const PREVIEW_TAIL_BYTES: usize = 2200;
 /// Stable marker substring embedded in a conversation-visible result when the complete
 /// tool output was replaced by an artifact-backed preview.
 pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "section of output folded";
-/// Max bytes an artifact may store; larger results are inline-truncated only.
-const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Detect if a tool result indicates a command failure / error state (exit code != 0).
 fn is_failure_outcome(result: &jeikcode_kernel::tool::ToolResult) -> bool {
@@ -239,7 +270,7 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
         // Pre-spill original content to the artifact store so the marker can
         // reference the exact artifact ID and guarantee 100% lossless recall.
-        let artifact_id = if total > 1024 && total <= MAX_ARTIFACT_BYTES {
+        let artifact_id = if total > 1024 && (total as u64) <= GLOBAL_MAX_CAPACITY {
             self.store.put(result.content.as_bytes()).ok()
         } else {
             None
@@ -276,15 +307,15 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
         };
         let elided_lines = elided_content.lines().count();
 
-        if new_total > MAX_ARTIFACT_BYTES {
-            // Too large to store; inline-truncate only.
+        if (new_total as u64) > GLOBAL_MAX_CAPACITY {
+            // Runaway process exceeding entire 7GB global ceiling: inline-truncate only.
             let position_desc = if !head.is_empty() && !tail.is_empty() {
                 format!("Middle section of output folded ({elided_lines} lines elided)")
             } else {
                 format!("Subsequent section of output folded ({elided_lines} lines truncated)")
             };
             let marker = format!(
-                "\n\n[{position_desc}. Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n"
+                "\n\n[{position_desc}. Full output unavailable (exceeds {GLOBAL_MAX_CAPACITY}-byte artifact ceiling).]\n\n"
             );
             result.content = format!("{head}{marker}{tail}");
             return jeikcode_kernel::middleware::AfterOutcome::Proceed;
@@ -300,8 +331,8 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
                 format!(
                     "\n\n[{position_desc}, saved as artifact {id}. \
 If current information is insufficient to resolve the issue, \
-call `read(path=\"artifact://{id}\", key_string=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
-Prefer key_string match over sequential reading to quickly retrieve target details.]\n\n"
+call `read(path=\"artifact://{id}\", keyword=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
+Prefer keyword match over sequential reading to quickly retrieve target details.]\n\n"
                 )
             }
             None => {
@@ -425,13 +456,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn over_ceiling_inline_truncates_without_artifact() {
+    async fn five_mb_output_is_saved_as_artifact_losslessly() {
         use jeikcode_kernel::middleware::ToolMiddleware;
         use jeikcode_kernel::tool::ToolResult;
         let dir = tempfile::tempdir().unwrap();
         let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(
             dir.path(),
         )));
+        // 5 MiB output was previously rejected by the 4 MiB ceiling. Now it is preserved losslessly!
         let huge = "y".repeat(5 * 1024 * 1024);
         let mut r = ToolResult {
             call_id: "c".into(),
@@ -440,9 +472,9 @@ mod tests {
             images: vec![],
         };
         mw.after(&mut r, None).await;
-        assert!(r.content.contains("Full output unavailable"));
-        assert!(!r.content.contains("fetch_output"));
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(r.content.contains("saved as artifact"));
+        assert!(!r.content.contains("Full output unavailable"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// A tool that declares `never_truncate_result() == true` (like code_explore).
@@ -763,5 +795,28 @@ mod tests {
             r.content.contains("read(path=\"artifact://"),
             "MCP truncation must instruct LLM to use read with the generated artifact ID"
         );
+    }
+
+    #[test]
+    fn get_touches_and_updates_mtime_for_true_lru() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new_standalone(dir.path());
+        let id = store.put(b"hello lru").unwrap();
+        let path = dir.path().join(&id);
+
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(past))
+            .unwrap();
+        let old_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(old_mtime <= past + std::time::Duration::from_secs(1));
+
+        // Call get - should update mtime to recent
+        let retrieved = store.get(&id, 0, 100).unwrap().unwrap();
+        assert_eq!(retrieved, b"hello lru");
+
+        let new_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(new_mtime > old_mtime);
+        assert!(new_mtime >= std::time::SystemTime::now() - std::time::Duration::from_secs(5));
     }
 }

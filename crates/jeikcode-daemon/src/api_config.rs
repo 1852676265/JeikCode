@@ -697,6 +697,10 @@ pub(crate) fn bind_listener(
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // 允许地址复用（消除 TIME_WAIT 状态导致原地重启交接时的端口冲突）
+    let _ = socket.set_reuse_address(true);
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    let _ = socket.set_reuse_port(true);
     // Windows defaults IPV6_V6ONLY to 0, so a `[::]` socket also claims
     // `0.0.0.0` and can leave the IPv4 listener accepting only this PC.
     // Keep the two stacks on separate sockets.

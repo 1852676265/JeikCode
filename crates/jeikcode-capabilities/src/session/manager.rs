@@ -1178,6 +1178,23 @@ impl SessionManager {
     pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "artifacts")
     }
+}
+
+fn dir_file_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+impl SessionManager {
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta")
     }
@@ -3208,7 +3225,13 @@ impl SessionManager {
             }
         }
         if let Ok(dir) = self.artifacts_dir(id) {
+            let freed = dir_file_bytes(&dir);
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
+            #[cfg(feature = "tools")]
+            if freed > 0 {
+                crate::tools::artifact_watchdog::ArtifactWatchdog::global()
+                    .record_subtraction(freed);
+            }
         }
         crate::tools::purge_todo_board(id);
         Ok(())

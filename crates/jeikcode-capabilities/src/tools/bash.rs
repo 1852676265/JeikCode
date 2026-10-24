@@ -772,7 +772,7 @@ impl Tool for BashTool {
                 "\n\n[Note: The process is detached and actively running in the background. It may still be initializing, loading model weights, or warming up. If initial connection attempts fail, wait a few moments for startup to complete, poll the health endpoint/port, or inspect live progress via the log path above.\n\
                  Tips for fast log inspection with `read`:\n\
                  - To inspect latest logs at the tail: call `read` with a negative offset (e.g. `read(path=\"{bg_log_path_display}\", offset=-50)`).\n\
-                 - To search keywords or error context: call `read` with `key_string` and adjust `upward`/`downward` (e.g. `read(path=\"{bg_log_path_display}\", key_string=\"<keyword>\", upward=10, downward=20)`).]"
+                 - To search keywords or error context: call `read` with `keyword` and adjust `upward`/`downward` (e.g. `read(path=\"{bg_log_path_display}\", keyword=\"<keyword>\", upward=10, downward=20)`).]"
             );
 
             return annotate(ok(format!(
@@ -6582,7 +6582,7 @@ mod tests {
             res.content
         );
         assert!(
-            res.content.contains("key_string"),
+            res.content.contains("keyword"),
             "must include keyword search guidance: {:?}",
             res.content
         );

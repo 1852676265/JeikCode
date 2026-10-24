@@ -267,6 +267,7 @@ import {
   paintUserMessage,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
+  spliceAuthoritativeDiskTail,
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
@@ -1687,6 +1688,24 @@ export function Chat({
   }>>(new Map());
   /** 按会话隔离待去重自身用户消息 echo */
   const pendingSelfEchoBySessionRef = useRef<Map<string, Array<{ id: string; text: string }>>>(new Map());
+  /** 会话切入时的画布就绪标记：当前会话内存缓存已完全同步落入 messagesRef.current 和 state 后标记为该 sessionId */
+  const canvasReadySessionIdRef = useRef<string | null>(null);
+  /** 挂载就绪前的推流暂存队列（按 sessionId 隔离） */
+  const preMountStreamBufferRef = useRef<Map<string, Array<{ frame: SSEEvent; opts?: any }>>>(new Map());
+
+  function flushPreMountStreamBuffer(sid: string | null) {
+    if (!sid) return;
+    const buffer = preMountStreamBufferRef.current.get(sid);
+    if (!buffer || buffer.length === 0) return;
+    preMountStreamBufferRef.current.delete(sid);
+    for (const item of buffer) {
+      if (item.frame.type === 'text' || item.frame.type === 'reasoning') {
+        ensureAssistantBubbleForWatch();
+      }
+      handleEvent(item.frame, item.opts);
+    }
+    timelineFollow.changed();
+  }
   const liveAbortRef = useRef<AbortController | null>(null);
   const liveLifecycleRef = useRef(createLiveLifecycleState());
   // Wall-clock of the last byte received on the /live stream (any event OR the
@@ -1882,9 +1901,11 @@ export function Chat({
           if (activeIdRef.current === id) continue;
           if (!session || !Array.isArray(session.messages)) continue;
           const loaded = sessionMessagesToDisplay(session.messages, session.offset ?? 0, session.pinned_user_index);
-          const cached = messageCacheRef.current.get(id) ?? [];
-          const merged = cached.length > loaded.length ? mergeOlderMessages(loaded, cached) : loaded;
-          messageCacheRef.current.set(id, merged);
+          const cached = messageCacheRef.current.get(id);
+          // 纯净真相源：后台会话跑完后若内存已有完整状态，保持内存真相源，绝不用截断切片覆盖已展开的历史
+          if (!cached || cached.length === 0) {
+            messageCacheRef.current.set(id, loaded);
+          }
           const surface = hydrateSession(
             loaded,
             session.todos,
@@ -1904,7 +1925,11 @@ export function Chat({
   }
   function ensureAssistantBubbleForWatch() {
     setMessages((prev) => {
-      if (prev.length > 0 && prev[prev.length - 1].role === 'assistant') {
+      const last = prev[prev.length - 1];
+      const lastSettled = last && last.role === 'assistant' && last.parts?.some(
+        (p) => (p.kind === 'text' && (p.text || '').trim().length > 0)
+      );
+      if (last && last.role === 'assistant' && !lastSettled) {
         return prev;
       }
       const next = [
@@ -2067,6 +2092,19 @@ export function Chat({
                 ((event as { stop_reason?: string }).stop_reason === 'not_active' ||
                   (event as { stop_reason?: string }).stop_reason === 'watch_closed')
               ) {
+                terminalSeen = true;
+                sessionWatchersRef.current.delete(loadId);
+                localActiveStreamsBySessionRef.current.delete(loadId);
+                backgroundRunningSessionsRef.current.delete(loadId);
+                localTurnSessionsRef.current.delete(loadId);
+                onLiveRunningChange?.(loadId, false);
+                archiveBackgroundTodos(loadId);
+                if (activeIdRef.current === loadId) {
+                  setBusyAndClock(false);
+                  busyRef.current = false;
+                  settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
+                  void syncSessionCacheFromDisk(effectiveProjectHash, loadId);
+                }
                 return;
               }
 
@@ -2083,6 +2121,22 @@ export function Chat({
                 if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
                 const isCurrentView = activeIdRef.current === loadId;
                 if (isCurrentView) {
+                  if (canvasReadySessionIdRef.current !== loadId) {
+                    // 关键架构保证：内存尚未完全装载落定！推流事件进入预挂载缓冲队列，严格排队等候，绝不抢跑！
+                    let buf = preMountStreamBufferRef.current.get(loadId);
+                    if (!buf) {
+                      buf = [];
+                      preMountStreamBufferRef.current.set(loadId, buf);
+                    }
+                    buf.push({
+                      frame,
+                      opts: {
+                        requireReplayDedup: attachNeedsDedup || typeof frame.seq === 'number',
+                        repeatUserAfterSettled: false,
+                      },
+                    });
+                    continue;
+                  }
                   if (frame.type === 'text' || frame.type === 'reasoning') {
                     ensureAssistantBubbleForWatch();
                   }
@@ -2233,10 +2287,12 @@ export function Chat({
       diskHasUser,
     });
     if (adoptSettledDisk) {
-      const merged = canvas.length > disk.length ? mergeOlderMessages(disk, canvas) : disk;
-      messagesRef.current = merged;
-      messageCacheRef.current.set(id, merged);
-      setMessages(merged);
+      // 权威磁盘落盘：仅在画布为空或尚未有内容时采用磁盘首屏；绝不拿截断切片逆向污染内存画布
+      if (!canvas || canvas.length === 0) {
+        messagesRef.current = disk;
+        messageCacheRef.current.set(id, disk);
+        setMessages(disk);
+      }
     }
     if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
       return true;
@@ -2277,7 +2333,8 @@ export function Chat({
         : (messageCacheRef.current.get(sid) ?? []);
       // 立即发送会先把用户气泡画上。停止触发的这次对账往往早于落盘，
       // 直接覆盖会把气泡抹掉，直到刷新才从磁盘重新出现。
-      const baseCanvas = canvas.length > loaded.length ? mergeOlderMessages(loaded, canvas) : loaded;
+      // 纯净对账：用磁盘权威落盘的尾部切片安全替换画布/缓存的尾部，保留更早历史，消除重复并补全断网期间错过的最终回答
+      const baseCanvas = spliceAuthoritativeDiskTail(canvas, loaded, detail.offset ?? 0);
       const merged = mergeDiskWithUnpersistedTail(baseCanvas, canvas);
       const keptUnpersistedTail = merged.length !== loaded.length;
       messageCacheRef.current.set(sid, merged);
@@ -2511,6 +2568,22 @@ export function Chat({
           }
 
           if (sessionGenerationRef.current !== loadGeneration) {
+            continue;
+          }
+          if (canvasReadySessionIdRef.current !== loadId) {
+            // 关键架构保证：内存尚未完全装载落定！推流事件进入预挂载缓冲队列，严格排队等候，绝不抢跑！
+            let buf = preMountStreamBufferRef.current.get(loadId);
+            if (!buf) {
+              buf = [];
+              preMountStreamBufferRef.current.set(loadId, buf);
+            }
+            buf.push({
+              frame,
+              opts: {
+                requireReplayDedup: idleNeedsDedup || typeof frame.seq === 'number',
+                repeatUserAfterSettled: false,
+              },
+            });
             continue;
           }
           let skipSecondHandle = false;
@@ -2852,6 +2925,10 @@ export function Chat({
         pendingSelfEchoBySessionRef.current.delete(prevId);
       }
       activeIdRef.current = sessionId;
+      canvasReadySessionIdRef.current = null;
+      if (sessionId) {
+        preMountStreamBufferRef.current.set(sessionId, []);
+      }
       restoreProviderForSession(sessionId);
 
       // 恢复新会话的输入框草稿
@@ -3010,6 +3087,8 @@ export function Chat({
       if (cached && cached.length > 0) {
         messagesRef.current = cached;
         setMessages(cached);
+        canvasReadySessionIdRef.current = sessionId;
+        flushPreMountStreamBuffer(sessionId);
         // Schedule the cached history after layout without overriding reader intent.
         pinTimelineToBottom(1200);
       } else {
@@ -3096,6 +3175,8 @@ export function Chat({
       setLoading(false);
       messagesRef.current = cached;
       setMessages(cached);
+      canvasReadySessionIdRef.current = sessionId;
+      flushPreMountStreamBuffer(sessionId);
       if (scrollRef.current) {
         scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       }
@@ -3138,72 +3219,7 @@ export function Chat({
         // 空闲会话不挂历史清单。未完成项等服务端对账后再放回画板。
         writeLiveTodo(sessionId, null);
         startIdleWatch(effectiveHash, sessionId, sessionGenerationRef.current);
-        // SWR (Stale-While-Revalidate)：会话切回且处于空闲态时，0ms 呈现已有缓存的同时在后台静默核验磁盘权威转录，
-        // 纠偏可能遗留的未结工具状态（如 run_command 转圈卡死）与最终回答，彻底免除手动刷新。
-        if (effectiveHash) {
-          const switchGen = sessionGenerationRef.current;
-          void getSession(effectiveHash, sessionId, { tail: HISTORY_PAGE }).then((res) => {
-            if (
-              activeIdRef.current !== sessionId ||
-              sessionGenerationRef.current !== switchGen
-            ) {
-              return;
-            }
-            if (res && Array.isArray(res.messages)) {
-              const diskOffset = res.offset ?? 0;
-              const diskTotal = res.message_count ?? (res.messages.length + diskOffset);
-              const olderExists = diskOffset > 0;
-              historyOffsetRef.current = diskOffset;
-              historyTotalRef.current = diskTotal;
-              setHasOlder(olderExists);
-              historyOffsetBySessionRef.current.set(sessionId, diskOffset);
-              historyTotalBySessionRef.current.set(sessionId, diskTotal);
-              hasOlderBySessionRef.current.set(sessionId, olderExists);
-
-              const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0, res.pinned_user_index);
-              const lastCur = messagesRef.current[messagesRef.current.length - 1];
-              const lastLoaded = loaded[loaded.length - 1];
-              const hasUnfinishedTool = lastCur?.parts?.some(
-                (p) => p.kind === 'tool' && p.tool?.status === 'pending'
-              );
-              const diskCountDiffer = diskOffset === 0 && loaded.length !== messagesRef.current.length;
-              const shouldUpdate =
-                diskCountDiffer ||
-                hasUnfinishedTool ||
-                JSON.stringify(lastLoaded?.parts) !== JSON.stringify(lastCur?.parts);
-              if (shouldUpdate) {
-                const updated = messagesRef.current.length > loaded.length
-                  ? mergeOlderMessages(loaded, messagesRef.current)
-                  : loaded;
-                messageCacheRef.current.set(sessionId, updated);
-                messagesRef.current = updated;
-                setMessages(updated);
-                if (res.turns && res.turns.length > 0) {
-                  turnOutlineBySessionRef.current.set(sessionId, res.turns);
-                  setTurnOutline(res.turns);
-                }
-                if (res.token_usage) {
-                  applySessionTokens(sessionId, loaded, res.token_usage);
-                }
-                void saveSessionCache(
-                  effectiveHash,
-                  sessionId,
-                  loaded,
-                  res.todos,
-                  undefined,
-                  res.turns,
-                  res.token_usage,
-                  diskOffset,
-                  diskTotal,
-                );
-                if (scrollRef.current && atBottomRef.current) {
-                  scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-                }
-              }
-              writeLiveTodo(sessionId, reduceLiveTodo(null, { type: 'hydrate', items: res.todos ?? [] }));
-            }
-          }).catch(() => {});
-        }
+        // 会话已有内存缓存时，严格以内存为唯一真相源，彻底废除切回时的 SWR 磁盘拉取与杂交覆盖！
       }
       return;
     }
@@ -3357,78 +3373,29 @@ export function Chat({
             let displayMessages: Message[] = currentCached && currentCached.length > 0 ? currentCached : loaded;
 
             if (currentCached && currentCached.length > 0) {
-              const turnActive =
-                serverActive !== null
-                  ? serverActive
-                  : localTurnSessionsRef.current.has(loadId) ||
-                    backgroundRunningSessionsRef.current.has(loadId) ||
-                    liveSessionIdRef.current === loadId;
-
-              const diskHasUser = diskHasCanvasUser(loaded, currentCached);
-              const cacheInFlight = transcriptHasInFlightAssistant(currentCached);
-
-              const cachedUserCount = currentCached.filter((m) => m.role === 'user').length;
-              const loadedUserCount = loaded.filter((m) => m.role === 'user').length;
-              // 缓存中包含尚未在磁盘落盘的在途用户提问，绝不能被落后磁盘历史覆盖！
-              const cacheHasInFlightUser = turnActive && cachedUserCount > loadedUserCount;
-              // 外部新增了轮次（例如其他标签页或 TUI 新增了提问）
-              const cacheMissingUser = loadedUserCount > cachedUserCount;
-              // 磁盘内容比内存缓存多出新的结算内容
-              const diskHasNewContent = transcriptTextLen(loaded) > transcriptTextLen(currentCached);
-              // 切走时留下的残缺缓存缺少了后台跑完后落盘的最终正文消息
-              const cacheMissingSettled = (!turnActive || serverActive === false) && diskHasUser && cacheMissingSettledAssistant(currentCached, loaded);
-              // 关键修复：当会话未处于活跃轮次时，如果磁盘与缓存的消息结构或内容不一致（例如发生删除、改写或截断），以磁盘持久化为最高真相源！
-              // 注意：当 diskOffset > 0 时，loaded 只是尾部 HISTORY_PAGE 窗口，不能拿切片长度去误判已翻看过更早历史的全量缓存！
-              const diskCountDiffer = (!turnActive || serverActive === false) && !cacheInFlight && diskOffset === 0 && loaded.length !== currentCached.length;
-              const diskUserDiffer = (!turnActive || serverActive === false) && !cacheInFlight && diskOffset === 0 && loadedUserCount !== cachedUserCount;
-              // 上下文压缩会把硬盘上的老消息换成一条摘要 → 硬盘比画布**更短**。
-              // 显示只增不减：这种情况绝不能用硬盘覆盖画布（否则显示被阑割）。
-              const diskShrank = diskHasUser && transcriptTextLen(loaded) < transcriptTextLen(currentCached);
-              const cacheContentStale = !diskShrank && (!turnActive || serverActive === false) && !cacheInFlight && (
-                diskCountDiffer || diskUserDiffer || (diskOffset === 0 && diskHasUser && transcriptTextLen(loaded) !== transcriptTextLen(currentCached))
-              );
-
-              // 仅当缓存落后于磁盘最新状态，或磁盘内容被改写/删除产生结构差异时采用磁盘覆盖；
-              // 否则如果缓存已经完整且一致，保持内存真相源，消除切换时的双重冲刷闪烁！
-              const shouldAdoptDisk = !cacheHasInFlightUser && !diskShrank && (cacheMissingUser || cacheMissingSettled || (!turnActive && !cacheInFlight && diskHasUser && diskHasNewContent) || cacheContentStale);
-
-              if (shouldAdoptDisk) {
-                const adoptingMessages = currentCached.length > loaded.length
-                  ? mergeOlderMessages(loaded, currentCached)
-                  : loaded;
-                displayMessages = adoptingMessages;
-                messagesRef.current = adoptingMessages;
-                messageCacheRef.current.set(loadId, adoptingMessages);
-                setMessages(adoptingMessages);
-                if (scrollRef.current && atBottomRef.current) {
-                  scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+              displayMessages = currentCached;
+              // 保持内存真相源，消除切换时的双重冲刷与杂交渲染
+              if (messagesRef.current !== currentCached) {
+                messagesRef.current = currentCached;
+                setMessages(currentCached);
+                if (atBottomRef.current) {
                   timelineFollow.jump();
                 }
-              } else {
-                displayMessages = currentCached;
-                // 仅当当前画布尚未与缓存对齐时才更新，杜绝重复 setMessages 造成的 DOM 重绘与跳动
-                if (messagesRef.current !== currentCached) {
-                  messagesRef.current = currentCached;
-                  setMessages(currentCached);
-                  if (atBottomRef.current) {
-                    timelineFollow.jump();
-                  }
-                }
-                const effectiveOlder = diskOffset > 0;
-                historyOffsetRef.current = diskOffset;
-                historyTotalRef.current = totalOnDisk;
-                setHasOlder(effectiveOlder);
-                historyOffsetBySessionRef.current.set(loadId, diskOffset);
-                historyTotalBySessionRef.current.set(loadId, totalOnDisk);
-                hasOlderBySessionRef.current.set(loadId, effectiveOlder);
               }
+              canvasReadySessionIdRef.current = loadId;
+              flushPreMountStreamBuffer(loadId);
             } else if (loaded.length > 0) {
-              // 无痕模式首开或新会话首次进入：无本地缓存，一次性直接渲染磁盘加载内容，无任何闪烁
+              // 首次冷启动/无本地缓存：直接渲染磁盘加载内容
               displayMessages = loaded;
               messagesRef.current = loaded;
               messageCacheRef.current.set(loadId, loaded);
               setMessages(loaded);
+              canvasReadySessionIdRef.current = loadId;
+              flushPreMountStreamBuffer(loadId);
               pinTimelineToBottom(1200);
+            } else {
+              canvasReadySessionIdRef.current = loadId;
+              flushPreMountStreamBuffer(loadId);
             }
             // Seed the sticky panel from transcript only when this view has
             // nothing yet, or the turn is already finished. A running turn's
@@ -3524,14 +3491,11 @@ export function Chat({
                 });
               }
           } else if (!active) {
-            // 关键防线：若当前页面持有活跃的本地发送流（abortRef 存在、activeStreamRequestIdRef 存在，
-            // 或该会话在 localTurnSessionsRef 中登记为本端轮次），则该任务在本端真切活跃，
-            // 绝不允许仅仅因为后端活跃列表同步微秒级滞后或生成耗时超过 2.5 秒就误杀并解除 busy！
+            // 关键防线：只有当前页面真实持有正在发送的 HTTP 传输流时才保持 busy；
+            // 若服务端已明确返回会话空闲（!active），绝不能因残留的状态集合盲目死锁在 busy 停止态！
             const isLocalActiveInFlight =
-              abortRef.current !== null ||
-              activeStreamRequestIdRef.current !== null ||
-              localActiveStreamsBySessionRef.current.has(loadId) ||
-              localTurnSessionsRef.current.has(loadId);
+              (abortRef.current !== null && !abortRef.current.signal.aborted) ||
+              (activeStreamRequestIdRef.current !== null && activeIdRef.current === loadId);
             if (isLocalActiveInFlight) {
               setBusyAndClock(true);
               busyRef.current = true;
@@ -3544,6 +3508,8 @@ export function Chat({
               busyRef.current = false;
               if (requestIdRef.current === loadId) requestIdRef.current = null;
               onLiveTurnDone?.();
+              // 服务端已完结：拉取最新落盘记录，消除断连重入时最后一条正文未显示问题
+              void syncSessionCacheFromDisk(projectHash, loadId);
             }
           } else if (requestIdRef.current === loadId) {
             requestIdRef.current = null;
@@ -3762,8 +3728,7 @@ export function Chat({
                   startDetachedHistoryPoll(projectHash, sid, sessionGenerationRef.current);
                 }
               } else {
-                // 后端已结束或处于空闲态：静默更新一次磁盘最新消息，消除切后台期间跑完的内容未更新问题
-                void catchUpFromDisk(projectHash, sid);
+                // 空闲态视口恢复：保持推流监听通道自愈，绝不主动读磁盘覆盖内存画布
               }
             })
             .catch(() => {});
@@ -5535,11 +5500,12 @@ export function Chat({
         messagesRef.current = updated;
         return updated;
       }
-      // 历史中不存在：新工具。若末尾是 assistant 则追加，若末尾是 user（如 Steer）则安全开启新 assistant。
-      // 新行同样要带上管线身份（含同 id 已在别处时的唯一性守卫），否则这一轮此后
-      // 无法被重放/增量按 id 定位，只能落到“最后一条 assistant”上（串轮元凶）。
+      // 历史中不存在：新工具。若末尾是 assistant 且未封口回答则追加；若已回答完毕或末尾是 user（如 Steer）则安全开启新 assistant。
       const last = prev[prev.length - 1];
-      if (last && last.role === 'assistant') {
+      const lastSettled = last && last.role === 'assistant' && last.parts?.some(
+        (p) => (p.kind === 'text' && (p.text || '').trim().length > 0)
+      );
+      if (last && last.role === 'assistant' && !lastSettled) {
         next = [...prev.slice(0, -1), { ...last, parts: upsertToolPart(last.parts, tool) }];
       } else {
         next = [
@@ -5750,8 +5716,11 @@ export function Chat({
     }
 
     let last = next[next.length - 1];
+    const lastSettled = last && last.role === 'assistant' && last.parts?.some(
+      (p) => (p.kind === 'text' && (p.text || '').trim().length > 0)
+    );
 
-    if (!last || last.role !== 'assistant') {
+    if (!last || last.role !== 'assistant' || (event.type === 'tool_start' && lastSettled)) {
       last = { role: 'assistant', parts: [] };
       next.push(last);
     } else {

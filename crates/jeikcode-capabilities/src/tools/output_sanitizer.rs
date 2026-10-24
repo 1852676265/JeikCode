@@ -282,8 +282,8 @@ pub fn fold_assertion_diff(content: &str, artifact_id: Option<&str>) -> Option<S
             format!(
                 " Middle section of diff folded, raw dump saved as artifact {id}. \
 If current information is insufficient to resolve the issue, \
-call `read(path=\"artifact://{id}\", key_string=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
-Prefer key_string match over sequential reading to quickly retrieve target details."
+call `read(path=\"artifact://{id}\", keyword=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
+Prefer keyword match over sequential reading to quickly retrieve target details."
             )
         })
         .unwrap_or_default();
@@ -424,8 +424,8 @@ pub fn sanitize_build_output(
             format!(
                 " Pre-failure compiler warnings folded, full log saved as artifact {id}. \
 If current information is insufficient to resolve the issue, \
-call `read(path=\"artifact://{id}\", key_string=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
-Prefer key_string match over sequential reading to quickly retrieve target details."
+call `read(path=\"artifact://{id}\", keyword=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
+Prefer keyword match over sequential reading to quickly retrieve target details."
             )
         })
         .unwrap_or_default();

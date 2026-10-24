@@ -36,6 +36,7 @@ use std::sync::Arc;
 const DEFAULT_CHILD_MAX_ROUNDS: u32 = 230;
 
 pub mod approval;
+pub mod artifact_watchdog;
 pub mod ast_grep;
 pub mod bash;
 pub mod bash_ctl;
@@ -74,6 +75,7 @@ pub use approval::{
     parse_permission_decision, request_approval_decision, ApprovalMiddleware, ApprovalRequest,
     ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
+pub use artifact_watchdog::{ArtifactWatchdog, GLOBAL_MAX_CAPACITY, GLOBAL_TARGET_CAPACITY};
 pub use ast_grep::AstGrepTool;
 pub use bash::{
     bash_invocations, normalize_command_for_grant, run_shell, BashInvocation, BashTool, ShellExit,

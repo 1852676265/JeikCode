@@ -1091,8 +1091,8 @@ mod tests {
     fn stub_preserves_artifact_id_for_fetch_output() {
         let out = format!(
             "{}\n\n[Middle section of output folded (50 lines elided), saved as artifact ae50a6f1c4d2e3f5. \
-If current information is insufficient to resolve the issue, call `read(path=\"artifact://ae50a6f1c4d2e3f5\", key_string=\"<keyword>\")` or `read(path=\"artifact://ae50a6f1c4d2e3f5\", offset=1, limit=200)` to inspect more. \
-Prefer key_string match over sequential reading to quickly retrieve target details.]\n\n{}",
+If current information is insufficient to resolve the issue, call `read(path=\"artifact://ae50a6f1c4d2e3f5\", keyword=\"<keyword>\")` or `read(path=\"artifact://ae50a6f1c4d2e3f5\", offset=1, limit=200)` to inspect more. \
+Prefer keyword match over sequential reading to quickly retrieve target details.]\n\n{}",
             "H".repeat(100),
             "T".repeat(100)
         );

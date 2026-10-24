@@ -8,7 +8,7 @@ JeikCode comes equipped with an industrial-grade suite of native tools covering 
 
 | Tool | Purpose | Key Attributes & Safety |
 | :--- | :--- | :--- |
-| `read` | Read file contents, inspect images, or view directory trees | Canonical `read` (alias `read_file`); line-numbered, supports offset/limit paging and key_string anchors |
+| `read` | Read file contents, inspect images, or view directory trees | Canonical `read` (alias `read_file`); line-numbered, supports offset/limit paging and keyword anchors |
 | `edit` | Surgical exact-string code replacements | Canonical `edit` (alias `edit_file`); precise string matching prevents full-file rewrite drift |
 | `write` | Full file creation or complete replacement | Canonical `write` (alias `write_file`); recursively creates parent directories automatically |
 | `glob` | Find files matching wildcard patterns across folders | Fast cross-platform file path pattern matching |

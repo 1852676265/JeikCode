@@ -660,12 +660,32 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
 }
 
 /**
+ * 用磁盘返回的权威尾部切片（diskTail）安全替换画布/缓存的尾部，同时严格保留
+ * 画布中早于该切片起始偏移（sourceIndex < diskOffset）的更早历史头部（olderHead）。
+ * 既不丢失用户向上翻看过的更早历史，又彻底杜绝内存旧尾部与磁盘新尾部杂交双重渲染！
+ */
+export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number }>(
+  canvas: T[],
+  diskTail: T[],
+  diskOffset: number,
+): T[] {
+  if (!canvas || canvas.length === 0) return diskTail;
+  if (!diskTail || diskTail.length === 0) return canvas;
+  if (diskOffset <= 0) return diskTail;
+
+  const olderHead = canvas.filter(
+    (m) => typeof m.sourceIndex === 'number' && m.sourceIndex < diskOffset,
+  );
+  return [...olderHead, ...diskTail];
+}
+
+/**
  * 往前补页时，首屏钉住的那条提问可能已经在画布上。
  * 合并更早历史与现有画布时：
  * 1. 按 id 和 sourceIndex 严格去重，避免重复渲染；
  * 2. 保证所有具备 sourceIndex 的历史消息严格按照服务端绝对索引升序排列；
  *    彻底防止因首屏 pinned 置顶提问在向前翻页拼接时被挤到后续工具调用下方的倒插 BUG！
- * 3. 无 sourceIndex 的在途/实时消息保持在末尾原有相对顺序。
+ * 3. 无 sourceIndex 的在途实时消息保持在末尾原有相对顺序。
  */
 export function mergeOlderMessages<T extends { id?: string; sourceIndex?: number }>(
   prev: T[],

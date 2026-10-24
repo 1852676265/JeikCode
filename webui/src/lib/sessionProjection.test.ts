@@ -13,6 +13,7 @@ import {
   paintUserMessage,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
+  spliceAuthoritativeDiskTail,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -958,5 +959,40 @@ test('mergeOlderMessages 正确处理在途/无 sourceIndex 的实时末尾消�
   assert.equal(merged[0]?.sourceIndex, 5);
   assert.equal(merged[1]?.sourceIndex, 10);
   assert.equal(merged[2]?.id, 'a-live');
+});
+
+test('spliceAuthoritativeDiskTail 仅保留更早的历史 Head 并用权威磁盘切片无损替换尾部', () => {
+  // 画布包含 Turn 1 (0..35), Turn 2 (36..75), 以及内存中未完成的 Turn 3 (76..100)
+  const canvas = [
+    { role: 'user', id: 'u-1', sourceIndex: 10 },
+    { role: 'assistant', id: 'a-1', sourceIndex: 20 },
+    { role: 'user', id: 'u-2', sourceIndex: 50 },
+    { role: 'assistant', id: 'a-2-dirty', sourceIndex: 70 }, // 内存中带有脏内容的尾部
+  ];
+
+  // 磁盘返回 tail:48 切片，起始 offset=60，包含了干净落盘的 Turn 2 尾部与 Turn 3 完整答案
+  const diskTail = [
+    { role: 'assistant', id: 'a-2-clean', sourceIndex: 70 },
+    { role: 'user', id: 'u-3', sourceIndex: 80 },
+    { role: 'assistant', id: 'a-3', sourceIndex: 90 },
+  ];
+
+  // 当 offset=60 时：canvas 中 sourceIndex < 60 的（10, 50）保留；>= 60 的（70 脏尾部）被 diskTail 彻底替换！
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 60);
+
+  assert.equal(spliced.length, 6);
+  assert.equal(spliced[0]?.sourceIndex, 10);
+  assert.equal(spliced[1]?.sourceIndex, 20);
+  assert.equal(spliced[2]?.sourceIndex, 50);
+  assert.equal(spliced[3]?.id, 'a-2-clean');
+  assert.equal(spliced[4]?.id, 'u-3');
+  assert.equal(spliced[5]?.id, 'a-3');
+});
+
+test('spliceAuthoritativeDiskTail 在 offset <= 0 时直接全量采用磁盘', () => {
+  const canvas = [{ role: 'user', sourceIndex: 999 }];
+  const diskTail = [{ role: 'user', sourceIndex: 1 }, { role: 'assistant', sourceIndex: 2 }];
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 0);
+  assert.deepEqual(spliced, diskTail);
 });
 

@@ -552,6 +552,7 @@ pub async fn execute_update(
     let listen_host = state.bind_host.clone();
     let listen_port = state.bind_port;
     let restart_token = state.webui_tokens.display();
+    let shutdown_tx = Some(state.shutdown_tx.clone());
     let no_token = state
         .token_optional
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -580,6 +581,7 @@ pub async fn execute_update(
             listen_port,
             restart_token,
             no_token,
+            shutdown_tx,
         )
         .await
         {
@@ -609,6 +611,7 @@ async fn run_cli_update(
     listen_port: u16,
     restart_token: Option<String>,
     no_token: bool,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<jeikcode_updater::UpgradeEvent>();
@@ -693,8 +696,15 @@ async fn run_cli_update(
                         restart_token.clone(),
                     );
                 }
+                let shutdown_tx = shutdown_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    // 在调用 restart 前，主动触发优雅停机释放当前的监听套接字（Listen Socket）
+                    if let Some(tx) = shutdown_tx {
+                        let _ = tx.send(true);
+                    }
+                    crate::stop_server();
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                     let Err(err) = jeikcode_updater::restart_process_with_config(
                         &exe,
                         listen_port,
