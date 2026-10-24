@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.11 (2026-10-24)
+
+- **[Security Gate & Path Sanitization Hardening] Preserved traversal fail-closed behavior and cross-platform drive cleaning**:
+  - Maintained raw unresolved parent traversal in `resolve_path` so `has_unresolved_parent_traversal` in `write_approval` reliably catches uncreated directory escapes and fails closed into permission prompting.
+  - Confined lexical folding to user-facing error reporting (`format_path_not_found`) and read fallback presentation, ensuring pristine display paths without compromising filesystem security boundaries.
+  - Sanitized Windows drive letter leading slashes universally across platforms in `clean_model_path_input`.
+
+---
+
+- **[安全门控与路径清洗加固] 保留未解析父级跳转默认拒绝契约与跨平台盘符清洗**:
+  - 维护 `resolve_path` 中未解析的父级相对跳转形态，确保 `write_approval` 中的 `has_unresolved_parent_traversal` 能精准识别不存在目录的越界行为并触发人工审批。
+  - 将词法折叠规范化聚焦于用户侧错误反馈（`format_path_not_found`）与读取呈现回退层，在杜绝展示乱码的同时守护底层文件系统安全边界。
+  - 在 `clean_model_path_input` 中跨全平台统一剥离 Windows 盘符前的多余前导斜杠。
+
 ## v7.2.9-beta.10 (2026-10-24)
 
 - **[Desktop Shell & System Tray] Multilingual tray icon and close-to-tray mode**:
