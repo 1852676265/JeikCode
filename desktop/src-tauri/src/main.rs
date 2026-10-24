@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use tauri::{Listener, Manager};
 
 static DESKTOP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
@@ -238,7 +238,81 @@ fn open_in_external_browser(url: &str) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn ensure_single_instance_windows() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(
+            lpMutexAttributes: *mut std::ffi::c_void,
+            bInitialOwner: i32,
+            lpName: *const u16,
+        ) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> *mut std::ffi::c_void;
+        fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
+        fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let mutex_name = wide("Local\\JeikCode_Desktop_SingleInstance_Mutex");
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const SW_RESTORE: i32 = 9;
+    const SW_SHOW: i32 = 5;
+
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 1, mutex_name.as_ptr()) };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let win_title = wide("JeikCode Desktop");
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), win_title.as_ptr()) };
+        if !hwnd.is_null() {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+        return true;
+    }
+    std::mem::forget(handle);
+    false
+}
+
+fn desktop_settings_path() -> PathBuf {
+    jeikcode_dir().join("desktop-settings.json")
+}
+
+fn load_close_action() -> String {
+    let Ok(text) = std::fs::read_to_string(desktop_settings_path()) else {
+        return "ask".to_string();
+    };
+    #[derive(serde::Deserialize)]
+    struct Settings {
+        #[serde(default)]
+        close_action: Option<String>,
+    }
+    serde_json::from_str::<Settings>(&text)
+        .ok()
+        .and_then(|s| s.close_action)
+        .unwrap_or_else(|| "ask".to_string())
+}
+
 fn main() {
+    #[cfg(target_os = "windows")]
+    if ensure_single_instance_windows() {
+        return;
+    }
+
     let child = Mutex::new(None);
     tauri::Builder::default()
         .manage(ChildSlot(child))
@@ -283,12 +357,44 @@ fn main() {
             watch_host_presence(window.clone());
             let drop_window = window.clone();
             let close_window = window.clone();
-            // 仅原生拖放还开着的平台会收到这些事件（Windows 已关掉，改由页面 HTML5 处理）。
+            let hide_window = window.clone();
+            let app_handle_for_event = app.handle().clone();
+
+            let _ = window.listen("jeikcode:desktop:hide_to_tray", move |_| {
+                let _ = hide_window.hide();
+                publish_host_away(&hide_window, true);
+            });
+
+            let _ = window.listen("jeikcode:desktop:quit_app", move |_| {
+                DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                if let Some(slot) = app_handle_for_event.try_state::<ChildSlot>() {
+                    if let Some(child) = slot.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+                app_handle_for_event.exit(0);
+            });
+
+            // 窗口关闭拦截与 HTML5 拖放事件处理
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = close_window.hide();
-                    publish_host_away(&close_window, true);
+                    let action = load_close_action();
+                    match action.as_str() {
+                        "tray" => {
+                            api.prevent_close();
+                            let _ = close_window.hide();
+                            publish_host_away(&close_window, true);
+                        }
+                        "quit" => {
+                            DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+                        }
+                        _ => {
+                            api.prevent_close();
+                            let _ = close_window.eval(
+                                "window.dispatchEvent(new CustomEvent('jeikcode:desktop:close_prompt'));",
+                            );
+                        }
+                    }
                 }
                 if let tauri::WindowEvent::DragDrop(drop_event) = event {
                     if let tauri::DragDropEvent::Drop { paths, .. } = drop_event {

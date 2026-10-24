@@ -25,6 +25,8 @@ const OnboardingWizard = lazy(() => import('./components/OnboardingWizard').then
 const UpdateDialog = lazy(() => import('./components/UpdateDialog').then((m) => ({ default: m.UpdateDialog })));
 const ConfigSyncModal = lazy(() => import('./components/ConfigSyncModal').then((m) => ({ default: m.ConfigSyncModal })));
 const LegacyMigrationModal = lazy(() => import('./components/LegacyMigrationModal').then((m) => ({ default: m.LegacyMigrationModal })));
+const SystemSettingsDialog = lazy(() => import('./components/SystemSettingsDialog').then((m) => ({ default: m.SystemSettingsDialog })));
+const DesktopClosePromptDialog = lazy(() => import('./components/DesktopClosePromptDialog').then((m) => ({ default: m.DesktopClosePromptDialog })));
 import {
   getProject,
   getConfig,
@@ -1613,6 +1615,9 @@ export function App() {
         {settingsSection === 'model' && (
           <ModelConfigDialog onClose={() => setSettingsSection(null)} />
         )}
+        {settingsSection === 'system' && (
+          <SystemSettingsDialog onClose={() => setSettingsSection(null)} />
+        )}
         {headerDialog === 'rename' && activeSession && (
           <RenameDialog
             session={activeSession}
@@ -1662,6 +1667,7 @@ export function App() {
           />
         )}
         <LegacyMigrationModal />
+        <DesktopClosePromptDialog />
       </Suspense>
       <ConfirmModalHost />
       <ToastHost />

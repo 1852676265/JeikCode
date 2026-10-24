@@ -378,12 +378,12 @@ function LangGlyph() {
   );
 }
 
-/** Model glyph (chip). */
-function ModelGlyph() {
+/** Settings gear glyph. */
+function SettingsGlyph() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="4" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.2" />
-      <path d="M6.5 1.5v1.8M9.5 1.5v1.8M6.5 12.7v1.8M9.5 12.7v1.8M1.5 6.5h1.8M1.5 9.5h1.8M12.7 6.5h1.8M12.7 9.5h1.8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 }
@@ -1589,10 +1589,10 @@ export function Sidebar({
           </div>
         )}
 
-        {/* 模型配置：内容多，仍用弹窗 */}
-        <button class="item-menu-row" onClick={() => chooseSettings('model')}>
-          <ModelGlyph />
-          <span>{t('settings.menuModel')}</span>
+        {/* 系统设置：模块化系统设置弹窗 */}
+        <button class="item-menu-row" onClick={() => chooseSettings('system')}>
+          <SettingsGlyph />
+          <span>{t('settings.systemSettings')}</span>
         </button>
       </div>,
           document.body,
@@ -1974,12 +1974,12 @@ export function Sidebar({
             class="sidebar-rail-btn"
             onClick={() => {
               onCloseDrawer?.();
-              onOpenSettings('model');
+              onOpenSettings('system');
             }}
-            title={t('settings.menuModel')}
-            aria-label={t('settings.menuModel')}
+            title={t('settings.systemSettings')}
+            aria-label={t('settings.systemSettings')}
           >
-            <ModelGlyph />
+            <SettingsGlyph />
           </button>
         </div>
       </aside>
@@ -2383,12 +2383,12 @@ export function Sidebar({
           class="sidebar-icon-btn sidebar-settings-btn"
           onClick={() => {
             onCloseDrawer?.();
-            onOpenSettings('model');
+            onOpenSettings('system');
           }}
-          title={t('settings.menuModel')}
-          aria-label={t('settings.menuModel')}
+          title={t('settings.systemSettings')}
+          aria-label={t('settings.systemSettings')}
         >
-          <ModelGlyph />
+          <SettingsGlyph />
         </button>
       </div>
       {renderSkillsMenu()}

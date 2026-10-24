@@ -1306,6 +1306,25 @@ export async function postMigrateLegacy(killZombies: boolean): Promise<{
   return resp.json();
 }
 
+export interface DesktopSettings {
+  close_action: 'ask' | 'tray' | 'quit';
+}
+
+export async function getDesktopSettings(): Promise<DesktopSettings> {
+  const resp = await apiFetch('/api/system/desktop-settings', { headers: authHeaders() });
+  if (!resp.ok) return { close_action: 'ask' };
+  return resp.json();
+}
+
+export async function postDesktopSettings(settings: DesktopSettings): Promise<void> {
+  const resp = await apiFetch('/api/system/desktop-settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(settings),
+  });
+  if (!resp.ok) throw new Error('failed to save desktop settings');
+}
+
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
 export async function postConfigReload(): Promise<void> {
   const resp = await apiFetch('/config/reload', {

@@ -557,6 +557,24 @@ const zh = {
   'migration.failed': '迁移过程中出现异常，请稍后重试',
   'migration.completeNotice': '系统环境已完全净化并对接新架构',
 
+  // System Settings & Desktop Close-to-Tray
+  'settings.systemSettings': '系统设置',
+  'settings.tabDesktop': '桌面与系统',
+  'settings.tabAbout': '关于与版本',
+  'settings.desktopBehaviorTitle': '桌面客户端行为',
+  'settings.closeActionLabel': '关闭主窗口时',
+  'settings.closeActionDesc': '配置点击窗口右上角关闭按钮 (X) 时的默认动作',
+  'settings.closeActionTray': '最小化到系统托盘并在后台运行',
+  'settings.closeActionQuit': '直接退出程序并停止服务',
+  'settings.closeActionAsk': '每次询问我',
+  'settings.savedSuccess': '设置已保存',
+  'settings.aboutTitle': '关于 JeikCode',
+  'desktop.closePromptTitle': '关闭 JeikCode',
+  'desktop.closePromptDesc': '是否最小化到系统托盘并保持后台运行？',
+  'desktop.rememberChoice': '记住我的选择（可随时在系统设置中修改）',
+  'desktop.actionQuit': '退出程序',
+  'desktop.actionTray': '最小化到托盘',
+
   // Provider add/delete
   'settings.accounts': '提供商',
   'settings.addAccount': '添加提供商',
@@ -1607,6 +1625,24 @@ export const en: Record<MsgKey, string> = {
   'migration.successSummary': 'Successfully cleaned {files} legacy file(s) and {zombies} orphan process(es)',
   'migration.failed': 'Migration encountered an error, please try again later',
   'migration.completeNotice': 'System environment is completely sanitized and migrated',
+
+  // System Settings & Desktop Close-to-Tray
+  'settings.systemSettings': 'System Settings',
+  'settings.tabDesktop': 'Desktop & System',
+  'settings.tabAbout': 'About & Version',
+  'settings.desktopBehaviorTitle': 'Desktop Client Behavior',
+  'settings.closeActionLabel': 'When closing main window',
+  'settings.closeActionDesc': 'Configure the default action when clicking the close button (X)',
+  'settings.closeActionTray': 'Minimize to system tray and keep running in background',
+  'settings.closeActionQuit': 'Exit application and stop service',
+  'settings.closeActionAsk': 'Ask me every time',
+  'settings.savedSuccess': 'Settings saved',
+  'settings.aboutTitle': 'About JeikCode',
+  'desktop.closePromptTitle': 'Close JeikCode',
+  'desktop.closePromptDesc': 'Minimize to system tray and keep running in background?',
+  'desktop.rememberChoice': 'Remember my choice (can be changed in System Settings anytime)',
+  'desktop.actionQuit': 'Quit',
+  'desktop.actionTray': 'Minimize to Tray',
 
   // Provider add/delete
   'settings.accounts': 'Providers',

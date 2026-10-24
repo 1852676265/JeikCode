@@ -1536,6 +1536,41 @@ pub(crate) async fn post_migrate_legacy(
     })
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DesktopSettingsPayload {
+    #[serde(default)]
+    pub close_action: String,
+}
+
+fn desktop_settings_file_path() -> std::path::PathBuf {
+    jeikcode_config::config::Config::config_dir().join("desktop-settings.json")
+}
+
+pub(crate) async fn get_desktop_settings() -> impl IntoResponse {
+    let path = desktop_settings_file_path();
+    let text = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
+    let mut payload =
+        serde_json::from_str::<DesktopSettingsPayload>(&text).unwrap_or(DesktopSettingsPayload {
+            close_action: "ask".into(),
+        });
+    if payload.close_action.is_empty() {
+        payload.close_action = "ask".into();
+    }
+    Json(payload)
+}
+
+pub(crate) async fn post_desktop_settings(
+    Json(payload): Json<DesktopSettingsPayload>,
+) -> impl IntoResponse {
+    let path = desktop_settings_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::to_string_pretty(&payload).unwrap_or_default();
+    let _ = std::fs::write(path, body);
+    Json(serde_json::json!({ "success": true }))
+}
+
 /// POST /config/reload - Reloads config.toml from disk, remounts MCP/skills on
 /// the live runtime, and returns the sanitized config view.
 pub(crate) async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {

@@ -13993,6 +13993,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/api/system/migrate-legacy",
             post(api_config::post_migrate_legacy),
         )
+        .route(
+            "/api/system/desktop-settings",
+            get(api_config::get_desktop_settings).post(api_config::post_desktop_settings),
+        )
         // Provider API (P0)
         .route(
             "/providers",
