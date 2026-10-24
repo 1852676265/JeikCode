@@ -21,6 +21,44 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.0 (2026-10-24)
+
+- **[Desktop Architecture & Antivirus False-Positive Resolution] In-place execution, dropper elimination, and modular settings**:
+  - Eliminated Windows runtime dropper behavior by running `jeikcode.exe` in-place directly from the installation directory rather than copying payloads into `%USERPROFILE%\.local\bin\`.
+  - Removed runtime registry modifications (`HKCU\Environment\Path`); registered official installation directory via NSIS hooks at install time and cleanly cleaned up on uninstall.
+  - Added automatic environment migration (`migrate_legacy_environment`) at startup to purge obsolete `.local\bin` copies, benefiting direct binary updates.
+  - Enforced single-instance desktop locking: silently restoring and focusing the running instance without annoying popups when shortcuts are double-clicked.
+  - Intercepted close events with a modern glassmorphic confirmation modal, supporting "Remember my choice" to minimize to tray or quit.
+  - Replaced bottom-left sidebar model entry with a modular System Settings hub (`SystemSettingsDialog`), delegating model selection to the top-right header.
+- **[Remote Access & Service Supervision] Seamless cross-platform restarts and address binding**:
+  - Unlocked host input in the remote access globe panel with an instant `127.0.0.1 / 0.0.0.0` toggle and glassmorphic restart confirmation modal.
+  - Preserved user-edited host, port, and token upon restart confirmation, preventing stale running state rollbacks and external browser bounces.
+  - Dynamic CLI argument patching (`patch_restart_args`) ensures updated parameters are inherited seamlessly across upgrades and restarts without being overridden by legacy argv.
+  - Avoided orphan process port collisions under systemd and launchd supervisors by prioritizing `execve` in-place replacement and clean exit handoffs.
+  - Integrated zero-disruption health polling in remote browsers during restarts, preventing invalid `0.0.0.0` redirects and network error screens.
+- **[TUI & WebUI Steer Parity] Immediate steer consumption and user bubble rendering**:
+  - Fixed TUI steer confirmation by stripping `<user-query>` envelope tags in `strip_steer_envelope_for_tui`, ensuring exact prompt matching.
+  - Removed live-binding rendering restrictions so steered user bubbles render immediately in terminal scrollback upon kernel confirmation and pending cues clear instantly.
+
+---
+
+- **[桌面架构重构与杀软误报消除] 就地执行、消除释放器与单实例托盘治理**:
+  - 彻底移除 Windows 运行期 Dropper 行为：桌面壳直接在安装目录内就地（In-Place）执行 `jeikcode.exe`，不再向 `%USERPROFILE%\.local\bin\` 复制文件。
+  - 移除运行期对注册表 `HKCU\Environment\Path` 的篡改，改由 NSIS 安装包在安装阶段合规写入 `$INSTDIR\resources`，卸载时干净清理。
+  - 引入启动期自动环境迁移机制（`migrate_legacy_environment`），自动清理孤儿 `.local\bin` 副本与历史污染条目，使直接二进制更新的用户无需重装即可无缝受益。
+  - 引入桌面端单实例互斥锁：双击快捷方式时静默将已有桌面实例从托盘或后台唤醒并激活置顶（show / unminimize / set_focus），无弹窗打扰，新进程静默退出。
+  - 拦截窗口关闭事件并弹出高级毛玻璃确认向导，支持「记住我的选择」最小化到托盘或退出程序。
+  - 侧边栏左下角移除冗余的模型配置入口，升级为齿轮图标的模块化「系统设置」中心，支持桌面行为配置并预留未来模块扩展。
+- **[远程访问与服务守护] 跨平台无缝重启与全链路参数继承**:
+  - 放开小地球远程访问面板中的主机地址输入限制，提供一键切换 `127.0.0.1 / 0.0.0.0` 快捷选项与现代感重启确认弹窗。
+  - 修复点击保存确认时目标地址、端口与 Token 被旧状态倒灌回退的缺陷，并确保重启重载时保留在桌面壳内且携带认证 Token。
+  - 引入 `patch_restart_args` 机制，在自更新升级与配置重载全链路动态注入最新的 Host、Port 与 Token 参数，确保重启后新进程 100% 继承原有配置。
+  - 解决 systemd 与 launchd 服务管理器下的端口冲突：优先采用 `execve` 原地镜像替换，避免自身额外 spawn 孤儿进程与守护策略产生端口争抢。
+  - 优化异地远程浏览器重启体验：引入平滑探活轮询器，禁止重定向至无效的 `0.0.0.0`，新服务就绪后无缝刷新。
+- **[TUI 与 WebUI 转向对齐] 转向消息实时消费与用户气泡即刻渲染**:
+  - 修复 TUI 转向消息消费：通过 `strip_steer_envelope_for_tui` 解包 `<user-query>` 标签以准确对齐内核折叠确认。
+  - 移除 live-binding 渲染限制，使转向消息消费后即刻在终端绘制用户气泡并清空待处理队列，体验与 WebUI 完全一致。
+
 ## v7.2.9-beta.11 (2026-10-24)
 
 - **[Security Gate & Path Sanitization Hardening] Preserved traversal fail-closed behavior and cross-platform drive cleaning**:
