@@ -99,7 +99,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: ["provider,tools", "provider,tools,cc-hooks"]
+        include:
+          - id: "provider-tools"
+            features: "provider,tools"
+          - id: "provider-tools-cc-hooks"
+            features: "provider,tools,cc-hooks"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,7 +116,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "portability-feature-subsets-${{ matrix.features }}"
+          shared-key: "portability-feature-subsets-${{ matrix.id }}"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -132,7 +136,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: beta-subset-logs-${{ matrix.os }}-${{ matrix.features }}
+          name: beta-subset-logs-${{ matrix.id }}
           path: ${{ runner.temp }}/subset-test.log
           if-no-files-found: warn
           retention-days: 7
