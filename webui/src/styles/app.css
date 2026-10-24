@@ -741,8 +741,11 @@ body {
   color: var(--app-primary-foreground);
   transform: none;
 }
-.top-nav-more-remote-wrapper .top-nav-btn::after {
-  content: '远程访问';
+.remote-access-label {
+  display: none;
+}
+.top-nav-more-remote-wrapper .remote-access-label {
+  display: inline-block;
   margin-left: 2px;
 }
 .update-more-badge {

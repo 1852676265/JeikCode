@@ -10,7 +10,9 @@ import { useT } from '../settings';
 export function RemoteAccessControl() {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const [host, setHost] = useState('0.0.0.0');
+  const [host, setHost] = useState(
+    typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : '127.0.0.1'
+  );
   const currentUrlPort = (typeof window !== 'undefined' && window.location.port) ? window.location.port : '13457';
   const [port, setPort] = useState(currentUrlPort);
   const [token, setToken] = useState('');
@@ -24,6 +26,8 @@ export function RemoteAccessControl() {
   const [copied, setCopied] = useState(false);
   const [active, setActive] = useState(false);
   const [savedPort, setSavedPort] = useState(0);
+  const [showRestartModal, setShowRestartModal] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const applyingRef = useRef(false);
   const revision = useRef(0);
 
@@ -34,8 +38,9 @@ export function RemoteAccessControl() {
     const isAutoIncremented = pending > 0 && pending < Number(livePort);
     const effectivePending = isAutoIncremented ? 0 : pending;
     setActive(status.active);
-    setHost(status.host || '0.0.0.0');
-    setListenHost(status.host || '0.0.0.0');
+    const resolvedHost = status.host || '127.0.0.1';
+    setHost(resolvedHost);
+    setListenHost(resolvedHost);
     setListenPort(livePort);
     setNoToken(!!status.no_token);
     setSavedPort(effectivePending);
@@ -96,7 +101,7 @@ export function RemoteAccessControl() {
     };
   }, [open]);
 
-  async function apply() {
+  async function apply(shouldRestart: boolean = false) {
     revision.current += 1;
     const seen = revision.current;
     if (applyingRef.current) return;
@@ -105,15 +110,20 @@ export function RemoteAccessControl() {
     setCopied(false);
     const ctrl = new AbortController();
     const timer = window.setTimeout(() => ctrl.abort(), 12000);
+    const targetHost = host.trim() || '127.0.0.1';
     try {
       const status = await postRemoteAccess({
-        host: host.trim() || '0.0.0.0',
+        host: targetHost,
         port: Number(port) || 13457,
         token: noToken ? '' : token,
         no_token: noToken,
         apply_launch: true,
+        restart: shouldRestart,
       }, ctrl.signal);
       showStatus(status);
+      if (!shouldRestart) {
+        setOpen(false);
+      }
     } catch (err) {
       const aborted = err instanceof Error && err.name === 'AbortError';
       const message = err instanceof Error && !aborted ? err.message : t('remote.applyFailed');
@@ -131,6 +141,67 @@ export function RemoteAccessControl() {
       applyingRef.current = false;
       setApplying(false);
     }
+  }
+
+  function handleApplyClick() {
+    const currentHost = listenHost;
+    const currentPort = Number(listenPort) || 13457;
+    const targetHost = host.trim() || '127.0.0.1';
+    const targetPort = Number(port) || 13457;
+    const hostChanged = targetHost.toLowerCase() !== currentHost.toLowerCase();
+    const portChanged = targetPort !== currentPort;
+    if (hostChanged || portChanged) {
+      setShowRestartModal(true);
+    } else {
+      void apply(false);
+    }
+  }
+
+  async function triggerImmediateRestart() {
+    setRestarting(true);
+    const targetPortNum = Number(port) || 13457;
+
+    // 1. 发起后端保存并安全重启
+    await apply(true);
+
+    // 2. 异地探活轮询：保留浏览器当前实际访问的主机名（禁止重定向至 0.0.0.0）
+    let probeHost = (typeof window !== 'undefined' && window.location.hostname) ? window.location.hostname : '127.0.0.1';
+    if (probeHost === '0.0.0.0') {
+      probeHost = '127.0.0.1';
+    }
+    const proto = (typeof window !== 'undefined' && window.location.protocol) ? window.location.protocol : 'http:';
+    const probeUrl = `${proto}//${probeHost}:${targetPortNum}/health`;
+
+    // 3. 轮询探活（最多等待 30 秒）
+    const deadline = Date.now() + 30000;
+    await new Promise((r) => window.setTimeout(r, 800));
+
+    const pollInterval = window.setInterval(async () => {
+      try {
+        const resp = await fetch(probeUrl, {
+          signal: AbortSignal.timeout(1500),
+          credentials: 'include',
+        });
+        if (resp.ok) {
+          window.clearInterval(pollInterval);
+          if (typeof window !== 'undefined') {
+            if (targetPortNum !== Number(window.location.port || '13457')) {
+              const nextUrl = new URL(window.location.href);
+              nextUrl.port = String(targetPortNum);
+              window.location.href = nextUrl.toString();
+            } else {
+              window.location.reload();
+            }
+          }
+        }
+      } catch {
+        if (Date.now() > deadline) {
+          window.clearInterval(pollInterval);
+          setRestarting(false);
+          setNote(t('remote.connectTimeout'));
+        }
+      }
+    }, 600);
   }
 
   async function copyLink() {
@@ -165,7 +236,7 @@ export function RemoteAccessControl() {
             type="button"
             class="modal-close-btn"
             onClick={() => setOpen(false)}
-            aria-label="Close"
+            aria-label={t('common.dismiss')}
           >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18" />
@@ -177,7 +248,24 @@ export function RemoteAccessControl() {
         <div class="modal-body remote-access-modal-body">
           <label class="remote-access-field">
             <span>{t('remote.host')}</span>
-            <input value={host} readOnly spellcheck={false} />
+            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+              <input
+                value={host}
+                spellcheck={false}
+                placeholder="127.0.0.1 / 0.0.0.0"
+                onInput={(e) => setHost((e.target as HTMLInputElement).value.trim())}
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                class="btn btn-secondary"
+                style={{ padding: '4px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+                onClick={() => setHost(host === '0.0.0.0' ? '127.0.0.1' : '0.0.0.0')}
+                title="127.0.0.1 / 0.0.0.0"
+              >
+                {host === '0.0.0.0' ? '127.0.0.1' : '0.0.0.0'}
+              </button>
+            </div>
           </label>
           <label class="remote-access-field">
             <span>{t('remote.port')}</span>
@@ -232,10 +320,131 @@ export function RemoteAccessControl() {
               {copied ? t('remote.copied') : t('remote.copy')}
             </button>
           )}
-          <button type="button" class="btn btn-primary" disabled={applying} onClick={() => void apply()}>
+          <button type="button" class="btn btn-primary" disabled={applying} onClick={handleApplyClick}>
             {t('remote.apply')}
           </button>
         </div>
+      </div>
+    </div>
+  );
+
+  const restartModalDialog = showRestartModal && (
+    <div
+      class="modal-overlay remote-access-restart-overlay"
+      onClick={() => {
+        if (!restarting) setShowRestartModal(false);
+      }}
+      role="dialog"
+      aria-modal="true"
+      style={{ zIndex: 10001 }}
+    >
+      <div
+        class="modal-card remote-access-restart-card"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: '440px',
+          padding: '24px',
+          borderRadius: '16px',
+          background: 'var(--bg-modal, rgba(28, 30, 36, 0.95))',
+          backdropFilter: 'blur(16px)',
+          WebkitBackdropFilter: 'blur(16px)',
+          boxShadow: '0 20px 40px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.1)',
+        }}
+      >
+        <div style={{ textAlign: 'center', marginBottom: '18px' }}>
+          <div
+            style={{
+              width: '54px',
+              height: '54px',
+              margin: '0 auto 14px',
+              borderRadius: '50%',
+              background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(16, 185, 129, 0.2))',
+              border: '1px solid rgba(59, 130, 246, 0.3)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxShadow: '0 0 20px rgba(59, 130, 246, 0.25)',
+            }}
+          >
+            <svg
+              width="26"
+              height="26"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--accent-color, #3b82f6)"
+              stroke-width="2.2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              style={restarting ? { animation: 'spin 1s linear infinite' } : {}}
+            >
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
+            </svg>
+          </div>
+          <h3 style={{ margin: '0 0 8px', fontSize: '18px', fontWeight: 600 }}>
+            {t('remote.restartPromptTitle')}
+          </h3>
+          <p style={{ margin: 0, fontSize: '13.5px', color: 'var(--text-muted, #9ca3af)', lineHeight: '1.5' }}>
+            {t('remote.restartPromptDesc', {
+              from: `${listenHost}:${listenPort}`,
+              to: `${host.trim() || '127.0.0.1'}:${port.trim() || '13457'}`,
+            })}
+          </p>
+        </div>
+
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '10px',
+            padding: '10px 14px',
+            marginBottom: '20px',
+            borderRadius: '10px',
+            background: 'rgba(255, 255, 255, 0.04)',
+            border: '1px solid rgba(255, 255, 255, 0.06)',
+            fontSize: '13px',
+            fontFamily: 'monospace',
+          }}
+        >
+          <span style={{ color: 'var(--text-muted, #9ca3af)' }}>{listenHost}:{listenPort}</span>
+          <span style={{ color: 'var(--accent-color, #3b82f6)' }}>➔</span>
+          <span style={{ color: '#10b981', fontWeight: 600 }}>
+            {host.trim() || '127.0.0.1'}:{port.trim() || '13457'}
+          </span>
+        </div>
+
+        {restarting ? (
+          <div style={{ textAlign: 'center', padding: '10px 0', color: 'var(--accent-color, #3b82f6)', fontSize: '14px', fontWeight: 500 }}>
+            {t('remote.restarting')}
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+            <button
+              type="button"
+              class="btn btn-secondary"
+              onClick={() => {
+                setShowRestartModal(false);
+                void apply(false);
+              }}
+              style={{ flex: 1, padding: '9px 12px' }}
+            >
+              {t('remote.restartLater')}
+            </button>
+            <button
+              type="button"
+              class="btn btn-primary"
+              onClick={triggerImmediateRestart}
+              style={{
+                flex: 1,
+                padding: '9px 12px',
+                background: 'linear-gradient(135deg, #2563eb, #1d4ed8)',
+                boxShadow: '0 4px 14px rgba(37, 99, 235, 0.35)',
+              }}
+            >
+              {t('remote.restartNow')}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -257,8 +466,10 @@ export function RemoteAccessControl() {
           <path d="M12 3a14 14 0 0 0 0 18" />
         </svg>
         {listenPort && <span class="remote-access-port-text">{listenPort}</span>}
+        <span class="remote-access-label">{t('remote.bindTitle')}</span>
       </button>
       {modalDialog && (typeof document !== 'undefined' ? createPortal(modalDialog, document.body) : modalDialog)}
+      {restartModalDialog && (typeof document !== 'undefined' ? createPortal(restartModalDialog, document.body) : restartModalDialog)}
     </div>
   );
 }

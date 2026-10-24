@@ -973,7 +973,7 @@ export function App() {
                   e.stopPropagation();
                   setMobileTabsDropdownOpen((v) => !v);
                 }}
-                aria-label="Tabs menu"
+                aria-label={t('header.tabsMenu')}
               >
                 {liveRunningIds.has(activeSession.id) ? (
                   <span
@@ -1062,7 +1062,7 @@ export function App() {
                               e.stopPropagation();
                               handleCloseDiffTab(tab.id);
                             }}
-                            title="Close tab"
+                            title={t('preview.closeTab')}
                           >
                             ×
                           </button>
@@ -1101,8 +1101,8 @@ export function App() {
                 'session-title-btn session-new-cloud-btn' +
                 (activeMainTabId === 'chat' ? ' active' : ' clickable-nav')
               }
-              title={t('sidebar.newChat') || '新建对话'}
-              aria-label={t('sidebar.newChat') || '新建对话'}
+              title={t('sidebar.newChat')}
+              aria-label={t('sidebar.newChat')}
               onClick={() => {
                 setActiveMainTabId('chat');
                 handleNewSession();
@@ -1111,7 +1111,7 @@ export function App() {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
               </svg>
-              <span class="session-title-text">{t('sidebar.newChat') || '新建对话'}</span>
+              <span class="session-title-text">{t('sidebar.newChat')}</span>
             </button>
           )}
 
@@ -1174,7 +1174,7 @@ export function App() {
                       e.stopPropagation();
                       handleCloseDiffTab(tab.id);
                     }}
-                    title={`${tab.filePath}${tab.commitShortHash ? ` (${tab.commitShortHash})` : ''} (双击关闭标签)`}
+                    title={`${tab.filePath}${tab.commitShortHash ? ` (${tab.commitShortHash})` : ''} (${t('header.doubleClickClose')})`}
                     draggable={true}
                     onDragStart={(e) => {
                       setMainTabDragIdx(idx);
@@ -1249,7 +1249,7 @@ export function App() {
                         e.stopPropagation();
                         handleCloseDiffTab(tab.id);
                       }}
-                      title="Close tab"
+                      title={t('preview.closeTab')}
                     >
                       ×
                     </button>
@@ -1263,7 +1263,7 @@ export function App() {
           <div
             class="top-nav-actions"
             role="toolbar"
-            aria-label="Quick settings"
+            aria-label={t('header.quickSettings')}
           >
             {/* 桌面端外显：刷新当前会话 */}
             <button
