@@ -21,6 +21,38 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.8 (2026-10-24)
+
+- **[Cross-Language Inline Script Self-Healing & Quoting Isolation] Automatic single-quote healing and environment-variable tunneling**:
+  - Automatically healed invalid single-quote escapes (`\'`) within single-quoted inline scripts across Python, Node.js, Vue, C/C++, Java, C#, Rust, and Go into POSIX-compliant `'\'''`.
+  - Transparently tunneled multiline and triple-quoted inline scripts through `JEIK_INLINE_SCRIPT` environment variables, preventing Windows command-line argument quote collapsing and corruption.
+- **[Desktop In-Place Execution & Cross-Platform Restart Streamlining] Anti-virus heuristics elimination and clean process replacement**:
+  - Eliminated runtime dropper heuristics by executing `jeikcode.exe` in-place from the installation folder, replacing runtime user registry writes with NSIS installer registration and clean uninstallation.
+  - Added startup legacy environment migration to safely purge obsolete `.local/bin` binaries and reclaim PATH.
+  - Defaulted desktop daemon spawn to loopback `127.0.0.1` to prevent firewall popups, allowing user-configured host bindings in `RemoteAccessControl` with instant restart verification.
+  - Dynamically patched restart arguments (`host`, `port`, `token`) across upgrades and restarts, and adopted `execve` in-place replacement under supervisors (systemd/launchd) to prevent port collisions.
+  - Hardened WebUI update dialog state machine to handle network interruption and verification failures gracefully.
+- **[WebUI Button Bar & Modal Internationalization] Complete localization and catalog purity**:
+  - Localized the quick settings button, tabs menu, tab closing tooltips, and remote access modal indicators across 11 world languages.
+  - Populated all missing update and remote configuration translation strings across `ko`, `ja`, `zh-TW`, `de`, `fr`, `es`, `ru`, and `ar`.
+  - Enforced single-language catalog purity by eliminating mixed constructs and parenthetical dual-language aliases.
+
+---
+
+- **[跨语言内联脚本转义自愈与环境变量中转] 单引号自动修复与高危复杂脚本隔离**:
+  - 自动识别并修复 Python、Node.js、Vue、C/C++、Java、C#、Rust、Go 等跨语言内联单引号脚本中非法的 `\'` 转义，升格为 POSIX 标准的 `'\'''`。
+  - 将多行及包含三引号的复杂高危内联脚本自动提取至 `JEIK_INLINE_SCRIPT` 环境变量中转执行，彻底免疫 Windows 命令行引号折叠与损坏。
+- **[桌面端就地运行与跨平台平滑重启] 消除误报特征与优化进程替换**:
+  - 消除 Windows 运行时 Dropper 误报特征，桌面壳直接在安装目录下就地启动 `jeikcode.exe`，改由 NSIS 安装阶段合规注册 PATH 并在卸载时干净清理。
+  - 二进制启动期自动执行旧版环境迁移，清理历史遗留的 `.local/bin` 冗余副本并自动接管环境。
+  - 桌面子进程默认监听地址收敛为回环 `127.0.0.1`，消除防火墙弹窗，并在 `RemoteAccessControl` 远程访问面板中放开主机地址输入限制与即刻重启确认。
+  - 动态注入最新的 `host`、`port` 与 `token` 参数确保重启后新进程继承原有配置，并在服务管理器（systemd / launchd）下采用 `execve` 原地镜像替换消除端口争抢。
+  - 完善 WebUI 更新弹窗（`UpdateDialog.tsx`）错误拦截与状态机流转，杜绝断网时误判进入重启探活。
+- **[WebUI 顶部按钮栏与弹窗全语种补齐] 完整多语言支持与语言包纯粹性治理**:
+  - 消除按钮栏与收纳菜单中的文本硬编码，全面支持快捷设置、标签页菜单、关闭提示与远程访问胶囊的多语言渲染。
+  - 全量补齐 `ko`、`ja`、`zh-TW`、`de`、`fr`、`es`、`ru`、`ar` 等语言包中此前缺失的软件更新与远程访问词条。
+  - 严格遵循单语字典纯粹性规范，全面清除词条中的混合附注写法。
+
 ## v7.2.9-beta.7 (2026-10-24)
 
 - **[Bash Script Resiliency & Idle Timeout Optimization] Inline backtick escaping self-healing and expanded idle harvest window**:
