@@ -213,7 +213,7 @@ pub(crate) async fn set_language(Json(body): Json<LanguageBody>) -> impl IntoRes
     Json(config_response(&config)).into_response()
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct RemoteAccessBody {
     host: String,
     port: u16,
@@ -1564,6 +1564,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), apply)
@@ -1589,6 +1590,7 @@ mod tests {
                 no_token: false,
                 stop: true,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), stop)
@@ -1620,6 +1622,7 @@ mod tests {
                 no_token: true,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         )
         .await
@@ -1662,6 +1665,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), different_port)
@@ -1684,6 +1688,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), same_port)
@@ -1717,6 +1722,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: true,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), same_port)
@@ -1740,6 +1746,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: true,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), next_port)
@@ -1760,6 +1767,7 @@ mod tests {
                 no_token: true,
                 stop: false,
                 apply_launch: true,
+                restart: false,
             }),
         );
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), open_now)
