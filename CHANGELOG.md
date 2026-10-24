@@ -21,6 +21,40 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.4 (2026-10-25)
+
+- **[WebUI Session Flow & Memory-First Architecture] Eliminate session race conditions, terminal freezes, and duplicate bubble cloning**:
+  - Established the in-memory session cache as the single source of truth; purged aggressive SWR disk refetches and fuzzy hybrid merges on session switch and focus recovery.
+  - Implemented pre-mount stream buffering to queue incoming stream events during session mounting, replaying them sequentially once the canvas is ready.
+  - Handled `not_active` and `watch_closed` terminal events on stream reconnects to release busy/stop buttons immediately and reconcile authoritative trailing responses.
+  - Fixed a flaw in `userMessageAlreadyOnCanvas` that caused duplicate user bubbles and phantom outline entries during watch replays, and added automatic consecutive duplicate user prompt folding on load.
+  - Sealed settled assistant responses against in-flight tool leaks and introduced `spliceAuthoritativeDiskTail` to replace canvas tails cleanly while preserving older history heads.
+- **[Artifact Governance & Read Standardization] Asynchronous watchdog and unified schema**:
+  - Removed the rigid 4 MiB output artifact cutoff, allowing complete output payloads to be stored losslessly up to the global capacity.
+  - Implemented `ArtifactWatchdog` with a 7 GiB global capacity ceiling, 5 GiB reactive eviction, 3-day periodic 30% maintenance, and touch-on-read LRU timestamp updates.
+  - Standardized the `read` tool external parameter schema from `key_string` to `keyword` across persona prompts and docs, while silently supporting backward-compatible aliases.
+- **[Updater & Desktop Process Supervision] Atomic in-place restart without port drift**:
+  - Enabled socket address and port reuse and triggered graceful listener release before updater restart handoffs to prevent port binding collisions.
+  - Locked target ports and introduced exponential retry backoff in desktop process supervision on intentional code 75 restarts, stopping phantom port drift.
+  - Enhanced update probing with `no-store` cache controls and instance ID transition tracking for instant and smooth browser reload.
+
+---
+
+- **[WebUI 会话流控与纯内存架构] 根除会话切换竞态、停止键死锁与用户气泡重复克隆**:
+  - 确立内存会话缓存为单一真相源，彻底清空切换会话与窗口失焦时多余的 SWR 磁盘拉取与模糊杂交合并。
+  - 实现挂载前推流缓冲队列（Pre-mount Stream Buffer），在会话装载期间暂存到达的流式事件，待画布就绪后严格按序释放上屏。
+  - 正确响应推流重连时的 `not_active` 与 `watch_closed` 终态信号，第一时间解除发送按钮蓝白色停止态并拉取落盘尾部答案。
+  - 修复 `userMessageAlreadyOnCanvas` 误判漏洞，彻底杜绝回放旧提问时无限克隆用户气泡与大纲幽灵条目的缺陷，并增加相邻重复提问的自动自愈折叠。
+  - 加固已完结助手气泡，严禁在途工具调用向旧回复追加泄漏，并引入 `spliceAuthoritativeDiskTail` 保留更早历史的同时安全替换尾部切片。
+- **[Artifact 存储治理与 Read 工具标准化] 异步看门狗与统一检索参数**:
+  - 移除 4 MiB 产物截断硬编码，超阈值输出在全局物理上限内 100% 全量保真落盘。
+  - 实现 `ArtifactWatchdog` 异步看门狗，提供 7 GiB 全局容量硬顶、5 GiB 应急削顶、3 天周期性 30% 温和淘汰及读时 mtime 刷新真实 LRU 机制。
+  - 将 `read` 工具对外参数 Schema 由 `key_string` 统一标准化为 `keyword`，并在底层反序列化中无感兼容旧版别名。
+- **[更新器与桌面端进程监管] 就地原子重启与端口防漂移**:
+  - 开启套接字地址与端口复用，在更新重启前主动优雅关闭释放监听套接字，消除端口冲突。
+  - 在桌面壳进程监管中对主动重启（退出码 75）锁定目标端口并支持退避重试，杜绝端口顺延递增漂移。
+  - 优化更新探活机制，增加 `no-store` 防缓存头并基于实例 ID 轮转实现异地网页毫秒级顺畅自动刷新。
+
 ## v7.3.0-beta.3 (2026-10-25)
 
 - **[Artifact Retrieval & Read Tool Integration] Seamless virtual URI inspection and prompt simplification**:
