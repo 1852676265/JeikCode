@@ -21,6 +21,36 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.10 (2026-10-24)
+
+- **[Desktop Shell & System Tray] Multilingual tray icon and close-to-tray mode**:
+  - Implemented a system tray icon with official branding and multilingual hover tooltip and context menu (`zh`, `en`, `vi`).
+  - Intercepted close button events to minimize to the tray by default, keeping active agent tasks, live SSE event streams, and composer drafts intact.
+  - Supported left-click to toggle window visibility, right-click menu with Show Window and Quit, and defined missing `StrStr` helper in NSIS hooks to fix Windows release packaging.
+- **[Chat Timeline Viewport Stability & Navigation Shortcuts] Smooth scrolling, jitter elimination, and Home/End support**:
+  - Prevented timeline auto-follow yanks while the user is reading in the middle, eliminating in-place text jitter during active streaming.
+  - Guarded turn completion catch-up against yanking scroll positions, keeping reader focus stable.
+  - Added `Home` key to scroll to the top and release follow, and `End` key to jump to the bottom with auto-follow re-engagement.
+- **[Tool Path Normalization & Model Input Compatibility] In-memory lexical folding and input sanitization**:
+  - Added pure in-memory lexical normalization (`lexical_normalize`) to collapse `.` and `..` segments without requiring filesystem presence, preventing raw unnormalized paths in error messages.
+  - Sanitized model-supplied path variations by stripping quotes, markdown backticks, `file://` schemes, Windows leading slashes, and percent-encoded spaces.
+  - Preserved caller relative directory context in "Did you mean" suggestions and corrected singular grammar.
+
+---
+
+- **[桌面端与系统托盘] 多语言任务栏托盘与关闭到托盘模式**:
+  - 接入基于官方 Logo 的系统托盘图标，提供多语言悬浮提示与右键菜单（支持 `zh`、`en`、`vi`）。
+  - 拦截窗口叉叉关闭事件，默认最小化到系统托盘而不退出进程，完整保持后台 Agent 任务、实时 SSE 事件总线与输入草稿。
+  - 支持左键点击智能切换显隐，右键菜单支持“显示主界面”与“退出”，并在 `hooks.nsh` 中补全缺失的 `StrStr` 宏函数，修复 Windows NSIS 桌面端打包报错。
+- **[主对话面板稳定性与快捷键] 流式防抖动、阅读焦点稳定与 Home/End 快捷键**:
+  - 当用户上滑至中间阅读时增设流式写入硬拦截，彻底消除正文输出期间的原地抖动。
+  - 修复回合落盘结算时无条件跳到底部的缺陷，保持用户当前视口位置绝对稳定。
+  - 支持键盘 `Home` 键平滑置顶并释放跟随，以及 `End` 键直达最底并自动重新激活焦点跟随。
+- **[工具路径规范化与模型输入容错] 内存词法折叠与路径输入清洗**:
+  - 实现纯内存词法折叠算法（`lexical_normalize`），在无需物理文件存在的前提下消除 `.` 与 `..`，彻底阻止未折叠的路径片段泄露至错误日志。
+  - 自动清洗模型输入的各种变体，包括外层引号、Markdown 反引号、`file://` 协议、Windows 盘符多余前导斜杠及 `%20` 空格转义。
+  - 修复“猜你想找”（Did-you-mean）建议中的路径前缀丢失缺陷，精准保留调用方传入的相对目录上下文并区分单复数语法。
+
 ## v7.2.9-beta.9 (2026-10-24)
 
 - **[CI & Test Quality Hardening] RemoteAccessBody initialization and Default derivation**:
