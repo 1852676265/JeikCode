@@ -14,7 +14,7 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 use super::{daemon_terminals, now_unix_ms, publish_global, DaemonTerminalItem, GlobalWireEvent};
 
 pub(crate) struct LiveTerminalProcess {
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Mutex<Box<dyn Child + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -261,8 +261,30 @@ fn utf8_prefix_len(bytes: &[u8]) -> usize {
     }
 }
 
+/// 过滤 Windows ConPTY 自行发出的光标位置查询序列（ESC[6n / ESC[?6n），
+/// 并由后台 PTY 读线程直接向子进程回复 CPR（\x1b[1;1R），满足 ConPTY 握手。
+/// 剔除该序列后，绝不将其广播给前端 xterm.js 或存入历史快照，彻底杜绝切会话回放导致敲入 "1R1R"。
+fn process_pty_output(text: &str, writer: &Mutex<Option<Box<dyn Write + Send>>>) -> String {
+    #[cfg(windows)]
+    {
+        if text.contains("\x1b[6n") || text.contains("\x1b[?6n") {
+            let mut w = lock(writer);
+            if let Some(w) = w.as_mut() {
+                let _ = w.write_all(b"\x1b[1;1R");
+                let _ = w.flush();
+            }
+            return text.replace("\x1b[6n", "").replace("\x1b[?6n", "");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = writer;
+
+    text.to_string()
+}
+
 fn start_reader(
     mut reader: Box<dyn Read + Send>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     buffer: Arc<Mutex<String>>,
     broadcast: tokio::sync::broadcast::Sender<String>,
 ) {
@@ -276,8 +298,11 @@ fn start_reader(
                     Ok(0) | Err(_) => {
                         if !pending.is_empty() {
                             let text = String::from_utf8_lossy(&pending).into_owned();
-                            append_output(&buffer, &text);
-                            let _ = broadcast.send(text);
+                            let clean = process_pty_output(&text, &writer);
+                            if !clean.is_empty() {
+                                append_output(&buffer, &clean);
+                                let _ = broadcast.send(clean);
+                            }
                         }
                         break;
                     }
@@ -286,18 +311,53 @@ fn start_reader(
                         if pending.len() > 8 && utf8_prefix_len(&pending) == 0 {
                             let text = String::from_utf8_lossy(&pending).into_owned();
                             pending.clear();
-                            append_output(&buffer, &text);
-                            let _ = broadcast.send(text);
+                            let clean = process_pty_output(&text, &writer);
+                            if !clean.is_empty() {
+                                append_output(&buffer, &clean);
+                                let _ = broadcast.send(clean);
+                            }
                             continue;
                         }
-                        let split = utf8_prefix_len(&pending);
+                        let mut split = utf8_prefix_len(&pending);
                         if split == 0 {
                             continue;
                         }
+                        // 边界处理：防止 \x1b[6n 或 \x1b[?6n 跨 chunk 读取时被截断
+                        let prefix_slice = &pending[..split];
+                        let partial_len = if prefix_slice.ends_with(b"\x1b[?6")
+                            || prefix_slice.ends_with(b"\x1b[6")
+                        {
+                            if prefix_slice.ends_with(b"\x1b[?6") {
+                                4
+                            } else {
+                                3
+                            }
+                        } else if prefix_slice.ends_with(b"\x1b[?")
+                            || prefix_slice.ends_with(b"\x1b[")
+                        {
+                            if prefix_slice.ends_with(b"\x1b[?") {
+                                3
+                            } else {
+                                2
+                            }
+                        } else if prefix_slice.ends_with(b"\x1b") {
+                            1
+                        } else {
+                            0
+                        };
+                        if partial_len > 0 && split > partial_len {
+                            split -= partial_len;
+                        } else if partial_len > 0 && split == partial_len {
+                            continue;
+                        }
+
                         let text = String::from_utf8_lossy(&pending[..split]).into_owned();
                         pending.drain(..split);
-                        append_output(&buffer, &text);
-                        let _ = broadcast.send(text);
+                        let clean = process_pty_output(&text, &writer);
+                        if !clean.is_empty() {
+                            append_output(&buffer, &clean);
+                            let _ = broadcast.send(clean);
+                        }
                     }
                 }
             }
@@ -533,9 +593,15 @@ pub(crate) async fn get_or_spawn_terminal_process(
         "\x1b[32m[JeikCode Terminal: {term_id} ({actual_shell})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
     );
     let buffer = Arc::new(Mutex::new(greeting));
-    start_reader(spawned.reader, buffer.clone(), broadcast.clone());
+    let writer = Arc::new(Mutex::new(Some(spawned.writer)));
+    start_reader(
+        spawned.reader,
+        writer.clone(),
+        buffer.clone(),
+        broadcast.clone(),
+    );
     let proc = Arc::new(LiveTerminalProcess {
-        writer: Mutex::new(Some(spawned.writer)),
+        writer,
         master: Mutex::new(Some(spawned.master)),
         child: Mutex::new(spawned.child),
         killer: Mutex::new(killer),
@@ -560,6 +626,26 @@ pub(crate) fn lookup_live_terminal(term_id: &str) -> Option<Arc<LiveTerminalProc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_pty_output_strips_conpty_dsr_and_answers_cpr() {
+        let cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let writer: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(Some(Box::new(cursor)));
+
+        let input = "hello\x1b[6nworld\x1b[?6n!";
+        let clean = process_pty_output(input, &writer);
+
+        #[cfg(windows)]
+        {
+            assert_eq!(clean, "helloworld!");
+            assert!(!clean.contains("\x1b[6n"));
+            assert!(!clean.contains("\x1b[?6n"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(clean, input);
+        }
+    }
 
     #[test]
     fn pty_input_uses_single_carriage_return() {

@@ -666,7 +666,15 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
 
         ws.onmessage = (event) => {
           receivedAnyData = true;
-          record.term.write(event.data);
+          // 防御性剔除 Windows ConPTY 残留的光标查询序列 (\x1b[6n / \x1b[?6n)，
+          // 彻底阻断 xterm.js 自动生成 CPR 响应（\x1b[1;1R）导致向终端敲入 1R1R。
+          const raw = event.data;
+          const clean = typeof raw === 'string' && raw.includes('\x1b[')
+            ? raw.replace(/\x1b\[\??6n/g, '')
+            : raw;
+          if (clean) {
+            record.term.write(clean);
+          }
         };
 
         ws.onclose = () => {
