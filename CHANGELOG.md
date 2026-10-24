@@ -21,6 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.9-beta.9 (2026-10-24)
+
+- **[CI & Test Quality Hardening] RemoteAccessBody initialization and Default derivation**:
+  - Derived `Default` on `RemoteAccessBody` in `crates/jeikcode-daemon/src/api_config.rs` to ensure robust struct extensibility.
+  - Supplied explicit `restart: false` across all unit test initializers in `api_config.rs`, resolving CI compilation failures under `cargo check --workspace --all-targets --locked`.
+
+---
+
+- **[CI 与测试质量加固] RemoteAccessBody 测试初始化补全与 Default 派生**:
+  - 为 `crates/jeikcode-daemon/src/api_config.rs` 中的 `RemoteAccessBody` 增加 `Default` 派生，提升结构体前向兼容性。
+  - 在 `api_config.rs` 单元测试中补全 `restart: false` 字段初始化，彻底解决 CI 自动化流水线在 `cargo check --workspace --all-targets --locked` 检查时的编译失败。
+
 ## v7.2.9-beta.8 (2026-10-24)
 
 - **[Cross-Language Inline Script Self-Healing & Quoting Isolation] Automatic single-quote healing and environment-variable tunneling**:
