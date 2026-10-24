@@ -26,6 +26,13 @@ done:
 FunctionEnd
 !endif
 
+!macro NSIS_HOOK_PREINSTALL
+  ; Terminate any existing running instances of desktop or daemon before extracting/overwriting files
+  nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
+  nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
+  Sleep 600
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   ; Re-create desktop shortcut explicitly with executable icon index 0
   CreateShortCut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\${MAINBINARYNAME}.exe" 0
@@ -70,6 +77,13 @@ FunctionEnd
   IfFileExists "$PROFILE\.local\bin\atomcode.bak.exe" 0 +2
     Delete "$PROFILE\.local\bin\atomcode.bak.exe"
   RMDir "$PROFILE\.local\bin"
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  ; Terminate any running instances before uninstalling
+  nsExec::Exec 'taskkill /F /IM "jeikcode-desktop.exe" /T'
+  nsExec::Exec 'taskkill /F /IM "jeikcode.exe" /T'
+  Sleep 600
 !macroend
 
 !macro NSIS_HOOK_UNINSTALL

@@ -1226,6 +1226,8 @@ export interface RemoteAccessStatus {
   firewall?: string | null;
   /** Saved port that differs from the socket listening now. */
   next_port?: number | null;
+  /** Saved host that differs from the socket listening now. */
+  next_host?: string | null;
 }
 
 export async function getRemoteAccess(): Promise<RemoteAccessStatus> {

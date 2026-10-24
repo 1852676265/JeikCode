@@ -34,25 +34,22 @@ export function RemoteAccessControl() {
   function showStatus(status: RemoteAccessStatus) {
     const livePort = String(status.port || ((typeof window !== 'undefined' && window.location.port) ? window.location.port : 13457));
     const pending = status.next_port && status.next_port !== status.port ? status.next_port : 0;
-    // 若 pending 端口小于当前实际监听端口，属于开局端口冲突自动累加造成的旧配置，输入框直接同步为当前实际端口
-    const isAutoIncremented = pending > 0 && pending < Number(livePort);
-    const effectivePending = isAutoIncremented ? 0 : pending;
     setActive(status.active);
-    const resolvedHost = status.host || '127.0.0.1';
+    const resolvedHost = (status.next_host && status.next_host.trim()) || status.host || '127.0.0.1';
     setHost(resolvedHost);
-    setListenHost(resolvedHost);
+    setListenHost(status.host || '127.0.0.1');
     setListenPort(livePort);
     setNoToken(!!status.no_token);
-    setSavedPort(effectivePending);
+    setSavedPort(pending);
     if (status.token) setToken(status.token);
-    setPort(effectivePending ? String(effectivePending) : livePort);
+    setPort(pending ? String(pending) : livePort);
     const urls = (status.urls && status.urls.length > 0 ? status.urls : status.url ? [status.url] : [])
       .filter((item): item is string => !!item);
     setLinks(status.active ? urls : []);
     setFirewall(status.firewall === 'prompt' ? status.firewall : '');
     const notes: string[] = [];
-    if (effectivePending) {
-      notes.push(t('remote.portNext', { port: String(effectivePending), listenPort: livePort }));
+    if (pending) {
+      notes.push(t('remote.portNext', { port: String(pending), listenPort: livePort }));
     }
     if (status.no_token) {
       notes.push(t('remote.noTokenSession'));
