@@ -42,6 +42,8 @@ export interface ProjectionMessage {
   /** 客户端关联键（`client_input_id`）：乐观气泡的幂等身份。随缓存/IDB 持久化，
    *  重放/刷新/异地端都能据此判定“这条提问已经在画布上”，无需猜文本。 */
   clientInputId?: string;
+  /** 绝对转录下标：跨窗口/分页唯一的身份（右栏锚点、历史合并排序都用它）。 */
+  sourceIndex?: number;
 }
 
 /**
@@ -414,6 +416,8 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
     created_at?: number;
     message_id?: string;
     client_input_id?: string;
+    /** 绝对转录下标（调用方按会话大纲补上）。有了它就能精确归位，不再靠“碰巧命中的锚点”。 */
+    source_index?: number;
   }>,
   before?: TurnUserAnchor,
 ): T[] {
@@ -444,6 +448,14 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
       continue;
     }
     const userTs = event.created_at && event.created_at > 0 ? event.created_at : Date.now();
+    // 绝对下标是唯一身份：画布上（pinned 主机键/磁盘行）已经有这一行就说明这条提问
+    // 已画过，绝不能再补一份。
+    if (
+      typeof event.source_index === 'number' &&
+      next.some((message) => message.sourceIndex === event.source_index)
+    ) {
+      continue;
+    }
     // 核心硬防线：若画布上最后一条用户提问文本与当前完全一致，且助手尚未产生回答，直接跳过
     const lastUser = [...next].reverse().find((m) => m.role === 'user');
     if (lastUser) {
@@ -462,9 +474,26 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
       parts: [{ kind: 'text', text: userText }],
       ts: userTs,
       ...(isSteer ? { isSteer: true } : {}),
+      ...(typeof event.source_index === 'number' ? { sourceIndex: event.source_index } : {}),
       ...(event.message_id ? { id: event.message_id } : {}),
       ...(event.client_input_id ? { clientInputId: event.client_input_id } : {}),
     } as T;
+    if (typeof event.source_index === 'number') {
+      // 有绝对下标就按序插入，而不是看“碰巧命中的锚点”：被折叠线切掉的开场提问
+      // 必须回到它在窗口里的真实顺序位置（通常就是窗口最前面），否则它会落在
+      // 48 行折叠线附近，随后又被 mergeOlderMessages 排到末尾。
+      const target = next.findIndex(
+        (message) =>
+          typeof message.sourceIndex === 'number' && message.sourceIndex > event.source_index!,
+      );
+      const pos = target >= 0 ? target : next.length;
+      const copy = next.slice();
+      copy.splice(pos, 0, row);
+      insertedAt = pos;
+      cursor = pos + 1;
+      next = copy;
+      continue;
+    }
     if (cursor == null) cursor = turnAnchorIndex(next, before);
     if (cursor < 0) {
       const painted = paintUserMessage(next, event.content, userTs, () => row);
@@ -920,6 +949,29 @@ export function sanitizeCanvasMessages<T extends { role: string; parts?: MsgPart
 }
 
 /**
+ * 旧缓存 / 回放恢复出来的提问行既没有 id 也没有 sourceIndex：
+ * 用「文本 + 时间戳（≤ 3s，缺失时间戳则保守视为同一行）」判断是不是同一条提问。
+ */
+function sameUserRow(
+  a: { role?: string; parts?: MsgPart[]; ts?: number },
+  b: { role?: string; parts?: MsgPart[]; ts?: number },
+): boolean {
+  if (a.role !== 'user' || b.role !== 'user') return false;
+  const textOf = (message: { parts?: MsgPart[] }): string =>
+    visibleUserText(
+      (message.parts ?? [])
+        .filter((part) => part.kind === 'text')
+        .map((part) => part.text || '')
+        .join(''),
+    );
+  const left = textOf(a);
+  const right = textOf(b);
+  if (!left || !right || !userTextsMatch(left, right)) return false;
+  if (a.ts && b.ts) return Math.abs(a.ts - b.ts) <= 3000;
+  return true;
+}
+
+/**
  * 往前补页时，首屏钉住的那条提问可能已经在画布上。
  * 合并更早历史与现有画布时：
  * 1. 按 id 和 sourceIndex 严格去重，避免重复渲染；
@@ -927,10 +979,9 @@ export function sanitizeCanvasMessages<T extends { role: string; parts?: MsgPart
  *    彻底防止因首屏 pinned 置顶提问在向前翻页拼接时被挤到后续工具调用下方的倒插 BUG！
  * 3. 无 sourceIndex 的在途实时消息保持在末尾原有相对顺序。
  */
-export function mergeOlderMessages<T extends { id?: string; sourceIndex?: number }>(
-  prev: T[],
-  older: T[],
-): T[] {
+export function mergeOlderMessages<
+  T extends { id?: string; sourceIndex?: number; role?: string; parts?: MsgPart[]; ts?: number },
+>(prev: T[], older: T[]): T[] {
   if (!older || older.length === 0) return prev;
   if (!prev || prev.length === 0) return older;
 
@@ -949,6 +1000,17 @@ export function mergeOlderMessages<T extends { id?: string; sourceIndex?: number
   for (const m of prev) {
     if (m.id && seenIds.has(m.id)) continue;
     if (typeof m.sourceIndex === 'number' && seenIndices.has(m.sourceIndex)) continue;
+    // 兼容旧缓存 / 回放恢复出来的行：既无 id 又无绝对下标时，用「文本 + 时间戳」
+    // 与更早历史对账。否则它会被当成“在途新消息”排到末尾 —— 用户看到的就是
+    // “第一条提问被渲染到了后面（48 条附近）”。
+    if (
+      m.role === 'user' &&
+      !m.id &&
+      typeof m.sourceIndex !== 'number' &&
+      merged.some((candidate) => sameUserRow(candidate, m))
+    ) {
+      continue;
+    }
     if (m.id) seenIds.add(m.id);
     if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
     merged.push(m);

@@ -202,3 +202,37 @@ test('异地浏览器刷新：回放缓冲尾帧（replay_last）仍未与旧画
   assert.equal(fold.overlapped, true);
 });
 
+test('整段回放都在折叠线以上（已落盘旧回合）时，绝不 flush 到时间线末尾', () => {
+  const canvas = [assistant('m-old')];
+  const onCanvas = (event: SSEEvent) => replayFrameOnCanvas(canvas, event);
+  const aboveFold = (event: SSEEvent) => event.type === 'user';
+  const fold = createReplayFold();
+  const user = seq({ type: 'user', content: '被折叠线切掉的开场提问', created_at: 1000 }, 1);
+  const mid = seq({ type: 'text', content: '中间过程', message_id: 'm-mid' }, 2);
+  const last = {
+    ...seq({ type: 'text', content: '最终答案', message_id: 'm-last' }, 3),
+    replay_last: true,
+  };
+
+  assert.deepEqual(acceptReplayFrame(fold, user, 55, onCanvas, false, aboveFold).paint, []);
+  assert.deepEqual(acceptReplayFrame(fold, mid, 55, onCanvas, false, aboveFold).paint, []);
+  assert.deepEqual(
+    acceptReplayFrame(fold, last, 55, onCanvas, false, aboveFold).paint,
+    [],
+    'above-fold replay must not append a duplicate turn at the end',
+  );
+  assert.equal(fold.aboveFold, true);
+});
+
+test('折叠线以上暂存之后到达的直播帧仍然放行', () => {
+  const canvas = [assistant('m-old')];
+  const onCanvas = (event: SSEEvent) => replayFrameOnCanvas(canvas, event);
+  const aboveFold = (event: SSEEvent) => event.type === 'user';
+  const fold = createReplayFold();
+  acceptReplayFrame(fold, seq({ type: 'user', content: '旧提问', created_at: 1 }, 1), 55, onCanvas, false, aboveFold);
+  acceptReplayFrame(fold, seq({ type: 'text', content: '旧回合中间', message_id: 'm-a' }, 2), 55, onCanvas, false, aboveFold);
+  const live = acceptReplayFrame(fold, { type: 'text', content: '新直播增量' }, 55, onCanvas, false, aboveFold);
+  assert.equal(live.paint.length, 1);
+  assert.equal(live.paint[0]!.type, 'text');
+});
+

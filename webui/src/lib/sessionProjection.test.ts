@@ -1192,3 +1192,47 @@ test('paintUserMessage 重放带关联键时不会把磁盘投影的同一行再
   assert.equal(legacyReplay.length, noTs.length);
 });
 
+test('placeRecoveredTurnUsers 用绝对下标把被折叠线切掉的提问放回原位置', () => {
+  const canvas = [
+    { role: 'user', sourceIndex: 55, id: 'u55', parts: [{ kind: 'text' as const, text: '窗口内的提问' }] },
+    { role: 'assistant', sourceIndex: 56, id: 'a56', parts: [{ kind: 'text' as const, text: '回答' }] },
+  ];
+  // 回放恢复的开场提问带真实下标 7 → 插到窗口最前面，而不是锚点/48 附近。
+  const placed = placeRecoveredTurnUsers(canvas, [
+    { type: 'user', content: '本回合开场提问', created_at: 1000, source_index: 7 },
+  ]);
+  assert.equal(placed.length, 3);
+  assert.equal(placed[0]!.role, 'user');
+  assert.equal(placed[0]!.sourceIndex, 7);
+  assert.equal(placed[1]!.sourceIndex, 55);
+
+  // 同一绝对下标已在画布上 → 幂等（原数组返回）。
+  assert.equal(
+    placeRecoveredTurnUsers(placed, [
+      { type: 'user', content: '本回合开场提问', created_at: 1000, source_index: 7 },
+    ]),
+    placed,
+  );
+
+  // 没有下标时保持旧行为：作为新回合追加 + Working 占位。
+  const appended = placeRecoveredTurnUsers(canvas, [
+    { type: 'user', content: '完全没有见过的提问', created_at: 2000 },
+  ]);
+  assert.equal(appended.length, 4);
+});
+
+test('mergeOlderMessages 把无 sourceIndex 的回放提问按文本+时间戳并入更早历史', () => {
+  const older = [
+    { role: 'user', id: 'm-u7', sourceIndex: 7, ts: 1000, parts: [{ kind: 'text' as const, text: '开场提问' }] },
+    { role: 'assistant', id: 'm-a8', sourceIndex: 8, ts: 1200, parts: [{ kind: 'text' as const, text: '回答' }] },
+  ];
+  const prev = [
+    // 旧版本恢复出来的同一提问：没有 id、也没有 sourceIndex。
+    { role: 'user', ts: 1000, parts: [{ kind: 'text' as const, text: '开场提问' }] },
+    { role: 'assistant', id: 'm-a55', sourceIndex: 55, ts: 2000, parts: [{ kind: 'text' as const, text: '窗口内回答' }] },
+  ];
+  const merged = mergeOlderMessages(prev, older);
+  assert.deepEqual(merged.map((m) => m.sourceIndex), [7, 8, 55]);
+  assert.equal(merged.filter((m) => m.role === 'user').length, 1);
+});
+

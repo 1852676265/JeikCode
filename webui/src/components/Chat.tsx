@@ -1993,14 +1993,40 @@ export function Chat({
     if (activeIdRef.current === sessionId) return messagesRef.current;
     return messageCacheRef.current.get(sessionId) ?? [];
   }
+  /** 回放帧的提问是否落在折叠线以上（右栏大纲里它的绝对下标早于当前窗口起点）。 */
+  function replayQueryAboveFold(sessionId: string, event: SSEEvent): boolean {
+    if (event.type !== 'user' || typeof event.content !== 'string') return false;
+    const outline =
+      sessionId === activeIdRef.current
+        ? turnOutlineRef.current
+        : (turnOutlineBySessionRef.current.get(sessionId) ?? []);
+    if (outline.length === 0) return false;
+    const hit = [...outline].reverse().find((turn) => userTextsMatch(turn.text, event.content!));
+    return !!hit && hit.index < watchReplayOffset(sessionId);
+  }
+
   /** 回放里被页切掉的提问插回这一轮前面，再画后面的帧。 */
   function placeReplayUsers(
     sessionId: string,
-    accepted: { placeUsers: Array<{ type: string; content?: string; created_at?: number; message_id?: string }>; before?: { messageId?: string; toolId?: string } },
+    accepted: { placeUsers: Array<{ type: string; content?: string; created_at?: number; message_id?: string; client_input_id?: string }>; before?: { messageId?: string; toolId?: string } },
   ) {
     if (accepted.placeUsers.length === 0) return;
     const base = watchReplayCanvas(sessionId);
-    const placed = placeRecoveredTurnUsers(base, accepted.placeUsers, accepted.before);
+    // 回放帧只带内容、不带绝对下标：用右栏大纲把它补上。被折叠线切掉的开场提问
+    // 只有靠这个下标才能回到真实顺序位置，否则会落在折叠线（~48 行）附近，随后又
+    // 被 mergeOlderMessages 当成“无下标在途消息”排到末尾。
+    const outline =
+      sessionId === activeIdRef.current
+        ? turnOutlineRef.current
+        : (turnOutlineBySessionRef.current.get(sessionId) ?? []);
+    const withIndex = accepted.placeUsers.map((event) => {
+      if (event.type !== 'user' || typeof event.content !== 'string') return event;
+      const hit = [...outline]
+        .reverse()
+        .find((turn) => userTextsMatch(turn.text, event.content!));
+      return hit ? { ...event, source_index: hit.index } : event;
+    });
+    const placed = placeRecoveredTurnUsers(base, withIndex, accepted.before);
     if (placed === base) return;
     messageCacheRef.current.set(sessionId, placed);
     if (activeIdRef.current === sessionId) {
@@ -2170,6 +2196,7 @@ export function Chat({
                 watchReplayOffset(loadId),
                 (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
                 transcriptHasOpenUserTurn(watchReplayCanvas(loadId)),
+                (candidate) => replayQueryAboveFold(loadId, candidate),
               );
               placeReplayUsers(loadId, accepted);
               for (const frame of accepted.paint) {
@@ -2610,6 +2637,7 @@ export function Chat({
           watchReplayOffset(loadId),
           (candidate) => replayFrameOnCanvas(watchReplayCanvas(loadId), candidate),
           transcriptHasOpenUserTurn(watchReplayCanvas(loadId)),
+          (candidate) => replayQueryAboveFold(loadId, candidate),
         );
         placeReplayUsers(loadId, accepted);
         for (const frame of accepted.paint) {
