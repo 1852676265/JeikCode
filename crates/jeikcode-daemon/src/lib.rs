@@ -8144,6 +8144,11 @@ struct ChatRuntimeProjector {
     /// `AgentEvent::AssistantMessage`). Tags text/reasoning deltas with the same
     /// identity the persisted `Message` carries.
     current_message_id: Option<String>,
+    /// Stored identity of the turn's user prompt (`AgentEvent::UserMessage`).
+    /// A turn that fails *before* its first assistant boundary (provider error on
+    /// the opening call) must still anchor its notice to this prompt, otherwise
+    /// the bubble lands under the previous answer or the next agent loop.
+    current_user_message_id: Option<String>,
     /// Monotonic per-message part counter; bumped when the streaming part KIND
     /// changes (reasoning → text → …) so each part gets a unique `part_id`.
     part_seq: u32,
@@ -8162,6 +8167,7 @@ impl Default for ChatRuntimeProjector {
             last_error: None,
             keep_raw_markdown: false,
             current_message_id: None,
+            current_user_message_id: None,
             part_seq: 0,
             last_part_kind: None,
         }
@@ -8224,7 +8230,7 @@ impl ChatRuntimeProjector {
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
                 ),
-                message_id: self.current_message_id.clone(),
+                message_id: self.notice_anchor(),
             }],
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
@@ -8253,7 +8259,7 @@ impl ChatRuntimeProjector {
                     },
             } => vec![ChatEvent::Warning {
                 message: jeikcode_config::i18n::format_compaction_interrupted(),
-                message_id: self.current_message_id.clone(),
+                message_id: self.notice_anchor(),
             }],
             CodingRuntimeEvent::CompactionFinished {
                 completion:
@@ -8318,7 +8324,7 @@ impl ChatRuntimeProjector {
             CodingRuntimeEvent::ControllerWarning(message) => {
                 vec![ChatEvent::Warning {
                     message,
-                    message_id: self.current_message_id.clone(),
+                    message_id: self.notice_anchor(),
                 }]
             }
             CodingRuntimeEvent::PersistenceWarning(message) => {
@@ -8376,6 +8382,17 @@ impl ChatRuntimeProjector {
         self.last_part_kind = None;
     }
 
+    /// Anchor for a non-fatal notice (`warning` / `rate_limited`).
+    ///
+    /// Prefer the streaming assistant round; fall back to the turn's user message
+    /// so a failure that happened BEFORE any assistant boundary still anchors to
+    /// its own prompt instead of the previous answer's tail.
+    fn notice_anchor(&self) -> Option<String> {
+        self.current_message_id
+            .clone()
+            .or_else(|| self.current_user_message_id.clone())
+    }
+
     fn project_agent(
         &mut self,
         event: jeikcode_kernel::event::AgentEvent,
@@ -8397,6 +8414,12 @@ impl ChatRuntimeProjector {
             } => {
                 // Identity-only boundary: the `user` echo already painted the
                 // bubble; this binds it to the stored message id.
+                //
+                // 新回合开始：记住本轮的 user 身份，并清掉上一轮的 assistant id。
+                // 失败轮（尚未产生 assistant 边界）的提示必须锚到这轮提问上，
+                // 否则会挂到上一轮回答底部 / 下一条 loop 下面。
+                self.current_user_message_id = Some(message_id.clone());
+                self.current_message_id = None;
                 vec![ChatEvent::UserIdentified {
                     message_id,
                     turn_ordinal,
@@ -8502,12 +8525,12 @@ impl ChatRuntimeProjector {
                 // Emitting a terminal HTTP error here would create Error + Done for one turn.
                 vec![ChatEvent::Warning {
                     message,
-                    message_id: self.current_message_id.clone(),
+                    message_id: self.notice_anchor(),
                 }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning {
                 message,
-                message_id: self.current_message_id.clone(),
+                message_id: self.notice_anchor(),
             }],
             Agent::RateLimited {
                 reset_at_display,
@@ -8521,7 +8544,7 @@ impl ChatRuntimeProjector {
                 secs_until_reset,
                 auto_resuming,
                 server_message,
-                message_id: self.current_message_id.clone(),
+                message_id: self.notice_anchor(),
             }],
             Agent::Steered { count, inputs } => {
                 let mut events = Vec::new();
@@ -8571,7 +8594,7 @@ impl ChatRuntimeProjector {
                         message: jeikcode_config::i18n::format_compaction_mark(
                             removed, est_before, est_after,
                         ),
-                        message_id: self.current_message_id.clone(),
+                        message_id: self.notice_anchor(),
                     },
                 ]
             }
@@ -8589,7 +8612,7 @@ impl ChatRuntimeProjector {
                     },
                     ChatEvent::Warning {
                         message: format!("Compaction failed: {error}"),
-                        message_id: self.current_message_id.clone(),
+                        message_id: self.notice_anchor(),
                     },
                 ]
             }
@@ -9506,6 +9529,57 @@ mod chat_watch_frame_tests {
 #[cfg(test)]
 mod chat_part_identity_tests {
     use super::*;
+
+    #[test]
+    fn notice_anchors_to_the_turn_user_message_before_any_assistant_round() {
+        use jeikcode_kernel::event::AgentEvent as Agent;
+        let mut projector = ChatRuntimeProjector::default();
+        // 上一轮已经开过 assistant 回合：此时提示应锚到该回合。
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-prev".into(),
+            },
+            "sess-1",
+        );
+        assert_eq!(projector.notice_anchor().as_deref(), Some("m-prev"));
+
+        // 新回合开始（提问已落盘），provider 在首个 assistant 边界前就失败：
+        // 锚点必须切到本轮提问，绝不能再挂到上一轮回答上。
+        projector.project_agent(
+            Agent::UserMessage {
+                message_id: "m-user".into(),
+                turn_ordinal: 2,
+            },
+            "sess-1",
+        );
+        assert_eq!(
+            projector.current_message_id, None,
+            "stale assistant id must be cleared at turn start"
+        );
+        let events = projector.project_agent(
+            Agent::Error {
+                message: "HTTP 400: {\"model\":\"x\"}".into(),
+                http_status: Some(400),
+                code: None,
+            },
+            "sess-1",
+        );
+        match events.as_slice() {
+            [ChatEvent::Warning { message_id, .. }] => {
+                assert_eq!(message_id.as_deref(), Some("m-user"));
+            }
+            other => panic!("expected one warning, got {other:?}"),
+        }
+
+        // assistant 边界出现后，提示回到该回合。
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-round".into(),
+            },
+            "sess-1",
+        );
+        assert_eq!(projector.notice_anchor().as_deref(), Some("m-round"));
+    }
 
     #[test]
     fn tool_boundary_opens_a_new_text_part() {

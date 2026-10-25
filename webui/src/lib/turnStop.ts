@@ -49,6 +49,35 @@ export function consumesProgrammaticStopMark(
   return now <= mark.expiresAt;
 }
 
+/** Minimal terminal-frame shape needed to classify a displaced turn. */
+export interface StopTerminalFrame {
+  type: string;
+  stop_reason?: string;
+}
+
+/**
+ * Is this terminal frame still reporting the turn that 「立即发送」 displaced?
+ *
+ * A cancelled turn emits `done(stop_reason=cancelled)` **and** a legacy
+ * `stopped`. Both belong to the old turn: settling the connection or clearing
+ * busy on them flips the send button back to the arrow while the replacement
+ * turn is already streaming. A normal completion (`done` without a cancel/stop
+ * reason) must still be honoured.
+ */
+export function isStaleProgrammaticStopFrame(
+  mark: ProgrammaticStopMark | null | undefined,
+  frame: StopTerminalFrame,
+  sessionId: string | null | undefined,
+  now: number,
+): boolean {
+  if (!consumesProgrammaticStopMark(mark, sessionId, now)) return false;
+  if (frame.type === 'stopped') return true;
+  return (
+    frame.type === 'done' &&
+    (frame.stop_reason === 'cancelled' || frame.stop_reason === 'stopped')
+  );
+}
+
 /**
  * 这一条停止别名是否允许紧接着投递下一回合。
  *

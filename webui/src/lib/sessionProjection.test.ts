@@ -1102,6 +1102,32 @@ test('paintAssistantNotice 重放幂等：同一条提示不会叠多份', () =>
   assert.equal(paintAssistantNotice(targeted, '另一条提示', 'a-1')[0]!.parts.length, 3);
 });
 
+test('paintAssistantNotice 失败回合的提示锚定到自己那条提问下面', () => {
+  const canvas = [
+    { role: 'assistant', id: 'a-prev', parts: [{ kind: 'text' as const, text: '上一轮回答' }] },
+    { role: 'user', id: 'u-next', parts: [{ kind: 'text' as const, text: '这一轮失败' }] },
+    { role: 'assistant', id: 'a-next', parts: [] }, // Working 占位
+  ];
+  const once = paintAssistantNotice(canvas, 'HTTP 400: {"model":"x"}', 'u-next');
+  // 复用提问后的空 assistant 占位，而不是堆到上一轮回答底部。
+  assert.equal(once.length, 3);
+  assert.equal(once[0]!.parts.length, 1);
+  assert.equal(once[2]!.parts.length, 1);
+  assert.equal(once[2]!.parts[0]!.kind, 'notice');
+  // 同一提示重放 → 幂等。
+  assert.equal(paintAssistantNotice(once, 'HTTP 400: {"model":"x"}', 'u-next'), once);
+
+  // 下一轮已经开跑（有正文）时，插在提问之后而不是并进下一轮。
+  const busy = [
+    { role: 'user', id: 'u-fail', parts: [{ kind: 'text' as const, text: '失败那轮' }] },
+    { role: 'assistant', id: 'a-busy', parts: [{ kind: 'text' as const, text: '下一轮正文' }] },
+  ];
+  const inserted = paintAssistantNotice(busy, 'HTTP 500', 'u-fail');
+  assert.equal(inserted.length, 3);
+  assert.equal(inserted[1]!.parts[0]!.kind, 'notice');
+  assert.equal(inserted[2]!.parts[0]!.text, '下一轮正文');
+});
+
 test('paintUserMessage 用 client_input_id 做身份幂等，同文不同发不再被吞', () => {
   const create = () => ({ role: 'user', parts: [{ kind: 'text' as const, text: '同样的提问' }] });
 
@@ -1112,17 +1138,17 @@ test('paintUserMessage 用 client_input_id 做身份幂等，同文不同发不�
   // 2. 同一条关联键重放 → 幂等（原数组返回）。
   assert.equal(paintUserMessage(first, '同样的提问', 1, create, { clientInputId: 'req-1' }), first);
 
-  // 3. 同文不同发（新关联键）→ 必须真的再画一条；旧文本启发式会在这里吞掉。
+  // 3. 同文不同发（新关联键 + 时间戳相差 > 3s）→ 必须真的再画一条；旧文本启发式会在这里吞掉。
   const settled = [
-    { role: 'user', clientInputId: 'req-1', parts: [{ kind: 'text' as const, text: '同样的提问' }] },
+    { role: 'user', clientInputId: 'req-1', ts: 1_000, parts: [{ kind: 'text' as const, text: '同样的提问' }] },
     { role: 'assistant', parts: [{ kind: 'text' as const, text: '答完了' }] },
   ];
-  const second = paintUserMessage(settled, '同样的提问', 2, create, { clientInputId: 'req-2' });
+  const second = paintUserMessage(settled, '同样的提问', 100_000, create, { clientInputId: 'req-2' });
   assert.equal(second.length, 4);
   assert.equal(second[2]!.clientInputId, 'req-2');
 
   // 4. 无身份（legacy 端）→ 文本兜底仍然生效，不重复画。
-  const legacy = paintUserMessage(settled, '同样的提问', 2, create);
+  const legacy = paintUserMessage(settled, '同样的提问', 200_000, create);
   assert.equal(legacy.length, settled.length);
 
   // 5. 盖章助手：只给「还没有身份」的最新 user 行盖章，绝不覆写已有身份。
@@ -1130,5 +1156,39 @@ test('paintUserMessage 用 client_input_id 做身份幂等，同文不同发不�
   const stamped = stampUserClientInputId(bare, 'req-9');
   assert.equal(stamped[0]!.clientInputId, 'req-9');
   assert.equal(stampUserClientInputId(stamped, 'req-1'), stamped);
+});
+
+test('paintUserMessage 重放带关联键时不会把磁盘投影的同一行再追加一次', () => {
+  const create = () => ({
+    role: 'user',
+    parts: [{ kind: 'text' as const, text: '上山打老虎' }],
+  });
+  // 磁盘投影：同一行没有 clientInputId，但 ts 与回放的 created_at 一致。
+  const projected = [
+    { role: 'assistant', id: 'a-prev', ts: 900, parts: [{ kind: 'text' as const, text: '上一轮' }] },
+    { role: 'user', id: 'm-u1', ts: 1_000, parts: [{ kind: 'text' as const, text: '上山打老虎' }] },
+    { role: 'assistant', id: 'm-a1', ts: 1_500, parts: [{ kind: 'text' as const, text: '老虎没打到' }] },
+  ];
+  const replayed = paintUserMessage(projected, '上山打老虎', 1_000, create, { clientInputId: 'req-x' });
+  assert.equal(replayed.length, 3, 'replay must not append a duplicate bubble at the bottom');
+  assert.equal(replayed[1]!.clientInputId, 'req-x', 'replay stamps the existing row instead');
+  // 同一关联键再次回放 → 幂等。
+  assert.equal(
+    paintUserMessage(replayed, '上山打老虎', 1_000, create, { clientInputId: 'req-x' }),
+    replayed,
+  );
+
+  // 用户真的又发了一遍相同内容（时间戳差 > 3s）→ 必须新增一条。
+  const repeated = paintUserMessage(replayed, '上山打老虎', 60_000, create, { clientInputId: 'req-y' });
+  assert.equal(repeated.length, 5);
+  assert.equal(repeated[3]!.clientInputId, 'req-y');
+
+  // 旧投影没有时间戳：宁可幂等也不克隆。
+  const noTs = [
+    { role: 'user', parts: [{ kind: 'text' as const, text: '没有时间戳' }] },
+    { role: 'assistant', parts: [{ kind: 'text' as const, text: '回答' }] },
+  ];
+  const legacyReplay = paintUserMessage(noTs, '没有时间戳', 123, create, { clientInputId: 'req-z' });
+  assert.equal(legacyReplay.length, noTs.length);
 });
 

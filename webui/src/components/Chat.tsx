@@ -188,7 +188,7 @@ import {
   stashSessionQueued,
   restoreSessionQueued,
 } from '../lib/queuedDraft';
-import { consumesProgrammaticStopMark, runningTurnStopAliases, stopAliasAllowsNextTurn, type ProgrammaticStopMark } from '../lib/turnStop';
+import { consumesProgrammaticStopMark, isStaleProgrammaticStopFrame, runningTurnStopAliases, stopAliasAllowsNextTurn, type ProgrammaticStopMark } from '../lib/turnStop';
 import { loadAppliedTodoCallIds, saveAppliedTodoCallIds } from '../lib/todoAppliedIds';
 import {
   chatRecoveryPolicy,
@@ -1865,6 +1865,19 @@ export function Chat({
   function clearManualStopGuard(sid: string) {
     if (sid) terminalSettleGuardUntilRef.current.delete(sid);
   }
+  /**
+   * 「立即发送」停掉的旧回合，其 `stopped` 终态可能晚于新一轮的首帧到达。
+   * 它属于被换掉的那一轮，绝不能收尾当前连接 / 把 busy 清回发送箭头（否则 agent
+   * 明明在跑，按钮却是可发送状态）。帧本身也不能作废这个标记（见 handleEvent）。
+   */
+  function isStaleProgrammaticStop(frame: SSEEvent, sid: string): boolean {
+    return isStaleProgrammaticStopFrame(
+      programmaticStopMarkRef.current,
+      frame,
+      sid,
+      Date.now(),
+    );
+  }
   function stopDetachedHistoryPoll(targetSid?: string) {
     if (detachedPollTimerRef.current != null) {
       window.clearInterval(detachedPollTimerRef.current);
@@ -2195,6 +2208,7 @@ export function Chat({
                     frame.type === 'stopped' ||
                     frame.type === 'error'
                   ) {
+                    if (isStaleProgrammaticStop(frame, loadId)) continue;
                     terminalSeen = true;
                     sessionWatchersRef.current.delete(loadId);
                     localActiveStreamsBySessionRef.current.delete(loadId);
@@ -2209,6 +2223,7 @@ export function Chat({
                     frame.type === 'stopped' ||
                     frame.type === 'error'
                   ) {
+                    if (isStaleProgrammaticStop(frame, loadId)) continue;
                     terminalSeen = true;
                     sessionWatchersRef.current.delete(loadId);
                     localActiveStreamsBySessionRef.current.delete(loadId);
@@ -2696,6 +2711,7 @@ export function Chat({
             frame.type === 'stopped' ||
             frame.type === 'error'
           ) {
+            if (isStaleProgrammaticStop(frame, loadId)) continue;
             terminalSeen = true;
             // 游标会话级递增，跨回合不清（清了就没法续传断线期间的内容）。
             idleWatchFlashDisconnectsRef.current.delete(loadId);
@@ -4193,10 +4209,6 @@ export function Chat({
     () => new Map(turnNavItems.map((item) => [item.index, item])),
     [turnNavItems],
   );
-  const turnNavByOrdinal = useMemo(
-    () => new Map(turnNavItems.map((item) => [item.ordinal, item])),
-    [turnNavItems],
-  );
   const turnNavPinUntilRef = useRef(0);
   const turnNavScrollCleanupRef = useRef<(() => void) | null>(null);
 
@@ -4709,19 +4721,10 @@ export function Chat({
     const compact = compactTurnNavText(clean);
     if (!compact) return;
     setTurnOutline((prev) => {
-      if (
-        prev.some(
-          (item, position) =>
-            (item.ordinal ?? position) === ordinal ||
-            item.index === index ||
-            (position === prev.length - 1 && item.text.trim() === compact.trim()),
-        )
-      ) {
-        return prev;
-      }
-      return [...prev, { ordinal, index, text: compact }].sort(
-        (a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0),
-      );
+      // 只按绝对下标去重/排序：它是唯一跨窗口稳定的身份。ordinal 是“当前窗口内的
+      // 顺序号”，拿它去重会把不同提问误并掉（回放/分页后尤其明显）。
+      if (prev.some((item) => item.index === index)) return prev;
+      return [...prev, { ordinal, index, text: compact }].sort((a, b) => a.index - b.index);
     });
   }
 
@@ -5692,10 +5695,17 @@ export function Chat({
     }
     if (event.type === 'user') {
       const created = event.created_at && event.created_at > 0 ? event.created_at : Date.now();
+      // 后台会话的行也要盖绝对下标：右栏锚点以它为身份，缺省会退化成
+      // “当前视图的窗口偏移 + 渲染序”，与大纲下标错位后跳转会落到别的提问上。
+      let nextIndex = historyTotalBySessionRef.current.get(targetSid) ?? 0;
+      for (const message of msgs) {
+        if (message.sourceIndex != null) nextIndex = Math.max(nextIndex, message.sourceIndex + 1);
+      }
       messageCacheRef.current.set(targetSid, paintUserMessage(msgs, event.content, created, () => ({
         role: 'user',
         parts: [{ kind: 'text', text: visibleUserText(event.content) }],
         ts: created,
+        sourceIndex: nextIndex,
       }), { clientInputId: event.client_input_id }));
       return;
     }
@@ -6069,7 +6079,6 @@ export function Chat({
       }
 
       case 'text': {
-        programmaticStopMarkRef.current = null;
         appendToLastAssistant(
           event.content,
           { requireReplayDedup },
@@ -6087,7 +6096,6 @@ export function Chat({
       }
 
       case 'reasoning': {
-        programmaticStopMarkRef.current = null;
         // Thinking / chain-of-thought stream — collapsible block in the UI.
         setMessages((prev) => {
           const next = withAssistantIdentity(
@@ -6111,7 +6119,6 @@ export function Chat({
       }
 
       case 'tool_start': {
-        programmaticStopMarkRef.current = null;
         const argsStr = formatArgs(event.arguments);
         const subtasks =
           event.name === 'task' ? subtasksFromTaskArgs(argsStr) ?? undefined : undefined;
@@ -6424,23 +6431,24 @@ export function Chat({
           stopReason: event.stop_reason,
           message: event.message,
         });
-        if (terminal.discardQueued) {
-          // 异常终端 / 被取消：程序化停止（立即发送）场景静默放行，严禁弹黄色未完成警告，也不中断后续投递
-          if (isProgrammaticDone) {
-            programmaticStopMarkRef.current = null;
-          } else {
-            blockQueueDrainRef.current = true;
-            pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
-            transitionChatRecovery({ type: 'authoritative_terminal' });
-            localTurnSessionsRef.current.delete(event.session_id);
-            backgroundRunningSessionsRef.current.delete(event.session_id);
-            onLiveRunningChange?.(event.session_id, false);
-            turnStartedAtBySessionRef.current.delete(event.session_id);
-            setIsCompacting(false);
-            setBusyAndClock(false);
-            if (event.session_id) {
-              markSessionTerminalSettled(event.session_id);
-            }
+        if (isProgrammaticDone) {
+          // 「立即发送」停掉的旧回合终态：新回合已经接手。绝不能清 busy / 删 localTurn /
+          // 回吐队列 / 弹通知；标记必须保留到 TTL，让紧随其后的 legacy `stopped` 也被
+          // 同一条规则吞掉。旧实现会在这里先清标记，导致随后到达的 stopped 按“用户停止”
+          // 处理，把正在跑的新回合按钮清回发送箭头。
+        } else if (terminal.discardQueued) {
+          // 异常终端 / 被取消：弹黄色未完成提示，并停止自动 drain。
+          blockQueueDrainRef.current = true;
+          pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+          transitionChatRecovery({ type: 'authoritative_terminal' });
+          localTurnSessionsRef.current.delete(event.session_id);
+          backgroundRunningSessionsRef.current.delete(event.session_id);
+          onLiveRunningChange?.(event.session_id, false);
+          turnStartedAtBySessionRef.current.delete(event.session_id);
+          setIsCompacting(false);
+          setBusyAndClock(false);
+          if (event.session_id) {
+            markSessionTerminalSettled(event.session_id);
           }
         } else {
           // ── 正常交互完成 (Normal Turn Completion) ──
@@ -6790,6 +6798,23 @@ export function Chat({
           }
         }
 
+        // 非当前视图的会话同样要修剪大纲：否则下次热切回时会带着指向已删行 /
+        // 已截断之后的大纲条目，点击这些条目自然无法命中锚点（跳转落空）。
+        if (mutation.session_id !== activeIdRef.current) {
+          const cachedOutline = turnOutlineBySessionRef.current.get(mutation.session_id);
+          if (cachedOutline) {
+            const pruned =
+              mutation.action === 'delete' && mutation.source_index != null
+                ? cachedOutline.filter((t) => t.index !== mutation.source_index)
+                : mutation.action === 'truncate' && mutation.target_index != null
+                  ? cachedOutline.filter((t) => t.index < mutation.target_index!)
+                  : cachedOutline;
+            if (pruned !== cachedOutline) {
+              turnOutlineBySessionRef.current.set(mutation.session_id, pruned);
+            }
+          }
+        }
+
         // 同步持久化写入 IndexedDB (确保异地/后台实例及离线存储实时一致)
         if (updatedCached) {
           const ph =
@@ -7089,6 +7114,13 @@ export function Chat({
           activeIdRef.current = effectiveSid;
           loadedForRef.current = effectiveSid;
           messageCacheRef.current.set(effectiveSid, messagesRef.current);
+          // 新会话首发：屏幕上已经画好了乐观提问 + Working 占位，画布就是就绪态。
+          // 必须在这里落定 canvasReady 并冲刷预挂载队列 —— 否则后续推流帧会一直
+          // 压在 preMountStreamBuffer 里，直到终态磁盘对账才一次性倒出，表现就是
+          // “非流式：Working 转到底，结束时中间过程与正文啪地全部出现”。模型响应
+          // 越快、回放帧越集中，这个现象越明显（新会话窗口首条消息最常见）。
+          canvasReadySessionIdRef.current = effectiveSid;
+          flushPreMountStreamBuffer(effectiveSid);
         } else if (!messageCacheRef.current.has(effectiveSid)) {
           // 切走后缓存可能还是空的（落地页首发后立刻切走，切换块因 prevId 为空未落盘）。
           // 用本轮的乐观提问补一个起点，否则 applyEventToSessionCache 会把后续推流帧整体丢弃。
@@ -7098,6 +7130,8 @@ export function Chat({
               parts: [{ kind: 'text' as const, text }],
               images: images.length ? images : undefined,
               ts: now,
+              // 右栏锚点身份 = 绝对下标；新会话的首条提问下标为 0。
+              sourceIndex: historyTotalBySessionRef.current.get(effectiveSid) ?? 0,
             },
             { role: 'assistant' as const, parts: [] },
           ]);
@@ -9734,11 +9768,12 @@ export function Chat({
             const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
 
             if (msg.role === 'user') {
+              // 锚点身份 = 绝对转录下标（与右栏大纲同一口径）。窗口相对的
+              // turnNavOrdinal 在多页加载后会重复、也会与服务端大纲的序号漂移，
+              // 绝不能拿来拼 DOM id，否则跳转与高亮会指向另一条提问。
               const turnIndex = msg.sourceIndex ?? historyOffsetRef.current + origIdx;
-              const turnItem = msg.turnNavOrdinal != null
-                ? turnNavByOrdinal.get(msg.turnNavOrdinal)
-                : turnNavByIndex.get(turnIndex);
-              const anchorId = turnItem?.id ?? turnNavId(msg.turnNavOrdinal ?? origIdx);
+              const turnItem = turnNavByIndex.get(turnIndex);
+              const anchorId = turnItem?.id ?? turnNavId(turnIndex);
               const isEditing = editingSourceIndex === turnIndex;
               const hasActiveDraft = isEditing && bubbleEditDraft?.sourceIndex === turnIndex;
               return (

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   consumesProgrammaticStopMark,
+  isStaleProgrammaticStopFrame,
   runningTurnStopAliases,
   stopAliasAllowsNextTurn,
 } from './turnStop.ts';
@@ -57,4 +58,32 @@ test('stopAliasAllowsNextTurn treats an idle alias as free and a live turn as bu
     false,
   );
   assert.equal(stopAliasAllowsNextTurn({ released: false }), false);
+});
+
+test('isStaleProgrammaticStopFrame swallows only the displaced turn terminal pair', () => {
+  const mark = { sessionId: 's1', expiresAt: 10_000 };
+  const at = 9_000;
+
+  // 取消会先发 done(cancelled)，再发 legacy stopped；两条都属于被「立即发送」换掉的那一轮。
+  assert.equal(isStaleProgrammaticStopFrame(mark, { type: 'stopped' }, 's1', at), true);
+  assert.equal(
+    isStaleProgrammaticStopFrame(mark, { type: 'done', stop_reason: 'cancelled' }, 's1', at),
+    true,
+  );
+  assert.equal(
+    isStaleProgrammaticStopFrame(mark, { type: 'done', stop_reason: 'stopped' }, 's1', at),
+    true,
+  );
+
+  // 新回合的正常完成绝不能被吞（否则真实终态不弹通知/不回吐队列）。
+  assert.equal(
+    isStaleProgrammaticStopFrame(mark, { type: 'done', stop_reason: 'provider_error' }, 's1', at),
+    false,
+  );
+  assert.equal(isStaleProgrammaticStopFrame(mark, { type: 'done' }, 's1', at), false);
+
+  // 会话不匹配 / 标记过期 / 无标记：一律不算旧回合。
+  assert.equal(isStaleProgrammaticStopFrame(mark, { type: 'stopped' }, 's2', at), false);
+  assert.equal(isStaleProgrammaticStopFrame(mark, { type: 'stopped' }, 's1', 10_001), false);
+  assert.equal(isStaleProgrammaticStopFrame(null, { type: 'stopped' }, 's1', at), false);
 });

@@ -6,11 +6,14 @@ import {
 
 /** One user question in the session outline (DeepSeek-style right rail). */
 export interface TurnNavItem {
-  /** Stable DOM id on the user message wrapper. */
+  /** Stable DOM id on the user message wrapper. Derived from `index`. */
   id: string;
-  /** Stable ordinal among real user questions. */
+  /** Session-wide outline ordinal. Display metadata only — never an identity:
+   *  the canvas numbers the *loaded window*, which drifts from the server outline
+   *  as soon as history is paginated or internal rows exist. */
   ordinal: number;
-  /** Absolute index in the raw persisted transcript, used for history loading. */
+  /** Absolute index in the raw persisted transcript, used for history loading
+   *  and as the canonical anchor identity (unique across pages). */
   index: number;
   /** Truncated label shown in the outline. */
   label: string;
@@ -20,8 +23,16 @@ export interface TurnNavItem {
 
 const DEFAULT_MAX_LABEL = 28;
 
-export function turnNavId(ordinal: number): string {
-  return `turn-nav-${ordinal}`;
+/**
+ * Anchor DOM id for one user turn.
+ *
+ * The key MUST be the absolute transcript index (`sourceIndex`), not a
+ * window-relative ordinal: the outline covers the whole session while the canvas
+ * only holds the loaded window, so an ordinal-based id points at a different row
+ * (or collides across pages) the moment history is paginated.
+ */
+export function turnNavId(index: number): string {
+  return `turn-nav-${index}`;
 }
 
 export function compactTurnNavText(text: string): string {
@@ -52,8 +63,10 @@ export function buildTurnNavItemsFromOutline(
     // New daemons provide an ordinal that stays stable when failed turns add
     // diagnostic rows to the raw transcript. Older daemons fall back to the
     // visible outline order, which has the same semantics.
+    // `ordinal` stays metadata only. The anchor id must be the absolute index so
+    // the rail id equals the canvas row id (`sourceIndex`) on every page.
     const ordinal = turn.ordinal ?? items.length;
-    items.push({ id: turnNavId(ordinal), ordinal, index: turn.index, label, text });
+    items.push({ id: turnNavId(turn.index), ordinal, index: turn.index, label, text });
   }
   return items;
 }
@@ -76,7 +89,9 @@ export function buildTurnNavItems(
     // conversion; the visible index is only a fallback for live/legacy data.
     const index = msg.sourceIndex ?? windowOffset + i;
     const ordinal = typeof msg.turnNavOrdinal === 'number' ? msg.turnNavOrdinal : items.length;
-    items.push({ id: turnNavId(ordinal), ordinal, index, label, text });
+    // Same contract as the outline path: the id is the absolute index, `ordinal`
+    // is only carried along for display/back-compat.
+    items.push({ id: turnNavId(index), ordinal, index, label, text });
   }
   return items;
 }

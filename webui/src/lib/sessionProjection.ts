@@ -252,18 +252,58 @@ export function paintUserMessage<T extends ProjectionMessage>(
   opts?: { repeatAfterSettled?: boolean; clientInputId?: string },
 ): T[] {
   const clientInputId = opts?.clientInputId;
-  // 身份幂等最优先：同一条客户端关联键已经在画布/缓存的行上（随缓存持久化）。
-  // 这是库端唯一能区分「两条一模一样的提问」的信号 —— 文本比对做不到，所以
-  // 异地端/重放端也能靠它把重复回声彻底重掉。
-  if (clientInputId && messages.some((message) => message.clientInputId === clientInputId)) {
-    return messages;
+  if (clientInputId) {
+    // 1. 身份幂等：同一条关联键已经在画布/缓存的行上（随缓存持久化）。
+    if (messages.some((message) => message.clientInputId === clientInputId)) return messages;
+    // 2. 键没见过 ≠ 新消息：磁盘投影 / 旧缓存里的同一条提问没有这个键。必须再用
+    //    文本 + 时间戳判定是不是**同一次发送的重放** —— 否则回放会把用户气泡重新
+    //    追加到末尾，紧随其后的正文/工具帧再落到这个新气泡里，表现为“提问错位 + 回复重复”。
+    const sameSend = findSameSendUserIndex(messages, rawText, userTs);
+    if (sameSend >= 0) {
+      const row = messages[sameSend]!;
+      if (row.clientInputId) return messages; // 已被其它发送占用
+      const next = messages.slice();
+      next[sameSend] = { ...row, clientInputId } as T;
+      return next;
+    }
+    // 3. 确实是新的一次发送（可能是又发了一遍同样的内容）→ 追加，跳过模糊文本启发式。
+    const appended = paintUserMessageInner(messages, rawText, userTs, create, {
+      repeatAfterSettled: opts?.repeatAfterSettled,
+      identityKnown: true,
+    });
+    return stampUserClientInputId(appended, clientInputId);
   }
-  const next = paintUserMessageInner(messages, rawText, userTs, create, {
+  return paintUserMessageInner(messages, rawText, userTs, create, {
     repeatAfterSettled: opts?.repeatAfterSettled,
-    // 有权威身份时，inner 里的文本启发式必须整体让位（见 inner 注释）。
-    identityKnown: !!clientInputId,
+    identityKnown: false,
   });
-  return stampUserClientInputId(next, clientInputId);
+}
+
+/**
+ * 文本命中的旧提问是不是「同一次发送」的重放（而不是用户又发了一遍相同内容）。
+ *
+ * - 行上有时间戳且与本次相差 ≤ 3s → 同一次发送；
+ * - 行上没有时间戳（旧投影/legacy）→ 保守视为同一次发送，宁可幂等也不克隆；
+ * - 时间戳明显不同 → 真的是新的发送，返回 -1 让调用方追加。
+ */
+function findSameSendUserIndex(
+  messages: ProjectionMessage[],
+  rawText: string,
+  userTs: number,
+): number {
+  const want = visibleUserText(rawText);
+  if (!want) return -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== 'user') continue;
+    const text = visibleUserText(
+      message.parts?.filter((part) => part.kind === 'text').map((part) => part.text || '').join('') ?? '',
+    );
+    if (!userTextsMatch(text, want)) continue;
+    if (message.ts && userTs > 0 && Math.abs(message.ts - userTs) > 3000) return -1;
+    return i;
+  }
+  return -1;
 }
 
 /** 给画布上最新的一条 user 行盖上客户端关联键（幂等；行已被别的发送占用则不动）。 */
@@ -733,6 +773,27 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
         ...existing,
         parts: [...existing.parts, { kind: 'notice', text }],
       };
+      return next;
+    }
+    // 失败回合还没有 assistant 行：提示属于它自己的提问，必须留在该提问下面，
+    // 而不是挂到上一轮回答的底部或下一条 loop 下面。复用/插入一个“只装提示”的
+    // assistant 行（空 Working 占位也可复用）。
+    const user = messages.findIndex((m) => m.role === 'user' && m.id === targetId);
+    if (user >= 0) {
+      const nextRow = messages[user + 1];
+      const reusable =
+        !!nextRow && nextRow.role === 'assistant' && nextRow.parts.every((part) => part.kind === 'notice');
+      if (reusable) {
+        if (hasNotice(nextRow)) return messages;
+        const next = messages.slice();
+        next[user + 1] = { ...nextRow, parts: [...nextRow.parts, { kind: 'notice', text }] };
+        return next;
+      }
+      const next = messages.slice();
+      next.splice(user + 1, 0, {
+        role: 'assistant',
+        parts: [{ kind: 'notice', text }],
+      } as unknown as T);
       return next;
     }
   }

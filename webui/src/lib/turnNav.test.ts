@@ -33,7 +33,7 @@ test('buildTurnNavItems keeps user questions in order and skips empty/system', (
     items.map((i) => ({ id: i.id, ordinal: i.ordinal, index: i.index, label: i.label, text: i.text })),
     [
       { id: 'turn-nav-0', ordinal: 0, index: 0, label: '你好 今天天气', text: '你好 今天天气' },
-      { id: 'turn-nav-1', ordinal: 1, index: 4, label: '第二问', text: '第二问' },
+      { id: 'turn-nav-4', ordinal: 1, index: 4, label: '第二问', text: '第二问' },
     ],
   );
 });
@@ -45,7 +45,7 @@ test('buildTurnNavItems preserves raw transcript indexes after display filtering
   ], 80);
   assert.deepEqual(
     items.map((i) => ({ id: i.id, index: i.index })),
-    [{ id: 'turn-nav-0', index: 87 }],
+    [{ id: 'turn-nav-87', index: 87 }],
   );
 });
 
@@ -72,7 +72,7 @@ test('buildTurnNavItemsFromOutline uses absolute transcript indexes', () => {
     items.map((i) => ({ id: i.id, index: i.index, label: i.label })),
     [
       { id: 'turn-nav-0', index: 0, label: '第一问' },
-      { id: 'turn-nav-2', index: 80, label: '很后面的提问' },
+      { id: 'turn-nav-80', index: 80, label: '很后面的提问' },
     ],
   );
 });
@@ -118,11 +118,40 @@ test('outline ids do not shift when failed turns insert diagnostic rows', () => 
   assert.deepEqual(
     items.map((i) => ({ id: i.id, ordinal: i.ordinal, index: i.index })),
     [
-      { id: 'turn-nav-4', ordinal: 4, index: 10 },
-      { id: 'turn-nav-5', ordinal: 5, index: 12 },
-      { id: 'turn-nav-6', ordinal: 6, index: 15 },
+      { id: 'turn-nav-10', ordinal: 4, index: 10 },
+      { id: 'turn-nav-12', ordinal: 5, index: 12 },
+      { id: 'turn-nav-15', ordinal: 6, index: 15 },
     ],
   );
+});
+
+test('outline and message fallback agree on the anchor id for the same absolute index', () => {
+  // 右栏大纲与画布必须用同一套身份：绝对转录下标。否则分页加载后同一个
+  // “窗口内序号”会指向不同提问（或产生重复 DOM id），跳转/高亮就会错位。
+  const fromOutline = buildTurnNavItemsFromOutline([{ ordinal: 7, index: 42, text: '同一问' }]);
+  const fromMessages = buildTurnNavItems([
+    { role: 'user', text: '同一问', sourceIndex: 42, turnNavOrdinal: 0 },
+  ]);
+  assert.equal(fromOutline[0]?.id, 'turn-nav-42');
+  assert.equal(fromMessages[0]?.id, fromOutline[0]?.id);
+});
+
+test('paged windows never collide: same window ordinal, different absolute index', () => {
+  // 旧实现把“窗口内 ordinal”当 DOM id，第二页从 0 重新计数就会与首屏重复。
+  const tailPage = buildTurnNavItems([
+    { role: 'user', text: '首屏提问 A', sourceIndex: 60, turnNavOrdinal: 0 },
+    { role: 'user', text: '首屏提问 B', sourceIndex: 70, turnNavOrdinal: 1 },
+  ]);
+  const olderPage = buildTurnNavItems(
+    [
+      { role: 'user', text: '更早提问 X', turnNavOrdinal: 0 },
+      { role: 'user', text: '更早提问 Y', turnNavOrdinal: 1 },
+    ],
+    10,
+  );
+  const ids = [...olderPage, ...tailPage].map((item) => item.id);
+  assert.deepEqual(ids, ['turn-nav-10', 'turn-nav-11', 'turn-nav-60', 'turn-nav-70']);
+  assert.equal(new Set(ids).size, ids.length, 'anchor ids must stay unique across pages');
 });
 
 test('filterTurnNavItems matches full question text, not only the truncated label', () => {
