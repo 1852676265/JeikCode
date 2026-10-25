@@ -21,6 +21,40 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.7 (2026-10-25)
+
+- **[MCP & Capabilities] Project-accurate toggles across restarts**:
+  - Toggling a server now reloads the active project's registry and evicts other cached projects, so a disabled server no longer survives until a restart; evicted projects rebuild lazily from disk.
+  - Toggling a server another scope does not declare writes a disabled-only marker instead of copying the definition, so a deleted server is no longer resurrected by a project switch.
+  - `/capabilities`, `/capabilities/toggle` and `/mcp/status` are scoped by the active session's directory, and the project-scope skill toggle is hidden when the project state file is the global one.
+- **[Chat Canvas] No duplicated rows and no misplaced notices**:
+  - The authoritative disk-tail splice is idempotent and the merged canvas is sanitized and written back on both cold start and warm switches, so a pinned opening question no longer accumulates a copy per turn.
+  - Exactly one live subscription per session prevents replayed deltas from being painted twice.
+  - Warning and rate-limit notices are replay-idempotent and attach to the round they belong to instead of piling up at the bottom of the timeline.
+  - User bubbles carry a client correlation id end to end, so a send is claimed by identity: identical prompts are no longer swallowed, and preprocessed or rewritten text still maps to its optimistic bubble.
+- **[Session History] Rewind and delete reset the agent checklist**:
+  - Deleting a turn or message, or rewinding, now physically clears the session-scoped todo board (memory and on-disk) and resets the WebUI sticky checklist, so a removed plan can no longer leak into the next turn.
+  - `session_assigned` and send acknowledgements only claim the view while the event still belongs to the session on screen; a late acknowledgement is handled as a background turn.
+- **[Kernel] Blank assistant output is surfaced**:
+  - A whitespace-only assistant stream is retried visibly and then reported as a clear error instead of persisting a blank turn that looks like a silent stop.
+
+---
+
+- **[MCP 与能力开关] 跨重启的项目级开关精准生效**:
+  - 开关某个 MCP 服务时会重载当前项目的注册表并驱逐其他项目的缓存，被禁用的服务不再拖到重启才失效；被驱逐的项目按需从磁盘重建。
+  - 开关其他作用域未声明的服务时只写入禁用标记，不再复制服务定义，避免已删除的服务被项目切换重新复活。
+  - `/capabilities`、`/capabilities/toggle` 与 `/mcp/status` 按当前会话目录限定作用域；当项目状态文件就是全局文件时，隐藏项目级技能开关。
+- **[聊天画布] 不再重复绘制，也不再让提示错位**:
+  - 磁盘权威尾部拼接改为幂等，并在冷启动与热切回两条路径都做清洗与回写，长会话的回合开头提问不再每轮多出一份。
+  - 同一会话严格保持一条实时订阅，重放增量不会被画第二遍。
+  - 黄色提示（告警、限流）加入重放幂等，并挂回所属回合，不再堆在时间线底部。
+  - 用户气泡端到端携带客户端关联 id，发送按身份认领：连发两条相同提问不再被吞，图片预处理或注入改写正文时也仍能准确对上乐观气泡。
+- **[会话历史] 回溯与删除会同步复位 agent 清单**:
+  - 删除整轮或单条消息、以及回溯时，后端物理清空会话级清单（内存与磁盘），前端同步复位顶部清单，被删掉的计划不会再泄漏到下一个回合。
+  - `session_assigned` 与发送回执只在事件仍属于当前视图会话时才认领视图；迟到的回执按后台回合处理，不再把视图拽回。
+- **[内核] 空白回复不再被静默吞掉**:
+  - 仅含空白的助手流会先显式重试，再以清晰错误报告，而不是落盘一个看起来像静默停止的空回合。
+
 ## v7.3.0-beta.6 (2026-10-25)
 
 - **[Capabilities & Runtime Robustness] Safe thread fallback for artifact watchdog initial scan**:
