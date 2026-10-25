@@ -13,6 +13,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// Canonical GLOBAL-tier instruction file names under the config root (`~/.jeikcode/`),
+/// highest precedence first.
+///
+/// SINGLE SOURCE OF TRUTH: shared by this `/status` display loader and the ACTIVE prompt
+/// loader in `jeikcode-capabilities/src/session/instructions.rs`, so their precedence
+/// tables can never drift apart.
+pub const GLOBAL_INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "JEIKCODE.md"];
+
+/// Canonical PROJECT-tier instruction file names under the workspace root, highest
+/// precedence first: `AGENTS.md` (the open standard) wins, then the native JeikCode names,
+/// then the Claude Code compatibility names.
+///
+/// SINGLE SOURCE OF TRUTH: shared with the ACTIVE prompt loader (see above).
+pub const PROJECT_INSTRUCTION_FILES: [&str; 5] = [
+    "AGENTS.md",
+    ".jeikcode.md",
+    "JEIKCODE.md",
+    "CLAUDE.md",
+    "claude.md",
+];
+
 #[derive(Debug)]
 pub struct InstructionFile {
     pub path: PathBuf,
@@ -54,20 +75,14 @@ impl LayeredInstructions {
     ///   `JEIKCODE.md`, `CLAUDE.md`, or `claude.md` (first match wins)
     pub fn load(project_root: &Path) -> Self {
         let config_dir = crate::config::Config::config_dir();
-        let global = Self::try_load(&config_dir.join("AGENTS.md"), InstructionLevel::Global)
-            .or_else(|| Self::try_load(&config_dir.join("JEIKCODE.md"), InstructionLevel::Global));
+        let global = GLOBAL_INSTRUCTION_FILES
+            .iter()
+            .find_map(|name| Self::try_load(&config_dir.join(name), InstructionLevel::Global));
 
-        // Lookup order matches the ACTIVE prompt loader: AGENTS.md (open standard) first,
-        // then native JeikCode names, then Claude Code names.
-        let project = [
-            "AGENTS.md",
-            ".jeikcode.md",
-            "JEIKCODE.md",
-            "CLAUDE.md",
-            "claude.md",
-        ]
-        .iter()
-        .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
+        // Lookup order matches the ACTIVE prompt loader (shared `PROJECT_INSTRUCTION_FILES`).
+        let project = PROJECT_INSTRUCTION_FILES
+            .iter()
+            .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
 
         Self { global, project }
     }
@@ -115,12 +130,12 @@ impl LayeredInstructions {
             InstructionStatusLine::new(
                 InstructionLevel::Global,
                 self.global.as_ref(),
-                crate::config::Config::config_dir().join("JEIKCODE.md"),
+                crate::config::Config::config_dir().join(GLOBAL_INSTRUCTION_FILES[0]),
             ),
             InstructionStatusLine::new(
                 InstructionLevel::Project,
                 self.project.as_ref(),
-                project_root.join(".jeikcode.md"),
+                project_root.join(PROJECT_INSTRUCTION_FILES[0]),
             ),
         ]
     }
@@ -324,7 +339,8 @@ mod tests {
         assert!(lines[0].path.ends_with("g.md"));
         assert_eq!(lines[1].level, InstructionLevel::Project);
         assert!(!lines[1].found);
-        assert_eq!(lines[1].path, tmp.path().join(".jeikcode.md"));
+        // Preferred path to create matches the loader's FIRST-precedence name (AGENTS.md).
+        assert_eq!(lines[1].path, tmp.path().join("AGENTS.md"));
     }
 
     #[test]
