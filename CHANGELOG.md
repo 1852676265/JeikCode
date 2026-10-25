@@ -21,6 +21,48 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.9 (2026-10-26)
+
+- **[Git Auto-Sync & Polling] Event-driven git refresh and background token renewal**:
+  - Heuristic classifier detects git-mutating commands executed via `run_command` or `bash` and automatically broadcasts `GitUpdated` to all sessions and windows in the project; remote- and ref-changing commands trigger a safe, throttled `git fetch` (fetch only, working tree untouched) with single-flight deduplication.
+  - New `auto_git_sync` setting (enabled by default) with an instant toggle in the sidebar settings menu.
+  - GitHub App installation token automatic refresh integrated into the polling engine and webhook routes, eliminating 401 token expiry stalls in long-running background polling.
+- **[Models & System Settings] Integrated model management, live latency probe, and aesthetic refinement**:
+  - System Settings dialog now integrates "Models & Config" as its primary first tab, embedding a responsive `ModelConfigView` with clean multi-layered backdrop dismiss guards.
+  - Live model latency probe: test individual models directly from the editor via lightweight protocol-specific `Hi` requests returning instant `OK · <ms>` or failure details.
+  - "Test All" concurrent batch probe button in the ModelSelector cascade header tests all models under the active provider in parallel (bounded concurrency of 5).
+  - High-contrast probe status badges: deep emerald `#047857` on light backgrounds and `#34d399` on dark; untracked/untested models display no tags and no brain emojis.
+  - Removed unconditional pink brain emojis across all model selector lists.
+  - Compact model editor: narrowed model ID input, unified single-row context window and output token controls, and modern segmented toggle switches.
+- **[WebUI & Theming] Terminal theme synchronization, token popover polish, and light mode contrast**:
+  - Terminal now follows system light/dark preference with an active high-contrast light terminal palette.
+  - Token details popover: moved Compact button to the bottom, tightened spacing to hug the context progress box, and added a markdown icon to the Context title.
+  - Light mode typography contrast: deepened secondary text and timestamp tokens for crisp readability.
+  - Resolved pinned prompt inversion during authoritative disk tail splice on long transcripts.
+- **[Internationalization] Comprehensive multilingual support and localized tooltips**:
+  - Added full translation coverage for probe, batch probe, auto-sync, and system settings across Chinese, English, Vietnamese, Traditional Chinese, and all supported locale catalogs with 100% localized hover tooltips.
+
+---
+
+- **[Git 自动同步与轮询] 关键节点启发式刷新 + 后台安装令牌自动换发**:
+  - 启发式识别经由 `run_command` 或 `bash` 执行的 Git 变更命令，执行完毕后向本项目所有会话与窗口广播 `GitUpdated`；远端与引用类命令触发安全的单飞节流 `git fetch`（只拉取远端引用，绝不动工作区）。
+  - 新增 `auto_git_sync` 配置项（默认开启），并在侧栏设置菜单提供即时拨动开关。
+  - 纯后台轮询引擎与 Webhook 路径集成 GitHub App 安装令牌自动刷新，消除长跑守护进程因令牌过期遭遇 401 的停摆问题。
+- **[模型与系统设置] 系统设置集成模型配置、实时延迟探活与紧凑美学升级**:
+  - 系统设置弹窗首栏新增「模型与配置」标签页，内嵌响应式 `ModelConfigView`，多层弹窗防误触与层级穿透全面守护。
+  - 实时延迟探活：编辑模型时可通过单独的「探活」按钮按协议发送极小 `Hi` 测试连通性，即时返回 `OK · <ms>` 响应延迟或失败信息。
+  - 模型选择器顶栏提供商右侧新增「⚡ 一键测试」按钮，以 5 并发异步多线程批量测试当前提供商下所有模型。
+  - 高对比双模延迟标签：亮色模式适配深祖母绿 `#047857` 保证清晰可读，暗色模式适配微光青绿；未测模型干净利落，不带延迟标签也不带大脑图标。
+  - 彻底移除模型选择器列表项中无条件显示的粉色大脑图标。
+  - 模型编辑弹窗紧凑化打磨：收窄模型 ID 输入框，输入输出限制收敛为单行等宽组合控件，大药丸升级为现代微型分段开关。
+- **[WebUI 与主题] 终端亮色自适应、Token 弹窗打磨与浅色高对比度**:
+  - 终端支持跟随全局亮/暗模式自动切换，新增高对比度浅色终端主题。
+  - Token 弹窗布局优化：Compact 按钮下移到底部，明细网格紧贴进度条，消除中间空挡，Context 标题旁增加 Markdown 图标。
+  - 浅色模式对比度提升：加深次级文字令牌与时间戳，彻底消除浅色底发灰偏淡问题。
+  - 修复长会话权威切片对账时 pinned 置顶提问倒插的问题。
+- **[多语言] 全链路国际化与悬浮提示全覆盖**:
+  - 探活、批量测试、自动同步与系统设置等新增特性已在简中、英文、越南语、繁中及 7 国语言回退字典中实现 100% 覆盖，所有按钮与状态徽标均提供多语言悬浮提示。
+
 ## v7.3.0-beta.8 (2026-10-26)
 
 - **[Compaction & Context] Adaptive output budget and lossless, artifact-backed compaction**:
