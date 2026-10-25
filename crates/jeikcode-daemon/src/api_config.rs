@@ -1617,7 +1617,7 @@ pub(crate) async fn reload_config(State(state): State<AppState>) -> impl IntoRes
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     };
-    let _ = crate::reload_mcp_and_live_runtime(&state).await;
+    let _ = crate::reload_mcp_and_live_runtime(&state, true, None).await;
     crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
     Json(config_response(&config)).into_response()
 }

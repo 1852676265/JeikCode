@@ -11704,30 +11704,61 @@ fn merge_configured_mcp_statuses(
     by_name.into_iter().collect()
 }
 
-async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
-    Json(build_mcp_status(&state).await)
+async fn mcp_status(
+    State(state): State<AppState>,
+    Query(query): Query<CapQuery>,
+) -> Json<McpStatusResponse> {
+    let working_dir = resolve_capability_project(&state, query.working_dir.as_deref()).await;
+    Json(build_mcp_status_for(&state, working_dir).await)
 }
 
-/// Build the full MCP status response. Shared by `GET /mcp/status` and the MCP half
-/// of `GET /capabilities`.
+/// Query for the capability surfaces. `working_dir` lets the WebUI ask about the
+/// project of the session it is VIEWING rather than the daemon's last `cd`
+/// target — after a restart those differ (the daemon starts in its process cwd),
+/// and the panel would otherwise list/edit another project's MCP + skills.
+#[derive(serde::Deserialize, Default)]
+struct CapQuery {
+    working_dir: Option<String>,
+}
+
+/// Resolve the project a capability request is about. An explicitly requested,
+/// existing directory wins; otherwise fall back to the daemon's current project.
+async fn resolve_capability_project(
+    state: &AppState,
+    requested: Option<&str>,
+) -> std::path::PathBuf {
+    if let Some(dir) = requested.map(str::trim).filter(|dir| !dir.is_empty()) {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    state.project.read().await.working_dir.clone()
+}
+
+/// Build the MCP status response for the daemon's current project.
 async fn build_mcp_status(state: &AppState) -> McpStatusResponse {
+    let working_dir = state.project.read().await.working_dir.clone();
+    build_mcp_status_for(state, working_dir).await
+}
+
+/// Build the full MCP status response for ONE project. Shared by `GET /mcp/status`
+/// and the MCP half of `GET /capabilities`.
+async fn build_mcp_status_for(
+    state: &AppState,
+    working_dir: std::path::PathBuf,
+) -> McpStatusResponse {
     // Agent `jeikcode_config_reload` dirties the daemon MCP cache; rebuild it
     // here so the WebUI sidebar reflects newly written mcp.json. Live-runtime
     // remount happens at TurnFinished (reload_capabilities is Busy mid-turn).
     if jeikcode_capabilities::config_reload::take_pending_mcp_cache_reload() {
-        let working_dir = state.project.read().await.working_dir.clone();
         let registry = state.mcp_pool.reload_full(&working_dir).await;
         *state.mcp_registry.write().await = registry;
     }
-    // Prefer the per-project `/chat` registry when it exists; otherwise report
-    // the daemon registry. Live runtime capability changes use the awaitable
-    // CodingRuntime boundary and are reported on the live event stream.
-    let working_dir = state.project.read().await.working_dir.clone();
-    let registry = if let Some(reg) = state.mcp_pool.cached_registry(&working_dir).await {
-        reg
-    } else {
-        state.mcp_registry.read().await.clone()
-    };
+    // The per-project pool is the source of truth. `registry()` initializes a
+    // project that has no cached slot yet (the caller is viewing it, so its
+    // servers are about to be needed anyway).
+    let registry = state.mcp_pool.registry(&working_dir).await;
 
     let session_schema = jeikcode_capabilities::mcp::ensure_session_mcp_schema(&working_dir).await;
     let session_registry = if let Some(session_id) = crate::native_live::live_view_session_id() {
@@ -11886,13 +11917,35 @@ pub(crate) async fn replace_project_mcp_registry(
 }
 
 /// Rebuild the per-project MCP registry from disk and remount live capabilities.
-/// Shared by `POST /mcp/reload` and `POST /config/reload`.
-pub(crate) async fn reload_mcp_and_live_runtime(state: &AppState) -> bool {
-    let project = state.project.read().await;
-    let project_dir = project.working_dir.clone();
-    drop(project);
-    let registry = state.mcp_pool.reload_full(&project_dir).await;
-    *state.mcp_registry.write().await = registry;
+/// Shared by `POST /mcp/reload`, `POST /config/reload` and capability toggles.
+///
+/// `all_projects` rebuilds the target project and EVICTS every other cached
+/// project registry. An MCP toggle or an explicit MCP reload is process-wide in
+/// intent: each `ProjectMcpPool` slot holds its own registry, so leaving the other
+/// slots in place keeps a disabled server's tools on the wire for sessions in
+/// those projects until the process restarts. Evicted slots rebuild from the new
+/// on-disk config on their next lookup (no eager re-spawn storm). Skill toggles
+/// pass `false` — they must not touch other projects' MCP registries at all.
+pub(crate) async fn reload_mcp_and_live_runtime(
+    state: &AppState,
+    all_projects: bool,
+    target: Option<std::path::PathBuf>,
+) -> bool {
+    let daemon_dir = state.project.read().await.working_dir.clone();
+    let project_dir = target
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| daemon_dir.clone());
+    let registry = if all_projects {
+        state.mcp_pool.reload_all(&project_dir).await
+    } else {
+        state.mcp_pool.reload_full(&project_dir).await
+    };
+    // `state.mcp_registry` is the legacy fallback for the daemon's OWN project;
+    // never point it at a project the caller merely happens to be viewing (and do
+    // not rebuild the daemon project just to refresh a fallback nobody reads).
+    if project_dir == daemon_dir {
+        *state.mcp_registry.write().await = registry;
+    }
     match crate::native_live::binding() {
         Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
         Err(_) => true,
@@ -11900,7 +11953,7 @@ pub(crate) async fn reload_mcp_and_live_runtime(state: &AppState) -> bool {
 }
 
 async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    let runtime_reloaded = reload_mcp_and_live_runtime(&state, true, None).await;
     Json(serde_json::json!({
         "ok": runtime_reloaded,
         "status": "reloading",
@@ -11929,6 +11982,27 @@ struct CapItemResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dir: Option<String>,
+    /// Skills only: TRUE when the project's skill-state file IS the global one
+    /// (the active project is the user's home directory, so
+    /// `<project>/.jeikcode/skills.json` == `$JEIKCODE_HOME/skills.json`).
+    /// The WebUI hides the project toggle then — both scopes would edit one file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    project_scope_shared: bool,
+}
+
+/// TRUE when `<working_dir>/.jeikcode/skills.json` resolves to the GLOBAL skills
+/// file. Happens when the active project is the user's home directory.
+fn skills_project_scope_shared(working_dir: &std::path::Path) -> bool {
+    use jeikcode_capabilities::skills::controls as controls;
+    let project = controls::project_state_path(working_dir);
+    let global = controls::global_state_path();
+    if project == global {
+        return true;
+    }
+    match (std::fs::canonicalize(&project), std::fs::canonicalize(&global)) {
+        (Ok(project), Ok(global)) => project == global,
+        _ => false,
+    }
 }
 
 /// Bare skill name without its namespace prefix (`skills:foo` → `foo`).
@@ -11939,11 +12013,14 @@ fn bare_skill_name(name: &str) -> &str {
 /// GET /capabilities — unified MCP + skills inventory with per-scope disable state.
 /// The WebUI renders ONE toggle component for both families, so switching projects
 /// surfaces each project's own disable differences.
-async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let working_dir = { state.project.read().await.working_dir.clone() };
+async fn capabilities(
+    State(state): State<AppState>,
+    Query(query): Query<CapQuery>,
+) -> Json<serde_json::Value> {
+    let working_dir = resolve_capability_project(&state, query.working_dir.as_deref()).await;
 
     // MCP: disable state from mcp.json (global + project), enriched with live status.
-    let mcp_status = build_mcp_status(&state).await;
+    let mcp_status = build_mcp_status_for(&state, working_dir.clone()).await;
     let mut items: Vec<CapItemResponse> = Vec::new();
     for item in jeikcode_capabilities::control::mcp_items(&working_dir) {
         let row = mcp_status
@@ -11962,6 +12039,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
             tool_count: row.and_then(|r| r.tool_count),
             error: row.and_then(|r| r.error.clone()),
             dir: None,
+            project_scope_shared: false,
         });
     }
 
@@ -11970,6 +12048,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
     jeikcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     let global = jeikcode_capabilities::skills::controls::load_global();
     let project = jeikcode_capabilities::skills::controls::load_project(&working_dir);
+    let project_scope_shared = skills_project_scope_shared(&working_dir);
     for skill in registry.user_invocable() {
         let global_disabled =
             jeikcode_capabilities::skills::controls::is_skill_disabled(&global, &skill.name);
@@ -11987,6 +12066,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
             tool_count: None,
             error: None,
             dir: Some(skill.skill_dir.to_string_lossy().to_string()),
+            project_scope_shared,
         });
     }
 
@@ -11999,6 +12079,10 @@ struct CapToggleRequest {
     id: String,
     scope: jeikcode_capabilities::control::CapScope,
     disabled: bool,
+    /// Project whose config the caller is viewing (the active session's dir).
+    /// Omitted ⇒ the daemon's current project.
+    #[serde(default)]
+    working_dir: Option<String>,
 }
 
 /// POST /capabilities/toggle — persist a capability's disabled flag at the chosen
@@ -12008,7 +12092,8 @@ async fn capabilities_toggle(
     State(state): State<AppState>,
     Json(req): Json<CapToggleRequest>,
 ) -> axum::response::Response {
-    let working_dir = { state.project.read().await.working_dir.clone() };
+    let working_dir =
+        resolve_capability_project(&state, req.working_dir.as_deref()).await;
     if let Err(error) = jeikcode_capabilities::control::set_disabled(
         &working_dir,
         req.kind,
@@ -12022,7 +12107,12 @@ async fn capabilities_toggle(
         )
             .into_response();
     }
-    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    let runtime_reloaded = reload_mcp_and_live_runtime(
+        &state,
+        matches!(req.kind, jeikcode_capabilities::control::CapKind::Mcp),
+        Some(working_dir),
+    )
+    .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "runtime_reloaded": runtime_reloaded })),

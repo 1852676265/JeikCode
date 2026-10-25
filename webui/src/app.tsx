@@ -525,21 +525,24 @@ export function App() {
   }, [headerMenuOpen]);
 
   // Chat 完成首条消息后会回传它创建的 session id；刷新侧栏列表。
-  function handleSessionAssigned(id: string) {
+  // `claimView=false`：只对齐侧栏/列表，绝不切换当前视图（用户在发送飞行期间已切走）。
+  function handleSessionAssigned(id: string, opts?: { claimView?: boolean }) {
     // 把乐观条目的临时 id 对齐到后端真实 id（落地页发送时乐观条目用的是临时 id），
     // 这样接下来的列表刷新能按 id 去重，用真实条目（含自动命名）覆盖乐观条目。
     setOptimisticSessions((prev) => {
-      const next = { ...prev };
+      const next: Record<string, SessionMetaWithProject> = { ...prev };
       for (const key of Object.keys(next)) {
         if (key.startsWith('optimistic-') || key === id) {
           const item = next[key];
           delete next[key];
-          next[id] = { ...item, id };
+          if (item) next[id] = { ...item, id };
         }
       }
       return next;
     });
-    if (id !== sessionId) {
+    // 只有仍在看这条 turn 归属的会话（或落地页）才把视图切过去；已切走时保持用户选择，
+    // 新会话由侧栏列表与 /events 的 session_upsert 自行出现。
+    if (id !== sessionId && opts?.claimView !== false) {
       setSessionId(id);
     }
     // 关键触发：一旦服务端确认会话分配，立即刷新侧栏，确保切换会话后该会话稳固展示

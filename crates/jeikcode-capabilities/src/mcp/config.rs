@@ -911,9 +911,21 @@ pub fn set_mcp_server_disabled(
 
     let mut servers = collect_merged_mcp_server_maps(root_obj);
     if !servers.contains_key(server) {
-        let copied = read_raw_server_entry(&other, server)?
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{server}' is not configured"))?;
-        servers.insert(server.to_string(), copied);
+        if read_raw_server_entry(&other, server)?.is_none() {
+            return Err(anyhow::anyhow!("MCP server '{server}' is not configured"));
+        }
+        if !disabled {
+            // Nothing to clear at this scope: the server is already enabled there
+            // (the definition lives at the other scope, and the disable state is a
+            // UNION, so a scope without an entry can never re-enable it anyway).
+            return Ok(());
+        }
+        // Write a MARKER-ONLY entry rather than copying the definition across
+        // scopes. Copying resurrected servers the user had deliberately deleted
+        // from THIS file: the next toggle re-created the entry, so a "deleted"
+        // server reappeared after restart. A marker is all the union rule needs —
+        // `load_config_file` skips it and the raw scan still sees the disable.
+        servers.insert(server.to_string(), json!({ "disabled": true }));
     }
 
     let mut drop_entry = false;
@@ -1477,15 +1489,17 @@ mod capability_tests {
         let user_text = std::fs::read_to_string(config.path().join("mcp.json")).unwrap();
         assert!(user_text.contains("\"disabled\": true"));
 
-        // Disable at PROJECT scope: the definition is copied into the project file.
+        // Disable at PROJECT scope: only a MARKER is written. The definition must
+        // NOT be copied across scopes — copying made a server deleted from this
+        // file reappear on the next toggle.
         set_mcp_server_disabled(project.path(), "alpha", false, true).unwrap();
         let states = list_mcp_server_states(project.path());
         assert!(states[0].project_disabled && states[0].effective_disabled);
         let proj_text = std::fs::read_to_string(project.path().join(".mcp.json")).unwrap();
         assert!(proj_text.contains("\"disabled\": true"));
         assert!(
-            proj_text.contains("server.js"),
-            "definition copied for later re-enable"
+            !proj_text.contains("server.js"),
+            "definition must not be copied into the other scope; got {proj_text}"
         );
 
         // The runtime list drops every disabled server (both scopes are disabled here).
@@ -1503,6 +1517,48 @@ mod capability_tests {
         let states = list_mcp_server_states(project.path());
         assert!(!states[0].effective_disabled);
         assert_eq!(load_mcp_config(project.path()).unwrap().len(), 1);
+    }
+
+    /// Enabling at a scope that does not declare the server must be a NO-OP: it
+    /// must neither copy the definition in nor create a marker entry. (The union
+    /// rule means a scope without an entry is already "enabled".)
+    #[test]
+    #[serial_test::serial]
+    fn enabling_at_an_undeclared_scope_writes_nothing() {
+        let config = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config.path());
+        merge_stdio_mcp_server_into_json_file(
+            &config.path().join("mcp.json"),
+            "alpha",
+            "node",
+            &["server.js".to_string()],
+        )
+        .unwrap();
+
+        set_mcp_server_disabled(project.path(), "alpha", false, false)
+            .expect("enabling an already-enabled scope must succeed");
+
+        assert!(
+            !project.path().join(".mcp.json").exists(),
+            "no project file may be created when there was nothing to change"
+        );
+        let states = list_mcp_server_states(project.path());
+        assert_eq!(states.len(), 1);
+        assert!(!states[0].effective_disabled);
+    }
+
+    /// Toggling a server that exists in NEITHER scope stays an error.
+    #[test]
+    #[serial_test::serial]
+    fn toggling_an_unknown_server_errors() {
+        let config = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config.path());
+
+        let error = set_mcp_server_disabled(project.path(), "ghost", false, true)
+            .expect_err("an unknown server must not be toggled");
+        assert!(error.to_string().contains("not configured"), "{error}");
     }
 
     /// A pure marker entry (`{ "disabled": true }`) written into a scope must not

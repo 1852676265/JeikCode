@@ -317,7 +317,11 @@ function CapScopeToggles({
   return (
     <div class="cap-toggles">
       {toggleBtn('global', t('cap.global'), item.global_disabled, t('cap.toggleGlobal'))}
-      {toggleBtn('project', t('cap.project'), item.project_disabled, t('cap.toggleProject'))}
+      {/* When the active project IS the user's home dir, the project state file
+          and the global one are the SAME file — two toggles would fight over
+          one state (clicking one appeared to flip the other). Show only global. */}
+      {!item.project_scope_shared &&
+        toggleBtn('project', t('cap.project'), item.project_disabled, t('cap.toggleProject'))}
     </div>
   );
 }
@@ -1234,11 +1238,11 @@ export function Sidebar({
   function refreshCapabilities() {
     capProjectKeyRef.current = capabilityProjectKey();
     setCapsLoading(true);
-    getCapabilities()
+    getCapabilities(cwd || undefined)
       .then(setCapabilities)
       .catch(() => setCapabilities((cur) => cur ?? []))
       .finally(() => setCapsLoading(false));
-    getMcpStatus()
+    getMcpStatus(cwd || undefined)
       .then(maybeAutoTrustProjectMcp)
       .catch(() => {});
   }
@@ -1313,13 +1317,19 @@ export function Sidebar({
       // 轮询兜底。关闭路径、技能开关与信任门无关，连状态都不查。
       if (item.kind === 'mcp' && wasDisabled) {
         try {
-          const info = await getMcpStatus();
+          const info = await getMcpStatus(cwd || undefined);
           if (mcpEnableNeedsTrust(info, item.kind, true)) await postLiveMcpTrust();
         } catch {
           /* 静默失败：开关照落，随后的状态刷新仍会走一次自动信任兜底 */
         }
       }
-      const res = await toggleCapability(item.kind, item.id, scope, !wasDisabled);
+      const res = await toggleCapability(
+        item.kind,
+        item.id,
+        scope,
+        !wasDisabled,
+        cwd || undefined,
+      );
       if (!res.ok) setCapsError(res.error || 'toggle failed');
       // Give the runtime a beat to rebuild, then reconcile with the backend.
       await new Promise((resolve) => window.setTimeout(resolve, 300));
@@ -1369,7 +1379,10 @@ export function Sidebar({
       setSkillsMenuOpen(false);
       return;
     }
-    ensureCapabilities();
+    // Reopening forces a fresh fetch (same as the MCP menu), so skills added or
+    // removed on disk — or disabled in another project — are reflected instead of
+    // showing a stale list/count from mount time.
+    refreshCapabilities();
     const zoom = getPageZoom() || 1.0;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setSkillsMenuPos({ top: (rect.bottom + 4) / zoom, left: rect.left / zoom, width: rect.width / zoom });
@@ -1393,15 +1406,15 @@ export function Sidebar({
       mcpAutoTrustSigRef.current = null;
       await postMcpReload();
       mcpPollAttemptsRef.current = 0;
-      let list = await getCapabilities();
+      let list = await getCapabilities(cwd || undefined);
       setCapabilities(list);
       for (let attempt = 0; attempt < 6; attempt++) {
         if (!list.some((c) => c.kind === 'mcp' && c.status === 'connecting')) break;
         await new Promise((resolve) => window.setTimeout(resolve, 400));
-        list = await getCapabilities();
+        list = await getCapabilities(cwd || undefined);
         setCapabilities(list);
       }
-      getMcpStatus().then(maybeAutoTrustProjectMcp).catch(() => {});
+      getMcpStatus(cwd || undefined).then(maybeAutoTrustProjectMcp).catch(() => {});
       setMcpReloaded(true);
       if (mcpReloadedTimerRef.current != null) window.clearTimeout(mcpReloadedTimerRef.current);
       mcpReloadedTimerRef.current = window.setTimeout(() => setMcpReloaded(false), 2500);

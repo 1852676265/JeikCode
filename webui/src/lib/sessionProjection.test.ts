@@ -1032,3 +1032,48 @@ test('paintUserMessage 在前一个提问完全相同且助手未结回答时拒
   assert.equal(painted.length, 2);
 });
 
+test('spliceAuthoritativeDiskTail 不会把 pinned 提问重复保留，且重复对账保持幂等', () => {
+  // tail:48 切在回合中间：offset=52，服务端把本回合开头的提问（绝对索引 50）pinned 到切片首位。
+  // 它的 sourceIndex < offset，旧实现会同时落进 olderHead 与 diskTail，每轮终态 +1 份。
+  const pinned = () => ({
+    role: 'user',
+    id: 'u-50',
+    sourceIndex: 50,
+    parts: [{ kind: 'text' as const, text: '为什么出错了？' }],
+  });
+  const tailRows = () => [
+    { role: 'assistant', id: 'a-53', sourceIndex: 53, parts: [] },
+    { role: 'assistant', id: 'a-60', sourceIndex: 60, parts: [] },
+  ];
+  const canvas = [pinned(), ...tailRows()];
+  const diskTail = [pinned(), ...tailRows()];
+
+  const once = spliceAuthoritativeDiskTail(canvas, diskTail, 52);
+  assert.equal(once.filter((m) => m.id === 'u-50').length, 1);
+  assert.deepEqual(once.map((m) => m.sourceIndex), [50, 53, 60]);
+
+  // 每个回合终态都会再对账一次：必须保持 1 份，不能 2 -> 3 -> 4 累积。
+  const twice = spliceAuthoritativeDiskTail(once, diskTail, 52);
+  const thrice = spliceAuthoritativeDiskTail(twice, diskTail, 52);
+  assert.equal(twice.filter((m) => m.id === 'u-50').length, 1);
+  assert.equal(thrice.filter((m) => m.id === 'u-50').length, 1);
+  assert.deepEqual(thrice.map((m) => m.sourceIndex), [50, 53, 60]);
+});
+
+test('spliceAuthoritativeDiskTail 按 sourceIndex 排除重叠行（无 id 的历史也能去重）', () => {
+  const canvas = [
+    { role: 'assistant', sourceIndex: 40, parts: [] },
+    { role: 'user', sourceIndex: 50, parts: [] },
+    { role: 'assistant', sourceIndex: 55, parts: [] },
+  ];
+  const diskTail = [
+    { role: 'user', sourceIndex: 50, parts: [] },
+    { role: 'assistant', sourceIndex: 55, parts: [] },
+    { role: 'assistant', sourceIndex: 60, parts: [] },
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 52);
+  // 40 是更早历史保留；50 已在权威切片里，不能再从画布头部留一份。
+  assert.deepEqual(spliced.map((m) => m.sourceIndex), [40, 50, 55, 60]);
+});
+

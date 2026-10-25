@@ -731,6 +731,19 @@ test('userTextsMatch tolerates trailing whitespace and newline variations', () =
   assert.equal(userTextsMatch('完全不同的提问', '请你扫描我的setup命令 setup命令是啥？'), false);
 });
 
+test('userTextsMatch 不把前缀相同、尾部不同的长提问误判为同一条', () => {
+  // 公共前缀超过 40 字符、只改末尾（追问常见形态）：旧的「前 40 字符一致」兜底规则会
+  // 在这里返回 true，把真实的新提问当成重放吞掉。
+  const shared =
+    '请你在当前仓库里帮我仔细排查这个模块的边界条件与错误处理是否完整可靠，并且给出最小改动方案，先不要动测试代码，';
+  assert.equal(userTextsMatch(`${shared}重点看登录路径。`, `${shared}重点看注册路径。`), false);
+
+  // 真正的重放形态必须继续收敛（磁盘干净文本 vs 直播带注文本）：
+  assert.equal(userTextsMatch(shared, shared), true);
+  assert.equal(userTextsMatch(shared, `${shared}   \n`), true);
+  assert.equal(userTextsMatch(shared, `${shared}\n\n[图片识别失败]`), true);
+});
+
 test('reconcileRunningTranscript preserves earlier history when disk snapshot is tail-truncated', () => {
   const t0 = { role: 'user', parts: [{ kind: 'text', text: '早期提问T0' }] };
   const a0 = { role: 'assistant', parts: [{ kind: 'text', text: '回答T0' }] };

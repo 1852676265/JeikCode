@@ -139,6 +139,53 @@ impl ProjectMcpPool {
         slots.get(&project_dir).map(|slot| slot.registry.clone())
     }
 
+    /// Project keys currently holding a cached registry, in insertion-independent
+    /// order (the map is unordered, so callers must not depend on order).
+    pub async fn cached_project_dirs(&self) -> Vec<PathBuf> {
+        self.slots.read().await.keys().cloned().collect()
+    }
+
+    /// Rebuild `current` from disk, then DROP every OTHER cached project registry,
+    /// and return the fresh registry for `current`.
+    ///
+    /// A capability toggle or an explicit MCP reload is process-wide in intent:
+    /// disabling a server at the GLOBAL scope must remove its tools from EVERY
+    /// project, not only from the directory the caller happens to treat as
+    /// "current". Keeping the other slots would leave their pre-toggle tool set on
+    /// the wire until the process restarts.
+    ///
+    /// The other slots are EVICTED rather than eagerly rebuilt: rebuilding them
+    /// would re-spawn every project's MCP servers (including slow `npx` handshakes)
+    /// for projects nobody is looking at. A dropped slot rebuilds from the new
+    /// on-disk config on its next lookup — same guarantee, no startup storm.
+    ///
+    /// `current` is always reloaded even when it is not cached yet, so the
+    /// returned registry reflects the on-disk config.
+    pub async fn reload_all(&self, current: &Path) -> Arc<McpRegistry> {
+        let registry = self.reload_full(current).await;
+        self.invalidate_others(current).await;
+        registry
+    }
+
+    /// Shut down and forget every cached project registry except `keep`. The next
+    /// lookup for an evicted project rebuilds it from disk.
+    async fn invalidate_others(&self, keep: &Path) {
+        let keep_key = project_key(keep);
+        let stale: Vec<ProjectMcpSlot> = {
+            let _lifecycle = self.lifecycle.lock().await;
+            let mut slots = self.slots.write().await;
+            let keys: Vec<PathBuf> = slots
+                .keys()
+                .filter(|key| **key != keep_key)
+                .cloned()
+                .collect();
+            keys.into_iter().filter_map(|key| slots.remove(&key)).collect()
+        };
+        for slot in stale {
+            slot.registry.shutdown().await;
+        }
+    }
+
     async fn get_or_init(&self, project_dir: &Path) -> Arc<McpRegistry> {
         let _lifecycle = self.lifecycle.lock().await;
         {
@@ -302,6 +349,54 @@ mod tests {
             .iter()
             .all(|registry| Arc::ptr_eq(first, registry)));
         assert_eq!(pool.slots.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_all_rebuilds_current_and_evicts_others() {
+        let pool = Arc::new(ProjectMcpPool::new());
+        let first_project = tempfile::tempdir().unwrap();
+        let second_project = tempfile::tempdir().unwrap();
+        let first_before = pool.registry(first_project.path()).await;
+        let second_before = pool.registry(second_project.path()).await;
+
+        let current = pool.reload_all(first_project.path()).await;
+
+        let first_after = pool
+            .cached_registry(first_project.path())
+            .await
+            .expect("current project must stay cached");
+        assert!(
+            Arc::ptr_eq(&current, &first_after),
+            "reload_all must return the current project's fresh registry"
+        );
+        assert!(
+            !Arc::ptr_eq(&first_before, &first_after),
+            "current project registry must be rebuilt"
+        );
+        assert!(
+            pool.cached_registry(second_project.path()).await.is_none(),
+            "other projects must be EVICTED so they rebuild from the new config"
+        );
+
+        let second_after = pool.registry(second_project.path()).await;
+        assert!(
+            !Arc::ptr_eq(&second_before, &second_after),
+            "an evicted project must rebuild lazily on its next lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_all_registers_an_uncached_current_project() {
+        let pool = Arc::new(ProjectMcpPool::new());
+        let project = tempfile::tempdir().unwrap();
+
+        let current = pool.reload_all(project.path()).await;
+
+        let cached = pool
+            .cached_registry(project.path())
+            .await
+            .expect("current project must be registered even when it was not cached");
+        assert!(Arc::ptr_eq(&current, &cached));
     }
 
     #[tokio::test]

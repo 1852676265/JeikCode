@@ -732,7 +732,9 @@ interface PermissionRequestEvent {
 
 interface ChatProps {
   sessionId: string | null;
-  onSessionId: (id: string) => void;
+  /** 回传会话 id。`claimView=false` 表示只做侧栏/列表对齐，绝不切换当前视图
+   *  （用户在 POST 飞行期间已切到别的会话时必须用这个模式，否则视图会被拽回）。 */
+  onSessionId: (id: string, opts?: { claimView?: boolean }) => void;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
   /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
@@ -2004,20 +2006,32 @@ export function Chat({
     projectHash: string,
     loadId: string,
     loadGeneration: number,
-    opts?: { localReattach?: boolean },
+    opts?: { localReattach?: boolean; background?: boolean },
   ) {
+    // 同一会话只允许一条实时订阅。待机 watch（standby）在 daemon admit 时会被转成
+    // live 订阅；若这里不复位它，重连后会与它并行收到同一批实时帧。实时帧不带 seq，
+    // 画布按直播增量无条件追加 —— 直接表现为正文重复。
+    // 只在「这条 watch 属于当前视图」时复位：待机 watch 永远跟随当前视图，后台会话的
+    // detached watch 不能误杀它，否则当前视图会失去推送唤醒。
+    if (activeIdRef.current === loadId) stopIdleWatch();
     // 针对指定会话先停止其既有 watcher，但绝不误杀其他正在后台运行的会话流！
     sessionWatchersRef.current.get(loadId)?.abort();
     sessionWatchersRef.current.delete(loadId);
 
     // Show running UI; send stays locked via recovery / requestId for foreign turns.
-    setBusyAndClock(true);
-    busyRef.current = true;
+    // 后台会话（用户已切走，只订阅推流写缓存）绝不污染当前视图的 busy / 时钟状态。
+    if (!opts?.background) {
+      setBusyAndClock(true);
+      busyRef.current = true;
+    }
     // Disk (or the in-memory cache) stays on screen. Watch replay is a delta:
     // events already painted are skipped, and only the unpainted suffix is
     // appended. Deleting the trailing assistant here is what made a refresh
     // drop the in-flight turn and leave only the steer card.
-    seedAppliedTodoIds(loadId, todoCallIdsFromMessages(messagesRef.current));
+    // 后台会话没有前台画布，幂等键必须从该会话自己的缓存取，不能读当前视图的 messagesRef。
+    const todoSeedCanvas =
+      activeIdRef.current === loadId ? messagesRef.current : (messageCacheRef.current.get(loadId) ?? []);
+    seedAppliedTodoIds(loadId, todoCallIdsFromMessages(todoSeedCanvas));
     // Backup path: explicit pending query restores approval cards even if the
     // watch stream drops the edge event (or a mid-turn race loses the snapshot).
     restorePendingInteractive(loadId, loadGeneration);
@@ -2339,18 +2353,22 @@ export function Chat({
       const baseCanvas = spliceAuthoritativeDiskTail(canvas, loaded, detail.offset ?? 0);
       const merged = mergeDiskWithUnpersistedTail(baseCanvas, canvas);
       const keptUnpersistedTail = merged.length !== loaded.length;
-      messageCacheRef.current.set(sid, merged);
+      // 拼接与尾部合并后统一自愈一次：pinned 提问、相邻重复 user、空占位都可能在
+      // 历史缓存里留下重复节点。落缓存与上屏必须用同一份清洗后的数组，否则下一个
+      // 回合终态会拿脏画布再拼一次，重复会逐轮累积。
+      const cleanMerged = sanitizeCanvasMessages(merged);
+      messageCacheRef.current.set(sid, cleanMerged);
       void saveSessionCache(
         hash,
         sid,
-        merged,
+        cleanMerged,
         detail.todos,
         undefined,
         detail.turns,
         detail.token_usage,
       );
       if (activeIdRef.current === sid) {
-        messagesRef.current = merged;
+        messagesRef.current = cleanMerged;
         commitActiveTodosIntoLastAssistant();
         setMessages(messagesRef.current);
         if (detail.turns && detail.turns.length > 0) {
@@ -2499,6 +2517,11 @@ export function Chat({
     opts?: { replayIfLive?: boolean },
   ) {
     if (syncRef.current && liveSessionIdRef.current === loadId) return;
+    // 该会话已经有实时订阅（detached watch）在跑：待机 watch 必须让位。
+    // 否则 standby 在 admit 时会被 daemon 转成 live，两条连接同时收帧；实时帧
+    // 不带 seq，画布会无条件追加，造成正文重复。
+    const liveWatcher = sessionWatchersRef.current.get(loadId);
+    if (liveWatcher && !liveWatcher.signal.aborted) return;
     if (
       idleWatchAbortRef.current &&
       !idleWatchAbortRef.current.signal.aborted
@@ -3088,6 +3111,9 @@ export function Chat({
       timelineFollow.reset();
       if (cached && cached.length > 0) {
         const cleanCached = sanitizeCanvasMessages(cached);
+        // 清洗结果必须回写缓存：同一次 effect 后面的 warm 分支会用缓存重新上屏，
+        // 只改画布不改缓存的话，sanitize 会被原始引用立刻覆盖。
+        if (sessionId) messageCacheRef.current.set(sessionId, cleanCached);
         messagesRef.current = cleanCached;
         setMessages(cleanCached);
         canvasReadySessionIdRef.current = sessionId;
@@ -3176,8 +3202,12 @@ export function Chat({
       if (effectiveHash) projectHashBySessionRef.current.set(sessionId, effectiveHash);
 
       setLoading(false);
-      messagesRef.current = cached;
-      setMessages(cached);
+      // 热切回以内存为唯一真相源，但缓存里可能残留历史清理前的重复节点；
+      // 上屏前清洗并回写，保证下一轮终态对账基于干净画布拼接（重复不会累积）。
+      const cleanCached = sanitizeCanvasMessages(cached);
+      messageCacheRef.current.set(sessionId, cleanCached);
+      messagesRef.current = cleanCached;
+      setMessages(cleanCached);
       canvasReadySessionIdRef.current = sessionId;
       flushPreMountStreamBuffer(sessionId);
       if (scrollRef.current) {
@@ -5894,15 +5924,23 @@ export function Chat({
               previousId && localTurnSessionsRef.current.has(previousId)
             ),
           });
-          if (previousId && messageCacheRef.current.has(previousId) && previousId !== event.session_id) {
-            const cached = messageCacheRef.current.get(previousId);
-            if (cached) messageCacheRef.current.set(event.session_id, cached);
-          }
           if (claim) localTurnSessionsRef.current.add(event.session_id);
+          // 后台 watcher 的 replay 同样会带 session_assigned。只有事件会话就是当前视图
+          // （落地页尚无视图也算）时才允许认领画布/session id；用户已切到别的会话时认领
+          // 会把视图拽回、并把该会话的画布搬进另一个会话的缓存（串台 + 画布冻结）。
+          const viewingThisSession = !previousId || previousId === event.session_id;
+          if (viewingThisSession) {
+            if (previousId && previousId !== event.session_id && messageCacheRef.current.has(previousId)) {
+              const cached = messageCacheRef.current.get(previousId);
+              if (cached) messageCacheRef.current.set(event.session_id, cached);
+            }
+            activeIdRef.current = event.session_id;
+            loadedForRef.current = event.session_id;
+            onSessionId(event.session_id);
+          } else {
+            onSessionId(event.session_id, { claimView: false });
+          }
         }
-        activeIdRef.current = event.session_id;
-        loadedForRef.current = event.session_id;
-        onSessionId(event.session_id);
         break;
       case 'command_output':
         pushCommandNotice(event.text);
@@ -6979,13 +7017,35 @@ export function Chat({
 
       const ack = await postChatPrompt(body, controller.signal);
       const effectiveSid = ack.session_id || boundSessionId || turnOwnerSid;
+      // 认领画布/视图只在「这条 turn 仍属于当前视图」时成立：落地页（activeIdRef 为空）
+      // 或仍停在这条 turn 所属会话。用户在 POST 飞行期间切走后，绝不能把 activeIdRef /
+      // onSessionId 抢回来（视图被拽回 + 画布冻结），更不能把目的会话的画布写进这条 turn
+      // 的缓存（跨会话污染）。此时按后台回合处理：只对齐侧栏、订阅推流写缓存。
+      const stillViewingTurn =
+        !activeIdRef.current ||
+        activeIdRef.current === turnOwnerSid ||
+        activeIdRef.current === effectiveSid;
       if (effectiveSid) {
         boundSessionId = effectiveSid;
-        activeIdRef.current = effectiveSid;
-        loadedForRef.current = effectiveSid;
         localTurnSessionsRef.current.add(effectiveSid);
-        messageCacheRef.current.set(effectiveSid, messagesRef.current);
-        onSessionId(effectiveSid);
+        if (stillViewingTurn) {
+          activeIdRef.current = effectiveSid;
+          loadedForRef.current = effectiveSid;
+          messageCacheRef.current.set(effectiveSid, messagesRef.current);
+        } else if (!messageCacheRef.current.has(effectiveSid)) {
+          // 切走后缓存可能还是空的（落地页首发后立刻切走，切换块因 prevId 为空未落盘）。
+          // 用本轮的乐观提问补一个起点，否则 applyEventToSessionCache 会把后续推流帧整体丢弃。
+          messageCacheRef.current.set(effectiveSid, [
+            {
+              role: 'user' as const,
+              parts: [{ kind: 'text' as const, text }],
+              images: images.length ? images : undefined,
+              ts: now,
+            },
+            { role: 'assistant' as const, parts: [] },
+          ]);
+        }
+        onSessionId(effectiveSid, { claimView: stillViewingTurn });
         onLiveRunningChange?.(effectiveSid, true);
       }
       if (!sessionId || acceptedWithoutSession) {
@@ -7000,7 +7060,9 @@ export function Chat({
         (effectiveSid ? projectHashBySessionRef.current.get(effectiveSid) : undefined) ||
         '';
       if (effectiveSid) {
-        startDetachedHistoryPoll(currentProjectHash, effectiveSid, sessionGenerationRef.current);
+        startDetachedHistoryPoll(currentProjectHash, effectiveSid, sessionGenerationRef.current, {
+          background: !stillViewingTurn,
+        });
       }
     } catch (err: unknown) {
       const stillCurrent =

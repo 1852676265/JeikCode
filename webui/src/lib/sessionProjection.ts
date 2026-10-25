@@ -684,7 +684,7 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
  * 画布中早于该切片起始偏移（sourceIndex < diskOffset）的更早历史头部（olderHead）。
  * 既不丢失用户向上翻看过的更早历史，又彻底杜绝内存旧尾部与磁盘新尾部杂交双重渲染！
  */
-export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number }>(
+export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id?: string }>(
   canvas: T[],
   diskTail: T[],
   diskOffset: number,
@@ -693,9 +693,24 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number }>(
   if (!diskTail || diskTail.length === 0) return canvas;
   if (diskOffset <= 0) return diskTail;
 
-  const olderHead = canvas.filter(
-    (m) => typeof m.sourceIndex === 'number' && m.sourceIndex < diskOffset,
-  );
+  // 权威切片里已经带上的行，绝不能再从画布头部保留一次：
+  // tail 页为了不丢掉本回合开头的提问，会把该提问 pinned 到切片首位，而它的
+  // sourceIndex 恰好小于 diskOffset（绝对索引更靠前）。只按 `< diskOffset`
+  // 过滤会让同一条提问同时出现在 olderHead 与 diskTail 里，并且每次终态对账
+  // 都会再叠一份。按绝对索引 + 稳定 id 双重排除，保证拼接幂等。
+  const tailIndices = new Set<number>();
+  const tailIds = new Set<string>();
+  for (const message of diskTail) {
+    if (typeof message.sourceIndex === 'number') tailIndices.add(message.sourceIndex);
+    if (message.id) tailIds.add(message.id);
+  }
+  const olderHead = canvas.filter((message) => {
+    if (typeof message.sourceIndex !== 'number' || message.sourceIndex >= diskOffset) {
+      return false;
+    }
+    if (tailIndices.has(message.sourceIndex)) return false;
+    return !(message.id && tailIds.has(message.id));
+  });
   return [...olderHead, ...diskTail];
 }
 

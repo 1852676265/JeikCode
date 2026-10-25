@@ -1479,8 +1479,9 @@ export interface McpStatusInfo {
   blocked?: string[];
 }
 
-export async function getMcpStatus(): Promise<McpStatusInfo> {
-  const resp = await apiFetch('/mcp/status', { headers: authHeaders() });
+export async function getMcpStatus(workingDir?: string): Promise<McpStatusInfo> {
+  const q = workingDir ? `?working_dir=${encodeURIComponent(workingDir)}` : '';
+  const resp = await apiFetch(`/mcp/status${q}`, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
   return resp.json();
 }
@@ -1540,11 +1541,21 @@ export interface CapabilityItem {
   error?: string;
   /** Skills only: the folder that owns the skill (for "reveal in explorer"). */
   dir?: string;
+  /** Skills only: the project-scope state file IS the global one (home project).
+   *  Both toggles would edit one file, so the project toggle is hidden. */
+  project_scope_shared?: boolean;
 }
 
 /** GET /capabilities — one unified list for the sidebar's MCP + skills menus. */
-export async function getCapabilities(): Promise<CapabilityItem[]> {
-  const resp = await apiFetch('/capabilities', { headers: authHeaders() });
+/**
+ * Unified MCP + skills inventory. `workingDir` asks about the project of the
+ * session being VIEWED — after a restart the daemon's own project may still be
+ * its launch directory, and without this the panel would show (and toggle)
+ * another project's servers and skills.
+ */
+export async function getCapabilities(workingDir?: string): Promise<CapabilityItem[]> {
+  const q = workingDir ? `?working_dir=${encodeURIComponent(workingDir)}` : '';
+  const resp = await apiFetch(`/capabilities${q}`, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`capabilities failed: ${resp.status}`);
   const body = await resp.json() as { items?: CapabilityItem[] };
   return body.items ?? [];
@@ -1559,11 +1570,12 @@ export async function toggleCapability(
   id: string,
   scope: CapScope,
   disabled: boolean,
+  workingDir?: string,
 ): Promise<{ ok: boolean; error?: string; runtime_reloaded?: boolean }> {
   const resp = await apiFetch('/capabilities/toggle', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ kind, id, scope, disabled }),
+    body: JSON.stringify({ kind, id, scope, disabled, working_dir: workingDir }),
   });
   return resp.json();
 }

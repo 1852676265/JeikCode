@@ -2771,6 +2771,11 @@ impl RunningAgent {
             // arrival in each content arm below.
             let mut saw_stream_content = false;
             let mut saw_text_or_tool = false;
+            // Did the PROVIDER stream any NON-WHITESPACE visible text this round
+            // (before hooks)? Distinguishes a gateway that emits a lone whitespace
+            // token and stops (content-free → retry) from a hook that redacts real
+            // text down to whitespace (must NOT be retried as empty).
+            let mut saw_visible_text = false;
             let mut saw_suppressed_reasoning_filler = false;
             // Did the adapter report dropping an UNPARSEABLE chunk this round (a
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
@@ -2943,6 +2948,9 @@ impl RunningAgent {
                         // (possibly clearing) hook, so a redacted/cleared response is
                         // not misread as an empty 200 and retried.
                         saw_stream_content = true;
+                        if !t.trim().is_empty() {
+                            saw_visible_text = true;
+                        }
                         self.hooks.on_text_delta(&mut t).await;
                         if !t.is_empty() {
                             if suppress_internal_stream {
@@ -3244,8 +3252,23 @@ impl RunningAgent {
                 && pending_calls.is_empty()
                 && !filler_only_reasoning
                 && !truncated;
-            let empty_completion =
-                (!saw_stream_content || filler_only_reasoning || thinking_only) && !truncated;
+            // A gateway can stream a SINGLE whitespace token and end the stream
+            // (observed with OpenCode Zen when it refuses a large tool set): the
+            // provider DID emit visible output, so `saw_text_or_tool` is set and
+            // neither `thinking_only` nor `filler_only_reasoning` fires — yet the
+            // round has no answer. Without this, the blank bubble is stored and the
+            // turn reports a clean stop. Keyed on PRE-hook text so a hook that
+            // redacts a real response to whitespace is never misclassified.
+            let blank_text_only = saw_stream_content
+                && !saw_visible_text
+                && assistant_text.trim().is_empty()
+                && pending_calls.is_empty()
+                && !truncated;
+            let empty_completion = (!saw_stream_content
+                || filler_only_reasoning
+                || thinking_only
+                || blank_text_only)
+                && !truncated;
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;

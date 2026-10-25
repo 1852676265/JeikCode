@@ -184,12 +184,10 @@ export function userTextsMatch(a: string, b: string): boolean {
     if (rest.trim() === '') return true;
     return VISION_ANNOTATION_MARKERS.some((m) => rest.includes(m.replace(/^\n\n/, '')));
   }
-  // 互相包含或者前 40 字符一致（针对长提问后带不同系统注入提示词或标记的情况，杜绝误判重放）
-  if (normLeft.length >= 20 && normRight.length >= 20) {
-    if (normLeft.startsWith(normRight.slice(0, 40)) || normRight.startsWith(normLeft.slice(0, 40))) {
-      return true;
-    }
-  }
+  // 到这里说明两条文本既不完全相同、也不互为前缀（尾部纯空白 / 视觉标记的重放
+  // 形态已在上面收敛）。旧实现在这里再按「前 40 字符一致」兜底判同一条，会把
+  // 「前缀相同、只改末尾」的真实追问（路径/参数/文件名）误判成重放而吞掉。
+  // 用户提问的去重只能靠精确相等 / 严格前缀 / 消息身份，绝不能靠模糊前缀。
   return false;
 }
 
