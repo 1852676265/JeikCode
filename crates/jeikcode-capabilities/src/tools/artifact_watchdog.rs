@@ -49,6 +49,9 @@ pub struct EvictionCandidate {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: SystemTime,
+    /// Pinned artifacts (compaction archives) sort AFTER every unpinned one, so routine
+    /// eviction never spends its byte budget on them while ordinary artifacts remain.
+    pub pinned: bool,
 }
 
 impl Ord for EvictionCandidate {
@@ -216,16 +219,18 @@ impl ArtifactWatchdog {
     }
 
     /// Immediate emergency eviction: called when capacity breaches `max_capacity`.
+    /// Pinned artifacts are eligible only as a LAST resort (after every unpinned one).
     pub async fn perform_emergency_eviction(&self) -> u64 {
         let current = self.global_bytes();
         if current <= self.target_capacity {
             return 0;
         }
         let bytes_to_free = current.saturating_sub(self.target_capacity);
-        self.evict_oldest_bytes(bytes_to_free).await
+        self.evict_oldest_bytes_with(bytes_to_free, true).await
     }
 
     /// Periodic maintenance: called every 3 days. Evicts the oldest 30% of data.
+    /// Pinned artifacts (compaction archives) are EXEMPT from this routine cycle.
     pub async fn perform_periodic_maintenance(&self) -> u64 {
         let current = self.global_bytes();
         if current == 0 {
@@ -234,7 +239,7 @@ impl ArtifactWatchdog {
         // Evict oldest 30% to maintain steady lifecycle turnover.
         let bytes_to_free = current.saturating_mul(30) / 100;
         if bytes_to_free > 0 {
-            self.evict_oldest_bytes(bytes_to_free).await
+            self.evict_oldest_bytes_with(bytes_to_free, false).await
         } else {
             0
         }
@@ -256,7 +261,10 @@ impl ArtifactWatchdog {
                     std::thread::sleep(SCAN_YIELD_SLEEP);
                 }
                 if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() && !entry.file_name().to_string_lossy().ends_with(".tmp") {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    // `.tmp` are in-flight writes; `.pin` are zero-byte protection markers.
+                    if meta.is_file() && !name.ends_with(".tmp") && !name.ends_with(".pin") {
                         total = total.saturating_add(meta.len());
                     }
                 }
@@ -266,8 +274,16 @@ impl ArtifactWatchdog {
     }
 
     /// Evicts at least `target_bytes` of oldest artifacts across all sessions.
-    /// Offloads the scan and deletion to `spawn_blocking` to avoid blocking Tokio workers.
+    /// Pinned artifacts (compaction archives) are EXEMPT from this routine path.
     pub async fn evict_oldest_bytes(&self, target_bytes: u64) -> u64 {
+        self.evict_oldest_bytes_with(target_bytes, false).await
+    }
+
+    /// Evicts at least `target_bytes` of oldest artifacts. `allow_pinned` makes pinned
+    /// artifacts eligible as a LAST resort (they still sort after every unpinned file);
+    /// the routine cycle leaves them untouched.
+    /// Offloads the scan and deletion to `spawn_blocking` to avoid blocking Tokio workers.
+    async fn evict_oldest_bytes_with(&self, target_bytes: u64, allow_pinned: bool) -> u64 {
         if target_bytes == 0 {
             return 0;
         }
@@ -293,21 +309,30 @@ impl ArtifactWatchdog {
                     }
                     let file_name = entry.file_name();
                     let name = file_name.to_string_lossy();
-                    if name.ends_with(".tmp") {
+                    // `.tmp` = in-flight write; `.pin` = zero-byte protection marker.
+                    if name.ends_with(".tmp") || name.ends_with(".pin") {
                         continue;
                     }
                     if let Ok(meta) = entry.metadata() {
                         if !meta.is_file() {
                             continue;
                         }
+                        // A compaction archive carries a `<id>.pin` sibling. Routine
+                        // eviction skips it; the hard-cap path may take it last.
+                        let pinned = dir.join(format!("{name}.pin")).exists();
+                        if pinned && !allow_pinned {
+                            continue;
+                        }
+                        let path = entry.path();
                         let size = meta.len();
                         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
                         if heap_bytes < target_bytes || heap.len() < MAX_HEAP_CANDIDATES {
                             heap.push(EvictionCandidate {
-                                path: entry.path(),
+                                path,
                                 size,
                                 mtime,
+                                pinned,
                             });
                             heap_bytes = heap_bytes.saturating_add(size);
                         } else if let Some(youngest) = heap.peek() {
@@ -316,9 +341,10 @@ impl ArtifactWatchdog {
                                 let popped = heap.pop().unwrap();
                                 heap_bytes = heap_bytes.saturating_sub(popped.size);
                                 heap.push(EvictionCandidate {
-                                    path: entry.path(),
+                                    path,
                                     size,
                                     mtime,
+                                    pinned,
                                 });
                                 heap_bytes = heap_bytes.saturating_add(size);
                             }
@@ -327,9 +353,10 @@ impl ArtifactWatchdog {
                 }
             }
 
-            // 2. Sort the collected candidates strictly oldest-first.
+            // 2. Sort the collected candidates: every unpinned file first, then pinned
+            //    ones, each group oldest-first.
             let mut candidates: Vec<EvictionCandidate> = heap.into_vec();
-            candidates.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+            candidates.sort_by(|a, b| a.pinned.cmp(&b.pinned).then(a.mtime.cmp(&b.mtime)));
 
             // 3. Delete files sequentially with cooperative pauses until target is reached.
             let mut freed = 0u64;
@@ -338,6 +365,11 @@ impl ArtifactWatchdog {
                     break;
                 }
                 if std::fs::remove_file(&candidate.path).is_ok() {
+                    if candidate.pinned {
+                        let mut pin = candidate.path.clone().into_os_string();
+                        pin.push(".pin");
+                        let _ = std::fs::remove_file(PathBuf::from(pin));
+                    }
                     freed = freed.saturating_add(candidate.size);
                     let _ =
                         global_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -454,6 +486,59 @@ mod tests {
         // Oldest file f1 must be removed first
         assert!(!f1.exists(), "Oldest file f1 should be evicted");
         assert!(wd.global_bytes() <= 5, "Global bytes reduced to <= 5");
+    }
+
+    #[tokio::test]
+    async fn pinned_artifacts_skip_routine_eviction_and_go_last_under_pressure() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("sess.artifacts");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let unpinned_old = dir.join("0123456789abcdef");
+        let pinned_old = dir.join("1123456789abcdef");
+        let unpinned_new = dir.join("2123456789abcdef");
+        for (path, age) in [
+            (&unpinned_old, 200u64),
+            (&pinned_old, 300),
+            (&unpinned_new, 100),
+        ] {
+            std::fs::write(path, vec![b'x'; 100]).unwrap();
+            let at = SystemTime::now() - Duration::from_secs(age);
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(at))
+                .unwrap();
+        }
+        std::fs::write(dir.join("1123456789abcdef.pin"), b"").unwrap();
+
+        let wd = ArtifactWatchdog::with_options(
+            temp.path(),
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+        );
+        wd.set_total_bytes(300);
+
+        // Routine lifecycle eviction: the pinned (and OLDEST) artifact is exempt.
+        let freed = wd.evict_oldest_bytes(100).await;
+        assert_eq!(freed, 100);
+        assert!(
+            !unpinned_old.exists(),
+            "oldest UNPINNED artifact goes first"
+        );
+        assert!(
+            pinned_old.exists(),
+            "pinned archive must survive routine eviction"
+        );
+
+        // Emergency/hard-cap path: pinned is eligible, but only after unpinned ones.
+        let freed = wd.evict_oldest_bytes_with(200, true).await;
+        assert!(freed >= 200, "freed {freed}");
+        assert!(!unpinned_new.exists());
+        assert!(!pinned_old.exists(), "pinned is the LAST resort");
+        assert!(
+            !dir.join("1123456789abcdef.pin").exists(),
+            "pin marker is removed with its artifact"
+        );
     }
 
     #[tokio::test]

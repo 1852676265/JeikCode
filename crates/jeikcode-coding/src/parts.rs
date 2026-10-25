@@ -1539,12 +1539,23 @@ pub fn assemble(
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). Stubs old tool results once utilization crosses the threshold
         // (kept full below it); the overflow tiers fire only on a typed overflow error.
-        .compaction(Arc::new(
-            jeikcode_capabilities::compaction::OverflowCompaction::new(
+        .compaction({
+            let mut strategy = jeikcode_capabilities::compaction::OverflowCompaction::new(
                 jeikcode_capabilities::compaction::StubCompaction::default(),
                 Some(summary_provider),
-            ),
-        ))
+            );
+            // Session-bound runtimes archive every drained span VERBATIM into the
+            // session's artifact store (watchdog-governed), so the summary can point a
+            // successor at `artifact://<id>` for exact code/errors/tool output.
+            if let Some(binding) = &parts.session {
+                if let Ok(dir) = binding.manager.artifacts_dir(&binding.id) {
+                    strategy = strategy.with_archive(Arc::new(
+                        jeikcode_capabilities::tools::output_artifact::ArtifactStore::new(dir),
+                    ));
+                }
+            }
+            Arc::new(strategy)
+        })
         .compact_threshold(cfg.compact_threshold)
         .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)

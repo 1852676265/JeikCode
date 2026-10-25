@@ -573,16 +573,29 @@ fn empty_exhaustion_message(
 /// "near the limit" at 49% — the "max_tokens folded into the context window" defect.)
 const OUTPUT_WATERMARK_BUFFER: u32 = 20_000;
 
-/// Default per-call output budget when `[models.X] max_tokens` is unset — the 64K tier the
-/// model editor offers (32K / 64K / 128K / 256K / 384K / custom).
-pub const DEFAULT_OUTPUT_BUDGET: u32 = 64_000;
+/// Default per-call output budget when `[models.X] max_tokens` is unset — the 64Ki
+/// tier the model editor offers (32K / 64K / 128K / 256K / 384K / custom).
+pub const DEFAULT_OUTPUT_BUDGET: u32 = 65_536;
 
-/// The output budget handed to the provider this round: the DECLARED value VERBATIM
-/// (`max_tokens` / `max_output_tokens` per protocol), or [`DEFAULT_OUTPUT_BUDGET`] when
-/// unset. The only adjustment is a window sanity clamp — a budget above the window is
-/// protocol-invalid on every gateway. This value never feeds the context/watermark math:
-/// the real output is whatever the model actually generates within it, and real context
-/// pressure comes from the provider's reported usage.
+/// Soft per-request output-budget cap expressed as a fraction of the window
+/// (`window / 8`). A model's declared capability (e.g. 384K) is an upper bound,
+/// not a per-request target: reserving it on every call shrinks the usable input
+/// to `window − capability` and makes gateways reject otherwise valid requests
+/// (`prompt + max_tokens > context`). One eighth of the window is a wide ceiling —
+/// 128Ki on a 1M model, 25Ki on 200K — that still leaves ~7/8 of the window for
+/// the prompt even at the compaction trigger.
+pub const OUTPUT_SOFT_CAP_DIVISOR: u32 = 8;
+
+/// Fallback per-request cap when the context window is UNKNOWN (`window == 0`),
+/// where the window-relative cap can't be computed.
+pub const DEFAULT_REQUEST_MAX_TOKENS: u32 = 65_536;
+
+/// The model's output CAPABILITY ceiling (`max_tokens` / `max_output_tokens` per
+/// protocol), or [`DEFAULT_OUTPUT_BUDGET`] when unset. The only adjustment here is
+/// a window sanity clamp — a budget above the window is protocol-invalid on every
+/// gateway. This is an upper bound only: the per-request value is further capped
+/// by [`DEFAULT_REQUEST_MAX_TOKENS`] and by the remaining context window in
+/// [`wire_output_budget_for_prompt`]. It never feeds the context/watermark math.
 pub fn wire_output_budget(window: u32, declared: Option<u32>) -> u32 {
     let budget = declared.unwrap_or(DEFAULT_OUTPUT_BUDGET);
     let bounded = if window > 0 {
@@ -591,6 +604,51 @@ pub fn wire_output_budget(window: u32, declared: Option<u32>) -> u32 {
         budget
     };
     bounded.max(1)
+}
+
+/// The per-request output budget actually put on the wire.
+///
+/// `[models.X] max_tokens` is a CAPABILITY declaration (the model's maximum
+/// output), but the REST of the window is what the prompt gets to use: gateways
+/// validate `prompt_tokens + max_tokens <= context_window` and answer HTTP 400
+/// once the declared ceiling no longer fits. Sending 384K verbatim killed a long
+/// session precisely at `window - 384K` prompt tokens even though the prompt
+/// itself was well inside the window (opencode-zen returns
+/// `{"model":"…"}` for this rejection).
+///
+/// The wire value is the capability ceiling CLAMPED by, in order:
+///   1. a wide soft cap of `window / 8` ([`OUTPUT_SOFT_CAP_DIVISOR`]), and
+///   2. what actually remains in the window: `window - prompt - 4K guard`.
+///
+/// This mirrors Pi's adaptive clamp (plus a window-relative ceiling). Small
+/// sessions send the soft cap (or the declared capability when smaller); as the
+/// context fills the budget shrinks to exactly the room left. At the compaction
+/// trigger (0.9 × watermark) a 1M window still has ~119K of output room, so the
+/// budget never collapses to a token or two before compaction fires.
+///
+/// The 4K guard is fixed (not a fraction of the prompt) because the prompt anchor
+/// is CONSERVATIVE: it uses the provider's exact last context plus
+/// [`Message::estimate_tokens_conservative`], which counts each CJK char as a full
+/// token. Overestimating only shrinks the output budget; underestimating would
+/// re-open the gateway 400.
+pub fn wire_output_budget_for_prompt(
+    window: u32,
+    declared: Option<u32>,
+    prompt_tokens: u32,
+) -> u32 {
+    let capability = wire_output_budget(window, declared);
+    let soft_cap = if window > 0 {
+        (window / OUTPUT_SOFT_CAP_DIVISOR).max(1)
+    } else {
+        DEFAULT_REQUEST_MAX_TOKENS
+    };
+    let budget = capability.min(soft_cap).max(1);
+    if window == 0 {
+        return budget;
+    }
+    let margin = 4_096.min(window);
+    let remaining = window.saturating_sub(prompt_tokens).saturating_sub(margin);
+    budget.min(remaining.max(1)).max(1)
 }
 
 /// The input WATERMARK budget — the denominator of every pressure decision: the window
@@ -1346,9 +1404,10 @@ impl RunningAgent {
     }
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
-    /// `compact_threshold` is configured AND the last stored assistant turn's raw
-    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model's
-    /// WATERMARK budget (`window − min(20K, output budget)`) are `>= threshold`
+    /// `compact_threshold` is configured AND the last stored assistant turn's
+    /// CONTEXT size (`prompt + completion` — what the next request carries)
+    /// recomputed against the CURRENT model's WATERMARK budget
+    /// (`window − min(20K, output budget)`) is `>= threshold`
     /// (default 0.9). The denominator is the watermark budget — NOT the raw window and
     /// NOT the declared output ceiling — so this trigger and the pre-send guard share
     /// one line: a `max_tokens` capability ceiling (e.g. 384K) can no longer shrink the
@@ -1362,13 +1421,29 @@ impl RunningAgent {
     /// threshold. Pure read — never mutates the conversation.
     fn should_compact(&self, convo: &Conversation) -> Option<CompactTrigger> {
         let thresh = self.compact_threshold?;
+        // Measure the context the NEXT request will carry: the provider's prompt
+        // PLUS that response's completion (the assistant output is now part of the
+        // history). `meta.used_tokens` alone is the prompt side, so a 20K response
+        // used to arrive "20K under" the real pressure. Fall back to the
+        // conservative estimator when the provider reported no usage.
         let (recorded_window, used) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| (meta.ctx_window, meta.used_tokens))?;
+            .map(|meta| {
+                let used = if meta.tokens.prompt > 0 {
+                    meta.tokens.prompt.saturating_add(meta.tokens.completion)
+                } else {
+                    convo
+                        .messages
+                        .iter()
+                        .map(|m| m.estimate_tokens_conservative())
+                        .sum()
+                };
+                (meta.ctx_window, used)
+            })?;
         // Prefer the live window; fall back to the recorded one only when the live
         // window is unknown (0) — mirrors `run_compaction`, and reproduces the old
         // stored-ratio behavior for the unknown-window case (no regression there).
@@ -2450,8 +2525,13 @@ impl RunningAgent {
             {
                 let window = self.provider.context_window();
                 let limit = input_watermark_budget(window);
+                // CONSERVATIVE estimate (CJK chars count as full tokens): the
+                // byte/4 estimate undercounts Chinese ~2×, which used to let a
+                // CJK-heavy turn slide past the watermark without compacting.
                 let est = |msgs: &[Message]| -> u64 {
-                    msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
+                    msgs.iter()
+                        .map(|m| m.estimate_tokens_conservative() as u64)
+                        .sum()
                 };
                 // Only worth compacting if a COMPLETED exchange exists to drain. On the
                 // very first request an over-window prompt is a single oversized input that
@@ -2488,7 +2568,12 @@ impl RunningAgent {
             // request under the window (single input too large), so the user gets the
             // actionable advice instead of a silent doomed request.
             if !over_window_warned {
-                let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
+                // Same conservative estimator as the emergency compaction above, so
+                // the advisory and the compaction verdict agree for CJK content.
+                let est: u32 = messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative())
+                    .sum();
                 let window = self.provider.context_window();
                 let limit = input_watermark_budget(window);
                 if let Some(advisory) = over_window_advisory(est, window, limit) {
@@ -2519,17 +2604,46 @@ impl RunningAgent {
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
             let mut request_options = self.chat_options.clone();
-            // OUTPUT BUDGET (capability declaration → protocol max budget): the configured
-            // `[models.X] max_tokens` rides the wire VERBATIM (32K / 64K / 128K / 256K / 384K /
-            // custom; 64K when unset), so the model may generate up to it. It deliberately
-            // does NOT feed the context/watermark math above — that math uses the window minus
-            // a fixed watermark buffer, and real pressure comes from the provider's report.
-            // `pre_request_options` runs below and may still override (documented hook seam).
+            // OUTPUT BUDGET (capability ceiling → per-request budget): `[models.X]
+            // max_tokens` declares how much the model CAN emit, but it must not
+            // reserve that much of the window on every call — gateways validate
+            // `prompt_tokens + max_tokens <= context_window`, so sending 384K
+            // verbatim makes every request 400 once the history passes
+            // `window - 384K`. Clamp to what remains for THIS request; small
+            // sessions still get the wide soft cap (`window / 8`).
+            //
+            // This value does NOT feed the pressure/watermark math (that remains
+            // window − fixed watermark; real pressure comes from the provider's
+            // report). `pre_request_options` runs below and may still override
+            // (documented hook seam).
             let wire_window = self.provider.context_window();
             if wire_window > 0 {
-                request_options.max_tokens = Some(wire_output_budget(
+                // Anchor the prompt size on the provider's last reported context
+                // (`prompt + completion` — the response is now part of the next
+                // prompt) plus a CONSERVATIVE estimate of the messages appended
+                // after it. `estimate_tokens_conservative` counts each CJK char as
+                // a full token, so the anchor errs HIGH; the 4K guard in the
+                // helper on top means we never under-reserve the prompt.
+                let full_estimate: u32 = messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative())
+                    .sum();
+                let provider_context = convo.last_context_tokens();
+                let prompt_anchor = if provider_context > 0 {
+                    let tail: u32 = messages
+                        .iter()
+                        .rev()
+                        .take_while(|m| m.role != crate::message::Role::Assistant)
+                        .map(|m| m.estimate_tokens_conservative())
+                        .sum();
+                    provider_context.saturating_add(tail).max(full_estimate)
+                } else {
+                    full_estimate
+                };
+                request_options.max_tokens = Some(wire_output_budget_for_prompt(
                     wire_window,
                     self.chat_options.max_tokens,
+                    prompt_anchor,
                 ));
             }
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
@@ -5218,7 +5332,8 @@ mod internal_continuation_compaction_tests {
     #[tokio::test]
     async fn hook_continuation_below_threshold_does_not_compact() {
         // One token below the watermark-budget threshold (0.7 × 750 = 525).
-        let (events, calls) = run_hook_continuation(524).await;
+        // Pressure is prompt + completion, and the fixture's completion is 1.
+        let (events, calls) = run_hook_continuation(523).await;
         assert!(
             !events
                 .iter()
@@ -6367,17 +6482,72 @@ mod provider_message_pairing_tests {
 
 #[cfg(test)]
 mod output_budget_tests {
-    use super::{input_watermark_budget, wire_output_budget, DEFAULT_OUTPUT_BUDGET};
+    use super::{
+        input_watermark_budget, wire_output_budget, wire_output_budget_for_prompt,
+        DEFAULT_OUTPUT_BUDGET, DEFAULT_REQUEST_MAX_TOKENS,
+    };
 
     #[test]
-    fn declared_budget_rides_the_wire_verbatim() {
-        // The model editor's tiers: 32K / 64K / 128K / 256K / 384K / custom.
+    fn soft_cap_bounds_a_large_capability_to_an_eighth_of_the_window() {
+        let window = 1_048_576;
+        // Capability alone (editor tiers) is preserved by the raw helper…
         for tier in [32_000, 64_000, 128_000, 256_000, 384_000] {
             assert_eq!(wire_output_budget(1_000_000, Some(tier)), tier);
         }
-        // Unset ⇒ the 64K default tier.
-        assert_eq!(DEFAULT_OUTPUT_BUDGET, 64_000);
-        assert_eq!(wire_output_budget(1_000_000, None), 64_000);
+        // …but the WIRE value is bounded by window/8 (128Ki on a 1M model).
+        assert_eq!(
+            wire_output_budget_for_prompt(window, Some(384_000), 28_000),
+            131_072
+        );
+        // A declared capability BELOW the soft cap wins.
+        assert_eq!(
+            wire_output_budget_for_prompt(window, Some(32_000), 28_000),
+            32_000
+        );
+        // A small window scales the soft cap down with it (200K ⇒ 25K).
+        assert_eq!(
+            wire_output_budget_for_prompt(200_000, Some(384_000), 28_000),
+            25_000
+        );
+    }
+
+    #[test]
+    fn prompt_clamp_keeps_prompt_plus_budget_inside_the_window() {
+        let window = 1_048_576;
+        // At the compaction trigger (0.9 × watermark) the budget is still
+        // meaningful — it must NOT collapse before compaction fires.
+        let trigger = 925_718;
+        let budget = wire_output_budget_for_prompt(window, Some(384_000), trigger);
+        assert!(
+            budget > 100_000,
+            "budget must stay healthy at the compaction trigger: {budget}"
+        );
+        assert!(
+            trigger + budget < window,
+            "prompt + budget must fit the window: {trigger} + {budget}"
+        );
+        // As the window fills, the budget shrinks to exactly the room left.
+        let near = window - 10_000;
+        let budget = wire_output_budget_for_prompt(window, Some(384_000), near);
+        assert_eq!(budget, 5_904, "window - prompt - 4K guard");
+        // Near the window the request stays VALID (never a negative/zero budget).
+        assert_eq!(
+            wire_output_budget_for_prompt(window, Some(384_000), window - 100),
+            1
+        );
+        // Unknown window ⇒ the fixed 64Ki fallback cap applies.
+        assert_eq!(
+            wire_output_budget_for_prompt(0, Some(384_000), 10_000),
+            DEFAULT_REQUEST_MAX_TOKENS
+        );
+        assert_eq!(DEFAULT_REQUEST_MAX_TOKENS, 65_536);
+    }
+
+    #[test]
+    fn declared_budget_rides_the_wire_verbatim() {
+        // Unset ⇒ the 64Ki default tier.
+        assert_eq!(DEFAULT_OUTPUT_BUDGET, 65_536);
+        assert_eq!(wire_output_budget(1_000_000, None), 65_536);
         // The ONLY adjustment is the window sanity clamp (a budget above the window is
         // protocol-invalid on every gateway) — never a capability downsizing.
         assert_eq!(wire_output_budget(16_000, Some(384_000)), 16_000);

@@ -406,10 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn default_output_budget_is_the_64k_tier_clamped_to_the_window() {
-        // Unset `max_tokens` ⇒ the 64K default tier; never above the model window.
-        assert_eq!(default_max_tokens(2_000_000), 64_000);
-        assert_eq!(default_max_tokens(200_000), 64_000);
+    fn default_output_budget_is_the_64ki_tier_clamped_to_the_window() {
+        // Unset `max_tokens` ⇒ the 64Ki default tier; never above the model window.
+        assert_eq!(default_max_tokens(2_000_000), 65_536);
+        assert_eq!(default_max_tokens(200_000), 65_536);
         assert_eq!(default_max_tokens(32_000), 32_000);
     }
 }

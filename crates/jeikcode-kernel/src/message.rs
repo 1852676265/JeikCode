@@ -411,6 +411,45 @@ impl Message {
         ((byte_count / 4).max(1) + 4) as u32
     }
 
+    /// Conservative token estimate for the OUTPUT-BUDGET clamp (never for pressure
+    /// math). ASCII runs count at 4 chars/token; every NON-ASCII char counts as a
+    /// full token, because CJK is ~0.6–1 token/char while `bytes/4` underestimates
+    /// it by roughly 2×.
+    ///
+    /// Overestimating here only SHRINKS the per-request output budget; an
+    /// underestimate would let `prompt + max_tokens` exceed the gateway window and
+    /// produce an opaque HTTP 400. So this is the safe direction to be wrong in.
+    pub fn estimate_tokens_conservative(&self) -> u32 {
+        // Images dominate when present (vision ≈ 1600 tok each).
+        if !self.images.is_empty() {
+            return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
+        }
+        let mut ascii: usize = 0;
+        let mut non_ascii: usize = 0;
+        {
+            let mut add = |text: &str| {
+                for ch in text.chars() {
+                    if ch.is_ascii() {
+                        ascii += 1;
+                    } else {
+                        non_ascii += 1;
+                    }
+                }
+            };
+            add(&self.text);
+            for call in &self.tool_calls {
+                add(&call.name);
+                add(&call.arguments);
+            }
+            if let Some(reasoning) = &self.reasoning {
+                add(reasoning);
+            }
+        }
+        // Mirror `estimate_tokens`' small per-shape overheads.
+        let overhead = self.tool_calls.len() * 20 + if self.role == Role::Tool { 10 } else { 1 };
+        (non_ascii + ascii.div_ceil(4) + overhead + 4) as u32
+    }
+
     /// Stored for WebUI/TUI replay only — never forwarded on the provider wire.
     pub fn is_display_only(&self) -> bool {
         self.internal_origin.as_deref() == Some(TURN_DIAGNOSTIC_ORIGIN)
@@ -903,6 +942,25 @@ impl Conversation {
             .unwrap_or((0, 0, 0.0))
     }
 
+    /// Provider-reported size of the context AFTER the most recent successful
+    /// response: `prompt + completion` (the assistant output becomes part of the
+    /// NEXT prompt). 0 when no usage has been recorded yet.
+    ///
+    /// [`last_pressure`](Self::last_pressure) reports the PROMPT side only, which
+    /// is the right input for utilization/pressure math but undercounts the room
+    /// the next request needs by the previous response's output. The output-budget
+    /// clamp wants THIS figure: `max_tokens` must leave room for the whole next
+    /// prompt, including that already-generated assistant text.
+    pub fn last_context_tokens(&self) -> u32 {
+        self.messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == Role::Assistant)
+            .find_map(|m| m.meta.as_ref())
+            .map(|meta| meta.tokens.prompt.saturating_add(meta.tokens.completion))
+            .unwrap_or(0)
+    }
+
     /// Prepare a compaction [`CompactionPlan`] without changing this conversation.
     /// (besides `backfill_cancelled_tool_results`). The kernel — not the strategy —
     /// owns and enforces every invariant here, so a buggy strategy cannot corrupt
@@ -1335,6 +1393,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conservative_estimate_counts_cjk_as_full_tokens() {
+        // 100 ASCII chars ≈ 25 tokens; 100 CJK chars ≈ 100 tokens (not ~75).
+        let ascii = Message::user(&"a".repeat(400));
+        let cjk = Message::user(&"中".repeat(100));
+        let ascii_est = ascii.estimate_tokens() as i64;
+        let ascii_cons = ascii.estimate_tokens_conservative() as i64;
+        assert!(
+            (ascii_cons - ascii_est).abs() <= 2,
+            "ASCII must estimate the same in both estimators (4 chars/token): \
+             {ascii_est} vs {ascii_cons}"
+        );
+        let conservative = cjk.estimate_tokens_conservative();
+        assert!(
+            conservative >= 100,
+            "each CJK char must count as at least one token; got {conservative}"
+        );
+        assert!(
+            conservative > cjk.estimate_tokens(),
+            "the byte estimate must be the smaller one for CJK"
+        );
+    }
+
+    #[test]
     fn model_history_keeps_tool_results_verbatim() {
         let mut c = Conversation::new();
         c.push(Message::user("run build"));
@@ -1373,6 +1454,32 @@ mod tests {
         });
         c.push(a);
         assert_eq!(c.last_pressure(), (128_000, 40_000, 0.3125));
+    }
+
+    #[test]
+    fn last_context_tokens_includes_the_response_output() {
+        let mut c = Conversation::new();
+        assert_eq!(
+            c.last_context_tokens(),
+            0,
+            "no assistant meta yet → no anchor"
+        );
+        let mut a = Message::assistant("ans", vec![]);
+        a.meta = Some(MessageMeta {
+            used_tokens: 40_000,
+            tokens: crate::stream::TokenUsage {
+                prompt: 40_000,
+                completion: 5_000,
+                cached: 0,
+            },
+            ..Default::default()
+        });
+        c.push(a);
+        assert_eq!(
+            c.last_context_tokens(),
+            45_000,
+            "the response output is part of the NEXT prompt"
+        );
     }
 
     #[test]

@@ -68,6 +68,19 @@ impl ArtifactStore {
         Ok(id)
     }
 
+    /// Protect an artifact from ROUTINE watchdog eviction (compaction archives).
+    ///
+    /// The marker is a zero-byte `<id>.pin` sibling. The global watchdog skips pinned
+    /// artifacts in its periodic 30% cycle and only considers them last when the hard
+    /// 7 GiB ceiling forces an emergency eviction. Idempotent.
+    pub fn pin(&self, id: &str) -> std::io::Result<()> {
+        if !is_valid_id(id) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.dir.join(format!("{id}.pin")), b"")
+    }
+
     pub fn get(&self, id: &str, offset: usize, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
         if !is_valid_id(id) {
             return Ok(None);
