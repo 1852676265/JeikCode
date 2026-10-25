@@ -993,6 +993,40 @@ test('spliceAuthoritativeDiskTail 仅保留更早的历史 Head 并用权威磁�
   assert.equal(spliced[5]?.id, 'a-3');
 });
 
+test('spliceAuthoritativeDiskTail 绝不会把 pinned 开场提问倒插到回答下方（>48条历史长会话结算防倒插）', () => {
+  // 核心回归案例：长会话（>48条）当且仅当包含早先历史时，对账切片自带 pinned 开场提问（src=8 < offset=22）。
+  // 画布原本时序：User(8) -> Assistant(9) -> Tool(10) -> Assistant(21)。
+  // 磁盘尾部切片：[User(8, pinned), Tool(22), Tool(23), Assistant(24)]。
+  // 旧实现将 User(8) 从早先历史 Head 中剔除，挪到了拼接 Seam（即 Assistant(21) 之后），导致提问倒插在回答下方！
+  const canvas = [
+    { role: 'user', id: 'u-8', sourceIndex: 8 },
+    { role: 'assistant', id: 'a-9', sourceIndex: 9 },
+    { role: 'assistant', id: 't-10', sourceIndex: 10 },
+    { role: 'assistant', id: 'a-21', sourceIndex: 21 },
+    { role: 'assistant', id: 't-22-dirty', sourceIndex: 22 },
+  ];
+  const diskTail = [
+    { role: 'user', id: 'u-8', sourceIndex: 8 }, // daemon tail=48 切片首部的 pinned user
+    { role: 'assistant', id: 't-22-clean', sourceIndex: 22 },
+    { role: 'assistant', id: 't-23', sourceIndex: 23 },
+    { role: 'assistant', id: 'a-24', sourceIndex: 24 },
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 22);
+
+  // 必须严格保证 User(8) 仍在索引 0 位置，绝不能被挪到 a-21 后面！
+  assert.equal(spliced[0]?.id, 'u-8');
+  assert.equal(spliced[0]?.sourceIndex, 8);
+  assert.equal(spliced[1]?.id, 'a-9');
+  assert.equal(spliced[1]?.sourceIndex, 9);
+  assert.equal(spliced[2]?.id, 't-10');
+  assert.equal(spliced[3]?.id, 'a-21');
+  assert.equal(spliced[4]?.id, 't-22-clean');
+  assert.equal(spliced[5]?.id, 't-23');
+  assert.equal(spliced[6]?.id, 'a-24');
+  assert.equal(spliced.length, 7);
+});
+
 test('spliceAuthoritativeDiskTail 在 offset <= 0 时直接全量采用磁盘', () => {
   const canvas = [{ role: 'user', sourceIndex: 999 }];
   const diskTail = [{ role: 'user', sourceIndex: 1 }, { role: 'assistant', sourceIndex: 2 }];

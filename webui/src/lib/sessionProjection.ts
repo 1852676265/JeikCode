@@ -883,6 +883,14 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
  * 用磁盘返回的权威尾部切片（diskTail）安全替换画布/缓存的尾部，同时严格保留
  * 画布中早于该切片起始偏移（sourceIndex < diskOffset）的更早历史头部（olderHead）。
  * 既不丢失用户向上翻看过的更早历史，又彻底杜绝内存旧尾部与磁盘新尾部杂交双重渲染！
+ *
+ * 核心架构铁律：
+ * diskTail 包含两部分：
+ * 1. pinned 行：sourceIndex < diskOffset（daemon 为首屏展示钉住的开场提问）；
+ * 2. actualTail：sourceIndex >= diskOffset（真正的尾部权威数据）。
+ * 若画布本身已具有早先历史（olderHead.length > 0），早先提问已处于其天然时序位置（在回答
+ * 之前），绝不能从 olderHead 中剔除挪到 diskTail 头部（否则造成提问倒插到回答下方！）。
+ * 只有画布无早先历史时，才采用 pinnedInTail。拼接后严格按 sourceIndex 升序对齐与去重。
  */
 export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id?: string }>(
   canvas: T[],
@@ -893,25 +901,40 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   if (!diskTail || diskTail.length === 0) return canvas;
   if (diskOffset <= 0) return diskTail;
 
-  // 权威切片里已经带上的行，绝不能再从画布头部保留一次：
-  // tail 页为了不丢掉本回合开头的提问，会把该提问 pinned 到切片首位，而它的
-  // sourceIndex 恰好小于 diskOffset（绝对索引更靠前）。只按 `< diskOffset`
-  // 过滤会让同一条提问同时出现在 olderHead 与 diskTail 里，并且每次终态对账
-  // 都会再叠一份。按绝对索引 + 稳定 id 双重排除，保证拼接幂等。
-  const tailIndices = new Set<number>();
-  const tailIds = new Set<string>();
+  const actualTail: T[] = [];
+  const pinnedInTail: T[] = [];
   for (const message of diskTail) {
-    if (typeof message.sourceIndex === 'number') tailIndices.add(message.sourceIndex);
-    if (message.id) tailIds.add(message.id);
-  }
-  const olderHead = canvas.filter((message) => {
-    if (typeof message.sourceIndex !== 'number' || message.sourceIndex >= diskOffset) {
-      return false;
+    if (typeof message.sourceIndex === 'number' && message.sourceIndex < diskOffset) {
+      pinnedInTail.push(message);
+    } else {
+      actualTail.push(message);
     }
-    if (tailIndices.has(message.sourceIndex)) return false;
-    return !(message.id && tailIds.has(message.id));
+  }
+
+  const olderHead = canvas.filter((message) => {
+    return typeof message.sourceIndex === 'number' && message.sourceIndex < diskOffset;
   });
-  return [...olderHead, ...diskTail];
+
+  const baseHead = olderHead.length > 0 ? olderHead : pinnedInTail;
+  const combined = [...baseHead, ...actualTail];
+
+  combined.sort((a, b) => {
+    const aSrc = typeof a.sourceIndex === 'number' ? a.sourceIndex : Infinity;
+    const bSrc = typeof b.sourceIndex === 'number' ? b.sourceIndex : Infinity;
+    return aSrc - bSrc;
+  });
+
+  const seenIds = new Set<string>();
+  const seenSrc = new Set<number>();
+  const result: T[] = [];
+  for (const m of combined) {
+    if (m.id && seenIds.has(m.id)) continue;
+    if (typeof m.sourceIndex === 'number' && seenSrc.has(m.sourceIndex)) continue;
+    if (m.id) seenIds.add(m.id);
+    if (typeof m.sourceIndex === 'number') seenSrc.add(m.sourceIndex);
+    result.push(m);
+  }
+  return result;
 }
 
 /**
