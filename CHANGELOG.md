@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.5 (2026-10-25)
+
+- **[WebUI Message Deduplication & Mobile Stream Reconciliation] Eliminate duplicate prompt bubbles and recover settled answers**:
+  - Hardened `paintUserMessage` and `placeRecoveredTurnUsers` against phantom prompt duplicates by preventing appends when the trailing canvas prompt is identical and awaiting an answer.
+  - Implemented `sanitizeCanvasMessages` to automatically clean up and fold consecutive duplicate user bubbles and dangling empty placeholders when restoring from IndexedDB or local cache.
+  - Reconciled settled turns across mobile disconnections: adopted authoritative disk tails via `spliceAuthoritativeDiskTail` when the server confirms completion while the local cache remains frozen on tool steps.
+
+---
+
+- **[WebUI 提问去重与移动端断网自愈] 彻底杜绝提问气泡克隆与最终回答缺失**:
+  - 加固 `paintUserMessage` 与 `placeRecoveredTurnUsers` 防克隆屏障：当画布末尾存在完全相同的用户提问且助手尚未产生回答时，严禁重复追加气泡。
+  - 引入 `sanitizeCanvasMessages` 自愈清洗逻辑：在从 IndexedDB 或内存缓存读取时，自动折叠剔除受历史污染的连续重复提问气泡与无用空占位。
+  - 修复移动端断网唤醒时的会话对账缺陷：当服务端确认轮次已完结而本地缓存仍停留在未结工具态时，通过 `spliceAuthoritativeDiskTail` 顺畅吸纳落盘权威尾部，彻底解决断线重入后最终回答缺失的问题。
+
 ## v7.3.0-beta.4 (2026-10-25)
 
 - **[WebUI Session Flow & Memory-First Architecture] Eliminate session race conditions, terminal freezes, and duplicate bubble cloning**:
