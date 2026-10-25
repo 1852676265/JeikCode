@@ -3,8 +3,10 @@ import { test } from 'node:test';
 import { marked } from 'marked';
 import {
   buildTableDelimiter,
+  isLanguageLikeInfo,
   isTableDelimiterLine,
   preprocessMarkdown,
+  promoteNestedCodeFences,
   splitTableCells,
   stripLanguageSentinel,
 } from './markdownPrep.ts';
@@ -462,6 +464,64 @@ test('cleanRedactedThinkingBlocks collapses raw encrypted thinking blocks into d
   assert.match(out2, /用户提供的反馈表明/);
 });
 
+test('isLanguageLikeInfo accepts real language tags and rejects prose info strings', () => {
+  for (const ok of ['rust', 'diff', 'json', 'c++', 'c#', 'mermaid-streaming', 'toml', 'bash', 'markdown']) {
+    assert.equal(isLanguageLikeInfo(ok), true, `expected language-like: ${ok}`);
+  }
+  for (const bad of ['', '+', '+ 【执行铁律】(禁 checkout)', '这是示例', 'some prose here', '标签']) {
+    assert.equal(isLanguageLikeInfo(bad), false, `expected prose: ${bad}`);
+  }
+});
+
+test('prose line starting with ``` inside a fence is not mistaken for a nested sub-fence (no desync)', () => {
+  // 复刻历史失真原文：外层 3 反引号，正文里出现 ` ``` + 【执行铁律】… `，后面还有一个同级代码块
+  const md = [
+    '**① 用户轮消息** — `formatted_comment_instruction`：',
+    '',
+    '```',
+    '【来源事件】：Issue #64 (...)',
+    '【评论内容】：',
+    '``` + 【执行铁律】(禁 checkout / 遵守 System Prompt / 非 OWNER 回 0)',
+    '```',
+    '',
+    '**② 动态 System Prompt 前缀**',
+    '```',
+    '评论双语输出规范：',
+    '```',
+    '',
+  ].join('\n');
+
+  // 预处理器绝不能把外层围栏提升到 4 个反引号（那会与真实闭合行错位）
+  const prepared = preprocessMarkdown(md);
+  assert.doesNotMatch(prepared, /````/);
+
+  const out = markdownToHtml(md);
+  // ① 的围栏代码块必须完整包含那行散文内容（注意避开行内 <code>）
+  const firstBlock = out.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/)?.[1] ?? '';
+  assert.match(firstBlock, /【来源事件】/);
+  assert.match(firstBlock, /``` \+ 【执行铁律】/);
+  // ② 的标题必须作为正常正文加粗渲染，绝不能被吞进代码块
+  assert.match(out, /<strong>② 动态 System Prompt 前缀<\/strong>/);
+  const codes = out.match(/<code[\s\S]*?<\/code>/g) ?? [];
+  for (const block of codes) assert.doesNotMatch(block, /② 动态 System Prompt/);
+});
+
+test('correctly authored 4-backtick outer fence is left intact and not over-promoted', () => {
+  const md = ['````', 'outer content', '``` + prose that looks like a fence', '````'].join('\n');
+  const prepared = preprocessMarkdown(md);
+  assert.doesNotMatch(prepared, /`````/); // 不得被提升到 5 反引号
+  const out = markdownToHtml(md);
+  const code = out.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/)?.[1] ?? '';
+  assert.match(code, /``` \+ prose that looks like a fence/);
+});
+
+test('genuine nested language-tagged fence is still promoted (regression guard)', () => {
+  const md = ['```markdown', '# title', '```bash', 'echo hi', '```', '```'].join('\n');
+  const promoted = promoteNestedCodeFences(md);
+  assert.match(promoted, /^````markdown$/m); // 外层被提升到 4 反引号
+  assert.match(promoted, /^````$/m);        // 外层闭合同步提升
+  assert.match(promoted, /^```bash$/m);     // 内层语言标签围栏保持不变
+});
 
 
 

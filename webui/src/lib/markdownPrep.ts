@@ -116,6 +116,20 @@ export function fenceClose(line: string, state: FenceState): boolean {
 }
 
 /**
+ * info 串是否是一个「像语言标签」的 token（rust / diff / json / c++ / c# / mermaid-streaming / toml …）。
+ *
+ * ★ 关键防御：围栏正文里经常出现以 ``` 开头的散文行（如 ` ``` + 【执行铁律】… `、` ``` 这是示例 `）。
+ * 按 CommonMark 它们确实是「带 info 串的开围栏」，但在一个已开启的围栏内部属于普通内容。
+ * 若不加甄别而把这行当成「嵌套子围栏」，promoteNestedCodeFences 会错误提升外层围栏长度、
+ * 并把错误的行改写为闭合，导致围栏长度 desync → 后续正文被吞进代码块（渲染成一片乱码画布）。
+ * 因此这里只接受「纯英文数字 + 常见语言符号」的 token，含中文/空白/标点的散文一律排除。
+ */
+const LANGUAGE_INFO_RE = /^[a-z][a-z0-9_+.#-]*$/;
+export function isLanguageLikeInfo(lang: string | undefined): boolean {
+  return LANGUAGE_INFO_RE.test((lang ?? '').trim().toLowerCase());
+}
+
+/**
  * 探测从 start 行开始，是否存在匹配当前围栏的合法闭合标记。
  * 如果在遇到匹配的闭合标记之前，遇到了另一个明确带语言的新代码块开启：
  * - 对于 Markdown 容器或文本/提示词语言：支持嵌套子代码块栈深度，避免内层闭合误伤外层。
@@ -133,9 +147,14 @@ export function findMatchingFenceClose(
     const raw = stripLineBreak(lines[k]);
     const trimmed = raw.trim();
 
-    // 遇到带语言标签的代码块开启行
+    // 遇到带语言标签的代码块开启行（★ 必须是「像语言标签」的 info 串，散文行不算，否则会误判嵌套）
     const nextOpen = fenceOpen(lines[k]);
-    if (nextOpen && trimmed.length > nextOpen.length && nextOpen.marker === fence.marker) {
+    if (
+      nextOpen &&
+      nextOpen.marker === fence.marker &&
+      isLanguageLikeInfo(nextOpen.lang) &&
+      trimmed.length > nextOpen.length
+    ) {
       // 关键防御：如果内部围栏长度严格小于外层围栏长度（例如 4 反引号包裹 3 反引号），
       // 内部围栏在 CommonMark 规范下纯属普通内容，绝不构成断裂！放行继续查找！
       if (nextOpen.length < fence.length) {
@@ -197,8 +216,10 @@ export function promoteNestedCodeFences(raw: string): string {
       const line = lines[k];
       const nextOpen = fenceOpen(line);
 
-      // 若内部出现带语言的代码块开启（通用支持所有编程语言与 diff 内部的嵌套保护）
-      if (nextOpen && nextOpen.marker === open.marker && nextOpen.lang) {
+      // 若内部出现「像语言标签」的代码块开启（通用支持所有编程语言与 diff 内部的嵌套保护）
+      // ★ 关键防御：围栏正文里的散文行（如 ` ``` + 【执行铁律】… `）info 串不是语言，
+      // 绝不能当作子围栏，否则会错误提升外层围栏长度并错位改写闭合行，导致围栏 desync。
+      if (nextOpen && nextOpen.marker === open.marker && isLanguageLikeInfo(nextOpen.lang)) {
         foundSubFence = true;
         maxInnerLen = Math.max(maxInnerLen, nextOpen.length);
         depth += 1;
@@ -385,7 +406,12 @@ export function isStructuralTerminator(line: string, currentFence: FenceState): 
   // 核心原则：只有当新代码块的围栏长度大于等于当前代码块时，才构成外部代码块的断裂开启！
   // 若新代码块围栏长度小于外层（如 4 反引号代码块内部包含了 3 反引号的示例文档），内部围栏纯属合法内容，绝不提前腰斩
   const opening = fenceOpen(line);
-  if (opening && opening.length >= currentFence.length && trimmed.length > opening.length) {
+  if (
+    opening &&
+    isLanguageLikeInfo(opening.lang) &&
+    opening.length >= currentFence.length &&
+    trimmed.length > opening.length
+  ) {
     return true;
   }
 
