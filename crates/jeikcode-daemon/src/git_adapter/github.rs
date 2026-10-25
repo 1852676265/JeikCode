@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{
     constant_time_eq, hmac_sha256, to_hex, GitEventKind, GitPlatformAdapter, GitUserMeta,
-    NormalizedGitEvent,
+    NormalizedGitEvent, PollPullRequestsOutput,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -456,12 +456,13 @@ impl GitPlatformAdapter for GitHubAdapter {
         Ok(msg)
     }
 
-    async fn fetch_active_pull_requests(
+    async fn fetch_active_pull_requests_with_etag(
         &self,
         token: &str,
         api_base: Option<&str>,
         repo: &str,
-    ) -> Result<Vec<NormalizedGitEvent>, String> {
+        etag: Option<&str>,
+    ) -> Result<PollPullRequestsOutput, String> {
         let base = api_base
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -471,10 +472,19 @@ impl GitPlatformAdapter for GitHubAdapter {
         let url =
             format!("{base}/repos/{repo}/pulls?state=open&sort=updated&direction=desc&per_page=50");
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let mut req = client.get(&url).header("User-Agent", "JeikCode-Bot/1.0");
         if !token.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", token.trim()));
+        }
+        if let Some(tag) = etag {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                req = req.header("If-None-Match", tag);
+            }
         }
 
         let resp = req
@@ -482,13 +492,34 @@ impl GitPlatformAdapter for GitHubAdapter {
             .await
             .map_err(|e| format!("Failed to fetch open PRs from GitHub: {e}"))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            let response_etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|val| val.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            return Ok(PollPullRequestsOutput {
+                events: vec![],
+                etag: response_etag.or_else(|| etag.map(|s| s.to_string())),
+                not_modified: true,
+            });
+        }
+
+        if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
             return Err(format!(
                 "GitHub fetch open PRs failed ({status}): {err_text}"
             ));
         }
+
+        let new_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|val| val.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let prs: Vec<Value> = resp
             .json()
@@ -534,7 +565,11 @@ impl GitPlatformAdapter for GitHubAdapter {
             });
         }
 
-        Ok(events)
+        Ok(PollPullRequestsOutput {
+            events,
+            etag: new_etag,
+            not_modified: false,
+        })
     }
 }
 
@@ -652,5 +687,86 @@ mod tests {
         assert_eq!(parsed_pr.head_branch.as_deref(), Some("feat/my-branch"));
         assert_eq!(parsed_pr.base_branch.as_deref(), Some("beta"));
         assert_eq!(parsed_pr.sender.username, "contributor");
+    }
+
+    #[tokio::test]
+    async fn test_github_fetch_active_pull_requests_etag_header_and_304() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock github server");
+        let addr = listener.local_addr().expect("mock addr");
+        let api_base = format!("http://127.0.0.1:{}", addr.port());
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.expect("read");
+                let req_text = String::from_utf8_lossy(&buf[..n]);
+
+                if req_text.contains("if-none-match: W/\"etag-42\"")
+                    || req_text.contains("If-None-Match: W/\"etag-42\"")
+                {
+                    let resp = "HTTP/1.1 304 Not Modified\r\nETag: W/\"etag-42\"\r\nContent-Length: 0\r\n\r\n";
+                    stream.write_all(resp.as_bytes()).await.expect("write 304");
+                } else {
+                    let body = serde_json::json!([{
+                        "number": 42,
+                        "title": "PR 42",
+                        "body": "PR description",
+                        "html_url": "https://github.com/owner/repo/pull/42",
+                        "head": {
+                            "sha": "sha-42",
+                            "ref": "feature-42"
+                        },
+                        "base": {
+                            "ref": "beta"
+                        },
+                        "user": {
+                            "login": "tester",
+                            "type": "User"
+                        }
+                    }])
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nETag: W/\"etag-42\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).await.expect("write 200");
+                }
+            }
+        });
+
+        let adapter = GitHubAdapter::new();
+
+        // 1. First poll: no etag provided -> 200 OK with ETag
+        let out1 = adapter
+            .fetch_active_pull_requests_with_etag("test-token", Some(&api_base), "owner/repo", None)
+            .await
+            .expect("fetch 200");
+        assert!(!out1.not_modified);
+        assert_eq!(out1.etag.as_deref(), Some("W/\"etag-42\""));
+        assert_eq!(out1.events.len(), 1);
+        assert_eq!(out1.events[0].issue_or_pr_number, Some(42));
+        assert_eq!(out1.events[0].head_sha.as_deref(), Some("sha-42"));
+
+        // 2. Second poll: cached etag provided -> 304 Not Modified
+        let out2 = adapter
+            .fetch_active_pull_requests_with_etag(
+                "test-token",
+                Some(&api_base),
+                "owner/repo",
+                out1.etag.as_deref(),
+            )
+            .await
+            .expect("fetch 304");
+        assert!(out2.not_modified);
+        assert_eq!(out2.etag.as_deref(), Some("W/\"etag-42\""));
+        assert!(out2.events.is_empty());
+
+        let _ = server_task.await;
     }
 }

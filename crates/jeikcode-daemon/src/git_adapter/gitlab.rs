@@ -6,7 +6,10 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use super::{constant_time_eq, GitEventKind, GitPlatformAdapter, GitUserMeta, NormalizedGitEvent};
+use super::{
+    constant_time_eq, GitEventKind, GitPlatformAdapter, GitUserMeta, NormalizedGitEvent,
+    PollPullRequestsOutput,
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct GitLabAdapter;
@@ -456,12 +459,13 @@ impl GitPlatformAdapter for GitLabAdapter {
         }
     }
 
-    async fn fetch_active_pull_requests(
+    async fn fetch_active_pull_requests_with_etag(
         &self,
         token: &str,
         api_base: Option<&str>,
         repo: &str,
-    ) -> Result<Vec<NormalizedGitEvent>, String> {
+        etag: Option<&str>,
+    ) -> Result<PollPullRequestsOutput, String> {
         let base = api_base
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -472,22 +476,54 @@ impl GitPlatformAdapter for GitLabAdapter {
             "{base}/projects/{encoded_repo}/merge_requests?state=opened&order_by=updated_at&sort=desc&per_page=50"
         );
 
-        let client = reqwest::Client::new();
-        let resp = client
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let mut req = client
             .get(&url)
             .header("PRIVATE-TOKEN", token.trim())
-            .header("User-Agent", "JeikCode-Bot/1.0")
+            .header("User-Agent", "JeikCode-Bot/1.0");
+        if let Some(tag) = etag {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                req = req.header("If-None-Match", tag);
+            }
+        }
+
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("Failed to fetch open Merge Requests from GitLab: {e}"))?;
 
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            let response_etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|val| val.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            return Ok(PollPullRequestsOutput {
+                events: vec![],
+                etag: response_etag.or_else(|| etag.map(|s| s.to_string())),
+                not_modified: true,
+            });
+        }
+
         if !resp.status().is_success() {
-            let status = resp.status();
             let err_text = resp.text().await.unwrap_or_default();
             return Err(format!(
                 "GitLab fetch open MRs failed ({status}): {err_text}"
             ));
         }
+
+        let new_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|val| val.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let mrs: Vec<Value> = resp
             .json()
@@ -539,7 +575,11 @@ impl GitPlatformAdapter for GitLabAdapter {
             });
         }
 
-        Ok(events)
+        Ok(PollPullRequestsOutput {
+            events,
+            etag: new_etag,
+            not_modified: false,
+        })
     }
 }
 
