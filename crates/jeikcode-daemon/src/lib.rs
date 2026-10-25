@@ -6758,6 +6758,10 @@ pub enum ChatEvent {
     UserIdentified {
         message_id: String,
         turn_ordinal: u32,
+        /// 绝对转录下标（客户端的 `sourceIndex`）：回放中“被折叠线切掉的提问”靠它
+        /// 回到真实位置，不必再用文本去大纲里猜。压缩可能重编号，故按 hint 使用。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        absolute_index: Option<usize>,
     },
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
@@ -8411,6 +8415,7 @@ impl ChatRuntimeProjector {
             Agent::UserMessage {
                 message_id,
                 turn_ordinal,
+                message_index,
             } => {
                 // Identity-only boundary: the `user` echo already painted the
                 // bubble; this binds it to the stored message id.
@@ -8423,6 +8428,7 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::UserIdentified {
                     message_id,
                     turn_ordinal,
+                    absolute_index: Some(message_index),
                 }]
             }
             Agent::TextDelta(text) => {
@@ -9545,13 +9551,24 @@ mod chat_part_identity_tests {
 
         // 新回合开始（提问已落盘），provider 在首个 assistant 边界前就失败：
         // 锚点必须切到本轮提问，绝不能再挂到上一轮回答上。
-        projector.project_agent(
+        let identified = projector.project_agent(
             Agent::UserMessage {
                 message_id: "m-user".into(),
                 turn_ordinal: 2,
+                message_index: 7,
             },
             "sess-1",
         );
+        match identified.as_slice() {
+            [ChatEvent::UserIdentified { absolute_index, .. }] => {
+                assert_eq!(
+                    *absolute_index,
+                    Some(7),
+                    "identity frame must carry the absolute transcript index"
+                );
+            }
+            other => panic!("expected one user_identified, got {other:?}"),
+        }
         assert_eq!(
             projector.current_message_id, None,
             "stale assistant id must be cleared at turn start"
@@ -16237,11 +16254,13 @@ mod tests {
         let identified = serde_json::to_value(ChatEvent::UserIdentified {
             message_id: "m-user-1".into(),
             turn_ordinal: 3,
+            absolute_index: Some(7),
         })
         .unwrap();
         assert_eq!(identified["type"], "user_identified");
         assert_eq!(identified["message_id"], "m-user-1");
         assert_eq!(identified["turn_ordinal"], 3);
+        assert_eq!(identified["absolute_index"], 7);
     }
 
     #[tokio::test]

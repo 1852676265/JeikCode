@@ -17,6 +17,7 @@ import {
   spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
   stampUserClientInputId,
+  stampUserSourceIndex,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -1234,5 +1235,33 @@ test('mergeOlderMessages 把无 sourceIndex 的回放提问按文本+时间戳�
   const merged = mergeOlderMessages(prev, older);
   assert.deepEqual(merged.map((m) => m.sourceIndex), [7, 8, 55]);
   assert.equal(merged.filter((m) => m.role === 'user').length, 1);
+});
+
+test('stampUserSourceIndex 用身份帧的绝对下标只回填无下标的回放提问', () => {
+  const canvas = [
+    // 回放恢复出来的提问：有 id（刚被 user_identified 绑定）但没有下标。
+    { role: 'user', id: 'm-u7', parts: [{ kind: 'text' as const, text: '开场提问' }] },
+    // 磁盘投影行：已有权威下标。
+    { role: 'user', id: 'm-u9', sourceIndex: 9, parts: [{ kind: 'text' as const, text: '磁盘行' }] },
+  ];
+  const stamped = stampUserSourceIndex(canvas, 'm-u7', 7);
+  assert.equal(stamped[0]!.sourceIndex, 7);
+  assert.equal(stamped[1]!.sourceIndex, 9);
+
+  // 已有权威下标的行绝不覆盖；未知 id / 非法下标 → 原数组返回。
+  assert.equal(stampUserSourceIndex(stamped, 'm-u9', 999), stamped);
+  assert.equal(stampUserSourceIndex(stamped, 'm-nope', 7), stamped);
+  assert.equal(stampUserSourceIndex(stamped, 'm-u7', Number.NaN), stamped);
+  assert.equal(stampUserSourceIndex(stamped, undefined, 7), stamped);
+
+  // 已错位到末尾的无下标行：盖章后必须真的重排回头部（渲染按数组序）。
+  const stray = [
+    { role: 'assistant', id: 'a-55', sourceIndex: 55, parts: [{ kind: 'text' as const, text: '窗口内回答' }] },
+    { role: 'user', id: 'm-u7', parts: [{ kind: 'text' as const, text: '开场提问' }] },
+  ];
+  const reordered = stampUserSourceIndex(stray, 'm-u7', 7);
+  assert.equal(reordered[0]!.id, 'm-u7');
+  assert.equal(reordered[0]!.sourceIndex, 7);
+  assert.equal(reordered[1]!.sourceIndex, 55);
 });
 

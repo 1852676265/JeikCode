@@ -1893,6 +1893,9 @@ impl RunningAgent {
                 self.rt.emit(AgentEvent::UserMessage {
                     message_id,
                     turn_ordinal,
+                    // The prompt was just pushed: its absolute position in the
+                    // conversation (== the persisted snapshot index) is the last row.
+                    message_index: convo.messages.len().saturating_sub(1),
                 });
             }
         }
@@ -6100,6 +6103,7 @@ mod steer_buffer_tests {
                 AgentEvent::UserMessage {
                     message_id,
                     turn_ordinal,
+                    ..
                 } => prompts.push((message_id, turn_ordinal)),
                 AgentEvent::Steered { inputs, .. } => {
                     steered_ids.extend(inputs.into_iter().map(|input| input.message_id));

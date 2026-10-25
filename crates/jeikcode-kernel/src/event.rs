@@ -166,6 +166,11 @@ pub enum AgentEvent {
     UserMessage {
         message_id: String,
         turn_ordinal: u32,
+        /// Absolute index of the stored prompt in the conversation/snapshot array
+        /// (the client's `sourceIndex`). Replay clients use it to put a prompt that
+        /// was cut off by the history page fold back at its real position instead
+        /// of guessing from text. A hint: compaction may renumber later rows.
+        message_index: usize,
     },
     TextDelta(String),
     /// A STREAMING fragment of a tool call the model is still emitting — live display of

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   consumesProgrammaticStopMark,
   isStaleProgrammaticStopFrame,
+  isStaleTerminalForArmedTurn,
   runningTurnStopAliases,
   stopAliasAllowsNextTurn,
 } from './turnStop.ts';
@@ -58,6 +59,21 @@ test('stopAliasAllowsNextTurn treats an idle alias as free and a live turn as bu
     false,
   );
   assert.equal(stopAliasAllowsNextTurn({ released: false }), false);
+});
+
+test('isStaleTerminalForArmedTurn 只吞“新回合尚未吐帧”窗口内的终态', () => {
+  // 刚投递、还没吐帧：这就是上一回合的缓存终态（自动 drain 后的假停止根因）。
+  assert.equal(isStaleTerminalForArmedTurn({ armedAt: 1_000, frameSeen: false, now: 1_500 }), true);
+  // 已吐过帧：这条终态属于本轮，必须照常收尾。
+  assert.equal(isStaleTerminalForArmedTurn({ armedAt: 1_000, frameSeen: true, now: 1_500 }), false);
+  // 没投递过新回合：不干预。
+  assert.equal(isStaleTerminalForArmedTurn({ frameSeen: false, now: 1_500 }), false);
+  // 窗口过期（真失败永远收不到帧）：交回正常终态处理，避免 bus 永久卡住。
+  assert.equal(isStaleTerminalForArmedTurn({ armedAt: 1_000, frameSeen: false, now: 20_000 }), false);
+  assert.equal(
+    isStaleTerminalForArmedTurn({ armedAt: 1_000, frameSeen: false, now: 5_000, ttlMs: 2_000 }),
+    false,
+  );
 });
 
 test('isStaleProgrammaticStopFrame swallows only the displaced turn terminal pair', () => {

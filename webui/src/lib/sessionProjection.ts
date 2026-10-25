@@ -326,6 +326,43 @@ export function stampUserClientInputId<T extends ProjectionMessage>(
   return messages;
 }
 
+/**
+ * 用回放的身份帧（`user_identified.absolute_index`）回填提问行的绝对下标，
+ * 并按该下标把这一行**重排回正确位置**（渲染按数组序，光盖字段不改可见位置）。
+ *
+ * 回放里“被折叠线切掉的提问”由客户端重建，天然没有下标；服务端在身份帧里带上
+ * 真实下标后就能直接归位。只处理“还没有下标”的行：磁盘投影行已有权威下标，绝不动。
+ */
+export function stampUserSourceIndex<T extends ProjectionMessage>(
+  messages: T[],
+  messageId: string | undefined,
+  sourceIndex: number | undefined,
+): T[] {
+  if (
+    !messageId ||
+    typeof sourceIndex !== 'number' ||
+    !Number.isFinite(sourceIndex) ||
+    sourceIndex < 0
+  ) {
+    return messages;
+  }
+  const index = messages.findIndex((message) => message.role === 'user' && message.id === messageId);
+  if (index < 0) return messages;
+  const row = messages[index]!;
+  if (typeof row.sourceIndex === 'number') return messages;
+
+  const rest = messages.slice(0, index).concat(messages.slice(index + 1));
+  const stamped = { ...row, sourceIndex } as T;
+  // 插到“第一个绝对下标更大”的行之前；没有则放末尾（在途新行）。
+  let insertAt = rest.findIndex(
+    (message) => typeof message.sourceIndex === 'number' && message.sourceIndex > sourceIndex,
+  );
+  if (insertAt < 0) insertAt = rest.length;
+  const next = rest.slice();
+  next.splice(insertAt, 0, stamped);
+  return next;
+}
+
 function paintUserMessageInner<T extends ProjectionMessage>(
   messages: T[],
   rawText: string,

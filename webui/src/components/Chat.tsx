@@ -189,7 +189,7 @@ import {
   stashSessionQueued,
   restoreSessionQueued,
 } from '../lib/queuedDraft';
-import { consumesProgrammaticStopMark, isStaleProgrammaticStopFrame, runningTurnStopAliases, stopAliasAllowsNextTurn, type ProgrammaticStopMark } from '../lib/turnStop';
+import { consumesProgrammaticStopMark, isStaleProgrammaticStopFrame, isStaleTerminalForArmedTurn, runningTurnStopAliases, stopAliasAllowsNextTurn, type ProgrammaticStopMark } from '../lib/turnStop';
 import { loadAppliedTodoCallIds, saveAppliedTodoCallIds } from '../lib/todoAppliedIds';
 import {
   chatRecoveryPolicy,
@@ -273,6 +273,7 @@ import {
   sanitizeCanvasMessages,
   lastAssistantHasAnswer,
   stampUserClientInputId,
+  stampUserSourceIndex,
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
@@ -1993,6 +1994,42 @@ export function Chat({
     if (activeIdRef.current === sessionId) return messagesRef.current;
     return messageCacheRef.current.get(sessionId) ?? [];
   }
+  /**
+   * 「新一轮已投递但还没吐任何帧」的窗口：此时到达的终态是**上一回合的缓存终态**
+   * （`/chat/watch` 对判定空闲的会话会补发 `session_terminal`）。它绝不能当作
+   * 本轮终态去清 busy / 收尾连接，否则按钮会变回发送箭头而 agent 仍在跑。
+   */
+  const turnArmedAtRef = useRef<Map<string, number>>(new Map());
+  const turnFrameSeenRef = useRef<Set<string>>(new Set());
+  function armTurn(sid: string | null | undefined) {
+    if (!sid) return;
+    turnArmedAtRef.current.set(sid, Date.now());
+    turnFrameSeenRef.current.delete(sid);
+  }
+  function disarmTurn(sid: string | null | undefined) {
+    if (!sid) return;
+    turnArmedAtRef.current.delete(sid);
+    turnFrameSeenRef.current.delete(sid);
+  }
+  function markTurnFrameSeen(sid: string) {
+    if (turnArmedAtRef.current.has(sid)) turnFrameSeenRef.current.add(sid);
+  }
+  function isTerminalForArmedTurnWithoutFrames(sid: string): boolean {
+    return isStaleTerminalForArmedTurn({
+      armedAt: turnArmedAtRef.current.get(sid),
+      frameSeen: turnFrameSeenRef.current.has(sid),
+      now: Date.now(),
+    });
+  }
+  /** 该会话是否有一条**新的本地回合**正在投递/运行（旧终态与磁盘对账不得收尾它）。 */
+  function isLocalTurnInFlight(sid: string | null | undefined): boolean {
+    if (!sid) return false;
+    return (
+      localTurnSessionsRef.current.has(sid) ||
+      backgroundRunningSessionsRef.current.has(sid) ||
+      localActiveStreamsBySessionRef.current.has(sid)
+    );
+  }
   /** 回放帧的提问是否落在折叠线以上（右栏大纲里它的绝对下标早于当前窗口起点）。 */
   function replayQueryAboveFold(sessionId: string, event: SSEEvent): boolean {
     if (event.type !== 'user' || typeof event.content !== 'string') return false;
@@ -2201,6 +2238,11 @@ export function Chat({
               placeReplayUsers(loadId, accepted);
               for (const frame of accepted.paint) {
                 if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
+                const frameIsTerminal =
+                  frame.type === 'done' || frame.type === 'stopped' || frame.type === 'error';
+                // 新一轮刚投递、这轮还没吐过任何帧：此时到达的终态属于上一回合。
+                if (frameIsTerminal && isTerminalForArmedTurnWithoutFrames(loadId)) continue;
+                if (!frameIsTerminal) markTurnFrameSeen(loadId);
                 const isCurrentView = activeIdRef.current === loadId;
                 if (isCurrentView) {
                   if (canvasReadySessionIdRef.current !== loadId) {
@@ -2239,6 +2281,7 @@ export function Chat({
                     frame.type === 'error'
                   ) {
                     if (isStaleProgrammaticStop(frame, loadId)) continue;
+                    disarmTurn(loadId);
                     terminalSeen = true;
                     sessionWatchersRef.current.delete(loadId);
                     localActiveStreamsBySessionRef.current.delete(loadId);
@@ -2254,6 +2297,7 @@ export function Chat({
                     frame.type === 'error'
                   ) {
                     if (isStaleProgrammaticStop(frame, loadId)) continue;
+                    disarmTurn(loadId);
                     terminalSeen = true;
                     sessionWatchersRef.current.delete(loadId);
                     localActiveStreamsBySessionRef.current.delete(loadId);
@@ -2342,6 +2386,9 @@ export function Chat({
         if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
           return true;
         }
+        // 新一轮已经在投递/运行（自动 drain 的 steer、立即发送的新回合）：
+        // 这份“空闲”签名来自尚未登记新回合的磁盘，绝不能据此清掉 busy。
+        if (isLocalTurnInFlight(id)) return true;
         setBusyAndClock(false);
         busyRef.current = false;
         onLiveRunningChange?.(id, false);
@@ -2381,6 +2428,8 @@ export function Chat({
     if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
       return true;
     }
+    // 旧回合的终态对账绝不能收尾已经在跑的新回合（否则按钮变回发送箭头）。
+    if (isLocalTurnInFlight(id)) return true;
     // 会话已停就收尾：停表、把本轮勾完的清单冻到尾部。
     // 服务端在空闲时不会再把已完成清单当作活跃画板返回，这里也不能把那份历史清单贴回输入框上方。
     setBusyAndClock(false);
@@ -2642,6 +2691,10 @@ export function Chat({
         placeReplayUsers(loadId, accepted);
         for (const frame of accepted.paint) {
           if (typeof frame.seq === 'number') writeStreamCursor(loadId, frame.seq);
+          const frameIsTerminal =
+            frame.type === 'done' || frame.type === 'stopped' || frame.type === 'error';
+          if (frameIsTerminal && isTerminalForArmedTurnWithoutFrames(loadId)) continue;
+          if (!frameIsTerminal) markTurnFrameSeen(loadId);
           const isCurrentView = activeIdRef.current === loadId;
           if (!isCurrentView) {
             // 核心对标：会话在后台运行时，总线推流绝不丢弃，实时反哺进会话专属缓存 messageCacheRef！
@@ -2743,6 +2796,7 @@ export function Chat({
             frame.type === 'error'
           ) {
             if (isStaleProgrammaticStop(frame, loadId)) continue;
+            disarmTurn(loadId);
             terminalSeen = true;
             // 游标会话级递增，跨回合不清（清了就没法续传断线期间的内容）。
             idleWatchFlashDisconnectsRef.current.delete(loadId);
@@ -6099,7 +6153,29 @@ export function Chat({
         // 身份回传：把乐观用户气泡绑定到落盘消息 id（刷新/切换/回放时按 id 收敛，
         // 不再回退文本启发）。受唯一性守卫保护，幂等。
         setMessages((prev) => {
-          const next = bindUserMessageIdentity(prev, event.message_id);
+          let next = bindUserMessageIdentity(prev, event.message_id);
+          // 回放里被折叠线切掉的提问没有绝对下标：用身份帧里的真实下标补上。
+          // 注意两个下标空间不同：wire 的 `absolute_index` 是**会话数组**下标，而画布的
+          // `sourceIndex` 是**显示列表**下标（展示层会过滤 system-reminder / legacy
+          // summary 行并插入 presentation 行）。所以优先用右栏大纲（磁盘显示空间）
+          // 的同名条目，wire 下标仅作“当前回合还没进大纲”时的兜底。
+          let outlineIndex: number | undefined;
+          if (turnOutlineRef.current.length > 0) {
+            const row = prev.find((m) => m.role === 'user' && m.id === event.message_id);
+            const rowText = visibleUserText(
+              row?.parts.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
+            );
+            if (rowText) {
+              outlineIndex = [...turnOutlineRef.current]
+                .reverse()
+                .find((turn) => userTextsMatch(turn.text, rowText))?.index;
+            }
+          }
+          next = stampUserSourceIndex(
+            next,
+            event.message_id,
+            outlineIndex ?? event.absolute_index,
+          );
           if (next === prev) return prev;
           messagesRef.current = next;
           const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
@@ -7058,6 +7134,8 @@ export function Chat({
     const now = Date.now();
     setBusyAndClock(true, now);
     busyRef.current = true;
+    // 新回合开始投递：进入“已投递、尚未吐帧”的窗口，用于识别上一回合的缓存终态。
+    armTurn(turnOwnerSid);
     if (turnOwnerSid) {
       localTurnSessionsRef.current.add(turnOwnerSid);
       onLiveRunningChange?.(turnOwnerSid, true);
@@ -7152,6 +7230,8 @@ export function Chat({
           // 越快、回放帧越集中，这个现象越明显（新会话窗口首条消息最常见）。
           canvasReadySessionIdRef.current = effectiveSid;
           flushPreMountStreamBuffer(effectiveSid);
+          // 新会话首发时 turnOwnerSid 还是 null，这里补上“已投递未吐帧”的窗口标记。
+          armTurn(effectiveSid);
         } else if (!messageCacheRef.current.has(effectiveSid)) {
           // 切走后缓存可能还是空的（落地页首发后立刻切走，切换块因 prevId 为空未落盘）。
           // 用本轮的乐观提问补一个起点，否则 applyEventToSessionCache 会把后续推流帧整体丢弃。

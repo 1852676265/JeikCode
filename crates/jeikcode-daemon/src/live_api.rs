@@ -1686,6 +1686,9 @@ pub(crate) enum LiveWireEvent {
     UserIdentified {
         message_id: String,
         turn_ordinal: u32,
+        /// 绝对转录下标（= 客户端的 `sourceIndex`），回放时用于归位被折叠线切掉的提问。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        absolute_index: Option<usize>,
     },
     /// One or more live inputs were folded into the active turn. The exact
     /// payload lets browser clients acknowledge their FIFO pending-steer UI
@@ -1795,11 +1798,13 @@ impl NativeLiveWireProjector {
         if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(Kernel::UserMessage {
             message_id,
             turn_ordinal,
+            message_index,
         })) = &event
         {
             return Some(LiveWireEvent::UserIdentified {
                 message_id: message_id.clone(),
                 turn_ordinal: *turn_ordinal,
+                absolute_index: Some(*message_index),
             });
         }
 
@@ -4918,6 +4923,7 @@ mod tests {
                 CodingRuntimeEvent::Agent(jeikcode_kernel::event::AgentEvent::UserMessage {
                     message_id: "m-user-1".into(),
                     turn_ordinal: 4,
+                    message_index: 11,
                 }),
             ))
             .expect("the stored user identity must reach the live wire");
@@ -4925,6 +4931,7 @@ mod tests {
         assert_eq!(json["type"], "user_identified");
         assert_eq!(json["message_id"], "m-user-1");
         assert_eq!(json["turn_ordinal"], 4);
+        assert_eq!(json["absolute_index"], 11);
     }
 
     #[test]

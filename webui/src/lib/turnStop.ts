@@ -79,6 +79,28 @@ export function isStaleProgrammaticStopFrame(
 }
 
 /**
+ * Is a terminal frame arriving **after a new turn was delivered, but before that
+ * turn produced any frame**, actually the previous turn's cached terminal?
+ *
+ * `/chat/watch` re-sends `session_terminal` to a reattaching watcher when the
+ * session looks idle. A freshly-drained steer starts its POST a moment later, so
+ * the cached `done` can land in between and would otherwise clear `busy` / close
+ * the new connection: the send button flips back to the arrow while the agent is
+ * running ("fake stop"). A turn that already produced a frame owns the next
+ * terminal, and the window expires so a genuinely silent failure cannot wedge it.
+ */
+export function isStaleTerminalForArmedTurn(input: {
+  armedAt?: number;
+  frameSeen: boolean;
+  now: number;
+  ttlMs?: number;
+}): boolean {
+  if (input.armedAt == null) return false;
+  if (input.frameSeen) return false;
+  return input.now - input.armedAt <= (input.ttlMs ?? 15_000);
+}
+
+/**
  * 这一条停止别名是否允许紧接着投递下一回合。
  *
  * `released: true` 是权威结论。`was not running` 是幂等空操作（别名本来就没占槽），
