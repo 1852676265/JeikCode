@@ -16,6 +16,7 @@ import {
   setDefaultProvider,
   deleteProvider,
   fetchUpstreamModels,
+  probeUpstreamModel,
 } from '../api';
 import { useSettings, Theme } from '../settings';
 import { languageOptions, Lang } from '../i18n';
@@ -355,7 +356,7 @@ function notifyConfigChange() {
   }
 }
 
-export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
+export function ModelConfigView({ onDone }: { onDone?: () => void }) {
   const { t } = useSettings();
   const [config, setConfig] = useState<ConfigInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -484,7 +485,6 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <>
-    <SettingsModal title={t('settings.menuModel')} extraLarge onClose={onClose}>
       <div class="field-group" style={{ gap: '14px' }}>
         {loadError && <div class="modal-error">{t('settings.loadFailed')}: {loadError}</div>}
         {!config && !loadError && <div class="modal-loading">{t('settings.loading')}</div>}
@@ -759,7 +759,6 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
           </>
         )}
       </div>
-    </SettingsModal>
 
     {showAddModel && (
       <ProviderFormDialog
@@ -845,6 +844,15 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
+  const { t } = useSettings();
+  return (
+    <SettingsModal title={t('settings.menuModel')} extraLarge onClose={onClose}>
+      <ModelConfigView onDone={onClose} />
+    </SettingsModal>
+  );
+}
+
 /**
  * 「添加 / 编辑模型」弹窗。
  * 协议 / Base URL / API Key 只在提供商账号阶段配置；这里只选账号，并填写
@@ -914,6 +922,13 @@ function ProviderFormDialog({
   const [fetching, setFetching] = useState(false);
   const [fetchStatus, setFetchStatus] = useState<string | null>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  // 探活：用当前账号 key/url 按协议发一次极小「Hi」，展示 OK+延迟 / Failed。
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<{
+    ok: boolean;
+    latencyMs: number;
+    error?: string;
+  } | null>(null);
   const [highlight, setHighlight] = useState(0);
   const modelWrapRef = useRef<HTMLDivElement | null>(null);
 
@@ -974,6 +989,33 @@ function ProviderFormDialog({
       );
     } finally {
       setFetching(false);
+    }
+  };
+
+  const runProbe = async () => {
+    if (!selectedAccount) {
+      setFetchStatus(t('settings.needAccountFirst'));
+      return;
+    }
+    const id = model.trim();
+    if (!id) {
+      setFetchStatus(t('settings.allRequired'));
+      return;
+    }
+    setProbing(true);
+    setProbeResult(null);
+    try {
+      const res = await probeUpstreamModel({
+        account: selectedAccount.id,
+        provider_name: isEdit ? name : undefined,
+        skip_tls_verify: selectedAccount.skip_tls_verify,
+        model: id,
+      });
+      setProbeResult({ ok: res.ok, latencyMs: res.latency_ms, error: res.error });
+    } catch (e: unknown) {
+      setProbeResult({ ok: false, latencyMs: 0, error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setProbing(false);
     }
   };
 
@@ -1075,6 +1117,7 @@ function ProviderFormDialog({
                   setAccount(v);
                   setCandidates([]);
                   setFetchStatus(null);
+                  setProbeResult(null);
                 }}
               />
               <span class="field-hint">{t('settings.inheritAccountCreds')}</span>
@@ -1105,6 +1148,7 @@ function ProviderFormDialog({
               onInput={(e) => {
                 setModel((e.target as HTMLInputElement).value);
                 setModelMenuOpen(true);
+                setProbeResult(null);
               }}
               onKeyDown={(e) => {
                 if (!modelMenuOpen || filtered.length === 0) return;
@@ -1131,6 +1175,23 @@ function ProviderFormDialog({
             >
               {fetching ? '…' : '↻'}
             </button>
+            <button
+              type="button"
+              class="btn model-id-probe"
+              disabled={probing || !selectedAccount || !model.trim()}
+              title={t('settings.probeHint')}
+              onClick={() => void runProbe()}
+            >
+              {probing ? '…' : t('settings.probe')}
+            </button>
+            {probeResult && (
+              <span
+                class={'model-probe-status ' + (probeResult.ok ? 'ok' : 'bad')}
+                title={probeResult.error || ''}
+              >
+                {probeResult.ok ? `OK · ${probeResult.latencyMs} ms` : 'Failed'}
+              </span>
+            )}
           </div>
           {fetchStatus && <span class="field-hint">{fetchStatus}</span>}
           {modelMenuOpen && filtered.length > 0 && (

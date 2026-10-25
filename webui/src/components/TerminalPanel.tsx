@@ -583,10 +583,10 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
     };
   }, [active, activeTabId]);
 
-  // 终端统一使用专业沉浸的暗黑主题（即使全局为亮色模式，终端视口亦保持经典深色黑底）
+  // 终端主题跟随全局亮/暗：亮色模式用高对比浅色终端，暗色用经典深色终端。
   useEffect(() => {
     for (const { term } of termMap.current.values()) {
-      term.options.theme = DARK_TERMINAL_THEME;
+      term.options.theme = isDark ? DARK_TERMINAL_THEME : LIGHT_TERMINAL_THEME;
     }
   }, [isDark]);
 
@@ -710,7 +710,7 @@ export function TerminalPanel({ cwd, active, onTabsCountChange }: TerminalPanelP
           fontFamily: '"Cascadia Mono", Consolas, "Courier New", monospace',
           lineHeight: 1,
           letterSpacing: 0,
-          theme: DARK_TERMINAL_THEME,
+          theme: isDark ? DARK_TERMINAL_THEME : LIGHT_TERMINAL_THEME,
           allowProposedApi: true,
           scrollback: 10000,
           windowsPty: isHostWin ? { backend: 'conpty' } : undefined,

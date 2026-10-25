@@ -4,12 +4,14 @@ import { getDesktopSettings, postDesktopSettings, getHealth, type DesktopSetting
 import { bakedAppVersion, normalizeAppVersion } from '../lib/appVersion';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
+import { ModelConfigView } from './SettingsDialogs';
 
 interface SystemSettingsDialogProps {
   onClose: () => void;
+  initialTab?: TabKey;
 }
 
-type TabKey = 'desktop' | 'about';
+type TabKey = 'models' | 'desktop' | 'about';
 
 interface ModuleTab {
   key: TabKey;
@@ -18,9 +20,9 @@ interface ModuleTab {
   icon: string;
 }
 
-export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
+export function SystemSettingsDialog({ onClose, initialTab }: SystemSettingsDialogProps) {
   const t = useT();
-  const [activeTab, setActiveTab] = useState<TabKey>('desktop');
+  const [activeTab, setActiveTab] = useState<TabKey>(initialTab || 'models');
   const [closeAction, setCloseAction] = useState<'ask' | 'tray' | 'quit'>('ask');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -31,6 +33,7 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
   const backdropDismiss = useBackdropDismiss(onClose);
 
   const tabs: ModuleTab[] = [
+    { key: 'models', labelKey: 'settings.tabModels', defaultLabel: '模型与配置', icon: '⚡' },
     { key: 'desktop', labelKey: 'settings.tabDesktop', defaultLabel: '桌面与系统', icon: '🖥️' },
     { key: 'about', labelKey: 'settings.tabAbout', defaultLabel: '关于与版本', icon: 'ℹ️' },
   ];
@@ -88,7 +91,7 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
       role="dialog"
       aria-modal="true"
       style={{
-        zIndex: 100000,
+        zIndex: 90000,
         background: 'var(--app-modal-background, rgba(0, 0, 0, 0.65))',
         backdropFilter: 'blur(14px)',
         WebkitBackdropFilter: 'blur(14px)',
@@ -98,8 +101,8 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
         class="modal-card modal-card-lg system-settings-card"
         onClick={(e) => e.stopPropagation()}
         style={{
-          width: 'min(760px, 94vw)',
-          height: 'min(580px, 86dvh)',
+          width: 'min(980px, 95vw)',
+          height: 'min(700px, 90dvh)',
           display: 'flex',
           flexDirection: 'column',
           background: 'var(--app-menu-background, #181a20)',
@@ -178,11 +181,15 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
           <div
             style={{
               flex: 1,
-              padding: '24px',
+              padding: activeTab === 'models' ? '16px' : '24px',
               overflowY: 'auto',
               background: 'transparent',
+              minWidth: 0,
             }}
           >
+            {activeTab === 'models' && (
+              <ModelConfigView onDone={onClose} />
+            )}
             {activeTab === 'desktop' && (
               <div>
                 <h4 style={{ margin: '0 0 16px', fontSize: '15px', fontWeight: 600 }}>

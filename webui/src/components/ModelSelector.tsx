@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { getModels, ModelInfo, postLiveReasoningEffort } from '../api';
+import { getModels, ModelInfo, postLiveReasoningEffort, probeUpstreamModel } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 import { modelAliasLabel } from '../lib/modelLabel';
@@ -114,6 +114,53 @@ export function ModelSelector({
   const [budgetChecked, setBudgetChecked] = useState<Record<string, boolean>>({});
   // 思考强度每一项输入的自定义预算数值
   const [budgetInputs, setBudgetInputs] = useState<Record<string, number>>({});
+
+  // 批量并发探活状态与结果缓存
+  const [probingProviders, setProbingProviders] = useState<Set<string>>(new Set());
+  const [probeResults, setProbeResults] = useState<
+    Map<string, { ok: boolean; latencyMs: number; error?: string }>
+  >(new Map());
+
+  const runBatchProbe = async (providerGroup: string, targetModels: ModelInfo[]) => {
+    if (probingProviders.has(providerGroup) || targetModels.length === 0) return;
+    setProbingProviders((prev) => new Set(prev).add(providerGroup));
+
+    // 并发工作池（最大 5 个并发请求异步多线程测试）
+    const concurrency = 5;
+    const queue = [...targetModels];
+    const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+      while (queue.length > 0) {
+        const m = queue.shift();
+        if (!m) break;
+        try {
+          const res = await probeUpstreamModel({
+            account: m.account,
+            provider_name: m.provider,
+            model: m.model,
+          });
+          setProbeResults((prev) => {
+            const next = new Map(prev);
+            next.set(m.provider, { ok: res.ok, latencyMs: res.latency_ms, error: res.error });
+            return next;
+          });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setProbeResults((prev) => {
+            const next = new Map(prev);
+            next.set(m.provider, { ok: false, latencyMs: 0, error: msg });
+            return next;
+          });
+        }
+      }
+    });
+
+    await Promise.allSettled(workers);
+    setProbingProviders((prev) => {
+      const next = new Set(prev);
+      next.delete(providerGroup);
+      return next;
+    });
+  };
 
   const ref = useRef<HTMLDivElement>(null);
   const effortRef = useRef<HTMLDivElement>(null);
@@ -756,7 +803,34 @@ export function ModelSelector({
               {/* 右栏：当前提供商下的所有模型列表 */}
               <div class="model-cascade-models-column">
                 <div class="model-column-title">
-                  <span>{activeProvider || t('model.label')}</span>
+                  <div class="model-column-title-left">
+                    <span class="model-column-provider-name">{activeProvider || t('model.label')}</span>
+                    {activeProvider && activeModels.length > 0 && (
+                      <button
+                        type="button"
+                        class={'model-batch-probe-btn' + (probingProviders.has(activeProvider) ? ' is-probing' : '')}
+                        disabled={probingProviders.has(activeProvider)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void runBatchProbe(activeProvider, activeModels);
+                        }}
+                        title={t('settings.probeAllHint')}
+                        aria-label={t('settings.probeAll')}
+                      >
+                        {probingProviders.has(activeProvider) ? (
+                          <>
+                            <span class="model-probe-spinner" aria-hidden="true" />
+                            <span>{t('settings.probing')}</span>
+                          </>
+                        ) : (
+                          <>
+                            <span class="model-probe-icon" aria-hidden="true">⚡</span>
+                            <span>{t('settings.probeAll')}</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
                   <span class="model-count-tag">{activeModels.length}</span>
                 </div>
                 <div class="model-models-list">
@@ -764,6 +838,7 @@ export function ModelSelector({
                     const isSelected = m.provider === (value ?? current?.provider);
                     const alias = modelAliasLabel(m);
                     const wireModel = m.model;
+                    const probe = probeResults.get(m.provider);
 
                     return (
                       <button
@@ -781,8 +856,18 @@ export function ModelSelector({
                               <HighlightText text={alias} query={searchQuery} />
                             </span>
                             {m.is_default && <span class="model-badge-default">{t('settings.default')}</span>}
-                            {m.effort_applicable && (
-                              <span class="model-badge-thinking" title={t('settings.reasoningModel')}>🧠</span>
+                            {/* 探活结果标签：成功显示绿色延迟，失败显示红色 Failed，未测不带标签也不带大脑 */}
+                            {probe && (
+                              <span
+                                class={'model-probe-tag ' + (probe.ok ? 'ok' : 'failed')}
+                                title={
+                                  probe.ok
+                                    ? t('settings.probeSuccess', { ms: probe.latencyMs })
+                                    : t('settings.probeFailed', { error: probe.error || '' })
+                                }
+                              >
+                                {probe.ok ? `${probe.latencyMs} ms` : 'Failed'}
+                              </span>
                             )}
                           </div>
                           {wireModel && wireModel !== alias && (

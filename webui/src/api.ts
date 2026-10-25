@@ -1743,6 +1743,39 @@ export async function fetchUpstreamModels(body: {
   return Array.isArray(data?.models) ? data.models.filter((id: unknown) => typeof id === 'string') : [];
 }
 
+export interface UpstreamProbeResult {
+  ok: boolean;
+  latency_ms: number;
+  error?: string;
+}
+
+/** POST /providers/upstream-models {probe:true} — 用当前账号的 key/url 按协议发一次极小「Hi」探活。 */
+export async function probeUpstreamModel(body: {
+  protocol?: string;
+  base_url?: string;
+  api_key?: string;
+  /** 已有提供商账号：服务端继承其 key / base_url / 协议。 */
+  account?: string;
+  provider_name?: string;
+  skip_tls_verify?: boolean;
+  model: string;
+}): Promise<UpstreamProbeResult> {
+  const r = await apiFetch('/providers/upstream-models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ ...body, probe: true }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new Error((data as any)?.error || `HTTP ${r.status}`);
+  }
+  return {
+    ok: data?.ok === true,
+    latency_ms: typeof data?.latency_ms === 'number' ? data.latency_ms : 0,
+    error: typeof data?.error === 'string' ? data.error : undefined,
+  };
+}
+
 /** POST /providers/:name/default —— 设为默认 provider。 */
 export async function setDefaultProvider(name: string): Promise<unknown> {
   const r = await apiFetch(`/providers/${encodeURIComponent(name)}/default`, {

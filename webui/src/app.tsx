@@ -1616,10 +1616,10 @@ export function App() {
           <LanguageDialog onClose={() => setSettingsSection(null)} />
         )}
         {settingsSection === 'model' && (
-          <ModelConfigDialog onClose={() => setSettingsSection(null)} />
+          <SystemSettingsDialog initialTab="models" onClose={() => setSettingsSection(null)} />
         )}
         {settingsSection === 'system' && (
-          <SystemSettingsDialog onClose={() => setSettingsSection(null)} />
+          <SystemSettingsDialog initialTab="models" onClose={() => setSettingsSection(null)} />
         )}
         {headerDialog === 'rename' && activeSession && (
           <RenameDialog

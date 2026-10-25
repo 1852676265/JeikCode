@@ -1060,6 +1060,13 @@ pub(crate) struct UpstreamModelsRequest {
     pub provider_name: Option<String>,
     #[serde(default)]
     pub skip_tls_verify: bool,
+    /// 为 true 时不做模型目录列举，而是经解析后的传输发一次极小「Hi」请求，
+    /// 返回 `{ok, latency_ms}`（探活）。
+    #[serde(default)]
+    pub probe: bool,
+    /// 探活目标模型 id（`probe=true` 时必填）。
+    #[serde(default)]
+    pub model: String,
 }
 
 /// Resolved transport facts for an upstream `/models` probe.
@@ -1176,6 +1183,28 @@ pub(crate) async fn list_upstream_models(
         Ok(v) => v,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
     };
+    // 探活分支：发一次极小「Hi」，无论成败都返回 200，由前端渲染 OK(绿)/Failed(红)。
+    if req.probe {
+        let model = req.model.trim();
+        if model.is_empty() {
+            return json_error(StatusCode::BAD_REQUEST, "model is required for probe")
+                .into_response();
+        }
+        let started = std::time::Instant::now();
+        return match probe_upstream_chat(&resolved, model).await {
+            Ok(()) => Json(serde_json::json!({
+                "ok": true,
+                "latency_ms": started.elapsed().as_millis() as u64,
+            }))
+            .into_response(),
+            Err(error) => Json(serde_json::json!({
+                "ok": false,
+                "latency_ms": started.elapsed().as_millis() as u64,
+                "error": error,
+            }))
+            .into_response(),
+        };
+    }
     match fetch_upstream_model_ids(
         &resolved.protocol,
         &resolved.base_url,
@@ -1187,6 +1216,117 @@ pub(crate) async fn list_upstream_models(
         Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error).into_response(),
     }
+}
+
+/// 按协议推导 chat 端点（与 [`models_endpoint`] 同源规则）。
+fn chat_endpoint(protocol: &str, base_url: &str, model: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    let p = protocol.to_ascii_lowercase();
+    if p == "ollama" {
+        let origin = base
+            .strip_suffix("/v1")
+            .unwrap_or(base)
+            .trim_end_matches('/');
+        return format!("{origin}/api/chat");
+    }
+    if p == "gemini" || p == "google-gemini" || p == "gemini-compatible" {
+        let root = if base.ends_with("/v1beta") || base.ends_with("/v1") {
+            base.to_string()
+        } else {
+            format!("{base}/v1beta")
+        };
+        return format!("{root}/models/{model}:generateContent");
+    }
+    if p == "anthropic" || p == "claude" || p == "anthropic-compatible" {
+        return if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
+    }
+    let root = if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    };
+    if p == "responses" || p == "responses-compatible" || p == "openai-responses" {
+        format!("{root}/responses")
+    } else {
+        format!("{root}/chat/completions")
+    }
+}
+
+/// 各协议的最小「Hi」请求体（max tokens = 1，成本极小）。
+fn probe_body(protocol: &str, model: &str) -> serde_json::Value {
+    let p = protocol.to_ascii_lowercase();
+    if p == "gemini" || p == "google-gemini" || p == "gemini-compatible" {
+        return serde_json::json!({
+            "contents": [{ "parts": [{ "text": "Hi" }] }],
+            "generationConfig": { "maxOutputTokens": 1 }
+        });
+    }
+    if p == "anthropic" || p == "claude" || p == "anthropic-compatible" {
+        return serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+    }
+    if p == "responses" || p == "responses-compatible" || p == "openai-responses" {
+        return serde_json::json!({ "model": model, "input": "Hi", "max_output_tokens": 16 });
+    }
+    if p == "ollama" {
+        return serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        });
+    }
+    serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "max_tokens": 1,
+        "stream": false
+    })
+}
+
+/// 探活：按解析后的协议向目标模型发一次极小「Hi」，仅关心是否 2xx。
+async fn probe_upstream_chat(resolved: &UpstreamResolve, model: &str) -> Result<(), String> {
+    let url = chat_endpoint(&resolved.protocol, &resolved.base_url, model);
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .connect_timeout(std::time::Duration::from_secs(8));
+    if resolved.skip_tls_verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let p = resolved.protocol.to_ascii_lowercase();
+    let is_gemini = p == "gemini" || p == "google-gemini" || p == "gemini-compatible";
+    let is_anthropic = p == "anthropic" || p == "claude" || p == "anthropic-compatible";
+    let mut req = client
+        .post(&url)
+        .json(&probe_body(&resolved.protocol, model));
+    if is_gemini {
+        if !resolved.api_key.is_empty() {
+            req = req.header("x-goog-api-key", &resolved.api_key);
+        }
+    } else if is_anthropic {
+        if !resolved.api_key.is_empty() {
+            req = req
+                .header("x-api-key", &resolved.api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+    } else if !resolved.api_key.is_empty() {
+        req = req.bearer_auth(&resolved.api_key);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let snippet: String = body.trim().chars().take(200).collect();
+    Err(format!("HTTP {} {snippet}", status.as_u16()))
 }
 
 fn models_endpoint(protocol: &str, base_url: &str) -> String {
@@ -1294,7 +1434,8 @@ async fn fetch_upstream_model_ids(
 #[cfg(test)]
 mod upstream_tests {
     use super::{
-        models_endpoint, parse_model_ids, resolve_upstream_request, UpstreamModelsRequest,
+        chat_endpoint, models_endpoint, parse_model_ids, probe_body, resolve_upstream_request,
+        UpstreamModelsRequest,
     };
     use crate::api_config::update_config;
     use jeikcode_config::config::provider::{ModelProfileConfig, ProviderAccountConfig};
@@ -1322,6 +1463,59 @@ mod upstream_tests {
             parse_model_ids(body),
             vec!["grok-4.5".to_string(), "grok-4.6".to_string()]
         );
+    }
+
+    #[test]
+    fn chat_endpoint_derives_per_protocol_paths() {
+        assert_eq!(
+            chat_endpoint("openai", "https://x/v1", "m"),
+            "https://x/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_endpoint("openai", "https://x", "m"),
+            "https://x/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_endpoint("responses", "https://x/v1", "m"),
+            "https://x/v1/responses"
+        );
+        assert_eq!(
+            chat_endpoint("anthropic", "https://x", "m"),
+            "https://x/v1/messages"
+        );
+        assert_eq!(
+            chat_endpoint("anthropic", "https://x/v1", "m"),
+            "https://x/v1/messages"
+        );
+        assert_eq!(
+            chat_endpoint("gemini", "https://x", "gem"),
+            "https://x/v1beta/models/gem:generateContent"
+        );
+        assert_eq!(
+            chat_endpoint("gemini", "https://x/v1beta", "gem"),
+            "https://x/v1beta/models/gem:generateContent"
+        );
+        assert_eq!(
+            chat_endpoint("ollama", "http://x:11434/v1", "m"),
+            "http://x:11434/api/chat"
+        );
+        assert_eq!(
+            chat_endpoint("ollama", "http://x:11434", "m"),
+            "http://x:11434/api/chat"
+        );
+    }
+
+    #[test]
+    fn probe_body_uses_protocol_specific_minimal_shape() {
+        assert_eq!(probe_body("openai", "m")["messages"][0]["content"], "Hi");
+        assert_eq!(probe_body("openai", "m")["max_tokens"], 1);
+        assert_eq!(probe_body("anthropic", "m")["max_tokens"], 1);
+        assert_eq!(
+            probe_body("gemini", "m")["contents"][0]["parts"][0]["text"],
+            "Hi"
+        );
+        assert_eq!(probe_body("responses", "m")["input"], "Hi");
+        assert_eq!(probe_body("ollama", "m")["stream"], false);
     }
 
     #[test]
@@ -1354,6 +1548,8 @@ mod upstream_tests {
             account: Some("my-gemini".into()),
             provider_name: None,
             skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
         })
         .expect("resolve");
 
@@ -1392,6 +1588,8 @@ mod upstream_tests {
             account: Some("ds".into()),
             provider_name: None,
             skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
         })
         .expect("resolve");
 
@@ -1452,6 +1650,8 @@ mod upstream_tests {
             account: None,
             provider_name: Some("chat".into()),
             skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
         })
         .expect("resolve");
 
