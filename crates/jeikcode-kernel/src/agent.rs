@@ -2548,23 +2548,38 @@ impl RunningAgent {
             // per turn: if it cannot shrink (single huge input), the emergency
             // block below still owns the hard backstop.
             if !midturn_auto_attempted {
-                if let Some(utilization) = midturn_auto_utilization(
-                    self.provider.context_window(),
-                    self.compact_threshold,
-                    messages
-                        .iter()
-                        .map(|m| m.estimate_tokens_conservative())
-                        .sum::<u32>(),
-                ) {
-                    midturn_auto_attempted = true;
-                    self.run_compaction(convo, CompactTrigger::Auto { utilization })
-                        .await;
-                    messages = convo.model_history();
-                    self.hooks.pre_request(&mut messages, &turn_ctx).await;
-                    let stored_wire = convo.model_history();
-                    appended_only &= messages.len() >= stored_wire.len()
-                        && messages[..stored_wire.len()] == stored_wire[..];
-                    Conversation::repair_pairing(&mut messages);
+                let window = self.provider.context_window();
+                let estimated_prompt: u32 = messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative())
+                    .sum();
+                if let Some(utilization) =
+                    midturn_auto_utilization(window, self.compact_threshold, estimated_prompt)
+                {
+                    // Only the HIGH-QUALITY drain+summary path is worth a mid-turn
+                    // cache break. A pure-stub strategy keeps the task-boundary
+                    // cadence it was designed for (the stub exists to protect the
+                    // prefix cache, and mid-turn stubbing would rewrite a prefix the
+                    // current turn already sent).
+                    let view = CompactionView {
+                        messages: &convo.messages,
+                        trigger: CompactTrigger::Auto { utilization },
+                        ctx_window: window,
+                        used_tokens: estimated_prompt,
+                        utilization,
+                        sacred_floor: convo.sacred_floor(),
+                    };
+                    if self.compaction.will_summarize(&view) {
+                        midturn_auto_attempted = true;
+                        self.run_compaction(convo, CompactTrigger::Auto { utilization })
+                            .await;
+                        messages = convo.model_history();
+                        self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                        let stored_wire = convo.model_history();
+                        appended_only &= messages.len() >= stored_wire.len()
+                            && messages[..stored_wire.len()] == stored_wire[..];
+                        Conversation::repair_pairing(&mut messages);
+                    }
                 }
             }
             // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
