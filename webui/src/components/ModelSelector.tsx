@@ -737,7 +737,6 @@ export function ModelSelector({
                   title={t('effort.label')}
                   aria-label={t('effort.label')}
                 >
-                  <span class="model-header-effort-icon" aria-hidden="true">🧠</span>
                   <span class="model-header-effort-label">{effortLabel(effort)}</span>
                   <span class={'model-header-effort-chevron' + (effortOpen ? ' rotated' : '')}>▾</span>
                 </button>

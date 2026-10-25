@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.0 (2026-10-26)
+
+- **[Responsive Mobile UI] System Settings vertical layout adaptation & ModelSelector header alignment**:
+  - System Settings dialog now smoothly adapts to mobile viewports: transforms the rigid two-column layout into a top horizontal scrollable pill tab bar (`[⚡ Models & Config] [🖥️ Desktop & System] [ℹ️ About & Version]`) with 100% full-width content below, completely resolving squished columns, cramped radio buttons, and awkward path wrapping.
+  - ModelSelector header optimization on mobile: removed the brain emoji from the thinking effort button so all header buttons (`[🎯 Model] [↻] [⚙️ Config] [Effort ▾] [×]`) sit cleanly on a single row, placing the close button (×) naturally to the right of the effort button without line wrapping.
+  - Full-width card boxes and touch-friendly padding across Desktop Behavior and About tabs on narrow screens.
+
+---
+
+- **[移动端响应式布局] 系统设置手机端自适应 + 模型选择器顶栏排版优化**:
+  - 系统设置弹窗移动端深度自适应：将原本拥挤的双栏结构自动切换为顶部横向滑选胶囊 Tab（`[⚡ 模型与配置] [🖥️ 桌面与系统] [ℹ️ 关于与版本]`）以及下方 100% 满宽内容展示区，彻底消除手机端左侧栏挤占、文本折行错位及单选框被挤压的问题。
+  - 手机端模型选择器顶栏协调对齐：移除思考强度胶囊中的大脑图标，使顶栏 5 项操作控件（`[🎯 模型] [↻] [⚙️ 模型配置] [强度 ▾] [×]`）在手机端能够整齐平铺于第一行，关闭按钮（×）紧凑贴合在强度按钮右侧，不再错位断行。
+  - 针对手机端全面优化桌面设置卡片与关于界面的内边距、行高与触摸区域，带来精致原生的移动端体验。
+
 ## v7.3.0-beta.9 (2026-10-26)
 
 - **[Git Auto-Sync & Polling] Event-driven git refresh and background token renewal**:

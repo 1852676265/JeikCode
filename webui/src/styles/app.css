@@ -8519,6 +8519,214 @@ body {
 .config-row .config-val { color: var(--app-primary-foreground); font-size: 12px; word-break: break-all; }
 .config-row .config-val.mono { font-family: var(--app-monospace-font-family); }
 
+/* ==========================================================================
+   System Settings Dialog Styles (Desktop side-by-side & Mobile vertical stack)
+   ========================================================================== */
+.system-settings-modal-overlay {
+  z-index: 90000 !important;
+  background: var(--app-modal-background, rgba(0, 0, 0, 0.65)) !important;
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+}
+
+.system-settings-card {
+  width: min(980px, 95vw);
+  height: min(720px, 88dvh);
+  display: flex;
+  flex-direction: column;
+  background: var(--app-menu-background, #181a20);
+  border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.1));
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+:root[data-theme='light'] .system-settings-card {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.15), 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+.system-settings-header {
+  padding: 14px 20px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  border-bottom: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.08)) !important;
+  background: color-mix(in srgb, var(--app-primary-foreground) 3%, transparent) !important;
+}
+.system-settings-header-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.system-settings-header-title h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--app-primary-foreground);
+}
+.system-settings-header-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.system-settings-body {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+}
+
+.system-settings-nav {
+  width: 180px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.08));
+  background: color-mix(in srgb, var(--app-primary-foreground) 2.5%, transparent);
+  padding: 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+:root[data-theme='light'] .system-settings-nav {
+  background: #f8fafc;
+  border-right-color: #e2e8f0;
+}
+
+.system-settings-tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13.5px;
+  font-weight: 400;
+  color: var(--app-secondary-foreground, #9ca3af);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.system-settings-tab-btn:hover {
+  background: color-mix(in srgb, var(--app-primary-foreground) 6%, transparent);
+  color: var(--app-primary-foreground);
+}
+.system-settings-tab-btn.active {
+  font-weight: 600;
+  color: var(--app-brand, #3b82f6);
+  background: color-mix(in srgb, var(--app-brand) 14%, transparent);
+}
+:root[data-theme='light'] .system-settings-tab-btn.active {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.system-settings-content {
+  flex: 1;
+  padding: 24px;
+  overflow-y: auto;
+  background: transparent;
+  min-width: 0;
+}
+.system-settings-content.is-models {
+  padding: 16px 20px;
+}
+
+.system-settings-pane-title {
+  margin: 0 0 16px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--app-primary-foreground);
+}
+
+.system-settings-card-box {
+  background: color-mix(in srgb, var(--app-primary-foreground) 3%, transparent);
+  border: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.08));
+  border-radius: 12px;
+  padding: 18px;
+  margin-bottom: 20px;
+}
+:root[data-theme='light'] .system-settings-card-box {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.system-settings-box-title {
+  font-weight: 600;
+  font-size: 13.5px;
+  margin-bottom: 8px;
+  color: var(--app-primary-foreground);
+}
+.system-settings-box-desc {
+  font-size: 12.5px;
+  color: var(--app-secondary-foreground, #9ca3af);
+  margin-bottom: 14px;
+  line-height: 1.5;
+}
+
+.system-settings-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.system-settings-radio-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 13.5px;
+  color: var(--app-primary-foreground);
+  line-height: 1.4;
+}
+
+.system-settings-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.system-settings-save-btn {
+  padding: 8px 20px;
+  font-size: 13.5px;
+  border-radius: 8px;
+}
+.system-settings-saved-hint {
+  color: var(--app-success-foreground, #10b981);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.about-hero-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.about-app-title {
+  font-size: 15px;
+  color: var(--app-primary-foreground);
+}
+.about-version-badge {
+  font-size: 11px;
+  font-family: var(--app-monospace-font-family);
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--app-brand) 16%, transparent);
+  color: var(--app-brand);
+  font-weight: 600;
+}
+.about-desc {
+  color: var(--app-primary-foreground);
+  margin-bottom: 6px;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.about-features {
+  color: var(--app-secondary-foreground);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
 /* === Model Config Dashboard / Overview & Model Management === */
 .model-config-overview {
   display: flex;
@@ -11364,6 +11572,64 @@ body {
     margin-top: 4px;
   }
 
+  /* === System Settings Dialog Mobile Adaptation (Fix Screenshots 1, 2, 3) === */
+  .system-settings-card {
+    width: 100% !important;
+    max-width: 100% !important;
+    height: min(92dvh, 720px) !important;
+    max-height: 92dvh !important;
+  }
+  .system-settings-body {
+    flex-direction: column !important;
+  }
+  .system-settings-nav {
+    width: 100% !important;
+    flex-direction: row !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    border-right: none !important;
+    border-bottom: 1px solid var(--app-menu-border, rgba(255, 255, 255, 0.08)) !important;
+    padding: 8px 10px !important;
+    gap: 6px !important;
+    scrollbar-width: none;
+    flex-shrink: 0 !important;
+  }
+  .system-settings-nav::-webkit-scrollbar {
+    display: none;
+  }
+  .system-settings-tab-btn {
+    padding: 6px 14px !important;
+    font-size: 13px !important;
+    border-radius: 999px !important;
+    border: 1px solid color-mix(in srgb, var(--app-primary-foreground) 10%, transparent) !important;
+    flex-shrink: 0 !important;
+    background: color-mix(in srgb, var(--app-primary-foreground) 3%, transparent) !important;
+  }
+  .system-settings-tab-btn.active {
+    background: color-mix(in srgb, var(--app-brand) 16%, transparent) !important;
+    border-color: color-mix(in srgb, var(--app-brand) 40%, transparent) !important;
+    color: var(--app-brand) !important;
+  }
+  :root[data-theme='light'] .system-settings-tab-btn.active {
+    background: #eff6ff !important;
+    border-color: #bfdbfe !important;
+    color: #1d4ed8 !important;
+  }
+  .system-settings-content {
+    padding: 14px 12px !important;
+    width: 100% !important;
+  }
+  .system-settings-content.is-models {
+    padding: 10px 8px !important;
+  }
+  .system-settings-card-box {
+    padding: 14px !important;
+    border-radius: 10px !important;
+  }
+  .system-settings-radio-label {
+    font-size: 13px !important;
+  }
+
   /* === Model picker sheet === */
   .modal-card.model-selector-modal-card {
     height: min(84dvh, 680px) !important;
@@ -11372,23 +11638,26 @@ body {
   }
   .model-streamlined-header {
     flex-wrap: wrap !important;
+    gap: 6px !important;
     row-gap: 8px !important;
-    padding: 6px 12px 10px !important;
+    padding: 8px 10px 10px !important;
   }
   .model-header-title-badge {
-    font-size: 14px !important;
+    font-size: 13px !important;
+    gap: 4px !important;
     flex-shrink: 0 !important;
   }
   .model-header-refresh-btn {
-    height: 34px !important;
-    width: 34px !important;
+    height: 30px !important;
+    width: 30px !important;
     flex-shrink: 0 !important;
   }
   .model-header-config-btn {
-    height: 34px !important;
-    padding: 0 10px !important;
+    height: 30px !important;
+    padding: 0 8px !important;
+    font-size: 11.5px !important;
     flex-shrink: 0 !important;
-    max-width: 110px !important;
+    max-width: 95px !important;
   }
   .model-header-config-btn span {
     overflow: hidden !important;
@@ -11397,21 +11666,22 @@ body {
   }
   .model-header-effort-btn {
     display: inline-flex !important;
-    height: 34px !important;
+    height: 30px !important;
     padding: 0 8px !important;
+    font-size: 11.5px !important;
     flex-shrink: 0 !important;
-    max-width: 105px !important;
+    max-width: 85px !important;
   }
   .model-header-effort-label {
-    max-width: 65px !important;
+    max-width: 55px !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
     white-space: nowrap !important;
   }
   .model-streamlined-header .modal-close-btn {
     margin-left: auto !important;
-    height: 34px !important;
-    width: 34px !important;
+    height: 30px !important;
+    width: 30px !important;
     flex-shrink: 0 !important;
   }
   .model-header-search-wrap {
