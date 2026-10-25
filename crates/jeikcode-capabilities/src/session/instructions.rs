@@ -21,17 +21,13 @@
 //! [`SessionContextHook`]: super::context::SessionContextHook
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Project-root filenames checked IN ORDER for the project tier; the FIRST existing wins.
-/// Includes the ecosystem names (`AGENTS.md`, `CLAUDE.md`) so a repo's existing agent
-/// instructions are honored. AGENTS.md takes first precedence (the open standard).
-const PROJECT_NAMES: [&str; 5] = [
-    "AGENTS.md",
-    ".jeikcode.md",
-    "JEIKCODE.md",
-    "CLAUDE.md",
-    "claude.md",
-];
+use jeikcode_config::config::instructions::{GLOBAL_INSTRUCTION_FILES, PROJECT_INSTRUCTION_FILES};
+
+// Project-tier file-name precedence lives in `jeikcode-config` (`PROJECT_INSTRUCTION_FILES`)
+// as the SINGLE source of truth, shared with the `/status` display loader so the two tables
+// can never drift apart again.
 
 /// Header for the GLOBAL tier block: cross-project user preferences.
 pub const USER_PREFERENCES_HEADER: &str = "<user_preferences>";
@@ -39,14 +35,20 @@ pub const USER_PREFERENCES_HEADER: &str = "<user_preferences>";
 /// Header for the PROJECT tier block: project instructions + additive knowledge packs.
 pub const INSTRUCTIONS_HEADER: &str = "<project_instructions>";
 
-/// Precedence preamble carried by BOTH rendered blocks. Each block is reconciled and
-/// hot-reloaded independently, so it must be self-contained: whichever tier is present,
-/// the model still reads the three-way rule (GLOBAL preferences / PROJECT instructions /
-/// system defaults). Pinned by the tests so the policy can never silently drift.
-const PREAMBLE: &str = "\
-The GLOBAL (user preferences), the PROJECT instructions, and this system prompt's default rules ALL apply together — respect all three simultaneously when they do not conflict. On conflict, precedence is: PROJECT instructions >> user preferences > system rules. When reviewing code or advising other developers, apply only the PROJECT rules and conventions — never surface or enforce the user's personal preferences. These instruction blocks govern work on the project only; they do not describe or override the host application or active configured model. (Safety, approval, and destructive-action gates remain non-overridable.)
+/// Shared, compact precedence note carried by BOTH rendered blocks. Each block is
+/// reconciled and hot-reloaded independently, so it must be self-contained: whichever tier
+/// is present, the model still reads the three-way rule (GLOBAL preferences / PROJECT
+/// instructions / system defaults). Pinned by the tests so the policy can never silently
+/// drift. Kept intentionally short — the heavier project-only clauses live in
+/// [`PROJECT_PREAMBLE_EXTRA`] so neither block duplicates them verbatim.
+const PRECEDENCE_NOTE: &str = "\
+Non-conflicting rule sets — GLOBAL user preferences, PROJECT instructions, and this system prompt's default rules — ALL apply together; on conflict, precedence is: PROJECT instructions >> user preferences > system rules. These blocks govern work on the project only; they do not describe or override the host application or active configured model. (Safety, approval, and destructive-action gates remain non-overridable.)";
 
-DOMAIN GLOSSARY / BUSINESS RULES / DB WORDS (if present) are project knowledge packs: use them for term expansion, policy, and schema mapping; they do not override safety gates.";
+/// PROJECT-tier-only tail (the knowledge packs live in this block): the code-review stance
+/// plus the pack semantics. Deliberately NOT emitted in `<user_preferences>`, so the two
+/// blocks never repeat this paragraph.
+const PROJECT_PREAMBLE_EXTRA: &str = "\
+When reviewing code or advising other developers, apply only the PROJECT rules and conventions — never surface or enforce the user's personal preferences. DOMAIN GLOSSARY / BUSINESS RULES / DB WORDS (if present) are project knowledge packs: use them for term expansion, policy, and schema mapping; they do not override safety gates.";
 
 /// Additive knowledge pack: first existing path wins per pack; packs do not replace each other.
 struct KnowledgePack {
@@ -110,21 +112,17 @@ before searching code or inventing schema.",
 ///
 /// `home` = config root (`~/.jeikcode`).
 pub fn render_user_preferences(home: &Path) -> Option<String> {
-    // Prefer AGENTS.md (open standard); fall back to the JeikCode-native name.
-    let global = if home.join("AGENTS.md").exists() {
-        home.join("AGENTS.md")
-    } else if home.join("JEIKCODE.md").exists() {
-        home.join("JEIKCODE.md")
-    } else {
-        home.join("JEIKCODE.md")
-    };
+    // Prefer AGENTS.md (open standard); fall back to the JeikCode-native name. The order
+    // comes from `jeikcode-config` (single source of truth), shared with the display loader.
+    let fallback = home.join(GLOBAL_INSTRUCTION_FILES[GLOBAL_INSTRUCTION_FILES.len() - 1]);
+    let global = first_existing(home, &GLOBAL_INSTRUCTION_FILES).unwrap_or(fallback);
     let body = read_tier(&global)?;
     let filename = global
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("JEIKCODE.md");
     Some(format!(
-        "{USER_PREFERENCES_HEADER}\n\n{PREAMBLE}\n\n# USER PREFERENCES ({filename})\n{body}\n</user_preferences>"
+        "{USER_PREFERENCES_HEADER}\n\n{PRECEDENCE_NOTE}\n\n# USER PREFERENCES ({filename})\n{body}\n</user_preferences>"
     ))
 }
 
@@ -162,14 +160,36 @@ pub fn render_project_instructions(project: &Path) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{INSTRUCTIONS_HEADER}\n\n{PREAMBLE}\n\n{}\n</project_instructions>",
+        "{INSTRUCTIONS_HEADER}\n\n{PRECEDENCE_NOTE}\n\n{PROJECT_PREAMBLE_EXTRA}\n\n{}\n</project_instructions>",
         out.join("\n\n")
     ))
 }
 
+/// The removed legacy `.jeikcode.user.md` tier. Detected once per process so we can tell the
+/// user their personal per-project preferences are silently no longer injected.
+const LEGACY_USER_TIER_FILE: &str = ".jeikcode.user.md";
+static LEGACY_USER_TIER_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Emit a ONE-TIME migration notice when a legacy `.jeikcode.user.md` is present but no
+/// longer honored (the tier was removed). Hot-reload calls this every turn, so the
+/// `OnceLock` guard keeps it to a single log line per process. No-op when the file is absent.
+pub fn warn_legacy_user_tier_once(project: &Path) {
+    if !project.join(LEGACY_USER_TIER_FILE).is_file() {
+        return;
+    }
+    if LEGACY_USER_TIER_WARNED.set(()).is_ok() {
+        tracing::warn!(
+            "[instructions] `{}` is no longer an instruction tier and is being IGNORED. \
+             Migrate its personal preferences into `~/.jeikcode/AGENTS.md` (cross-project) or \
+             the project `AGENTS.md` (team-shared).",
+            project.join(LEGACY_USER_TIER_FILE).display()
+        );
+    }
+}
+
 /// The first existing project-tier file (precedence order), if any.
 fn project_file(project: &Path) -> Option<PathBuf> {
-    first_existing(project, &PROJECT_NAMES)
+    first_existing(project, &PROJECT_INSTRUCTION_FILES)
 }
 
 fn first_existing(project: &Path, names: &[&str]) -> Option<PathBuf> {
@@ -207,11 +227,12 @@ mod tests {
         assert!(block.ends_with("</user_preferences>"));
         assert!(block.contains("# USER PREFERENCES (AGENTS.md)"));
         assert!(block.contains("global habits"));
-        // Self-contained precedence preamble (three-way policy).
+        // Self-contained precedence note (three-way policy) without the project-only clauses.
         assert!(block.contains("PROJECT instructions >> user preferences"));
-        assert!(block.contains("never surface or enforce the user's personal preferences"));
-        // A global-only block never leaks the project tier.
+        assert!(!block.contains("never surface or enforce the user's personal preferences"));
+        // A global-only block never leaks the project tier or its pack semantics.
         assert!(!block.contains("# PROJECT INSTRUCTIONS"));
+        assert!(!block.contains("DOMAIN GLOSSARY"));
     }
 
     #[test]
@@ -239,6 +260,20 @@ mod tests {
         assert!(out.contains("agents rules"));
         assert!(!out.contains("claude rules"), "first-precedence file wins");
         assert!(out.contains("PROJECT instructions >> user preferences"));
+        // Project block carries the project-only clauses (review stance + pack semantics).
+        assert!(out.contains("never surface or enforce the user's personal preferences"));
+        assert!(out.contains("DOMAIN GLOSSARY"));
+    }
+
+    #[test]
+    fn legacy_user_tier_warns_once_without_panicking() {
+        let d = tempfile::tempdir().unwrap();
+        // Side-effect-free when absent, and idempotent (global OnceLock) when present.
+        warn_legacy_user_tier_once(d.path());
+        fs::write(d.path().join(".jeikcode.user.md"), "legacy prefs").unwrap();
+        warn_legacy_user_tier_once(d.path());
+        warn_legacy_user_tier_once(d.path());
+        assert!(d.path().join(".jeikcode.user.md").is_file());
     }
 
     #[test]

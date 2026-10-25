@@ -17,7 +17,9 @@
 //! - Both blocks stay off `Role::System`, so a downstream consecutive-system merger can
 //!   never fold user-owned bytes into the persona prefix.
 
-use super::instructions::{render_project_instructions, render_user_preferences};
+use super::instructions::{
+    render_project_instructions, render_user_preferences, warn_legacy_user_tier_once,
+};
 use async_trait::async_trait;
 use jeikcode_kernel::hook::LifecycleHooks;
 use jeikcode_kernel::message::Conversation;
@@ -99,6 +101,8 @@ impl SessionContextHook {
     /// A client-supplied system prompt (OpenAI/Anthropic compat) is appended AFTER the
     /// project packs so it sits at the bottom of the instruction stack.
     pub fn render_project_instructions_block(&self) -> Option<String> {
+        // One-time migration notice when the removed `.jeikcode.user.md` tier is still present.
+        warn_legacy_user_tier_once(&self.working_dir);
         let mut instr = render_project_instructions(&self.working_dir).unwrap_or_default();
         if let Some(extra) = &self.extra_append {
             if instr.is_empty() {
