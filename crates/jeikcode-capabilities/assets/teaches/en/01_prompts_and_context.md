@@ -107,3 +107,20 @@ Loaded by nearest scope (first hit takes effect):
 - `init.yaml`, `rules.yaml`, and `user-wrap.md` **automatically hot-reload based on file mtime**.
 - No restart or reload command is necessary; changes take effect immediately on the next user message turn.
 - If a file is accidentally deleted, the system gracefully falls back to the official built-in default rules.
+
+---
+
+## 6. Instruction Injection Block Layout
+
+The global / project instructions, plus memory, skills, and MCP, are each injected as **independent blocks before the first real query** (they are NOT inside the system prompt, and they sit inside the compaction-protected `sacred_floor`, so compaction never drops them):
+
+| Order | Block Tag | Source |
+| :--- | :--- | :--- |
+| 30 | `<available_skills>` | Installed skill catalog |
+| 40 | `<mcp_server_instructions>` | MCP server instructions |
+| 50 | `<memory>` | `memory.md` (global + project) |
+| 55 | `<user_preferences>` | `~/.jeikcode/AGENTS.md` / `JEIKCODE.md` |
+| 60 | `<project_instructions>` | Project `AGENTS.md` etc. + domain knowledge packs |
+
+- Each block carries its own PRECEDENCE note; on conflict **project instructions >> user preferences > system rules**.
+- After any instruction / knowledge file changes, the next turn hot-reloads by mtime (unchanged files stay byte-identical, so the prefix cache is preserved).

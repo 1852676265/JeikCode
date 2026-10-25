@@ -63,7 +63,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  指令文件：\n".into(),
         Msg::StatusInstructionScopeGlobal => "用户全局".into(),
         Msg::StatusInstructionScopeProject => "项目共享".into(),
-        Msg::StatusInstructionScopeUser => "用户项目覆盖".into(),
         Msg::StatusInstructionPresent { path, label, scope } =>
             format!("    ✓ {scope}（{label}）：{path}\n").into(),
         Msg::StatusInstructionMissing { path, label, scope } =>

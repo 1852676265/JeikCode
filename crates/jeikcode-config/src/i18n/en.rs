@@ -64,7 +64,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Instruction files:\n".into(),
         Msg::StatusInstructionScopeGlobal => "User global".into(),
         Msg::StatusInstructionScopeProject => "Project shared".into(),
-        Msg::StatusInstructionScopeUser => "User project override".into(),
         Msg::StatusInstructionPresent { path, label, scope } =>
             format!("    ✓ {scope} ({label}): {path}\n").into(),
         Msg::StatusInstructionMissing { path, label, scope } =>

@@ -27,7 +27,6 @@ fn vietnamese_dictionary_preserves_interpolation_contract() {
         Msg::StatusInstructionFilesHeader,
         Msg::StatusInstructionScopeGlobal,
         Msg::StatusInstructionScopeProject,
-        Msg::StatusInstructionScopeUser,
         Msg::StatusInstructionPresent {
             path: "THAM_SO",
             label: "THAM_SO",

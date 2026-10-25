@@ -12,7 +12,7 @@ This directory serves as the progressive guide to the JeikCode global and worksp
 | **04** | `thesaurus` / `cilin` | `teaches/04_thesaurus_and_retrieval.md` | Cilin `thesaurus/*.txt` mappings, bilingual code search relevance, domain dictionary tuning |
 | **05** | `tools` / `timeouts` | `teaches/05_tools_and_timeouts.md` | `[tools.bash]` hard limits, `[tools.timeouts]` short budgets, `[tools.tool_output]` 64KB/24KB folding, background daemon tasks, proxy |
 | **06** | `directories` / `files` | `teaches/06_directories_and_system.md` | `~/.jeikcode/` directory layout & file catalog, maintenance and cleanup |
-| **07** | `project` / `rules` | `teaches/07_project_constraints_and_rules.md` | Three-tier project instructions (AGENTS.md, JEIKCODE.md, .jeikcode.user.md), domain knowledge packs (rules.md, glossary.md, dbwords.md) |
+| **07** | `project` / `rules` | `teaches/07_project_constraints_and_rules.md` | Two-tier project instructions (`AGENTS.md`/`JEIKCODE.md` → `<user_preferences>`/`<project_instructions>` blocks), domain knowledge packs (rules.md, glossary.md, dbwords.md) |
 | **08** | `updates` / `upgrade` | `teaches/08_updates_and_releases.md` | Update endpoints (github.com/jeikl/JeikCode / latest.json), self-update commands (/upgrade), environment variable overrides |
 
 ---

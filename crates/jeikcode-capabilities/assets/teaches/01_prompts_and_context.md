@@ -107,3 +107,20 @@ prohibitions:
 - `init.yaml`、`rules.yaml`、`user-wrap.md` 保存后**自动根据文件 mtime 动态热重载**。
 - 无需执行任何重启或重载命令，下一轮用户消息发出时立即以最新内容生效。
 - 若文件被误删除，系统自动平滑回退至官方内置默认规则。
+
+---
+
+## 6. 指令注入块布局
+
+全局 / 项目指令与记忆、技能、MCP 各自注入为**首条真实提问之前的独立块**（不在系统提示词内，且处于压缩的 `sacred_floor` 保护区，不会被压缩丢弃）：
+
+| 顺序 | 块标签 | 来源 |
+| :--- | :--- | :--- |
+| 30 | `<available_skills>` | 已安装技能目录 |
+| 40 | `<mcp_server_instructions>` | MCP 服务器说明 |
+| 50 | `<memory>` | `memory.md`（全局 + 项目） |
+| 55 | `<user_preferences>` | `~/.jeikcode/AGENTS.md` / `JEIKCODE.md` |
+| 60 | `<project_instructions>` | 项目 `AGENTS.md` 等 + 业务知识包 |
+
+- 每个块自带 PRECEDENCE 说明；冲突时 **项目指令 >> 用户偏好 > system 规则**。
+- 指令 / 知识文件修改后，下一轮按 mtime 自动热重载（未变的文件字节不变，前缀缓存不失效）。

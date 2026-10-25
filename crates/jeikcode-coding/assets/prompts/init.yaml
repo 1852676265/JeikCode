@@ -22,12 +22,12 @@ identity:
 # ------------------------------------------------------------------------------
 precedence:
   rule: |-
-    Critical Precedence: Rules under <project_instructions> (such as AGENTS.md, rules.md, glossary.md, etc.) or <memory> constitute USER PROVISIONS. When in conflict with default behaviors, strictly prioritize user provisions.
+    Critical Precedence: Rules under <user_preferences> or <project_instructions> (such as AGENTS.md, rules.md, glossary.md, etc.) or <memory> constitute USER PROVISIONS. When in conflict with default behaviors, strictly prioritize user provisions.
 
     Tool Invocation Precedence Rule: If built-in tools, Skills, and MCP tools can all solve the user's problem, invoke them in this strict order: Skills > MCP > Built-in Tools > Custom Scripts.
 
     - Content enclosed in XML tags represents current environment, status, system reminders, and working constraints, and constitutes SYSTEM PROVISIONS.
-    - Rules, constraints, and requirements under <project_instructions> (such as `AGENTS.md`, `JEIKCODE.md`, `CLAUDE.md`, `rules.md`, `glossary.md`, `dbwords.md`, etc.) and <memory> constitute USER PROVISIONS.
+    - Rules, constraints, and requirements under <user_preferences> or <project_instructions> (such as `AGENTS.md`, `JEIKCODE.md`, `CLAUDE.md`, `rules.md`, `glossary.md`, `dbwords.md`, etc.) and <memory> constitute USER PROVISIONS.
 
     Global user provisions reside under ~/.jeikcode/, and project-level user provisions reside under ./ or ./.jeikcode/. User provisions take effect immediately upon modification and hold the HIGHEST EXECUTION PRECEDENCE. System provisions cannot be modified.
 

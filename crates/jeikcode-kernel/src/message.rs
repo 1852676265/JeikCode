@@ -772,6 +772,8 @@ fn frozen_user_block_order(text: &str) -> u8 {
         40
     } else if text.starts_with("<memory>") || text.starts_with("=== MEMORY ===") {
         50
+    } else if text.starts_with("<user_preferences>") {
+        55
     } else if text.starts_with("<project_instructions>")
         || text.starts_with("=== AUTHORITATIVE PROJECT INSTRUCTIONS")
     {
@@ -819,7 +821,7 @@ impl Conversation {
     /// Insert, refresh, or remove a frozen synthetic-user prefix block identified
     /// by a stable header (`<memory>`, skill catalog, MCP instructions, project instructions).
     ///
-    /// Preserves canonical ordering (skills 30 -> MCP 40 -> memory 50 -> project instructions 60)
+    /// Preserves canonical ordering (skills 30 -> MCP 40 -> memory 50 -> user preferences 55 -> project instructions 60)
     /// within the synthetic user run after leading systems and before the first real user.
     ///
     /// A leftover `Role::System` copy from older sessions is converted (removed

@@ -73,7 +73,6 @@ pub enum Msg<'a> {
     StatusInstructionFilesHeader,
     StatusInstructionScopeGlobal,
     StatusInstructionScopeProject,
-    StatusInstructionScopeUser,
     StatusInstructionPresent {
         path: &'a str,
         label: &'a str,

@@ -4,15 +4,15 @@
 
 ## 1. Three-Tier Project Instruction Hierarchy
 
-The system automatically resolves and injects project instructions in hierarchical order (higher precedence overrides lower precedence):
+The system resolves and injects project instructions as **two independent blocks**: the global tier → `<user_preferences>`, the project tier → `<project_instructions>` (both are frozen synthetic-user blocks placed before the first real query, inside the compaction-protected floor):
 
-| Tier | File Path (First matching hit in order) | Purpose & Nuances |
-| :--- | :--- | :--- |
-| **1. Global Tier** | `~/.jeikcode/AGENTS.md`<br>`~/.jeikcode/JEIKCODE.md` | Universal cross-project development directives. |
-| **2. Project Tier** | `1. .jeikcode.md`<br>`2. JEIKCODE.md`<br>`3. AGENTS.md`<br>`4. CLAUDE.md`<br>`5. claude.md` | **Core project standards** (architecture boundaries, coding style, commit rules). Recommended to commit to Git for team sharing. |
-| **3. User Tier** | `.jeikcode.user.md` | **Personal local developer preferences**. Higher precedence than project-level `AGENTS.md`, typically git-ignored so it doesn't affect team members. |
+| Tier | File Path (First matching hit in order) | Inject Block | Purpose & Nuances |
+| :--- | :--- | :--- | :--- |
+| **1. Global Tier** | `~/.jeikcode/AGENTS.md`<br>`~/.jeikcode/JEIKCODE.md` | `<user_preferences>` | Universal cross-project personal preferences. |
+| **2. Project Tier** | `1. AGENTS.md`<br>`2. .jeikcode.md`<br>`3. JEIKCODE.md`<br>`4. CLAUDE.md`<br>`5. claude.md` | `<project_instructions>` | **Core project standards** (architecture boundaries, coding style, commit rules). Recommended to commit to Git for team sharing. |
 
-> Note: User provisions take effect alongside system rules without conflict; when conflicting, user provisions take strict precedence (except core safety gates and destructive operation confirmation gates).
+> Precedence: non-conflicting rule sets (global preferences / project instructions / system defaults) all apply together; on conflict **project instructions >> user preferences > system rules**. When reviewing code and advising other developers, cite only the project rules — never surface personal preferences.
+> (The former `.jeikcode.user.md` tier was removed; core safety gates and destructive-operation confirmation gates remain non-overridable.)
 
 ---
 

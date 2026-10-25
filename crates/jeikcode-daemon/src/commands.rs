@@ -481,7 +481,6 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
         let scope = t(match line.level {
             InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
             InstructionLevel::Project => Msg::StatusInstructionScopeProject,
-            InstructionLevel::User => Msg::StatusInstructionScopeUser,
         });
         let path = line.path.display().to_string();
         if line.found {

@@ -1,8 +1,14 @@
-//! Three-tier project-instructions loader (global / project / user) — the v2 port of
-//! v1 `config/instructions.rs`. Each tier is a markdown file injected into the session
-//! context block under a header carrying its source path. Pure (paths in, string out) so
-//! it is testable without touching the real home dir; [`SessionContextHook`] supplies the
-//! config-root and project paths.
+//! Two-block instruction loader — the v2 port of v1 `config/instructions.rs`.
+//!
+//! - **GLOBAL tier** (`~/.jeikcode/AGENTS.md` → `~/.jeikcode/JEIKCODE.md`) renders as an
+//!   independent `<user_preferences>` block (cross-project personal preferences).
+//! - **PROJECT tier** (`AGENTS.md` / `.jeikcode.md` / `JEIKCODE.md` / `CLAUDE.md` /
+//!   `claude.md`, first match wins) plus the additive knowledge packs renders as an
+//!   independent `<project_instructions>` block.
+//!
+//! Both blocks are pure (paths in, string out) so they are testable without touching the
+//! real home dir; [`SessionContextHook`] supplies the config-root and project paths and
+//! reconciles each block separately. The legacy `.jeikcode.user.md` tier was removed.
 //!
 //! Also loads optional **additive knowledge packs** (coexist with AGENTS.md):
 //! - domain glossary — business term → code aliases
@@ -18,9 +24,7 @@ use std::path::{Path, PathBuf};
 
 /// Project-root filenames checked IN ORDER for the project tier; the FIRST existing wins.
 /// Includes the ecosystem names (`AGENTS.md`, `CLAUDE.md`) so a repo's existing agent
-/// instructions are honored (matches v1).
-/// Project-root filenames checked IN ORDER for the project tier; the FIRST existing wins.
-/// AGENTS.md takes first precedence.
+/// instructions are honored. AGENTS.md takes first precedence (the open standard).
 const PROJECT_NAMES: [&str; 5] = [
     "AGENTS.md",
     ".jeikcode.md",
@@ -29,8 +33,20 @@ const PROJECT_NAMES: [&str; 5] = [
     "claude.md",
 ];
 
-/// Header for Block 6: Authoritative Project Instructions & Knowledge
+/// Header for the GLOBAL tier block: cross-project user preferences.
+pub const USER_PREFERENCES_HEADER: &str = "<user_preferences>";
+
+/// Header for the PROJECT tier block: project instructions + additive knowledge packs.
 pub const INSTRUCTIONS_HEADER: &str = "<project_instructions>";
+
+/// Precedence preamble carried by BOTH rendered blocks. Each block is reconciled and
+/// hot-reloaded independently, so it must be self-contained: whichever tier is present,
+/// the model still reads the three-way rule (GLOBAL preferences / PROJECT instructions /
+/// system defaults). Pinned by the tests so the policy can never silently drift.
+const PREAMBLE: &str = "\
+The GLOBAL (user preferences), the PROJECT instructions, and this system prompt's default rules ALL apply together — respect all three simultaneously when they do not conflict. On conflict, precedence is: PROJECT instructions >> user preferences > system rules. When reviewing code or advising other developers, apply only the PROJECT rules and conventions — never surface or enforce the user's personal preferences. These instruction blocks govern work on the project only; they do not describe or override the host application or active configured model. (Safety, approval, and destructive-action gates remain non-overridable.)
+
+DOMAIN GLOSSARY / BUSINESS RULES / DB WORDS (if present) are project knowledge packs: use them for term expansion, policy, and schema mapping; they do not override safety gates.";
 
 /// Additive knowledge pack: first existing path wins per pack; packs do not replace each other.
 struct KnowledgePack {
@@ -89,12 +105,12 @@ before searching code or inventing schema.",
     },
 ];
 
-/// Render the global / project / user instruction tiers plus additive knowledge packs.
-/// Empty string when nothing exists (the caller then omits the section).
+/// Render the GLOBAL tier (`~/.jeikcode/AGENTS.md` → `~/.jeikcode/JEIKCODE.md`) as an
+/// independent `<user_preferences>` block. `None` when no non-empty global file exists.
 ///
-/// `home` = config root (`~/.jeikcode`); `project` = workspace root.
-pub fn render_instructions(home: &Path, project: &Path) -> String {
-    let mut out: Vec<String> = Vec::new();
+/// `home` = config root (`~/.jeikcode`).
+pub fn render_user_preferences(home: &Path) -> Option<String> {
+    // Prefer AGENTS.md (open standard); fall back to the JeikCode-native name.
     let global = if home.join("AGENTS.md").exists() {
         home.join("AGENTS.md")
     } else if home.join("JEIKCODE.md").exists() {
@@ -102,13 +118,23 @@ pub fn render_instructions(home: &Path, project: &Path) -> String {
     } else {
         home.join("JEIKCODE.md")
     };
-    if let Some(body) = read_tier(&global) {
-        let filename = global
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("JEIKCODE.md");
-        out.push(format!("# GLOBAL INSTRUCTIONS ({filename})\n{body}"));
-    }
+    let body = read_tier(&global)?;
+    let filename = global
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("JEIKCODE.md");
+    Some(format!(
+        "{USER_PREFERENCES_HEADER}\n\n{PREAMBLE}\n\n# USER PREFERENCES ({filename})\n{body}\n</user_preferences>"
+    ))
+}
+
+/// Render the PROJECT tier (first existing AGENTS.md / .jeikcode.md / JEIKCODE.md /
+/// CLAUDE.md / claude.md) plus the additive knowledge packs as an independent
+/// `<project_instructions>` block. `None` when no project tier file and no pack exists.
+///
+/// `project` = workspace root.
+pub fn render_project_instructions(project: &Path) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
     if let Some(proj) = project_file(project) {
         if let Some(body) = read_tier(&proj) {
             let filename = proj
@@ -117,14 +143,6 @@ pub fn render_instructions(home: &Path, project: &Path) -> String {
                 .unwrap_or("AGENTS.md");
             out.push(format!("# PROJECT INSTRUCTIONS ({filename})\n{body}"));
         }
-    }
-    let user = project.join(".jeikcode.user.md");
-    if let Some(body) = read_tier(&user) {
-        let filename = user
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or(".jeikcode.user.md");
-        out.push(format!("# USER INSTRUCTIONS ({filename})\n{body}"));
     }
     for pack in KNOWLEDGE_PACKS {
         if let Some(path) = first_existing(project, pack.candidates) {
@@ -141,18 +159,12 @@ pub fn render_instructions(home: &Path, project: &Path) -> String {
         }
     }
     if out.is_empty() {
-        return String::new();
+        return None;
     }
-    // Precedence preamble: GLOBAL/PROJECT/USER override default working rules.
-    // Knowledge packs are project facts (aliases / rules / schema), not safety overrides.
-    const PREAMBLE: &str = "\
-The following GLOBAL / PROJECT / USER instructions take PRECEDENCE over the assistant's default system-prompt rules — when they conflict with a default working rule, follow these. These instructions govern work on the project only; they do not describe or override the host application or active configured model. (Safety, approval, and destructive-action gates are not overridable here.)
-
-DOMAIN GLOSSARY / BUSINESS RULES / DB WORDS (if present) are project knowledge packs: use them for term expansion, policy, and schema mapping; they do not override safety gates.";
-    format!(
+    Some(format!(
         "{INSTRUCTIONS_HEADER}\n\n{PREAMBLE}\n\n{}\n</project_instructions>",
         out.join("\n\n")
-    )
+    ))
 }
 
 /// The first existing project-tier file (precedence order), if any.
@@ -177,70 +189,86 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn empty_dir_produces_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path();
+        assert!(render_user_preferences(&d.path().join("nohome")).is_none());
+        assert!(render_project_instructions(proj).is_none());
+    }
+
+    #[test]
+    fn global_tier_renders_as_user_preferences_block() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("AGENTS.md"), "global habits").unwrap();
+        let block = render_user_preferences(&home).expect("global block");
+        assert!(block.starts_with(USER_PREFERENCES_HEADER));
+        assert!(block.ends_with("</user_preferences>"));
+        assert!(block.contains("# USER PREFERENCES (AGENTS.md)"));
+        assert!(block.contains("global habits"));
+        // Self-contained precedence preamble (three-way policy).
+        assert!(block.contains("PROJECT instructions >> user preferences"));
+        assert!(block.contains("never surface or enforce the user's personal preferences"));
+        // A global-only block never leaks the project tier.
+        assert!(!block.contains("# PROJECT INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn global_tier_falls_back_to_jeikcode_md() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("JEIKCODE.md"), "jeikcode global").unwrap();
+        let block = render_user_preferences(&home).expect("global block");
+        assert!(block.contains("# USER PREFERENCES (JEIKCODE.md)"));
+        assert!(block.contains("jeikcode global"));
+    }
+
+    #[test]
     fn project_tier_picks_first_existing_name() {
         let d = tempfile::tempdir().unwrap();
         let proj = d.path();
         // AGENTS.md and CLAUDE.md both exist → AGENTS.md (earlier in precedence) wins.
         fs::write(proj.join("AGENTS.md"), "agents rules").unwrap();
         fs::write(proj.join("CLAUDE.md"), "claude rules").unwrap();
-        let out = render_instructions(&d.path().join("nohome"), proj);
-        assert!(out.contains("PROJECT INSTRUCTIONS"));
+        let out = render_project_instructions(proj).expect("project block");
+        assert!(out.starts_with(INSTRUCTIONS_HEADER));
+        assert!(out.ends_with("</project_instructions>"));
+        assert!(out.contains("# PROJECT INSTRUCTIONS (AGENTS.md)"));
         assert!(out.contains("agents rules"));
         assert!(!out.contains("claude rules"), "first-precedence file wins");
-        assert!(out.contains("AGENTS.md"), "header carries the source path");
+        assert!(out.contains("PROJECT instructions >> user preferences"));
     }
 
     #[test]
-    fn global_and_user_tiers_included() {
+    fn user_tier_is_removed() {
+        // `.jeikcode.user.md` is no longer an injection tier — it must be ignored entirely.
         let d = tempfile::tempdir().unwrap();
-        let home = d.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        fs::write(home.join("JEIKCODE.md"), "global rules").unwrap();
-        let proj = d.path().join("proj");
-        fs::create_dir_all(&proj).unwrap();
-        fs::write(proj.join(".jeikcode.user.md"), "user rules").unwrap();
-        let out = render_instructions(&home, &proj);
-        assert!(out.contains("GLOBAL INSTRUCTIONS") && out.contains("global rules"));
-        assert!(out.contains("USER INSTRUCTIONS") && out.contains("user rules"));
-        let prec = out.find("PRECEDENCE").expect("preamble present");
-        let global_idx = out.find("GLOBAL INSTRUCTIONS").unwrap();
-        assert!(prec < global_idx, "preamble precedes the blocks: {out}");
+        let proj = d.path();
+        fs::write(proj.join(".jeikcode.user.md"), "should be ignored").unwrap();
         assert!(
-            out.contains("OVERRIDE") || out.contains("take PRECEDENCE"),
-            "states override: {out}"
+            render_project_instructions(proj).is_none(),
+            "removed user tier must not render a project block"
         );
-    }
-
-    #[test]
-    fn no_precedence_preamble_when_no_instructions() {
-        let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
-        fs::create_dir_all(&proj).unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
-        assert!(
-            out.is_empty(),
-            "no tiers → fully empty, no preamble: {out:?}"
-        );
+        assert!(render_user_preferences(&d.path().join("nohome")).is_none());
     }
 
     #[test]
     fn missing_and_empty_are_skipped() {
         let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
-        fs::create_dir_all(&proj).unwrap();
+        let proj = d.path();
         fs::write(proj.join("AGENTS.md"), "   \n  ").unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
-        assert!(out.is_empty(), "no non-empty tiers → empty: {out:?}");
+        assert!(render_project_instructions(proj).is_none());
     }
 
     #[test]
     fn large_file_is_not_truncated() {
         let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
-        fs::create_dir_all(&proj).unwrap();
+        let proj = d.path();
         let big = format!("prefix-{}-suffix", "x".repeat(1_100_000));
         fs::write(proj.join("AGENTS.md"), &big).unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
+        let out = render_project_instructions(proj).expect("block");
         assert!(!out.contains("[truncated:"));
         assert!(out.contains("prefix-") && out.contains("-suffix"));
         assert!(out.len() > 1_100_000);
@@ -249,7 +277,7 @@ mod tests {
     #[test]
     fn domain_glossary_is_additive_with_agents_md() {
         let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
+        let proj = d.path();
         fs::create_dir_all(proj.join(".jeikcode")).unwrap();
         fs::write(proj.join("AGENTS.md"), "build with cargo").unwrap();
         fs::write(
@@ -257,26 +285,26 @@ mod tests {
             "- 优惠券 → Coupon, PromoCode, Voucher\n- 结算 → Checkout, Settlement\n",
         )
         .unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
-        assert!(out.contains("PROJECT INSTRUCTIONS") && out.contains("build with cargo"));
+        let out = render_project_instructions(proj).expect("block");
+        assert!(out.contains("build with cargo"));
         assert!(out.contains("DOMAIN GLOSSARY") && out.contains("优惠券"));
         assert!(out.contains("expand each term into the listed code aliases"));
         fs::write(proj.join("DOMAIN.md"), "should not win").unwrap();
-        let out2 = render_instructions(&d.path().join("nohome"), &proj);
+        let out2 = render_project_instructions(proj).unwrap();
         assert!(!out2.contains("should not win"));
     }
 
     #[test]
     fn domain_glossary_falls_back_to_docs_path() {
         let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
+        let proj = d.path();
         fs::create_dir_all(proj.join("docs")).unwrap();
         fs::write(
             proj.join("docs/domain-glossary.md"),
             "invoice → Fapiao, InvoiceService\n",
         )
         .unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
+        let out = render_project_instructions(proj).expect("block");
         assert!(out.contains("DOMAIN GLOSSARY"));
         assert!(out.contains("InvoiceService"));
     }
@@ -284,7 +312,7 @@ mod tests {
     #[test]
     fn rules_and_dbwords_are_additive() {
         let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
+        let proj = d.path();
         fs::create_dir_all(proj.join(".jeikcode")).unwrap();
         fs::write(proj.join("AGENTS.md"), "use cargo").unwrap();
         fs::write(
@@ -297,8 +325,8 @@ mod tests {
             "| 业务 | 表名 |\n| 优惠券 | t_coupon |\n",
         )
         .unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
-        assert!(out.contains("PROJECT INSTRUCTIONS") && out.contains("use cargo"));
+        let out = render_project_instructions(proj).expect("block");
+        assert!(out.contains("use cargo"));
         assert!(
             out.contains("BUSINESS RULES") && out.contains("组织架构") && out.contains("营销中心"),
             "rules.md injected: {out}"
@@ -314,11 +342,11 @@ mod tests {
     #[test]
     fn rules_prefers_jeikcode_dir_over_root() {
         let d = tempfile::tempdir().unwrap();
-        let proj = d.path().join("proj");
+        let proj = d.path();
         fs::create_dir_all(proj.join(".jeikcode")).unwrap();
         fs::write(proj.join(".jeikcode/rules.md"), "nested-rules").unwrap();
         fs::write(proj.join("rules.md"), "root-rules-should-lose").unwrap();
-        let out = render_instructions(&d.path().join("nohome"), &proj);
+        let out = render_project_instructions(proj).expect("block");
         assert!(out.contains("nested-rules"));
         assert!(!out.contains("root-rules-should-lose"));
     }
@@ -329,7 +357,7 @@ mod tests {
         let proj = d.path();
         fs::write(proj.join("AGENTS.md"), "agents first").unwrap();
         fs::write(proj.join(".jeikcode.md"), "jeikcode second").unwrap();
-        let out = render_instructions(&d.path().join("nohome"), proj);
+        let out = render_project_instructions(proj).expect("block");
         assert!(out.contains("agents first"));
         assert!(!out.contains("jeikcode second"));
         assert!(out.starts_with(INSTRUCTIONS_HEADER));
@@ -341,12 +369,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let proj = d.path();
         fs::write(proj.join("AGENTS.md"), "cached-body-v1").unwrap();
-        let first = render_instructions(&d.path().join("nohome"), proj);
-        let second = render_instructions(&d.path().join("nohome"), proj);
+        let first = render_project_instructions(proj).expect("block");
+        let second = render_project_instructions(proj).expect("block");
         assert_eq!(first, second);
         assert!(first.contains("cached-body-v1"));
         fs::write(proj.join("AGENTS.md"), "cached-body-v2-hot").unwrap();
-        let third = render_instructions(&d.path().join("nohome"), proj);
+        let third = render_project_instructions(proj).expect("block");
         assert!(third.contains("cached-body-v2-hot"));
         assert!(!third.contains("cached-body-v1"));
     }

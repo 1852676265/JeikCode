@@ -62,7 +62,6 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
             "  Tệp chỉ dẫn:\n".into(),
         Msg::StatusInstructionScopeGlobal => "Người dùng toàn cục".into(),
         Msg::StatusInstructionScopeProject => "Dùng chung trong dự án".into(),
-        Msg::StatusInstructionScopeUser => "Ghi đè riêng của người dùng cho dự án".into(),
         Msg::StatusInstructionPresent { path, label, scope } =>
             format!("    ✓ {scope} ({label}): {path}\n").into(),
         Msg::StatusInstructionMissing { path, label, scope } =>
