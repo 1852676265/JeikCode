@@ -205,7 +205,7 @@ export type SSEEvent =
   | { type: 'session_assigned'; session_id: string }
   /** `after_seq = -1`（新会话）的握手帧：不补发，只告知起始游标。 */
   | { type: 'session_start'; session_id?: string; cursor: number }
-  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number }
+  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number; client_input_id?: string }
   | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
   | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
   | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
@@ -223,7 +223,7 @@ export type SSEEvent =
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string; message_id?: string }
   | { type: 'persistence_warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null; message_id?: string }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
   // events (see ArtifactDetector in crates/jeikcode-daemon/src/lib.rs). Without handling
@@ -2032,7 +2032,7 @@ export type LiveWireEvent =
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string; message_id?: string }
   | { type: 'persistence_warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null; message_id?: string }
   | { type: 'permission_request'; session_id?: string; runtime_instance_id: string; generation: number; request_id: number; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'user_input_request'; session_id?: string; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }

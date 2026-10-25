@@ -1506,6 +1506,50 @@ mod tests {
         }
     }
 
+    /// 回溯/删除改写转录尾部后，daemon 依赖的语义：`clear_todo_board` 必须让读者看到空清单，
+    /// 且禁止旧槽/磁盘快照复活（否则幽灵清单会被下一个回合继承，agent 状态错乱）。
+    #[test]
+    fn clear_todo_board_wipes_live_items_and_blocks_restore() {
+        let sid = "clear-on-rewind";
+        purge_todo_board(sid); // 隔离：不残留其他用例的槽
+        commit_todo_board(
+            sid,
+            &[TodoItem {
+                content: "残留步骤".into(),
+                status: TodoStatus::InProgress,
+            }],
+        );
+        assert!(
+            read_todo_board(sid).is_some(),
+            "board must be live before clear"
+        );
+
+        clear_todo_board(sid);
+        assert!(
+            read_todo_board(sid).is_none(),
+            "readers must see no checklist after clear"
+        );
+        assert!(todo_session_is_closed(sid));
+
+        // closed 之后即使有人拿着旧 board（磁盘/旧槽）来恢复，也必须被拒绝。
+        restore_todo_board(
+            sid,
+            TodoBoard {
+                id: "todo-ghost".into(),
+                seq: 9,
+                items: vec![TodoItem {
+                    content: "幽灵步骤".into(),
+                    status: TodoStatus::Pending,
+                }],
+            },
+        );
+        assert!(
+            read_todo_board(sid).is_none(),
+            "a closed session must not resurrect a ghost checklist"
+        );
+        purge_todo_board(sid);
+    }
+
     #[test]
     fn parse_valid_full_list() {
         let todos = parse_todos(r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#).unwrap();

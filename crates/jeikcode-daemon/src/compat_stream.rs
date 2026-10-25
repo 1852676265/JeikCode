@@ -970,7 +970,7 @@ impl CompatProjector {
                     None,
                 ));
             }
-            ChatEvent::Warning { message } => {
+            ChatEvent::Warning { message, .. } => {
                 self.ensure_openai_started(&mut out);
                 out.push(self.openai_chunk(
                     json!({ "jeikcode": { "type": "warning", "message": message } }),

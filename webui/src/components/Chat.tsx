@@ -229,6 +229,7 @@ import {
   userMessageAlreadyOnCanvas,
   visibleUserText,
   userTextsMatch,
+  findPendingSelfEchoIndex,
   dropSnapshotDuplicates,
   type ChatRecoveryEvent,
   type ChatRecoveryState,
@@ -270,6 +271,7 @@ import {
   spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
   lastAssistantHasAnswer,
+  stampUserClientInputId,
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
@@ -307,6 +309,9 @@ interface Message {
   /** Stable ordinal among real user questions. Browser-local optimistic turns
    * carry this until the daemon's authoritative outline arrives. */
   turnNavOrdinal?: number;
+  /** 客户端关联键（`client_input_id`）：乐观提问气泡的幂等身份。随会话缓存
+   *  （含 IndexedDB）一起持久化，重放/刷新/异地端据此去重，不靠文本比对。 */
+  clientInputId?: string;
 }
 
 /**
@@ -1468,6 +1473,24 @@ export function Chat({
       activeTodosBySessionRef.current.delete(sessionId);
     }
   }
+
+  /**
+   * 删除/回溯等物理改写转录尾部之后，会话级单例清单必须整体复位：
+   * 后端已 `clear_todo_board`（内存板置 closed + 删磁盘 `.todo`，随 mutation 广播），
+   * 前端同步清掉 sticky 画板、live 文档与幂等键。否则残留的未完成项会被下一个回合
+   * 继承，agent 会带着已经不存在的计划继续跑（状态错乱）。
+   *
+   * 与上面“完成态不清幂等键”的防线不冲突：这里是转录被物理回退，那些 callId 对应的
+   * 行已经不存在了，旧键留着只会保护幽灵帧。
+   */
+  function clearSessionTodoState(sessionId: string | null | undefined) {
+    if (!sessionId) return;
+    // active 会话：连带清掉输入框上方的 sticky 画板；后台会话：清掉会话级缓存。
+    writeLiveTodo(sessionId, null);
+    activeTodosBySessionRef.current.delete(sessionId);
+    appliedTodoIdsFor(sessionId).clear();
+    persistAppliedTodoIds();
+  }
   function adoptStickyFromMessages(
     sessionId: string | null | undefined,
     messages: Message[],
@@ -2619,10 +2642,16 @@ export function Chat({
             }
             if (frame.type === 'user') {
               const cleanText = visibleUserText(frame.content).trim();
-              const alreadyPresent = messagesRef.current.some((m) => {
-                if (m.role !== 'user') return false;
-                return m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text, cleanText));
-              });
+              // 身份优先：带关联键时只看“这一行是否已在画布上”，不再用文本启发式——
+              // 否则用户连发两条一模一样的提问时，第二条回放帧会被误判为旧帧而漏激活。
+              const alreadyPresent = frame.client_input_id
+                ? messagesRef.current.some(
+                    (m) => m.role === 'user' && m.clientInputId === frame.client_input_id,
+                  )
+                : messagesRef.current.some((m) => {
+                    if (m.role !== 'user') return false;
+                    return m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text, cleanText));
+                  });
               if (alreadyPresent) {
                 // 关键防线：该用户提问早已存在于当前画布上，纯属后端重放的旧提问帧，坚决不能误激活为新轮次！
                 continue;
@@ -5474,6 +5503,15 @@ export function Chat({
         return next;
       }
       const last = prev[prev.length - 1];
+      // 重放幂等：同一条限流提示已在目标行/末尾行 → 断线重连重发的回放帧不得再叠一份。
+      const dedupTarget = messageId
+        ? prev.find((m) => m.role === 'assistant' && m.id === messageId)
+        : last.role === 'assistant'
+          ? last
+          : undefined;
+      if (dedupTarget?.parts.some((p) => p.kind === 'rate_limited' && p.text === text)) {
+        return prev;
+      }
       let next: Message[];
       if (last.role === 'assistant') {
         const parts: MsgPart[] = [...last.parts, { kind: 'rate_limited', text }];
@@ -5658,7 +5696,7 @@ export function Chat({
         role: 'user',
         parts: [{ kind: 'text', text: visibleUserText(event.content) }],
         ts: created,
-      })));
+      }), { clientInputId: event.client_input_id }));
       return;
     }
     if (event.type === 'tool_result' && isTodoTool(event.name)) {
@@ -5957,11 +5995,24 @@ export function Chat({
         // re-append or drop the optimistic empty assistant (that made text /
         // reasoning appends no-op while sticky todos still updated).
         const userText = visibleUserText(event.content);
-        const echoIdx = pendingSelfEchoRef.current.findIndex(
-          (p) => userTextsMatch(p.text, event.content) || visibleUserText(p.text) === userText,
-        );
+        // 优先按服务端回传的客户端关联键精确认领（`/chat` 的 `request_id`）；
+        // 无 id（legacy / 第三方端）才退化为文本比对。
+        const echoIdx = findPendingSelfEchoIndex(pendingSelfEchoRef.current, event);
         if (echoIdx >= 0) {
           pendingSelfEchoRef.current.splice(echoIdx, 1);
+          // 乐观气泡此刻才拿到服务端身份：把关联键盖到那一行上。否则断线重连时回放的
+          // 同一条提问会因“行上没有身份”被当成新消息再画一份。
+          if (event.client_input_id) {
+            setMessages((prev) => {
+              const next = stampUserClientInputId(prev, event.client_input_id);
+              if (next !== prev) {
+                messagesRef.current = next;
+                const sid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
+                if (sid) messageCacheRef.current.set(sid, next);
+              }
+              return next;
+            });
+          }
           break;
         }
         const userDelta = estimateTextTokens(userText);
@@ -5991,7 +6042,7 @@ export function Chat({
               sourceIndex: turnIndex,
               turnNavOrdinal: turnOrdinal,
             };
-          }, { repeatAfterSettled: opts?.repeatUserAfterSettled ?? false });
+          }, { repeatAfterSettled: opts?.repeatUserAfterSettled ?? false, clientInputId: event.client_input_id });
           messagesRef.current = next;
           return next;
         });
@@ -6553,7 +6604,7 @@ export function Chat({
         } else {
           text = `${t('chat.rateLimited.pausedNoTime')}${dur} · ${t('chat.rateLimited.hint')}`;
         }
-        pushRateLimitedToLastAssistant(text);
+        pushRateLimitedToLastAssistant(text, event.message_id);
         break;
       }
 
@@ -6615,6 +6666,12 @@ export function Chat({
         // 否则带旧游标重连会把变更前发出的旧帧补回来 —— 已删内容会复活。
         clearStreamCursor(mutation.session_id);
         clearStreamCursor(mutation.session_id, 'sync');
+        // 删除/回溯物理改写了转录尾部：会话级单例清单已在后端物理清空，
+        // 前端必须同步复位（sticky 画板 / live 文档 / 幂等键），否则残留的未完成项
+        // 会被下一个回合继承，导致 agent 状态错乱。（patch 是原地改文本，不动清单）
+        if (mutation.action === 'delete' || mutation.action === 'truncate') {
+          clearSessionTodoState(mutation.session_id);
+        }
         // Update cached session in memory if exists
         const cached = messageCacheRef.current.get(mutation.session_id);
         let updatedCached: Message[] | undefined = undefined;
@@ -7783,6 +7840,8 @@ export function Chat({
           expected_role: 'user',
           inclusive: false,
         });
+        // 回溯删掉了后续 agent 消息：会话级单例清单同步物理复位。
+        clearSessionTodoState(sid);
         // 乐观截断：画布与内存缓存同步截断！
         let truncated: Message[] = [];
         setMessages((prev) => {
@@ -7839,6 +7898,8 @@ export function Chat({
             expected_text: expected,
             expected_role: 'user',
           });
+          // 删除整轮 agent 消息：会话级单例清单同步物理复位。
+          clearSessionTodoState(sid);
         } catch (err) {
           console.warn('[Chat] Failed to delete session turn on backend:', err);
         }
@@ -7910,6 +7971,8 @@ export function Chat({
           expected_role: 'user',
           inclusive: false,
         });
+        // 重新生成 = 回溯这一轮：会话级单例清单同步物理复位。
+        clearSessionTodoState(sid);
         let nextMessages: Message[] = [];
         setMessages((prev) => {
           const next = prev.slice(0, userMsgIdx);
@@ -7969,6 +8032,8 @@ export function Chat({
             expected_text: expected,
             expected_role: 'assistant',
           });
+          // 删除 agent 轮次消息：会话级单例清单同步物理复位。
+          clearSessionTodoState(sid);
         } catch (err) {
           console.warn('[Chat] Failed to delete assistant message on backend:', err);
         }
@@ -8274,6 +8339,8 @@ export function Chat({
       activeSession?.project_hash ||
       '';
     if (sid && effectiveHash) {
+      // 回落到输入框 = 物理回退这一轮：会话级单例清单必须同步物理复位。
+      clearSessionTodoState(sid);
       messageCacheRef.current.set(sid, rolledBackMsgs);
       const filteredOutline = turnOutlineRef.current.filter(
         (t) => t.index !== sourceIndex && t.index < sourceIndex,

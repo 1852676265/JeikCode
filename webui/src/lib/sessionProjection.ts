@@ -39,6 +39,9 @@ export interface ProjectionMessage {
   ts?: number;
   /** 管线身份（kernel message id）。增量事件按此定向落笔，而非盲写“最后一条”。 */
   id?: string;
+  /** 客户端关联键（`client_input_id`）：乐观气泡的幂等身份。随缓存/IDB 持久化，
+   *  重放/刷新/异地端都能据此判定“这条提问已经在画布上”，无需猜文本。 */
+  clientInputId?: string;
 }
 
 /**
@@ -246,38 +249,84 @@ export function paintUserMessage<T extends ProjectionMessage>(
   rawText: string,
   userTs: number,
   create: (base: T[]) => T,
-  opts?: { repeatAfterSettled?: boolean },
+  opts?: { repeatAfterSettled?: boolean; clientInputId?: string },
+): T[] {
+  const clientInputId = opts?.clientInputId;
+  // 身份幂等最优先：同一条客户端关联键已经在画布/缓存的行上（随缓存持久化）。
+  // 这是库端唯一能区分「两条一模一样的提问」的信号 —— 文本比对做不到，所以
+  // 异地端/重放端也能靠它把重复回声彻底重掉。
+  if (clientInputId && messages.some((message) => message.clientInputId === clientInputId)) {
+    return messages;
+  }
+  const next = paintUserMessageInner(messages, rawText, userTs, create, {
+    repeatAfterSettled: opts?.repeatAfterSettled,
+    // 有权威身份时，inner 里的文本启发式必须整体让位（见 inner 注释）。
+    identityKnown: !!clientInputId,
+  });
+  return stampUserClientInputId(next, clientInputId);
+}
+
+/** 给画布上最新的一条 user 行盖上客户端关联键（幂等；行已被别的发送占用则不动）。 */
+export function stampUserClientInputId<T extends ProjectionMessage>(
+  messages: T[],
+  clientInputId?: string,
+): T[] {
+  if (!clientInputId) return messages;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== 'user') continue;
+    if (message.clientInputId === clientInputId) return messages;
+    if (message.clientInputId) return messages;
+    const next = messages.slice();
+    next[i] = { ...message, clientInputId } as T;
+    return next;
+  }
+  return messages;
+}
+
+function paintUserMessageInner<T extends ProjectionMessage>(
+  messages: T[],
+  rawText: string,
+  userTs: number,
+  create: (base: T[]) => T,
+  opts?: { repeatAfterSettled?: boolean; identityKnown?: boolean },
 ): T[] {
   const userText = visibleUserText(rawText);
-  // 核心硬防线：若画布上最后一条用户提问文本与当前完全一致，且助手尚未产生回答，绝对禁止重复追加！
-  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
-  if (lastUser) {
-    const lastText = visibleUserText(
-      lastUser.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
-    );
-    if (userTextsMatch(lastText, userText) && !lastAssistantHasAnswer(messages)) {
-      return ensureWorkingAssistant(messages);
-    }
-  }
-  const echoed = userMessageAlreadyOnCanvas(messages, userText, userTs);
-  const hasAnswer = lastAssistantHasAnswer(messages);
-  if (echoed && (!opts?.repeatAfterSettled || !hasAnswer)) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]!;
-      if (message.role !== 'user') continue;
-      const curText = visibleUserText(
-        message.parts.filter((p) => p.kind === 'text').map((p) => p.text || '').join(''),
+  // 身份权威（服务端回传了 client_input_id）时，全部文本启发式一律跳过：
+  // 「同文不同发」是两条真实消息，文本去重会把它当回声吞掉；而真正的重放已由
+  // 顶部的身份幂等 + 行上盖的关联键挡住。只有身份缺失（legacy daemon /
+  // 第三方客户端）才启用下面的文本兜底。
+  if (!opts?.identityKnown) {
+    // 核心硬防线：若画布上最后一条用户提问文本与当前完全一致，且助手尚未产生回答，绝对禁止重复追加！
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    if (lastUser) {
+      const lastText = visibleUserText(
+        lastUser.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
       );
-      if (userTextsMatch(curText, userText)) {
-        if (message.ts == null || message.ts === 0) {
-          const next = messages.slice();
-          next[i] = { ...message, ts: userTs };
-          return ensureWorkingAssistant(next);
-        }
+      if (userTextsMatch(lastText, userText) && !lastAssistantHasAnswer(messages)) {
         return ensureWorkingAssistant(messages);
       }
     }
-    return ensureWorkingAssistant(messages);
+    const echoed = userMessageAlreadyOnCanvas(messages, userText, userTs);
+    const hasAnswer = lastAssistantHasAnswer(messages);
+    if (echoed && (!opts?.repeatAfterSettled || !hasAnswer)) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i]!;
+        if (message.role !== 'user') continue;
+        const curText = visibleUserText(
+          message.parts.filter((p) => p.kind === 'text').map((p) => p.text || '').join(''),
+        );
+        if (userTextsMatch(curText, userText)) {
+          if (message.ts == null || message.ts === 0) {
+            const next = messages.slice();
+            next[i] = { ...message, ts: userTs };
+            return ensureWorkingAssistant(next);
+          }
+          return ensureWorkingAssistant(messages);
+        }
+      }
+      return ensureWorkingAssistant(messages);
+    }
   }
   let base = messages;
   const last = messages[messages.length - 1];
@@ -319,7 +368,13 @@ function turnAnchorIndex<T extends ProjectionMessage>(messages: T[], before?: Tu
  */
 export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
   messages: T[],
-  events: Array<{ type: string; content?: string; created_at?: number; message_id?: string }>,
+  events: Array<{
+    type: string;
+    content?: string;
+    created_at?: number;
+    message_id?: string;
+    client_input_id?: string;
+  }>,
   before?: TurnUserAnchor,
 ): T[] {
   let next = messages;
@@ -341,6 +396,13 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
       continue;
     }
     if (event.type !== 'user' || typeof event.content !== 'string') continue;
+    // 客户端关联键已在画布上 → 同一条提问已画过，绝不再补一份。
+    if (
+      event.client_input_id &&
+      next.some((message) => message.clientInputId === event.client_input_id)
+    ) {
+      continue;
+    }
     const userTs = event.created_at && event.created_at > 0 ? event.created_at : Date.now();
     // 核心硬防线：若画布上最后一条用户提问文本与当前完全一致，且助手尚未产生回答，直接跳过
     const lastUser = [...next].reverse().find((m) => m.role === 'user');
@@ -361,6 +423,7 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
       ts: userTs,
       ...(isSteer ? { isSteer: true } : {}),
       ...(event.message_id ? { id: event.message_id } : {}),
+      ...(event.client_input_id ? { clientInputId: event.client_input_id } : {}),
     } as T;
     if (cursor == null) cursor = turnAnchorIndex(next, before);
     if (cursor < 0) {
@@ -655,11 +718,17 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
   if (messages.length === 0) {
     return [{ role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T];
   }
+  // 重放幂等：同一条提示已经在目标行 / 末尾行出现过 → 断线重连重发的回放帧不得再叠一份。
+  // （文本/工具帧有后缀去重、用户气泡有身份去重，只有 notice 一直缺这一层，
+  //   表现为同一段黄色提示被重连重发的回放帧叠成多份并落到尾部。）
+  const hasNotice = (message: ProjectionMessage | undefined): boolean =>
+    !!message && message.parts.some((part) => part.kind === 'notice' && part.text === text);
   if (targetId) {
     const target = messages.findIndex((m) => m.role === 'assistant' && m.id === targetId);
     if (target >= 0) {
-      const next = messages.slice();
       const existing = messages[target]!;
+      if (hasNotice(existing)) return messages;
+      const next = messages.slice();
       next[target] = {
         ...existing,
         parts: [...existing.parts, { kind: 'notice', text }],
@@ -669,6 +738,7 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
   }
   const last = messages[messages.length - 1]!;
   if (last.role === 'assistant') {
+    if (hasNotice(last)) return messages;
     const next = messages.slice();
     next[next.length - 1] = {
       ...last,
@@ -676,7 +746,10 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
     };
     return next;
   }
-  return [...messages, { role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T];
+  return [
+    ...messages,
+    { role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T,
+  ];
 }
 
 /**

@@ -1295,6 +1295,9 @@ pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> =
 struct AdmittedUser {
     content: String,
     created_at: Option<u64>,
+    /// 客户端关联键（`/chat` 的 `request_id`）。回传到 `ChatEvent::User`，让发送端
+    /// 按身份认领自己的乐观气泡，而不是退化到文本比对。
+    client_input_id: Option<String>,
 }
 
 /// One admitted `/chat` operation. Aliases include both the persisted session id
@@ -1302,6 +1305,9 @@ struct AdmittedUser {
 struct ActiveChatOperation {
     started_at: u64,
     session_id: Option<String>,
+    /// 客户端为本轮提供的关联键（`/chat` 的 `request_id`；`/chat/steer` 走
+    /// `client_input_id` + `steered` 通道）。回传到 user 回声，供前端按 id 认领。
+    request_id: Option<String>,
     aliases: Vec<String>,
     cancellation: CancellationToken,
     /// Linearizes user stop against approval consumption. A stop must mark this
@@ -1475,6 +1481,7 @@ impl ActiveChatRegistry {
             ActiveChatOperation {
                 started_at,
                 session_id: session_id.clone(),
+                request_id,
                 aliases,
                 cancellation: cancellation.clone(),
                 stop_gate,
@@ -1624,6 +1631,7 @@ impl ActiveChatRegistry {
                             message_id: None,
                             order: None,
                             turn_ordinal: None,
+                            client_input_id: admitted.client_input_id.clone(),
                         },
                     ),
                 );
@@ -1746,9 +1754,11 @@ impl ActiveChatRegistry {
     ) {
         if let Some(op) = self.inner.write().await.operations.get_mut(operation_id) {
             let created = created_at.or((op.started_at > 0).then_some(op.started_at));
+            let client_input_id = op.request_id.clone();
             op.admitted_user = Some(AdmittedUser {
                 content,
                 created_at: created,
+                client_input_id,
             });
         }
     }
@@ -1794,6 +1804,7 @@ impl ActiveChatRegistry {
             message_id: None,
             order: None,
             turn_ordinal: None,
+            client_input_id: admitted.client_input_id,
         });
     }
 
@@ -6166,6 +6177,11 @@ async fn delete_session_message(
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
         meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        // 删除/回溯物理改写了权威转录：agent 的会话级单例清单属于被删掉的那一轮，
+        // 必须同步物理清空（内存板置 closed；磁盘 `.todo` 由下面 save_snapshot 内部的
+        // persist_todo_board 一并删除）。否则残留的未完成清单会被下一个回合继承，
+        // 让 agent 带着已经不存在的计划继续跑（状态错乱）。
+        jeikcode_capabilities::tools::clear_todo_board(&id);
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6283,6 +6299,11 @@ async fn truncate_session(
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
         meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        // 删除/回溯物理改写了权威转录：agent 的会话级单例清单属于被删掉的那一轮，
+        // 必须同步物理清空（内存板置 closed；磁盘 `.todo` 由下面 save_snapshot 内部的
+        // persist_todo_board 一并删除）。否则残留的未完成清单会被下一个回合继承，
+        // 让 agent 带着已经不存在的计划继续跑（状态错乱）。
+        jeikcode_capabilities::tools::clear_todo_board(&id);
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6724,6 +6745,10 @@ pub enum ChatEvent {
         order: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_ordinal: Option<u32>,
+        /// 客户端关联键（`/chat` 的 `request_id`）：发送端据此按身份认领自己的乐观
+        /// 气泡，而不是靠文本比对；缺失时才退化为文本密等（legacy / 第三方客户端）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_input_id: Option<String>,
     },
     /// The STORED identity of the real user prompt this turn runs on (from the
     /// kernel `UserMessage` boundary). Identity-only — the visible bubble is
@@ -6880,7 +6905,13 @@ pub enum ChatEvent {
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
-    Warning { message: String },
+    Warning {
+        message: String,
+        /// 提示所属的 assistant 消息 id（管线身份）。客户端据此把提示挂回它所属的
+        /// 回合，而不是盲写“最后一条”落到时间线尾部；重放时也能幂等去重。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// Auxiliary session persistence failed. Clients must display this outside
     /// the assistant message timeline.
     #[serde(rename = "persistence_warning")]
@@ -6899,6 +6930,9 @@ pub enum ChatEvent {
         /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
         #[serde(default)]
         server_message: Option<String>,
+        /// 同 `Warning`：提示所属的 assistant 消息 id，供客户端定向挂载与重放去重。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// AI session title generated / renamed
     #[serde(rename = "session_renamed")]
@@ -8190,6 +8224,7 @@ impl ChatRuntimeProjector {
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
                 ),
+                message_id: self.current_message_id.clone(),
             }],
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
@@ -8218,6 +8253,7 @@ impl ChatRuntimeProjector {
                     },
             } => vec![ChatEvent::Warning {
                 message: jeikcode_config::i18n::format_compaction_interrupted(),
+                message_id: self.current_message_id.clone(),
             }],
             CodingRuntimeEvent::CompactionFinished {
                 completion:
@@ -8280,7 +8316,10 @@ impl ChatRuntimeProjector {
                 events
             }
             CodingRuntimeEvent::ControllerWarning(message) => {
-                vec![ChatEvent::Warning { message }]
+                vec![ChatEvent::Warning {
+                    message,
+                    message_id: self.current_message_id.clone(),
+                }]
             }
             CodingRuntimeEvent::PersistenceWarning(message) => {
                 vec![ChatEvent::PersistenceWarning { message }]
@@ -8461,9 +8500,15 @@ impl ChatRuntimeProjector {
                 self.last_error = Some(message.clone());
                 // Agent errors are diagnostics until the runtime emits TurnFinished.
                 // Emitting a terminal HTTP error here would create Error + Done for one turn.
-                vec![ChatEvent::Warning { message }]
+                vec![ChatEvent::Warning {
+                    message,
+                    message_id: self.current_message_id.clone(),
+                }]
             }
-            Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::Warning(message) => vec![ChatEvent::Warning {
+                message,
+                message_id: self.current_message_id.clone(),
+            }],
             Agent::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -8476,6 +8521,7 @@ impl ChatRuntimeProjector {
                 secs_until_reset,
                 auto_resuming,
                 server_message,
+                message_id: self.current_message_id.clone(),
             }],
             Agent::Steered { count, inputs } => {
                 let mut events = Vec::new();
@@ -8525,6 +8571,7 @@ impl ChatRuntimeProjector {
                         message: jeikcode_config::i18n::format_compaction_mark(
                             removed, est_before, est_after,
                         ),
+                        message_id: self.current_message_id.clone(),
                     },
                 ]
             }
@@ -8542,6 +8589,7 @@ impl ChatRuntimeProjector {
                     },
                     ChatEvent::Warning {
                         message: format!("Compaction failed: {error}"),
+                        message_id: self.current_message_id.clone(),
                     },
                 ]
             }
@@ -9084,11 +9132,18 @@ pub(crate) async fn process_chat_request(
         // Record it FIRST: broadcast has no replay window, so late watchers
         // (connected after this send) get the message back from
         // `chat_watch`'s Live replay. A watcher attaching between the record
-        // and the send may receive both — the WebUI dedups identical user text.
+        // and the send may receive both — the WebUI dedups it by the echoed
+        // client correlation id (text matching only as a legacy fallback).
         let created_at = (created_at > 0).then_some(created_at);
         active_chats
             .record_user_message(&operation_id, runtime_text.clone(), created_at)
             .await;
+        // 回传客户端关联键（`/chat` 的 `request_id`）：发送端据此按身份认领自己的
+        // 乐观气泡，无需要靠文本比对（文本只作 legacy / 无 id 的兜底）。
+        let client_input_id = active_chats
+            .admitted_user_message(&operation_id)
+            .await
+            .and_then(|admitted| admitted.client_input_id);
         let _ = event_tx.send(ChatEvent::User {
             content: runtime_text,
             session_id: Some(session_id.clone()),
@@ -9096,6 +9151,7 @@ pub(crate) async fn process_chat_request(
             message_id: None,
             order: None,
             turn_ordinal: None,
+            client_input_id,
         });
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
@@ -15926,6 +15982,7 @@ mod tests {
             message_id: None,
             order: None,
             turn_ordinal: None,
+            client_input_id: None,
         };
         let _ = bus.send(user_event);
 
@@ -16049,9 +16106,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_admitted_user_includes_created_at() {
+    async fn replay_admitted_user_includes_created_at_and_client_id() {
         let registry = ActiveChatRegistry::default();
-        let admission = registry.admit(Some("session-1"), None).await.unwrap();
+        let admission = registry
+            .admit(Some("session-1"), Some("req-1"))
+            .await
+            .unwrap();
         registry
             .record_user_message(
                 &admission.operation_id,
@@ -16067,11 +16127,14 @@ mod tests {
                 content,
                 session_id,
                 created_at,
+                client_input_id,
                 ..
             } => {
                 assert_eq!(content, "hello");
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(created_at, Some(1_700_000_000_000));
+                // 关联键必须回传，发送端才能按身份认领乐观气泡。
+                assert_eq!(client_input_id.as_deref(), Some("req-1"));
             }
             other => panic!("expected user event, got {other:?}"),
         }
@@ -16087,10 +16150,12 @@ mod tests {
             message_id: None,
             order: None,
             turn_ordinal: None,
+            client_input_id: Some("req-9".into()),
         })
         .unwrap();
         assert_eq!(json["type"], "user");
         assert_eq!(json["created_at"], 42);
+        assert_eq!(json["client_input_id"], "req-9");
 
         // 身份回传事件：与可见气泡分离的纯身份通道。
         let identified = serde_json::to_value(ChatEvent::UserIdentified {
@@ -17049,6 +17114,7 @@ mod tests {
     fn chat_warning_serializes_as_its_own_type_not_error() {
         let json = serde_json::to_string(&ChatEvent::Warning {
             message: "conversation compacted".into(),
+            message_id: None,
         })
         .unwrap();
         assert_eq!(
@@ -17153,6 +17219,7 @@ mod tests {
             secs_until_reset: Some(7200),
             auto_resuming: false,
             server_message: None,
+            message_id: None,
         })
         .unwrap();
         // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)

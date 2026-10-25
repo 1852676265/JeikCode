@@ -191,6 +191,29 @@ export function userTextsMatch(a: string, b: string): boolean {
   return false;
 }
 
+/**
+ * 认领本端乐观气泡：优先用服务端回传的客户端关联 id（`/chat` 的 `request_id`，
+ * `/live` 的 `client_input_id`）精确命中；缺失或不匹配时才退回文本比对，
+ * 供 legacy daemon / 第三方客户端兜底。
+ *
+ * 返回应消费的待回声条目下标，`-1` 表示这条不是本端发出的。
+ */
+export function findPendingSelfEchoIndex(
+  pending: ReadonlyArray<{ id: string; text: string }>,
+  event: { client_input_id?: string; content: string },
+): number {
+  // 1. 身份优先：服务端回声带回了发出去时的关联键，命中即精确消费，无需猜文本。
+  if (event.client_input_id) {
+    const byId = pending.findIndex((item) => item.id === event.client_input_id);
+    if (byId >= 0) return byId;
+  }
+  // 2. 文本兜底（无 id 的旧服务端/第三方端）：完全一致或归一化后一致。
+  const want = visibleUserText(event.content);
+  return pending.findIndex(
+    (item) => userTextsMatch(item.text, event.content) || visibleUserText(item.text) === want,
+  );
+}
+
 /** True when `userText` is already the latest user turn on the canvas.
  * Snapshot reconnect / `/chat/watch` replay both re-emit that echo; appending
  * it again creates duplicate bubbles.

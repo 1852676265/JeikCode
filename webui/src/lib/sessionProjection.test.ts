@@ -9,12 +9,14 @@ import {
   identifiedAssistantIndex,
   paintAssistantReasoning,
   paintAssistantText,
+  paintAssistantNotice,
   paintCachedAssistantDelta,
   paintUserMessage,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
   spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
+  stampUserClientInputId,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -1075,5 +1077,58 @@ test('spliceAuthoritativeDiskTail 按 sourceIndex 排除重叠行（无 id 的�
   const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 52);
   // 40 是更早历史保留；50 已在权威切片里，不能再从画布头部留一份。
   assert.deepEqual(spliced.map((m) => m.sourceIndex), [40, 50, 55, 60]);
+});
+
+test('paintAssistantNotice 重放幂等：同一条提示不会叠多份', () => {
+  const canvas = [{ role: 'assistant', id: 'a-1', parts: [{ kind: 'text' as const, text: '正文' }] }];
+  const once = paintAssistantNotice(canvas, 'HTTP 400: {"model":"x"}');
+  assert.equal(once.length, 1);
+  assert.equal(once[0]!.parts.length, 2);
+  // 断线重连重发的同一帧：原数组返回，不再叠一份。
+  const twice = paintAssistantNotice(once, 'HTTP 400: {"model":"x"}');
+  assert.equal(twice, once);
+  assert.equal(twice[0]!.parts.length, 2);
+
+  // 带 message_id：挂回它所属的回合，而不是盲写时间线尾部。
+  const multi = [
+    { role: 'assistant', id: 'a-1', parts: [{ kind: 'text' as const, text: '第一轮' }] },
+    { role: 'assistant', id: 'a-2', parts: [{ kind: 'text' as const, text: '第二轮' }] },
+  ];
+  const targeted = paintAssistantNotice(multi, '压缩完成', 'a-1');
+  assert.equal(targeted[0]!.parts.length, 2);
+  assert.equal(targeted[1]!.parts.length, 1);
+  assert.equal(paintAssistantNotice(targeted, '压缩完成', 'a-1'), targeted);
+  // 不同文案仍然各自上屏。
+  assert.equal(paintAssistantNotice(targeted, '另一条提示', 'a-1')[0]!.parts.length, 3);
+});
+
+test('paintUserMessage 用 client_input_id 做身份幂等，同文不同发不再被吞', () => {
+  const create = () => ({ role: 'user', parts: [{ kind: 'text' as const, text: '同样的提问' }] });
+
+  // 1. 新画的行盖上关联键。
+  const first = paintUserMessage([], '同样的提问', 1, create, { clientInputId: 'req-1' });
+  assert.equal(first.length, 2);
+  assert.equal(first[0]!.clientInputId, 'req-1');
+  // 2. 同一条关联键重放 → 幂等（原数组返回）。
+  assert.equal(paintUserMessage(first, '同样的提问', 1, create, { clientInputId: 'req-1' }), first);
+
+  // 3. 同文不同发（新关联键）→ 必须真的再画一条；旧文本启发式会在这里吞掉。
+  const settled = [
+    { role: 'user', clientInputId: 'req-1', parts: [{ kind: 'text' as const, text: '同样的提问' }] },
+    { role: 'assistant', parts: [{ kind: 'text' as const, text: '答完了' }] },
+  ];
+  const second = paintUserMessage(settled, '同样的提问', 2, create, { clientInputId: 'req-2' });
+  assert.equal(second.length, 4);
+  assert.equal(second[2]!.clientInputId, 'req-2');
+
+  // 4. 无身份（legacy 端）→ 文本兜底仍然生效，不重复画。
+  const legacy = paintUserMessage(settled, '同样的提问', 2, create);
+  assert.equal(legacy.length, settled.length);
+
+  // 5. 盖章助手：只给「还没有身份」的最新 user 行盖章，绝不覆写已有身份。
+  const bare = [{ role: 'user', parts: [{ kind: 'text' as const, text: 'x' }] }];
+  const stamped = stampUserClientInputId(bare, 'req-9');
+  assert.equal(stamped[0]!.clientInputId, 'req-9');
+  assert.equal(stampUserClientInputId(stamped, 'req-1'), stamped);
 });
 

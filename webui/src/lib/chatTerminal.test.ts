@@ -42,6 +42,7 @@ import {
   transcriptToolCallIsResolved,
   dropSnapshotDuplicates,
   userTextsMatch,
+  findPendingSelfEchoIndex,
 } from './chatTerminal.ts';
 
 test('legacy done and stopped are natural completions that preserve queued messages', () => {
@@ -742,6 +743,40 @@ test('userTextsMatch 不把前缀相同、尾部不同的长提问误判为同�
   assert.equal(userTextsMatch(shared, shared), true);
   assert.equal(userTextsMatch(shared, `${shared}   \n`), true);
   assert.equal(userTextsMatch(shared, `${shared}\n\n[图片识别失败]`), true);
+});
+
+test('findPendingSelfEchoIndex 优先按客户端关联键认领，文本仅作兜底', () => {
+  const pending = [
+    { id: 'req-1', text: '同样的提问' },
+    { id: 'req-2', text: '同样的提问' },
+  ];
+
+  // 1. 关联键命中：即使文本对不上，也精确消费自己的那一条（图片预处理/注入改写正文时就靠它）。
+  assert.equal(
+    findPendingSelfEchoIndex(pending, { client_input_id: 'req-2', content: '完全不同的文本' }),
+    1,
+  );
+  // 2. 无关联键（legacy daemon / 第三方客户端）→ 文本兜底。
+  assert.equal(findPendingSelfEchoIndex(pending, { content: '同样的提问' }), 0);
+  // 3. 关联键给了但命中不了 → 继续文本兜底，绝不误伤。
+  assert.equal(
+    findPendingSelfEchoIndex(pending, { client_input_id: 'req-9', content: '同样的提问' }),
+    0,
+  );
+  // 4. 不是本端发出的 → -1，正常入画布。
+  assert.equal(
+    findPendingSelfEchoIndex(pending, { client_input_id: 'req-9', content: '别人的提问' }),
+    -1,
+  );
+
+  // 5. 正文与本地输入不一致（预处理/追加注入）：有 id 靠 id，无 id 时宁可多画一条也不吞真实消息。
+  const rewritten = [{ id: 'req-5', text: '修一下这个报错' }];
+  const echoed = {
+    client_input_id: 'req-5',
+    content: '修一下这个报错\n\n[Additional context from user]: 附上日志',
+  };
+  assert.equal(findPendingSelfEchoIndex(rewritten, echoed), 0);
+  assert.equal(findPendingSelfEchoIndex(rewritten, { content: echoed.content }), -1);
 });
 
 test('reconcileRunningTranscript preserves earlier history when disk snapshot is tail-truncated', () => {
