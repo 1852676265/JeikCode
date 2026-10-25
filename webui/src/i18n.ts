@@ -563,6 +563,9 @@ const zh = {
 
   // System Settings & Desktop Close-to-Tray
   'settings.systemSettings': '系统设置',
+  'settings.autoGitSync': 'Git 自动同步',
+  'settings.autoGitSyncHint': 'Agent 跑完 commit / push / rebase 等会改动分支或远端的命令后，自动刷新本项目所有会话的 Git 面板，并顺带拉取远端最新状态（仅 git fetch，不改动工作区）。',
+  'settings.autoGitSyncSaveFailed': '无法保存 Git 自动同步设置，请重试。',
   'settings.tabDesktop': '桌面与系统',
   'settings.tabAbout': '关于与版本',
   'settings.desktopBehaviorTitle': '桌面客户端行为',
@@ -1642,6 +1645,9 @@ export const en: Record<MsgKey, string> = {
 
   // System Settings & Desktop Close-to-Tray
   'settings.systemSettings': 'System Settings',
+  'settings.autoGitSync': 'Auto Git Sync',
+  'settings.autoGitSyncHint': 'After the agent runs a branch/remote-changing command (commit, push, rebase…), auto-refresh the Git panel across every session of this project and fetch the latest remote state (git fetch only — never touches your working tree).',
+  'settings.autoGitSyncSaveFailed': 'Could not save the Auto Git Sync setting. Please try again.',
   'settings.tabDesktop': 'Desktop & System',
   'settings.tabAbout': 'About & Version',
   'settings.desktopBehaviorTitle': 'Desktop Client Behavior',

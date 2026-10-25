@@ -393,6 +393,20 @@ function SettingsGlyph() {
   );
 }
 
+/** Git 自动同步 glyph（分支 + 汇合弧线）。 */
+function GitSyncGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="4.5" cy="3.6" r="1.7" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="4.5" cy="12.4" r="1.7" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="11.5" cy="8" r="1.7" stroke="currentColor" stroke-width="1.2" />
+      <path d="M4.5 5.3v5.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <path d="M6 4.4c2.4.3 3.3 1.5 4 2.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <path d="M6 11.6c2.4-.3 3.3-1.5 4-2.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 /** Official GitHub Octocat mark glyph. */
 function GithubLogo() {
   return (
@@ -441,7 +455,7 @@ export function Sidebar({
     return () => mq.removeEventListener('change', apply);
   }, []);
   const t = useT();
-  const { theme, setTheme, lang, setLang, githubLogo } = useSettings();
+  const { theme, setTheme, lang, setLang, githubLogo, autoGitSync, setAutoGitSync } = useSettings();
   const SIDEBAR_TAB_STORAGE_KEY = 'jeikcode:sidebar_tab';
   // Sidebar View Tab: 'chats' (会话与项目) vs 'files' (资源管理器)，刷新自动记忆最后选择
   const [sidebarTab, setSidebarTabState] = useState<'chats' | 'files'>(() => {
@@ -1604,6 +1618,25 @@ export function Sidebar({
             ))}
           </div>
         )}
+
+        {/* Git 自动同步：Agent 跑完改动分支/远端的命令后，自动刷新并对齐远端（仅 fetch） */}
+        <button
+          type="button"
+          class="item-menu-row settings-toggle-row"
+          role="switch"
+          aria-checked={autoGitSync}
+          title={t('settings.autoGitSyncHint')}
+          onClick={() => {
+            void setAutoGitSync(!autoGitSync).catch(() => {
+              showToast(t('settings.autoGitSyncSaveFailed'), 'error');
+            });
+          }}
+        >
+          <GitSyncGlyph />
+          <span>{t('settings.autoGitSync')}</span>
+          <span class={'settings-toggle' + (autoGitSync ? ' on' : '')} aria-hidden="true" />
+        </button>
+        <div class="settings-menu-divider" />
 
         {/* 系统设置：模块化系统设置弹窗 */}
         <button class="item-menu-row" onClick={() => chooseSettings('system')}>

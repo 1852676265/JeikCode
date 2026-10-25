@@ -692,6 +692,9 @@ export const de: Record<keyof typeof en, string> = {
 
   // System Settings & Desktop Close-to-Tray
   'settings.systemSettings': 'System Settings',
+  'settings.autoGitSync': 'Auto Git Sync',
+  'settings.autoGitSyncHint': 'After the agent runs a branch/remote-changing command (commit, push, rebase…), auto-refresh the Git panel across every session of this project and fetch the latest remote state (git fetch only — never touches your working tree).',
+  'settings.autoGitSyncSaveFailed': 'Could not save the Auto Git Sync setting. Please try again.',
   'settings.tabDesktop': 'Desktop & System',
   'settings.tabAbout': 'About & Version',
   'settings.desktopBehaviorTitle': 'Desktop Client Behavior',

@@ -502,6 +502,9 @@ export const vi: Record<keyof typeof en, string> = {
 
   // System Settings & Desktop Close-to-Tray
   'settings.systemSettings': 'Cài đặt hệ thống',
+  'settings.autoGitSync': 'Tự đồng bộ Git',
+  'settings.autoGitSyncHint': 'Sau khi agent chạy lệnh thay đổi nhánh/từ xa (commit, push, rebase…), tự động làm mới bảng Git ở mọi phiên của dự án và lấy trạng thái từ xa mới nhất (chỉ git fetch — không đụng vào thư mục làm việc).',
+  'settings.autoGitSyncSaveFailed': 'Không thể lưu cài đặt Tự đồng bộ Git. Vui lòng thử lại.',
   'settings.tabDesktop': 'Màn hình nền & Hệ thống',
   'settings.tabAbout': 'Giới thiệu & Phiên bản',
   'settings.desktopBehaviorTitle': 'Hành vi ứng dụng máy tính',

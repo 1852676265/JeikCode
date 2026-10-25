@@ -692,6 +692,9 @@ export const zhTw: Record<keyof typeof en, string> = {
 
   // System Settings & Desktop Close-to-Tray
   'settings.systemSettings': '系統設定',
+  'settings.autoGitSync': 'Git 自動同步',
+  'settings.autoGitSyncHint': 'Agent 執行完 commit / push / rebase 等會變更分支或遠端的命令後，自動重新整理本專案所有工作階段的 Git 面板，並一併拉取遠端最新狀態（僅 git fetch，不會更動工作區）。',
+  'settings.autoGitSyncSaveFailed': '無法儲存 Git 自動同步設定，請重試。',
   'settings.tabDesktop': '桌面與系統',
   'settings.tabAbout': '關於與版本',
   'settings.desktopBehaviorTitle': '桌面用戶端行為',

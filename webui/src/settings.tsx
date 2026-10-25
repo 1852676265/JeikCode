@@ -5,7 +5,7 @@
 import { createContext, ComponentChildren } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { messages, Lang, MsgKey } from './i18n';
-import { getConfig, postLanguage } from './api';
+import { getConfig, postLanguage, postAutoGitSync } from './api';
 import { Theme, EffectiveTheme, resolveEffectiveTheme } from './lib/theme';
 
 export type { Theme, EffectiveTheme };
@@ -24,6 +24,9 @@ interface SettingsCtx {
   setLang: (l: Lang) => Promise<void>;
   t: (key: MsgKey, params?: TParams) => string;
   githubLogo: boolean;
+  /** Agent 执行 git 变更命令后是否自动同步/刷新（来自 /config，默认开启）。 */
+  autoGitSync: boolean;
+  setAutoGitSync: (v: boolean) => Promise<void>;
 }
 
 const Ctx = createContext<SettingsCtx | null>(null);
@@ -105,6 +108,7 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
   const [effectiveTheme, setEffectiveTheme] = useState<EffectiveTheme>(() => resolveEffectiveTheme(readTheme()));
   const [lang, setLangState] = useState<Lang>(readLang);
   const [githubLogo, setGithubLogo] = useState<boolean>(true);
+  const [autoGitSync, setAutoGitSyncState] = useState<boolean>(true);
 
   const selectionVersion = useRef(0);
   const pendingSave = useRef(Promise.resolve());
@@ -121,6 +125,9 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
         if (typeof cfg.github_logo === 'boolean') {
           setGithubLogo(cfg.github_logo);
         }
+        if (typeof cfg.auto_git_sync === 'boolean') {
+          setAutoGitSyncState(cfg.auto_git_sync);
+        }
       })
       .catch(() => {});
 
@@ -128,6 +135,9 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
       getConfig().then((cfg) => {
         if (typeof cfg.github_logo === 'boolean') {
           setGithubLogo(cfg.github_logo);
+        }
+        if (typeof cfg.auto_git_sync === 'boolean') {
+          setAutoGitSyncState(cfg.auto_git_sync);
         }
       }).catch(() => {});
     };
@@ -150,6 +160,17 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
     // Keep the promise chain alive on error while propagating rejection to caller.
     pendingSave.current = save.catch(() => {});
     return save;
+  }
+
+  // 乐观切换 Git 自动同步开关：失败时回滚，保证 UI 与磁盘配置一致。
+  function setAutoGitSync(next: boolean): Promise<void> {
+    setAutoGitSyncState(next);
+    const save = pendingSave.current.then(() => postAutoGitSync(next));
+    pendingSave.current = save.catch(() => {});
+    return save.catch((err) => {
+      setAutoGitSyncState((prev) => (prev === next ? !next : prev));
+      throw err;
+    });
   }
 
   // Apply theme to <html data-theme>; theme.css and app.css key light/dark off this.
@@ -213,7 +234,7 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
 
   return (
     <Ctx.Provider
-      value={{ theme, effectiveTheme, setTheme: setThemeState, lang, setLang, t, githubLogo }}
+      value={{ theme, effectiveTheme, setTheme: setThemeState, lang, setLang, t, githubLogo, autoGitSync, setAutoGitSync }}
     >
       {children}
     </Ctx.Provider>

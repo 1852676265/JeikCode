@@ -35,6 +35,7 @@ mod commands;
 mod compat_api;
 mod fs_upload;
 pub mod git_adapter;
+mod git_intent;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
 pub mod live_hub;
@@ -130,6 +131,8 @@ pub(crate) struct ConfigResponse {
     pub language: String,
     /// Whether to display the GitHub repository logo in the UI.
     pub github_logo: bool,
+    /// Agent 执行完会改动分支/引用/远端的 git 命令后，是否自动向该项目全部会话广播 Git 刷新。
+    pub auto_git_sync: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2385,9 +2388,15 @@ pub(crate) enum GlobalWireEvent {
     /// 全局配置热重载（如 CLI 执行 jeikcode ghimg 或后台变更）。
     #[serde(rename = "config_reloaded")]
     ConfigReloaded,
-    /// Git 仓库状态变更（discard / stage / commit / pull / fetch / checkout 等），跨设备全量广播
+    /// Git 仓库状态变更（discard / stage / commit / pull / fetch / checkout 等），跨设备全量广播。
+    /// `fetch: true` 表示「分支/远端引用可能已变」：客户端除本地刷新外，还应（按自身节流）
+    /// 补一次 `git fetch`（只更新 remote-tracking refs，绝不动工作区）。
     #[serde(rename = "git_updated")]
-    GitUpdated { cwd: String },
+    GitUpdated {
+        cwd: String,
+        #[serde(default)]
+        fetch: bool,
+    },
     /// 终端会话状态变更（创建 / 关闭 / 清空），项目级跨设备全局广播
     #[serde(rename = "terminal_updated")]
     TerminalUpdated { cwd: String },
@@ -2481,6 +2490,15 @@ pub(crate) fn global_events() -> &'static tokio::sync::broadcast::Sender<GlobalW
 /// the next invalidation (or a client's cold start) reconciles the state.
 pub(crate) fn publish_global(event: GlobalWireEvent) {
     let _ = global_events().send(event);
+}
+
+/// 「git 变更命令自动同步」开关：默认开启；读配置失败时按开启兜底。
+/// 仅在确实命中 git 写命令的关键节点调用，开销可忽略（不做任何轮询）。
+fn auto_git_sync_enabled() -> bool {
+    jeikcode_config::store::ConfigStore::default_store()
+        .read()
+        .map(|snapshot| snapshot.config.auto_git_sync)
+        .unwrap_or(true)
 }
 
 /// `/events` 的挂载点。单独抽成 helper，生产路由与测试共用同一份定义：
@@ -2614,18 +2632,35 @@ pub(crate) fn fanout_chat_events_for_session(
     tokio::spawn(async move {
         let mut current_sid = session_id;
         let current_wd = working_dir;
+        // Git 变更命令登记表：call_id → 意图（见 git_intent）。仅在 shell 工具里命中
+        // 「改动分支/引用/远端」的 git 命令时登记，待其 ToolResult 落地才触发一次广播。
+        // 这是关键节点启发触发，不引入任何轮询。
+        let mut pending_git: HashMap<String, crate::git_intent::GitIntent> = HashMap::new();
         while let Some(event) = rx.recv().await {
             let mut deferred_activity: Option<GlobalWireEvent> = None;
             let mut deferred_upsert_sid: Option<String> = None;
             match &event {
                 ChatEvent::ToolCallStarted {
-                    name, arguments, ..
+                    id,
+                    name,
+                    arguments,
+                    ..
                 } => {
                     tracing::info!(
                         tool = %name,
                         args = %log_truncate(arguments, 300),
                         "chat: tool call started"
                     );
+                    // 关键节点启发：仅解析 shell 工具的命令，命中 git 写操作才登记，
+                    // 等 ToolResult 落地后再广播（绝不新增轮询）。
+                    if jeikcode_capabilities::tools::is_shell_tool_name(name) {
+                        if let Some(intent) =
+                            jeikcode_capabilities::tools::extract_shell_command(arguments)
+                                .and_then(|cmd| crate::git_intent::classify(&cmd))
+                        {
+                            pending_git.insert(id.clone(), intent);
+                        }
+                    }
                 }
                 ChatEvent::PermissionRequest {
                     session_id,
@@ -2695,8 +2730,23 @@ pub(crate) fn fanout_chat_events_for_session(
                         });
                     }
                 }
-                ChatEvent::ToolCallResult { name, success, .. } => {
+                ChatEvent::ToolCallResult {
+                    id, name, success, ..
+                } => {
                     tracing::info!(tool = %name, success, "chat: tool result");
+                    // shell 的 git 变更命令已执行完毕（关键节点）：向本项目全部会话广播一次
+                    // Git 刷新；远端/引用类命令让客户端再按节流补一次 `git fetch`。
+                    if let Some(intent) = pending_git.remove(id) {
+                        if auto_git_sync_enabled() {
+                            if let Some(dir) = current_wd.as_deref() {
+                                api_git::invalidate_git_cache(dir);
+                                publish_global(GlobalWireEvent::GitUpdated {
+                                    cwd: dir.to_string_lossy().to_string(),
+                                    fetch: intent.needs_fetch(),
+                                });
+                            }
+                        }
+                    }
                 }
                 ChatEvent::SessionAssigned { session_id }
                 | ChatEvent::SessionRenamed { session_id, .. } => {
@@ -14516,6 +14566,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/config", get(api_config::get_config))
         .route("/config/reload", post(api_config::reload_config))
         .route("/config/language", post(api_config::set_language))
+        .route("/config/auto-git-sync", post(api_config::set_auto_git_sync))
         .route(
             "/api/remote-access",
             get(api_config::get_remote_access).post(api_config::post_remote_access),

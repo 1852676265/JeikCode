@@ -9322,7 +9322,10 @@ export function Chat({
                         {contextLimit && (
                           <div class="token-popover-progress-box">
                             <div class="token-popover-progress-labels">
-                              <span class="token-popover-progress-title">{t('tokens.contextProgressTitle')}</span>
+                              <span class="token-popover-progress-title">
+                                <span class="token-popover-progress-icon" aria-hidden="true">📝</span>
+                                {t('tokens.contextProgressTitle')}
+                              </span>
                               <span class="token-popover-progress-val">
                                 {totalStr} / {limitStr}
                               </span>
@@ -9343,25 +9346,6 @@ export function Chat({
                               <span class="token-popover-progress-pct">{pctOfLimit}%</span>
                             </div>
                           </div>
-                        )}
-
-                        {sessionId && (
-                          <button
-                            type="button"
-                            class="token-popover-compact"
-                            disabled={busy || isCompacting}
-                            title={busy ? t('cmd.session.busy') : t('tokens.compactAction')}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              // Same path as the `/compact` slash command: the HIGH-QUALITY
-                              // compaction (recent window kept verbatim + anchored LLM
-                              // summary + verbatim artifact archive), not the cheap stub.
-                              void slashHandlers.execServerCommand('compact', '');
-                            }}
-                          >
-                            <span class="token-compact-icon" aria-hidden="true">🗜️</span>
-                            <span>{t('tokens.compactAction')}</span>
-                          </button>
                         )}
 
                         <div class="token-popover-grid">
@@ -9428,6 +9412,25 @@ export function Chat({
                             <span class="token-popover-row-val">{billableStr}</span>
                           </div>
                         </div>
+
+                        {sessionId && (
+                          <button
+                            type="button"
+                            class="token-popover-compact"
+                            disabled={busy || isCompacting}
+                            title={busy ? t('cmd.session.busy') : t('tokens.compactAction')}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              // Same path as the `/compact` slash command: the HIGH-QUALITY
+                              // compaction (recent window kept verbatim + anchored LLM
+                              // summary + verbatim artifact archive), not the cheap stub.
+                              void slashHandlers.execServerCommand('compact', '');
+                            }}
+                          >
+                            <span class="token-compact-icon" aria-hidden="true">🗜️</span>
+                            <span>{t('tokens.compactAction')}</span>
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>

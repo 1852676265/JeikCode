@@ -561,7 +561,7 @@ class ProjectGitManager {
   /**
    * 接收来自 /events SSE 广播的增量事件（支持异地多设备协同）
    */
-  public handleRemoteUpdate(data: { cwd?: string; version?: number; force?: boolean }): void {
+  public handleRemoteUpdate(data: { cwd?: string; version?: number; force?: boolean; fetch?: boolean }): void {
     const key = this.normalizeKey(data.cwd);
     const remoteVer = data.version ?? 0;
     const cur = this.getState(key);
@@ -573,6 +573,11 @@ class ProjectGitManager {
     if (this.hasSubscribers(key)) {
       // 当前设备正打开着 Git 面板，立即强制刷新
       void this.scheduleRefresh(key, { immediate: true, forceAll: true, reason: 'remote_broadcast' });
+      // 分支/远端引用可能已变：按既有 60s 节流补一次静默 fetch（不强制、绝不 pull），
+      // 与后端「关键节点触发、不做高频轮询」的温和策略保持一致。
+      if (data.fetch) {
+        void this.triggerAutoFetch(key);
+      }
     } else {
       // 当前设备处于折叠状态，仅记下版本号，0次网络开销，等用户点开时才拉取
       this.pendingVersions.set(key, remoteVer || cur.version + 1);

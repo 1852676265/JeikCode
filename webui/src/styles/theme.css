@@ -47,9 +47,9 @@
   color-scheme: light;
   --app-brand:#2563eb; --app-brand-button:#2563eb; --app-brand-ivory:#ffffff; --app-brand-slate:#0f172a;
   --app-primary-foreground:#0f172a; --app-primary-background:#ebedf0; --app-brand-text:#2563eb;
-  --app-secondary-foreground:#475569; --app-secondary-background:#e1e4e8;
+  --app-secondary-foreground:#334155; --app-secondary-background:#e1e4e8;
   --app-card-background:#f6f8fa; --app-border:#c8cdd4;
-  --app-msg-time-color:#64748b;
+  --app-msg-time-color:#475569;
   --app-input-foreground:#0f172a; --app-input-background:#ffffff; --app-input-border:#cbd2d9;
   --app-input-active-border:#2563eb; --app-input-placeholder-foreground:#64748b; --app-input-secondary-background:#d9dde3;
   --app-button-foreground:#ffffff; --app-button-background:#2563eb; --app-button-hover-background:#1d4ed8; --app-ghost-button-hover-background:rgba(0, 0, 0, 0.06);
@@ -78,9 +78,9 @@
     color-scheme: light;
     --app-brand:#2563eb; --app-brand-button:#2563eb; --app-brand-ivory:#ffffff; --app-brand-slate:#0f172a;
     --app-primary-foreground:#0f172a; --app-primary-background:#ebedf0; --app-brand-text:#2563eb;
-    --app-secondary-foreground:#475569; --app-secondary-background:#e1e4e8;
+    --app-secondary-foreground:#334155; --app-secondary-background:#e1e4e8;
     --app-card-background:#f6f8fa; --app-border:#c8cdd4;
-    --app-msg-time-color:#64748b;
+    --app-msg-time-color:#475569;
     --app-input-foreground:#0f172a; --app-input-background:#ffffff; --app-input-border:#cbd2d9;
     --app-input-active-border:#2563eb; --app-input-placeholder-foreground:#64748b; --app-input-secondary-background:#d9dde3;
     --app-button-foreground:#ffffff; --app-button-background:#2563eb; --app-button-hover-background:#1d4ed8; --app-ghost-button-hover-background:rgba(0, 0, 0, 0.06);

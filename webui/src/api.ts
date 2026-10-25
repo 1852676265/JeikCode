@@ -1188,6 +1188,8 @@ export interface ConfigInfo {
   language?: string;
   /** Whether to display the GitHub repository logo in the UI. Defaults to true. */
   github_logo?: boolean;
+  /** Agent 执行完会改动分支/引用/远端的 git 命令后，是否自动向所有会话广播 Git 刷新。默认 true。 */
+  auto_git_sync?: boolean;
 }
 
 export async function getConfig(): Promise<ConfigInfo> {
@@ -1214,6 +1216,16 @@ export async function postLanguage(lang: Lang): Promise<void> {
     body: JSON.stringify({ language }),
   });
   if (!resp.ok) throw new Error(`set language failed: ${resp.status}`);
+}
+
+/** Persist the "auto git sync" switch (POST /config/auto-git-sync). */
+export async function postAutoGitSync(enabled: boolean): Promise<void> {
+  const resp = await apiFetch('/config/auto-git-sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!resp.ok) throw new Error(`set auto git sync failed: ${resp.status}`);
 }
 
 export interface RemoteAccessStatus {
@@ -1981,7 +1993,7 @@ export type GlobalWireEvent =
   /** 侧栏项目可见性（隐藏/钉住/运行中自动恢复），跨实例就地对齐。 */
   | { type: 'sidebar_projects'; hidden: string[]; pinned?: ProjectInfo[] }
   /** Git 仓库变更（discard / stage / commit / pull / fetch 等），跨实例全量广播 */
-  | { type: 'git_updated'; cwd: string }
+  | { type: 'git_updated'; cwd: string; fetch?: boolean }
   /** 终端会话变更（创建 / 关闭 / 清空），跨实例项目级全量广播 */
   | { type: 'terminal_updated'; cwd: string };
 

@@ -32,7 +32,7 @@ export function emitGlobalEvent(event: GlobalWireEvent): void {
   if (event.type === 'git_updated') {
     try {
       import('./gitStore').then((m) => {
-        m.gitStore.handleRemoteUpdate({ cwd: event.cwd, force: true });
+        m.gitStore.handleRemoteUpdate({ cwd: event.cwd, force: true, fetch: event.fetch });
       });
     } catch {}
   }

@@ -84,6 +84,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         accounts,
         language,
         github_logo: config.github_logo,
+        auto_git_sync: config.auto_git_sync,
     }
 }
 
@@ -210,6 +211,27 @@ pub(crate) async fn set_language(Json(body): Json<LanguageBody>) -> impl IntoRes
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
     };
+    Json(config_response(&config)).into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct AutoGitSyncBody {
+    enabled: bool,
+}
+
+/// POST /config/auto-git-sync — 持久化「Agent 执行 git 变更命令后自动刷新/同步」开关。
+pub(crate) async fn set_auto_git_sync(Json(body): Json<AutoGitSyncBody>) -> impl IntoResponse {
+    let config = match update_config(|cfg| {
+        cfg.auto_git_sync = body.enabled;
+        Ok(())
+    }) {
+        Ok(config) => config,
+        Err(err) => {
+            return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+    };
+    // 复用既有 config_reloaded 失效总线，让其它实例/标签页即时对齐该开关。
+    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
     Json(config_response(&config)).into_response()
 }
 

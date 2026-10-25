@@ -681,6 +681,11 @@ pub struct Config {
         deserialize_with = "deserialize_lenient_bool"
     )]
     pub github_logo: bool,
+    /// 当 Agent 通过 shell 工具（run_command/bash）执行完会改动分支 / 引用 / 远端的 git
+    /// 命令后，自动向该项目所有会话广播一次 Git 状态刷新（远端/引用类命令再由客户端按节拍
+    /// 补一次 `git fetch`，只更新 remote-tracking refs，绝不动工作区）。默认开启。
+    #[serde(default = "default_true")]
+    pub auto_git_sync: bool,
     /// Offline deployment switch (intranet / air-gapped). Default off = online build unchanged.
     #[serde(default)]
     pub offline_mode: offline::OfflineMode,
@@ -964,6 +969,7 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             keep_interrupted_context: true,
             github_logo: true,
+            auto_git_sync: true,
             offline_mode: offline::OfflineMode::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),
@@ -2642,6 +2648,7 @@ model = "missing-type"
             web_search: Default::default(),
             keep_interrupted_context: false,
             github_logo: true,
+            auto_git_sync: true,
             offline_mode: Default::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),

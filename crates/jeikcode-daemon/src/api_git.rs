@@ -227,6 +227,7 @@ pub async fn git_action(
                 invalidate_git_cache(&dir);
                 crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                     cwd: dir.to_string_lossy().to_string(),
+                    fetch: false,
                 });
                 Json(GitActionResp {
                     success: true,
@@ -1020,6 +1021,7 @@ pub async fn git_checkout(
                 invalidate_git_cache(&dir);
                 crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                     cwd: dir.to_string_lossy().to_string(),
+                    fetch: false,
                 });
                 Json(GitCheckoutResp {
                     success: true,
@@ -1448,6 +1450,7 @@ pub async fn git_stage(
             invalidate_git_cache(&dir);
             crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                 cwd: dir.to_string_lossy().to_string(),
+                fetch: false,
             });
             Json(serde_json::json!({ "success": true })).into_response()
         }
@@ -1494,6 +1497,7 @@ pub async fn git_unstage(
             invalidate_git_cache(&dir);
             crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                 cwd: dir.to_string_lossy().to_string(),
+                fetch: false,
             });
             Json(serde_json::json!({ "success": true })).into_response()
         }
@@ -1635,6 +1639,7 @@ pub async fn git_discard(
             invalidate_git_cache(&dir);
             crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                 cwd: dir.to_string_lossy().to_string(),
+                fetch: false,
             });
             Json(serde_json::json!({ "success": true })).into_response()
         }
@@ -1676,6 +1681,7 @@ pub async fn git_commit(
             invalidate_git_cache(&dir);
             crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                 cwd: dir.to_string_lossy().to_string(),
+                fetch: false,
             });
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             Json(serde_json::json!({
@@ -1737,6 +1743,7 @@ pub async fn git_push(
                 invalidate_git_cache(&dir);
                 crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                     cwd: dir.to_string_lossy().to_string(),
+                    fetch: false,
                 });
                 Json(serde_json::json!({
                     "success": true,
@@ -1916,6 +1923,7 @@ pub async fn git_fetch(
                 invalidate_git_cache(&dir);
                 crate::publish_global(crate::GlobalWireEvent::GitUpdated {
                     cwd: dir.to_string_lossy().to_string(),
+                    fetch: false,
                 });
                 Json(serde_json::json!({
                     "success": true,
