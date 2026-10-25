@@ -172,13 +172,23 @@ impl ArtifactWatchdog {
     }
 
     /// Spawn a background initial scan of `sessions_dir` to seed the atomic counter on startup.
-    /// Never blocks the caller; runs on Tokio's blocking threadpool.
+    /// Never blocks the caller; runs on Tokio's blocking threadpool if available, or a dedicated thread.
     pub fn spawn_initial_scan(self: Arc<Self>) {
         let wd = Arc::clone(&self);
-        tokio::task::spawn_blocking(move || {
-            let total = wd.scan_disk_total_bytes_sync();
-            wd.set_total_bytes(total);
-        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(move || {
+                let total = wd.scan_disk_total_bytes_sync();
+                wd.set_total_bytes(total);
+            });
+        } else {
+            std::thread::Builder::new()
+                .name("artifact-watchdog-init".into())
+                .spawn(move || {
+                    let total = wd.scan_disk_total_bytes_sync();
+                    wd.set_total_bytes(total);
+                })
+                .ok();
+        }
     }
 
     /// Start the asynchronous background maintenance loop.
