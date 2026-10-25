@@ -488,7 +488,10 @@ impl GitPlatformAdapter for GitLabAdapter {
             "{base}/projects/{encoded_repo}/merge_requests?state=opened&order_by=updated_at&sort=desc&per_page=50"
         );
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let mut req = client
             .get(&url)
             .header("PRIVATE-TOKEN", token.trim())

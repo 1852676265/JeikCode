@@ -130,6 +130,10 @@ pub fn get_repo_etag(repo: &str) -> Option<String> {
 /// 更新仓库 ETag 缓存（仅在 ETag 实际发生变动时持久化落盘）
 pub fn update_repo_etag(repo: &str, new_etag: Option<String>) -> bool {
     let normalized_repo = repo.trim().to_lowercase();
+    let normalized_etag = new_etag
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let Ok(mut lock) = get_state_cache().lock() else {
         return false;
     };
@@ -138,11 +142,11 @@ pub fn update_repo_etag(repo: &str, new_etag: Option<String>) -> bool {
         .entry(normalized_repo)
         .or_insert_with(RepoPollState::default);
 
-    if repo_state.etag == new_etag {
+    if repo_state.etag == normalized_etag {
         return false;
     }
 
-    repo_state.etag = new_etag;
+    repo_state.etag = normalized_etag;
     save_poll_state_to_disk(&lock);
     true
 }
@@ -301,6 +305,13 @@ pub async fn poll_cycle_tick(state: &AppState) {
         {
             Ok(output) => {
                 if output.not_modified {
+                    // 若平台在 304 响应中提供了刷新/轮换的 ETag，确保同步更新持久化
+                    if let Some(ref new_etag) = output.etag {
+                        update_repo_etag(repo, Some(new_etag.clone()));
+                    }
+                    if !is_repo_initialized(repo) {
+                        seed_repo_baseline_with_etag(repo, &[], output.etag);
+                    }
                     tracing::debug!(
                         "[git_polling] Repository `{repo}` returned HTTP 304 Not Modified. Zero quota deduction, preserving existing state."
                     );
@@ -539,6 +550,11 @@ mod tests {
         // Changing ETag should return true
         assert!(update_repo_etag(repo, Some("tag-v2".to_string())));
         assert_eq!(get_repo_etag(repo).as_deref(), Some("tag-v2"));
+
+        // Whitespace/empty ETag should normalize to None
+        assert!(update_repo_etag(repo, Some("   ".to_string())));
+        assert_eq!(get_repo_etag(repo), None);
+        assert!(!update_repo_etag(repo, None));
     }
 
     #[test]
@@ -580,14 +596,27 @@ mod tests {
         let addr = listener.local_addr().expect("mock addr");
         let api_base = format!("http://127.0.0.1:{}", addr.port());
 
-        // Mock server always returns HTTP 304 Not Modified
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Mock server returns HTTP 304 with existing ETag on first request, and rotated ETag on second request
         let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf).await.expect("read");
-            let resp =
-                "HTTP/1.1 304 Not Modified\r\nETag: W/\"304-tag\"\r\nContent-Length: 0\r\n\r\n";
-            stream.write_all(resp.as_bytes()).await.expect("write 304");
+            let mut cycle = 0;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    res = listener.accept() => {
+                        let Ok((mut stream, _)) = res else { break; };
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        cycle += 1;
+                        let etag_val = if cycle == 1 { "W/\"304-tag\"" } else { "W/\"rotated-etag-v2\"" };
+                        let resp = format!(
+                            "HTTP/1.1 304 Not Modified\r\nETag: {etag_val}\r\nContent-Length: 0\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    }
+                }
+            }
         });
 
         let repo = "test-owner/test-304-repo";
@@ -612,17 +641,28 @@ mod tests {
         let home = crate::tests::ScopedChatHome::new();
         let state = crate::tests::chat_test_state(&home);
 
-        // Run poll cycle tick: Should fetch 304, preserve existing state without spawning review
+        // 1. First tick: Returns 304 with same ETag -> Preserves state, no review triggered
         poll_cycle_tick(&state).await;
 
-        // ETag remains unchanged
         assert_eq!(get_repo_etag(repo).as_deref(), Some("W/\"304-tag\""));
-        // SHA remains deduplicated
         assert!(!check_and_update_pr_sha(repo, 1, "sha-existing-1"));
-        // Last polled timestamp was updated in memory
         assert!(get_repo_last_polled(repo) > 0);
 
+        // 2. Clear last polled timestamp to allow second tick immediately
+        if let Ok(mut lock) = get_last_polled_cache().lock() {
+            lock.remove(&repo.to_lowercase());
+        }
+
+        // Second tick: Platform returns 304 with rotated ETag -> updates cached ETag
+        poll_cycle_tick(&state).await;
+        assert_eq!(
+            get_repo_etag(repo).as_deref(),
+            Some("W/\"rotated-etag-v2\"")
+        );
+        assert!(!check_and_update_pr_sha(repo, 1, "sha-existing-1"));
+
         crate::git_adapter::disable_binding_for_project(project);
+        let _ = shutdown_tx.send(());
         let _ = server_task.await;
     }
 }

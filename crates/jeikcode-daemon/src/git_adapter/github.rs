@@ -484,7 +484,10 @@ impl GitPlatformAdapter for GitHubAdapter {
         let url =
             format!("{base}/repos/{repo}/pulls?state=open&sort=updated&direction=desc&per_page=50");
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let mut req = client.get(&url).header("User-Agent", "JeikCode-Bot/1.0");
         if !token.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", token.trim()));
