@@ -568,30 +568,15 @@ pub(crate) async fn execute_git_workflow(
         return Ok(());
     }
 
-    // 3. 若未在运行，若配置了有效 Token，先发出即时看板进度卡（方案 C：无尾注，带 🌟，工整紧凑）
+    // 3. 若未在运行，若配置了有效 Token，先发出即时看板进度卡（全语种统一英文占位，简洁紧凑）
+    //    注意：正文必须保留 "JeikCode" 关键字，供 git_adapter 的 find_bot_primary_comment 定位并原地更新。
     if !token.is_empty() {
-        let ack_message = if is_zh {
-            format!(
-                "### 🌟 JeikCode Code Review\n\
-                - **状态 (Status)**: ⏳ 正在审查 / In Progress\n\
-                - **目标 (Target)**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
-                > *(审查完成后，完整报告将在此直接更新呈现)*"
-            )
-        } else if is_vi {
-            format!(
-                "### 🌟 JeikCode Code Review\n\
-                - **Trạng thái (Status)**: ⏳ Đang tiến hành đánh giá / In Progress\n\
-                - **Mục tiêu (Target)**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
-                > *(Sau khi hoàn thành đánh giá, báo cáo đầy đủ sẽ được cập nhật trực tiếp tại đây)*"
-            )
-        } else {
-            format!(
-                "### 🌟 JeikCode Code Review\n\
-                - **Status**: ⏳ In Progress\n\
-                - **Target**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
-                > *(The complete review report will be updated here shortly)*"
-            )
-        };
+        let ack_message = format!(
+            "### 🌟 JeikCode Code Review\n\n\
+            ⏳ Reviewing, please hold on…\n\
+            📄 The full report will be published right here once ready\n\n\
+            > Target: [{kind_label} #{pr_or_issue_number}]({pr_url})"
+        );
         let _ = adapter
             .post_comment(
                 &token,
