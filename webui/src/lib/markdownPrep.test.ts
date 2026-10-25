@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { marked } from 'marked';
 import {
   buildTableDelimiter,
+  fenceOpen,
   isLanguageLikeInfo,
   isTableDelimiterLine,
   preprocessMarkdown,
@@ -464,13 +465,48 @@ test('cleanRedactedThinkingBlocks collapses raw encrypted thinking blocks into d
   assert.match(out2, /用户提供的反馈表明/);
 });
 
-test('isLanguageLikeInfo accepts real language tags and rejects prose info strings', () => {
-  for (const ok of ['rust', 'diff', 'json', 'c++', 'c#', 'mermaid-streaming', 'toml', 'bash', 'markdown']) {
+test('isLanguageLikeInfo accepts language tags (incl. comma options) and rejects prose tokens', () => {
+  for (const ok of [
+    'rust',
+    'diff',
+    'json',
+    'c++',
+    'c#',
+    'mermaid-streaming',
+    'toml',
+    'bash',
+    'markdown',
+    // Comma-separated options survive `fenceOpen`'s first-token split → must be accepted,
+    // otherwise a genuine nested ```rust,no_run fence is not promoted and the fences desync.
+    'rust,no_run',
+    'python,linenums',
+  ]) {
     assert.equal(isLanguageLikeInfo(ok), true, `expected language-like: ${ok}`);
   }
-  for (const bad of ['', '+', '+ 【执行铁律】(禁 checkout)', '这是示例', 'some prose here', '标签']) {
-    assert.equal(isLanguageLikeInfo(bad), false, `expected prose: ${bad}`);
+  for (const bad of ['', '+', '这是示例', '标签', '...', '1.2']) {
+    assert.equal(isLanguageLikeInfo(bad), false, `expected non-language token: ${bad}`);
   }
+});
+
+test('fenceOpen reduces info strings to the first token that isLanguageLikeInfo judges', () => {
+  // Production passes `fenceOpen(line).lang` — the FIRST whitespace-delimited token, not the
+  // whole multi-word info string. Pin that contract so these unit tests cannot silently drift
+  // away from the real call sites in findMatchingFenceClose / promoteNestedCodeFences.
+  assert.equal(fenceOpen('```rust,no_run')?.lang, 'rust,no_run');
+  assert.equal(isLanguageLikeInfo(fenceOpen('```rust,no_run')?.lang), true);
+  assert.equal(fenceOpen('```js title="x"')?.lang, 'js');
+  assert.equal(isLanguageLikeInfo(fenceOpen('```js title="x"')?.lang), true);
+  // The historical prose line: first token is `+` → rejected even though the tail is prose.
+  assert.equal(fenceOpen('``` + 【执行铁律】(禁 checkout)')?.lang, '+');
+  assert.equal(isLanguageLikeInfo(fenceOpen('``` + 【执行铁律】(禁 checkout)')?.lang), false);
+});
+
+test('a genuine nested fence whose info carries comma options (```rust,no_run) is still promoted', () => {
+  const md = ['```markdown', '# title', '```rust,no_run', 'fn main() {}', '```', '```'].join('\n');
+  const promoted = promoteNestedCodeFences(md);
+  assert.match(promoted, /^````markdown$/m); // outer promoted to 4 backticks
+  assert.match(promoted, /^````$/m); // outer close promoted in lockstep
+  assert.match(promoted, /^```rust,no_run$/m); // inner kept as-is
 });
 
 test('prose line starting with ``` inside a fence is not mistaken for a nested sub-fence (no desync)', () => {

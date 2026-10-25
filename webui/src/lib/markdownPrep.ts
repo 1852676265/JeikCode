@@ -116,15 +116,18 @@ export function fenceClose(line: string, state: FenceState): boolean {
 }
 
 /**
- * info 串是否是一个「像语言标签」的 token（rust / diff / json / c++ / c# / mermaid-streaming / toml …）。
+ * info 串是否是一个「像语言标签」的 token（rust / diff / json / c++ / c# / mermaid-streaming / toml / rust,no_run …）。
  *
  * ★ 关键防御：围栏正文里经常出现以 ``` 开头的散文行（如 ` ``` + 【执行铁律】… `、` ``` 这是示例 `）。
  * 按 CommonMark 它们确实是「带 info 串的开围栏」，但在一个已开启的围栏内部属于普通内容。
  * 若不加甄别而把这行当成「嵌套子围栏」，promoteNestedCodeFences 会错误提升外层围栏长度、
  * 并把错误的行改写为闭合，导致围栏长度 desync → 后续正文被吞进代码块（渲染成一片乱码画布）。
- * 因此这里只接受「纯英文数字 + 常见语言符号」的 token，含中文/空白/标点的散文一律排除。
+ * ★ 输入形态：调用方传入的是 `fenceOpen` 已按空白切分后的**首个 token**（`rust,no_run` 整体、
+ * `js title="x"` 只取 `js`），并非整条多词 info 串。因此判定只需满足「以 ASCII 字母开头」，
+ * 其后允许字母数字与常见语言/属性符号（`+ # . , : @ / = _ -`）；中文、空白、反引号等散文特征
+ * 一律排除（`+ ...`、`这是示例` 被拒，`rust,no_run` 放行）。
  */
-const LANGUAGE_INFO_RE = /^[a-z][a-z0-9_+.#-]*$/;
+const LANGUAGE_INFO_RE = /^[a-z][a-z0-9_+.#,\-:/@=]*$/;
 export function isLanguageLikeInfo(lang: string | undefined): boolean {
   return LANGUAGE_INFO_RE.test((lang ?? '').trim().toLowerCase());
 }
