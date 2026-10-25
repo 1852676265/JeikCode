@@ -12049,13 +12049,16 @@ struct CapItemResponse {
 /// TRUE when `<working_dir>/.jeikcode/skills.json` resolves to the GLOBAL skills
 /// file. Happens when the active project is the user's home directory.
 fn skills_project_scope_shared(working_dir: &std::path::Path) -> bool {
-    use jeikcode_capabilities::skills::controls as controls;
+    use jeikcode_capabilities::skills::controls;
     let project = controls::project_state_path(working_dir);
     let global = controls::global_state_path();
     if project == global {
         return true;
     }
-    match (std::fs::canonicalize(&project), std::fs::canonicalize(&global)) {
+    match (
+        std::fs::canonicalize(&project),
+        std::fs::canonicalize(&global),
+    ) {
         (Ok(project), Ok(global)) => project == global,
         _ => false,
     }
@@ -12148,8 +12151,7 @@ async fn capabilities_toggle(
     State(state): State<AppState>,
     Json(req): Json<CapToggleRequest>,
 ) -> axum::response::Response {
-    let working_dir =
-        resolve_capability_project(&state, req.working_dir.as_deref()).await;
+    let working_dir = resolve_capability_project(&state, req.working_dir.as_deref()).await;
     if let Err(error) = jeikcode_capabilities::control::set_disabled(
         &working_dir,
         req.kind,

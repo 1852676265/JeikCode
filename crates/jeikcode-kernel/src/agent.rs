@@ -3264,11 +3264,9 @@ impl RunningAgent {
                 && assistant_text.trim().is_empty()
                 && pending_calls.is_empty()
                 && !truncated;
-            let empty_completion = (!saw_stream_content
-                || filler_only_reasoning
-                || thinking_only
-                || blank_text_only)
-                && !truncated;
+            let empty_completion =
+                (!saw_stream_content || filler_only_reasoning || thinking_only || blank_text_only)
+                    && !truncated;
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;

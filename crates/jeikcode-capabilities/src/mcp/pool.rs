@@ -179,7 +179,9 @@ impl ProjectMcpPool {
                 .filter(|key| **key != keep_key)
                 .cloned()
                 .collect();
-            keys.into_iter().filter_map(|key| slots.remove(&key)).collect()
+            keys.into_iter()
+                .filter_map(|key| slots.remove(&key))
+                .collect()
         };
         for slot in stale {
             slot.registry.shutdown().await;
