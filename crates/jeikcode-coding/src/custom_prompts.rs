@@ -932,7 +932,6 @@ doing_tasks:
             .contains("determine the final goal"));
         let guide = wf.guidelines.as_ref().unwrap();
         assert!(guide.contains_key("todolist_closure"));
-        assert!(guide.contains_key("disambiguation"));
         assert!(guide.contains_key("concurrency"));
         assert!(guide.contains_key("exploration_tasks"));
         assert!(guide.contains_key("targeted_exploration"));

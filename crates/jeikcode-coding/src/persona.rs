@@ -642,35 +642,20 @@ use the minimal set; if none match, proceed normally. When the loaded skill runs
 to refine a design, let the user answer in the UI \
 by surfacing its choice questions as selectable options rather than as prose.";
 
-/// Asking-the-user guidance for the system prompt. Judgment-framed: call
-/// `request_user_input` only when the decision is genuinely the user's to make —
-/// not for things the code, the task, or a quick check already answers. Only
-/// injected when the `request_user_input` tool is actually mounted (see the
+/// Asking-the-user guidance for the system prompt. Deliberately terse: it reinforces the
+/// `request_user_input` tool description (weak models under-weight it) without restating the
+/// tool's own trigger list, its mode/schema help, or the skill-interview handling already owned
+/// by [`SKILLS_USAGE`]. Only injected when the tool is actually mounted (see the
 /// `request_user_input_enabled` gate in `coding_persona`).
 const REQUEST_USER_INPUT_USAGE: &str = "\n\n## ASKING THE USER:\n\
-When you reach a decision that is genuinely the USER'S to make — a preference, a confirmation, \
-or a choice between approaches where no option is clearly correct from the code or the task — \
-call `request_user_input` to ask instead of guessing. Prefer `single` or `multiple` with \
-concrete `options` when you can enumerate the choices; use `text` for an open answer. Ask ONLY \
-for what you genuinely cannot decide, look up, or verify yourself — never for something the \
-code, the task, or a quick check already answers. Keep each question focused. \
-When the user EXPLICITLY asks you to recommend, compare, or give them options to pick from \
-(for example 'recommend a few X for me to choose', 'let me pick', 'let me select', '让我勾选', \
-'选一个'), that request itself IS a decision that is theirs to make: enumerate the concrete \
-options via `single` or `multiple` (use `multiple` when they may want to select several) so \
-they choose in the UI, instead of writing the list out as prose. If you have MORE \
-THAN ONE question for the user at this point, put them ALL into ONE `request_user_input` call's \
-`questions` array — do NOT make several `request_user_input` calls in the same turn, and never \
-write a multiple-choice question as prose; the user answers them together in one form. Never ask \
-the user to type a secret (password, API key, token) into the prompt — those come from the \
-environment or a secrets store, not a question. \
-When a loaded skill is driving a round of clarifying, interview-style \
-questions to refine a design, surface ITS questions through this tool too: use `single` or \
-`multiple` with concrete `options` for choice questions and `text` for an open answer, so the \
-user answers in the UI instead of reading a prose question. The 'ask sparingly, only for what \
-you cannot decide yourself' guidance above governs YOUR OWN unprompted ad-hoc questions; it \
-does not constrain a skill's structured interview, nor a choice the user explicitly asked you \
-to offer.";
+Default: don't ask — infer missing details from the codebase and existing conventions. Ask only \
+when truly blocked with no safe default: (a) ambiguity that materially changes the result; (b) a \
+destructive, irreversible, or production/billing/security action; (c) a secret you cannot infer. \
+When you must ask: finish all non-blocked work first, ask ONE focused question with your \
+recommended default, and state what would change. Never ask permission questions (\"Should I \
+proceed?\"), never bounce back what you can look up yourself, and never ask the user to type a \
+secret. Put EVERY question in ONE `request_user_input` call (never several calls in a turn); when \
+the user explicitly asks to be given options to pick from, enumerate them there instead of as prose.";
 
 /// Always-present workflow guidance for the failure mode behind issue #1169.
 /// It deliberately does not name the optional structured input tool.
@@ -838,18 +823,18 @@ mod tests {
         // carves out an EXPLICIT user request to choose from the "ask sparingly" rule.
         let on = coding_persona("deepseek-v4-flash", false, true);
         assert!(
-            on.contains("EXPLICITLY asks you to recommend, compare, or give them options to pick"),
+            on.contains("when the user explicitly asks to be given options to pick from"),
             "enabled → explicit choice-request carve-out present"
         );
         assert!(
-            on.contains("nor a choice the user explicitly asked you to offer"),
-            "enabled → scarcity rule explicitly does not constrain an explicit choice request"
+            on.contains("enumerate them there instead of as prose"),
+            "enabled → carve-out routes the options into the picker, not a prose list"
         );
         // Gated with the tool: when the tool is unmounted the carve-out disappears too, so we
         // never nudge toward an unavailable tool.
         let off = coding_persona("deepseek-v4-flash", false, false);
         assert!(
-            !off.contains("EXPLICITLY asks you to recommend"),
+            !off.contains("explicitly asks to be given options to pick from"),
             "disabled → carve-out gone with the rest of the ASKING THE USER block"
         );
     }
@@ -858,36 +843,28 @@ mod tests {
     fn batch_questions_rule_present_only_when_enabled() {
         let on = coding_persona("deepseek-v4-flash", false, true);
         assert!(
-            on.contains("answers them together in one form"),
+            on.contains("ONE `request_user_input` call"),
             "enabled → batching rule present"
-        );
-        assert!(
-            on.contains("`questions` array"),
-            "enabled → names the questions array"
         );
         let off = coding_persona("deepseek-v4-flash", false, false);
         assert!(
-            !off.contains("answers them together in one form"),
+            !off.contains("ONE `request_user_input` call"),
             "disabled → batching rule gone with the whole block"
         );
     }
 
     #[test]
-    fn skill_interview_bridge_present_only_when_enabled_without_fixed_skill_name() {
-        let on = coding_persona("deepseek-v4-flash", false, true);
-        assert!(
-            on.contains("structured interview"),
-            "enabled → skill interview bridge clause present"
-        );
-        assert!(
-            !on.contains("brainstorming"),
-            "persona must not advertise an unverified skill name"
-        );
-        let off = coding_persona("deepseek-v4-flash", false, false);
-        assert!(
-            !off.contains("structured interview"),
-            "disabled → bridge clause gone with the whole block"
-        );
+    fn persona_does_not_advertise_unverified_skill_names() {
+        // The skill-interview handling moved to the ALWAYS-ON SKILLS block (see
+        // `skills_block_points_at_ui_answering`); this only guards that no ghost skill name
+        // leaks into the persona under either gate.
+        for enabled in [true, false] {
+            let p = coding_persona("deepseek-v4-flash", false, enabled);
+            assert!(
+                !p.contains("brainstorming"),
+                "persona must not advertise an unverified skill name (enabled={enabled})"
+            );
+        }
     }
 
     #[test]

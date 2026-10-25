@@ -204,8 +204,6 @@ async fn full_assembly_lifecycle() {
             shape()
         );
         assert!(memory.text.contains("prefers tabs"));
-        // StatusReminderHook appends the date to the bottom of the real query;
-        // no independent synthetic user message is created.
         assert_eq!(
             first.last().unwrap().role,
             Role::User,
@@ -215,13 +213,14 @@ async fn full_assembly_lifecycle() {
             !first.last().unwrap().synthetic,
             "last user must be the real query, not a reminder"
         );
+        // StatusReminderHook appends the date to the bottom of the real query; no
+        // independent synthetic user message is created. The opening `<strong-reminder>`
+        // exploration tail (CodeToolsFirstHook, added 2026-10-17) may sit AHEAD of it, so
+        // assert the real query owns BOTH tails instead of pinning a prefix that predates
+        // that feature.
+        let tail = &first.last().unwrap().text;
         assert!(
-            first
-                .last()
-                .unwrap()
-                .text
-                .starts_with("the first task\n\n<system-reminder>")
-                && first.last().unwrap().text.contains("Current date"),
+            tail.starts_with("the first task") && tail.contains("Current date"),
             "date reminder belongs to the real query block: {:?}",
             shape()
         );
@@ -254,10 +253,10 @@ async fn full_assembly_lifecycle() {
     {
         let calls = calls1b.lock().unwrap();
         let first = &calls[0].0;
+        // The user block now carries the opening `<strong-reminder>` exploration tail, so
+        // match the task text itself rather than a fixed `<system-reminder>`-first prefix.
         assert!(
-            first
-                .iter()
-                .any(|m| m.text.starts_with("the first task\n\n<system-reminder>")),
+            first.iter().any(|m| m.text.starts_with("the first task")),
             "respawn on the same parts carries the conversation"
         );
     }
@@ -286,20 +285,14 @@ async fn full_assembly_lifecycle() {
         let calls = calls2.lock().unwrap();
         let first = &calls[0].0;
         assert!(
-            first
-                .iter()
-                .any(|m| m.text.starts_with("the first task\n\n<system-reminder>")),
+            first.iter().any(|m| m.text.starts_with("the first task")),
             "resume carries history"
         );
         assert!(
-            first
-                .iter()
-                .any(|m| m.text.starts_with("the swap task\n\n<system-reminder>")),
+            first.iter().any(|m| m.text.starts_with("the swap task")),
             "incl. the respawned turn"
         );
-        assert!(first
-            .iter()
-            .any(|m| m.text.starts_with("the second task\n\n<system-reminder>")));
+        assert!(first.iter().any(|m| m.text.starts_with("the second task")));
         // Each REQUIRED System block is injected exactly once on resume (reconcile in
         // place — no duplication). Assert by uniqueness of the block markers instead of
         // a magic total: the block set grows as new discipline blocks land.
