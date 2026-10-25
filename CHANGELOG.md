@@ -21,6 +21,16 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.6 (2026-10-25)
+
+- **[Capabilities & Runtime Robustness] Safe thread fallback for artifact watchdog initial scan**:
+  - Added runtime detection in `ArtifactWatchdog::spawn_initial_scan`: when invoked outside a Tokio asynchronous reactor (such as in synchronous unit test harnesses), safe fallback to a dedicated OS thread prevents "no reactor running" panics.
+
+---
+
+- **[Capabilities 运行时健壮性] 产物看门狗初始扫描安全系统线程回退**:
+  - 在 `ArtifactWatchdog::spawn_initial_scan` 中加入运行时探针：在无 Tokio 异步反应堆的同步测试环境调用时，自动安全回退至独立系统线程，彻底解决 "no reactor running" panic 导致测试中断的问题。
+
 ## v7.3.0-beta.5 (2026-10-25)
 
 - **[WebUI Message Deduplication & Mobile Stream Reconciliation] Eliminate duplicate prompt bubbles and recover settled answers**:
