@@ -469,6 +469,7 @@ mod tests {
     use crate::git_adapter::{GitEventKind, GitUserMeta};
 
     #[test]
+    #[serial_test::serial]
     fn test_poll_state_deduplication_logic() {
         let test_repo = "test-owner/test-repo-poll";
         let pr_num = 101;
@@ -492,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_baseline_seeding_prevents_thundering_herd() {
         let test_repo = "test-owner/test-baseline-repo";
         assert!(!is_repo_initialized(test_repo));
@@ -550,6 +552,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_in_memory_heartbeat_updates() {
         let test_repo = "test-owner/test-heartbeat-repo";
         mark_repo_polled(test_repo);
@@ -558,6 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_poll_cycle_tick_offline_exits_immediately() {
         use jeikcode_config::config::offline::{seed_offline_verdict, OfflineMode};
         let repo = "test-owner/test-offline-repo";
@@ -581,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_repo_poll_state_etag_serialization_and_aliases() {
         let repo = "test-owner/test-etag-serialization";
 
@@ -618,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_baseline_seeding_stores_initial_etag() {
         let test_repo = "test-owner/test-baseline-etag-repo";
         assert!(!is_repo_initialized(test_repo));
@@ -647,6 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_poll_cycle_tick_304_cache_hit_preserves_state() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -745,6 +752,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_record_poll_results_atomic_persists_etag_and_shas_together() {
         let repo = "test-owner/test-atomic-persistence";
         assert_eq!(get_repo_etag(repo), None);
@@ -825,6 +833,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_record_poll_results_atomic_clears_etag_on_200_without_etag() {
         let repo = "test-owner/test-clear-etag-repo";
 

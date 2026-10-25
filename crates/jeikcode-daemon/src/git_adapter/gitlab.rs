@@ -459,18 +459,6 @@ impl GitPlatformAdapter for GitLabAdapter {
         }
     }
 
-    async fn fetch_active_pull_requests(
-        &self,
-        token: &str,
-        api_base: Option<&str>,
-        repo: &str,
-    ) -> Result<Vec<NormalizedGitEvent>, String> {
-        let out = self
-            .fetch_active_pull_requests_with_etag(token, api_base, repo, None)
-            .await?;
-        Ok(out.events)
-    }
-
     async fn fetch_active_pull_requests_with_etag(
         &self,
         token: &str,

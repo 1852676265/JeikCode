@@ -411,34 +411,28 @@ pub trait GitPlatformAdapter: Send + Sync {
         repo: &str,
     ) -> Result<String, String>;
 
-    /// 查询活跃的 Pull Request / Merge Request 列表（轮询同步模式专用，基础实现）。
-    /// 若平台适配器未专门实现带有 ETag 的条件查询，重写此方法即可支持主动轮询。
-    async fn fetch_active_pull_requests(
-        &self,
-        _token: &str,
-        _api_base: Option<&str>,
-        _repo: &str,
-    ) -> Result<Vec<NormalizedGitEvent>, String> {
-        Ok(vec![])
-    }
-
-    /// 查询活跃的 Pull Request / Merge Request 列表，支持携带 If-None-Match 条件标头。
-    /// 默认实现回退委托至 `fetch_active_pull_requests`，返回无 ETag、无 304 缓存标记的全量结果。
+    /// 查询活跃的 Pull Request / Merge Request 列表，支持携带 If-None-Match 条件标头（轮询模式规范方法）。
+    /// 所有平台适配器均需实现此方法。若平台不支持 ETag 或未返回 ETag，直接返回 `etag: None, not_modified: false` 即可。
     async fn fetch_active_pull_requests_with_etag(
         &self,
         token: &str,
         api_base: Option<&str>,
         repo: &str,
-        _etag: Option<&str>,
-    ) -> Result<PollPullRequestsOutput, String> {
-        let events = self
-            .fetch_active_pull_requests(token, api_base, repo)
-            .await?;
-        Ok(PollPullRequestsOutput {
-            events,
-            etag: None,
-            not_modified: false,
-        })
+        etag: Option<&str>,
+    ) -> Result<PollPullRequestsOutput, String>;
+
+    /// 查询活跃的 Pull Request / Merge Request 列表（向后兼容/测试调用便捷方法）。
+    /// 默认实现自动委托至规范方法 `fetch_active_pull_requests_with_etag(token, api_base, repo, None)` 并提取事件列表。
+    async fn fetch_active_pull_requests(
+        &self,
+        token: &str,
+        api_base: Option<&str>,
+        repo: &str,
+    ) -> Result<Vec<NormalizedGitEvent>, String> {
+        Ok(self
+            .fetch_active_pull_requests_with_etag(token, api_base, repo, None)
+            .await?
+            .events)
     }
 }
 
@@ -778,12 +772,12 @@ mod tests {
         ));
     }
 
-    struct LegacyMockAdapter;
+    struct MockCanonicalAdapter;
 
     #[async_trait::async_trait]
-    impl GitPlatformAdapter for LegacyMockAdapter {
+    impl GitPlatformAdapter for MockCanonicalAdapter {
         fn platform_id(&self) -> &'static str {
-            "legacy_mock"
+            "canonical_mock"
         }
         fn verify_signature(
             &self,
@@ -838,42 +832,46 @@ mod tests {
         ) -> Result<String, String> {
             Ok("ok".to_string())
         }
-        async fn fetch_active_pull_requests(
+        async fn fetch_active_pull_requests_with_etag(
             &self,
             _token: &str,
             _api_base: Option<&str>,
             _repo: &str,
-        ) -> Result<Vec<NormalizedGitEvent>, String> {
-            Ok(vec![NormalizedGitEvent {
-                platform: "legacy_mock".to_string(),
-                event_kind: GitEventKind::PullRequestOpened,
-                repo_full_name: "test/legacy".to_string(),
-                is_pull_request: true,
-                issue_or_pr_number: Some(123),
-                sender: GitUserMeta::default(),
-                commit_author: None,
-                title: Some("Legacy PR".to_string()),
-                body_text: None,
-                comment_id: None,
-                head_sha: Some("sha-legacy".to_string()),
-                base_branch: None,
-                head_branch: None,
-                html_url: None,
-                raw_payload: serde_json::Value::Null,
-            }])
+            _etag: Option<&str>,
+        ) -> Result<PollPullRequestsOutput, String> {
+            Ok(PollPullRequestsOutput {
+                events: vec![NormalizedGitEvent {
+                    platform: "canonical_mock".to_string(),
+                    event_kind: GitEventKind::PullRequestOpened,
+                    repo_full_name: "test/canonical".to_string(),
+                    is_pull_request: true,
+                    issue_or_pr_number: Some(123),
+                    sender: GitUserMeta::default(),
+                    commit_author: None,
+                    title: Some("Canonical PR".to_string()),
+                    body_text: None,
+                    comment_id: None,
+                    head_sha: Some("sha-canonical".to_string()),
+                    base_branch: None,
+                    head_branch: None,
+                    html_url: None,
+                    raw_payload: serde_json::Value::Null,
+                }],
+                etag: Some("mock-etag-123".to_string()),
+                not_modified: false,
+            })
         }
     }
 
     #[tokio::test]
-    async fn test_fetch_active_pull_requests_with_etag_delegates_to_legacy_method() {
-        let adapter = LegacyMockAdapter;
-        let output = adapter
-            .fetch_active_pull_requests_with_etag("token", None, "test/legacy", Some("stale-etag"))
+    async fn test_fetch_active_pull_requests_delegates_to_with_etag() {
+        let adapter = MockCanonicalAdapter;
+        let events = adapter
+            .fetch_active_pull_requests("token", None, "test/canonical")
             .await
             .expect("fetch success");
-        assert_eq!(output.events.len(), 1);
-        assert_eq!(output.events[0].issue_or_pr_number, Some(123));
-        assert_eq!(output.etag, None);
-        assert!(!output.not_modified);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].issue_or_pr_number, Some(123));
+        assert_eq!(events[0].head_sha.as_deref(), Some("sha-canonical"));
     }
 }
