@@ -268,6 +268,8 @@ import {
   placeRecoveredTurnUsers,
   mergeOlderMessages,
   spliceAuthoritativeDiskTail,
+  sanitizeCanvasMessages,
+  lastAssistantHasAnswer,
   visibleToolChunk,
   withAssistantIdentity,
 } from '../lib/sessionProjection';
@@ -3085,8 +3087,9 @@ export function Chat({
       );
       timelineFollow.reset();
       if (cached && cached.length > 0) {
-        messagesRef.current = cached;
-        setMessages(cached);
+        const cleanCached = sanitizeCanvasMessages(cached);
+        messagesRef.current = cleanCached;
+        setMessages(cleanCached);
         canvasReadySessionIdRef.current = sessionId;
         flushPreMountStreamBuffer(sessionId);
         // Schedule the cached history after layout without overriding reader intent.
@@ -3246,9 +3249,10 @@ export function Chat({
       getSessionCache(projectHash, loadId).then((idb) => {
         if (idb && idb.messages.length > 0 && activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration) {
           if (!messageCacheRef.current.has(loadId)) {
-            messageCacheRef.current.set(loadId, idb.messages);
-            messagesRef.current = idb.messages;
-            setMessages(idb.messages);
+            const cleanIdbMessages = sanitizeCanvasMessages(idb.messages);
+            messageCacheRef.current.set(loadId, cleanIdbMessages);
+            messagesRef.current = cleanIdbMessages;
+            setMessages(cleanIdbMessages);
             setLoading(false);
             if (scrollRef.current) {
               scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -3373,23 +3377,36 @@ export function Chat({
             let displayMessages: Message[] = currentCached && currentCached.length > 0 ? currentCached : loaded;
 
             if (currentCached && currentCached.length > 0) {
-              displayMessages = currentCached;
-              // 保持内存真相源，消除切换时的双重冲刷与杂交渲染
-              if (messagesRef.current !== currentCached) {
-                messagesRef.current = currentCached;
-                setMessages(currentCached);
-                if (atBottomRef.current) {
-                  timelineFollow.jump();
+              const cacheNeedsSettledTail = serverActive === false && (
+                !lastAssistantHasAnswer(currentCached) && lastAssistantHasAnswer(loaded)
+              );
+              if (cacheNeedsSettledTail) {
+                // 服务端已完结且磁盘具有最终回答，而内存缓存尚未收尾（例如切后台导致断流）：
+                // 用权威磁盘切片无损替换尾部，把最后一段正文与工具结果瞬间补全！
+                const spliced = spliceAuthoritativeDiskTail(currentCached, loaded, diskOffset);
+                displayMessages = sanitizeCanvasMessages(spliced);
+                messagesRef.current = displayMessages;
+                messageCacheRef.current.set(loadId, displayMessages);
+                setMessages(displayMessages);
+              } else {
+                displayMessages = sanitizeCanvasMessages(currentCached);
+                if (messagesRef.current !== currentCached) {
+                  messagesRef.current = displayMessages;
+                  messageCacheRef.current.set(loadId, displayMessages);
+                  setMessages(displayMessages);
+                  if (atBottomRef.current) {
+                    timelineFollow.jump();
+                  }
                 }
               }
               canvasReadySessionIdRef.current = loadId;
               flushPreMountStreamBuffer(loadId);
             } else if (loaded.length > 0) {
               // 首次冷启动/无本地缓存：直接渲染磁盘加载内容
-              displayMessages = loaded;
-              messagesRef.current = loaded;
-              messageCacheRef.current.set(loadId, loaded);
-              setMessages(loaded);
+              displayMessages = sanitizeCanvasMessages(loaded);
+              messagesRef.current = displayMessages;
+              messageCacheRef.current.set(loadId, displayMessages);
+              setMessages(displayMessages);
               canvasReadySessionIdRef.current = loadId;
               flushPreMountStreamBuffer(loadId);
               pinTimelineToBottom(1200);

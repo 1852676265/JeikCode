@@ -14,6 +14,7 @@ import {
   placeRecoveredTurnUsers,
   mergeOlderMessages,
   spliceAuthoritativeDiskTail,
+  sanitizeCanvasMessages,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -994,5 +995,40 @@ test('spliceAuthoritativeDiskTail 在 offset <= 0 时直接全量采用磁盘', 
   const diskTail = [{ role: 'user', sourceIndex: 1 }, { role: 'assistant', sourceIndex: 2 }];
   const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 0);
   assert.deepEqual(spliced, diskTail);
+});
+
+test('sanitizeCanvasMessages 自动自愈连续重复的用户提问气泡和夹杂的空占位', () => {
+  const dirty = [
+    { role: 'assistant', parts: [{ kind: 'text' as const, text: '已完成' }] },
+    { role: 'user', parts: [{ kind: 'text' as const, text: '修吧 修好了发ci 红了发布新版beta' }] },
+    { role: 'assistant', parts: [] },
+    { role: 'user', parts: [{ kind: 'text' as const, text: '修吧 修好了发ci 红了发布新版beta' }] },
+    { role: 'assistant', parts: [] },
+    { role: 'user', parts: [{ kind: 'text' as const, text: '修吧 修好了发ci 红了发布新版beta' }] },
+    { role: 'assistant', parts: [] },
+    { role: 'user', parts: [{ kind: 'text' as const, text: '修吧 修好了发ci 红了发布新版beta' }] },
+    { role: 'assistant', parts: [] },
+  ];
+
+  const cleaned = sanitizeCanvasMessages(dirty);
+  assert.equal(cleaned.length, 3);
+  assert.equal(cleaned[0]?.role, 'assistant');
+  assert.equal(cleaned[1]?.role, 'user');
+  assert.equal(cleaned[2]?.role, 'assistant');
+  assert.equal(cleaned[2]?.parts?.length, 0);
+});
+
+test('paintUserMessage 在前一个提问完全相同且助手未结回答时拒绝重复追加', () => {
+  const base = [
+    { role: 'user', parts: [{ kind: 'text' as const, text: '继续任务' }] },
+    { role: 'assistant', parts: [{ kind: 'tool' as const, tool: { id: 'c1', name: 'grep', args: '', status: 'done' as const } }] },
+  ];
+
+  const painted = paintUserMessage(base, '继续任务', Date.now(), () => ({
+    role: 'user',
+    parts: [{ kind: 'text' as const, text: '继续任务' }],
+  }));
+
+  assert.equal(painted.length, 2);
 });
 

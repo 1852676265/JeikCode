@@ -228,7 +228,7 @@ export function ensureWorkingAssistant<T extends ProjectionMessage>(messages: T[
  *  assistant behind it, or Working never renders. `repeatAfterSettled` appends
  *  the same words again after the previous turn already has an answer — an
  *  observer's next send, not a replay of the open turn. */
-function lastAssistantHasAnswer<T extends ProjectionMessage>(messages: T[]): boolean {
+export function lastAssistantHasAnswer<T extends ProjectionMessage>(messages: T[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m?.role === 'assistant') {
@@ -249,6 +249,16 @@ export function paintUserMessage<T extends ProjectionMessage>(
   opts?: { repeatAfterSettled?: boolean },
 ): T[] {
   const userText = visibleUserText(rawText);
+  // 核心硬防线：若画布上最后一条用户提问文本与当前完全一致，且助手尚未产生回答，绝对禁止重复追加！
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  if (lastUser) {
+    const lastText = visibleUserText(
+      lastUser.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
+    );
+    if (userTextsMatch(lastText, userText) && !lastAssistantHasAnswer(messages)) {
+      return ensureWorkingAssistant(messages);
+    }
+  }
   const echoed = userMessageAlreadyOnCanvas(messages, userText, userTs);
   const hasAnswer = lastAssistantHasAnswer(messages);
   if (echoed && (!opts?.repeatAfterSettled || !hasAnswer)) {
@@ -332,6 +342,16 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
     }
     if (event.type !== 'user' || typeof event.content !== 'string') continue;
     const userTs = event.created_at && event.created_at > 0 ? event.created_at : Date.now();
+    // 核心硬防线：若画布上最后一条用户提问文本与当前完全一致，且助手尚未产生回答，直接跳过
+    const lastUser = [...next].reverse().find((m) => m.role === 'user');
+    if (lastUser) {
+      const lastText = visibleUserText(
+        lastUser.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
+      );
+      if (userTextsMatch(lastText, visibleUserText(event.content)) && !lastAssistantHasAnswer(next)) {
+        continue;
+      }
+    }
     if (userMessageAlreadyOnCanvas(next, event.content, userTs)) continue;
     const isSteer = isSteerUserMessage({ role: 'user', content: event.content });
     const userText = visibleUserText(event.content);
@@ -677,6 +697,77 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number }>(
     (m) => typeof m.sourceIndex === 'number' && m.sourceIndex < diskOffset,
   );
   return [...olderHead, ...diskTail];
+}
+
+/**
+ * 清理画布与缓存中的重复与脏节点：
+ * 1. 过滤掉连续相邻、完全相同的 User 提问气泡；
+ * 2. 如果存在连续的 User 消息（中间只有空 assistant 或无 assistant），且内容重复，折叠为单一提问；
+ * 3. 清理掉夹在连续重复提问之间的无用空 assistant 占位符；
+ * 4. 确保从 IndexedDB 或历史缓存加载出来的画布是纯净无污染的。
+ */
+export function sanitizeCanvasMessages<T extends { role: string; parts?: MsgPart[] }>(
+  messages: T[],
+): T[] {
+  if (!messages || messages.length <= 1) return messages;
+  const result: T[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const cur = messages[i]!;
+    // 1. 如果当前是空助手气泡，且前一个已经是助手气泡，丢弃多余的空助手
+    if (cur.role === 'assistant' && (!cur.parts || cur.parts.length === 0)) {
+      const prev = result[result.length - 1];
+      if (prev && prev.role === 'assistant') {
+        continue;
+      }
+    }
+    // 2. 如果当前是用户提问，检查前一个提问是否完全一样且中间无实质回复
+    if (cur.role === 'user') {
+      const curText = visibleUserText(
+        cur.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
+      );
+      let prevUser: T | null = null;
+      let hasMeaningfulAssistant = false;
+      for (let j = result.length - 1; j >= 0; j--) {
+        const prev = result[j]!;
+        if (prev.role === 'user') {
+          prevUser = prev;
+          break;
+        }
+        if (prev.role === 'assistant') {
+          if (
+            prev.parts &&
+            prev.parts.some(
+              (p) =>
+                (p.kind === 'text' && (p.text || '').trim()) ||
+                p.kind === 'tool' ||
+                p.kind === 'reasoning',
+            )
+          ) {
+            hasMeaningfulAssistant = true;
+          }
+        }
+      }
+      if (prevUser && !hasMeaningfulAssistant) {
+        const prevText = visibleUserText(
+          prevUser.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
+        );
+        if (userTextsMatch(prevText, curText)) {
+          // 清除上一个重复提问留下的空助手（如果有的话）
+          while (result.length > 0) {
+            const tail = result[result.length - 1];
+            if (tail && tail.role === 'assistant' && (!tail.parts || tail.parts.length === 0)) {
+              result.pop();
+            } else {
+              break;
+            }
+          }
+          continue;
+        }
+      }
+    }
+    result.push(cur);
+  }
+  return result;
 }
 
 /**
