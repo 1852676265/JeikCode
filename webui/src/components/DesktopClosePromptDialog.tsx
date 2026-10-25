@@ -1,12 +1,16 @@
 import { useEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { postDesktopSettings } from '../api';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 export function DesktopClosePromptDialog() {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [remember, setRemember] = useState(false);
+
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(() => setOpen(false));
 
   useEffect(() => {
     const handlePrompt = () => {
@@ -77,7 +81,7 @@ export function DesktopClosePromptDialog() {
   const modal = (
     <div
       class="modal-overlay desktop-close-prompt-overlay"
-      onClick={() => setOpen(false)}
+      {...backdropDismiss}
       role="dialog"
       aria-modal="true"
       style={{

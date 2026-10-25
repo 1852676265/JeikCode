@@ -21,6 +21,7 @@ import { useSettings, Theme } from '../settings';
 import { languageOptions, Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './Select';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 
 // 上下文窗口预设（计算机标准二进制 1024 进制：256K / 512K / 1M / 2M）。
 const CONTEXT_WINDOW_PRESETS = [262144, 524288, 1048576, 2097152];
@@ -112,6 +113,13 @@ function SettingsModal({
 }) {
   const { t } = useSettings();
   const mountTimeRef = useRef(Date.now());
+
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  // 挂载前 150ms 忽略外部点击，防双层弹窗点击穿透。
+  const backdropDismiss = useBackdropDismiss(() => {
+    if (Date.now() - mountTimeRef.current < 150) return;
+    onClose();
+  });
   const sizeClass = extraLarge
     ? ' modal-card-xl'
     : large
@@ -122,11 +130,7 @@ function SettingsModal({
   const modalContent = (
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        // 防双层弹窗点击穿透：挂载前 150ms 忽略外部点击误关
-        if (Date.now() - mountTimeRef.current < 150) return;
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
       style={{ zIndex: 99999 }}
     >
       <div class={'modal-card' + sizeClass} onClick={(e) => e.stopPropagation()}>

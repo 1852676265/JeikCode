@@ -3,6 +3,7 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus, UpdateVersionEntry } from '../api';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { Markdown } from './Markdown';
 import { useT } from '../settings';
 
@@ -60,6 +61,12 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const currentVersionRef = useRef('');
   const initialInstanceIdRef = useRef('');
   const reloadAfterRestartRef = useRef<() => void>(() => {});
+
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  const mainBackdropDismiss = useBackdropDismiss(() => {
+    if (!updating) onClose();
+  });
+  const notesBackdropDismiss = useBackdropDismiss(() => setNotesOpen(false));
 
   useEffect(() => {
     isMounted.current = true;
@@ -309,9 +316,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     <>
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        if (!updating && e.target === e.currentTarget) onClose();
-      }}
+      {...mainBackdropDismiss}
     >
       <div class="modal-card update-modal-card" role="dialog" aria-labelledby="update-dialog-title">
         <div class="modal-header">
@@ -548,9 +553,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     {notesOpen && (
       <div
         class="release-notes-overlay"
-        onClick={(e) => {
-          if (e.target === e.currentTarget) setNotesOpen(false);
-        }}
+        {...notesBackdropDismiss}
       >
         <div
           class="release-notes-card"

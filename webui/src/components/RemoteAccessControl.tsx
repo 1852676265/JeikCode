@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getRemoteAccess, postRemoteAccess, WEBUI_TOKEN_STORAGE_KEY, type RemoteAccessStatus } from '../api';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 export function RemoteAccessControl() {
@@ -30,6 +31,12 @@ export function RemoteAccessControl() {
   const [restarting, setRestarting] = useState(false);
   const applyingRef = useRef(false);
   const revision = useRef(0);
+
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  const backdropDismiss = useBackdropDismiss(() => setOpen(false));
+  const restartBackdropDismiss = useBackdropDismiss(() => {
+    if (!restarting) setShowRestartModal(false);
+  });
 
   function showStatus(status: RemoteAccessStatus) {
     const livePort = String(status.port || ((typeof window !== 'undefined' && window.location.port) ? window.location.port : 13457));
@@ -272,9 +279,7 @@ export function RemoteAccessControl() {
   const modalDialog = open && (
     <div
       class="modal-overlay remote-access-modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) setOpen(false);
-      }}
+      {...backdropDismiss}
       role="dialog"
       aria-modal="true"
       aria-label={t('remote.bindTitle')}
@@ -384,9 +389,7 @@ export function RemoteAccessControl() {
   const restartModalDialog = showRestartModal && (
     <div
       class="modal-overlay remote-access-restart-overlay"
-      onClick={() => {
-        if (!restarting) setShowRestartModal(false);
-      }}
+      {...restartBackdropDismiss}
       role="dialog"
       aria-modal="true"
       style={{ zIndex: 10001 }}

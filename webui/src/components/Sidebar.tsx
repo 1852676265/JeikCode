@@ -4,6 +4,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo, SidebarProjects } from '../api';
 import { mergeSessionRow, onGlobalEvent, removeSessionRows } from '../lib/globalEvents';
 import { deleteSessionCache } from '../lib/sessionCache';
@@ -582,6 +583,8 @@ export function Sidebar({
   const [searchResults, setSearchResults] = useState<SessionMetaWithProject[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  const searchBackdropDismiss = useBackdropDismiss(() => setSearchOpen(false));
   const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
   const [deleteTargets, setDeleteTargets] = useState<SessionMetaWithProject[] | null>(null);
   const [selectMode, setSelectMode] = useState(false);
@@ -2409,7 +2412,7 @@ export function Sidebar({
 
       {/* Session search dialog (centered modal) */}
       {searchOpen && createPortal(
-        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
+        <div class="modal-overlay" {...searchBackdropDismiss}>
           <div class="modal-card search-modal-card">
             <div class="search-input-row">
               <SearchIcon />

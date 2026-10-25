@@ -5,6 +5,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { listDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo, FsShortcut } from '../api';
 import { fsBreadcrumbs, joinFsChild, stripExtendedPathPrefix } from '../lib/displayPath';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -17,6 +18,8 @@ interface CwdPickerProps {
 
 export function CwdPicker({ current, onPick, onClose, title }: CwdPickerProps) {
   const t = useT();
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(onClose);
   const initialPath = stripExtendedPathPrefix(current || '~');
   const [inputPath, setInputPath] = useState(initialPath);
   const [browsePath, setBrowsePath] = useState(initialPath);
@@ -178,9 +181,7 @@ export function CwdPicker({ current, onPick, onClose, title }: CwdPickerProps) {
   return (
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
     >
       <div class="modal-card cwd-picker-modal">
         <div class="modal-header">

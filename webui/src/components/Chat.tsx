@@ -82,6 +82,7 @@ import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
 import { getPageZoom } from '../lib/pageZoom';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 
 // 动态懒加载非首屏必需的重型 Git / Diff 面板，削减初始 JS 主包体积，加速桌面端冷启动与弱网访问
 const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })));
@@ -452,6 +453,8 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   const t = useT();
   const [scale, setScale] = useState(1);
   const imgRef = useRef<HTMLImageElement>(null);
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  const backdropDismiss = useBackdropDismiss(onClose);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -480,7 +483,7 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   const content = (
     <div
       class="img-lightbox"
-      onClick={onClose}
+      {...backdropDismiss}
       role="dialog"
       aria-modal="true"
       style={{ zIndex: 99999 }}

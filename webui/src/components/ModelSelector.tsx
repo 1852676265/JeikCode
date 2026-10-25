@@ -4,6 +4,7 @@ import { getModels, ModelInfo, postLiveReasoningEffort } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 import { modelAliasLabel } from '../lib/modelLabel';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 
 function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
   if (a.length !== b.length) return false;
@@ -116,6 +117,11 @@ export function ModelSelector({
 
   const ref = useRef<HTMLDivElement>(null);
   const effortRef = useRef<HTMLDivElement>(null);
+
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  // stopPropagation 保留原行为：点击弹窗内部时不惊扰其它 document 级 mousedown 监听。
+  const effortBackdropDismiss = useBackdropDismiss(() => setEffortOpen(false), { stopPropagation: true });
+  const modalBackdropDismiss = useBackdropDismiss(() => setOpen(false), { stopPropagation: true });
 
   const modelsRef = useRef(models);
   modelsRef.current = models;
@@ -536,10 +542,7 @@ export function ModelSelector({
       {effortOpen && (narrow || open) && typeof document !== 'undefined' && createPortal(
         <div
           class="modal-overlay effort-selector-modal-overlay"
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setEffortOpen(false);
-          }}
+          {...effortBackdropDismiss}
           role="dialog"
           aria-modal="true"
           aria-label={t('effort.label')}
@@ -597,10 +600,7 @@ export function ModelSelector({
       {open && typeof document !== 'undefined' && createPortal(
         <div
           class="modal-overlay model-selector-modal-overlay"
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setOpen(false);
-          }}
+          {...modalBackdropDismiss}
           role="dialog"
           aria-modal="true"
           aria-label={t('model.label')}

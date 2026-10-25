@@ -5,6 +5,7 @@ import { messages, type Lang } from '../i18n';
 import { Select, SelectOption } from './Select';
 import { ModelSelector } from './ModelSelector';
 import { getPageZoom } from '../lib/pageZoom';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 
 /** 支持的 Git 托管平台渠道类型 */
 export type GitPlatformChannel = 'github' | 'gitlab' | 'gitee' | 'gitea' | 'custom_git';
@@ -441,6 +442,9 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   // 动态响应页面/浏览器缩放与视口尺寸变动，自适应计算弹窗最大高度与居中边界，彻底防止大比例缩放下被遮挡
   const [modalAdaptiveStyle, setModalAdaptiveStyle] = useState<{ maxHeight?: string; width?: string }>({});
 
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  const backdropDismiss = useBackdropDismiss(onClose);
+
   useEffect(() => {
     function computeAdaptiveBounds() {
       if (typeof window === 'undefined') return;
@@ -771,7 +775,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   const isGithubApp = config.channel === 'github';
 
   return (
-    <div class="modal-overlay git-webhook-modal-overlay" onClick={onClose}>
+    <div class="modal-overlay git-webhook-modal-overlay" {...backdropDismiss}>
       <div
         class="modal-card modal-card-lg git-webhook-modal-card"
         style={modalAdaptiveStyle}

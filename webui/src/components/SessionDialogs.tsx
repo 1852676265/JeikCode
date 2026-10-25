@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { renameSession, deleteSession, DeleteSessionError, SessionMetaWithProject } from '../api';
 import { deleteSessionsStreaming, SESSION_DELETE_CONCURRENCY } from '../lib/sessionDelete';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 interface RenameDialogProps {
@@ -14,6 +15,8 @@ interface RenameDialogProps {
 
 export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
   const t = useT();
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(onClose);
   const [name, setName] = useState(session.name || '');
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -39,9 +42,7 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
   return (
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
     >
       <div class="modal-card modal-card-sm">
         <div class="modal-header">
@@ -117,6 +118,10 @@ export function DeleteDialog({
   onBatchProgress,
 }: DeleteDialogProps) {
   const t = useT();
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(() => {
+    if (!busy) onClose();
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const remaining = sessions;
@@ -168,9 +173,7 @@ export function DeleteDialog({
   return (
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
     >
       <div class="modal-card modal-card-sm">
         <div class="modal-header">

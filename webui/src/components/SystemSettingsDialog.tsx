@@ -2,6 +2,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getDesktopSettings, postDesktopSettings, getHealth, type DesktopSettings } from '../api';
 import { bakedAppVersion, normalizeAppVersion } from '../lib/appVersion';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 interface SystemSettingsDialogProps {
@@ -25,6 +26,9 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [appVersion, setAppVersion] = useState(bakedAppVersion());
+
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(onClose);
 
   const tabs: ModuleTab[] = [
     { key: 'desktop', labelKey: 'settings.tabDesktop', defaultLabel: '桌面与系统', icon: '🖥️' },
@@ -80,9 +84,7 @@ export function SystemSettingsDialog({ onClose }: SystemSettingsDialogProps) {
   const modal = (
     <div
       class="modal-overlay system-settings-modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
       role="dialog"
       aria-modal="true"
       style={{
