@@ -31,7 +31,7 @@ fn get_last_polled_cache() -> &'static Mutex<HashMap<String, u64>> {
 }
 
 /// 单个仓库的轮询同步状态
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RepoPollState {
     /// 上次轮询时间戳 (Unix 时间戳，秒)
     #[serde(default)]
@@ -39,6 +39,14 @@ pub struct RepoPollState {
     /// 是否已完成初次基线快照初始化（未初始化时仅记录现有 PR，不触发审查，避免海啸审查）
     #[serde(default)]
     pub initialized: bool,
+    /// HTTP ETag 缓存标识，用于携带 If-None-Match 触发 HTTP 304 零配额消耗
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "last_etag",
+        alias = "lastEtag"
+    )]
+    pub etag: Option<String>,
     /// 已审查或已知 PR 及其最后处理的 Head Commit SHA 映射 (pr_number -> head_sha)
     #[serde(default)]
     pub pr_head_shas: HashMap<u64, String>,
@@ -108,8 +116,48 @@ pub fn is_repo_initialized(repo: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 获取指定仓库当前缓存的 ETag
+pub fn get_repo_etag(repo: &str) -> Option<String> {
+    let normalized_repo = repo.trim().to_lowercase();
+    let Ok(lock) = get_state_cache().lock() else {
+        return None;
+    };
+    lock.repos
+        .get(&normalized_repo)
+        .and_then(|r| r.etag.clone())
+}
+
+/// 更新仓库 ETag 缓存（仅在 ETag 实际发生变动时持久化落盘）
+pub fn update_repo_etag(repo: &str, new_etag: Option<String>) -> bool {
+    let normalized_repo = repo.trim().to_lowercase();
+    let Ok(mut lock) = get_state_cache().lock() else {
+        return false;
+    };
+    let repo_state = lock
+        .repos
+        .entry(normalized_repo)
+        .or_insert_with(RepoPollState::default);
+
+    if repo_state.etag == new_etag {
+        return false;
+    }
+
+    repo_state.etag = new_etag;
+    save_poll_state_to_disk(&lock);
+    true
+}
+
 /// 初次同步时对现有存量 PR 进行基线录入（纯登记 head_sha，严禁触发审查与发送 ACK）
 pub fn seed_repo_baseline(repo: &str, events: &[NormalizedGitEvent]) {
+    seed_repo_baseline_with_etag(repo, events, None);
+}
+
+/// 初次同步时对现有存量 PR 及 ETag 进行基线录入（纯登记 head_sha 与 etag，严禁触发审查）
+pub fn seed_repo_baseline_with_etag(
+    repo: &str,
+    events: &[NormalizedGitEvent],
+    etag: Option<String>,
+) {
     let normalized_repo = repo.trim().to_lowercase();
     let Ok(mut lock) = get_state_cache().lock() else {
         return;
@@ -125,6 +173,12 @@ pub fn seed_repo_baseline(repo: &str, events: &[NormalizedGitEvent]) {
             if !s.is_empty() {
                 repo_state.pr_head_shas.insert(num, s.to_string());
             }
+        }
+    }
+    if let Some(tag) = etag {
+        let tag = tag.trim();
+        if !tag.is_empty() {
+            repo_state.etag = Some(tag.to_string());
         }
     }
     repo_state.initialized = true;
@@ -228,24 +282,46 @@ pub async fn poll_cycle_tick(state: &AppState) {
             Some(config.custom_api_base.as_str())
         };
 
+        let cached_etag = get_repo_etag(repo);
+
         tracing::debug!(
-            "[git_polling] Polling open PRs for `{repo}` on platform `{}`",
-            adapter.platform_id()
+            "[git_polling] Polling open PRs for `{repo}` on platform `{}` (ETag: {:?})",
+            adapter.platform_id(),
+            cached_etag
         );
 
         match adapter
-            .fetch_active_pull_requests(&config.access_token, custom_api_base, repo)
+            .fetch_active_pull_requests_with_etag(
+                &config.access_token,
+                custom_api_base,
+                repo,
+                cached_etag.as_deref(),
+            )
             .await
         {
-            Ok(events) => {
+            Ok(output) => {
+                if output.not_modified {
+                    tracing::debug!(
+                        "[git_polling] Repository `{repo}` returned HTTP 304 Not Modified. Zero quota deduction, preserving existing state."
+                    );
+                    continue;
+                }
+
+                let events = output.events;
+
                 // 基线初始化检查：若该仓库首次接入轮询，仅对存量 PR 录入基线快照，严禁触发海啸审查
                 if !is_repo_initialized(repo) {
                     let total = events.len();
-                    seed_repo_baseline(repo, &events);
+                    seed_repo_baseline_with_etag(repo, &events, output.etag);
                     tracing::info!(
                         "[git_polling] Initialized baseline for `{repo}` with {total} existing open PR(s). No reviews triggered during initial sync."
                     );
                     continue;
+                }
+
+                // 仓库已初始化：若平台返回了新的 ETag，更新并持久化
+                if let Some(new_etag) = output.etag {
+                    update_repo_etag(repo, Some(new_etag));
                 }
 
                 for event in events {
@@ -431,5 +507,122 @@ mod tests {
 
         crate::git_adapter::disable_binding_for_project("offline-test-project");
         seed_offline_verdict(OfflineMode::Off, None);
+    }
+
+    #[test]
+    fn test_repo_poll_state_etag_serialization_and_aliases() {
+        let repo = "test-owner/test-etag-serialization";
+
+        // 1. Deserialization with "etag"
+        let json1 = r#"{"last_polled_at":12345,"initialized":true,"etag":"tag-v1"}"#;
+        let state1: RepoPollState = serde_json::from_str(json1).unwrap();
+        assert_eq!(state1.etag.as_deref(), Some("tag-v1"));
+
+        // 2. Deserialization with alias "last_etag"
+        let json2 = r#"{"last_polled_at":12345,"initialized":true,"last_etag":"tag-v2"}"#;
+        let state2: RepoPollState = serde_json::from_str(json2).unwrap();
+        assert_eq!(state2.etag.as_deref(), Some("tag-v2"));
+
+        // 3. Deserialization with alias "lastEtag"
+        let json3 = r#"{"last_polled_at":12345,"initialized":true,"lastEtag":"tag-v3"}"#;
+        let state3: RepoPollState = serde_json::from_str(json3).unwrap();
+        assert_eq!(state3.etag.as_deref(), Some("tag-v3"));
+
+        // 4. Update and query helper
+        assert_eq!(get_repo_etag(repo), None);
+        assert!(update_repo_etag(repo, Some("tag-v1".to_string())));
+        assert_eq!(get_repo_etag(repo).as_deref(), Some("tag-v1"));
+
+        // Same ETag update should return false (no unnecessary disk write)
+        assert!(!update_repo_etag(repo, Some("tag-v1".to_string())));
+
+        // Changing ETag should return true
+        assert!(update_repo_etag(repo, Some("tag-v2".to_string())));
+        assert_eq!(get_repo_etag(repo).as_deref(), Some("tag-v2"));
+    }
+
+    #[test]
+    fn test_baseline_seeding_stores_initial_etag() {
+        let test_repo = "test-owner/test-baseline-etag-repo";
+        assert!(!is_repo_initialized(test_repo));
+
+        let events = vec![NormalizedGitEvent {
+            platform: "github".to_string(),
+            event_kind: GitEventKind::PullRequestOpened,
+            repo_full_name: test_repo.to_string(),
+            is_pull_request: true,
+            issue_or_pr_number: Some(99),
+            sender: GitUserMeta::default(),
+            commit_author: None,
+            title: Some("PR 99".into()),
+            body_text: None,
+            comment_id: None,
+            head_sha: Some("sha-99-init".into()),
+            base_branch: None,
+            head_branch: None,
+            html_url: None,
+            raw_payload: serde_json::Value::Null,
+        }];
+
+        seed_repo_baseline_with_etag(test_repo, &events, Some("init-etag-99".to_string()));
+        assert!(is_repo_initialized(test_repo));
+        assert_eq!(get_repo_etag(test_repo).as_deref(), Some("init-etag-99"));
+        assert!(!check_and_update_pr_sha(test_repo, 99, "sha-99-init"));
+    }
+
+    #[tokio::test]
+    async fn test_poll_cycle_tick_304_cache_hit_preserves_state() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock addr");
+        let api_base = format!("http://127.0.0.1:{}", addr.port());
+
+        // Mock server always returns HTTP 304 Not Modified
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await.expect("read");
+            let resp =
+                "HTTP/1.1 304 Not Modified\r\nETag: W/\"304-tag\"\r\nContent-Length: 0\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await.expect("write 304");
+        });
+
+        let repo = "test-owner/test-304-repo";
+        let project = "test-304-project";
+
+        // Pre-seed repo baseline and SHA in state cache
+        update_repo_etag(repo, Some("W/\"304-tag\"".to_string()));
+        check_and_update_pr_sha(repo, 1, "sha-existing-1");
+
+        let mut binding: crate::git_adapter::GitAdapterConfig =
+            serde_json::from_str(r#"{"channel":"github","enabled":true,"syncMode":"polling"}"#)
+                .unwrap();
+        binding.project_hash = project.to_string();
+        binding.repo_identifier = repo.to_string();
+        binding.custom_api_base = api_base;
+        binding.polling.interval_seconds = 10;
+        // GitHub App mode parameters to satisfy is_github_app_mode()
+        binding.github_app_id = Some("12345".to_string());
+        binding.github_app_private_key = Some("test-key".to_string());
+        crate::git_adapter::save_binding(binding);
+
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+
+        // Run poll cycle tick: Should fetch 304, preserve existing state without spawning review
+        poll_cycle_tick(&state).await;
+
+        // ETag remains unchanged
+        assert_eq!(get_repo_etag(repo).as_deref(), Some("W/\"304-tag\""));
+        // SHA remains deduplicated
+        assert!(!check_and_update_pr_sha(repo, 1, "sha-existing-1"));
+        // Last polled timestamp was updated in memory
+        assert!(get_repo_last_polled(repo) > 0);
+
+        crate::git_adapter::disable_binding_for_project(project);
+        let _ = server_task.await;
     }
 }

@@ -414,12 +414,37 @@ pub trait GitPlatformAdapter: Send + Sync {
     /// 查询活跃的 Pull Request / Merge Request 列表（轮询同步模式专用）
     async fn fetch_active_pull_requests(
         &self,
+        token: &str,
+        api_base: Option<&str>,
+        repo: &str,
+    ) -> Result<Vec<NormalizedGitEvent>, String> {
+        let out = self
+            .fetch_active_pull_requests_with_etag(token, api_base, repo, None)
+            .await?;
+        Ok(out.events)
+    }
+
+    /// 查询活跃的 Pull Request / Merge Request 列表，支持携带 If-None-Match 条件标头
+    async fn fetch_active_pull_requests_with_etag(
+        &self,
         _token: &str,
         _api_base: Option<&str>,
         _repo: &str,
-    ) -> Result<Vec<NormalizedGitEvent>, String> {
-        Ok(vec![])
+        _etag: Option<&str>,
+    ) -> Result<PollPullRequestsOutput, String> {
+        Ok(PollPullRequestsOutput::default())
     }
+}
+
+/// 轮询拉取活跃 PR/MR 输出结构体，携带 ETag 与 304 缓存状态
+#[derive(Debug, Clone, Default)]
+pub struct PollPullRequestsOutput {
+    /// 标准化 PR 事件列表（若 304 Not Modified 则为空列表）
+    pub events: Vec<NormalizedGitEvent>,
+    /// 平台响应返回的最新 ETag 标头
+    pub etag: Option<String>,
+    /// 是否命中 HTTP 304 Not Modified 缓存（零配额消耗）
+    pub not_modified: bool,
 }
 
 /// 根据平台渠道标识获取对应平台适配器驱动
