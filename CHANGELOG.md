@@ -21,6 +21,44 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.0-beta.8 (2026-10-26)
+
+- **[Compaction & Context] Adaptive output budget and lossless, artifact-backed compaction**:
+  - `[models.X] max_tokens` is now a capability ceiling rather than a per-request target: the wire value is `min(capability, window/8, window − prompt − 4K)`, anchored on the provider's last `prompt + completion` plus a CJK-aware conservative estimate, so long sessions can no longer exceed the gateway window.
+  - Every drained span is archived verbatim in the session artifact store (full tool output, reasoning and signatures, user-turn index) before the summary runs; the summary ends with an `artifact://<id>` pointer, and compaction archives are pinned against routine eviction.
+  - Compaction summaries use a 13-section continuity template that is updated across repeated compactions; a missing or failed summary keeps an anchored pointer instead of silently dropping history.
+  - Auto compaction now checks `0.9 × watermark` before every model request (once per turn, drain-capable strategies), and a one-click "Compact" button in Token & Context details reuses the same high-quality manual pass with the same `Compacting...` status.
+  - The context meter updates immediately after compaction on both event paths, with a guard against stale persisted usage snapping it back.
+  - Compaction notices are localized in all 10 UI languages; the kernel's liveness/retry yellow notices are localized at the daemon as well.
+- **[Prompts & Instructions] Two-tier instructions and a concise ask policy**:
+  - Global personal instructions render as `<user_preferences>` while project rules stay in `<project_instructions>`; the legacy `.jeikcode.user.md` tier is removed with a one-time migration notice.
+  - A shared precedence table is the single source of truth for both `/status` and prompt injection; the "asking the user" guidance is condensed to a default-don't-ask policy and the duplicate disambiguation rule is gone.
+- **[WebUI] Stable turn anchors, replay placement, busy state and code fences**:
+  - User turns are anchored by absolute transcript index; prompts recovered from replay land at their real position, rewind/delete prune background outlines, and notices are replay-idempotent and attach to the right turn.
+  - Busy state survives send-now, automatic drain and end-of-turn races (no more fake stop); dialogs no longer close when a text-selection drag ends on the backdrop.
+  - Nested code fences keep prose lines as prose and accept comma-option info strings.
+- **[Daemon] One English git review placeholder**:
+  - The PR/Issue progress card is a single English card for every locale and is still updated in place with the final report.
+
+---
+
+- **[压缩与上下文] 自适应输出预算 + 不丢原文的压缩归档**:
+  - `[models.X] max_tokens` 改为能力上限：线上值 = `min(能力值, 窗口/8, 窗口 − 提示词 − 4K)`，锚点取 provider 上次 prompt+completion 加中文保守估算，长会话不再超出网关窗口。
+  - 每次 drain 的原文（完整工具输出、思考、签名、用户轮次索引）在摘要前完整写入会话 artifact，摘要末尾带 `artifact://<id>` 指针；压缩归档带 pin，避免被日常淘汰。
+  - 压缩摘要升级为 13 段连续性模板，跨多次压缩持续更新；无摘要或摘要失败时保留锚点+指针，而不是静默丢历史。
+  - 自动压缩在每次模型请求前检查 `0.9 × 水位`（每回合最多一次，仅限 drain 型策略）；Token 与上下文详情里的「压缩」按钮复用同一高质量手动链路，并显示同样的 `Compacting...`。
+  - 压缩完成后上下文比例/数值在两条事件路径上立即刷新，并防止旧的持久化 usage 把数值拽回去。
+  - 压缩通知已覆盖全部 10 种 UI 语言；内核的空响应/重试等黄色通知也在 daemon 侧本地化。
+- **[提示词与指令] 双层指令块 + 精简提问策略**:
+  - 全局个人指令渲染为 `<user_preferences>`，项目规则保留在 `<project_instructions>`；移除旧的 `.jeikcode.user.md` 层并给出一次性迁移提示。
+  - 共享优先级表成为 `/status` 与注入 loader 的唯一真源；"提问用户"指引收敛为默认不问，删除重复的消歧规则。
+- **[WebUI] 回合锚点、回放归位、运行态与代码围栏**:
+  - 用户回合按绝对转录下标锚定；回放恢复的提问回到真实位置，撤回/删除同步修剪后台大纲，提示重放幂等并挂回正确回合。
+  - 立即发送、自然 drain、回合结束三种时序下运行态不再误判为停止；拖拽划词到遮罩松开不再误关弹窗。
+  - 嵌套代码围栏不再把散文行当围栏，并支持逗号式 info 串。
+- **[Daemon] Git 审查占坑卡统一**:
+  - PR/Issue 进度占坑卡改为全语种统一英文，仍可原地更新为最终报告。
+
 ## v7.3.0-beta.7 (2026-10-25)
 
 - **[MCP & Capabilities] Project-accurate toggles across restarts**:
