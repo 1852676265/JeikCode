@@ -112,6 +112,23 @@ pub(super) fn de(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "Esc zum Abbrechen drücken".into(),
         Msg::CodeExploreOpeningReminder =>
             "Erkunden Sie außerdem die Codebasis gründlich, bevor Sie antworten. Verwenden Sie `code_explore`, um die Suche nach Codelogik zu beschleunigen und sich schnell einen vollständigen Überblick zu verschaffen. Wenn keine Abhängigkeiten zwischen Tool-Aufrufen bestehen, rufen Sie diese vorrangig parallel auf. Wenn Sie keine Erkundungsaufgabe ausführen, ignorieren Sie diesen Satz.".into(),
+        Msg::CompactNothingShort => "(nichts zu komprimieren — Unterhaltung ist kurz)\n".into(),
+        Msg::CompactStarting => "(Komprimierung mit LLM-Zusammenfassung...)\n".into(),
+        Msg::CompactInterrupted => "(Komprimierung unterbrochen — die coding runtime wurde geändert oder gestoppt)\n".into(),
+        Msg::CompactUnavailableDuringSync => "Während der Live-Synchronisierung kann nicht komprimiert werden; führe zuerst /sync off aus".into(),
+        Msg::CompactUnavailableDuringResync => "Komprimieren ist erst möglich, wenn die lokale Runtime die zuletzt synchronisierte Unterhaltung wiederhergestellt hat".into(),
+        Msg::LocalRuntimeRestorePending => "Die lokale Runtime stellt die synchronisierte Unterhaltung wieder her; bitte warten".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "Zeitüberschreitung bei der Wiederherstellung der lokalen Runtime; Live-Synchronisierung wiederhergestellt".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("(nichts zu komprimieren — würde keine Tokens sparen: {} → {})\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("(komprimiert — {} Nachrichten verworfen, {} → {} tokens)\n", messages, before, after).into(),
+        Msg::Compacting => "Komprimiere…".into(),
+        Msg::CompactingSlow => "Komprimiere… (langsam)".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("Komprimiert · {} Nachricht(en) zusammengefasst · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("Tool-Ausgabe eingeklappt · ~{} tok gespart", saved).into(),
         _ => super::en::en(msg),
     }
 }

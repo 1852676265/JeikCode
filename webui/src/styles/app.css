@@ -5841,17 +5841,72 @@ body {
 }
 
 .token-popover-progress-track {
+  position: relative;
   width: 100%;
-  height: 6px;
+  height: 16px;
   background: color-mix(in srgb, var(--app-input-border), transparent 40%);
-  border-radius: 3px;
+  border-radius: 4px;
   overflow: hidden;
 }
 
 .token-popover-progress-fill {
   height: 100%;
-  border-radius: 3px;
+  border-radius: 4px;
   transition: width 0.3s ease, background-color 0.3s ease;
+}
+
+/* 百分比叠加在进度条内部：文字颜色取自主题前景色（与进度填充色解耦），
+   并用反向背景色作描边光晕，使其在明/暗主题及任意填充色（绿/琥珀/红）之上都保持清晰。 */
+.token-popover-progress-pct {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--app-primary-foreground, #1f1e1d);
+  text-shadow: 0 0 3px var(--app-primary-background, #ebedf0);
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Compact action: theme-adaptive (light / dark / system all use the app tokens). */
+.token-popover-compact {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--app-primary-border-color, #eae6db);
+  background: var(--app-secondary-background, #f0eee6);
+  color: var(--app-primary-foreground, #1f1e1d);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+.token-popover-compact:hover:not(:disabled) {
+  border-color: var(--app-brand-accent, #10a37f);
+  background: color-mix(in srgb, var(--app-secondary-background, #f0eee6), var(--app-primary-foreground, #1f1e1d) 8%);
+}
+.token-popover-compact:active:not(:disabled) {
+  background: color-mix(in srgb, var(--app-secondary-background, #f0eee6), var(--app-primary-foreground, #1f1e1d) 14%);
+}
+.token-popover-compact:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.token-popover-compact .token-compact-icon {
+  font-size: 13px;
+  line-height: 1;
 }
 
 .token-popover-grid {
@@ -5921,17 +5976,6 @@ body {
   color: var(--app-secondary-foreground, #6b6a63);
   font-variant-numeric: tabular-nums;
 }
-
-.token-popover-row.is-total {
-  border-top: 1px dashed var(--app-primary-border-color, #eae6db);
-  padding-top: 7px;
-  margin-top: 2px;
-}
-.token-popover-row.is-total .token-popover-row-val {
-  color: var(--app-success-foreground, #16a34a);
-  font-weight: 700;
-}
-
 
 .token-popover-row.is-billable {
   background: var(--app-secondary-background, #f0eee6);

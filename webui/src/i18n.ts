@@ -837,7 +837,8 @@ const zh = {
 
   // Token Details Popover & Footers
   'tokens.popoverTitle': 'Token 与上下文详情',
-  'tokens.budgetTitle': '🎯 上下文预算',
+  'tokens.contextProgressTitle': '上下文',
+  'tokens.compactAction': '压缩',
   'tokens.inputLabel': '输入',
   'tokens.onlineCacheHit': '缓存',
   'tokens.estimatedCache': '预估缓存',
@@ -1913,7 +1914,8 @@ export const en: Record<MsgKey, string> = {
 
   // Token Details Popover & Footers
   'tokens.popoverTitle': 'Token & Context Details',
-  'tokens.budgetTitle': '🎯 Context Budget',
+  'tokens.contextProgressTitle': 'Context',
+  'tokens.compactAction': 'Compact',
   'tokens.inputLabel': 'Input',
   'tokens.onlineCacheHit': 'Cache',
   'tokens.estimatedCache': 'Estimated Cache',

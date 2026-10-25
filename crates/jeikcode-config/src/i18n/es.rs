@@ -112,6 +112,23 @@ pub(super) fn es(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "presione esc para cancelar".into(),
         Msg::CodeExploreOpeningReminder =>
             "Además, explore la base de código exhaustivamente antes de responder. Utilice `code_explore` para acelerar la recuperación de la lógica del código y obtener rápidamente una visión general. Cuando no haya dependencias entre las llamadas a herramientas, ejecútelas en paralelo con prioridad. Si no está realizando una tarea de exploración, ignore esta frase.".into(),
+        Msg::CompactNothingShort => "(nada que compactar — la conversación es corta)\n".into(),
+        Msg::CompactStarting => "(compactando con resumen LLM...)\n".into(),
+        Msg::CompactInterrupted => "(compactación interrumpida — el coding runtime cambió o se detuvo)\n".into(),
+        Msg::CompactUnavailableDuringSync => "No se puede compactar durante la sincronización live; ejecuta /sync off primero".into(),
+        Msg::CompactUnavailableDuringResync => "No se puede compactar hasta que el runtime local restaure la última conversación sincronizada".into(),
+        Msg::LocalRuntimeRestorePending => "El runtime local está restaurando la conversación sincronizada; espera".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "La restauración del runtime local agotó el tiempo; se restauró la sincronización Live".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("(nada que compactar — no ahorraría tokens: {} → {})\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("(compactado — {} mensajes descartados, {} → {} tokens)\n", messages, before, after).into(),
+        Msg::Compacting => "Compactando…".into(),
+        Msg::CompactingSlow => "Compactando… (lento)".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("Compactado · {} mensaje(s) resumido(s) · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("Salida de herramienta plegada · ~{} tok ahorrados", saved).into(),
         _ => super::en::en(msg),
     }
 }

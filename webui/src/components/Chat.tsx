@@ -685,6 +685,10 @@ type SessionTokenSnapshot = {
   cacheState: TokenCacheState;
   /** True when the snapshot came from provider telemetry or persisted server usage. */
   authoritative: boolean;
+  /** Set by a committed compaction until the next REAL usage frame. A persisted
+   *  turn stat can still report the pre-compaction size; this lets the smaller,
+   *  newer compaction value win instead of snapping the meter back. */
+  compacted?: boolean;
 };
 
 /** Build a displayable data URL from an ImageData. */
@@ -1381,6 +1385,14 @@ export function Chat({
     const mem = tokenUsageCacheRef.current.get(sid);
     const running = sessionTokensRunning(sid);
 
+    // A just-committed compaction is NEWER than the persisted turn stat, which
+    // still describes the pre-compaction context. Never let that stale (larger)
+    // number snap the footer back; the next real usage frame replaces this.
+    if (mem?.compacted && serverUsage && serverUsage.total > (mem.tokens.total ?? 0)) {
+      applyTokenUsage(mem.tokens, mem.cacheState, false);
+      return;
+    }
+
     if (serverUsage && (serverUsage.prompt > 0 || serverUsage.total > 0)) {
       // Persisted turn stats are the idle baseline. During an active turn only
       // prefer in-memory telemetry when it is authoritative and ahead of disk.
@@ -1400,7 +1412,7 @@ export function Chat({
       }
     }
 
-    if (mem && (running || mem.authoritative)) {
+    if (mem && (running || mem.authoritative || mem.compacted)) {
       applyTokenUsage(mem.tokens, mem.cacheState, mem.authoritative);
       return;
     }
@@ -5447,10 +5459,16 @@ export function Chat({
               // Gate sendMessage while the dispatch is in flight, mirroring the
               // non-sync path (compactingRef guards the submit handler).
               compactingRef.current = true;
+              // Same immediate "Compacting..." indication as a passive/auto pass.
+              setIsCompacting(true);
               try {
                 const { accepted } = await postLiveCompact();
-                if (!accepted) pushCommandNotice(t('cmd.compact.syncNoRuntime'));
+                if (!accepted) {
+                  setIsCompacting(false);
+                  pushCommandNotice(t('cmd.compact.syncNoRuntime'));
+                }
               } catch (e) {
+                setIsCompacting(false);
                 setMessages((prev) => prev.filter((m) => m !== pendingNote));
                 pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
               } finally {
@@ -5465,6 +5483,8 @@ export function Chat({
         if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
         const isCompact = command === 'compact';
         if (isCompact) compactingRef.current = true;
+        // Immediate "Compacting..." indication, identical to a passive/auto pass.
+        if (isCompact) setIsCompacting(true);
         try {
           let res: CommandResult;
           try {
@@ -5477,10 +5497,15 @@ export function Chat({
               provider: provider ?? undefined,
             });
           } catch (e) {
+            if (isCompact) setIsCompacting(false);
             pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
             return;
           }
-          if (res.kind === 'error') { pushCommandNotice(res.message); return; }
+          if (res.kind === 'error') {
+            if (isCompact) setIsCompacting(false);
+            pushCommandNotice(res.message);
+            return;
+          }
           if (res.kind === 'undo') {
             if (res.undone > 0 && sessionId) await reloadSessionTranscript(sessionId);
             pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
@@ -5494,6 +5519,7 @@ export function Chat({
             return;
           }
           if (res.kind === 'compact') {
+            setIsCompacting(false);
             if (res.applied) {
               if (sessionId) await reloadSessionTranscript(sessionId);
               pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
@@ -5536,7 +5562,12 @@ export function Chat({
             return;
           }
         } finally {
-          if (isCompact) compactingRef.current = false;
+          if (isCompact) {
+            compactingRef.current = false;
+            // The non-live `/command compact` response is returned only after the
+            // compaction committed/no-oped, so the pass is over by now.
+            setIsCompacting(false);
+          }
         }
       },
       initProject: () => {
@@ -5710,6 +5741,31 @@ export function Chat({
   function applyEventToSessionCache(targetSid: string, event: SSEEvent) {
     if (event.type === 'steered') {
       foldSteeredInputs(event.inputs ?? [], event.client_input_ids, targetSid);
+      return;
+    }
+    if (event.type === 'context_compacted') {
+      // No usage event follows a compaction: refresh the background session's
+      // cached context meter immediately so switching back never shows the
+      // pre-compaction number.
+      const prompt = Math.max(0, event.tokens);
+      tokenUsageCacheRef.current.set(targetSid, {
+        tokens: {
+          prompt,
+          completion: 0,
+          total: prompt,
+          cached: 0,
+          cached_estimated: false,
+          reasoning: 0,
+        },
+        cacheState: {
+          lastPrompt: prompt,
+          providerReportsCache: false,
+          turnPromptSum: prompt,
+          turnCachedSum: 0,
+        },
+        authoritative: false,
+        compacted: true,
+      });
       return;
     }
     const msgs = messageCacheRef.current.get(targetSid);
@@ -6682,11 +6738,79 @@ export function Chat({
         setUserInputReq(null);
         break;
 
-      case 'warning':
+      case 'warning': {
         // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
         // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
         pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }), event.message_id);
+        // /live path: a compaction notice carries the post-compaction token count.
+        if (typeof event.tokens_after === 'number') {
+          const prompt = Math.max(0, event.tokens_after);
+          const cacheState = {
+            lastPrompt: prompt,
+            providerReportsCache: false,
+            turnPromptSum: prompt,
+            turnCachedSum: 0,
+          };
+          applyTokenUsage(
+            { prompt, completion: 0, total: prompt, cached: 0, cached_estimated: false, reasoning: 0 },
+            cacheState,
+            false,
+          );
+          if (activeIdRef.current) {
+            tokenUsageCacheRef.current.set(activeIdRef.current, {
+              tokens: {
+                prompt,
+                completion: 0,
+                total: prompt,
+                cached: 0,
+                cached_estimated: false,
+                reasoning: 0,
+              },
+              cacheState,
+              authoritative: false,
+              compacted: true,
+            });
+          }
+          setIsCompacting(false);
+        }
         break;
+      }
+
+      case 'context_compacted': {
+        // Compaction changed the context WITHOUT a usage frame: update the footer
+        // meter right away instead of waiting for the next model response.
+        const prompt = Math.max(0, event.tokens);
+        const cacheState = {
+          lastPrompt: prompt,
+          providerReportsCache: false,
+          turnPromptSum: prompt,
+          turnCachedSum: 0,
+        };
+        applyTokenUsage(
+          { prompt, completion: 0, total: prompt, cached: 0, cached_estimated: false, reasoning: 0 },
+          cacheState,
+          false,
+        );
+        if (activeIdRef.current) {
+          tokenUsageCacheRef.current.set(activeIdRef.current, {
+            tokens: {
+              prompt,
+              completion: 0,
+              total: prompt,
+              cached: 0,
+              cached_estimated: false,
+              reasoning: 0,
+            },
+            cacheState,
+            authoritative: false,
+            compacted: true,
+          });
+        }
+        // The daemon also sends SessionStatus("running"), but clear here too so a
+        // dropped status frame can never leave the shimmer stuck on "Compacting...".
+        setIsCompacting(false);
+        break;
+      }
 
       case 'persistence_warning':
         setPersistenceWarning(event.message);
@@ -9198,9 +9322,9 @@ export function Chat({
                         {contextLimit && (
                           <div class="token-popover-progress-box">
                             <div class="token-popover-progress-labels">
-                              <span class="token-popover-progress-title">{t('tokens.budgetTitle')}</span>
+                              <span class="token-popover-progress-title">{t('tokens.contextProgressTitle')}</span>
                               <span class="token-popover-progress-val">
-                                {totalStr} / {limitStr} ({pctOfLimit}%)
+                                {totalStr} / {limitStr}
                               </span>
                             </div>
                             <div class="token-popover-progress-track">
@@ -9216,8 +9340,28 @@ export function Chat({
                                       : 'var(--app-brand-accent, #10a37f)',
                                 }}
                               />
+                              <span class="token-popover-progress-pct">{pctOfLimit}%</span>
                             </div>
                           </div>
+                        )}
+
+                        {sessionId && (
+                          <button
+                            type="button"
+                            class="token-popover-compact"
+                            disabled={busy || isCompacting}
+                            title={busy ? t('cmd.session.busy') : t('tokens.compactAction')}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              // Same path as the `/compact` slash command: the HIGH-QUALITY
+                              // compaction (recent window kept verbatim + anchored LLM
+                              // summary + verbatim artifact archive), not the cheap stub.
+                              void slashHandlers.execServerCommand('compact', '');
+                            }}
+                          >
+                            <span class="token-compact-icon" aria-hidden="true">🗜️</span>
+                            <span>{t('tokens.compactAction')}</span>
+                          </button>
                         )}
 
                         <div class="token-popover-grid">
@@ -9274,17 +9418,6 @@ export function Chat({
                                 </span>
                               )}
                             </div>
-                          </div>
-
-                          <div class="token-popover-row is-total">
-                            <div class="token-popover-row-left">
-                              <span class="token-row-icon">🎯</span>
-                              <span class="token-row-label">{t('tokens.totalContext')}</span>
-                            </div>
-                            <span class="token-popover-row-val">
-                              {totalStr}
-                              {contextLimit ? ` / ${limitStr}` : ''}
-                            </span>
                           </div>
 
                           <div class="token-popover-row is-billable">
@@ -9990,6 +10123,15 @@ export function Chat({
             );
           });
         })()}
+
+        {/* Compaction in flight before the turn's assistant bubble exists (task-boundary
+            or auto pass): render the SAME shimmer status as Working..., English-only,
+            so the user never sees "Working..." while a compaction is running. */}
+        {isCompacting && !busy && (
+          <div class="compacting-status" role="status" aria-live="polite">
+            <span class="codex-shimmer-status">Compacting...</span>
+          </div>
+        )}
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，卡片下方提供立即发送、转向、取消按钮。 */}
         {queued.map((q) => (

@@ -112,6 +112,23 @@ pub(super) fn zh_tw(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::CodeExploreOpeningReminder =>
             "還有，在回答前請充分探索程式碼庫。使用 `code_explore` 加快程式碼邏輯檢索速度以便快速獲得全貌。當工具調用之間無依賴時，優先並行發起調用。如果你沒在執行探索任務，請忽略此句即可。".into(),
+        Msg::CompactNothingShort => "（無需壓縮 — 對話較短）\n".into(),
+        Msg::CompactStarting => "（正在使用 LLM 摘要進行壓縮...）\n".into(),
+        Msg::CompactInterrupted => "（壓縮已中斷 — coding runtime 已變更或停止）\n".into(),
+        Msg::CompactUnavailableDuringSync => "同步模式下 /compact 暫不可用；請先執行 /sync off".into(),
+        Msg::CompactUnavailableDuringResync => "本地 runtime 尚未恢復最新同步會話，暫不能執行 /compact".into(),
+        Msg::LocalRuntimeRestorePending => "本地 runtime 正在恢復同步會話，請稍候".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "本地 runtime 恢復逾時，已重新接回 Live 同步".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("（無需壓縮 — 壓縮後不會節省 token：{} → {}）\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("（已壓縮 — 捨棄 {} 條訊息，{} → {} tokens）\n", messages, before, after).into(),
+        Msg::Compacting => "正在壓縮…".into(),
+        Msg::CompactingSlow => "正在壓縮…（較慢）".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("已壓縮 · 摘要 {} 條 · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("已摺疊工具輸出 · 節省 ~{} tok", saved).into(),
         _ => super::zh_cn::zh_cn(msg),
     }
 }

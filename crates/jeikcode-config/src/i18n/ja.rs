@@ -112,6 +112,23 @@ pub(super) fn ja(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "esc でキャンセル".into(),
         Msg::CodeExploreOpeningReminder =>
             "なお、回答する前にコードベースを十分に探索してください。`code_explore` を使用してコードロジックの検索を高速化し、素早く全体像を把握してください。ツール呼び出し間に依存関係がない場合は、優先して並行して呼び出してください。探索タスクを実行していない場合は、この文を無視してください。".into(),
+        Msg::CompactNothingShort => "（圧縮不要 — 会話が短い）\n".into(),
+        Msg::CompactStarting => "（LLM 要約で圧縮中...）\n".into(),
+        Msg::CompactInterrupted => "（圧縮は中断されました — coding runtime が変更または停止）\n".into(),
+        Msg::CompactUnavailableDuringSync => "ライブ同期中は圧縮できません。/sync off を先に実行してください".into(),
+        Msg::CompactUnavailableDuringResync => "ローカル runtime が最新の同期会話を復元するまで圧縮できません".into(),
+        Msg::LocalRuntimeRestorePending => "ローカル runtime が同期会話を復元中です。しばらくお待ちください".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "ローカル runtime の復元がタイムアウトしました。Live 同期に再接続しました".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("（圧縮不要 — トークンを節約できません：{} → {}）\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("（圧縮しました — {} 件のメッセージを破棄、{} → {} tokens）\n", messages, before, after).into(),
+        Msg::Compacting => "圧縮中…".into(),
+        Msg::CompactingSlow => "圧縮中…（遅い）".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("圧縮済み · {} 件を要約 · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("ツール出力を折りたたみました · ~{} tok 節約", saved).into(),
         _ => super::en::en(msg),
     }
 }

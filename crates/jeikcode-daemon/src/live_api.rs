@@ -1648,7 +1648,13 @@ pub(crate) enum LiveWireEvent {
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
-    Warning { message: String },
+    Warning {
+        message: String,
+        /// Committed compaction: post-compaction context tokens. Clients update the
+        /// live context meter immediately (no usage frame follows a compaction).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u32>,
+    },
     /// Auxiliary session persistence failed. Kept distinct from conversational
     /// warnings so browser clients render it outside the message timeline.
     #[serde(rename = "persistence_warning")]
@@ -1938,7 +1944,10 @@ impl NativeLiveWireProjector {
                         before_tokens,
                         after_tokens,
                     );
-                    LiveWireEvent::Warning { message: mark }
+                    LiveWireEvent::Warning {
+                        message: mark,
+                        tokens_after: Some(after_tokens as u32),
+                    }
                 }
                 Kernel::CompactionFailed { error, .. } => {
                     crate::publish_global(crate::GlobalWireEvent::Activity {
@@ -1949,6 +1958,7 @@ impl NativeLiveWireProjector {
                     });
                     LiveWireEvent::Warning {
                         message: format!("Compaction failed: {error}"),
+                        tokens_after: None,
                     }
                 }
                 Kernel::CompactionStarted { .. } => {
@@ -1964,7 +1974,10 @@ impl NativeLiveWireProjector {
                     }
                 }
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
-                Kernel::Warning(message) => LiveWireEvent::Warning { message },
+                Kernel::Warning(message) => LiveWireEvent::Warning {
+                    message: crate::localize_agent_warning(&message),
+                    tokens_after: None,
+                },
                 Kernel::RateLimited {
                     reset_at_display,
                     reset_label,
@@ -2097,7 +2110,10 @@ impl NativeLiveWireProjector {
                 working_dir: working_dir.to_string_lossy().to_string(),
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
-                LiveWireEvent::Warning { message }
+                LiveWireEvent::Warning {
+                    message: crate::localize_agent_warning(&message),
+                    tokens_after: None,
+                }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::PersistenceWarning(message)) => {
                 LiveWireEvent::PersistenceWarning { message }
@@ -2122,6 +2138,7 @@ impl NativeLiveWireProjector {
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
                 ),
+                tokens_after: Some(outcome.estimated_tokens_after as u32),
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Failed { error, .. },

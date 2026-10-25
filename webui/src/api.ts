@@ -221,7 +221,9 @@ export type SSEEvent =
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string; message_id?: string }
+  | { type: 'warning'; message: string; message_id?: string; /** Live path: committed compaction's post-context tokens. */ tokens_after?: number }
+  /** Committed compaction: update the context meter immediately (no usage follows). */
+  | { type: 'context_compacted'; session_id?: string; tokens: number }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null; message_id?: string }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
@@ -2030,7 +2032,8 @@ export type LiveWireEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number; cached?: number }
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string; message_id?: string }
+  | { type: 'warning'; message: string; message_id?: string; /** Live path: committed compaction's post-context tokens. */ tokens_after?: number }
+  | { type: 'context_compacted'; session_id?: string; tokens: number }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null; message_id?: string }
   | { type: 'permission_request'; session_id?: string; runtime_instance_id: string; generation: number; request_id: number; tool_name: string; reason: string; call_id: string; arguments: string }

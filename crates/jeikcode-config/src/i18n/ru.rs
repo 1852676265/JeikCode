@@ -112,6 +112,23 @@ pub(super) fn ru(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "нажмите esc для отмены".into(),
         Msg::CodeExploreOpeningReminder =>
             "Кроме того, перед ответом тщательно исследуйте кодовую базу. Используйте `code_explore`, чтобы ускорить поиск логики кода и быстро получить полную картину. Если между вызовами инструментов нет зависимостей, вызывайте их параллельно. Если вы не выполняете задачу исследования, проигнорируйте эту фразу.".into(),
+        Msg::CompactNothingShort => "(нечего сжимать — разговор короткий)\n".into(),
+        Msg::CompactStarting => "(сжатие с помощью LLM-сводки...)\n".into(),
+        Msg::CompactInterrupted => "(сжатие прервано — coding runtime изменился или остановлен)\n".into(),
+        Msg::CompactUnavailableDuringSync => "Нельзя сжимать при активной live-синхронизации; сначала выполните /sync off".into(),
+        Msg::CompactUnavailableDuringResync => "Нельзя сжимать, пока локальный runtime не восстановит последний синхронизированный диалог".into(),
+        Msg::LocalRuntimeRestorePending => "Локальный runtime восстанавливает синхронизированный диалог; подождите".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "Восстановление локального runtime истекло по времени; Live-синхронизация восстановлена".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("(нечего сжимать — экономии токенов не будет: {} → {})\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("(сжато — удалено {} сообщений, {} → {} tokens)\n", messages, before, after).into(),
+        Msg::Compacting => "Сжатие…".into(),
+        Msg::CompactingSlow => "Сжатие… (медленно)".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("Сжато · {} сообщ. суммировано · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("Вывод инструментов свёрнут · сэкономлено ~{} tok", saved).into(),
         _ => super::en::en(msg),
     }
 }

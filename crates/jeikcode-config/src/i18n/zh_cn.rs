@@ -1294,5 +1294,41 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "【严重安全警告】检测到你未配置访问令牌 (Token)！\n如果你当前未设置对应防火墙，请向 JeikCode 的 AI 询问让其帮忙设立防火墙和白名单 IP，否则你的服务器很容易被黑客入侵！".into(),
         Msg::CodeExploreOpeningReminder =>
             "还有，在回答前请充分探索代码库。使用 `code_explore` 加快代码逻辑检索速度以便快速获得全貌。当工具调用之间无依赖时，优先并发发起调用。如果你没在运行探索任务，请忽略此句即可。".into(),
+        Msg::AgentRetryEmpty { attempt, max, wait } => if wait > 0 {
+            format!("模型返回空响应，{wait} 秒后重试({attempt}/{max})...")
+        } else {
+            format!("模型返回空响应，正在重试({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryThinking { attempt, max, wait } => if wait > 0 {
+            format!("模型只返回了思考，{wait} 秒后重试({attempt}/{max})...")
+        } else {
+            format!("模型只返回了思考，正在重试({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryMalformed { attempt, max, wait } => if wait > 0 {
+            format!("响应格式异常，{wait} 秒后重试({attempt}/{max})...")
+        } else {
+            format!("响应格式异常，正在重试({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryFirstToken { secs, attempt, max } =>
+            format!("模型延迟高:{secs} 秒内无响应,正在重试({attempt}/{max})…").into(),
+        Msg::AgentRetryApi { reason, wait, attempt, max } =>
+            format!("API error {reason}，{wait} 秒后重试({attempt}/{max})...").into(),
+        Msg::AgentOverWindow { estimate_k, window_k, buffer_k } =>
+            format!(
+                "请求约 {estimate_k}K tokens 已达上下文水位（窗口约 {window_k}K − 水位缓冲 \
+                 {buffer_k}K）：请精简输入或换用更大窗口的模型。"
+            ).into(),
+        Msg::AgentContextOverflow { round, attempt } =>
+            format!("第 {round} 轮上下文溢出（第 {attempt} 次尝试）；正在压缩并重试").into(),
+        Msg::AgentStreamReconnecting { attempt, max } =>
+            format!("流空闲超时 — 正在重连（{attempt}/{max}）").into(),
+        Msg::AgentResponseTruncated => "响应被截断：finish_reason=length".into(),
+        Msg::AgentUnsupportedSnapshot { version, supported } =>
+            format!("不支持的快照版本 {version}（内核支持 {supported}）；以空会话启动").into(),
+        Msg::AgentPreRequestNotAppendOnly { stored } =>
+            format!(
+                "pre_request 不是只追加：出站前缀与已存的 {stored} 条消息不一致 — 这会破坏本次请求的 \
+                 provider 前缀缓存（pre_request hook 只能追加尾部提醒）"
+            ).into(),
     }
 }

@@ -1317,5 +1317,43 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "[CRITICAL SECURITY WARNING] No access token configured!\nIf you have not set up a corresponding firewall, please ask JeikCode AI to help establish firewall rules and whitelist IPs; otherwise, your server can easily be compromised by hackers!".into(),
         Msg::CodeExploreOpeningReminder =>
             "Explore the codebase generously before answering. Use `code_explore` to accelerate code logic retrieval and quickly gain a complete overview. Fire concurrent calls when there is no dependency between them. If you are not running an exploration task, please ignore this sentence.".into(),
+        Msg::AgentRetryEmpty { attempt, max, wait } => if wait > 0 {
+            format!("Model returned an empty response, retrying in {wait}s ({attempt}/{max})...")
+        } else {
+            format!("Model returned an empty response, retrying ({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryThinking { attempt, max, wait } => if wait > 0 {
+            format!("Model returned only reasoning, retrying in {wait}s ({attempt}/{max})...")
+        } else {
+            format!("Model returned only reasoning, retrying ({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryMalformed { attempt, max, wait } => if wait > 0 {
+            format!("Malformed response, retrying in {wait}s ({attempt}/{max})...")
+        } else {
+            format!("Malformed response, retrying ({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryFirstToken { secs, attempt, max } =>
+            format!("Model is slow: no token within {secs}s, retrying ({attempt}/{max})…").into(),
+        Msg::AgentRetryApi { reason, wait, attempt, max } =>
+            format!("API error {reason}, retrying in {wait}s ({attempt}/{max})...").into(),
+        Msg::AgentOverWindow { estimate_k, window_k, buffer_k } =>
+            format!(
+                "Request is ~{estimate_k}K tokens, at the context watermark \
+                 (window ~{window_k}K − buffer {buffer_k}K): trim the input or switch \
+                 to a larger-window model."
+            ).into(),
+        Msg::AgentContextOverflow { round, attempt } =>
+            format!("Context overflow on round {round} (attempt {attempt}); compacting and retrying").into(),
+        Msg::AgentStreamReconnecting { attempt, max } =>
+            format!("Stream idle timeout — reconnecting ({attempt}/{max})").into(),
+        Msg::AgentResponseTruncated => "Response truncated: finish_reason=length".into(),
+        Msg::AgentUnsupportedSnapshot { version, supported } =>
+            format!("Unsupported snapshot version {version} (kernel supports {supported}); starting empty").into(),
+        Msg::AgentPreRequestNotAppendOnly { stored } =>
+            format!(
+                "pre_request is not append-only: the outgoing prefix diverges from the {stored} \
+                 stored message(s) — this poisons the provider prefix cache for this request \
+                 (a pre_request hook may only APPEND tail reminders)"
+            ).into(),
     }
 }

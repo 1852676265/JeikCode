@@ -112,6 +112,23 @@ pub(super) fn ko(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "esc를 눌러 취소".into(),
         Msg::CodeExploreOpeningReminder =>
             "또한 답변하기 전에 코드베이스를 충분히 탐색해 주세요. `code_explore`를 사용하여 코드 로직 검색 속도를 높이고 전체적인 구조를 빠르게 파악하세요. 도구 호출 간에 종속성이 없을 경우 병렬로 우선 호출하세요. 탐색 작업을 수행하지 않는 경우 이 문장은 무시하셔도 됩니다.".into(),
+        Msg::CompactNothingShort => "（압축할 필요 없음 — 대화가 짧음）\n".into(),
+        Msg::CompactStarting => "（LLM 요약으로 압축 중...）\n".into(),
+        Msg::CompactInterrupted => "（압축이 중단됨 — coding runtime 이 변경되었거나 중지됨）\n".into(),
+        Msg::CompactUnavailableDuringSync => "라이브 동기화 중에는 압축할 수 없습니다. 먼저 /sync off 를 실행하세요".into(),
+        Msg::CompactUnavailableDuringResync => "로컬 runtime 이 최신 동기화 대화를 복원할 때까지 압축할 수 없습니다".into(),
+        Msg::LocalRuntimeRestorePending => "로컬 runtime 이 동기화 대화를 복원 중입니다. 잠시 기다려 주세요".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "로컬 runtime 복원 시간이 초과되었습니다. Live 동기화로 다시 연결했습니다".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("（압축할 필요 없음 — 토큰을 절약할 수 없음: {} → {}）\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("（압축됨 — {}개 메시지 삭제, {} → {} tokens）\n", messages, before, after).into(),
+        Msg::Compacting => "압축 중…".into(),
+        Msg::CompactingSlow => "압축 중…（느림）".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("압축됨 · {}개 요약 · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("도구 출력 접힘 · ~{} tok 절약", saved).into(),
         _ => super::en::en(msg),
     }
 }

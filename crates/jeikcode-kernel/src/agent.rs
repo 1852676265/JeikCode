@@ -699,6 +699,28 @@ fn auto_compact_trigger(
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
 }
 
+/// Mid-turn auto-compaction verdict: evaluate the SAME threshold as the
+/// task-boundary trigger, but against the CURRENT outgoing prompt (conservative
+/// CJK-aware estimate) before every model call. `None` when compaction is
+/// disabled (`compact_threshold` unset), the window is unknown, or pressure is
+/// still below the line.
+fn midturn_auto_utilization(
+    window: u32,
+    threshold: Option<f32>,
+    estimated_prompt: u32,
+) -> Option<f32> {
+    let threshold = threshold?;
+    if window == 0 {
+        return None;
+    }
+    let limit = input_watermark_budget(window);
+    if limit == 0 {
+        return None;
+    }
+    let utilization = estimated_prompt as f32 / limit as f32;
+    (utilization >= threshold).then_some(utilization)
+}
+
 /// Classification of a single tool call for the three-phase tool loop.
 ///
 /// Phase ① CLASSIFY maps every `pending_call` (in order) to a `CallPlan`;
@@ -1559,16 +1581,14 @@ impl RunningAgent {
                 utilization,
                 sacred_floor: floor,
             };
-            // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
-            // show a "compacting…" progress line — but ONLY if the strategy will
-            // actually do that slow drain/summarize. A manual `/compact` that turns out
-            // to be a no-op (nothing older than the active turn) must NOT show a
-            // spurious "compacting…" line ahead of "nothing to compact" (v1 parity).
-            if self.compaction.will_summarize(&view) {
-                self.rt.emit(AgentEvent::CompactionStarted {
-                    trigger: trigger_for_event.clone(),
-                });
-            }
+            // Announce BEFORE the plan/summary so drivers render a live
+            // "Compacting..." status for EVERY compaction pass — stub-only passes
+            // included. (For a no-op pass the matching `Compacted`/terminal event
+            // clears the status immediately; a brief flash is preferable to the UI
+            // showing "Working..." while a stub/summary is actually running.)
+            self.rt.emit(AgentEvent::CompactionStarted {
+                trigger: trigger_for_event.clone(),
+            });
             self.compaction.plan(&view).await
         };
         // Prepare the complete next conversation without changing the live state.
@@ -2357,6 +2377,11 @@ impl RunningAgent {
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
         // terminal not to repeat the same size-blame.
         let mut over_window_warned = false;
+        // Whether the mid-turn AUTO compaction pass has run this turn. Mainstream
+        // agents check the context threshold before every model call; we do the
+        // same, but at most ONCE per turn so a no-op pass cannot thrash. The
+        // 100%-watermark emergency block below remains the hard backstop.
+        let mut midturn_auto_attempted = false;
         // Per-turn state for the always-on coarse fuse. Unlike the exact guard's
         // session-owned streak, this only describes consecutive rounds of this
         // running turn.
@@ -2515,6 +2540,33 @@ impl RunningAgent {
             // provider can spuriously compact persistent conversation state, while
             // synthesized results can make the final wire larger than estimated.
             Conversation::repair_pairing(&mut messages);
+            // MID-TURN AUTO COMPACTION (mainstream timing): pi / opencode /
+            // grok-build all check the context threshold before EVERY model call,
+            // not only at task boundaries. Do the same with the gentle `Auto`
+            // strategy (recent-window kept verbatim, old span drained+summarized)
+            // instead of waiting for the 100% overflow ladder. Runs at most once
+            // per turn: if it cannot shrink (single huge input), the emergency
+            // block below still owns the hard backstop.
+            if !midturn_auto_attempted {
+                if let Some(utilization) = midturn_auto_utilization(
+                    self.provider.context_window(),
+                    self.compact_threshold,
+                    messages
+                        .iter()
+                        .map(|m| m.estimate_tokens_conservative())
+                        .sum::<u32>(),
+                ) {
+                    midturn_auto_attempted = true;
+                    self.run_compaction(convo, CompactTrigger::Auto { utilization })
+                        .await;
+                    messages = convo.model_history();
+                    self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                    let stored_wire = convo.model_history();
+                    appended_only &= messages.len() >= stored_wire.len()
+                        && messages[..stored_wire.len()] == stored_wire[..];
+                    Conversation::repair_pairing(&mut messages);
+                }
+            }
             // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
             // meets/exceeds the model window, COMPACT before sending rather than firing a
             // doomed over-window request. This is the case the between-turn `should_compact`
@@ -6487,9 +6539,27 @@ mod provider_message_pairing_tests {
 #[cfg(test)]
 mod output_budget_tests {
     use super::{
-        input_watermark_budget, wire_output_budget, wire_output_budget_for_prompt,
-        DEFAULT_OUTPUT_BUDGET, DEFAULT_REQUEST_MAX_TOKENS,
+        input_watermark_budget, midturn_auto_utilization, wire_output_budget,
+        wire_output_budget_for_prompt, DEFAULT_OUTPUT_BUDGET, DEFAULT_REQUEST_MAX_TOKENS,
     };
+
+    #[test]
+    fn midturn_auto_compaction_uses_the_task_boundary_threshold() {
+        let window = 1_048_576;
+        // watermark = 1,028,576; 0.9 ⇒ 925,718.
+        assert_eq!(
+            midturn_auto_utilization(window, Some(0.9), 925_000),
+            None,
+            "just below the line must not compact"
+        );
+        assert!(
+            midturn_auto_utilization(window, Some(0.9), 926_000).is_some(),
+            "crossing the line MUST compact before the next request"
+        );
+        // Auto-compaction disabled / unknown window ⇒ never.
+        assert_eq!(midturn_auto_utilization(window, None, 1_000_000), None);
+        assert_eq!(midturn_auto_utilization(0, Some(0.9), 1_000_000), None);
+    }
 
     #[test]
     fn soft_cap_bounds_a_large_capability_to_an_eighth_of_the_window() {

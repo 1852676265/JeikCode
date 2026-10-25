@@ -1729,4 +1729,64 @@ pub enum Msg<'a> {
     ServeNoTokenSecurityWarning,
     /// Tail reminder injected on the first user turn to encourage exploring via code_explore.
     CodeExploreOpeningReminder,
+
+    // ── kernel liveness / retry advisories (yellow notices) ──
+    /// Empty 200 from the gateway; the kernel re-issues the request.
+    AgentRetryEmpty {
+        attempt: u32,
+        max: u32,
+        wait: u64,
+    },
+    /// The model streamed reasoning only, no visible answer; retried.
+    AgentRetryThinking {
+        attempt: u32,
+        max: u32,
+        wait: u64,
+    },
+    /// The adapter dropped unparseable chunks; retried with a distinct wording.
+    AgentRetryMalformed {
+        attempt: u32,
+        max: u32,
+        wait: u64,
+    },
+    /// No first token within the timeout; the request is re-issued.
+    AgentRetryFirstToken {
+        secs: u64,
+        attempt: u32,
+        max: u32,
+    },
+    /// Transient provider API error; the request is retried after a backoff.
+    AgentRetryApi {
+        reason: &'a str,
+        wait: u64,
+        attempt: u32,
+        max: u32,
+    },
+    /// Context-pressure advisory before a request that is at/over the watermark.
+    AgentOverWindow {
+        estimate_k: u32,
+        window_k: u32,
+        buffer_k: u32,
+    },
+    /// Mid-turn context overflow; the kernel compacts then retries the round.
+    AgentContextOverflow {
+        round: u32,
+        attempt: u32,
+    },
+    /// Stream went byte-idle; reconnecting.
+    AgentStreamReconnecting {
+        attempt: u32,
+        max: u32,
+    },
+    /// The model's response hit the output ceiling.
+    AgentResponseTruncated,
+    /// A resumed snapshot has a version the kernel does not support.
+    AgentUnsupportedSnapshot {
+        version: u32,
+        supported: u32,
+    },
+    /// A `pre_request` hook mutated the historical prefix (cache poison warning).
+    AgentPreRequestNotAppendOnly {
+        stored: usize,
+    },
 }

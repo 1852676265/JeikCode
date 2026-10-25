@@ -6916,6 +6916,16 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
+    /// Context pressure changed WITHOUT a new model response (a committed
+    /// compaction). Clients update the live context meter immediately instead of
+    /// waiting for the next usage event — otherwise the footer keeps showing the
+    /// pre-compaction number until the next turn.
+    #[serde(rename = "context_compacted")]
+    ContextCompacted {
+        session_id: String,
+        /// Post-compaction estimated context tokens (summary + kept recent turns).
+        tokens: u32,
+    },
     /// Auxiliary session persistence failed. Clients must display this outside
     /// the assistant message timeline.
     #[serde(rename = "persistence_warning")]
@@ -8132,6 +8142,200 @@ impl ArtifactDetector {
     }
 }
 
+/// Localize the kernel's user-facing yellow notices.
+///
+/// The kernel is i18n-neutral (it has no `jeikcode-config` dependency), so it
+/// emits stable message templates. The daemon owns the locale, and translates the
+/// known liveness/retry/progress templates here; anything unrecognized passes
+/// through unchanged (provider-supplied text, already-localized notices, …).
+pub(crate) fn localize_agent_warning(message: &str) -> String {
+    localize_agent_warning_with(jeikcode_config::i18n::current_locale(), message)
+}
+
+fn localize_agent_warning_with(locale: jeikcode_config::locale::Locale, message: &str) -> String {
+    use jeikcode_config::i18n::{t_with, Msg};
+
+    /// `"{wait} 秒后重试({n}/{max})..."` or `"正在重试({n}/{max})..."` (wait = 0).
+    fn retry_tail(rest: &str) -> Option<(u64, u32, u32)> {
+        let open = rest.find("重试(")?;
+        let after = &rest[open + "重试(".len()..];
+        let close = after.find(')')?;
+        let (attempt, max) = after[..close].split_once('/')?;
+        let attempt = attempt.trim().parse::<u32>().ok()?;
+        let max = max.trim().parse::<u32>().ok()?;
+        let wait = match rest[..open].find(" 秒后") {
+            Some(pos) => rest[..pos]
+                .trim()
+                .trim_end_matches('，')
+                .trim()
+                .parse::<u64>()
+                .ok()?,
+            None => 0,
+        };
+        Some((wait, attempt, max))
+    }
+
+    if let Some(rest) = message.strip_prefix("模型返回空响应，") {
+        if let Some((wait, attempt, max)) = retry_tail(rest) {
+            return t_with(locale, Msg::AgentRetryEmpty { attempt, max, wait }).into_owned();
+        }
+    }
+    if let Some(rest) = message.strip_prefix("模型只返回了思考，") {
+        if let Some((wait, attempt, max)) = retry_tail(rest) {
+            return t_with(locale, Msg::AgentRetryThinking { attempt, max, wait }).into_owned();
+        }
+    }
+    if let Some(rest) = message.strip_prefix("响应格式异常，") {
+        if let Some((wait, attempt, max)) = retry_tail(rest) {
+            return t_with(locale, Msg::AgentRetryMalformed { attempt, max, wait }).into_owned();
+        }
+    }
+    if let Some(rest) = message.strip_prefix("API error ") {
+        if let Some((reason, tail)) = rest.split_once('，') {
+            if let Some((wait, attempt, max)) = retry_tail(tail) {
+                return t_with(
+                    locale,
+                    Msg::AgentRetryApi {
+                        reason,
+                        wait,
+                        attempt,
+                        max,
+                    },
+                )
+                .into_owned();
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("模型延迟高:") {
+        if let Some(pos) = rest.find(" 秒内无响应") {
+            if let Ok(secs) = rest[..pos].trim().parse::<u64>() {
+                if let Some((_, attempt, max)) = retry_tail(&rest[pos..]) {
+                    return t_with(locale, Msg::AgentRetryFirstToken { secs, attempt, max })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("请求约 ") {
+        if let Some((estimate, tail)) = rest.split_once("K tokens 已达上下文水位（窗口约 ")
+        {
+            if let Some((window, tail)) = tail.split_once("K − 水位缓冲 ") {
+                if let Some((buffer, _)) = tail.split_once("K）") {
+                    if let (Ok(estimate_k), Ok(window_k), Ok(buffer_k)) = (
+                        estimate.trim().parse::<u32>(),
+                        window.trim().parse::<u32>(),
+                        buffer.trim().parse::<u32>(),
+                    ) {
+                        return t_with(
+                            locale,
+                            Msg::AgentOverWindow {
+                                estimate_k,
+                                window_k,
+                                buffer_k,
+                            },
+                        )
+                        .into_owned();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("context overflow on round ") {
+        if let Some((round, tail)) = rest.split_once(" (attempt ") {
+            if let Some((attempt, _)) = tail.split_once(')') {
+                if let (Ok(round), Ok(attempt)) =
+                    (round.trim().parse::<u32>(), attempt.trim().parse::<u32>())
+                {
+                    return t_with(locale, Msg::AgentContextOverflow { round, attempt })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("stream idle timeout — reconnecting (") {
+        if let Some((nums, _)) = rest.split_once(')') {
+            if let Some((attempt, max)) = nums.split_once('/') {
+                if let (Ok(attempt), Ok(max)) =
+                    (attempt.trim().parse::<u32>(), max.trim().parse::<u32>())
+                {
+                    return t_with(locale, Msg::AgentStreamReconnecting { attempt, max })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if message == "response truncated: finish_reason=length" {
+        return t_with(locale, Msg::AgentResponseTruncated).into_owned();
+    }
+    if let Some(rest) = message.strip_prefix("unsupported snapshot version ") {
+        if let Some((version, tail)) = rest.split_once(" (kernel supports ") {
+            if let Some((supported, _)) = tail.split_once(')') {
+                if let (Ok(version), Ok(supported)) = (
+                    version.trim().parse::<u32>(),
+                    supported.trim().parse::<u32>(),
+                ) {
+                    return t_with(locale, Msg::AgentUnsupportedSnapshot { version, supported })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if let Some(rest) = message
+        .strip_prefix("pre_request is not append-only: the outgoing prefix diverges from the ")
+    {
+        if let Some((stored, _)) = rest.split_once(" stored message(s)") {
+            if let Ok(stored) = stored.trim().parse::<usize>() {
+                return t_with(locale, Msg::AgentPreRequestNotAppendOnly { stored }).into_owned();
+            }
+        }
+    }
+    message.to_string()
+}
+
+#[cfg(test)]
+mod agent_warning_i18n_tests {
+    use super::localize_agent_warning_with;
+    use jeikcode_config::locale::Locale;
+
+    #[test]
+    fn translates_known_kernel_templates_and_passes_unknown_through() {
+        let zh = localize_agent_warning_with(Locale::ZhCn, "模型返回空响应，3 秒后重试(2/5)...");
+        assert!(zh.contains("3 秒后重试"), "{zh}");
+        assert!(zh.contains("2/5"), "{zh}");
+
+        let en = localize_agent_warning_with(Locale::En, "模型返回空响应，3 秒后重试(2/5)...");
+        assert!(en.contains("empty response"), "{en}");
+        assert!(en.contains("3s"), "{en}");
+        assert!(en.contains("2/5"), "{en}");
+
+        let thinking =
+            localize_agent_warning_with(Locale::En, "模型只返回了思考，正在重试(1/5)...");
+        assert!(thinking.contains("only reasoning"), "{thinking}");
+
+        let api = localize_agent_warning_with(
+            Locale::En,
+            "API error server overloaded，6 秒后重试(1/3)...",
+        );
+        assert!(api.contains("server overloaded"), "{api}");
+
+        let over = localize_agent_warning_with(
+            Locale::En,
+            "请求约 950K tokens 已达上下文水位（窗口约 1048K − 水位缓冲 20K）：请精简输入或换用更大窗口的模型。",
+        );
+        assert!(over.contains("950K"), "{over}");
+        assert!(over.contains("watermark"), "{over}");
+
+        let reconnecting =
+            localize_agent_warning_with(Locale::En, "stream idle timeout — reconnecting (2/4)");
+        assert!(reconnecting.contains("reconnecting"), "{reconnecting}");
+
+        assert_eq!(
+            localize_agent_warning_with(Locale::En, "provider says hi"),
+            "provider says hi"
+        );
+    }
+}
+
 struct ChatRuntimeProjector {
     artifacts: ArtifactDetector,
     live_tools: HashMap<String, (String, std::time::Instant)>,
@@ -8228,23 +8432,49 @@ impl ChatRuntimeProjector {
             }
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
-            } if outcome.committed => vec![ChatEvent::Warning {
-                message: jeikcode_config::i18n::format_compaction_mark(
-                    outcome.removed_messages,
-                    outcome.estimated_tokens_before,
-                    outcome.estimated_tokens_after,
-                ),
-                message_id: self.notice_anchor(),
-            }],
+            } if outcome.committed => {
+                // Clear the driver's "compacting" status (the kernel announced it for
+                // every pass) and refresh the footer meter with the post-compaction size.
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: permission_session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![
+                    ChatEvent::Warning {
+                        message: jeikcode_config::i18n::format_compaction_mark(
+                            outcome.removed_messages,
+                            outcome.estimated_tokens_before,
+                            outcome.estimated_tokens_after,
+                        ),
+                        message_id: self.notice_anchor(),
+                    },
+                    ChatEvent::ContextCompacted {
+                        session_id: permission_session_id.to_string(),
+                        tokens: outcome.estimated_tokens_after as u32,
+                    },
+                    ChatEvent::SessionStatus {
+                        session_id: permission_session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                ]
+            }
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
             } if outcome.is_manual() => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: permission_session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
                 let text = jeikcode_config::i18n::format_compaction_noop(
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
                     outcome.summary_would_grow(),
                 );
-                if self.keep_raw_markdown {
+                let mut events = if self.keep_raw_markdown {
                     vec![ChatEvent::TextDelta {
                         content: text,
                         message_id: None,
@@ -8253,7 +8483,12 @@ impl ChatRuntimeProjector {
                     }]
                 } else {
                     self.artifacts.process(&text)
-                }
+                };
+                events.push(ChatEvent::SessionStatus {
+                    session_id: permission_session_id.to_string(),
+                    status: "running".to_string(),
+                });
+                events
             }
             CodingRuntimeEvent::CompactionFinished {
                 completion:
@@ -8261,19 +8496,47 @@ impl ChatRuntimeProjector {
                         trigger: jeikcode_kernel::message::CompactTrigger::Manual { .. },
                         ..
                     },
-            } => vec![ChatEvent::Warning {
-                message: jeikcode_config::i18n::format_compaction_interrupted(),
-                message_id: self.notice_anchor(),
-            }],
+            } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: permission_session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![
+                    ChatEvent::Warning {
+                        message: jeikcode_config::i18n::format_compaction_interrupted(),
+                        message_id: self.notice_anchor(),
+                    },
+                    ChatEvent::SessionStatus {
+                        session_id: permission_session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                ]
+            }
             CodingRuntimeEvent::CompactionFinished {
                 completion:
                     CompactionCompletion::Failed {
                         trigger: jeikcode_kernel::message::CompactTrigger::Manual { .. },
                         error,
                     },
-            } => vec![ChatEvent::Error {
-                message: format!("compact failed: {error}"),
-            }],
+            } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: permission_session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![
+                    ChatEvent::Error {
+                        message: format!("compact failed: {error}"),
+                    },
+                    ChatEvent::SessionStatus {
+                        session_id: permission_session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                ]
+            }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                 reason, stats, ..
             }) => {
@@ -8327,7 +8590,7 @@ impl ChatRuntimeProjector {
             }
             CodingRuntimeEvent::ControllerWarning(message) => {
                 vec![ChatEvent::Warning {
-                    message,
+                    message: localize_agent_warning(&message),
                     message_id: self.notice_anchor(),
                 }]
             }
@@ -8535,7 +8798,7 @@ impl ChatRuntimeProjector {
                 }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning {
-                message,
+                message: localize_agent_warning(&message),
                 message_id: self.notice_anchor(),
             }],
             Agent::RateLimited {
@@ -8602,6 +8865,10 @@ impl ChatRuntimeProjector {
                         ),
                         message_id: self.notice_anchor(),
                     },
+                    ChatEvent::ContextCompacted {
+                        session_id: session_id.to_string(),
+                        tokens: est_after as u32,
+                    },
                 ]
             }
             Agent::CompactionFailed { error, .. } => {
@@ -8621,6 +8888,22 @@ impl ChatRuntimeProjector {
                         message_id: self.notice_anchor(),
                     },
                 ]
+            }
+            // A no-op / refused compaction still announced `CompactionStarted`; clear
+            // the "compacting" status so the driver does not stay stuck on it.
+            Agent::Compacted {
+                committed: false, ..
+            } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![ChatEvent::SessionStatus {
+                    session_id: session_id.to_string(),
+                    status: "running".to_string(),
+                }]
             }
             Agent::TurnStarted
             | Agent::ToolCallStreaming { .. }

@@ -112,6 +112,23 @@ pub(super) fn ar(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "اضغط على esc للإلغاء".into(),
         Msg::CodeExploreOpeningReminder =>
             "بالإضافة إلى ذلك، يرجى استكشاف قاعدة الكود بدقة قبل الإجابة. استخدم `code_explore` لتسريع استرجاع منطق الكود والحصول سريعًا على نظرة شاملة. عندما لا يكون هناك اعتماد متبادل بين استدعاءات الأدوات، قم بتشغيلها بالتوازي كأولوية. إذا لم تكن تنفذ مهمة استكشاف، يمكنك تجاهل هذه الجملة.".into(),
+        Msg::CompactNothingShort => "(لا شيء لضغطه — المحادثة قصيرة)\n".into(),
+        Msg::CompactStarting => "(جارٍ الضغط بملخص LLM...)\n".into(),
+        Msg::CompactInterrupted => "(تمت مقاطعة الضغط — تغيّر coding runtime أو توقف)\n".into(),
+        Msg::CompactUnavailableDuringSync => "لا يمكن الضغط أثناء المزامنة الحية؛ نفّذ /sync off أولاً".into(),
+        Msg::CompactUnavailableDuringResync => "لا يمكن الضغط حتى يستعيد runtime المحلي آخر محادثة متزامنة".into(),
+        Msg::LocalRuntimeRestorePending => "يقوم runtime المحلي باستعادة المحادثة المتزامنة؛ يُرجى الانتظار".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "انتهت مهلة استعادة runtime المحلي؛ تمت استعادة المزامنة الحية".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("(لا شيء لضغطه — لن يوفّر tokens: {} → {})\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("(تم الضغط — حُذفت {} رسائل، {} → {} tokens)\n", messages, before, after).into(),
+        Msg::Compacting => "جارٍ الضغط…".into(),
+        Msg::CompactingSlow => "جارٍ الضغط… (بطيء)".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("تم الضغط · تم تلخيص {} رسالة · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("تم طيّ مخرجات الأداة · توفير ~{} tok", saved).into(),
         _ => super::en::en(msg),
     }
 }

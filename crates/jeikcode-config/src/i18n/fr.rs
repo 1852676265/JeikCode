@@ -112,6 +112,23 @@ pub(super) fn fr(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StreamStalled => "appuyez sur esc pour annuler".into(),
         Msg::CodeExploreOpeningReminder =>
             "De plus, explorez attentivement la base de code avant de répondre. Utilisez `code_explore` pour accélérer la recherche de la logique du code et obtenir rapidement une vue d'ensemble. En l'absence de dépendance entre les appels d'outils, lancez-les en parallèle en priorité. Si vous n'exécutez pas de tâche d'exploration, ignorez cette phrase.".into(),
+        Msg::CompactNothingShort => "(rien à compacter — la conversation est courte)\n".into(),
+        Msg::CompactStarting => "(compactage par résumé LLM...)\n".into(),
+        Msg::CompactInterrupted => "(compactage interrompu — le coding runtime a changé ou s'est arrêté)\n".into(),
+        Msg::CompactUnavailableDuringSync => "Impossible de compacter pendant la synchronisation live ; lancez d'abord /sync off".into(),
+        Msg::CompactUnavailableDuringResync => "Impossible de compacter tant que le runtime local n'a pas restauré la dernière conversation synchronisée".into(),
+        Msg::LocalRuntimeRestorePending => "Le runtime local restaure la conversation synchronisée ; veuillez patienter".into(),
+        Msg::LocalRuntimeRestoreTimedOut => "La restauration du runtime local a expiré ; la synchronisation Live est rétablie".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("(rien à compacter — aucune économie de tokens : {} → {})\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("(compacté — {} messages supprimés, {} → {} tokens)\n", messages, before, after).into(),
+        Msg::Compacting => "Compactage…".into(),
+        Msg::CompactingSlow => "Compactage… (lent)".into(),
+        Msg::CompactMarkDrain { messages, before, after } =>
+            format!("Compacté · {} message(s) résumé(s) · ~{}→~{} tok", messages, before, after).into(),
+        Msg::CompactMarkStub { saved } =>
+            format!("Sortie d'outil repliée · ~{} tok économisés", saved).into(),
         _ => super::en::en(msg),
     }
 }
