@@ -10,7 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::{get_all_bindings, get_platform_adapter, GitSyncMode, NormalizedGitEvent};
+use super::{
+    ensure_fresh_github_app_token, get_all_bindings, get_platform_adapter, GitSyncMode,
+    NormalizedGitEvent,
+};
 use crate::api_git_webhook::execute_git_workflow;
 use crate::AppState;
 
@@ -324,7 +327,7 @@ pub async fn poll_cycle_tick(state: &AppState) {
     let bindings = get_all_bindings();
     let now = current_epoch_secs();
 
-    for config in bindings {
+    for mut config in bindings {
         // 仅处理配置为主动轮询模式且已启用的绑定，且必须为合法的 GitHub App 模式
         if !config.enabled
             || config.sync_mode != GitSyncMode::Polling
@@ -332,6 +335,10 @@ pub async fn poll_cycle_tick(state: &AppState) {
         {
             continue;
         }
+
+        // 确保 GitHub App 安装令牌新鲜有效：纯轮询（NAT / 无 Webhook 穿透）场景下安装令牌约 1 小时过期，
+        // 若不主动换发，长跑守护进程会在过期后持续 401 直至重启。令牌仍在有效期时该调用为纯内存判断。
+        config.access_token = ensure_fresh_github_app_token(&config).await;
 
         let repo = config.repo_identifier.trim();
         if repo.is_empty() {

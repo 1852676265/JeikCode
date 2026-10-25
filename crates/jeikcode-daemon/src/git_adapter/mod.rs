@@ -637,6 +637,87 @@ pub fn is_any_git_automation_active() -> bool {
     lock.values().any(|c| c.enabled && c.is_github_app_mode())
 }
 
+/// 解析 GitHub App 私钥内容：优先使用内联私钥，其次退回从私钥文件路径读取。
+fn resolve_github_app_pem(config: &GitAdapterConfig) -> Option<String> {
+    if let Some(content) = config
+        .github_app_private_key
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(content.to_string());
+    }
+    config
+        .github_app_private_key_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|path| std::fs::read_to_string(path.trim()).ok())
+}
+
+/// 确保 GitHub App 安装令牌新鲜有效，返回可直接用于 API 调用的令牌。
+///
+/// - 非 `github` 渠道、缺少 App 凭据、或已持有 5 分钟内不过期的令牌时，原样返回现有令牌；
+/// - 令牌缺失或临近过期时，使用 App 凭据换取新令牌，并同步持久化到绑定存储，
+///   供后续轮询 / Webhook 请求及进程重启后直接复用。
+///
+/// 纯轮询（NAT / 无 Webhook 穿透）场景下安装令牌约 1 小时过期，若无人主动换发，
+/// 长跑守护进程会在过期后持续 401 直至重启。该函数保证后台轮询始终携带有效令牌。
+pub async fn ensure_fresh_github_app_token(config: &GitAdapterConfig) -> String {
+    let existing = config.access_token.trim().to_string();
+
+    // 仅 GitHub 渠道支持 App 安装令牌轮换
+    if config.channel.to_lowercase().trim() != "github" {
+        return existing;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // 令牌距过期仍超过 5 分钟，直接复用（纯内存判断，零网络 / 磁盘开销）
+    if !existing.is_empty() && config.token_expires_at.is_some_and(|exp| now + 300 < exp) {
+        return existing;
+    }
+
+    let Some(app_id) = config
+        .github_app_id
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    else {
+        return existing;
+    };
+    let Some(pem) = resolve_github_app_pem(config) else {
+        return existing;
+    };
+
+    match github_app::fetch_installation_token(app_id, &pem, &config.repo_identifier).await {
+        Ok((fresh_token, _)) => {
+            // 同步持久化新令牌与过期时间，避免每个请求重复换签
+            if let Some(mut binding) = get_binding_by_project(&config.project_hash) {
+                binding.access_token = fresh_token.clone();
+                binding.token_expires_at = Some(now + 3300);
+                binding.github_app_id = Some(app_id.to_string());
+                if let Some(path) = config
+                    .github_app_private_key_path
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    binding.github_app_private_key_path = Some(path.to_string());
+                }
+                save_binding(binding);
+            }
+            fresh_token
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[git_adapter] GitHub App installation token refresh failed for `{}`: {e}",
+                config.project_hash
+            );
+            existing
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,5 +954,28 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].issue_or_pr_number, Some(123));
         assert_eq!(events[0].head_sha.as_deref(), Some("sha-canonical"));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_fresh_github_app_token_short_circuits_without_network() {
+        // 非 github 渠道：原样返回现有令牌
+        let mut cfg: GitAdapterConfig =
+            serde_json::from_str(r#"{"channel":"gitlab","accessToken":"pat-token"}"#).unwrap();
+        assert_eq!(ensure_fresh_github_app_token(&cfg).await, "pat-token");
+
+        // github 渠道但令牌仍在有效期：原样返回，不发起网络请求
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cfg.channel = "github".to_string();
+        cfg.access_token = "gh-token".to_string();
+        cfg.token_expires_at = Some(now + 3600);
+        assert_eq!(ensure_fresh_github_app_token(&cfg).await, "gh-token");
+
+        // github 渠道 + 令牌缺失且无 App 凭据：退化为现有（空）令牌，不 panic/不阻塞
+        cfg.access_token = "".to_string();
+        cfg.token_expires_at = Some(0);
+        assert_eq!(ensure_fresh_github_app_token(&cfg).await, "");
     }
 }

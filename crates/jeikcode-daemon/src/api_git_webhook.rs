@@ -62,64 +62,9 @@ pub async fn test_git_binding_api(Json(mut config): Json<GitAdapterConfig>) -> i
         Some(config.custom_api_base.as_str())
     };
 
-    // 如果配置了 GitHub App 认证凭据，由纯 Rust 原生在内存中自动签发或轮换最新的官方 [bot] 令牌！
-    if config.channel == "github" {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let token_still_valid = config
-            .token_expires_at
-            .is_some_and(|exp| now + 300 < exp && !config.access_token.trim().is_empty());
-
-        if !token_still_valid {
-            if let Some(app_id_str) = config.github_app_id.as_deref() {
-                if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
-                    let pem_res = if let Some(content) = config
-                        .github_app_private_key
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        Some(content.to_string())
-                    } else if let Some(path) = config
-                        .github_app_private_key_path
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        std::fs::read_to_string(path.trim()).ok()
-                    } else {
-                        None
-                    };
-
-                    if let Some(pem) = pem_res {
-                        if let Ok((fresh_token, _)) =
-                            crate::git_adapter::github_app::fetch_installation_token(
-                                app_id,
-                                &pem,
-                                &config.repo_identifier,
-                            )
-                            .await
-                        {
-                            config.access_token = fresh_token.clone();
-                            config.token_expires_at = Some(now + 3300);
-                            // 顺带同步持久化，确保后续请求直接复用有效令牌
-                            if let Some(mut existing) =
-                                crate::git_adapter::get_binding_by_project(&config.project_hash)
-                            {
-                                existing.access_token = fresh_token;
-                                existing.token_expires_at = Some(now + 3300);
-                                existing.github_app_id = Some(app_id.to_string());
-                                if let Some(p) = &config.github_app_private_key_path {
-                                    existing.github_app_private_key_path = Some(p.clone());
-                                }
-                                crate::git_adapter::save_binding(existing);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 如果配置了 GitHub App 认证凭据，由纯 Rust 原生自动签发或轮换最新的官方 [bot] 令牌！
+    let fresh_token = crate::git_adapter::ensure_fresh_github_app_token(&config).await;
+    config.access_token = fresh_token;
 
     let adapter = get_platform_adapter(&config.channel);
     match adapter
@@ -416,58 +361,8 @@ pub(crate) async fn execute_git_workflow(
     };
 
     let repo = &event.repo_full_name;
-    let mut token = config.access_token.trim().to_string();
-
-    // 如果是 GitHub 渠道，并且配置了 GitHub App 凭据，由纯 Rust 原生在内存中自动确保令牌为最新鲜有效状态！
-    if config.channel == "github" {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let token_still_valid = config
-            .token_expires_at
-            .is_some_and(|exp| now + 300 < exp && !token.trim().is_empty());
-
-        if !token_still_valid {
-            if let Some(app_id_str) = config.github_app_id.as_deref() {
-                if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
-                    let pem_res = if let Some(content) = config
-                        .github_app_private_key
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        Some(content.to_string())
-                    } else if let Some(path) = config
-                        .github_app_private_key_path
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        std::fs::read_to_string(path.trim()).ok()
-                    } else {
-                        None
-                    };
-
-                    if let Some(pem) = pem_res {
-                        if let Ok((fresh_token, _)) =
-                            crate::git_adapter::github_app::fetch_installation_token(
-                                app_id, &pem, repo,
-                            )
-                            .await
-                        {
-                            token = fresh_token.clone();
-                            if let Some(mut existing) =
-                                crate::git_adapter::get_binding_by_project(&config.project_hash)
-                            {
-                                existing.access_token = fresh_token;
-                                existing.token_expires_at = Some(now + 3300);
-                                crate::git_adapter::save_binding(existing);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 如果是 GitHub 渠道且配置了 GitHub App 凭据，由纯 Rust 原生自动确保令牌为最新鲜有效状态！
+    let token = crate::git_adapter::ensure_fresh_github_app_token(&config).await;
 
     let session_id = format!("git_pr_{}_{}", config.project_hash, pr_or_issue_number);
     let pr_url = event.resolve_html_url();
