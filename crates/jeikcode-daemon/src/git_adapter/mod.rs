@@ -411,28 +411,34 @@ pub trait GitPlatformAdapter: Send + Sync {
         repo: &str,
     ) -> Result<String, String>;
 
-    /// 查询活跃的 Pull Request / Merge Request 列表（轮询同步模式专用）
+    /// 查询活跃的 Pull Request / Merge Request 列表（轮询同步模式专用，基础实现）。
+    /// 若平台适配器未专门实现带有 ETag 的条件查询，重写此方法即可支持主动轮询。
     async fn fetch_active_pull_requests(
-        &self,
-        token: &str,
-        api_base: Option<&str>,
-        repo: &str,
-    ) -> Result<Vec<NormalizedGitEvent>, String> {
-        let out = self
-            .fetch_active_pull_requests_with_etag(token, api_base, repo, None)
-            .await?;
-        Ok(out.events)
-    }
-
-    /// 查询活跃的 Pull Request / Merge Request 列表，支持携带 If-None-Match 条件标头
-    async fn fetch_active_pull_requests_with_etag(
         &self,
         _token: &str,
         _api_base: Option<&str>,
         _repo: &str,
+    ) -> Result<Vec<NormalizedGitEvent>, String> {
+        Ok(vec![])
+    }
+
+    /// 查询活跃的 Pull Request / Merge Request 列表，支持携带 If-None-Match 条件标头。
+    /// 默认实现回退委托至 `fetch_active_pull_requests`，返回无 ETag、无 304 缓存标记的全量结果。
+    async fn fetch_active_pull_requests_with_etag(
+        &self,
+        token: &str,
+        api_base: Option<&str>,
+        repo: &str,
         _etag: Option<&str>,
     ) -> Result<PollPullRequestsOutput, String> {
-        Ok(PollPullRequestsOutput::default())
+        let events = self
+            .fetch_active_pull_requests(token, api_base, repo)
+            .await?;
+        Ok(PollPullRequestsOutput {
+            events,
+            etag: None,
+            not_modified: false,
+        })
     }
 }
 
@@ -770,5 +776,104 @@ mod tests {
             "any comment",
             "   ,  ， | ｜ "
         ));
+    }
+
+    struct LegacyMockAdapter;
+
+    #[async_trait::async_trait]
+    impl GitPlatformAdapter for LegacyMockAdapter {
+        fn platform_id(&self) -> &'static str {
+            "legacy_mock"
+        }
+        fn verify_signature(
+            &self,
+            _secret: &str,
+            _headers: &HeaderMap,
+            _body_bytes: &[u8],
+        ) -> bool {
+            true
+        }
+        fn parse_event(
+            &self,
+            _headers: &HeaderMap,
+            _payload: serde_json::Value,
+        ) -> Result<Option<NormalizedGitEvent>, String> {
+            Ok(None)
+        }
+        async fn post_comment(
+            &self,
+            _token: &str,
+            _api_base: Option<&str>,
+            _repo: &str,
+            _number: u64,
+            _body: &str,
+        ) -> Result<u64, String> {
+            Ok(1)
+        }
+        async fn update_comment(
+            &self,
+            _token: &str,
+            _api_base: Option<&str>,
+            _repo: &str,
+            _comment_id: u64,
+            _target_number: Option<u64>,
+            _body: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn find_bot_primary_comment(
+            &self,
+            _token: &str,
+            _api_base: Option<&str>,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
+        async fn test_connection(
+            &self,
+            _token: &str,
+            _api_base: Option<&str>,
+            _repo: &str,
+        ) -> Result<String, String> {
+            Ok("ok".to_string())
+        }
+        async fn fetch_active_pull_requests(
+            &self,
+            _token: &str,
+            _api_base: Option<&str>,
+            _repo: &str,
+        ) -> Result<Vec<NormalizedGitEvent>, String> {
+            Ok(vec![NormalizedGitEvent {
+                platform: "legacy_mock".to_string(),
+                event_kind: GitEventKind::PullRequestOpened,
+                repo_full_name: "test/legacy".to_string(),
+                is_pull_request: true,
+                issue_or_pr_number: Some(123),
+                sender: GitUserMeta::default(),
+                commit_author: None,
+                title: Some("Legacy PR".to_string()),
+                body_text: None,
+                comment_id: None,
+                head_sha: Some("sha-legacy".to_string()),
+                base_branch: None,
+                head_branch: None,
+                html_url: None,
+                raw_payload: serde_json::Value::Null,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_active_pull_requests_with_etag_delegates_to_legacy_method() {
+        let adapter = LegacyMockAdapter;
+        let output = adapter
+            .fetch_active_pull_requests_with_etag("token", None, "test/legacy", Some("stale-etag"))
+            .await
+            .expect("fetch success");
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].issue_or_pr_number, Some(123));
+        assert_eq!(output.etag, None);
+        assert!(!output.not_modified);
     }
 }

@@ -369,8 +369,6 @@ impl GitPlatformAdapter for GiteeAdapter {
             .unwrap_or(DEFAULT_GITEE_API_BASE)
             .trim_end_matches('/');
         let (owner, r) = split_repo_owner(repo);
-        let url = format!("{base}/repos/{owner}/{r}/pulls/{number}/comments?per_page=100&page=1");
-
         let client = reqwest::Client::new();
         let pr_url =
             format!("{base}/repos/{owner}/{r}/pulls/{number}/comments?per_page=100&page=1");
