@@ -859,6 +859,7 @@ export interface SessionMeta {
   updated_at: number;
   message_count: number;
   file_size?: number;
+  approval_mode?: ApprovalMode | null;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -933,6 +934,8 @@ export interface SessionDetail {
   messages: SessionMessage[];
   /** Per-session model selection. Absent on older sessions. */
   preferred_model?: string | null;
+  /** Per-session approval mode ("build" | "accept_edits" | "bypass" | "plan"). Absent on older sessions. */
+  approval_mode?: ApprovalMode | null;
   /** Last-request occupancy for the footer (persists across restart). Not turn-cumulative billing. */
   token_usage?: SessionTokenUsage | null;
   /** `manual` / `scheduled` / `protocol`. Protocol sessions are observed in Auto. */
@@ -2030,7 +2033,9 @@ export type GlobalWireEvent =
   /** Git 仓库变更（discard / stage / commit / pull / fetch 等），跨实例全量广播 */
   | { type: 'git_updated'; cwd: string; fetch?: boolean }
   /** 终端会话变更（创建 / 关闭 / 清空），跨实例项目级全量广播 */
-  | { type: 'terminal_updated'; cwd: string };
+  | { type: 'terminal_updated'; cwd: string }
+  /** 会话审批模式变更（跨实例全局广播） */
+  | { type: 'session_mode'; session_id?: string | null; mode: ApprovalMode };
 
 /** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
 export async function streamGlobalEvents(
@@ -2247,11 +2252,15 @@ function getModeBroadcastChannel(): BroadcastChannel | null {
   return modeBroadcastChannel;
 }
 
-export function broadcastApprovalMode(mode: ApprovalMode): void {
+export function broadcastApprovalMode(mode: ApprovalMode, sessionId?: string | null): void {
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('jeikcode:approval_mode_changed', { detail: mode }));
+    window.dispatchEvent(
+      new CustomEvent('jeikcode:approval_mode_changed', {
+        detail: { mode, session_id: sessionId ?? undefined },
+      }),
+    );
     try {
-      getModeBroadcastChannel()?.postMessage({ type: 'mode', mode });
+      getModeBroadcastChannel()?.postMessage({ type: 'mode', mode, session_id: sessionId ?? undefined });
     } catch {
       // ignore
     }
@@ -2261,21 +2270,24 @@ export function broadcastApprovalMode(mode: ApprovalMode): void {
 /** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
  *  session state — the next turn's PermissionDecider follows it; broadcast to
  *  other tabs. */
-export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
+export async function postLiveMode(mode: ApprovalMode, sessionId?: string | null): Promise<ApprovalMode> {
   const resp = await apiFetch('/approval_mode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, session_id: sessionId || undefined }),
   });
   if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
   if (!body.ok) throw new Error('live runtime rejected the mode switch');
-  broadcastApprovalMode(body.mode);
+  broadcastApprovalMode(body.mode, sessionId);
   return body.mode;
 }
 
-export async function getApprovalMode(): Promise<ApprovalMode> {
-  const resp = await apiFetch('/approval_mode', { headers: authHeaders() });
+export async function getApprovalMode(sessionId?: string | null): Promise<ApprovalMode> {
+  const url = sessionId
+    ? `/approval_mode?session_id=${encodeURIComponent(sessionId)}`
+    : '/approval_mode';
+  const resp = await apiFetch(url, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`get mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
   return body.mode;

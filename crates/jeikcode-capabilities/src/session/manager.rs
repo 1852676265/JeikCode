@@ -442,6 +442,9 @@ pub struct SessionMeta {
     /// different models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    /// Mode last chosen for this session (e.g. "build", "accept_edits", "bypass", "plan").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 impl SessionMeta {
@@ -468,6 +471,7 @@ impl SessionMeta {
             detached_unattributed_tokens: 0,
             origin: SessionOrigin::Manual,
             preferred_model: None,
+            approval_mode: None,
         }
     }
 

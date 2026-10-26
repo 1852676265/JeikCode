@@ -543,6 +543,7 @@ fn convert_legacy_session_with_diagnostic(
         detached_unattributed_tokens: 0,
         origin: SessionOrigin::Manual,
         preferred_model: None,
+        approval_mode: None,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 

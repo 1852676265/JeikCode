@@ -41,6 +41,15 @@ export function emitGlobalEvent(event: GlobalWireEvent): void {
       window.dispatchEvent(new CustomEvent('jeikcode:terminal:remote_updated', { detail: { cwd: event.cwd } }));
     } catch {}
   }
+  if (event.type === 'session_mode') {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('jeikcode:session_mode_changed', {
+          detail: { session_id: event.session_id, mode: event.mode },
+        }),
+      );
+    } catch {}
+  }
   for (const listener of [...listeners]) {
     try {
       listener(event);

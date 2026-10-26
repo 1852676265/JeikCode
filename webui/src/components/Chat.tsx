@@ -4047,14 +4047,15 @@ export function Chat({
           }
           const origin = sessionResult.value.origin;
           protocolSessionRef.current = origin === 'protocol';
+          const sessionMode = sessionResult.value.approval_mode;
           if (!modeState.pendingMode) {
-            setModeState(
-              initModeState(
-                origin === 'protocol'
-                  ? modeForSessionOrigin(origin)
-                  : nativeModeRef.current,
-              ),
-            );
+            const targetMode = sessionMode
+              ? sessionMode
+              : origin === 'protocol'
+              ? modeForSessionOrigin(origin)
+              : nativeModeRef.current;
+            nativeModeRef.current = targetMode;
+            setModeState(initModeState(targetMode));
           }
         } else if (!isLiveSession) {
           // Draft / brand-new empty sessions 404 on disk until first persist —
@@ -4064,7 +4065,16 @@ export function Chat({
           loadedForRef.current = isEmptyNew ? loadId : null;
           if (isEmptyNew) {
             protocolSessionRef.current = false;
-            setModeState(initModeState(nativeModeRef.current));
+            getApprovalMode(loadId)
+              .then((current) => {
+                if (activeIdRef.current === loadId) {
+                  nativeModeRef.current = current;
+                  setModeState(initModeState(current));
+                }
+              })
+              .catch(() => {
+                setModeState(initModeState(nativeModeRef.current));
+              });
           }
           if (!isEmptyNew) {
             nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
@@ -4292,11 +4302,24 @@ export function Chat({
     };
 
     const handleCustomEvent = (e: Event) => {
-      const mode = (e as CustomEvent<ApprovalMode>).detail;
-      if (mode) applyIncomingMode(mode);
+      const detail = (e as CustomEvent<ApprovalMode | { mode: ApprovalMode; session_id?: string }>).detail;
+      const mode = typeof detail === 'string' ? detail : detail?.mode;
+      const targetSessionId = typeof detail === 'object' ? detail?.session_id : undefined;
+      if (!targetSessionId || targetSessionId === activeIdRef.current) {
+        if (mode) applyIncomingMode(mode);
+      }
+    };
+
+    const handleRemoteSessionMode = (e: Event) => {
+      const detail = (e as CustomEvent<{ session_id?: string | null; mode: ApprovalMode }>).detail;
+      if (!detail || !detail.mode) return;
+      if (!detail.session_id || detail.session_id === activeIdRef.current) {
+        applyIncomingMode(detail.mode);
+      }
     };
 
     window.addEventListener('jeikcode:approval_mode_changed', handleCustomEvent);
+    window.addEventListener('jeikcode:session_mode_changed', handleRemoteSessionMode);
 
     let bc: BroadcastChannel | null = null;
     try {
@@ -4304,7 +4327,9 @@ export function Chat({
         bc = new BroadcastChannel('jeikcode_approval_mode');
         bc.onmessage = (ev) => {
           if (ev.data?.type === 'mode' && ev.data.mode) {
-            applyIncomingMode(ev.data.mode);
+            if (!ev.data.session_id || ev.data.session_id === activeIdRef.current) {
+              applyIncomingMode(ev.data.mode);
+            }
           }
         };
       }
@@ -4323,7 +4348,7 @@ export function Chat({
         Date.now() - pageHiddenSinceRef.current >= WATCH_REATTACH_AFTER_HIDDEN_MS;
       pageHiddenSinceRef.current = null;
       {
-        getApprovalMode()
+        getApprovalMode(activeIdRef.current ?? undefined)
           .then((current) => {
             if (!cancelled) applyIncomingMode(current);
           })
@@ -4370,6 +4395,7 @@ export function Chat({
     return () => {
       cancelled = true;
       window.removeEventListener('jeikcode:approval_mode_changed', handleCustomEvent);
+      window.removeEventListener('jeikcode:session_mode_changed', handleRemoteSessionMode);
       window.removeEventListener('focus', refreshOnFocus);
       document.removeEventListener('visibilitychange', refreshOnFocus);
       try {
@@ -5809,7 +5835,7 @@ export function Chat({
       setLivePending(null);
       onPermissionResolved?.(null);
     }
-    void postLiveMode(m)
+    void postLiveMode(m, sessionId)
       .then((confirmed) => {
         setModeState((cur) => completeModeSwitch(cur, confirmed));
         onConfirmed?.(confirmed);

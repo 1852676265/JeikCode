@@ -1158,6 +1158,7 @@ mod global_events_tests {
                 updated_at: 2,
                 message_count: 3,
                 origin: "manual".into(),
+                approval_mode: None,
             },
         })
         .unwrap();
@@ -1206,6 +1207,15 @@ mod global_events_tests {
         assert_eq!(resolved["type"], "review_resolved");
         assert_eq!(resolved["approval_id"], "a1");
         assert!(resolved.get("request_id").is_none());
+
+        let mode_event = serde_json::to_value(GlobalWireEvent::SessionMode {
+            session_id: Some("s1".into()),
+            mode: "bypass".into(),
+        })
+        .unwrap();
+        assert_eq!(mode_event["type"], "session_mode");
+        assert_eq!(mode_event["session_id"], "s1");
+        assert_eq!(mode_event["mode"], "bypass");
     }
 
     #[tokio::test]
@@ -1348,6 +1358,9 @@ pub struct SessionDetail {
     /// Per-session model selection. Absent on older sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    /// Per-session approval mode ("build" | "accept_edits" | "bypass" | "plan"). Absent on older sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
     /// Footer occupancy from the last completed turn (`used_tokens` / last request).
     /// Must not be turn-cumulative `model_usage` billing, or restart paints over-budget.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2720,6 +2733,13 @@ pub(crate) enum GlobalWireEvent {
     /// 终端会话状态变更（创建 / 关闭 / 清空），项目级跨设备全局广播
     #[serde(rename = "terminal_updated")]
     TerminalUpdated { cwd: String },
+    /// 会话审批模式变更（跨实例全局广播）
+    #[serde(rename = "session_mode")]
+    SessionMode {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        mode: String,
+    },
 }
 
 /// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
@@ -2734,6 +2754,8 @@ pub(crate) struct SessionRowWire {
     pub updated_at: u64,
     pub message_count: u32,
     pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 /// Build the incremental session row for one stored session. `None` when the
@@ -2758,6 +2780,13 @@ pub(crate) fn session_row_wire(
         updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
         message_count: meta.message_count,
         origin: origin.to_string(),
+        approval_mode: meta.approval_mode.clone().or_else(|| {
+            Some(
+                live_api::live_session_approval_mode(Some(session_id))
+                    .wire()
+                    .to_string(),
+            )
+        }),
     })
 }
 
@@ -2784,6 +2813,13 @@ pub(crate) fn session_row_wire_in_bucket(
         updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
         message_count: meta.message_count,
         origin: origin.to_string(),
+        approval_mode: meta.approval_mode.clone().or_else(|| {
+            Some(
+                live_api::live_session_approval_mode(Some(session_id))
+                    .wire()
+                    .to_string(),
+            )
+        }),
     })
 }
 
@@ -5243,6 +5279,13 @@ async fn get_session_detail(
                 turns,
                 messages,
                 preferred_model: session.meta.preferred_model.clone(),
+                approval_mode: session.meta.approval_mode.clone().or_else(|| {
+                    Some(
+                        live_api::live_session_approval_mode(Some(&id))
+                            .wire()
+                            .to_string(),
+                    )
+                }),
                 token_usage,
                 origin: session.meta.origin,
                 todos,
@@ -5265,6 +5308,11 @@ async fn get_session_detail(
                 turns: Vec::new(),
                 messages: Vec::new(),
                 preferred_model: None,
+                approval_mode: Some(
+                    live_api::live_session_approval_mode(Some(&id))
+                        .wire()
+                        .to_string(),
+                ),
                 token_usage: None,
                 origin: jeikcode_capabilities::session::SessionOrigin::Manual,
                 todos: Vec::new(),
@@ -10839,6 +10887,11 @@ fn publish_chat_session_assignment(
             now,
         );
         meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        meta.approval_mode = Some(
+            live_api::live_session_approval_mode(Some(session_id))
+                .wire()
+                .to_string(),
+        );
         meta.message_count = 1;
         if let Some(title) = session_title.map(str::trim).filter(|t| !t.is_empty()) {
             meta.name = title.to_string();

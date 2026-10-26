@@ -95,12 +95,39 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 /// 读取指定 session 的审批模式；若未单独指定则回退到全局默认模式。
 pub(crate) fn live_session_approval_mode(session_id: Option<&str>) -> ApprovalMode {
     if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+        let sid = sid.trim();
         let guard = SESSION_APPROVAL_MODES
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(map) = guard.as_ref() {
-            if let Some(mode) = map.get(sid.trim()) {
+            if let Some(mode) = map.get(sid) {
                 return *mode;
+            }
+        }
+        drop(guard);
+        // 若内存未命中，从磁盘会话元数据（SessionMeta）中读取持久化的模式
+        if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
+            let manager = jeikcode_capabilities::session::SessionManager::for_project(
+                &resolved.meta.working_dir,
+            );
+            if let Ok(meta) = manager.read_meta(sid) {
+                if let Some(mode_str) = meta.approval_mode.as_deref() {
+                    let parsed = match mode_str.trim().to_ascii_lowercase().as_str() {
+                        "build" => Some(ApprovalMode::Build),
+                        "accept_edits" => Some(ApprovalMode::AcceptEdits),
+                        "bypass" | "auto" => Some(ApprovalMode::Auto),
+                        "plan" => Some(ApprovalMode::Plan),
+                        _ => None,
+                    };
+                    if let Some(mode) = parsed {
+                        let mut guard = SESSION_APPROVAL_MODES
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let map = guard.get_or_insert_with(HashMap::new);
+                        map.insert(sid.to_string(), mode);
+                        return mode;
+                    }
+                }
             }
         }
     }
@@ -440,9 +467,21 @@ pub fn live_set_mode(mode: ApprovalMode) {
     live_set_mode_for_session(None, mode);
 }
 
-/// 设置 live 视图审批模式（可指定 session_id）；若命中活跃 binding 则下发 `SetMode`。
+/// 设置 live 视图审批模式（可指定 session_id）；若命中活跃 binding 则下发 `SetMode`，
+/// 同时持久化至会话元数据并通过全局事件总线广播给所有异地客户端。
 pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
     live_set_session_approval_mode(session_id, mode);
+    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+        let sid = sid.trim();
+        if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
+            let _ = jeikcode_capabilities::session::SessionManager::for_project(
+                &resolved.meta.working_dir,
+            )
+            .update_meta(sid, |meta| {
+                meta.approval_mode = Some(mode.wire().to_string());
+            });
+        }
+    }
     if let Ok(binding) = crate::native_live::binding() {
         let affects_binding = match session_id {
             Some(sid) => binding.session_id == sid,
@@ -457,6 +496,10 @@ pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
             );
         }
     }
+    crate::publish_global(crate::GlobalWireEvent::SessionMode {
+        session_id: session_id.map(str::to_string),
+        mode: mode.wire().to_string(),
+    });
 }
 
 #[cfg(test)]
@@ -3367,6 +3410,11 @@ async fn apply_live_mode_scoped(session_id: Option<&str>, mode: ApprovalMode) ->
             let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
         }
     }
+    if let Some(sid) = session_id {
+        if let Some(handle) = crate::native_live::existing_runner_handle(sid) {
+            let _ = handle.set_mode(native_runtime_mode(mode)).await;
+        }
+    }
     true
 }
 
@@ -4235,6 +4283,29 @@ mod tests {
             val_cleared,
             serde_json::json!({ "ok": true, "mode": "build" })
         );
+    }
+
+    #[tokio::test]
+    async fn approval_mode_broadcasts_to_global_bus() {
+        let _mode_guard = ScopedApprovalModeForTest::new();
+        let mut global_rx = crate::global_events().subscribe();
+
+        // 切换 session 专属模式
+        live_set_mode_for_session(Some("session-sync-test"), ApprovalMode::Auto);
+
+        // 验证广播事件
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), global_rx.recv())
+            .await
+            .expect("receive global event in time")
+            .expect("valid event");
+
+        match event {
+            crate::GlobalWireEvent::SessionMode { session_id, mode } => {
+                assert_eq!(session_id, Some("session-sync-test".to_string()));
+                assert_eq!(mode, "bypass");
+            }
+            other => panic!("expected SessionMode event, got: {other:?}"),
+        }
     }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
