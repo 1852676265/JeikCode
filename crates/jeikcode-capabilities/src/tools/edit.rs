@@ -2103,19 +2103,12 @@ fn best_window_by_line_similarity(
 
 const EDIT_DIFF_PROTOCOL_LEGEND: &str = "\
 Below is the discrepancy between your old_string and the actual file content:\n\
-Lines with '-' are the mismatched or erroneous line(s) in your old_string.\n\
-Lines with '+' are the actual, authoritative content in the file.\n\
-'>>> ' indicates the target matching location(s) in the file.\n\
-Lines without '-' or '+' are surrounding context for reference only.\n\
-Adjust your old_string based on the comparison below to achieve an exact match.\n\n";
+Lines with '-' come from your old_string; the number is the physical file line it conflicts with (-- = no corresponding file line at this position).\n\
+Lines with '+' are actual file content; the number is the physical file line.\n\
+Lines without '-' or '+' are surrounding file context for reference only.\n\n";
 
-#[derive(Debug)]
-struct ExactDiscrepancy {
-    line_no: usize,
-    expected: String,
-    actual: String,
-    hint: String,
-}
+const MISMATCH_ACTION_HINT: &str =
+    "👉 Conflict found — adjust your old_string to match the actual file content above.";
 
 fn format_cascade_conflict_diagnostic(
     cause_orig_idx: usize,
@@ -2158,6 +2151,157 @@ fn format_cascade_conflict_diagnostic(
     )
 }
 
+/// Most similar real file line inside the hunk. Pairing by index alone loses
+/// reordered/shifted lines; `预设` should point at `预估`, not at whichever
+/// unrelated line happens to occupy the same slot.
+fn closest_file_line(
+    expect: &str,
+    file_lines: &[&str],
+    search_start: usize,
+    search_end: usize,
+) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for idx in search_start..search_end.min(file_lines.len()) {
+        let candidate = file_lines[idx];
+        let sim = line_similarity(expect, candidate);
+        if best.map_or(true, |(_, score)| sim > score) {
+            best = Some((idx, sim));
+        }
+    }
+    best.filter(|(_, sim)| *sim >= 0.60)
+}
+
+/// Render one hunk. `-`/`+` numbers are physical file lines: paired Replace
+/// lines share the number, and old lines with no counterpart use `--`.
+fn render_hunk(
+    ops: &[similar::DiffOp],
+    old_lines: &[&str],
+    file_lines: &[&str],
+    win_start: usize,
+    win_end: usize,
+    hunk_start: usize,
+    hunk_end: usize,
+    first_equal: Option<usize>,
+    last_equal: Option<usize>,
+) -> Vec<String> {
+    const MAX_HUNK_LINES: usize = 60;
+
+    let file_no = |new_index: usize| win_start + new_index + 1;
+    let search_start = hunk_start.saturating_sub(win_start + 1);
+    let search_end = hunk_end.saturating_sub(win_start);
+    let mut out = Vec::new();
+    let mut omitted = 0usize;
+    let mut push = |line: String| {
+        if out.len() < MAX_HUNK_LINES {
+            out.push(line);
+        } else {
+            omitted += 1;
+        }
+    };
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        match *op {
+            similar::DiffOp::Equal { new_index, len, .. } => {
+                for k in 0..len {
+                    let no = file_no(new_index + k);
+                    if no >= hunk_start && no <= hunk_end {
+                        push(format!("  {:>4} | {}", no, file_lines[new_index + k]));
+                    }
+                }
+            }
+            similar::DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+                ..
+            } => {
+                let at = (win_start + new_index + 1).min(win_end);
+                if at < hunk_start || at > hunk_end {
+                    continue;
+                }
+                for k in 0..old_len {
+                    push(format!("-   -- | {}", old_lines[old_index + k]));
+                }
+            }
+            similar::DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                let span_start = file_no(new_index);
+                let span_end = file_no(new_index + new_len.saturating_sub(1));
+                if span_end < hunk_start || span_start > hunk_end {
+                    continue;
+                }
+                let boundary = match (first_equal, last_equal) {
+                    (Some(f), Some(l)) => op_idx < f || op_idx > l,
+                    _ => false,
+                };
+                for k in 0..new_len {
+                    let no = file_no(new_index + k);
+                    if no < hunk_start || no > hunk_end {
+                        continue;
+                    }
+                    if boundary {
+                        push(format!("  {:>4} | {}", no, file_lines[new_index + k]));
+                    } else {
+                        push(format!("+ {:>4} | {}", no, file_lines[new_index + k]));
+                    }
+                }
+            }
+            similar::DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                let span_start = file_no(new_index);
+                let span_end = file_no(new_index + new_len.saturating_sub(1));
+                if span_end < hunk_start || span_start > hunk_end {
+                    continue;
+                }
+                for k in 0..old_len {
+                    let expect = old_lines[old_index + k];
+                    // Default to the positional pair; only jump to a different
+                    // real file line when it is clearly more similar (e.g.
+                    // '预设' matches '预估' better than its slot's neighbour).
+                    let paired = if k < new_len {
+                        Some((
+                            file_no(new_index + k),
+                            line_similarity(expect, file_lines[new_index + k]),
+                        ))
+                    } else {
+                        None
+                    };
+                    let best = closest_file_line(expect, file_lines, search_start, search_end);
+                    let num = match (paired, best) {
+                        (Some((_, paired_sim)), Some((idx, best_sim)))
+                            if best_sim > paired_sim + 0.15 =>
+                        {
+                            Some(win_start + idx + 1)
+                        }
+                        (Some((paired_no, _)), _) => Some(paired_no),
+                        (None, Some((idx, _))) => Some(win_start + idx + 1),
+                        (None, None) => None,
+                    }
+                    .map(|n| format!("{:>4}", n))
+                    .unwrap_or_else(|| "  --".to_string());
+                    push(format!("- {} | {}", num, expect));
+                }
+                for k in 0..new_len {
+                    push(format!(
+                        "+ {:>4} | {}",
+                        file_no(new_index + k),
+                        file_lines[new_index + k]
+                    ));
+                }
+            }
+        }
+    }
+    if omitted > 0 {
+        out.push(format!("  ... ({} more line(s) omitted)", omitted));
+    }
+    out
+}
+
 fn build_structured_mismatch_diff(
     path: Option<&std::path::Path>,
     file: &NormalizedFile<'_>,
@@ -2166,208 +2310,159 @@ fn build_structured_mismatch_diff(
     end: usize,
     score: f32,
 ) -> String {
-    use similar::{ChangeTag, TextDiff};
+    use similar::{DiffOp, TextDiff};
+
+    const CONTEXT: usize = 3;
+    const HUNK_GAP: usize = CONTEXT * 2;
 
     let target_display = path
         .map(|p| crate::pathnorm::to_display(p))
         .map(|s| format!(" in {s}"))
         .unwrap_or_default();
 
-    let file_core = file.lines[start..end].join("\n");
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    if old_lines.is_empty() {
+        return MISMATCH_GREP_HINT.to_string();
+    }
+
+    // Widen the window: a real conflict may sit outside the token-bag pick
+    // (old_string can stitch together lines from different regions). Use
+    // terminator-free slices for the diff — `diff_lines(old_string, join(...))`
+    // used to invent a Replace on the last line when old_string ended with '\n'.
+    let win_start = start.saturating_sub(CONTEXT);
+    let win_end = end.saturating_add(CONTEXT).min(file.lines.len());
+    if win_start >= win_end {
+        return MISMATCH_GREP_HINT.to_string();
+    }
+    let file_lines: Vec<&str> = file.lines[win_start..win_end].to_vec();
+
     let mut config = TextDiff::configure();
     config.timeout(std::time::Duration::from_millis(200));
-    let diff = config.diff_lines(old_string, &file_core);
+    let diff = config.diff_slices(&old_lines, &file_lines);
+    let ops = diff.ops();
+    let first_equal = ops.iter().position(|op| matches!(op, DiffOp::Equal { .. }));
+    let last_equal = ops
+        .iter()
+        .rposition(|op| matches!(op, DiffOp::Equal { .. }));
+    let file_no = |new_index: usize| win_start + new_index + 1;
+    let insertion_no = |new_index: usize| (win_start + new_index + 1).min(win_end);
 
-    let changes: Vec<_> = diff.iter_all_changes().collect();
-
-    // 1. 第一遍扫描：准确定位第一处失配冲突点所在的真实文件物理行号与差异细节
-    let mut first_conflict_line: Option<usize> = None;
-    let mut discrepancy: Option<ExactDiscrepancy> = None;
-    let mut scan_line = start + 1;
-    let mut scan_idx = 0;
-
-    while scan_idx < changes.len() {
-        let change = &changes[scan_idx];
-        match change.tag() {
-            ChangeTag::Equal => {
-                scan_line += 1;
-                scan_idx += 1;
+    // Collect real (internal) changes. Leading/trailing Inserts are just the
+    // window boundary around old_string, not omissions, so they do not create
+    // their own hunk.
+    let mut changes: Vec<(usize, usize)> = Vec::new();
+    for (op_idx, op) in ops.iter().enumerate() {
+        match *op {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Delete { new_index, .. } => {
+                let at = insertion_no(new_index);
+                changes.push((at, at));
             }
-            ChangeTag::Delete => {
-                if first_conflict_line.is_none() {
-                    first_conflict_line = Some(scan_line);
-                }
-                let exp = change.value().trim_end_matches(['\r', '\n']);
-
-                if scan_idx + 1 < changes.len() && changes[scan_idx + 1].tag() == ChangeTag::Insert
-                {
-                    let act = changes[scan_idx + 1].value().trim_end_matches(['\r', '\n']);
-                    if discrepancy.is_none() {
-                        let hint = if exp.trim() == act.trim() {
-                            "Notice whitespace/indentation mismatch between old_string and actual file".to_string()
-                        } else if exp.starts_with(act) && !act.is_empty() {
-                            let extra = &exp[act.len()..];
-                            format!(
-                                "Notice extra trailing characters in your old_string: {:?}",
-                                extra
-                            )
-                        } else if act.starts_with(exp) && !exp.is_empty() {
-                            let missing = &act[exp.len()..];
-                            format!(
-                                "Notice trailing characters omitted from your old_string (present in actual file): {:?}",
-                                missing
-                            )
-                        } else {
-                            "Notice character mismatch on this line between old_string and actual file".to_string()
-                        };
-
-                        discrepancy = Some(ExactDiscrepancy {
-                            line_no: scan_line,
-                            expected: exp.to_string(),
-                            actual: act.to_string(),
-                            hint,
-                        });
-                    }
-                    scan_line += 1;
-                    scan_idx += 2;
-                } else {
-                    if discrepancy.is_none() {
-                        discrepancy = Some(ExactDiscrepancy {
-                            line_no: scan_line,
-                            expected: exp.to_string(),
-                            actual: String::new(),
-                            hint: format!(
-                                "Notice extra unexpected line in your old_string: {:?}",
-                                exp
-                            ),
-                        });
-                    }
-                    scan_idx += 1;
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                let boundary = match (first_equal, last_equal) {
+                    (Some(f), Some(l)) => op_idx < f || op_idx > l,
+                    _ => false,
+                };
+                if !boundary {
+                    changes.push((
+                        file_no(new_index),
+                        file_no(new_index + new_len.saturating_sub(1)),
+                    ));
                 }
             }
-            ChangeTag::Insert => {
-                if first_conflict_line.is_none() {
-                    first_conflict_line = Some(scan_line);
+            DiffOp::Replace {
+                new_index, new_len, ..
+            } => {
+                changes.push((
+                    file_no(new_index),
+                    file_no(new_index + new_len.saturating_sub(1)),
+                ));
+            }
+        }
+    }
+    if changes.is_empty() {
+        // No internal change (all matches are Equal and only boundary inserts
+        // exist): fall back to every non-Equal op so the caller still sees the
+        // block. Low-similarity cases are refused before reaching here.
+        for op in ops {
+            match *op {
+                DiffOp::Equal { .. } => {}
+                DiffOp::Delete { new_index, .. } => {
+                    let at = insertion_no(new_index);
+                    changes.push((at, at));
                 }
-                let act = change.value().trim_end_matches(['\r', '\n']);
-                if discrepancy.is_none() {
-                    discrepancy = Some(ExactDiscrepancy {
-                        line_no: scan_line,
-                        expected: String::new(),
-                        actual: act.to_string(),
-                        hint: format!(
-                            "Notice line present in file but omitted from your old_string: {:?}",
-                            act
-                        ),
-                    });
+                DiffOp::Insert {
+                    new_index, new_len, ..
+                } => {
+                    changes.push((
+                        file_no(new_index),
+                        file_no(new_index + new_len.saturating_sub(1)),
+                    ));
                 }
-                scan_line += 1;
-                scan_idx += 1;
+                DiffOp::Replace {
+                    new_index, new_len, ..
+                } => {
+                    changes.push((
+                        file_no(new_index),
+                        file_no(new_index + new_len.saturating_sub(1)),
+                    ));
+                }
             }
         }
     }
 
-    // 2. 以冲突行（first_conflict_line）为绝对圆心，严格锁定上下各 3 行（最多 7-8 行）紧凑上下文，
-    // 杜绝长 Hunk 后续几十行完全相同的 Equal 行全量刷屏！
-    let target_conflict_line = first_conflict_line.unwrap_or(start + 1);
-    const FOCUS_RADIUS: usize = 3;
-    let focus_start = target_conflict_line.saturating_sub(FOCUS_RADIUS).max(1);
-    let focus_end = target_conflict_line + FOCUS_RADIUS;
-
-    let mut core_lines = Vec::new();
-    let mut curr_line = start + 1;
-    let mut idx = 0;
-
-    while idx < changes.len() {
-        let change = &changes[idx];
-        match change.tag() {
-            ChangeTag::Equal => {
-                let val = change.value().trim_end_matches(['\r', '\n']);
-                if curr_line >= focus_start && curr_line <= focus_end {
-                    core_lines.push(format!("  {:>4} | {}", curr_line, val));
-                }
-                curr_line += 1;
-                idx += 1;
-            }
-            ChangeTag::Delete => {
-                let exp = change.value().trim_end_matches(['\r', '\n']);
-                let in_focus = curr_line >= focus_start && curr_line <= focus_end;
-
-                if idx + 1 < changes.len() && changes[idx + 1].tag() == ChangeTag::Insert {
-                    let act = changes[idx + 1].value().trim_end_matches(['\r', '\n']);
-                    if in_focus {
-                        core_lines.push(format!("- {:>4} | {}", curr_line, exp));
-                        core_lines.push(format!("+ {:>4} | {}", curr_line, act));
-                    }
-                    curr_line += 1;
-                    idx += 2;
-                } else {
-                    if in_focus {
-                        core_lines.push(format!("- {:>4} | {}", curr_line, exp));
-                    }
-                    idx += 1;
-                }
-            }
-            ChangeTag::Insert => {
-                let act = change.value().trim_end_matches(['\r', '\n']);
-                if curr_line >= focus_start && curr_line <= focus_end {
-                    core_lines.push(format!("+ {:>4} | {}", curr_line, act));
-                }
-                curr_line += 1;
-                idx += 1;
-            }
-        }
-    }
-
-    // 如果冲突行在整个 block 的开头或结尾导致前后缺少上下文，从物理文件中优雅补齐参考行
-    let mut display_lines = Vec::new();
-    if focus_start < (start + 1) {
-        for i in focus_start..(start + 1) {
-            if i >= 1 && i <= file.lines.len() {
-                display_lines.push(format!("  {:>4} | {}", i, file.lines[i - 1]));
-            }
-        }
-    }
-    display_lines.extend(core_lines);
-    if focus_end > end {
-        for i in (end + 1)..=focus_end {
-            if i <= file.lines.len() {
-                display_lines.push(format!("  {:>4} | {}", i, file.lines[i - 1]));
-            }
+    // Merge changes whose untouched gap is <= 2*CONTEXT; farther clusters get
+    // their own action hint + diff block.
+    let mut hunks: Vec<Vec<(usize, usize)>> = Vec::new();
+    for change in changes {
+        let merge = hunks
+            .last()
+            .and_then(|hunk| hunk.last())
+            .is_some_and(|last| change.0 <= last.1.saturating_add(HUNK_GAP + 1));
+        if merge {
+            hunks.last_mut().unwrap().push(change);
+        } else {
+            hunks.push(vec![change]);
         }
     }
 
     let mut out = String::new();
     out.push_str(&format!(
         "[Content Mismatch]: Closest matching block found around lines {}-{}{target_display} (similarity {:.0}%):\n\n",
-        start + 1,
-        end,
+        win_start + 1,
+        win_end,
         score * 100.0,
     ));
-
     out.push_str(EDIT_DIFF_PROTOCOL_LEGEND);
 
-    if let Some(disc) = discrepancy {
-        let old_repr = if disc.expected.is_empty() {
-            "<missing / line omitted in old_string>".to_string()
-        } else {
-            format!("{:?}", disc.expected)
-        };
-        let file_repr = if disc.actual.is_empty() {
-            "<none / not in actual file>".to_string()
-        } else {
-            format!("{:?}", disc.actual)
-        };
-        out.push_str(&format!(
-            "👉 Exact Line Discrepancy (around line {}):\n  conflict in old_string : {}\n  actual in file on disk : {}\n  ({})\n\n",
-            disc.line_no, old_repr, file_repr, disc.hint
-        ));
+    for hunk in &hunks {
+        let first = hunk.first().unwrap().0;
+        let last = hunk.last().unwrap().1;
+        let hunk_start = first.saturating_sub(CONTEXT).max(win_start + 1);
+        let hunk_end = last.saturating_add(CONTEXT).min(win_end);
+
+        out.push_str(MISMATCH_ACTION_HINT);
+        out.push_str("\n\n");
+
+        let lines = render_hunk(
+            ops,
+            &old_lines,
+            &file_lines,
+            win_start,
+            win_end,
+            hunk_start,
+            hunk_end,
+            first_equal,
+            last_equal,
+        );
+        out.push_str("```````diff\n");
+        out.push_str(&lines.join("\n"));
+        out.push_str("\n```````\n\n");
     }
 
-    out.push_str("```````diff\n");
-    out.push_str(&display_lines.join("\n"));
-    out.push_str("\n```````\n");
-    out.push_str("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)");
+    out.push_str("(Hint: surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)");
 
     out
 }
@@ -3403,11 +3498,7 @@ mod tests {
             r.content
         );
         assert!(r.content.contains("```diff"), "{}", r.content);
-        assert!(
-            r.content.contains("Exact Line Discrepancy"),
-            "{}",
-            r.content
-        );
+        assert!(r.content.contains("👉 Conflict found"), "{}", r.content);
         assert!(
             r.content.contains("adjust your old_string"),
             "{}",
@@ -4475,13 +4566,13 @@ fn b() { 2 }
         assert!(
             hint.contains("[Content Mismatch]: Closest matching block found around lines")
                 && hint.contains("```diff")
-                && hint.contains("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)"),
+                && hint.contains("(Hint: surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)"),
             "Expected expanded Unified Diff, got: {hint}"
         );
     }
 
     #[test]
-    fn test_structured_mismatch_diff_with_line_numbers_and_discrepancy() {
+    fn test_structured_mismatch_diff_with_line_numbers() {
         let content =
             "line 1\nline 2\n```bash [Linux]\ncurl install.sh | bash\n```\nline 7\nline 8\n";
         let file_norm = NormalizedFile::new(content);
@@ -4493,12 +4584,11 @@ fn b() { 2 }
             find_closest_match_snippet(Some(path), &file_norm, old_str_with_trailing).unwrap();
 
         assert!(hint.contains("in scripts/test.md"));
-        assert!(hint.contains("👉 Exact Line Discrepancy"));
-        assert!(hint.contains("Notice extra trailing characters in your old_string: \"}],path:\""));
+        assert!(hint.contains("👉 Conflict found — adjust your old_string"));
         assert!(hint.contains(
             "Below is the discrepancy between your old_string and the actual file content:"
         ));
-        assert!(hint.contains("Lines with '-' are the mismatched or erroneous line(s)"));
+        assert!(hint.contains("Lines with '-' come from your old_string"));
         assert!(hint.contains("2 | line 2")); // 上下文行不带任何 - 或 +
         assert!(hint.contains("-    5 | ```}],path:"));
         assert!(hint.contains("+    5 | ```"));
@@ -4572,11 +4662,330 @@ fn b() { 2 }
             "function demo() {\n  const a = 1;\n  const c = 3;\n  return a + b + c;\n}";
         let hint = find_closest_match_snippet(None, &file_norm, old_str_missing_b).unwrap();
 
-        assert!(hint.contains("👉 Exact Line Discrepancy"), "hint: {hint}");
+        assert!(hint.contains("👉 Conflict found"), "hint: {hint}");
         assert!(hint.contains("const b = 2;"), "hint: {hint}");
         assert!(
             hint.contains("```diff"),
             "hint should still retain expanded diff: {hint}"
+        );
+    }
+
+    fn marked_lines(hint: &str, marker: char) -> Vec<(usize, String)> {
+        hint.lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix(marker)?.strip_prefix(' ')?;
+                let (no, text) = rest.split_once(" | ")?;
+                Some((no.trim().parse().ok()?, text.to_string()))
+            })
+            .collect()
+    }
+
+    /// Both '-' and '+' numbers are physical file lines; '--' marks an old line
+    /// with no counterpart (skipped by the parser). Neither side may repeat or
+    /// regress, and the same visible line must never be marked as both removed
+    /// and added (the old trailing-newline artifact).
+    fn assert_diff_invariants(hint: &str) {
+        let minus = marked_lines(hint, '-');
+        let plus = marked_lines(hint, '+');
+        for (name, lines) in [("-", &minus), ("+", &plus)] {
+            let mut prev = 0;
+            for (no, _) in lines {
+                assert!(
+                    *no > prev,
+                    "{name} line numbers must be unique and ascending: {no}\n{hint}"
+                );
+                prev = *no;
+            }
+        }
+        let minus_texts: std::collections::HashSet<&str> =
+            minus.iter().map(|(_, text)| text.as_str()).collect();
+        for (_, text) in &plus {
+            assert!(
+                !minus_texts.contains(text.as_str()),
+                "the same line must never be marked as both '-' and '+': {text:?}\n{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_line_replace_keeps_block_together_and_never_reports_missing_lines() {
+        let content = "function demo() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  const d = 4;\n  return a + b + c + d;\n}\n";
+        let file_norm = NormalizedFile::new(content);
+        // Two consecutive wrong lines + a trailing newline (the old phantom-
+        // Replace trigger). The whole 2->2 block must stay one unit.
+        let old = "function demo() {\n  const a = 1;\n  const wrongB = 20;\n  const wrongC = 30;\n  const d = 4;\n  return a + b + c + d;\n}\n";
+        let hint = find_closest_match_snippet(None, &file_norm, old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "a line that exists in the file must never be reported as missing: {hint}"
+        );
+        assert!(hint.contains("-    3 |   const wrongB = 20;"), "{hint}");
+        assert!(hint.contains("-    4 |   const wrongC = 30;"), "{hint}");
+        assert!(hint.contains("+    3 |   const b = 2;"), "{hint}");
+        assert!(hint.contains("+    4 |   const c = 3;"), "{hint}");
+        assert!(hint.contains("👉 Conflict found"), "{hint}");
+    }
+
+    #[test]
+    fn multi_region_old_string_reports_real_conflicts_without_false_absence() {
+        let content = "const k0 = 0;\n  'tokens.estBadge': '预估',\n  'tokens.estimatedCache': '预估缓存',\n  'tokens.hitBadge': '命中',\n  'tokens.inputLabel': '輸入',\n  'tokens.inputTooltip': '輸入 (history): {n}',\n  'tokens.loopHitLabel': '累計缓存',\n  'tokens.loopSavingsLabel': '累計节省',\n  'tokens.onlineCacheHit': '缓存',\nconst k9 = 9;\n";
+        let file_norm = NormalizedFile::new(content);
+        // 复现真实故障：把文件中相隔几行的 key 拼成一个 old_string。
+        let old = "  'tokens.hitBadge': '命中',\n  'tokens.estBadge': '预设',\n  'tokens.loopHitLabel': '累計缓存',\n  'tokens.loopSavingsLabel': '累計节省',\n";
+        let hint = find_closest_match_snippet(None, &file_norm, old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "hitBadge/estBadge exist in the file; absence must not be fabricated: {hint}"
+        );
+        // Both conflict regions must be visible, not just the first one.
+        assert!(hint.contains("estimatedCache"), "{hint}");
+        assert!(hint.contains("inputLabel"), "{hint}");
+        assert!(hint.contains("预设"), "{hint}");
+        assert!(hint.contains("预估"), "{hint}");
+        // The old line points at the real file line it conflicts with, not at
+        // its own index inside old_string.
+        assert!(hint.contains("👉 Conflict found"), "{hint}");
+        assert!(
+            hint.contains("-    2 |   'tokens.estBadge': '预设',"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn long_multi_region_fixture_reports_every_conflict() {
+        let mut lines = vec!["// long generated fixture".to_string()];
+        for i in 0..40 {
+            lines.push(format!("const filler_a{i} = {i};"));
+        }
+        lines.push("function alphaBlock() {".into());
+        lines.push("  const alpha = 1;".into());
+        lines.push("  const beta = 2;".into());
+        lines.push("  const gamma = 3;".into());
+        lines.push("  return alpha + beta + gamma;".into());
+        lines.push("}".into());
+        for i in 0..40 {
+            lines.push(format!("const filler_b{i} = {i};"));
+        }
+        lines.push("function omegaBlock() {".into());
+        lines.push("  const omega = 10;".into());
+        lines.push("  const sigma = 20;".into());
+        lines.push("  return omega + sigma;".into());
+        lines.push("}".into());
+        let content = lines.join("\n") + "\n";
+        let file_norm = NormalizedFile::new(&content);
+
+        let mut old_lines = vec!["function alphaBlock() {".to_string()];
+        old_lines.push("  const alpha = 1;".into());
+        old_lines.push("  const betaWrong = 2;".into());
+        old_lines.push("  const gammaWrong = 3;".into());
+        old_lines.push("  return alpha + beta + gamma;".into());
+        old_lines.push("}".into());
+        for i in 0..40 {
+            old_lines.push(format!("const filler_b{i} = {i};"));
+        }
+        old_lines.push("function omegaBlock() {".into());
+        old_lines.push("  const omega = 10;".into());
+        old_lines.push("  const sigmaWrong = 20;".into());
+        old_lines.push("  return omega + sigma;".into());
+        old_lines.push("}".into());
+        let old = old_lines.join("\n") + "\n";
+
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+        assert_diff_invariants(&hint);
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "both wrong clusters exist in the file; no absence may be fabricated: {hint}"
+        );
+        // Each conflict cluster gets its own action hint + diff block.
+        assert_eq!(hint.matches("👉 Conflict found").count(), 2, "{hint}");
+        // Both clusters must be reported, not just the first one.
+        assert!(
+            hint.contains("betaWrong") && hint.contains("gammaWrong"),
+            "{hint}"
+        );
+        assert!(hint.contains("sigmaWrong"), "{hint}");
+        assert!(hint.contains("const beta = 2;"), "{hint}");
+        assert!(hint.contains("const sigma = 20;"), "{hint}");
+        // '-' lines use the same physical file numbers as '+' lines; the old
+        // string's own line numbers (3/4/49) must never leak into the diff.
+        assert!(hint.contains("-   44 |   const betaWrong = 2;"), "{hint}");
+        assert!(hint.contains("-   45 |   const gammaWrong = 3;"), "{hint}");
+        assert!(hint.contains("+   44 |   const beta = 2;"), "{hint}");
+        assert!(hint.contains("+   45 |   const gamma = 3;"), "{hint}");
+        assert!(hint.contains("-   90 |   const sigmaWrong = 20;"), "{hint}");
+        assert!(hint.contains("+   90 |   const sigma = 20;"), "{hint}");
+        assert!(!hint.contains("-    3 |   const betaWrong"), "{hint}");
+        assert!(!hint.contains("-   49 |   const sigmaWrong"), "{hint}");
+    }
+
+    fn one_block_fixture(wrong: &[usize]) -> (String, String) {
+        let mut lines = vec!["// header".to_string()];
+        for i in 0..10 {
+            lines.push(format!("const pre{i} = {i};"));
+        }
+        lines.push("function settings() {".into());
+        for i in 0..30 {
+            lines.push(format!("  const v{i} = {i};"));
+        }
+        lines.push("}".into());
+        let content = lines.join("\n") + "\n";
+
+        let mut old_lines = vec!["function settings() {".to_string()];
+        for i in 0..30 {
+            if wrong.contains(&i) {
+                old_lines.push(format!("  const v{i}Wrong = {i};"));
+            } else {
+                old_lines.push(format!("  const v{i} = {i};"));
+            }
+        }
+        old_lines.push("}".into());
+        (content, old_lines.join("\n") + "\n")
+    }
+
+    #[test]
+    fn one_block_with_sparse_mismatches_prints_multiple_hunks() {
+        // One contiguous old_string, three wrong lines separated by 8 Equal
+        // lines each (> 2*context), so each cluster must get its own
+        // discrepancy + diff block.
+        let (content, old) = one_block_fixture(&[3, 12, 21]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 3, "{hint}");
+        for (file_line, wrong, right) in [
+            (16, "v3Wrong", "v3"),
+            (25, "v12Wrong", "v12"),
+            (34, "v21Wrong", "v21"),
+        ] {
+            assert!(
+                hint.contains(&format!("-   {file_line} |   const {wrong} = ")),
+                "{hint}"
+            );
+            assert!(
+                hint.contains(&format!("+   {file_line} |   const {right} = ")),
+                "{hint}"
+            );
+        }
+        // old_string indices 5/14/23 must never appear as file lines.
+        assert!(!hint.contains("-    5 |   const v3Wrong"), "{hint}");
+        assert!(!hint.contains("-   14 |   const v12Wrong"), "{hint}");
+        assert!(!hint.contains("-   23 |   const v21Wrong"), "{hint}");
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn one_block_with_near_mismatches_merges_into_one_hunk() {
+        // Two wrong lines separated by only 2 Equal lines (<= 2*context) stay
+        // in one hunk, but both conflict runs are still printed.
+        let (content, old) = one_block_fixture(&[3, 6]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 1, "{hint}");
+        assert!(hint.contains("-   16 |   const v3Wrong = 3;"), "{hint}");
+        assert!(hint.contains("-   19 |   const v6Wrong = 6;"), "{hint}");
+        assert!(hint.contains("+   16 |   const v3 = 3;"), "{hint}");
+        assert!(hint.contains("+   19 |   const v6 = 6;"), "{hint}");
+        // Exactly three context lines above the first change and below the last.
+        assert!(hint.contains("   13 |   const v0 = 0;"), "{hint}");
+        assert!(hint.contains("   22 |   const v9 = 9;"), "{hint}");
+        assert!(!hint.contains("   12 | function settings()"), "{hint}");
+        assert!(!hint.contains("   23 |   const v10 = 10;"), "{hint}");
+    }
+
+    #[test]
+    fn hunk_merge_boundary_is_six_unchanged_lines() {
+        // Gap of 6 untouched lines -> the +/- 3 context windows touch, so the
+        // two conflicts merge into one hunk.
+        let (content, old) = one_block_fixture(&[3, 10]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 1, "{hint}");
+        // v3 is line 16, v10 is line 23; merged context = 13..26.
+        assert!(hint.contains("   13 |   const v0 = 0;"), "{hint}");
+        assert!(hint.contains("   26 |   const v13 = 13;"), "{hint}");
+        assert!(!hint.contains("   12 | function settings()"), "{hint}");
+        assert!(!hint.contains("   27 |   const v14 = 14;"), "{hint}");
+        assert!(hint.contains("-   16 |   const v3Wrong = 3;"), "{hint}");
+        assert!(hint.contains("-   23 |   const v10Wrong = 10;"), "{hint}");
+
+        // Gap of 7 untouched lines -> a one-line hole remains, so they split.
+        let (content, old) = one_block_fixture(&[3, 11]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 2, "{hint}");
+        // Hunk 1 = 13..19, hunk 2 = 21..27; line 20 is the middle of the gap.
+        assert!(hint.contains("   19 |   const v6 = 6;"), "{hint}");
+        assert!(hint.contains("   21 |   const v8 = 8;"), "{hint}");
+        assert!(!hint.contains("   20 |   const v7 = 7;"), "{hint}");
+        assert!(hint.contains("   27 |   const v14 = 14;"), "{hint}");
+    }
+
+    /// Manual end-to-end smoke: node generates a long fixture and an
+    /// old_string with multiple cross-region conflicts, then the real tool is
+    /// invoked against it. Run with --ignored --nocapture and both env vars.
+    #[tokio::test]
+    #[ignore = "manual smoke: set JEIKCODE_EDIT_DIAG_FIXTURE / JEIKCODE_EDIT_DIAG_OLD"]
+    async fn manual_node_fixture_multi_region_diagnostic() {
+        let (Ok(fixture), Ok(old_path)) = (
+            std::env::var("JEIKCODE_EDIT_DIAG_FIXTURE"),
+            std::env::var("JEIKCODE_EDIT_DIAG_OLD"),
+        ) else {
+            eprintln!("skip: set JEIKCODE_EDIT_DIAG_FIXTURE and JEIKCODE_EDIT_DIAG_OLD");
+            return;
+        };
+        let old = std::fs::read_to_string(&old_path).unwrap();
+        let fixture_path = std::path::PathBuf::from(&fixture);
+        let dir = fixture_path.parent().unwrap().to_path_buf();
+        let name = fixture_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let args = serde_json::json!({
+            "path": name,
+            "edits": [{ "old_string": old, "new_string": "unused" }]
+        })
+        .to_string();
+        let r = EditFileTool.execute(&args, &ctx(&dir)).await;
+        assert!(
+            r.is_error,
+            "the deliberately wrong old_string must fail: {}",
+            r.content
+        );
+        println!("{}", r.content);
+        assert_diff_invariants(&r.content);
+        let allow_extra = std::env::var("JEIKCODE_EDIT_DIAG_ALLOW_EXTRA")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !allow_extra {
+            assert!(
+                !r.content
+                    .contains("<no corresponding line at this position>"),
+                "{}",
+                r.content
+            );
+        }
+        let expected_hunks: usize = std::env::var("JEIKCODE_EDIT_DIAG_EXPECT_HUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        assert_eq!(
+            r.content.matches("👉 Conflict found").count(),
+            expected_hunks,
+            "{}",
+            r.content
         );
     }
 
@@ -4597,9 +5006,10 @@ fn b() { 2 }
             "hint should not claim line 2 import assert is mismatched: {hint}"
         );
         assert!(
-            hint.contains("conflict in old_string : \"  compactTurnNavText,\""),
-            "hint: {hint}"
+            hint.contains("-   -- |   compactTurnNavText,"),
+            "the extra old line must be visible in the diff: {hint}"
         );
+        assert!(hint.contains("👉 Conflict found"), "hint: {hint}");
     }
 
     #[tokio::test]

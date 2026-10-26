@@ -1507,6 +1507,8 @@ fn delete_catalog_session_in_root(
         manager.snapshot_path(id)?,
         manager.meta_path(id)?,
         manager.jsonl_path(id)?,
+        manager.display_path(id)?,
+        manager.display_meta_path(id)?,
         manager.presentation_path(id)?,
         manager.legacy_path(id)?,
     ];

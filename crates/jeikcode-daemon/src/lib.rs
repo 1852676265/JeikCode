@@ -357,9 +357,20 @@ fn apply_session_message_window<T>(
     )
 }
 
-/// Tail page plus, when the cut falls inside a turn, the one user question that
-/// opened it. `offset` stays the index of the first non-pinned row so the gap
-/// can still be loaded. `pinned_user_index` is that question's absolute index.
+fn last_visible_user_before(messages: &[MessageInfo], end: usize) -> Option<usize> {
+    (0..end)
+        .rev()
+        .find(|&index| is_visible_user_turn_start(&messages[index]))
+}
+
+fn first_visible_user_from(messages: &[MessageInfo], start: usize) -> Option<usize> {
+    (start..messages.len()).find(|&index| is_visible_user_turn_start(&messages[index]))
+}
+
+/// Tail/older page snapped to complete user turns. A pathological turn is
+/// loaded whole instead of pinning its question and leaving an unloaded middle:
+/// "load older" walks backward from the cached head and could never fill that
+/// hole. Correctness wins over a bounded first paint here.
 fn take_session_page(
     mut messages: Vec<MessageInfo>,
     query: &SessionDetailQuery,
@@ -369,6 +380,15 @@ fn take_session_page(
         let offset = total.saturating_sub(n);
         if offset == 0 {
             return (total, 0, messages, None);
+        }
+        let turn_start = if is_visible_user_turn_start(&messages[offset]) {
+            Some(offset)
+        } else {
+            last_visible_user_before(&messages, offset)
+        };
+        if let Some(start) = turn_start {
+            let window = messages.split_off(start);
+            return (total, start, window, None);
         }
         let mut window: Vec<MessageInfo> = messages.drain(offset..).collect();
         let pinned = if window
@@ -389,9 +409,31 @@ fn take_session_page(
     }
     let offset = query.offset.unwrap_or(0).min(total);
     let limit = query.limit.unwrap_or(usize::MAX);
-    let end = offset.saturating_add(limit).min(messages.len());
-    let window = messages.drain(offset..end).collect();
-    (total, offset, window, None)
+    if limit == usize::MAX {
+        return (
+            total,
+            offset,
+            messages.into_iter().skip(offset).collect(),
+            None,
+        );
+    }
+    let end = offset.saturating_add(limit).min(total);
+    // Snap an older page to turn boundaries as well. Otherwise a page starting
+    // on a tool result drops that result (its assistant call lives in the newer
+    // page), and a page ending after a tool call loses the result to the next
+    // page. Complete turns keep every call/result pair in one conversion pass.
+    let start = if offset < total && is_visible_user_turn_start(&messages[offset]) {
+        offset
+    } else {
+        last_visible_user_before(&messages, offset).unwrap_or(offset)
+    };
+    let next = first_visible_user_from(&messages, end).unwrap_or(end);
+    // Always return the complete snapped turn, even when it is larger than the
+    // nominal page. Splitting an oversized turn leaves call/result or
+    // question/answer halves in different pages, and a pinned header cannot
+    // fill the missing middle in the backward paging direction.
+    let window = messages.drain(start..next).collect();
+    (total, start, window, None)
 }
 
 #[cfg(test)]
@@ -465,7 +507,7 @@ mod session_window_tests {
     }
 
     #[test]
-    fn tail_pins_the_opening_user_without_pulling_the_gap() {
+    fn tail_expands_to_the_opening_user_when_the_turn_fits() {
         let q = SessionDetailQuery {
             tail: Some(2),
             offset: None,
@@ -481,14 +523,90 @@ mod session_window_tests {
         ];
         let (total, offset, window, pinned) = take_session_page(messages, &q);
         assert_eq!(total, 6);
-        assert_eq!(offset, 4);
-        assert_eq!(pinned, Some(2));
+        assert_eq!(offset, 2);
+        assert_eq!(pinned, None);
         assert_eq!(
             window
                 .iter()
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>(),
-            vec!["这一问", "结果", "回答"]
+            vec!["这一问", "思考", "结果", "回答"]
+        );
+    }
+
+    #[test]
+    fn tail_loads_the_whole_oversized_turn_without_a_hole() {
+        const OVERSIZED: usize = 300;
+        let q = SessionDetailQuery {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+        };
+        let mut messages = vec![page_msg("user", "超长提问")];
+        for index in 0..OVERSIZED + 4 {
+            messages.push(page_msg("assistant", &format!("步骤{index}")));
+        }
+        let total = messages.len();
+        let (got_total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(got_total, total);
+        assert_eq!(offset, 0);
+        assert_eq!(pinned, None);
+        assert_eq!(window.len(), total);
+        assert_eq!(window[0].content, "超长提问");
+    }
+
+    #[test]
+    fn offset_page_snaps_to_complete_turns() {
+        let q = SessionDetailQuery {
+            tail: None,
+            offset: Some(1),
+            limit: Some(2),
+        };
+        let messages = vec![
+            page_msg("user", "问一"),
+            page_msg("assistant", "答一"),
+            page_msg("tool", "结果一"),
+            page_msg("user", "问二"),
+            page_msg("assistant", "答二"),
+            page_msg("tool", "结果二"),
+            page_msg("user", "问三"),
+            page_msg("assistant", "答三"),
+        ];
+        let (total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(total, 8);
+        assert_eq!(offset, 0);
+        assert_eq!(pinned, None);
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["问一", "答一", "结果一"]
+        );
+    }
+
+    #[test]
+    fn offset_page_loads_the_whole_oversized_turn_without_a_hole() {
+        const OVERSIZED: usize = 300;
+        let q = SessionDetailQuery {
+            tail: None,
+            offset: Some(2),
+            limit: Some(2),
+        };
+        let mut messages = vec![page_msg("user", "超长提问")];
+        for index in 0..OVERSIZED + 4 {
+            messages.push(page_msg("assistant", &format!("步骤{index}")));
+        }
+        messages.push(page_msg("user", "下一问"));
+        let (total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(total, OVERSIZED + 6);
+        assert_eq!(offset, 0);
+        assert_eq!(pinned, None);
+        assert_eq!(window.len(), OVERSIZED + 5);
+        assert_eq!(window[0].content, "超长提问");
+        assert_eq!(
+            window.last().unwrap().content,
+            format!("步骤{}", OVERSIZED + 3)
         );
     }
 
@@ -634,6 +752,190 @@ mod chat_replay_tests {
             }
             other => panic!("unexpected replay buffer: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod transcript_display_tests {
+    use super::*;
+    use jeikcode_capabilities::session::{ToolRecord, TurnRecord};
+
+    fn turn(id: u64, ts: i64, user: &str, assistant: &str) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            ts,
+            iso: String::new(),
+            session_id: "s1".into(),
+            turn_id: id,
+            undone: false,
+            user: user.into(),
+            assistant: assistant.into(),
+            reasoning: String::new(),
+            tools: Vec::new(),
+            usage: Default::default(),
+        }
+    }
+
+    fn info(role: &str, text: &str, synthetic: bool) -> MessageInfo {
+        MessageInfo {
+            role: role.into(),
+            id: None,
+            content: text.into(),
+            reasoning: None,
+            synthetic,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn transcript_prefix_rebuilds_user_assistant_and_paired_tools() {
+        let mut first = turn(1, 100, "Q1", "A1");
+        first.tools.push(ToolRecord {
+            name: "read".into(),
+            args: "{\"path\":\"a\"}".into(),
+            result: "R1".into(),
+            is_error: false,
+        });
+        let second = turn(2, 200, "Q2", "A2");
+
+        let rows = display_prefix_from_transcript(&[first, second], Some(150), None);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].content, "Q1");
+        assert_eq!(rows[0].created_at, None);
+        assert_eq!(rows[1].role, "assistant");
+        assert_eq!(rows[1].content, "A1");
+        assert_eq!(rows[1].created_at, Some(100));
+        let call = rows[1].tool_calls.as_ref().unwrap()[0].clone();
+        assert_eq!(call.id, "transcript-1-tool-0");
+        assert_eq!(rows[2].role, "tool");
+        assert_eq!(rows[2].content, "R1");
+        assert_eq!(rows[2].tool_result.as_ref().unwrap().call_id, call.id);
+        assert!(rows[2].tool_result.as_ref().unwrap().success);
+    }
+
+    #[test]
+    fn transcript_prefix_can_split_by_user_text_when_timestamp_is_missing() {
+        let first = turn(1, 100, "Q1", "A1");
+        let second = turn(2, 200, "Q2", "A2");
+        let rows = display_prefix_from_transcript(&[first, second], None, Some("Q2"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content, "Q1");
+        assert_eq!(rows[1].content, "A1");
+    }
+
+    fn display_record(role: &str, content: &str) -> jeikcode_capabilities::session::DisplayRecord {
+        jeikcode_capabilities::session::DisplayRecord {
+            v: jeikcode_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id: 1,
+            index: 0,
+            role: role.into(),
+            id: Some("m-1".into()),
+            content: content.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: Some(1),
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn display_record_round_trips_images_and_tool_results() {
+        let mut user = display_record("user", "看这张图");
+        user.images
+            .push(jeikcode_capabilities::session::DisplayImage {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+                missing: false,
+            });
+        let info = display_record_to_message_info(&user);
+        assert_eq!(info.images.as_ref().unwrap()[0].data, "AAAA");
+        let back = display_record_from_message_info("s1", 0, &info);
+        assert_eq!(back.images[0].data, "AAAA");
+
+        let mut call = display_record("assistant", "");
+        call.tool_calls
+            .push(jeikcode_capabilities::session::DisplayToolCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"a\"}".into(),
+            });
+        let call_info = display_record_to_message_info(&call);
+        assert_eq!(call_info.tool_calls.as_ref().unwrap()[0].id, "call-1");
+
+        let mut result = display_record("tool", "tool output");
+        result.tool_call_id = Some("call-1".into());
+        let result_info = display_record_to_message_info(&result);
+        assert_eq!(result_info.tool_result.as_ref().unwrap().call_id, "call-1");
+        assert!(result_info.tool_result.as_ref().unwrap().success);
+        assert_eq!(result_info.content, "tool output");
+    }
+
+    #[test]
+    fn display_prefix_stops_before_the_first_real_user() {
+        let snapshot = jeikcode_kernel::message::SessionSnapshot::new(vec![
+            jeikcode_kernel::message::Message::system("sys"),
+            jeikcode_kernel::message::Message::synthetic_user("ctx"),
+            jeikcode_kernel::message::Message::user("Q1"),
+        ]);
+        let meta = jeikcode_capabilities::session::SessionMeta::new("s1", "/p", 1);
+        let view = crate::legacy_convert::CatalogSessionView {
+            snapshot,
+            meta,
+            presentation: jeikcode_capabilities::session::PresentationFile::default(),
+        };
+        let prefix = display_prefix_messages(&view);
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(prefix[0].role, "system");
+        assert_eq!(prefix[1].role, "user");
+        assert!(prefix[1].synthetic);
+        assert!(prefix.iter().all(|message| message.content != "Q1"));
+    }
+
+    #[test]
+    fn display_record_strips_the_vision_marker_and_adds_a_placeholder() {
+        let record = display_record("user", "请描述[图片内容（由模型识别）]：一只猫");
+        let info = display_record_to_message_info(&record);
+        assert_eq!(info.content, "请描述");
+        assert!(info
+            .images
+            .as_ref()
+            .is_some_and(|images| images.iter().any(|image| image.missing)));
+    }
+
+    #[test]
+    fn splice_compacted_display_keeps_prefix_then_retained_tail_without_duplication() {
+        let messages = vec![
+            info("system", "sys", false),
+            info("user", "你好啊\n\n<strong-reminder>x", false),
+            info("user", "<!-- jeikcode:anchor v1 -->\nsummary", true),
+            info("user", "Q2", false),
+            info("assistant", "A2", false),
+        ];
+        let prefix = vec![
+            info("user", "你好啊", false),
+            info("assistant", "A1", false),
+        ];
+        let out = splice_compacted_display(messages, prefix);
+        let texts: Vec<_> = out.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, vec!["你好啊", "A1", "sys", "Q2", "A2"]);
+        assert_eq!(
+            out.iter().filter(|m| m.content == "你好啊").count(),
+            1,
+            "the pre-anchor user must be covered by the transcript prefix, not duplicated"
+        );
     }
 }
 
@@ -3110,7 +3412,7 @@ pub struct ArtifactInfo {
 }
 
 /// Tool call info for API response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
@@ -3119,7 +3421,7 @@ pub struct ToolCallInfo {
 }
 
 /// Tool result info for API response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolResultInfo {
     pub call_id: String,
     pub success: bool,
@@ -3128,7 +3430,7 @@ pub struct ToolResultInfo {
 }
 
 /// Message info for API response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageInfo {
     pub role: String,
     /// Stable per-message identity from the kernel `Message.id` (SIDECAR). Lets
@@ -4773,17 +5075,6 @@ async fn get_session_detail(
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
             let _ = crate::native_live::take_session_draft(&id);
-            let messages = match merge_catalog_session_messages_for_display(&session) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    let msg = format!("Failed to load session: {error}");
-                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-                }
-            };
-            let turns = session_user_outline(&messages);
-            let (message_count, offset, messages, pinned_user_index) =
-                take_session_page(messages, &query);
-            let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let turn_running = state
                 .active_chats
                 .active_session_ids()
@@ -4795,6 +5086,137 @@ async fn get_session_detail(
                     .live_turn_session_ids()
                     .iter()
                     .any(|sid| sid == &id);
+            let display_manager =
+                NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&hash));
+            let snapshot_last_turn = session
+                .meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid)
+                .map(|stat| stat.turn_id)
+                .max()
+                .unwrap_or(0);
+            // Prefer the append-only display transcript: it is never compacted,
+            // so it keeps every turn, image, reasoning block and tool card. A log
+            // that is behind the snapshot (failed write / old session) falls back
+            // to the snapshot projection and is backfilled below.
+            let display = read_display_cached(&display_manager, &session.meta.id)
+                .filter(|(meta, _)| meta.last_turn_id >= snapshot_last_turn);
+            let mut messages = if let Some((meta, records)) = display {
+                let elapsed = display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
+                // A hook-created log begins at the first user turn; a backfill
+                // already contains the session-start prefix. Prepend the prefix
+                // only in the former case so indices stay stable across upgrades.
+                let already_prefixed = meta.backfilled
+                    || records.first().is_some_and(|record| {
+                        record.role.eq_ignore_ascii_case("system")
+                            || (record.role.eq_ignore_ascii_case("user") && record.synthetic)
+                    });
+                let mut messages = if already_prefixed {
+                    Vec::new()
+                } else {
+                    display_prefix_messages(&session)
+                };
+                let prefix_len = messages.len();
+                messages.extend(records.iter().enumerate().map(|(index, record)| {
+                    let mut message = display_record_to_message_info(record);
+                    if let Some(duration) = elapsed.get(&index) {
+                        message.elapsed_ms = Some(*duration);
+                    }
+                    message
+                }));
+                // Compaction drains model context but the display log keeps the
+                // old rows. Mark records that no longer exist in the snapshot so
+                // the UI disables edit/delete/regenerate instead of sending an id
+                // the mutation API can no longer find.
+                let snapshot_ids: std::collections::HashSet<&str> = session
+                    .snapshot
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.id.as_deref())
+                    .collect();
+                mark_display_only_archive_rows(
+                    records.as_slice(),
+                    &mut messages[prefix_len..],
+                    &snapshot_ids,
+                    snapshot_last_turn,
+                    // If the session is idle and the log is not ahead of the
+                    // snapshot, a missing id on the last turn is genuinely
+                    // drained (not a snapshot-save race). Mark it too.
+                    !turn_running && meta.last_turn_id <= snapshot_last_turn,
+                );
+                attach_display_images(
+                    &mut messages,
+                    std::path::Path::new(&session.meta.working_dir),
+                    &session.meta.id,
+                );
+                messages
+            } else {
+                let mut messages = match merge_catalog_session_messages_for_display(&session) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let msg = format!("Failed to load session: {error}");
+                        return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                    }
+                };
+                // Compaction drains model context from the snapshot, but the raw
+                // transcript is append-only. Rebuild the pre-compaction display
+                // prefix from it so the question rail and canvas never lose turns
+                // after a refresh. Presentation entries already merged into the
+                // list are display-only rows: the splice keeps any that are not
+                // covered by the rebuilt transcript.
+                if let Some(anchor) = messages.iter().position(|message| {
+                    message.role.eq_ignore_ascii_case("user")
+                        && message.synthetic
+                        && jeikcode_capabilities::compaction::is_compaction_anchor_text(
+                            &message.content,
+                        )
+                }) {
+                    if let Some(turns) = load_display_transcript(&hash, &session.meta.id) {
+                        let boundary = messages[anchor + 1..].iter().find(|message| {
+                            message.role.eq_ignore_ascii_case("user") && !message.synthetic
+                        });
+                        let prefix = display_prefix_from_transcript(
+                            &turns,
+                            boundary.and_then(|message| message.created_at),
+                            boundary.map(|message| message.content.as_str()),
+                        );
+                        messages = splice_compacted_display(messages, prefix);
+                    }
+                }
+                // One-time upgrade path for sessions created before the display
+                // log existed. Only settled sessions are materialized so a live
+                // turn is never frozen into the log half-way. If an existing log
+                // is already beyond the readable ceiling, do not rewrite it on
+                // every read (the next read would fail the same way).
+                let display_too_large = display_manager
+                    .display_path(&session.meta.id)
+                    .ok()
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .is_some_and(|metadata| {
+                        metadata.len()
+                            > jeikcode_capabilities::session::display::MAX_DISPLAY_READ_BYTES as u64
+                    });
+                if !turn_running && !messages.is_empty() && !display_too_large {
+                    let records: Vec<_> = messages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, message)| {
+                            display_record_from_message_info(&session.meta.id, index, message)
+                        })
+                        .collect();
+                    let _ = display_manager.write_display_backfill(
+                        &session.meta.id,
+                        &records,
+                        snapshot_last_turn,
+                    );
+                }
+                messages
+            };
+            let turns = session_user_outline(&messages);
+            let (message_count, offset, messages, pinned_user_index) =
+                take_session_page(messages, &query);
+            let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let todos = if let Some(board) = jeikcode_capabilities::tools::read_todo_board(&id) {
                 if jeikcode_capabilities::tools::list_fully_completed(&board.items) && !turn_running
                 {
@@ -5035,7 +5457,23 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     if sets.is_empty() {
         return;
     }
-    let mut next = sets.into_iter();
+    // The sidecar is append-only and holds ALL VL submissions, while the
+    // message list may have lost the oldest placeholder rows to compaction.
+    // Match the TAIL of the sidecar (newest submissions) to the surviving
+    // placeholders; matching from the head would attach an old image to a
+    // newer question.
+    let placeholders = messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .images
+                    .as_ref()
+                    .is_some_and(|images| images.iter().any(|image| image.missing))
+        })
+        .count();
+    let skip = sets.len().saturating_sub(placeholders);
+    let mut next = sets.into_iter().skip(skip);
     for message in messages.iter_mut() {
         let is_missing_placeholder = message.role == "user"
             && message
@@ -5049,6 +5487,526 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
                 }
             }
         }
+    }
+}
+
+/// The display log is also read on every history page. A single-entry cache is
+/// enough for the common scroll pattern (consecutive pages of one session) and
+/// avoids re-reading + re-parsing a multi-megabyte JSONL per page. The cache is
+/// bounded so a pathological log cannot pin hundreds of MB in memory.
+const MAX_CACHED_DISPLAY_BYTES: u64 = 64 * 1024 * 1024;
+
+struct DisplayLogCacheEntry {
+    key: String,
+    log_mtime: Option<std::time::SystemTime>,
+    log_len: u64,
+    meta_mtime: Option<std::time::SystemTime>,
+    meta_len: u64,
+    meta: jeikcode_capabilities::session::DisplayMeta,
+    records: Arc<Vec<jeikcode_capabilities::session::DisplayRecord>>,
+}
+
+fn display_log_cache() -> &'static std::sync::Mutex<Option<DisplayLogCacheEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<DisplayLogCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Read a complete display log with an mtime+length guarded cache. The log is
+/// append-only; both the log and its meta sidecar are part of the fingerprint,
+/// so a new turn (or a backfill/invalidation) misses the cache immediately.
+fn read_display_cached(
+    manager: &NativeSessionManager,
+    id: &str,
+) -> Option<(
+    jeikcode_capabilities::session::DisplayMeta,
+    Arc<Vec<jeikcode_capabilities::session::DisplayRecord>>,
+)> {
+    read_display_with_cache(manager, id, display_log_cache())
+}
+
+fn read_display_with_cache(
+    manager: &NativeSessionManager,
+    id: &str,
+    cache: &std::sync::Mutex<Option<DisplayLogCacheEntry>>,
+) -> Option<(
+    jeikcode_capabilities::session::DisplayMeta,
+    Arc<Vec<jeikcode_capabilities::session::DisplayRecord>>,
+)> {
+    let log_path = manager.display_path(id).ok()?;
+    let meta_path = manager.display_meta_path(id).ok()?;
+    let log_metadata = std::fs::metadata(&log_path).ok()?;
+    let meta_metadata = std::fs::metadata(&meta_path).ok()?;
+    let log_mtime = log_metadata.modified().ok();
+    let meta_mtime = meta_metadata.modified().ok();
+    let log_len = log_metadata.len();
+    let meta_len = meta_metadata.len();
+    let key = log_path.to_string_lossy().into_owned();
+
+    // Do not cache an oversized log: the read itself is the memory risk.
+    if log_len > MAX_CACHED_DISPLAY_BYTES {
+        return manager
+            .read_display(id)
+            .ok()
+            .flatten()
+            .map(|(meta, records)| (meta, Arc::new(records)));
+    }
+
+    {
+        let guard = cache.lock().ok()?;
+        if let Some(cache) = guard.as_ref() {
+            if cache.key == key
+                && cache.log_mtime == log_mtime
+                && cache.log_len == log_len
+                && cache.meta_mtime == meta_mtime
+                && cache.meta_len == meta_len
+            {
+                return Some((cache.meta.clone(), cache.records.clone()));
+            }
+        }
+    }
+
+    let (meta, records) = manager.read_display(id).ok().flatten()?;
+    let records = Arc::new(records);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(DisplayLogCacheEntry {
+            key,
+            log_mtime,
+            log_len,
+            meta_mtime,
+            meta_len,
+            meta: meta.clone(),
+            records: records.clone(),
+        });
+    }
+    Some((meta, records))
+}
+
+/// Single-entry cache for the parsed raw transcript. `getSession` is called on
+/// every history page (48 rows) and by background reconciliation, so re-reading
+/// a multi-megabyte JSONL each time would stall the timeline. The fingerprint
+/// (mtime + length) invalidates the entry as soon as a turn is flushed.
+struct DisplayTranscriptCache {
+    key: String,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    turns: Arc<Vec<jeikcode_capabilities::session::TurnRecord>>,
+}
+
+fn display_transcript_cache() -> &'static std::sync::Mutex<Option<DisplayTranscriptCache>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<DisplayTranscriptCache>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Read the append-only transcript for display reconstruction, with a
+/// fingerprint-guarded single-entry cache. `None` means the transcript cannot
+/// be read (no file / corrupt); callers then keep the snapshot-only projection.
+fn load_display_transcript(
+    project_hash: &str,
+    id: &str,
+) -> Option<Arc<Vec<jeikcode_capabilities::session::TurnRecord>>> {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    let path = manager.jsonl_path(id).ok()?;
+    let metadata = std::fs::metadata(&path).ok();
+    let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
+    let len = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let key = format!("{project_hash}/{id}");
+
+    let mut guard = display_transcript_cache().lock().ok()?;
+    if let Some(cache) = guard.as_ref() {
+        if cache.key == key && cache.mtime == mtime && cache.len == len {
+            return Some(cache.turns.clone());
+        }
+    }
+    let turns = Arc::new(manager.read_transcript_turns(id).ok()?);
+    *guard = Some(DisplayTranscriptCache {
+        key,
+        mtime,
+        len,
+        turns: turns.clone(),
+    });
+    Some(turns)
+}
+
+fn normalized_display_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Rebuild display rows for every transcript turn before `boundary`. The raw
+/// transcript is never compacted; this is the authoritative pre-compaction
+/// display history. Timestamps are intentionally omitted for user rows because
+/// `TurnRecord.ts` is the turn's FLUSH time, not the prompt time.
+fn display_prefix_from_transcript(
+    turns: &[jeikcode_capabilities::session::TurnRecord],
+    boundary_ts: Option<u64>,
+    boundary_user: Option<&str>,
+) -> Vec<MessageInfo> {
+    let boundary_text = boundary_user.map(normalized_display_text);
+    let split = turns
+        .iter()
+        .position(|turn| match boundary_ts {
+            Some(ts) if ts > 0 => u64::try_from(turn.ts).map(|t| t >= ts).unwrap_or(false),
+            _ => boundary_text
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .is_some_and(|text| {
+                    let user = normalized_display_text(&turn.user);
+                    !user.is_empty() && (text.starts_with(&user) || user.starts_with(text))
+                }),
+        })
+        .unwrap_or(turns.len());
+
+    const ID_PREFIX: &str = "transcript";
+    // Display-only reconstruction: these rows have no kernel counterpart, so
+    // mutation APIs (edit/delete/regenerate by array index) must stay disabled.
+    const DISPLAY_ORIGIN: &str = "transcript_archive";
+    let mut rows = Vec::new();
+    for turn in &turns[..split] {
+        if !turn.user.trim().is_empty() {
+            rows.push(MessageInfo {
+                role: "user".into(),
+                id: Some(format!("{ID_PREFIX}-{}-user", turn.turn_id)),
+                content: cap_display_field(turn.user.clone()),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: Some(DISPLAY_ORIGIN.into()),
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+            });
+        }
+        let calls: Vec<ToolCallInfo> = turn
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| ToolCallInfo {
+                id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
+                name: tool.name.clone(),
+                arguments: cap_display_field(tool.args.clone()),
+                display: format_tool_args(&tool.name, &tool.args),
+            })
+            .collect();
+        let has_assistant = !turn.assistant.trim().is_empty()
+            || !turn.reasoning.trim().is_empty()
+            || !calls.is_empty();
+        if !has_assistant {
+            continue;
+        }
+        rows.push(MessageInfo {
+            role: "assistant".into(),
+            id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
+            content: cap_display_field(turn.assistant.clone()),
+            reasoning: (!turn.reasoning.trim().is_empty())
+                .then(|| cap_display_field(turn.reasoning.clone())),
+            synthetic: false,
+            internal_origin: Some(DISPLAY_ORIGIN.into()),
+            tool_calls: (!calls.is_empty()).then_some(calls),
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: u64::try_from(turn.ts).ok(),
+            elapsed_ms: None,
+        });
+        for (index, tool) in turn.tools.iter().enumerate() {
+            rows.push(MessageInfo {
+                role: "tool".into(),
+                id: Some(format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id)),
+                content: cap_display_field(tool.result.clone()),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: Some(DISPLAY_ORIGIN.into()),
+                tool_calls: None,
+                tool_result: Some(ToolResultInfo {
+                    call_id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
+                    success: !tool.is_error,
+                    summary: tool_result_summary(&tool.result),
+                    line_count: tool.result.lines().count(),
+                }),
+                artifacts: None,
+                images: None,
+                created_at: u64::try_from(turn.ts).ok(),
+                elapsed_ms: None,
+            });
+        }
+    }
+    rows
+}
+
+/// Splice the transcript-rebuilt prefix ahead of the snapshot's retained tail.
+/// The compaction anchor itself is model context, not a display row; the real
+/// rows before it are covered by the transcript and are dropped to avoid a
+/// duplicate "你好啊". Invisible scaffolding and display-only presentation rows
+/// are preserved. Tool rows before the anchor are always covered by the prefix.
+fn splice_compacted_display(
+    mut messages: Vec<MessageInfo>,
+    prefix: Vec<MessageInfo>,
+) -> Vec<MessageInfo> {
+    if prefix.is_empty() {
+        return messages;
+    }
+    let Some(anchor) = messages.iter().position(|m| {
+        m.role.eq_ignore_ascii_case("user")
+            && m.synthetic
+            && jeikcode_capabilities::compaction::is_compaction_anchor_text(&m.content)
+    }) else {
+        return messages;
+    };
+
+    let prefix_users: Vec<String> = prefix
+        .iter()
+        .filter(|m| m.role.eq_ignore_ascii_case("user"))
+        .map(|m| m.content.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+    let prefix_assistants: Vec<String> = prefix
+        .iter()
+        .filter(|m| m.role.eq_ignore_ascii_case("assistant"))
+        .map(|m| m.content.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    let (head, rest) = messages.split_at(anchor);
+    let tail = rest.get(1..).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(prefix.len() + head.len() + tail.len());
+    out.extend(prefix);
+    for message in head {
+        if message.role.eq_ignore_ascii_case("system") || message.synthetic {
+            out.push(message.clone());
+            continue;
+        }
+        let text = message.content.trim();
+        if message.role.eq_ignore_ascii_case("user")
+            && prefix_users.iter().any(|prefix_text| {
+                !prefix_text.is_empty()
+                    && (text.starts_with(prefix_text.as_str()) || prefix_text.starts_with(text))
+            })
+        {
+            continue;
+        }
+        if message.role.eq_ignore_ascii_case("assistant")
+            && prefix_assistants
+                .iter()
+                .any(|prefix_text| prefix_text == text)
+        {
+            continue;
+        }
+        if message.role.eq_ignore_ascii_case("tool") {
+            continue;
+        }
+        out.push(message.clone());
+    }
+    out.extend(tail.iter().cloned());
+    out
+}
+
+/// Full agent-loop duration for each turn's last assistant display record.
+/// Compaction preserves full turn durations only for the recent turn stats;
+/// older turns keep their per-round `MessageMeta.elapsed_ms`. Returns an index
+/// map instead of mutating the cached display records.
+fn display_turn_elapsed_overrides(
+    records: &[jeikcode_capabilities::session::DisplayRecord],
+    stats: &[jeikcode_capabilities::session::TurnStat],
+) -> std::collections::HashMap<usize, u64> {
+    use std::collections::HashMap;
+    let durations: HashMap<u64, u64> = stats
+        .iter()
+        .filter(|stat| stat.position_valid && stat.turn_id != 0 && stat.duration_ms > 0)
+        .map(|stat| (stat.turn_id, stat.duration_ms))
+        .collect();
+    let mut last_assistant: HashMap<u64, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.role.eq_ignore_ascii_case("assistant") && record.turn_id != 0 {
+            last_assistant.insert(record.turn_id, index);
+        }
+    }
+    last_assistant
+        .into_iter()
+        .filter_map(|(turn_id, index)| durations.get(&turn_id).map(|duration| (index, *duration)))
+        .collect()
+}
+
+/// The invisible session-start prefix (system prompts + synthetic instructions)
+/// that precedes the first real user turn. A hook-created display log starts at
+/// that user, so the read path prepends this prefix to keep `sourceIndex` aligned
+/// with the snapshot fallback (old caches, right-rail indices, jump anchors).
+fn display_prefix_messages(
+    session: &crate::legacy_convert::CatalogSessionView,
+) -> Vec<MessageInfo> {
+    let working_dir = std::path::Path::new(&session.meta.working_dir);
+    let mut out = Vec::new();
+    for message in &session.snapshot.messages {
+        if message.role == jeikcode_kernel::message::Role::User && !message.synthetic {
+            break;
+        }
+        out.push(MessageInfo::from_kernel_in(message, Some(working_dir)));
+    }
+    out
+}
+
+/// Convert one display-log record to the API shape the WebUI/TUI already render.
+fn display_record_to_message_info(
+    record: &jeikcode_capabilities::session::DisplayRecord,
+) -> MessageInfo {
+    let mut content = cap_display_field(record.content.clone());
+    let mut images = (!record.images.is_empty()).then(|| {
+        record
+            .images
+            .iter()
+            .map(|image| ImageData {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+                missing: image.missing,
+            })
+            .collect::<Vec<_>>()
+    });
+    if record.role.eq_ignore_ascii_case("user") {
+        let (display, had_vision_marker) = strip_vision_marker(&content);
+        if had_vision_marker {
+            content = display;
+            if images.is_none() {
+                images = Some(vec![ImageData::missing_placeholder()]);
+            }
+        }
+    }
+    let tool_calls = (!record.tool_calls.is_empty()).then(|| {
+        record
+            .tool_calls
+            .iter()
+            .map(|call| ToolCallInfo {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: cap_display_field(call.arguments.clone()),
+                display: format_tool_args(&call.name, &call.arguments),
+            })
+            .collect::<Vec<_>>()
+    });
+    let tool_result = record
+        .role
+        .eq_ignore_ascii_case("tool")
+        .then(|| ToolResultInfo {
+            call_id: record.tool_call_id.clone().unwrap_or_default(),
+            success: !record.is_error,
+            summary: tool_result_summary(&record.content),
+            line_count: record.content.lines().count(),
+        });
+    let artifacts = extract_artifacts_from_call_fields(
+        record
+            .tool_calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.arguments.as_str())),
+    );
+    MessageInfo {
+        role: record.role.clone(),
+        id: record.id.clone(),
+        content,
+        reasoning: record.reasoning.clone().map(cap_display_field),
+        synthetic: record.synthetic,
+        internal_origin: record.internal_origin.clone(),
+        tool_calls,
+        tool_result,
+        artifacts,
+        images,
+        created_at: record.created_at,
+        elapsed_ms: record.elapsed_ms,
+    }
+}
+
+/// Mark display-log rows that no longer exist in the kernel snapshot as
+/// display-only/read-only. Compaction drains model context while the display
+/// log stays append-only; editing such a row by id would return "message not
+/// found". The WebUI already renders `transcript_archive` rows as read-only.
+fn mark_display_only_archive_rows(
+    records: &[jeikcode_capabilities::session::DisplayRecord],
+    messages: &mut [MessageInfo],
+    snapshot_ids: &std::collections::HashSet<&str>,
+    persisted_last_turn: u64,
+    mark_latest: bool,
+) {
+    for (record, message) in records.iter().zip(messages.iter_mut()) {
+        // A turn beyond the persisted boundary is ahead of the snapshot; the
+        // latest turn may also race a snapshot save. Only mark it when the
+        // caller has proved the session is idle and the log is not ahead.
+        if record.turn_id > persisted_last_turn {
+            continue;
+        }
+        if record.turn_id == persisted_last_turn && !mark_latest {
+            continue;
+        }
+        if message.internal_origin.is_some() {
+            continue;
+        }
+        let Some(id) = message.id.as_deref() else {
+            continue;
+        };
+        if !snapshot_ids.contains(id) {
+            message.internal_origin = Some("transcript_archive".to_string());
+        }
+    }
+}
+
+/// Project an already-computed fallback display list into the append-only log.
+/// Used once for old sessions; future turns are written by `DisplayHook`.
+fn display_record_from_message_info(
+    session_id: &str,
+    index: usize,
+    message: &MessageInfo,
+) -> jeikcode_capabilities::session::DisplayRecord {
+    jeikcode_capabilities::session::DisplayRecord {
+        v: jeikcode_capabilities::session::DISPLAY_VERSION,
+        session_id: session_id.to_string(),
+        // Backfill rows have no kernel turn identity; the meta's `last_turn_id`
+        // carries the real coverage boundary for subsequent appends.
+        turn_id: 0,
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        role: message.role.clone(),
+        id: message.id.clone(),
+        content: message.content.clone(),
+        reasoning: message.reasoning.clone(),
+        synthetic: message.synthetic,
+        internal_origin: message.internal_origin.clone(),
+        tool_calls: message
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| jeikcode_capabilities::session::DisplayToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tool_call_id: message
+            .tool_result
+            .as_ref()
+            .map(|result| result.call_id.clone()),
+        is_error: message
+            .tool_result
+            .as_ref()
+            .is_some_and(|result| !result.success),
+        images: message
+            .images
+            .as_ref()
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| jeikcode_capabilities::session::DisplayImage {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                        missing: image.missing,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        created_at: message.created_at,
+        elapsed_ms: message.elapsed_ms,
     }
 }
 
@@ -5272,6 +6230,13 @@ async fn append_session_messages(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
         }
     };
+
+    // UI-only presentation entries live outside the conversation; the display
+    // log no longer matches. Drop it so the next read rebuilds from the merged
+    // snapshot + presentation projection.
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&project_hash));
+    let _ = manager.invalidate_display(&session_id);
 
     let response = AppendSessionMessagesResponse {
         success: true,
@@ -5879,7 +6844,23 @@ fn resolve_target_message_index(
     target_index: usize,
     expected_text: Option<&str>,
     expected_role: Option<&str>,
+    expected_message_id: Option<&str>,
 ) -> Option<usize> {
+    // The display list and the kernel snapshot are different coordinate
+    // systems: compaction, filtered system rows and reconstructed prefix rows
+    // make `sourceIndex` differ from the snapshot array index. A persisted
+    // message id is the only unambiguous identity. If the caller supplied one
+    // but it is gone (stale view), fail closed instead of fuzzy-matching and
+    // editing the wrong neighbour.
+    if let Some(id) = expected_message_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return messages
+            .iter()
+            .position(|message| message.id.as_deref() == Some(id));
+    }
+
     let role_matches = |role: &jeikcode_kernel::message::Role| -> bool {
         expected_role.map_or(true, |r| match role {
             jeikcode_kernel::message::Role::System => r.eq_ignore_ascii_case("system"),
@@ -6074,6 +7055,7 @@ async fn patch_session_message(
             index,
             req.expected_text.as_deref(),
             req.expected_role.as_deref(),
+            req.expected_message_id.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -6094,6 +7076,9 @@ async fn patch_session_message(
                 .collect();
         }
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        // Explicit mutation: the append-only display log no longer matches the
+        // edited snapshot. Drop it; the next read backfills from the new state.
+        let _ = manager.invalidate_display(&id);
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
@@ -6188,6 +7173,7 @@ async fn delete_session_message(
             index,
             query.expected_text.as_deref(),
             query.expected_role.as_deref(),
+            query.expected_message_id.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -6239,6 +7225,9 @@ async fn delete_session_message(
         snapshot.turn_counter = turn_c;
         snapshot.request_counter = req_c;
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        // Explicit mutation: the append-only display log no longer matches the
+        // edited snapshot. Drop it; the next read backfills from the new state.
+        let _ = manager.invalidate_display(&id);
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
         meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
@@ -6340,6 +7329,7 @@ async fn truncate_session(
             req.target_index,
             req.expected_text.as_deref(),
             req.expected_role.as_deref(),
+            req.target_message_id.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -6361,6 +7351,9 @@ async fn truncate_session(
         snapshot.turn_counter = turn_c;
         snapshot.request_counter = req_c;
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        // Explicit mutation: the append-only display log no longer matches the
+        // edited snapshot. Drop it; the next read backfills from the new state.
+        let _ = manager.invalidate_display(&id);
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
         meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
@@ -6468,6 +7461,7 @@ async fn fork_session(
                 target_index,
                 req.expected_text.as_deref(),
                 req.expected_role.as_deref(),
+                req.target_message_id.as_deref(),
             ) {
                 if req.inclusive.unwrap_or(true) {
                     (real_index + 1).min(source.snapshot.messages.len())
@@ -17950,6 +18944,114 @@ mod tests {
     }
 
     #[test]
+    fn display_backfill_round_trip_preserves_read_only_origin() {
+        use jeikcode_kernel::message::Message;
+
+        // Reconstructed prefix rows are display-only; the WebUI disables
+        // edit/delete/regenerate from `internal_origin`. A backfill must not
+        // drop that marker when it projects MessageInfo into DisplayRecord and
+        // back (otherwise the UI could edit a row the kernel does not have).
+        let mut msg = Message::assistant("archived answer", Vec::new());
+        msg.id = Some("m-archive".to_string());
+        msg.internal_origin = Some("transcript_archive".to_string());
+        let info = MessageInfo::from_kernel(&msg);
+        let record = display_record_from_message_info("s1", 0, &info);
+        let round = display_record_to_message_info(&record);
+
+        assert_eq!(round.id.as_deref(), Some("m-archive"));
+        assert_eq!(round.internal_origin.as_deref(), Some("transcript_archive"));
+    }
+
+    fn archive_record(turn_id: u64, id: &str) -> jeikcode_capabilities::session::DisplayRecord {
+        jeikcode_capabilities::session::DisplayRecord {
+            v: jeikcode_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id,
+            index: 0,
+            role: "user".into(),
+            id: Some(id.into()),
+            content: id.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: None,
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn display_log_cache_hits_until_the_log_or_meta_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = NativeSessionManager::with_root(dir.path());
+        mgr.write_display_backfill("s-cache", &[archive_record(1, "m-a")], 1)
+            .unwrap();
+        let cache = std::sync::Mutex::new(None);
+
+        let (_, first) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
+        let (_, second) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged log must be a cache hit"
+        );
+
+        // A backfill rewrites both the log and its meta; the fingerprint must
+        // invalidate instead of serving the old transcript.
+        mgr.write_display_backfill(
+            "s-cache",
+            &[archive_record(1, "m-a"), archive_record(2, "m-b")],
+            2,
+        )
+        .unwrap();
+        let (_, third) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "changed log must bypass the cache"
+        );
+        assert_eq!(third.len(), 2);
+    }
+
+    #[test]
+    fn compacted_display_rows_are_marked_read_only() {
+        let mut old = archive_record(1, "m-old");
+        old.index = 0;
+        let mut current = archive_record(2, "m-current");
+        current.index = 1;
+        let mut transient = archive_record(2, "m-transient");
+        transient.index = 2;
+        let records = vec![old, current, transient];
+        let mut messages = records
+            .iter()
+            .map(display_record_to_message_info)
+            .collect::<Vec<_>>();
+        let snapshot_ids = std::collections::HashSet::from(["m-current"]);
+
+        mark_display_only_archive_rows(&records, &mut messages, &snapshot_ids, 2, false);
+
+        // Drained by compaction, absent from the snapshot -> read-only.
+        assert_eq!(
+            messages[0].internal_origin.as_deref(),
+            Some("transcript_archive")
+        );
+        // Still present in the snapshot -> editable.
+        assert_eq!(messages[1].internal_origin, None);
+        // Latest turn may race the snapshot save; do not flash read-only.
+        assert_eq!(messages[2].internal_origin, None);
+
+        // Once the caller proves the session is idle and the log is not ahead,
+        // a missing id on the last turn is genuinely drained: mark it too.
+        mark_display_only_archive_rows(&records, &mut messages, &snapshot_ids, 2, true);
+        assert_eq!(
+            messages[2].internal_origin.as_deref(),
+            Some("transcript_archive")
+        );
+        assert_eq!(messages[1].internal_origin, None);
+    }
+
+    #[test]
     fn artifact_detector_does_not_repeat_full_code_block_content_on_close() {
         let mut detector = ArtifactDetector::new();
         assert!(matches!(
@@ -18290,6 +19392,33 @@ mod tests {
     }
 
     #[test]
+    fn attach_image_sets_uses_the_newest_sets_after_compaction() {
+        let image = |data: &str| ImageData {
+            media_type: "image/png".into(),
+            data: data.into(),
+            missing: false,
+        };
+        let mut messages = vec![MessageInfo {
+            role: "user".into(),
+            id: None,
+            content: "new question".into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: Some(vec![ImageData::missing_placeholder()]),
+            created_at: None,
+            elapsed_ms: None,
+        }];
+        // Two sidecar sets accumulated; the oldest placeholder was drained by
+        // compaction. The surviving question must receive the NEWEST image.
+        attach_image_sets(&mut messages, vec![vec![image("old")], vec![image("new")]]);
+        assert_eq!(messages[0].images.as_ref().unwrap()[0].data, "new");
+    }
+
+    #[test]
     fn list_files_returns_files_skips_dirs_and_hidden() {
         let tmp = std::env::temp_dir().join(format!("jeikcode_list_files_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -18573,6 +19702,329 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
         .await
         .into_response();
         assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Real-session stability probe. Skipped by default; run with:
+    /// `JEIKCODE_REAL_SESSION_DIR=<bucket> JEIKCODE_REAL_SESSION_ID=<id> \
+    ///  cargo test -p jeikcode-daemon --lib real_session_display_projection_stability -- --ignored`
+    #[ignore = "requires a real session bucket via JEIKCODE_REAL_SESSION_DIR"]
+    #[tokio::test]
+    async fn real_session_display_projection_stability() {
+        use jeikcode_kernel::message::Message;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let (Ok(source_dir), Ok(id)) = (
+            std::env::var("JEIKCODE_REAL_SESSION_DIR"),
+            std::env::var("JEIKCODE_REAL_SESSION_ID"),
+        ) else {
+            return;
+        };
+        let source_dir = std::path::PathBuf::from(source_dir);
+        let Some(project_hash) = source_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let sessions_root = NativeSessionManager::sessions_root();
+        let dest = sessions_root.join(&project_hash);
+        std::fs::create_dir_all(&dest).unwrap();
+        for entry in std::fs::read_dir(&source_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&id) || name.ends_with(".lease") || name.ends_with(".meta.lock") {
+                continue;
+            }
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dest.join(&name)).unwrap();
+            }
+        }
+
+        let read = |tail: Option<usize>, offset: Option<usize>, limit: Option<usize>| {
+            let state = state.clone();
+            let hash = project_hash.clone();
+            let id = id.clone();
+            async move {
+                let response = get_session_detail(
+                    State(state),
+                    Path((hash, id)),
+                    Query(SessionDetailQuery {
+                        tail,
+                        offset,
+                        limit,
+                    }),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        // 1. Cold start without a display log: fallback projection + backfill.
+        let first = read(Some(48), None, None).await;
+        let first_count = first["message_count"].as_u64().unwrap();
+        let first_turns = first["turns"].as_array().unwrap().clone();
+        assert!(first_count > 100, "real session should be long");
+        assert!(!first_turns.is_empty());
+        let manager = NativeSessionManager::with_root(dest.clone());
+        let (display_meta, _) = manager.read_display(&id).unwrap().expect("backfill");
+        assert!(display_meta.backfilled);
+
+        // 2. Second read must use the display log and produce the same projection.
+        let second = read(Some(48), None, None).await;
+        assert_eq!(second["message_count"].as_u64().unwrap(), first_count);
+        assert_eq!(second["turns"].as_array().unwrap().len(), first_turns.len());
+        assert_eq!(
+            second["messages"], first["messages"],
+            "display-log projection must match the backfill's first paint"
+        );
+
+        // 3. Page all the way back. Every absolute row must appear exactly once,
+        // every turn outline index must be a user row, and every tool result must
+        // pair with a tool call.
+        let collect = |page: &serde_json::Value, merged: &mut BTreeMap<i64, serde_json::Value>| {
+            let offset = page["offset"].as_i64().unwrap();
+            let pinned = page["pinned_user_index"].as_i64();
+            for (index, message) in page["messages"].as_array().unwrap().iter().enumerate() {
+                let absolute = if index == 0 {
+                    pinned.unwrap_or(offset)
+                } else if pinned.is_some() {
+                    offset + index as i64 - 1
+                } else {
+                    offset + index as i64
+                };
+                // Turn-aligned pages may overlap a previous raw page. The UI's
+                // mergeOlderMessages dedups by sourceIndex; overlapping copies
+                // must be byte-identical, otherwise the projection is unstable.
+                if let Some(previous) = merged.get(&absolute) {
+                    assert_eq!(
+                        previous, message,
+                        "overlapping row {absolute} changed between pages"
+                    );
+                } else {
+                    merged.insert(absolute, message.clone());
+                }
+            }
+        };
+        let mut merged = BTreeMap::new();
+        collect(&first, &mut merged);
+        let mut offset = first["offset"].as_u64().unwrap() as usize;
+        let mut pages = 1usize;
+        while offset > 0 {
+            let request = offset.saturating_sub(48);
+            let page = read(None, Some(request), Some(48)).await;
+            let next = page["offset"].as_u64().unwrap() as usize;
+            assert!(next < offset, "paging cursor must move backwards");
+            collect(&page, &mut merged);
+            offset = next;
+            pages += 1;
+            assert!(pages < 10_000, "paging runaway");
+        }
+        assert_eq!(
+            merged.len() as u64,
+            first_count,
+            "paged union must cover every transcript row"
+        );
+        let mut tool_calls = BTreeSet::new();
+        let mut result_calls = Vec::new();
+        let mut user_indices = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        for (absolute, message) in &merged {
+            if message["role"] == "user" {
+                user_indices.insert(*absolute);
+            }
+            if let Some(id) = message["id"].as_str() {
+                assert!(ids.insert(id.to_string()), "duplicate message id {id}");
+            }
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                if let Some(call_id) = call["id"].as_str() {
+                    tool_calls.insert(call_id.to_string());
+                }
+            }
+            if let Some(result) = message["tool_result"].as_object() {
+                if let Some(call_id) = result.get("call_id").and_then(|value| value.as_str()) {
+                    result_calls.push(call_id.to_string());
+                }
+            }
+        }
+        for turn in &first_turns {
+            let index = turn["index"].as_i64().unwrap();
+            assert!(
+                user_indices.contains(&index),
+                "turn outline index {index} is missing from the paged union"
+            );
+        }
+        for call_id in result_calls {
+            assert!(
+                tool_calls.contains(&call_id),
+                "tool result {call_id} has no tool call"
+            );
+        }
+
+        // 4. Compaction must not change the display projection.
+        let original = manager.load_native_session(&id).unwrap();
+        let mut compacted = original.snapshot.clone();
+        compacted.messages = vec![
+            Message::synthetic_user("<!-- jeikcode:anchor v1 -->\nsummary"),
+            original.snapshot.messages.last().cloned().unwrap(),
+        ];
+        manager.save_snapshot(&id, &compacted).unwrap();
+        let after_compaction = read(Some(48), None, None).await;
+        assert_eq!(
+            after_compaction["message_count"].as_u64().unwrap(),
+            first_count
+        );
+        assert_eq!(
+            after_compaction["turns"].as_array().unwrap().len(),
+            first_turns.len()
+        );
+        assert_eq!(after_compaction["messages"], first["messages"]);
+        manager.save_snapshot(&id, &original.snapshot).unwrap();
+
+        // 5. An explicit mutation invalidates the log; the next read rebuilds.
+        manager.invalidate_display(&id).unwrap();
+        let rebuilt = read(Some(48), None, None).await;
+        assert_eq!(rebuilt["message_count"].as_u64().unwrap(), first_count);
+        assert_eq!(
+            rebuilt["turns"].as_array().unwrap().len(),
+            first_turns.len()
+        );
+        assert_eq!(rebuilt["messages"], first["messages"]);
+        assert!(manager.read_display(&id).unwrap().unwrap().0.backfilled);
+
+        // 6. A partial final line (crash) must not hide the complete log.
+        let display_path = manager.display_path(&id).unwrap();
+        let mut bytes = std::fs::read(&display_path).unwrap();
+        bytes.extend_from_slice(b"{\"v\":1");
+        std::fs::write(&display_path, bytes).unwrap();
+        let after_partial = read(Some(48), None, None).await;
+        assert_eq!(
+            after_partial["message_count"].as_u64().unwrap(),
+            first_count
+        );
+        assert_eq!(after_partial["messages"], first["messages"]);
+    }
+
+    #[tokio::test]
+    async fn session_detail_backfills_then_prefers_the_display_log() {
+        use jeikcode_capabilities::session::{
+            DisplayRecord, PresentationFile, SessionMeta, StorageOwner, DISPLAY_VERSION,
+        };
+        use jeikcode_kernel::message::{Message, SessionSnapshot};
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let project_hash = NativeSessionManager::project_hash(&working_dir);
+        let manager = NativeSessionManager::for_project(&working_dir);
+        let id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("SNAPSHOT Q"),
+            Message::assistant("SNAPSHOT A", Vec::new()),
+        ]);
+        let mut meta = SessionMeta::new(id, working_dir.to_string_lossy(), 100);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 2;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let read = |state: AppState, project_hash: String, id: &'static str| async move {
+            let response = get_session_detail(
+                State(state),
+                Path((project_hash, id.to_string())),
+                Query(SessionDetailQuery {
+                    tail: Some(48),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        // First read: no display log -> snapshot fallback, then a backfill.
+        let value = read(state.clone(), project_hash.clone(), id).await;
+        let texts: Vec<String> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str().map(str::to_string))
+            .collect();
+        assert!(texts.iter().any(|text| text == "SNAPSHOT Q"));
+        let (display_meta, _) = manager.read_display(id).unwrap().unwrap();
+        assert!(display_meta.backfilled);
+
+        // Replace the log with a distinctive projection; the next read must
+        // prefer it over the snapshot (proves the display source is wired).
+        let records = vec![
+            DisplayRecord {
+                v: DISPLAY_VERSION,
+                session_id: id.into(),
+                turn_id: 0,
+                index: 0,
+                role: "user".into(),
+                id: None,
+                content: "DISPLAY ONLY Q".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(1),
+                elapsed_ms: None,
+            },
+            DisplayRecord {
+                v: DISPLAY_VERSION,
+                session_id: id.into(),
+                turn_id: 0,
+                index: 1,
+                role: "assistant".into(),
+                id: None,
+                content: "DISPLAY ONLY A".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(2),
+                elapsed_ms: None,
+            },
+        ];
+        manager.write_display_backfill(id, &records, 0).unwrap();
+        let value = read(state, project_hash, id).await;
+        let texts: Vec<String> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str().map(str::to_string))
+            .collect();
+        assert!(texts.iter().any(|text| text == "DISPLAY ONLY Q"));
+        assert!(!texts.iter().any(|text| text == "SNAPSHOT Q"));
     }
 }
 
@@ -18898,8 +20350,13 @@ mod channel_mode_tests {
         ];
 
         // 1. 通过正文匹配
-        let idx1 =
-            resolve_target_message_index(&messages, 1, Some("这是正式回答"), Some("assistant"));
+        let idx1 = resolve_target_message_index(
+            &messages,
+            1,
+            Some("这是正式回答"),
+            Some("assistant"),
+            None,
+        );
         assert_eq!(idx1, Some(1));
 
         // 2. 通过思考过程匹配
@@ -18908,17 +20365,49 @@ mod channel_mode_tests {
             1,
             Some("这是详细的思考过程"),
             Some("assistant"),
+            None,
         );
         assert_eq!(idx2, Some(1));
 
         // 3. 通过前端拼接的全文（思考过程 + 正文）匹配
         let combined = "这是详细的思考过程\n这是正式回答";
-        let idx3 = resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"));
+        let idx3 =
+            resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"), None);
         assert_eq!(idx3, Some(1));
 
         // 4. 第二轮助手匹配
-        let idx4 = resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"));
+        let idx4 =
+            resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"), None);
         assert_eq!(idx4, Some(3));
+
+        // Display indices are not snapshot indices. The persisted id must win
+        // even when an older index points at a different message with the same
+        // text, and a stale id must fail closed instead of editing a neighbour.
+        let mut first = Message::user("同一句");
+        first.id = Some("m-first".into());
+        let mut second = Message::user("同一句");
+        second.id = Some("m-second".into());
+        let duplicate_text = vec![first, second];
+        assert_eq!(
+            resolve_target_message_index(
+                &duplicate_text,
+                0,
+                Some("同一句"),
+                Some("user"),
+                Some("m-second"),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_target_message_index(
+                &duplicate_text,
+                0,
+                Some("同一句"),
+                Some("user"),
+                Some("m-gone"),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -18941,9 +20430,14 @@ mod channel_mode_tests {
         ];
 
         // 模拟删除问题1的 Agent 回复（从中间输出到最终回答，保留问题1的 User 消息）
-        let target_idx =
-            resolve_target_message_index(&messages, 3, Some("问题1最终回答"), Some("assistant"))
-                .unwrap();
+        let target_idx = resolve_target_message_index(
+            &messages,
+            3,
+            Some("问题1最终回答"),
+            Some("assistant"),
+            None,
+        )
+        .unwrap();
         assert_eq!(target_idx, 3);
 
         // 模拟 delete_turn: false 下的 Agent 范围清理逻辑

@@ -27,9 +27,9 @@ use jeikcode_capabilities::memory::MemoryHook;
 
 use jeikcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use jeikcode_capabilities::session::{
-    DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionContextHook,
-    SessionLease, SessionManager, SessionMeta, SnapshotHook, StatusReminderHook, StorageOwner,
-    TranscriptHook,
+    DisplayAnchor, DisplayHook, PresentationEntry, PresentationFile, PresentationRole,
+    SessionContextHook, SessionLease, SessionManager, SessionMeta, SnapshotHook,
+    StatusReminderHook, StorageOwner, TranscriptHook,
 };
 use jeikcode_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
@@ -320,8 +320,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
-    let bash_runtime =
-        reuse_bash_runtime.unwrap_or_else(jeikcode_capabilities::tools::legacy_bash_runtime_state);
+    // 每个 CodingRuntime 独占一个 BashRuntimeState：只有同一 runtime 的能力重载
+    // （Reprepare / 同会话 reconfigure）才复用旧状态，以便后台任务与关键词继续可见。
+    // 绝不能回退到进程级 `legacy_bash_runtime_state()`——那会让同进程内多个会话共享
+    // 一个任务注册表，导致 A 会话 Stop/被回收时误杀 B 会话正在执行的前台 run_command。
+    let bash_runtime = reuse_bash_runtime.unwrap_or_else(|| Arc::new(BashRuntimeState::new()));
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
@@ -640,6 +643,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     };
 
     if let Some(b) = &session {
+        // Bind the runtime state to this session so every live bash task it registers
+        // is attributable to (and cancellable only by) this session.
+        bash_runtime.bind_session(b.id.as_str());
         let keywords = b.manager.load_bash_keywords(&b.id).unwrap_or_default();
         if let Ok(path) = b.manager.bashkw_path(&b.id) {
             bash_runtime.bind_session_long_keywords(path, keywords);
@@ -743,6 +749,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             TranscriptHook::new(b.manager.clone(), &b.id)
                 .with_persistence_status(snapshot_hook.persistence_status()),
         ));
+        // UI-only append-only transcript: compaction never touches it, so the
+        // question rail and canvas keep every turn (including images).
+        hooks.push(Arc::new(DisplayHook::new(
+            b.manager.clone(),
+            &b.id,
+            &cfg.working_dir,
+        )));
     }
     // Status awareness is UNCONDITIONAL: a per-turn <system-reminder> with the calendar
     // date (NO context-usage gauge — pressure is handled silently by auto-compaction).
@@ -2787,6 +2800,54 @@ mod tests {
         .unwrap();
 
         assert!(Arc::ptr_eq(&parts.bash_runtime, &bash_runtime));
+    }
+
+    /// Regression guard: two sessions in one process must NOT share a Bash registry.
+    /// A shared registry let one session's Stop cancel the other session's foreground
+    /// command (`[task was canceled by bash kill tool]`).
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn distinct_prepares_isolate_bash_runtime_state_per_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+
+        let a = prepare_with_plugin_hooks_reusing_lease(
+            &cfg,
+            opts.clone(),
+            Vec::new(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = prepare_with_plugin_hooks_reusing_lease(&cfg, opts, Vec::new(), None, true, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&a.bash_runtime, &b.bash_runtime),
+            "each runtime must own its own BashRuntimeState"
+        );
+        let a_sid = a
+            .session
+            .as_ref()
+            .expect("fresh session binding")
+            .id
+            .clone();
+        let b_sid = b
+            .session
+            .as_ref()
+            .expect("fresh session binding")
+            .id
+            .clone();
+        assert_ne!(a_sid, b_sid);
+        assert_eq!(a.bash_runtime.session_id().as_deref(), Some(a_sid.as_str()));
+        assert_eq!(b.bash_runtime.session_id().as_deref(), Some(b_sid.as_str()));
     }
 
     #[tokio::test]

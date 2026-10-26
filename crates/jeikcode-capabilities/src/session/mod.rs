@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod context;
+pub mod display;
 pub mod instructions;
 pub mod manager;
 mod mtime_file;
@@ -38,6 +39,9 @@ pub mod user_wrap;
 #[cfg(feature = "tools")]
 pub use crate::tools::write_state::WriteStateHook;
 pub use context::SessionContextHook;
+pub use display::{
+    DisplayHook, DisplayImage, DisplayMeta, DisplayRecord, DisplayToolCall, DISPLAY_VERSION,
+};
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
     CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,

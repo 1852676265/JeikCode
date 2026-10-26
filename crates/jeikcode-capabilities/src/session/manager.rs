@@ -1599,7 +1599,7 @@ impl SessionManager {
         )
     }
 
-    fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
+    pub(crate) fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
         validate_session_id(id)?;
         Ok(self.root.join(format!("{id}.{extension}")))
     }
@@ -3208,6 +3208,8 @@ impl SessionManager {
             self.rewind_transaction_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
+            self.display_path(id)?,
+            self.display_meta_path(id)?,
             self.presentation_path(id)?,
             self.legacy_path(id)?,
             self.bashkw_path(id)?,
@@ -3237,7 +3239,52 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Read the append-only raw transcript (`<id>.jsonl`) for UI reconstruction.
+    ///
+    /// Compaction drains messages from the model snapshot but never from this file,
+    /// so display consumers use it to rebuild the pre-compaction history. Missing
+    /// file = an empty transcript (a brand-new session has not flushed a turn yet).
+    pub fn read_transcript_turns(
+        &self,
+        id: &str,
+    ) -> SessionResult<Vec<super::transcript::TurnRecord>> {
+        let path = self.jsonl_path(id)?;
+        let mut out = Vec::new();
+        match for_each_jsonl_line(&path, |line| {
+            if out.len() >= MAX_JSONL_LINES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "transcript lines",
+                    limit: MAX_JSONL_LINES,
+                    actual: out.len() + 1,
+                });
+            }
+            let record: super::transcript::TurnRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: error.to_string(),
+                })?;
+            out.push(record);
+            Ok(())
+        }) {
+            Ok(_) => Ok(out),
+            Err(SessionStoreError::NotFound { .. }) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
+        let path = self.jsonl_path(id)?;
+        self.append_jsonl_line_at(id, &path, "transcript", line)
+    }
+
+    /// Bounded append to any session-owned JSONL file (transcript / display).
+    pub(crate) fn append_jsonl_line_at(
+        &self,
+        id: &str,
+        path: &Path,
+        kind: &'static str,
+        line: &[u8],
+    ) -> SessionResult<()> {
         self.ensure_native_writable(id, "append transcript")?;
         if line.len() > MAX_JSONL_LINE_BYTES {
             return Err(SessionStoreError::TooLarge {
@@ -3246,33 +3293,52 @@ impl SessionManager {
                 actual: line.len(),
             });
         }
-        let path = self.jsonl_path(id)?;
         fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
         // Windows security software and indexers can briefly deny an open or
         // lock while inspecting a newly-updated file. Retry only those
         // pre-write operations: retrying write_all itself could duplicate a
         // partially-written JSONL record.
-        let mut file = retry_transient_file_access(|| open_append_file(&path))?;
+        let mut file = retry_transient_file_access(|| open_append_file(path))?;
         retry_transient_file_access(|| {
-            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
+            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(path, e))
         })?;
         let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
             .unwrap_or(usize::MAX);
         let next = current
             .checked_add(line.len())
             .ok_or(SessionStoreError::TooLarge {
-                kind: "transcript",
+                kind,
                 limit: MAX_JSONL_BYTES,
                 actual: usize::MAX,
             })?;
         if next > MAX_JSONL_BYTES {
             return Err(SessionStoreError::TooLarge {
-                kind: "transcript",
+                kind,
                 limit: MAX_JSONL_BYTES,
                 actual: next,
             });
         }
-        file.write_all(line).map_err(|e| io_at(&path, e))
+        file.write_all(line).map_err(|e| io_at(path, e))
+    }
+
+    pub(crate) fn read_bytes_bounded(
+        &self,
+        path: &Path,
+        kind: &'static str,
+        limit: usize,
+    ) -> SessionResult<Vec<u8>> {
+        read_regular_file_bounded(path, kind, limit)
+    }
+
+    pub(crate) fn write_bytes_atomic(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        kind: &'static str,
+        limit: usize,
+    ) -> SessionResult<()> {
+        ensure_size(kind, bytes.len(), limit)?;
+        atomic_write(path, bytes)
     }
 
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
@@ -4332,6 +4398,26 @@ fn read_regular_file_bounded(
     Ok(bytes)
 }
 
+/// Read a small optional JSON sidecar. Missing file = `None`; malformed/oversized
+/// content is an explicit corruption error (never silently defaulted).
+pub(crate) fn read_json_optional<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    kind: &'static str,
+) -> SessionResult<Option<T>> {
+    match read_regular_file_bounded(path, kind, 64 * 1024) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| SessionStoreError::Corrupt {
+                    kind,
+                    message: error.to_string(),
+                })
+        }
+        Err(SessionStoreError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn for_each_jsonl_line(
     path: &Path,
     mut visit: impl FnMut(&[u8]) -> SessionResult<()>,
@@ -4592,6 +4678,21 @@ mod tests {
             vec!["ninja".to_string(), "webpack".to_string()]
         );
         assert!(mgr.bashkw_path("s1").unwrap().is_file());
+    }
+
+    #[test]
+    fn read_transcript_turns_round_trips_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        assert!(mgr.read_transcript_turns("s1").unwrap().is_empty());
+
+        let line = r#"{"v":1,"ts":123,"iso":"","session_id":"s1","turn_id":7,"undone":false,"user":"Q","assistant":"A","tools":[],"usage":{"prompt":1,"completion":2}}"#;
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), format!("{line}\n")).unwrap();
+        let turns = mgr.read_transcript_turns("s1").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, 7);
+        assert_eq!(turns[0].user, "Q");
+        assert_eq!(turns[0].assistant, "A");
     }
 
     /// Windows 回归测试：transcript 追加必须真实完成 open → lock → append → unlock。

@@ -780,6 +780,20 @@ impl Tool for BashTool {
             )));
         }
 
+        // Foreground only: a stdout redirect sends nothing down the pipe, so the live
+        // pane sits silent for the whole run. Say so once (with the file to inspect)
+        // and keep the elapsed heartbeat below ticking; otherwise a working command is
+        // indistinguishable from a wedged one — it just reads `运行中` with no output.
+        let redirect_target = output_redirect_target(&effective_command);
+        if let Some(target) = redirect_target.as_ref() {
+            progress.emit(format!(
+                "[note: stdout is redirected to `{target}`; live output stays empty until the command exits. \
+                 Inspect the file with read(path=\"{target}\", offset=-50).]\n"
+            ));
+        }
+        let heartbeat_interval = silent_run_heartbeat();
+        let mut heartbeat_due = Instant::now() + heartbeat_interval;
+
         enum Drive {
             Result(ToolResult),
             Yield,
@@ -808,6 +822,7 @@ impl Tool for BashTool {
                 Duration::from_secs(86400)
             };
             let until_hard = hard_deadline.saturating_duration_since(Instant::now());
+            let until_heartbeat = heartbeat_due.saturating_duration_since(Instant::now());
 
             let elapsed_since_last_byte = last_byte
                 .lock()
@@ -849,6 +864,7 @@ impl Tool for BashTool {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
                             *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                            heartbeat_due = Instant::now() + heartbeat_interval;
                             extend_capped(
                                 &mut *stdout_cap.lock().unwrap_or_else(|e| e.into_inner()),
                                 &out_buf[..n],
@@ -867,6 +883,7 @@ impl Tool for BashTool {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
                             *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                            heartbeat_due = Instant::now() + heartbeat_interval;
                             extend_capped(
                                 &mut *stderr_cap.lock().unwrap_or_else(|e| e.into_inner()),
                                 &err_buf[..n],
@@ -994,6 +1011,29 @@ impl Tool for BashTool {
                         }
                         Err(e) => err(format!("bash: error running command: {e}")),
                     });
+                }
+                // Silent-run liveness tick. Long jobs (npm/cargo/…) skip idle
+                // rechecks entirely, and a redirected command never writes to the
+                // pipe, so without this the pane has no evidence of life while the
+                // command runs (up to max_timeout_secs). Any output pushes the
+                // deadline out again. Placed AFTER child.wait so a finishing
+                // process always wins.
+                _ = tokio::time::sleep(until_heartbeat) => {
+                    let secs = started.elapsed().as_secs();
+                    let silent_for = last_byte
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .elapsed()
+                        .as_secs();
+                    let redirected = if redirect_target.is_some() {
+                        "; stdout is redirected to a file"
+                    } else {
+                        ""
+                    };
+                    progress.emit(format!(
+                        "[still running: {secs}s total, {silent_for}s without output (pid {child_pid_val}){redirected}]\n"
+                    ));
+                    heartbeat_due = Instant::now() + heartbeat_interval;
                 }
                 _ = tokio::time::sleep(until_idle), if idle_enabled => {
                     #[cfg(windows)]
@@ -1259,7 +1299,10 @@ fn shell_tool_description(
              A silent CPU-idle process with no interactive fingerprint is a wait and \
              keeps running until it exits or `max_timeout_secs`. \
              Resident servers (uvicorn/nginx/npm run dev) should be started with background=true (or started detached). \
-             Compile/test families wait on `max_timeout_secs`."
+             Compile/test families wait on `max_timeout_secs`. \
+             If stdout/stderr are redirected to a file (`> log 2>&1`), nothing streams \
+             live: prefer letting output stream, or start long jobs with `background=true` \
+             and read the log path."
         };
     }
     macro_rules! cmd_suffix {
@@ -3255,6 +3298,12 @@ fn sanitize_terminal_output(s: &str) -> String {
 /// bounds the mid-flight UI/event flood (`yes`, tight loops, huge logs).
 const MAX_LIVE_STREAM_BYTES: usize = 256 * 1024;
 
+/// How often a foreground command that has produced NO output reports that it is
+/// still alive (`[still running: Ns …]`). Long jobs skip idle rechecks entirely and
+/// a redirected command never writes to the pipe, so this is the only UI evidence
+/// that the process has not wedged.
+const SILENT_RUN_HEARTBEAT: Duration = Duration::from_secs(20);
+
 fn emit_live_chunk(
     progress: &ProgressSink,
     live_sent: &std::sync::atomic::AtomicUsize,
@@ -3349,6 +3398,134 @@ async fn read_pipe_and_stream(
     if let Some(chunk) = decode_stream_chunk(&mut decode_pending, &[], true) {
         emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
     }
+}
+
+/// Target of a stdout redirect to a real file (`> log`, `>> log`, `&> log`), if any.
+///
+/// `run_command` reads the child's stdout/stderr PIPES. A command that redirects
+/// stdout to a file emits NOTHING on the pipe, so the live pane is empty for the
+/// entire run — indistinguishable from a hang. Detecting the target lets the tool
+/// say so up front (and point `read` at the file).
+///
+/// Conservative by design: only an unquoted `>`-family operator whose target is a
+/// real file counts. fd dups (`2>&1`, `>&2`, `>&-`), `/dev/null`, `nul`, and
+/// stderr-only redirects (`2> err.log`; stdout still streams) return `None`.
+pub(crate) fn output_redirect_target(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let n = bytes.len();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'\\' && i + 1 < n {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'\\' if i + 1 < n => i += 2,
+            b'>' => {
+                // Operator position: start, whitespace/separator, fd digit, or `&>`.
+                let prev = i.checked_sub(1).map(|p| bytes[p]);
+                let operator = match prev {
+                    None => true,
+                    Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b';')
+                    | Some(b'|') | Some(b'&') | Some(b'(') => true,
+                    Some(d) if d.is_ascii_digit() => true,
+                    _ => false,
+                };
+                if !operator {
+                    i += 1;
+                    continue;
+                }
+                // `2>`/`3>` write another stream; stdout still streams to the pipe.
+                let is_stdout = match prev {
+                    Some(d) if d.is_ascii_digit() => d == b'1',
+                    _ => true,
+                };
+                let mut j = i + 1;
+                while j < n && (bytes[j] == b'>' || bytes[j] == b'|') {
+                    j += 1;
+                }
+                while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'&' {
+                    // `>&2`, `2>&1`, `>&-` — fd dup keeps the pipe live.
+                    j += 1;
+                    while j < n && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                // Read the (possibly quoted) target word.
+                let (target, next) = if j < n && (bytes[j] == b'\'' || bytes[j] == b'"') {
+                    let quote = bytes[j];
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < n && bytes[k] != quote {
+                        if quote == b'"' && bytes[k] == b'\\' && k + 1 < n {
+                            k += 2;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    (command[start..k.min(n)].to_string(), (k + 1).min(n))
+                } else {
+                    let start = j;
+                    let mut k = start;
+                    while k < n
+                        && !matches!(
+                            bytes[k],
+                            b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b')' | b'>' | b'<'
+                        )
+                    {
+                        k += 1;
+                    }
+                    (command[start..k].to_string(), k)
+                };
+                i = next.max(i + 1);
+                if !is_stdout {
+                    continue;
+                }
+                let normalized = target.replace('\\', "/").to_ascii_lowercase();
+                if target.is_empty()
+                    || normalized == "/dev/null"
+                    || normalized == "nul"
+                    || normalized == "nul:"
+                    || normalized == "$null"
+                {
+                    continue;
+                }
+                return Some(target);
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn format_streams(
@@ -5387,6 +5564,41 @@ fn agent_second_level_secs(configured: u64) -> u64 {
 thread_local! {
     static TEST_AGENT_IDLE_SECS: std::cell::Cell<Option<u64>> =
         std::cell::Cell::new(None);
+    static TEST_SILENT_HEARTBEAT_MS: std::cell::Cell<Option<u64>> =
+        std::cell::Cell::new(None);
+}
+
+/// Interval between zero-output liveness ticks (test override: milliseconds).
+fn silent_run_heartbeat() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = TEST_SILENT_HEARTBEAT_MS.with(|c| c.get()) {
+        return Duration::from_millis(ms.max(1));
+    }
+    SILENT_RUN_HEARTBEAT
+}
+
+#[cfg(test)]
+struct TestHeartbeatGuard {
+    prev: Option<u64>,
+}
+
+#[cfg(test)]
+impl TestHeartbeatGuard {
+    fn set_ms(ms: u64) -> Self {
+        let prev = TEST_SILENT_HEARTBEAT_MS.with(|c| {
+            let previous = c.get();
+            c.set(Some(ms));
+            previous
+        });
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHeartbeatGuard {
+    fn drop(&mut self) {
+        TEST_SILENT_HEARTBEAT_MS.with(|c| c.set(self.prev));
+    }
 }
 
 #[cfg(test)]
@@ -6724,6 +6936,12 @@ mod tests {
         ));
         assert!(super::looks_like_resident_service("nginx -g 'daemon off;'"));
         assert!(super::looks_like_resident_service("npm run dev"));
+        assert!(super::looks_like_resident_service(
+            "npm run dev >> dev.log 2>&1"
+        ));
+        assert!(super::looks_like_resident_service(
+            "uvicorn app.main:app >> server.log 2>&1"
+        ));
         assert!(super::looks_like_resident_service("docker compose up"));
         assert!(!super::looks_like_resident_service("docker compose up -d"));
         assert!(super::looks_like_resident_service(
@@ -7192,6 +7410,89 @@ mod tests {
         );
         // no sudo at all → unchanged
         assert_eq!(rewrite_sudo_for_askpass("find / -name x"), "find / -name x");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirected_silent_command_reports_redirect_and_heartbeat() {
+        let _hb = TestHeartbeatGuard::set_ms(20);
+        let d = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_sink = Arc::clone(&seen);
+        let mut cx = ctx(d.path());
+        cx.progress = ProgressSink::new(Arc::new(move |message| {
+            seen_sink
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_str(&message);
+        }));
+
+        let log = d
+            .path()
+            .join("probe.log")
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Both streams leave the pipe for the file AND the process stays silent long
+        // enough for a couple of heartbeat ticks.
+        let command = format!(r#"sleep 0.12 > \"{log}\" 2>&1; echo done >> \"{log}\""#);
+        let args = serde_json::json!({ "command": command }).to_string();
+        let started = Instant::now();
+        let r = BashTool.execute(&args, &cx).await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a silent redirected command must still finish promptly"
+        );
+        let progress = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            progress.contains("stdout is redirected") && progress.contains("probe.log"),
+            "redirect note missing: {progress}"
+        );
+        assert!(
+            progress.contains("still running"),
+            "silent liveness heartbeat missing: {progress}"
+        );
+    }
+
+    #[test]
+    fn output_redirect_target_detects_stdout_file() {
+        assert_eq!(
+            output_redirect_target(
+                r#"cd webui && npm run typecheck > "$TMPDIR/webui-typecheck.log" 2>&1; echo EXIT=$?"#
+            )
+            .as_deref(),
+            Some("$TMPDIR/webui-typecheck.log")
+        );
+        assert_eq!(
+            output_redirect_target("cargo test >> build.log").as_deref(),
+            Some("build.log")
+        );
+        assert_eq!(
+            output_redirect_target("make &> all.log").as_deref(),
+            Some("all.log")
+        );
+        assert_eq!(
+            output_redirect_target("foo 1>out.txt").as_deref(),
+            Some("out.txt")
+        );
+    }
+
+    #[test]
+    fn output_redirect_target_ignores_dups_null_and_stderr_only() {
+        // fd dups keep stdout on the pipe.
+        assert_eq!(output_redirect_target("cmd >&2"), None);
+        assert_eq!(output_redirect_target("cmd 2>&1"), None);
+        assert_eq!(output_redirect_target("cmd >&- 2>/dev/null"), None);
+        // Discard targets are not files worth inspecting.
+        assert_eq!(output_redirect_target("cmd >/dev/null 2>&1"), None);
+        assert_eq!(output_redirect_target("cmd > nul"), None);
+        assert_eq!(output_redirect_target("cmd 2>NUL"), None);
+        // stderr-only redirect leaves stdout streaming.
+        assert_eq!(output_redirect_target("cmd 2> err.log"), None);
+        // A `>` inside quotes is data, not a redirect.
+        assert_eq!(output_redirect_target("echo 'a > b'"), None);
+        assert_eq!(output_redirect_target(r#"echo "a > b""#), None);
+        assert_eq!(output_redirect_target("echo no-redirect"), None);
     }
 
     // On Windows the `bash` tool routes through Git Bash / MSYS2, where the cmd.exe

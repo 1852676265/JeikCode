@@ -6,10 +6,10 @@
 //! `config.toml` is only touched when the model passes `global: true`.
 
 use jeikcode_kernel::tool::ProgressSink;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -103,13 +103,17 @@ pub enum IdleAction {
 }
 
 /// Idle expiry: bytes already decided there was no new output.
-/// CPU-busy work is promoted. Resident servers are killed. Everything else
-/// (including platforms that cannot sample CPU, e.g. macOS) is a wait
-/// recheck in the driver unless an interactive fingerprint is present.
-pub fn classify_idle(has_output: bool, busy: BusyKind, resident: bool) -> IdleAction {
+/// CPU-busy work is promoted. Resident servers are killed regardless of
+/// whether they printed anything: with stdout/stderr redirected (`>> log`)
+/// `has_output` is always false, and gating the resident kill on output made a
+/// foreground dev server occupy the bash pane until `max_timeout_secs` while
+/// the UI showed `运行中` forever. Everything else (including platforms that
+/// cannot sample CPU, e.g. macOS) is a wait recheck in the driver unless an
+/// interactive fingerprint is present.
+pub fn classify_idle(_has_output: bool, busy: BusyKind, resident: bool) -> IdleAction {
     match busy {
         BusyKind::Yes => IdleAction::AutoPromote,
-        BusyKind::No if resident && has_output => IdleAction::KillResident,
+        BusyKind::No if resident => IdleAction::KillResident,
         BusyKind::No | BusyKind::Unknown => IdleAction::KillStuck,
     }
 }
@@ -128,6 +132,10 @@ struct SessionKeywordBinding {
 /// alerts, and session keyword persistence must never be process-global. Callers
 /// that compose one runtime should share one `Arc<BashRuntimeState>` across the
 /// bash tool, its control tools, child bash tools, and the status reminder hook.
+///
+/// Ownership contract: one `CodingRuntime` = one state. A state-bound session id
+/// makes every task it registers belong to that session, so a stop issued for one
+/// session can never reach another session's foreground command.
 #[derive(Default)]
 pub struct BashRuntimeState {
     registry: Mutex<Vec<Arc<LiveBash>>>,
@@ -138,6 +146,36 @@ pub struct BashRuntimeState {
     session_id: RwLock<Option<String>>,
 }
 
+/// Process-wide `session id -> owning runtime state` index (weak handles only).
+///
+/// Session-scoped cancel/delete endpoints in the drivers only know a session id;
+/// this index is how they reach the state that actually owns that session's live
+/// bash jobs instead of falling back to a process-global kill.
+fn session_state_index() -> &'static Mutex<HashMap<String, Weak<BashRuntimeState>>> {
+    static INDEX: OnceLock<Mutex<HashMap<String, Weak<BashRuntimeState>>>> = OnceLock::new();
+    INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run `f` against the runtime state bound to `session_id`, if it is still alive.
+///
+/// Dead weak entries are pruned here so a torn-down runtime cannot resurrect.
+fn with_bound_session_state<R>(
+    session_id: &str,
+    f: impl FnOnce(&BashRuntimeState) -> R,
+) -> Option<R> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let state = {
+        let mut index = session_state_index()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index.retain(|_, weak| weak.strong_count() > 0);
+        index.get(session_id).and_then(Weak::upgrade)
+    };
+    state.map(|state| f(state.as_ref()))
+}
+
 impl BashRuntimeState {
     pub fn new() -> Self {
         Self::default()
@@ -145,6 +183,24 @@ impl BashRuntimeState {
 
     pub fn set_session_id(&self, session_id: impl Into<String>) {
         *self.session_id.write().unwrap_or_else(|e| e.into_inner()) = Some(session_id.into());
+    }
+
+    /// Bind this state (and every live task spawned through it) to `session_id`
+    /// and publish a weak handle in the process-wide session index.
+    ///
+    /// Rebinding is intentional: one runtime can switch sessions via reprepare,
+    /// and its state must follow the session it now owns.
+    pub fn bind_session(self: &Arc<Self>, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        if session_id.trim().is_empty() {
+            return;
+        }
+        self.set_session_id(session_id.clone());
+        let mut index = session_state_index()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        index.retain(|_, weak| weak.strong_count() > 0);
+        index.insert(session_id, Arc::downgrade(self));
     }
 
     pub fn session_id(&self) -> Option<String> {
@@ -369,8 +425,11 @@ impl BashRuntimeState {
     /// resident services (dev servers, daemons, FastAPI) to stay alive when a turn
     /// or prompt is cancelled by user stop, steer preemption, or network reconnect.
     ///
-    /// 增加会话范围保护：若当前运行时未绑定明确的 session_id，则安全返回 0（禁止无差别全局误杀）；
-    /// 仅精确取消归属于本会话的前台命令，彻底根除切页、刷新或多会话重连触发的偶发性秒停止 Bug！
+    /// 会话隔离：仅取消**本状态所绑定会话**登记的前台命令。
+    ///
+    /// 每个 `CodingRuntime` 持有独立的 `BashRuntimeState`（`prepare` 默认新建），
+    /// 因此本方法的删除范围天然是单会话的；绑定 session_id 后再按任务标签过滤一次，
+    /// 彻底根除「另一个会话点 Stop / 会话被回收 → 误杀本会话前台 run_command」的秒停 Bug。
     pub fn cancel_foreground_live_bash(&self) -> usize {
         let current_sid = self.session_id();
         let snapshot = self
@@ -380,15 +439,16 @@ impl BashRuntimeState {
             .clone();
         let mut cancelled = 0;
         for entry in &snapshot {
-            if !entry.is_background.load(Ordering::SeqCst) {
-                if let Some(ref sid) = current_sid {
-                    if !sid.is_empty() && &entry.session_id != sid {
-                        continue;
-                    }
-                }
-                entry.kill.cancel();
-                cancelled += 1;
+            if entry.is_background.load(Ordering::SeqCst) {
+                continue;
             }
+            if let Some(ref sid) = current_sid {
+                if !sid.is_empty() && &entry.session_id != sid {
+                    continue;
+                }
+            }
+            entry.kill.cancel();
+            cancelled += 1;
         }
         cancelled
     }
@@ -476,8 +536,20 @@ pub fn cancel_foreground_live_bash() -> usize {
     0
 }
 
+/// Cancel the foreground bash of exactly one session.
+///
+/// Routed to the runtime state that owns the session (per-runtime isolation), with
+/// the legacy singleton kept for direct standalone tool uses. Never touches other
+/// sessions' foreground commands.
 pub fn cancel_foreground_live_bash_for_session(session_id: &str) -> usize {
-    legacy_bash_runtime_state().cancel_foreground_live_bash_for_session(session_id)
+    let mut cancelled =
+        legacy_bash_runtime_state().cancel_foreground_live_bash_for_session(session_id);
+    if let Some(routed) = with_bound_session_state(session_id, |state| {
+        state.cancel_foreground_live_bash_for_session(session_id)
+    }) {
+        cancelled += routed;
+    }
+    cancelled
 }
 
 pub fn cancel_all_live_bash() -> usize {
@@ -581,12 +653,20 @@ pub fn command_matches_any_keyword(command: &str, keywords: &[String]) -> bool {
     keywords.iter().any(|k| command_matches_keyword(command, k))
 }
 
-/// Promote every live bash whose command contains `keyword`. Returns how many
-/// were newly promoted (already-promoted entries are skipped).
+/// Cascade-terminate every live bash task (foreground + background) of one
+/// session, routed to its owning runtime state. Used by session deletion.
 pub fn kill_by_session_id(session_id: &str) -> usize {
-    legacy_bash_runtime_state().kill_by_session_id(session_id)
+    let mut killed = legacy_bash_runtime_state().kill_by_session_id(session_id);
+    if let Some(routed) =
+        with_bound_session_state(session_id, |state| state.kill_by_session_id(session_id))
+    {
+        killed += routed;
+    }
+    killed
 }
 
+/// Promote every live bash whose command contains `keyword`. Returns how many
+/// were newly promoted (already-promoted entries are skipped).
 pub fn promote_matching(keyword: &str) -> usize {
     legacy_bash_runtime_state().promote_matching(keyword)
 }
@@ -761,7 +841,9 @@ mod tests {
         assert_eq!(classify_idle(false, No, false), KillStuck);
         assert_eq!(classify_idle(true, No, false), KillStuck);
         assert_eq!(classify_idle(true, No, true), KillResident);
-        assert_eq!(classify_idle(false, No, true), KillStuck);
+        // Redirected resident service (`npm run dev >> log 2>&1`) prints
+        // nothing, but it is still a foreground server and must be killed.
+        assert_eq!(classify_idle(false, No, true), KillResident);
         assert_eq!(classify_idle(true, Unknown, false), KillStuck);
         assert_eq!(classify_idle(false, Unknown, false), KillStuck);
     }
@@ -996,6 +1078,104 @@ mod tests {
         assert!(a.kill.is_cancelled());
         assert!(b.kill.is_cancelled());
         assert!(!next.kill.is_cancelled());
+    }
+
+    fn live_bg(pid: u32, command: &str, session_id: &str) -> Arc<LiveBash> {
+        Arc::new(LiveBash {
+            pid,
+            session_id: session_id.into(),
+            command: command.into(),
+            promoted: AtomicBool::new(false),
+            second_level: AtomicBool::new(false),
+            is_background: AtomicBool::new(true),
+            started_at: Instant::now(),
+            kill: CancellationToken::new(),
+            progress: ProgressSink::default(),
+            ring_buffer: Arc::new(Mutex::new(VecDeque::new())),
+        })
+    }
+
+    fn live_fg(pid: u32, command: &str, session_id: &str) -> Arc<LiveBash> {
+        Arc::new(LiveBash {
+            pid,
+            session_id: session_id.into(),
+            command: command.into(),
+            promoted: AtomicBool::new(false),
+            second_level: AtomicBool::new(false),
+            is_background: AtomicBool::new(false),
+            started_at: Instant::now(),
+            kill: CancellationToken::new(),
+            progress: ProgressSink::default(),
+            ring_buffer: Arc::new(Mutex::new(VecDeque::new())),
+        })
+    }
+
+    /// Regression: session A's Stop used to cancel every foreground task in the
+    /// process-global registry, instantly killing session B's `run_command` with
+    /// `[task was canceled by bash kill tool]`.
+    #[test]
+    fn stop_of_one_session_never_kills_another_sessions_foreground() {
+        let a = Arc::new(BashRuntimeState::new());
+        let b = Arc::new(BashRuntimeState::new());
+        a.bind_session("regression-stop-session-a");
+        b.bind_session("regression-stop-session-b");
+        let a_fg = live_fg(7001, "cargo test", "regression-stop-session-a");
+        let b_fg = live_fg(7002, "cargo test", "regression-stop-session-b");
+        a.register_live_bash(Arc::clone(&a_fg));
+        b.register_live_bash(Arc::clone(&b_fg));
+
+        assert_eq!(a.cancel_foreground_live_bash(), 1);
+        assert!(a_fg.kill.is_cancelled());
+        assert!(
+            !b_fg.kill.is_cancelled(),
+            "A's stop must not kill B's foreground command"
+        );
+    }
+
+    #[test]
+    fn session_scoped_cancel_routes_to_the_owning_runtime_state() {
+        let owner = Arc::new(BashRuntimeState::new());
+        owner.bind_session("regression-routed-session");
+        let fg = live_fg(7101, "cargo build", "regression-routed-session");
+        owner.register_live_bash(Arc::clone(&fg));
+
+        assert_eq!(
+            cancel_foreground_live_bash_for_session("regression-unrelated-session"),
+            0
+        );
+        assert!(!fg.kill.is_cancelled());
+
+        assert_eq!(
+            cancel_foreground_live_bash_for_session("regression-routed-session"),
+            1
+        );
+        assert!(fg.kill.is_cancelled());
+    }
+
+    #[test]
+    fn session_delete_routes_to_the_owning_state_only() {
+        let a = Arc::new(BashRuntimeState::new());
+        let b = Arc::new(BashRuntimeState::new());
+        a.bind_session("regression-delete-session-a");
+        b.bind_session("regression-delete-session-b");
+        let a_bg = live_bg(
+            7201,
+            "python -m uvicorn a:app",
+            "regression-delete-session-a",
+        );
+        let b_bg = live_bg(
+            7202,
+            "python -m uvicorn b:app",
+            "regression-delete-session-b",
+        );
+        a.register_live_bash(Arc::clone(&a_bg));
+        b.register_live_bash(Arc::clone(&b_bg));
+
+        assert_eq!(kill_by_session_id("regression-delete-session-a"), 1);
+        assert!(a_bg.kill.is_cancelled());
+        assert!(!b_bg.kill.is_cancelled());
+        assert!(a.find_live_bash(7201).is_none());
+        assert!(b.find_live_bash(7202).is_some());
     }
 
     #[test]

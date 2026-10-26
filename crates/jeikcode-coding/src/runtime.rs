@@ -4675,7 +4675,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         let reuse_lease = prepared_lease.or_else(|| {
                             matching_session_lease(&runtime.parts, &input.prepare.session)
                         });
-                        let reuse_bash_runtime = Some(Arc::clone(&runtime.parts.bash_runtime));
+                        // Same-session reprepare keeps the bash registry so detached
+                        // background jobs stay visible. A session/project transition gets a
+                        // fresh state: the outgoing state's jobs belong to the OLD session and
+                        // must never become cancellable through the new session's Stop.
+                        let reuse_bash_runtime =
+                            (operation == ReconfigureKind::Reprepare || reuses_current_session)
+                                .then(|| Arc::clone(&runtime.parts.bash_runtime));
                         let candidate_parts = prepare_with_plugin_hook_source_reusing_lease(
                             &input.config,
                             input.prepare.clone(),
@@ -4856,6 +4862,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
+                        if changes_session {
+                            // Irrevocable transition boundary: the outgoing state no longer owns
+                            // any session, so detach its live jobs now (foreground is impossible
+                            // here — a busy turn blocks session changes above).
+                            runtime.parts.bash_runtime.cancel_all_live_bash();
+                        }
                         runtime = candidate;
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);

@@ -208,6 +208,9 @@ fn exec_native_undo(session: NativeCommandSession, arg: &str) -> anyhow::Result<
             Ok(())
         },
     )?;
+    // /undo rewrites the model snapshot; the display log must be rebuilt from
+    // the new state on the next read. (Compaction deliberately does NOT do this.)
+    let _ = session.manager.invalidate_display(&session.lease.id());
     Ok(CommandResult::Undo {
         undone: undo
             .prompts_before
