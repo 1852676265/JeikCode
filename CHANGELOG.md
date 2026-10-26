@@ -21,6 +21,42 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.1 (2026-10-26)
+
+- **[WebUI & Remote Sessions] Pinned prompt inversion fix, cold-start outline restoration & phantom bubble cleanup**:
+  - Fixed prompt inversion on long transcripts (>48 messages): when authoritative disk tail splicing occurs on turn completion or context compaction, the turn's opening user prompt is now preserved in its natural chronological position at the top of the conversation instead of being pushed down below assistant answers.
+  - Remote browser cold-start outline restoration: session outline and metadata from disk are now unconditionally hydrated even when a session is active, preventing remote instances from losing historical turns or dropping outline items down to 3-5 streaming lines.
+  - Eliminated phantom "8 messages remaining" button by accurately discounting invisible internal system and synthetic prompt prefixes when reaching the first visible question.
+- **[Real-time Chat & Steer] Accurate steer timestamps & watch stream replay deduplication**:
+  - Steer messages now preserve their exact client send timestamps throughout the backend pipeline and event bus, preventing multiple follow-up messages from collapsing to the same folding timestamp.
+  - Fixed duplicate replay on watch stream reconnection: `ensureAssistantBubbleForWatch` now guards against creating redundant empty assistant bubbles when the target message already exists on canvas, and `paintAssistantText` idempotently prevents double-appending identical response blocks.
+- **[Turn Outline & Session Performance] Outline trailing deduplication & long session instant switching**:
+  - Turn outline deduplication (`dedupeTurnOutline`): resolved trailing duplicate turn items from optimistic client echo races by anchoring strictly on absolute turn index and complete query identity, eliminating duplicate entries at the bottom of the navigation rail.
+  - Long session switching acceleration: switched cached session rendering to display the active 48-item window by default, reducing DOM nodes from 7,300+ down to ~300 and cutting session switch time from 80ms down to 5~9ms without sacrificing earlier history (earlier turns in memory expand in 0ms on scroll/click).
+- **[Markdown Rendering] Indented code fence parser guard**:
+  - Excluded pure code fence lines from glued fence splitting, preventing 4-space indented code blocks under lists from being incorrectly sliced into stray backticks.
+- **[Developer Experience] Edit tool conflict pinpointing & diagnostic improvement**:
+  - Fixed sliding window tie-breaking bias in `best_window_by_token_bag` with boundary-matching weights, eliminating misleading `expected : ""` discrepancy errors on lines preceding the hunk.
+  - Replaced compiler-style `expected / actual` labels with intuitive `conflict in old_string` and `actual in file on disk` diagnostics.
+
+---
+
+- **[WebUI 与异地会话] 置顶提问防倒插、异地冷启动大纲修复与幽灵气泡清理**:
+  - 彻底修复长会话（>48条）对账时的提问倒插问题：当 agent loop 终态定格或上下文压缩触发权威切片对账时，开场提问将严格保持在其天然时序顶端，绝不被挪动到助手回答下方，彻底杜绝内存缓存与 IndexedDB 污染。
+  - 异地浏览器冷启动大纲即时对齐：解除大纲元数据在 live 状态下的更新阻断，手机端或异地新打开会话时即刻完整加载全量提问大纲与分页元数据，不再退化为仅有 3~5 条流式片段。
+  - 准确扣除首个用户提问前的系统与指令前缀，彻底消除跳到第一条提问顶部时出现的“还剩 8 条”幽灵气泡。
+- **[实时推流与转向] Steer 真实时间戳还原与推流重播克隆拦截**:
+  - 转向消息全链路支持真实发送时间戳对账，解决异地连发多条转向消息全部死锁在同一个完成时间的问题。
+  - 监听流重连防克隆：`ensureAssistantBubbleForWatch` 引入目标身份守卫，禁止为已有回答盲目追加空助手气泡；`paintAssistantText` 对长文本引入幂等拦截，彻底消除重连回放时回答正文和工具调用被二次追加的问题。
+- **[提问大纲与会话性能] 大纲末尾条目去重与长会话瞬切优化**:
+  - 提问大纲去重（`dedupeTurnOutline`）：彻底根除客户端乐观预录与服务端落盘序号竞争导致的提问大纲末尾 2~3 条提问重复的问题，以绝对索引与提问身份唯一锚定。
+  - 长会话切换性能优化：切换长会话时默认挂载最新 48 条活动视口，将 DOM 节点数从 7,300+ 骤降至约 300 个，切换耗时从 80ms 卡顿降至 5~9ms 瞬切；早先历史完整保存在内存中，向上滑动或点击展开时 0ms 瞬间补齐。
+- **[Markdown 渲染] 缩进代码块围栏防护**:
+  - 在粘连围栏检测中排除纯代码块围栏行，彻底防止列表项下带缩进的代码块被误拆出游离反引号。
+- **[开发者体验] Edit 工具冲突精准定位与报错文案重构**:
+  - 修复 `best_window_by_token_bag` 滑动窗口平局偏置 BUG，引入首尾边界匹配权重，杜绝错选窗口导致的误报。
+  - 全面重构报错文案，弃用易产生误解的 `expected / actual`，改为直观的 `conflict in old_string` 与 `actual in file on disk`。
+
 ## v7.3.1-beta.0 (2026-10-26)
 
 - **[Responsive Mobile UI] System Settings vertical layout adaptation & ModelSelector header alignment**:
