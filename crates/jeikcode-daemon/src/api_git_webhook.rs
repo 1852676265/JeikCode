@@ -615,7 +615,7 @@ pub(crate) async fn execute_git_workflow(
                 }
                 break;
             }
-            ChatEvent::Error { message } => {
+            ChatEvent::Error { message, .. } => {
                 tracing::warn!("[git_webhook] Review turn returned error: {message}");
                 if collected_review.trim().is_empty() {
                     collected_review = format!("Review encountered an error: {message}");

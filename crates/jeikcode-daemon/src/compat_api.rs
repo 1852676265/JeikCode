@@ -1071,6 +1071,7 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
         if let Err(e) = result {
             let _ = err_tx.send(ChatEvent::Error {
                 message: e.to_string(),
+                message_id: None,
             });
         }
         cleanup_chats.complete(&cleanup_op).await;
@@ -1331,7 +1332,7 @@ async fn collect_compat_response(
                     }
                 }
             }
-            ChatEvent::Error { message } => {
+            ChatEvent::Error { message, .. } => {
                 current_block.push_str(&close_open_artifact_fences(&mut artifact_open));
                 error = Some(message);
             }

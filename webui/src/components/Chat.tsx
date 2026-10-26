@@ -1512,6 +1512,10 @@ export function Chat({
   // stalls, this timer (guarded by busy/local-turn) recovers the tail without
   // waiting for a manual refresh.
   const deferredReconcileTimerRef = useRef<number | null>(null);
+  // Last authoritative user-prompt id per session. A synthetic terminal
+  // (`watch_closed`) has no daemon message_id; anchor its notice to the turn's
+  // own prompt instead of whatever assistant happens to be newest.
+  const turnUserAnchorBySessionRef = useRef<Map<string, string>>(new Map());
   // Inputs accepted by the live runtime as in-turn steers but not yet folded at
   // a kernel round boundary. Unlike `queued`, these already belong to the active
   // turn and must be recovered if that turn is cancelled before acknowledgement.
@@ -6287,6 +6291,7 @@ export function Chat({
     const msgs = messageCacheRef.current.get(targetSid);
     if (!msgs || msgs.length === 0) return;
     if (event.type === 'user_identified') {
+      turnUserAnchorBySessionRef.current.set(targetSid, event.message_id);
       messageCacheRef.current.set(targetSid, bindUserMessageIdentity(msgs, event.message_id));
       return;
     }
@@ -6783,6 +6788,9 @@ export function Chat({
             event.message_id,
             outlineIndex,
           );
+          if (activeIdRef.current) {
+            turnUserAnchorBySessionRef.current.set(activeIdRef.current, event.message_id);
+          }
           if (next === prev) return prev;
           messagesRef.current = next;
           const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
@@ -7150,8 +7158,16 @@ export function Chat({
           // 处理，把正在跑的新回合按钮清回发送箭头。
         } else if (terminal.discardQueued) {
           // 异常终端 / 被取消：弹黄色未完成提示，并停止自动 drain。
+          // Anchor to the terminal's own assistant/user row; a late done from
+          // the previous turn must not land on the next turn's answer tail.
           blockQueueDrainRef.current = true;
-          pushNoticeToLastAssistant(t('chat.incomplete', { msg: terminal.detail }));
+          const noticeAnchor =
+            event.message_id ??
+            (doneSid ? turnUserAnchorBySessionRef.current.get(doneSid) : undefined);
+          pushNoticeToLastAssistant(
+            t('chat.incomplete', { msg: terminal.detail }),
+            noticeAnchor,
+          );
           transitionChatRecovery({ type: 'authoritative_terminal' });
           localTurnSessionsRef.current.delete(event.session_id);
           backgroundRunningSessionsRef.current.delete(event.session_id);
@@ -7281,7 +7297,27 @@ export function Chat({
 
       case 'error':
         closeOpenArtifactFence();
-        appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
+        {
+          const errorText = t('chat.error', { msg: event.message });
+          const anchor =
+            event.message_id ??
+            (activeIdRef.current
+              ? turnUserAnchorBySessionRef.current.get(activeIdRef.current)
+              : undefined);
+          const anchorIsUser =
+            !!anchor && messagesRef.current.some((m) => m.role === 'user' && m.id === anchor);
+          if (anchorIsUser) {
+            // A provider failure before the first assistant boundary: keep the
+            // notice under its own prompt instead of the newest answer.
+            pushNoticeToLastAssistant(errorText, anchor);
+          } else {
+            appendToLastAssistant(
+              '\n\n' + errorText,
+              undefined,
+              { messageId: anchor },
+            );
+          }
+        }
         transitionChatRecovery({ type: 'authoritative_terminal' });
         if (activeIdRef.current) {
           backgroundRunningSessionsRef.current.delete(activeIdRef.current);

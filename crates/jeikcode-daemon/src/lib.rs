@@ -1219,6 +1219,7 @@ mod global_events_tests {
             session_id: "sid-fanout".into(),
             stop_reason: None,
             message: None,
+            message_id: None,
         })
         .expect("send Done");
         tx.send(ChatEvent::Stopped).expect("send Stopped");
@@ -7939,6 +7940,12 @@ pub enum ChatEvent {
         /// Last runtime error associated with this terminal, when available.
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Assistant (or turn-opening user) message this terminal's yellow
+        /// incomplete notice belongs to. Without it the client can only append
+        /// to the latest assistant, so a late terminal from turn N lands on the
+        /// tail of turn N+1's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// A tool requires user approval. The browser must POST the decision back
     /// to `/chat/permission`, correlated by `session_id` and `approval_id`.
@@ -7966,7 +7973,13 @@ pub enum ChatEvent {
     Stopped,
     /// Error occurred
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        message: String,
+        /// Same anchor contract as `done`/`warning`: keep a late error on its
+        /// own turn instead of the newest assistant bubble.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
@@ -8611,6 +8624,16 @@ mod chat_event_type_tests {
     #[test]
     fn agent_error_is_diagnostic_until_turn_finished_is_authoritative() {
         let mut projector = ChatRuntimeProjector::default();
+        // A turn that already streamed an assistant round must anchor its
+        // warning/terminal notice to that round.
+        let _ = projector.project_runtime(
+            jeikcode_coding::CodingRuntimeEvent::Agent(
+                jeikcode_kernel::event::AgentEvent::AssistantMessage {
+                    message_id: "m-anchor".into(),
+                },
+            ),
+            "session-1",
+        );
         let diagnostic = projector.project_runtime(
             jeikcode_coding::CodingRuntimeEvent::Agent(jeikcode_kernel::event::AgentEvent::Error {
                 message: "provider failed".into(),
@@ -8619,7 +8642,13 @@ mod chat_event_type_tests {
             }),
             "session-1",
         );
-        assert!(matches!(diagnostic.as_slice(), [ChatEvent::Warning { .. }]));
+        assert!(matches!(
+            diagnostic.as_slice(),
+            [ChatEvent::Warning {
+                message_id: Some(anchor),
+                ..
+            }] if anchor == "m-anchor"
+        ));
 
         let terminal = projector.project_runtime(
             jeikcode_coding::CodingRuntimeEvent::TurnFinished(
@@ -8639,8 +8668,44 @@ mod chat_event_type_tests {
             [ChatEvent::Done {
                 stop_reason: Some(reason),
                 message: Some(message),
+                message_id: Some(anchor),
                 ..
-            }] if reason == "provider_error" && message == "provider failed"
+            }] if reason == "provider_error"
+                && message == "provider failed"
+                && anchor == "m-anchor"
+        ));
+    }
+
+    #[test]
+    fn terminal_error_keeps_its_turn_anchor() {
+        let mut projector = ChatRuntimeProjector::default();
+        let _ = projector.project_runtime(
+            jeikcode_coding::CodingRuntimeEvent::Agent(
+                jeikcode_kernel::event::AgentEvent::AssistantMessage {
+                    message_id: "m-error-anchor".into(),
+                },
+            ),
+            "session-1",
+        );
+        let events = projector.project_runtime(
+            jeikcode_coding::CodingRuntimeEvent::TurnFinished(
+                jeikcode_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 9,
+                    reason: jeikcode_kernel::event::StopReason::ProviderError,
+                    error: jeikcode_coding::RuntimeSnapshotError {
+                        message: "provider failed".into(),
+                    },
+                    stats: jeikcode_coding::RuntimeTurnStats::default(),
+                },
+            ),
+            "session-1",
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::Error {
+                message_id: Some(anchor),
+                ..
+            }] if anchor == "m-error-anchor"
         ));
     }
 
@@ -8669,7 +8734,7 @@ mod chat_event_type_tests {
         );
         assert!(matches!(
             events.as_slice(),
-            [ChatEvent::Error { message }]
+            [ChatEvent::Error { message, .. }]
                 if message.contains("already in use by another runtime")
         ));
     }
@@ -9591,6 +9656,7 @@ impl ChatRuntimeProjector {
                 vec![
                     ChatEvent::Error {
                         message: format!("compact failed: {error}"),
+                        message_id: self.notice_anchor(),
                     },
                     ChatEvent::SessionStatus {
                         session_id: permission_session_id.to_string(),
@@ -9621,6 +9687,7 @@ impl ChatRuntimeProjector {
                     session_id: permission_session_id.to_string(),
                     stop_reason: Some(stop_reason_wire(reason).to_string()),
                     message: self.last_error.clone(),
+                    message_id: self.notice_anchor(),
                 });
                 if reason == jeikcode_kernel::event::StopReason::Cancelled {
                     // Legacy clients still understand `stopped`; typed clients latch
@@ -9646,6 +9713,7 @@ impl ChatRuntimeProjector {
                 }
                 events.push(ChatEvent::Error {
                     message: error.message,
+                    message_id: self.notice_anchor(),
                 });
                 events
             }
@@ -10298,6 +10366,7 @@ async fn finalize_chat_task(
         Ok(Err(e)) => {
             let _ = event_tx.send(ChatEvent::Error {
                 message: e.to_string(),
+                message_id: None,
             });
         }
         Err(join_error) => {
@@ -10309,6 +10378,7 @@ async fn finalize_chat_task(
             );
             let _ = event_tx.send(ChatEvent::Error {
                 message: "chat task failed".into(),
+                message_id: None,
             });
             if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 let session_id = cleanup_chats
@@ -10316,6 +10386,7 @@ async fn finalize_chat_task(
                     .await
                     .unwrap_or_else(|| requested_session_id.to_string());
                 let _ = event_tx.send(ChatEvent::Done {
+                    message_id: None,
                     tokens: 0,
                     tool_calls: 0,
                     session_id,
@@ -10675,7 +10746,10 @@ pub(crate) async fn process_chat_request(
             .last_error
             .clone()
             .unwrap_or_else(|| "coding runtime event stream closed before turn terminal".into());
-        let _ = event_tx.send(ChatEvent::Error { message });
+        let _ = event_tx.send(ChatEvent::Error {
+            message,
+            message_id: None,
+        });
     }
 
     // The native runtime owns turn boundaries, mid-turn cancel cleanup
@@ -17244,6 +17318,7 @@ mod tests {
             session_id: session_id.to_string(),
             stop_reason: Some("stopped".into()),
             message: None,
+            message_id: None,
         }
     }
 
@@ -17708,7 +17783,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, ChatEvent::Error { message } if message == "chat task failed")),
+                .any(|event| matches!(event, ChatEvent::Error { message, .. } if message == "chat task failed")),
             "panic must produce a redacted Error event"
         );
         assert!(
@@ -20211,6 +20286,7 @@ mod channel_mode_tests {
                 session_id: "s1".into(),
                 stop_reason: None,
                 message: None,
+                message_id: None,
             },
         ];
         let (perm, user) = pending_interactive_from_replay(&events);

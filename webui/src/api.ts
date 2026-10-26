@@ -218,9 +218,9 @@ export type SSEEvent =
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
   | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null>; timestamps?: Array<number | null> }
-  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
+  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string; message_id?: string }
   | { type: 'stopped' }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; message_id?: string }
   | { type: 'warning'; message: string; message_id?: string; /** Live path: committed compaction's post-context tokens. */ tokens_after?: number }
   /** Committed compaction: update the context meter immediately (no usage follows). */
   | { type: 'context_compacted'; session_id?: string; tokens: number }
