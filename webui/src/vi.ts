@@ -865,6 +865,8 @@ export const vi: Record<keyof typeof en, string> = {
   'preview.wheel': "Cuộn để thu phóng",
   'preview.reset': "Nhấp đúp để đặt lại",
   'preview.background': "Nhấp nền để đóng",
+  'preview.mobilePinch': "Thu phóng 2 ngón · Chạm đúp · Kéo để xem",
+  'preview.reset1x': "Đặt lại",
   'diagram.title': "Mermaid",
   'diagram.view': "Xem sơ đồ",
   'diagram.code': "Xem mã nguồn",

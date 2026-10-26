@@ -657,6 +657,8 @@ export const fr: Record<keyof typeof en, string> = {
   'preview.refresh': 'Refresh Preview',
   'preview.reset': 'Double-click to reset',
   'preview.wheel': 'Scroll to zoom',
+  'preview.mobilePinch': 'Pinch to zoom · Double tap · Drag to pan',
+  'preview.reset1x': 'Reset',
   'remote.applied': 'Écoute sur {url}',
   'remote.apply': 'Appliquer',
   'remote.applyFailed': 'Impossible d’ouvrir l’écoute',

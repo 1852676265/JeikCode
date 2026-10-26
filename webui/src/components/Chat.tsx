@@ -453,9 +453,59 @@ async function copyUserMessage(text: string, images?: ImageData[]): Promise<bool
 function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   const t = useT();
   const [scale, setScale] = useState(1);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const [isInteracting, setIsInteracting] = useState(false);
+  const [swipingY, setSwipingY] = useState(0);
+
+  const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
-  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
-  const backdropDismiss = useBackdropDismiss(onClose);
+
+  // 高性能手势追踪引用（避免频繁闭包捕获延迟）
+  const gRef = useRef({
+    scale: 1,
+    pos: { x: 0, y: 0 },
+    startDist: 0,
+    startScale: 1,
+    startMidpoint: { x: 0, y: 0 },
+    startPos: { x: 0, y: 0 },
+    startTouch: { x: 0, y: 0 },
+    isPanning: false,
+    isSwipingDown: false,
+    swipeY: 0,
+    lastTapTime: 0,
+    lastTapPos: { x: 0, y: 0 },
+    isMouseDown: false,
+    mouseStart: { x: 0, y: 0 },
+    mouseStartPos: { x: 0, y: 0 },
+  });
+
+  gRef.current.scale = scale;
+  gRef.current.pos = pos;
+
+  // 边界自适应限制：确保拖拽平移时用户能看清图片任意边缘细节，且不会将图片拖出屏幕视口
+  const clampOffset = (targetScale: number, targetPos: { x: number; y: number }) => {
+    if (targetScale <= 1.02) return { x: 0, y: 0 };
+    const img = imgRef.current;
+    if (!img) return targetPos;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const baseW = img.offsetWidth || Math.min(vw * 0.95, 1100);
+    const baseH = img.offsetHeight || Math.min(vh * 0.88, 800);
+    const visualW = baseW * targetScale;
+    const visualH = baseH * targetScale;
+    const maxX = Math.max(0, (visualW - vw) / 2 + 30);
+    const maxY = Math.max(0, (visualH - vh) / 2 + 30);
+    return {
+      x: Math.max(-maxX, Math.min(maxX, targetPos.x)),
+      y: Math.max(-maxY, Math.min(maxY, targetPos.y)),
+    };
+  };
+
+  const resetZoom = useCallback(() => {
+    setScale(1);
+    setPos({ x: 0, y: 0 });
+    setSwipingY(0);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -465,66 +515,283 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  // 原生相册级手势监听：双手捏合缩放 (Pinch-to-zoom)、单指拖动查看细节、双击放大
   useEffect(() => {
-    const el = imgRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      // 缩放交给用户的 ctrl+鼠标滚轮（防误触）
-      if (e.ctrlKey || e.metaKey) {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const getTouchDist = (t1: Touch, t2: Touch) => Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+    const getTouchMid = (t1: Touch, t2: Touch) => ({
+      x: (t1.clientX + t2.clientX) / 2,
+      y: (t1.clientY + t2.clientY) / 2,
+    });
+
+    const onTouchStart = (e: TouchEvent) => {
+      const g = gRef.current;
+      if (e.touches.length === 2) {
+        // 双手触屏：开启原生相册级捏合缩放 (Pinch-to-zoom)
         e.preventDefault();
-        e.stopPropagation();
-        const delta = e.deltaY > 0 ? 0.88 : 1.14;
-        setScale((s) => Math.min(6, Math.max(0.3, s * delta)));
+        setIsInteracting(true);
+        g.startDist = getTouchDist(e.touches[0], e.touches[1]);
+        g.startMidpoint = getTouchMid(e.touches[0], e.touches[1]);
+        g.startScale = g.scale;
+        g.startPos = { ...g.pos };
+        g.isPanning = false;
+        g.isSwipingDown = false;
+      } else if (e.touches.length === 1) {
+        const touch = e.touches[0];
+        const now = Date.now();
+        const distFromLastTap = Math.hypot(touch.clientX - g.lastTapPos.x, touch.clientY - g.lastTapPos.y);
+
+        // 双击放大/还原检测（像相册一样双击任意细节处直接放大到 2.8x）
+        if (now - g.lastTapTime < 280 && distFromLastTap < 40) {
+          e.preventDefault();
+          g.lastTapTime = 0;
+          setIsInteracting(false);
+          if (g.scale > 1.1) {
+            resetZoom();
+          } else {
+            const nextScale = 2.8;
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            const focalX = (vw / 2 - touch.clientX) * 1.5;
+            const focalY = (vh / 2 - touch.clientY) * 1.5;
+            const clamped = clampOffset(nextScale, { x: focalX, y: focalY });
+            setScale(nextScale);
+            setPos(clamped);
+          }
+          return;
+        }
+
+        g.lastTapTime = now;
+        g.lastTapPos = { x: touch.clientX, y: touch.clientY };
+        g.startTouch = { x: touch.clientX, y: touch.clientY };
+        g.startPos = { ...g.pos };
+        setIsInteracting(true);
+
+        if (g.scale > 1.05) {
+          // 放大状态下：单指自由拖拽平移查看图片细节 (像相册一样全方位拖拽)
+          g.isPanning = true;
+          g.isSwipingDown = false;
+        } else {
+          // 1x 状态下：单指向下滑动退出预览
+          g.isPanning = false;
+          g.isSwipingDown = true;
+          g.swipeY = 0;
+        }
       }
     };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, []);
+
+    const onTouchMove = (e: TouchEvent) => {
+      const g = gRef.current;
+      if (e.touches.length === 2) {
+        // 双手触控捏合缩放：以两指几何中心为锚点实时动态拉伸
+        e.preventDefault();
+        const currentDist = getTouchDist(e.touches[0], e.touches[1]);
+        if (g.startDist <= 0) return;
+        const ratio = currentDist / g.startDist;
+        const nextScale = Math.min(8, Math.max(0.65, g.startScale * ratio));
+
+        const currentMid = getTouchMid(e.touches[0], e.touches[1]);
+        const midDeltaX = currentMid.x - g.startMidpoint.x;
+        const midDeltaY = currentMid.y - g.startMidpoint.y;
+
+        const nextPos = {
+          x: g.startPos.x + midDeltaX,
+          y: g.startPos.y + midDeltaY,
+        };
+
+        setScale(nextScale);
+        setPos(nextPos);
+      } else if (e.touches.length === 1) {
+        const touch = e.touches[0];
+        const dx = touch.clientX - g.startTouch.x;
+        const dy = touch.clientY - g.startTouch.y;
+
+        if (g.isPanning && g.scale > 1.05) {
+          // 放大状态下查看细节：直接拖拽平移，带轻度弹性边界
+          e.preventDefault();
+          const targetPos = {
+            x: g.startPos.x + dx,
+            y: g.startPos.y + dy,
+          };
+          setPos(targetPos);
+        } else if (g.isSwipingDown && dy > 0) {
+          // 1x 下滑随手关闭
+          e.preventDefault();
+          g.swipeY = dy;
+          setSwipingY(dy);
+        }
+      }
+    };
+
+    const onTouchEnd = () => {
+      setIsInteracting(false);
+      const g = gRef.current;
+
+      // 1x 下滑超过 80px 触发关闭
+      if (g.isSwipingDown && g.swipeY > 80) {
+        onClose();
+        return;
+      }
+      setSwipingY(0);
+
+      // 缩放边界回弹与贴边校正
+      if (g.scale < 1) {
+        resetZoom();
+      } else if (g.scale > 8) {
+        setScale(8);
+        setPos(clampOffset(8, g.pos));
+      } else {
+        setPos(clampOffset(g.scale, g.pos));
+      }
+
+      g.startDist = 0;
+      g.isPanning = false;
+      g.isSwipingDown = false;
+    };
+
+    // 鼠标滚轮平滑缩放
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsInteracting(true);
+      const factor = e.deltaY > 0 ? 0.85 : 1.18;
+      const nextScale = Math.min(8, Math.max(1, gRef.current.scale * factor));
+      setScale(nextScale);
+      if (nextScale <= 1.02) {
+        resetZoom();
+      } else {
+        setPos(clampOffset(nextScale, gRef.current.pos));
+      }
+      setTimeout(() => setIsInteracting(false), 50);
+    };
+
+    container.addEventListener('touchstart', onTouchStart, { passive: false });
+    container.addEventListener('touchmove', onTouchMove, { passive: false });
+    container.addEventListener('touchend', onTouchEnd, { passive: false });
+    container.addEventListener('touchcancel', onTouchEnd, { passive: false });
+    container.addEventListener('wheel', onWheel, { passive: false });
+
+    return () => {
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('touchend', onTouchEnd);
+      container.removeEventListener('touchcancel', onTouchEnd);
+      container.removeEventListener('wheel', onWheel);
+    };
+  }, [onClose, resetZoom]);
+
+  // 桌面端鼠标拖拽平移查看细节
+  const handleMouseDown = (e: MouseEvent) => {
+    if (scale <= 1.05) return;
+    e.preventDefault();
+    const g = gRef.current;
+    g.isMouseDown = true;
+    g.mouseStart = { x: e.clientX, y: e.clientY };
+    g.mouseStartPos = { ...pos };
+    setIsInteracting(true);
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!g.isMouseDown) return;
+      const dx = ev.clientX - g.mouseStart.x;
+      const dy = ev.clientY - g.mouseStart.y;
+      setPos({
+        x: g.mouseStartPos.x + dx,
+        y: g.mouseStartPos.y + dy,
+      });
+    };
+
+    const onMouseUp = () => {
+      g.isMouseDown = false;
+      setIsInteracting(false);
+      setPos(clampOffset(gRef.current.scale, gRef.current.pos));
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
+  const isZoomed = scale > 1.05;
+  const opacity = swipingY > 0 ? Math.max(0.2, 1 - swipingY / 280) : 1;
 
   const content = (
     <div
-      class="img-lightbox"
-      {...backdropDismiss}
+      ref={containerRef}
+      class={'img-lightbox' + (isZoomed ? ' is-zoomed' : '')}
       role="dialog"
       aria-modal="true"
-      style={{ zIndex: 99999 }}
+      style={{
+        zIndex: 99999,
+        opacity,
+      }}
+      onClick={(e) => {
+        // 点击遮罩空白区域（非缩放/平移状态）直接关闭
+        if (e.target === containerRef.current && scale <= 1.05) {
+          onClose();
+        }
+      }}
     >
-      <div class="img-lightbox-content" onClick={(e) => e.stopPropagation()}>
-        <div class="img-lightbox-frame" style={{ transform: `scale(${scale})` }}>
-          <img
-            ref={imgRef}
-            class="img-lightbox-img"
-            src={src}
-            alt=""
-            onDblClick={() => setScale((s) => (s === 1 ? 1.8 : 1))}
-          />
-          {/* 紧贴图片右上角动态挂接的关闭按钮 */}
+      {/* 顶部常驻控制栏：1:1 复原按钮 + 固定关闭按钮（永不随图片缩放而偏移跑掉） */}
+      <div class="img-lightbox-topbar" onClick={(e) => e.stopPropagation()}>
+        {isZoomed && (
           <button
             type="button"
-            class="img-lightbox-close"
-            onClick={(e) => {
-              e.stopPropagation();
-              onClose();
-            }}
-            title={t('preview.close')}
-            aria-label={t('settings.close')}
+            class="img-lightbox-reset-btn"
+            onClick={resetZoom}
+            title={t('preview.reset1x')}
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
+            {Math.round(scale * 100)}% · {t('preview.reset1x')}
           </button>
-        </div>
-        <div class="img-lightbox-hint">
-          {scale !== 1 && <span class="lightbox-hint-scale">{Math.round(scale * 100)}%</span>}
-          <span class="lightbox-hint-item">
-            <kbd>Ctrl</kbd> + {t('preview.wheel')}
-          </span>
-          <span class="lightbox-hint-dot">·</span>
-          <span class="lightbox-hint-item">{t('preview.reset')}</span>
-          <span class="lightbox-hint-dot">·</span>
-          <span class="lightbox-hint-item">{t('preview.background')}</span>
-        </div>
+        )}
+        <button
+          type="button"
+          class="img-lightbox-close-fixed"
+          onClick={onClose}
+          title={t('preview.close')}
+          aria-label={t('settings.close')}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+
+      {/* 图片舞台视口：绝对定位平滑渲染，支持 120fps 无延迟触屏跟随 */}
+      <div
+        class="img-lightbox-viewport"
+        style={{
+          transform: `translate3d(${pos.x}px, ${pos.y + swipingY}px, 0) scale(${scale})`,
+          transition: isInteracting ? 'none' : 'transform 0.22s cubic-bezier(0.16, 1, 0.3, 1)',
+          cursor: isZoomed ? (isInteracting ? 'grabbing' : 'grab') : 'zoom-in',
+        }}
+        onMouseDown={handleMouseDown}
+        onDblClick={() => {
+          if (scale > 1.05) resetZoom();
+          else {
+            setScale(2.5);
+            setPos({ x: 0, y: 0 });
+          }
+        }}
+      >
+        <img
+          ref={imgRef}
+          class="img-lightbox-img"
+          src={src}
+          alt=""
+          draggable={false}
+        />
+      </div>
+
+      {/* 底部友好提示栏：移动端显示双指缩放提示，桌面端显示滚轮提示 */}
+      <div class="img-lightbox-hint" onClick={(e) => e.stopPropagation()}>
+        <span class="lightbox-hint-mobile">{t('preview.mobilePinch')}</span>
+        <span class="lightbox-hint-desktop">
+          <kbd>Ctrl</kbd> + {t('preview.wheel')} · {t('preview.reset')}
+        </span>
       </div>
     </div>
   );
@@ -1015,6 +1282,17 @@ export function Chat({
   const inputRef = useRef(input);
   inputRef.current = input;
   const [busy, setBusy] = useState(false);
+  const [globalPreviewImage, setGlobalPreviewImage] = useState<string | null>(null);
+
+  // 全局图片大图预览监听：捕获来自 Markdown/助理回复/附件中的任意图片点击
+  useEffect(() => {
+    const handleImg = (e: Event) => {
+      const src = (e as CustomEvent<{ src?: string }>).detail?.src;
+      if (src) setGlobalPreviewImage(src);
+    };
+    window.addEventListener('jeikcode:preview:image', handleImg);
+    return () => window.removeEventListener('jeikcode:preview:image', handleImg);
+  }, []);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
@@ -10658,6 +10936,9 @@ export function Chat({
       )}
       </div>
       {topModelChrome}
+      {globalPreviewImage && (
+        <ImageLightbox src={globalPreviewImage} onClose={() => setGlobalPreviewImage(null)} />
+      )}
       {confirmModal.open && (
         <ConfirmDialog
           title={confirmModal.title}

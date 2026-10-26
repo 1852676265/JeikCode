@@ -495,7 +495,18 @@ export function Markdown({
       }
     }
 
-    // 2. 处理代码块 Copy 按钮
+    // 2. 点击图片：在全屏相册级灯箱中打开大图浏览，支持手机双指缩放与自由拖拽看细节
+    const imgEl = targetEl?.closest('img') as HTMLImageElement | null;
+    if (imgEl && imgEl.src) {
+      e.preventDefault();
+      e.stopPropagation();
+      window.dispatchEvent(new CustomEvent('jeikcode:preview:image', {
+        detail: { src: imgEl.src }
+      }));
+      return;
+    }
+
+    // 3. 处理代码块 Copy 按钮
     const copyBtn = targetEl?.closest('.copy-button') as HTMLElement | null;
     if (copyBtn?.dataset.copy) {
       const text = decodeURIComponent(copyBtn.dataset.copy);

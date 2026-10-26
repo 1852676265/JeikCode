@@ -657,6 +657,8 @@ export const zhTw: Record<keyof typeof en, string> = {
   'preview.refresh': '重新整理预览',
   'preview.reset': '雙击還原',
   'preview.wheel': '滚轮缩放',
+  'preview.mobilePinch': '雙指縮放 · 雙擊放大 · 拖曳檢視',
+  'preview.reset1x': '復原',
   'remote.applied': '已在 {url} 監聽',
   'remote.apply': '套用',
   'remote.applyFailed': '開啟監聽失敗',
