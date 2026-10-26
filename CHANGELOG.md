@@ -21,6 +21,44 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.2 (2026-10-26)
+
+- **[UI History & Context Compaction] Append-only display transcript keeps the full conversation visible**:
+  - Sessions now maintain a lossless UI transcript containing messages, reasoning, tool calls and image attachments, independent of model-context compaction. The complete history remains visible after automatic or manual compaction.
+  - Existing sessions without a transcript are backfilled automatically on first open; history paging uses a fingerprint cache so large sessions are not re-read and re-parsed for every page.
+- **[Chat Timeline] Finished-turn replay, natural steer and terminal notice anchoring fixes**:
+  - Fixed finished turn tails being replayed twice during terminal reconciliation; cache schema v4 discards canvases polluted by older coordinate systems.
+  - Natural steer cards now keep their user bubble and new agent loop in the correct turn; completed todo lists no longer stick to the next loop.
+  - Yellow incomplete and terminal error notices now anchor to the turn that produced them, even if the next turn has already rendered its answer.
+- **[History Integrity] Read-only compacted history, message-ID mutations and complete-turn paging**:
+  - Historical rows that are no longer in the active model context are marked read-only; editing, deletion and regeneration are disabled with a clear explanation.
+  - Message editing, deletion and rollback resolve by stable message ID and fail safely instead of modifying a neighbouring row.
+  - Oversized turns are returned as complete turns instead of a pinned question with an unloaded middle gap.
+- **[Runtime Stability] Session-isolated Bash runtime and redirected resident services**:
+  - Each session now owns its Bash runtime; stopping one session no longer cancels another session's foreground command.
+  - Foreground resident services whose output is redirected to a file (`>> log 2>&1`) are detected and stopped with guidance to use background mode, instead of appearing to run forever.
+- **[CI] Cross-platform redirected-output test fix**:
+  - Corrected shell quoting in the redirected-output heartbeat regression test so Ubuntu and macOS portability jobs pass.
+
+---
+
+- **[界面历史与上下文压缩] 只增展示账本保留完整对话**:
+  - 每个会话新增独立于模型上下文的只增展示账本，完整记录消息、思考过程、工具调用与图片附件；自动或手动压缩后，界面依然能看到全部历史。
+  - 没有展示账本的旧会话首次打开时自动回填；长会话分页增加指纹缓存，避免每翻一页都重复读取和解析大文件。
+- **[聊天时间线] 终态重放、自然转向与黄色通知落点修复**:
+  - 修复回合终态对账把上一轮回答与工具整体重放的问题；缓存 schema 升到 v4，旧坐标系的污染画布自动作废。
+  - 自然发出的转向卡片会把自己的用户气泡和新 loop 留在正确位置；已完成的待办清单不再粘到下一轮顶部。
+  - 黄色 incomplete 与终态错误通知现在锚定到产生它的那一轮，即使下一轮回答已经渲染完成，也不会贴到下一轮尾巴。
+- **[历史一致性] 压缩前历史只读、按消息 ID 编辑与完整回合分页**:
+  - 已不在当前模型上下文中的历史行标记为只读，明确禁用编辑、删除和重新生成并给出说明。
+  - 消息编辑、删除与回溯改为按稳定消息 ID 定位，找不到时安全失败，绝不误改相邻行。
+  - 超大回合按完整回合返回，不再出现“钉一条提问 + 中间空洞”。
+- **[运行时稳定性] 会话级 Bash 隔离与重定向常驻服务**:
+  - 每个会话独占 Bash 运行时，停止 A 会话不会误杀 B 会话正在运行的前台命令。
+  - 输出被重定向到文件（`>> log 2>&1`）的前台常驻服务能够被识别并及时停止，同时提示改用后台运行，不再一直显示运行中。
+- **[CI] 跨平台重定向输出测试修复**:
+  - 修正重定向心跳回归测试的 shell 引号，使 Ubuntu 与 macOS 可移植性任务恢复通过。
+
 ## v7.3.1-beta.1 (2026-10-26)
 
 - **[WebUI & Remote Sessions] Pinned prompt inversion fix, cold-start outline restoration & phantom bubble cleanup**:
