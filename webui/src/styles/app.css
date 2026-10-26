@@ -10328,6 +10328,23 @@ body {
   justify-content: flex-start !important;
 }
 
+/* Historical rows kept only in the append-only display log (drained from the
+   model context by compaction): visible, but edit/delete/regenerate is off. */
+.msg-readonly-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.22));
+  background: var(--app-ghost-button-hover-background, rgba(128, 128, 128, 0.12));
+  color: var(--app-msg-time-color, #c8cbcf);
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+  user-select: none;
+}
+
 /* 网络控制单行精炼头部 */
 .remote-streamlined-header {
   display: flex;

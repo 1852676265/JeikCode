@@ -150,6 +150,47 @@ test('replaying tool_start after tool_result does not regress status or drop out
   assert.equal(row?.duration_ms, 8);
 });
 
+test('redirected shell heartbeat stays pending until the result arrives', () => {
+  let parts: MsgPart[] = upsertToolPart([], tool('shell-redirect', { name: 'run_command' }));
+  parts = updateToolProgress(
+    parts,
+    'shell-redirect',
+    '[note: stdout is redirected to `probe.log`; live output stays empty until the command exits.]',
+  );
+  parts = updateToolProgress(
+    parts,
+    'shell-redirect',
+    '[still running: 40s total, 40s without output (pid 1234); stdout is redirected to a file]',
+  );
+  const pending = parts[0]!.kind === 'tool' ? parts[0].tool : undefined;
+  assert.equal(pending?.status, 'pending');
+  assert.match(pending?.progress ?? '', /still running/);
+
+  parts = upsertToolPart(
+    parts,
+    tool('shell-redirect', {
+      name: 'run_command',
+      status: toolResultStatus(true, 'done [exit code 0]', 'run_command'),
+      output: 'done [exit code 0]',
+    }),
+  );
+  const settled = parts[0]!.kind === 'tool' ? parts[0].tool : undefined;
+  assert.equal(settled?.status, 'done');
+});
+
+test('finalizeToolsAfterTurn settles a pending redirected shell without a result', () => {
+  const next = finalizeToolsAfterTurn([
+    {
+      kind: 'tool',
+      tool: tool('redirect-no-result', {
+        name: 'run_command',
+        progress: '[note: stdout is redirected to `probe.log`]',
+      }),
+    },
+  ]);
+  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'error');
+});
+
 test('finalizeToolsAfterTurn settles leftover pending rows except live bash await', () => {
   const parts: MsgPart[] = [
     { kind: 'tool', tool: tool('guide', { name: 'jeikcode_config_guide', output: 'docs' }) },

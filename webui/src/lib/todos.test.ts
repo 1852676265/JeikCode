@@ -1038,6 +1038,30 @@ test('archived tool output does not resurrect the live panel', () => {
   );
   assert.equal(placed[0]!.parts.some((part) => part.kind === 'todo_list'), false);
   assert.equal(placed[2]!.parts.some((part) => part.kind === 'todo_list'), true);
+
+  // A natural steer can append an EMPTY assistant placeholder before the old
+  // terminal commits its todo archive. The completed plan belongs to the
+  // previous answer, NOT the new loop's placeholder.
+  const steerPlaced = placeArchivedTodos(
+    [
+      { role: 'user', parts: [{ kind: 'text', text: '上一问' }] },
+      { role: 'assistant', parts: [{ kind: 'text', text: '上一答' }] },
+      { role: 'user', parts: [{ kind: 'text', text: 'steer 自然发出' }] },
+      { role: 'assistant', parts: [] },
+    ],
+    settled.archive ?? [],
+    'call_1',
+  );
+  assert.equal(
+    steerPlaced[1]!.parts.some((part) => part.kind === 'todo_list'),
+    true,
+    'archive must land on the previous answer',
+  );
+  assert.equal(
+    steerPlaced[3]!.parts.some((part) => part.kind === 'todo_list'),
+    false,
+    'an empty next-loop placeholder must never receive the old todo list',
+  );
   assert.equal(placed[2]!.parts.filter((part) => part.kind === 'todo_list').length, 1);
 });
 

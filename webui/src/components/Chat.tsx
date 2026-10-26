@@ -66,7 +66,7 @@ import {
   FRONTEND_COMMANDS,
   type SlashHandlers,
 } from '../lib/slashCommands';
-import { buildTurnNavItems, buildTurnNavItemsFromOutline, compactTurnNavText, filterTurnNavItems, hasOlderVisibleMessages, resolveActiveTurnId, turnNavId, turnNavScrollTop, visibleOlderRemainingCount } from '../lib/turnNav';
+import { buildTurnNavItems, buildTurnNavItemsFromOutline, compactTurnNavText, filterTurnNavItems, hasOlderVisibleMessages, remainingUnloadedTurns, resolveActiveTurnId, turnNavId, turnNavScrollTop, visibleOlderRemainingCount } from '../lib/turnNav';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForSessionOrigin } from '../lib/modeSwitch';
 import { randomUUID } from '../lib/randomId';
@@ -220,7 +220,6 @@ import {
   formatCacheHitRate,
   createTokenCacheState,
   resetTokenCacheState,
-  startTokenTurn,
   estimateLocalCached,
   estimateCacheFromHistoryPrompt,
   type TokenCacheState,
@@ -269,9 +268,10 @@ import {
   paintUserMessage,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
+  cachedHeadIsContiguous,
+  resolveHistoryOffset,
   spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
-  lastAssistantHasAnswer,
   stampUserClientInputId,
   stampUserSourceIndex,
   visibleToolChunk,
@@ -314,6 +314,9 @@ interface Message {
   /** 客户端关联键（`client_input_id`）：乐观提问气泡的幂等身份。随会话缓存
    *  （含 IndexedDB）一起持久化，重放/刷新/异地端据此去重，不靠文本比对。 */
   clientInputId?: string;
+  /** Rebuilt from the append-only JSONL after compaction: display-only, no kernel
+   *  row exists at this index, so edit/delete/regenerate must stay disabled. */
+  readOnly?: boolean;
 }
 
 /**
@@ -996,9 +999,6 @@ interface TokenUsage {
   cached?: number;
   cached_estimated?: boolean;
   reasoning?: number;
-  /** Industrial loop sums for this user turn: Σ step prompt / Σ step cache. */
-  loop_prompt?: number;
-  loop_cached?: number;
 }
 
 interface PermissionRequestEvent {
@@ -1507,6 +1507,11 @@ export function Chat({
   // Stop restores the queue into the composer. Block one drain so a busy→idle
   // render cannot send those messages before the cleared queue commits.
   const blockQueueDrainRef = useRef(false);
+  // A deferred disk catch-up for the previous tail. The old terminal skips it
+  // while the next steer/queued turn is starting; if that next turn fails or
+  // stalls, this timer (guarded by busy/local-turn) recovers the tail without
+  // waiting for a manual refresh.
+  const deferredReconcileTimerRef = useRef<number | null>(null);
   // Inputs accepted by the live runtime as in-turn steers but not yet folded at
   // a kernel round boundary. Unlike `queued`, these already belong to the active
   // turn and must be recovered if that turn is cancelled before acknowledgement.
@@ -1578,8 +1583,6 @@ export function Chat({
       cached: resolved.cached,
       cached_estimated: resolved.cached_estimated,
       reasoning: usage.reasoning ?? 0,
-      loop_prompt: resolved.nextState.turnPromptSum,
-      loop_cached: resolved.nextState.turnCachedSum,
     });
   };
 
@@ -1639,8 +1642,6 @@ export function Chat({
     const cacheState: TokenCacheState = {
       lastPrompt: prompt,
       providerReportsCache: cached > 0 && !usage.cached_estimated,
-      turnPromptSum: prompt,
-      turnCachedSum: cached,
     };
     applyTokenUsage({
       prompt,
@@ -2750,6 +2751,14 @@ export function Chat({
    */
   const syncSessionCacheFromDisk = useCallback(async (hash: string, sid: string): Promise<boolean> => {
     if (!hash || !sid) return false;
+    // A previous turn's terminal must not reconcile the stale disk tail over a
+    // new turn (steer drain / immediate send) that is already in flight.
+    if (
+      localTurnSessionsRef.current.has(sid) ||
+      backgroundRunningSessionsRef.current.has(sid)
+    ) {
+      return true;
+    }
     try {
       const detail = await getSession(hash, sid, { tail: HISTORY_PAGE });
       if (!detail || !Array.isArray(detail.messages)) return false;
@@ -2889,11 +2898,42 @@ export function Chat({
   // 必须在同一同步块里把 busyRef 同步清掉——`setBusy` 是异步的,直接调
   // `startIdleWatch` 会被上一轮的 `busyRef.current === true` 入口守卫挡掉,
   // 导致第一轮结束后 watch 失联、第二轮无法同步。
+  function scheduleDeferredReconcile(
+    projectHash: string,
+    loadId: string,
+    delayMs = 5000,
+  ) {
+    if (!projectHash || !loadId) return;
+    if (deferredReconcileTimerRef.current != null) {
+      window.clearTimeout(deferredReconcileTimerRef.current);
+    }
+    deferredReconcileTimerRef.current = window.setTimeout(() => {
+      deferredReconcileTimerRef.current = null;
+      if (activeIdRef.current !== loadId && !messageCacheRef.current.has(loadId)) return;
+      // A live next turn owns the canvas; its own terminal will reconcile.
+      // Re-arm instead of giving up: a hung turn that never emits a terminal
+      // must still recover the previous tail once it is finally cleared.
+      if (busyRef.current || isLocalTurnInFlight(loadId)) {
+        scheduleDeferredReconcile(projectHash, loadId, delayMs);
+        return;
+      }
+      settleDiskCatchUp(projectHash, loadId);
+    }, delayMs);
+  }
+
   function settleToIdleWatch(
     projectHash: string,
     loadId: string,
     loadGeneration: number,
   ) {
+    // The next turn (auto-drained steer / send-now) may already own the stream.
+    // Never let the previous terminal's idle settlement abort it or clear busy.
+    if (
+      localTurnSessionsRef.current.has(loadId) ||
+      backgroundRunningSessionsRef.current.has(loadId)
+    ) {
+      return;
+    }
     sessionWatchersRef.current.get(loadId)?.abort();
     sessionWatchersRef.current.delete(loadId);
     localActiveStreamsBySessionRef.current.delete(loadId);
@@ -2911,14 +2951,45 @@ export function Chat({
     busyRef.current = false;
     markSessionTerminalSettled(loadId);
     commitActiveTodosIntoLastAssistant();
-    const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(loadId) ?? []);
-    // 回合结束进入待机：输入框上方已归档沉淀，持久化缓存写入 null，绝不残留脏待办
-    void saveSessionCache(projectHash, loadId, messagesRef.current, null, undefined, currentOutline, tokensAuthoritativeRef.current);
+    const currentOutline =
+      turnOutlineBySessionRef.current.get(loadId) ??
+      (turnOutlineRef.current.length > 0 ? turnOutlineRef.current : []);
+    // 回合结束进入待机：输入框上方已归档沉淀，持久化缓存写入 null，绝不残留脏待办。
+    // 用 L1 全量画布 ∪ 当前窗口，避免温切换的 48 条窗口把更早历史从 L2 截断。
+    const payload = canvasCachePayload(loadId);
+    void saveSessionCache(
+      projectHash,
+      loadId,
+      payload.messages,
+      null,
+      undefined,
+      currentOutline,
+      tokensAuthoritativeRef.current,
+      payload.offset,
+      payload.total,
+    );
     // API turn 已落盘:通知 App 刷新侧栏(消息数/自动命名标题),新建会话才会出现。
     onLiveTurnDone?.();
     startIdleWatch(projectHash, loadId, loadGeneration);
     // 终态已到：磁盘已结算，强制对账一次，补回流里可能丢掉（或被去重吞掉）的尾段正文。
-    settleDiskCatchUp(projectHash, loadId);
+    // 但若队列里还有待发的 steer/queue，下一回合马上会被 drain 发出；此时先去
+    // 对账旧磁盘会把新回合的乐观气泡/首个 loop 覆盖掉（用户气泡消失 + 新 loop
+    // 被接到上一轮下面）。让新回合自己的终态再做一次权威对账。
+    const targetQueued =
+      loadId === activeIdRef.current
+        ? queuedRef.current
+        : (queuedBySessionRef.current.get(loadId) ?? []);
+    const hasQueuedNextTurn = targetQueued.some(
+      (item) => item.kind === 'queue' || item.kind === 'steer' || item.kind === 'steering',
+    );
+    if (!hasQueuedNextTurn) {
+      settleDiskCatchUp(projectHash, loadId);
+    } else {
+      // If the queued/steer turn never starts (or dies without a terminal),
+      // recover the previous tail once it is safe. The callback re-checks
+      // busy/local-turn, so a healthy new turn is never clobbered.
+      scheduleDeferredReconcile(projectHash, loadId);
+    }
   }
   function startIdleWatch(
     projectHash: string,
@@ -3532,6 +3603,7 @@ export function Chat({
         sessionId ? activeTodosBySessionRef.current.get(sessionId) ?? null : null,
       );
       timelineFollow.reset();
+      let trimmedOffset: number | null = null;
       if (cached && cached.length > 0) {
         const cleanCached = sanitizeCanvasMessages(cached);
         if (sessionId) messageCacheRef.current.set(sessionId, cleanCached);
@@ -3547,8 +3619,11 @@ export function Chat({
           if (firstTail && typeof firstTail.sourceIndex === 'number') {
             windowOffset = firstTail.sourceIndex;
           } else {
-            windowOffset = Math.max(0, cleanCached.length - HISTORY_PAGE);
+            // Visible-message count is NOT a raw transcript index. Keep the last
+            // known raw cursor instead of inventing a page boundary.
+            windowOffset = (sessionId ? historyOffsetBySessionRef.current.get(sessionId) : 0) ?? 0;
           }
+          trimmedOffset = windowOffset;
         }
 
         messagesRef.current = displayTail;
@@ -3574,17 +3649,27 @@ export function Chat({
       setTurnNavQuery('');
       setActiveTurnId(null);
       turnNavPinUntilRef.current = 0;
-      const cachedOffset = sessionId ? (historyOffsetBySessionRef.current.get(sessionId) ?? 0) : 0;
+      const cachedOffset =
+        trimmedOffset ?? (sessionId ? (historyOffsetBySessionRef.current.get(sessionId) ?? 0) : 0);
       const cachedTotal = sessionId ? (historyTotalBySessionRef.current.get(sessionId) ?? 0) : 0;
       const cachedOutline = sessionId ? turnOutlineBySessionRef.current.get(sessionId) : undefined;
       const firstTurnIdx = cachedOutline?.[0]?.index ?? 0;
       const cachedHasOlder = sessionId
-        ? (hasOlderVisibleMessages({ offset: cachedOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: cached?.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) }) || (hasOlderBySessionRef.current.get(sessionId) === true))
+        ? (trimmedOffset != null ||
+            hasOlderVisibleMessages({ offset: cachedOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: cached?.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) }) ||
+            (hasOlderBySessionRef.current.get(sessionId) === true))
         : false;
       setHasOlder(cachedHasOlder);
       setLoadingOlder(false);
       historyOffsetRef.current = cachedOffset;
       historyTotalRef.current = cachedTotal;
+      if (sessionId && trimmedOffset != null) {
+        // The canvas was intentionally trimmed to its active window. Persist the
+        // trimmed cursor and the availability of the earlier in-memory rows, or
+        // the next switch reads the old (0) cursor and hides the load button.
+        historyOffsetBySessionRef.current.set(sessionId, cachedOffset);
+        hasOlderBySessionRef.current.set(sessionId, true);
+      }
       pendingJumpIdRef.current = null;
       setTurnOutline(cachedOutline ?? []);
 
@@ -3646,13 +3731,15 @@ export function Chat({
 
       let displayTail = cleanCached;
       let windowOffset = historyOffsetBySessionRef.current.get(sessionId) ?? 0;
-      if (cleanCached.length > HISTORY_PAGE) {
+      const trimmedWindow = cleanCached.length > HISTORY_PAGE;
+      if (trimmedWindow) {
         displayTail = cleanCached.slice(-HISTORY_PAGE);
         const firstTail = displayTail[0];
         if (firstTail && typeof firstTail.sourceIndex === 'number') {
           windowOffset = firstTail.sourceIndex;
         } else {
-          windowOffset = Math.max(0, cleanCached.length - HISTORY_PAGE);
+          // Same invariant as above: never use a visible count as a raw index.
+          windowOffset = historyOffsetBySessionRef.current.get(sessionId) ?? 0;
         }
       }
 
@@ -3674,12 +3761,18 @@ export function Chat({
       const savedOffset = windowOffset;
       const savedTotal = historyTotalBySessionRef.current.get(sessionId) ?? 0;
       const savedHasOlder =
+        trimmedWindow ||
         hasOlderVisibleMessages({ offset: savedOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: cached?.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) }) ||
         (hasOlderBySessionRef.current.get(sessionId) === true) ||
         (activeSession?.id === sessionId && (activeSession.message_count ?? 0) > cached.length);
       historyOffsetRef.current = savedOffset;
       historyTotalRef.current = savedTotal;
       setHasOlder(savedHasOlder);
+      // Keep the per-session cursor/flag in sync with the trimmed canvas; the
+      // old code left the full-history offset (often 0) here, so the next warm
+      // switch thought everything was loaded and never offered "load earlier".
+      historyOffsetBySessionRef.current.set(sessionId, savedOffset);
+      hasOlderBySessionRef.current.set(sessionId, savedHasOlder);
       const cachedProv = providerCacheRef.current.get(sessionId);
       if (cachedProv) {
         setProvider(cachedProv);
@@ -3818,12 +3911,35 @@ export function Chat({
           // 否则异地冷启动接入运行中会话时大纲会丢失（退化为仅有推流的 3-5 条）且无法向上加载历史！
           const totalOnDisk = sessionResult.value.message_count ?? (sessionResult.value.messages.length + (sessionResult.value.offset ?? 0));
           const diskOffset = sessionResult.value.offset ?? 0;
+          const cachedTotal = historyTotalBySessionRef.current.get(loadId) ?? 0;
+          // A shrinking transcript means compaction renumbered the snapshot array.
+          // Cached source indices are from the OLD array: merging them by index is
+          // what produced "old question below later answers". Fall back to the
+          // authoritative tail instead of mixing two coordinate systems.
+          const cacheShrank = cachedTotal > 0 && totalOnDisk > 0 && totalOnDisk < cachedTotal;
+          // A cache that ends before the disk tail leaves an unrendered hole when
+          // spliced. On an idle session, prefer the authoritative tail instead.
+          const cacheHasGap =
+            serverActive === false &&
+            !!currentCached &&
+            currentCached.length > 0 &&
+            !cachedHeadIsContiguous(currentCached, diskOffset);
+          // The API always answers with the 48-row tail offset. If L2 already holds
+          // earlier pages, keep its cursor; otherwise "load earlier" fetches rows
+          // already on screen and silently adds nothing.
+          const effectiveOffset = cacheShrank || cacheHasGap
+            ? diskOffset
+            : resolveHistoryOffset({
+                cachedMessages: currentCached,
+                cachedOffset: historyOffsetBySessionRef.current.get(loadId),
+                diskOffset,
+              });
           const firstTurnIdx = sessionResult.value.turns?.[0]?.index ?? 0;
-          const olderExists = hasOlderVisibleMessages({ offset: diskOffset, firstTurnIndex: firstTurnIdx });
+          const olderExists = hasOlderVisibleMessages({ offset: effectiveOffset, firstTurnIndex: firstTurnIdx });
           historyTotalRef.current = totalOnDisk;
-          historyOffsetRef.current = diskOffset;
+          historyOffsetRef.current = effectiveOffset;
           setHasOlder(olderExists);
-          historyOffsetBySessionRef.current.set(loadId, diskOffset);
+          historyOffsetBySessionRef.current.set(loadId, effectiveOffset);
           historyTotalBySessionRef.current.set(loadId, totalOnDisk);
           hasOlderBySessionRef.current.set(loadId, olderExists);
           if (sessionResult.value.turns && sessionResult.value.turns.length > 0) {
@@ -3847,36 +3963,24 @@ export function Chat({
               diskOffset,
               sessionResult.value.pinned_user_index,
             );
-            // 运行中的会话磁盘尚未落盘本轮未结消息，绝不能用落后磁盘历史覆盖缓存！
-            if (serverActive === false) {
-              void saveSessionCache(
-                projectHash,
-                loadId,
-                loaded,
-                sessionResult.value.todos,
-                undefined,
-                sessionResult.value.turns,
-                sessionResult.value.token_usage,
-                diskOffset,
-                totalOnDisk,
-              );
-            }
-            let displayMessages: Message[] = currentCached && currentCached.length > 0 ? currentCached : loaded;
+            const canUseCache =
+              !cacheShrank && !cacheHasGap && !!currentCached && currentCached.length > 0;
+            let displayMessages: Message[] = canUseCache ? currentCached! : loaded;
 
-            if (currentCached && currentCached.length > 0) {
-              const cacheNeedsSettledTail = serverActive === false && (
-                !lastAssistantHasAnswer(currentCached) && lastAssistantHasAnswer(loaded)
-              );
-              if (cacheNeedsSettledTail) {
-                // 服务端已完结且磁盘具有最终回答，而内存缓存尚未收尾（例如切后台导致断流）：
-                // 用权威磁盘切片无损替换尾部，把最后一段正文与工具结果瞬间补全！
-                const spliced = spliceAuthoritativeDiskTail(currentCached, loaded, diskOffset);
+            if (canUseCache) {
+              // A finished session's disk tail is authoritative. ALWAYS splice it
+              // into the cached head when the server says idle: the cache may be
+              // a complete answer from an earlier visit, yet miss every turn that
+              // landed afterwards. Only checking `lastAssistantHasAnswer` left the
+              // canvas stuck on the old 48-row window after a refresh.
+              if (serverActive === false) {
+                const spliced = spliceAuthoritativeDiskTail(currentCached!, loaded, diskOffset);
                 displayMessages = sanitizeCanvasMessages(spliced);
                 messagesRef.current = displayMessages;
                 messageCacheRef.current.set(loadId, displayMessages);
                 setMessages(displayMessages);
               } else {
-                displayMessages = sanitizeCanvasMessages(currentCached);
+                displayMessages = sanitizeCanvasMessages(currentCached!);
                 if (messagesRef.current !== currentCached) {
                   messagesRef.current = displayMessages;
                   messageCacheRef.current.set(loadId, displayMessages);
@@ -3900,6 +4004,22 @@ export function Chat({
             } else {
               canvasReadySessionIdRef.current = loadId;
               flushPreMountStreamBuffer(loadId);
+            }
+            // Persist the FULL rendered window, never just the 48-row tail we
+            // happened to fetch. Saving `loaded` here truncated the L2 cache on
+            // every refresh; the next cold start then had only 48 rows left.
+            if (serverActive === false && displayMessages.length > 0) {
+              void saveSessionCache(
+                projectHash,
+                loadId,
+                displayMessages,
+                sessionResult.value.todos,
+                undefined,
+                sessionResult.value.turns,
+                sessionResult.value.token_usage,
+                effectiveOffset,
+                totalOnDisk,
+              );
             }
             // Seed the sticky panel from transcript only when this view has
             // nothing yet, or the turn is already finished. A running turn's
@@ -4376,6 +4496,8 @@ export function Chat({
       const sourceIndex = pinned && rawIndex === 0
         ? pinnedUserIndex
         : sourceOffset + (pinned ? rawIndex - 1 : rawIndex);
+      const displayOrigin = msg.internal_origin ?? msg.internalOrigin;
+      const readOnly = displayOrigin === 'transcript_archive' || undefined;
       if (msg.role === 'user') {
         if (!msg.synthetic && !isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) {
           closeCompletedTurnTodos();
@@ -4389,11 +4511,17 @@ export function Chat({
           ),
         );
         if (!visible && !(msg.images && msg.images.length)) continue;
-        // 关键防御去重：检测前面相邻的是否已经是完全相同的 User 消息（防重放与脏缓存重复渲染）
+        // 关键防御去重：检测前面相邻的是否已经是完全相同的 User 消息（防重放与脏缓存重复渲染）。
+        // 但两条都带不同的绝对下标时，它们是用户真实连发的同一句话，绝不能吞掉第二条。
         const lastLoaded = loaded[loaded.length - 1];
+        const sameAbsoluteRow =
+          typeof lastLoaded?.sourceIndex === 'number' && lastLoaded.sourceIndex === sourceIndex;
+        const missingAbsoluteRow =
+          typeof lastLoaded?.sourceIndex !== 'number' || typeof sourceIndex !== 'number';
         if (
           lastLoaded &&
           lastLoaded.role === 'user' &&
+          (sameAbsoluteRow || missingAbsoluteRow) &&
           lastLoaded.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', visible))
         ) {
           continue;
@@ -4408,10 +4536,11 @@ export function Chat({
           sourceIndex,
           turnNavOrdinal,
           id: msg.id,
+          readOnly,
         });
       } else if (msg.role === 'assistant') {
         if (isInternalHistoryAssistantMessage(msg)) continue;
-        const origin = msg.internal_origin ?? msg.internalOrigin;
+        const origin = displayOrigin;
         if (origin === 'turn_diagnostic') {
           const text = (msg.content ?? '').trim();
           if (text) {
@@ -4472,6 +4601,7 @@ export function Chat({
           elapsedMs: msg.elapsed_ms,
           sourceIndex,
           id: msg.id,
+          readOnly,
         });
       } else if (msg.role === 'tool' && msg.tool_result) {
         const result = msg.tool_result;
@@ -4606,6 +4736,12 @@ export function Chat({
         historyOffsetRef.current,
       );
     },
+    [turnOutline, messages],
+  );
+  // 加载按钮只报「还没上画布的提问数」。旧口径把 tool/tool_result 原始行
+  // 也算进去，长回合会显示成「还剩 568 条消息」，与用户看到的卡片数量严重不符。
+  const unloadedTurnCount = useMemo(
+    () => remainingUnloadedTurns(turnOutline, messages),
     [turnOutline, messages],
   );
   const [turnNavQuery, setTurnNavQuery] = useState('');
@@ -5274,7 +5410,9 @@ export function Chat({
         next.push({
           role: 'assistant',
           parts: [],
-          sourceIndex: turnIndex + 1,
+          // 不盖 sourceIndex：这条流式占位行尚未落盘，绝对下标只有落盘/身份帧才有
+          // 权威值。猜一个下标会让终态对账把它当成「已结算的更早历史」保留下来，
+          // 与权威尾部里同一轮次叠成两份（整轮回答被重放）。
         });
       }
       return next;
@@ -5297,7 +5435,22 @@ export function Chat({
       }
     }
 
-    // 3. 消费 pendingSteers
+    // 3. A folded steer is still an ACTIVE turn. If the previous loop's done
+    //    already cleared busy (natural drain race), restore the running state so
+    //    the button returns to stop and the new loop is not left looking idle.
+    if (sid) {
+      localTurnSessionsRef.current.add(sid);
+      onLiveRunningChange?.(sid, true);
+      if (isCurrentView) {
+        liveLifecycleRef.current = { running: true, terminalConsumed: false };
+        setBusyAndClock(true);
+        busyRef.current = true;
+      } else {
+        backgroundRunningSessionsRef.current.add(sid);
+      }
+    }
+
+    // 4. 消费 pendingSteers
     if (sid) {
       const curSteers = pendingSteersBySessionRef.current.get(sid) ?? [];
       const nextSteers = acknowledgeLiveSteers(curSteers, steeredInputs, clientInputIds);
@@ -5490,6 +5643,52 @@ export function Chat({
     const prevOffset = historyOffsetRef.current;
     const page = Math.min(HISTORY_PAGE, prevOffset);
     const nextOffset = prevOffset - page;
+
+    // Warm switch trims the DOM to the active window but keeps the full canvas
+    // in L1. Expand instantly from that in-memory copy before touching the disk:
+    // this is the "早先历史在内存中完整保留，展开时 0ms 补齐" contract, and it
+    // also avoids a disk page whose boundary could split tool calls from results.
+    const cachedFull = messageCacheRef.current.get(id);
+    if (cachedFull && cachedFull.length > 0) {
+      const cachedOlder = cachedFull.filter(
+        (m) => typeof m.sourceIndex === 'number' && m.sourceIndex >= nextOffset && m.sourceIndex < prevOffset,
+      );
+      if (cachedOlder.length > 0) {
+        const earliest = Math.min(...cachedOlder.map((m) => m.sourceIndex!));
+        const firstTurnIdx = turnOutlineRef.current[0]?.index ?? 0;
+        const olderExists = hasOlderVisibleMessages({
+          offset: earliest,
+          firstTurnIndex: firstTurnIdx,
+          canvasHasFirstTurn:
+            messagesRef.current.some(
+              (m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx,
+            ) ||
+            cachedOlder.some(
+              (m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx,
+            ),
+        });
+        const root = scrollRef.current;
+        const prevHeight = root?.scrollHeight ?? 0;
+        const prevTop = root?.scrollTop ?? 0;
+        setMessages((prev) => {
+          const next = prependOlderMessages(prev, cachedOlder);
+          messagesRef.current = next;
+          return next;
+        });
+        historyOffsetRef.current = earliest;
+        setHasOlder(olderExists);
+        historyOffsetBySessionRef.current.set(id, earliest);
+        hasOlderBySessionRef.current.set(id, olderExists);
+        requestAnimationFrame(() => {
+          if (activeIdRef.current !== id || sessionGenerationRef.current !== generation) return;
+          const el = scrollRef.current;
+          if (!el) return;
+          el.scrollTop = prevTop + (el.scrollHeight - prevHeight);
+        });
+        return;
+      }
+    }
+
     setLoadingOlder(true);
     const root = scrollRef.current;
     const prevHeight = root?.scrollHeight ?? 0;
@@ -6079,8 +6278,6 @@ export function Chat({
         cacheState: {
           lastPrompt: prompt,
           providerReportsCache: false,
-          turnPromptSum: prompt,
-          turnCachedSum: 0,
         },
         authoritative: false,
         compacted: true,
@@ -6377,6 +6574,37 @@ export function Chat({
    * 所以每处理完一帧就排队一次缓存写入（L1 同步、L2 异步），回合收尾另有强制写入。
    */
   const canvasCacheTimerRef = useRef<number | null>(null);
+  /**
+   * Persist the UNION of the full L1 canvas and the visible window.
+   *
+   * A warm switch trims the DOM to its 48-message active window but keeps the
+   * full history in `messageCacheRef`. Saving only `messagesRef` overwrote L2
+   * with that window on every debounce/turn-end, so the next cold start lost
+   * the earlier history all over again. Merge both views instead.
+   */
+  function canvasCachePayload(target: string): {
+    messages: Message[];
+    offset: number;
+    total: number;
+  } {
+    const active = activeIdRef.current === target;
+    const cached = messageCacheRef.current.get(target);
+    const display = active ? messagesRef.current : [];
+    const messages =
+      cached && cached.length > 0
+        ? mergeOlderMessages(cached, display)
+        : display;
+    return {
+      messages,
+      offset:
+        historyOffsetBySessionRef.current.get(target) ??
+        (active ? historyOffsetRef.current : 0),
+      total:
+        historyTotalBySessionRef.current.get(target) ??
+        (active ? historyTotalRef.current : 0),
+    };
+  }
+
   function scheduleCanvasCacheSave() {
     if (canvasCacheTimerRef.current != null) return;
     canvasCacheTimerRef.current = window.setTimeout(() => {
@@ -6393,14 +6621,17 @@ export function Chat({
         turnOutlineRef.current.length > 0
           ? turnOutlineRef.current
           : turnOutlineBySessionRef.current.get(target) ?? [];
+      const payload = canvasCachePayload(target);
       void saveSessionCache(
         hash,
         target,
-        messagesRef.current,
+        payload.messages,
         activeTodosRef.current,
         undefined,
         outline,
         tokensAuthoritativeRef.current,
+        payload.offset,
+        payload.total,
       );
     }, 800);
   }
@@ -6529,11 +6760,12 @@ export function Chat({
         // 不再回退文本启发）。受唯一性守卫保护，幂等。
         setMessages((prev) => {
           let next = bindUserMessageIdentity(prev, event.message_id);
-          // 回放里被折叠线切掉的提问没有绝对下标：用身份帧里的真实下标补上。
-          // 注意两个下标空间不同：wire 的 `absolute_index` 是**会话数组**下标，而画布的
-          // `sourceIndex` 是**显示列表**下标（展示层会过滤 system-reminder / legacy
-          // summary 行并插入 presentation 行）。所以优先用右栏大纲（磁盘显示空间）
-          // 的同名条目，wire 下标仅作“当前回合还没进大纲”时的兜底。
+          // 回放里被折叠线切掉的提问没有绝对下标：用右栏大纲（磁盘显示空间）的
+          // 同名条目补上。**绝不能**退回 wire 的 `absolute_index`：那是会话快照
+          // 数组下标，而画布的 `sourceIndex` 是显示列表下标（压缩前缀、过滤掉的
+          // system-reminder、presentation 行都会让两者相差几十到几百）。混用会让
+          // 新提问的页码/跳转/改写定位整体错位。大纲还没有这一轮时保留发送时的
+          // 显示空间猜测值，等下一次权威大纲到达再收敛。
           let outlineIndex: number | undefined;
           if (turnOutlineRef.current.length > 0) {
             const row = prev.find((m) => m.role === 'user' && m.id === event.message_id);
@@ -6549,7 +6781,7 @@ export function Chat({
           next = stampUserSourceIndex(
             next,
             event.message_id,
-            outlineIndex ?? event.absolute_index,
+            outlineIndex,
           );
           if (next === prev) return prev;
           messagesRef.current = next;
@@ -6815,8 +7047,6 @@ export function Chat({
           cached: resolved.cached,
           cached_estimated: resolved.cached_estimated,
           reasoning: prev?.reasoning ?? 0,
-          loop_prompt: resolved.nextState.turnPromptSum,
-          loop_cached: resolved.nextState.turnCachedSum,
         }));
         break;
       }
@@ -6931,6 +7161,16 @@ export function Chat({
           setBusyAndClock(false);
           if (event.session_id) {
             markSessionTerminalSettled(event.session_id);
+          }
+          // A failed/hung next turn must not leave the previous tail skipped
+          // forever. User cancellation is excluded because the rollback path
+          // intentionally keeps the truncated canvas.
+          if (event.session_id && event.stop_reason !== 'cancelled') {
+            const reconcileHash =
+              projectHashBySessionRef.current.get(event.session_id) ||
+              (event.session_id === activeIdRef.current ? activeSession?.project_hash : undefined) ||
+              '';
+            scheduleDeferredReconcile(reconcileHash, event.session_id, 500);
           }
         } else {
           // ── 正常交互完成 (Normal Turn Completion) ──
@@ -7050,6 +7290,16 @@ export function Chat({
           turnStartedAtBySessionRef.current.delete(activeIdRef.current);
         }
         setBusyAndClock(false);
+        // Recover the previous tail after the failed turn settles. The timer
+        // re-checks busy/local-turn, so it cannot clobber a surviving new turn.
+        {
+          const errorSid = activeIdRef.current || sessionId;
+          const reconcileHash =
+            activeSession?.project_hash ||
+            (errorSid ? projectHashBySessionRef.current.get(errorSid) : undefined) ||
+            '';
+          if (errorSid) scheduleDeferredReconcile(reconcileHash, errorSid, 500);
+        }
         finalizePendingToolsOnCanvas();
         commitActiveTodosIntoLastAssistant();
         blockQueueDrainRef.current = true; // 出错时暂停自动 drain，但保留排队消息不丢失
@@ -7067,8 +7317,6 @@ export function Chat({
           const cacheState = {
             lastPrompt: prompt,
             providerReportsCache: false,
-            turnPromptSum: prompt,
-            turnCachedSum: 0,
           };
           applyTokenUsage(
             { prompt, completion: 0, total: prompt, cached: 0, cached_estimated: false, reasoning: 0 },
@@ -7102,8 +7350,6 @@ export function Chat({
         const cacheState = {
           lastPrompt: prompt,
           providerReportsCache: false,
-          turnPromptSum: prompt,
-          turnCachedSum: 0,
         };
         applyTokenUsage(
           { prompt, completion: 0, total: prompt, cached: 0, cached_estimated: false, reasoning: 0 },
@@ -7230,17 +7476,37 @@ export function Chat({
         if (mutation.action === 'delete' || mutation.action === 'truncate') {
           clearSessionTodoState(mutation.session_id);
         }
+        // Mutation events carry the persisted message id. Prefer it over the
+        // numeric source_index: the event's source_index is a KERNEL snapshot
+        // index, while the canvas stores a DISPLAY-list index (compacted prefix
+        // / filtered system rows make them diverge). Fail closed when an id is
+        // present but missing instead of editing/deleting a neighbouring row.
+        const mutationRowIndex = (rows: Message[]): number => {
+          if (mutation.message_id) {
+            return rows.findIndex((m) => m.id === mutation.message_id);
+          }
+          return mutation.source_index != null
+            ? rows.findIndex((m) => m.sourceIndex === mutation.source_index)
+            : -1;
+        };
+        const truncateRowIndex = (rows: Message[]): number => {
+          if (mutation.target_message_id) {
+            // The originating tab has already optimistically truncated; if the
+            // row is gone, do not fall back to the snapshot index and cut extra.
+            return rows.findIndex((m) => m.id === mutation.target_message_id);
+          }
+          return mutation.target_index != null
+            ? rows.findIndex((m) => (m.sourceIndex ?? 0) >= mutation.target_index!)
+            : -1;
+        };
+        let mutatedDisplayIndex: number | undefined;
         // Update cached session in memory if exists
         const cached = messageCacheRef.current.get(mutation.session_id);
         let updatedCached: Message[] | undefined = undefined;
         if (cached) {
           const nextCached = cached.slice();
           if (mutation.action === 'patch') {
-            const idx = nextCached.findIndex((m) =>
-              mutation.source_index != null
-                ? m.sourceIndex === mutation.source_index
-                : false
-            );
+            const idx = mutationRowIndex(nextCached);
             if (idx !== -1) {
               nextCached[idx] = {
                 ...nextCached[idx],
@@ -7251,12 +7517,9 @@ export function Chat({
               updatedCached = nextCached;
             }
           } else if (mutation.action === 'delete') {
-            const idx = nextCached.findIndex((m) =>
-              mutation.source_index != null
-                ? m.sourceIndex === mutation.source_index
-                : false
-            );
+            const idx = mutationRowIndex(nextCached);
             if (idx !== -1) {
+              mutatedDisplayIndex = nextCached[idx]?.sourceIndex;
               if (mutation.delete_turn) {
                 let end = idx + 1;
                 while (end < nextCached.length && nextCached[end]?.role !== 'user') {
@@ -7270,14 +7533,28 @@ export function Chat({
               updatedCached = nextCached;
             }
           } else if (mutation.action === 'truncate') {
-            if (mutation.target_index != null) {
-              const idx = nextCached.findIndex((m) => (m.sourceIndex ?? 0) >= mutation.target_index!);
-              if (idx !== -1) {
-                const nextTruncated = nextCached.slice(0, idx);
-                messageCacheRef.current.set(mutation.session_id, nextTruncated);
-                updatedCached = nextTruncated;
-              }
+            const idx = truncateRowIndex(nextCached);
+            if (idx !== -1) {
+              mutatedDisplayIndex = nextCached[idx]?.sourceIndex;
+              const nextTruncated = nextCached.slice(0, idx);
+              messageCacheRef.current.set(mutation.session_id, nextTruncated);
+              updatedCached = nextTruncated;
             }
+          }
+        }
+
+        // Resolve the DISPLAY-space index synchronously for the outline prune:
+        // a setMessages updater runs later, so it cannot feed the code below.
+        if (
+          mutatedDisplayIndex == null &&
+          mutation.session_id === activeIdRef.current
+        ) {
+          const activeRows = messagesRef.current;
+          const activeIdx = mutation.action === 'truncate'
+            ? truncateRowIndex(activeRows)
+            : mutationRowIndex(activeRows);
+          if (activeIdx >= 0) {
+            mutatedDisplayIndex = activeRows[activeIdx]?.sourceIndex;
           }
         }
 
@@ -7286,12 +7563,9 @@ export function Chat({
           if (mutation.action === 'patch') {
             setMessages((prev) => {
               const next = prev.slice();
-              const idx = next.findIndex((m) =>
-                mutation.source_index != null
-                  ? m.sourceIndex === mutation.source_index
-                  : false
-              );
+              const idx = mutationRowIndex(next);
               if (idx !== -1) {
+                mutatedDisplayIndex ??= next[idx]?.sourceIndex;
                 next[idx] = {
                   ...next[idx],
                   parts: [{ kind: 'text', text: mutation.text ?? '' }],
@@ -7303,12 +7577,9 @@ export function Chat({
             });
           } else if (mutation.action === 'delete') {
             setMessages((prev) => {
-              const idx = prev.findIndex((m) =>
-                mutation.source_index != null
-                  ? m.sourceIndex === mutation.source_index
-                  : false
-              );
+              const idx = mutationRowIndex(prev);
               if (idx === -1) return prev;
+              mutatedDisplayIndex ??= prev[idx]?.sourceIndex;
               const next = prev.slice();
               if (mutation.delete_turn) {
                 let end = idx + 1;
@@ -7322,25 +7593,30 @@ export function Chat({
               messagesRef.current = next;
               return next;
             });
-            if (mutation.delete_turn && mutation.source_index != null) {
-              const filteredTurns = turnOutlineRef.current.filter((t) => t.index !== mutation.source_index);
+            // A missing display index means this tab already applied the
+            // mutation optimistically (or has no such row); never fall back to
+            // the kernel snapshot index and prune the wrong outline entries.
+            const deletedOutlineIndex = mutatedDisplayIndex;
+            if (mutation.delete_turn && deletedOutlineIndex != null) {
+              const filteredTurns = turnOutlineRef.current.filter((t) => t.index !== deletedOutlineIndex);
               turnOutlineRef.current = filteredTurns;
               turnOutlineBySessionRef.current.set(mutation.session_id, filteredTurns);
               setTurnOutline(filteredTurns);
             }
           } else if (mutation.action === 'truncate') {
             setMessages((prev) => {
-              if (mutation.target_index == null) return prev;
-              const idx = prev.findIndex((m) => (m.sourceIndex ?? 0) >= mutation.target_index!);
+              const idx = truncateRowIndex(prev);
               if (idx !== -1) {
+                mutatedDisplayIndex ??= prev[idx]?.sourceIndex;
                 const next = prev.slice(0, idx);
                 messagesRef.current = next;
                 return next;
               }
               return prev;
             });
-            if (mutation.target_index != null) {
-              const filteredTurns = turnOutlineRef.current.filter((t) => t.index < mutation.target_index!);
+            const truncatedOutlineIndex = mutatedDisplayIndex;
+            if (truncatedOutlineIndex != null) {
+              const filteredTurns = turnOutlineRef.current.filter((t) => t.index < truncatedOutlineIndex);
               turnOutlineRef.current = filteredTurns;
               turnOutlineBySessionRef.current.set(mutation.session_id, filteredTurns);
               setTurnOutline(filteredTurns);
@@ -7353,11 +7629,13 @@ export function Chat({
         if (mutation.session_id !== activeIdRef.current) {
           const cachedOutline = turnOutlineBySessionRef.current.get(mutation.session_id);
           if (cachedOutline) {
+            const deleteIndex = mutatedDisplayIndex;
+            const truncateIndex = mutatedDisplayIndex;
             const pruned =
-              mutation.action === 'delete' && mutation.source_index != null
-                ? cachedOutline.filter((t) => t.index !== mutation.source_index)
-                : mutation.action === 'truncate' && mutation.target_index != null
-                  ? cachedOutline.filter((t) => t.index < mutation.target_index!)
+              mutation.action === 'delete' && deleteIndex != null
+                ? cachedOutline.filter((t) => t.index !== deleteIndex)
+                : mutation.action === 'truncate' && truncateIndex != null
+                  ? cachedOutline.filter((t) => t.index < truncateIndex)
                   : cachedOutline;
             if (pruned !== cachedOutline) {
               turnOutlineBySessionRef.current.set(mutation.session_id, pruned);
@@ -7598,10 +7876,13 @@ export function Chat({
         next = [
           ...prev,
           { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, sourceIndex: turnIndex, turnNavOrdinal: turnOrdinal },
-          { role: 'assistant', parts: [], sourceIndex: turnIndex + 1 },
+          // 流式占位行不盖 sourceIndex：它还没落盘，绝对下标只能来自磁盘投影或身份帧。
+          // 猜出来的下标会让终态对账把整轮累积的思考/工具当成更早历史保留，
+          // 与权威尾部里同一轮次叠成两份，表现为回合结束时回答被整体重放。
+          { role: 'assistant', parts: [] },
         ];
       } else if (prev[prev.length - 1]?.role !== 'assistant') {
-        next = [...prev, { role: 'assistant', parts: [], sourceIndex: nextTurnNavIndex(prev) }];
+        next = [...prev, { role: 'assistant', parts: [] }];
       }
       if (next === prev) return prev;
       messagesRef.current = next;
@@ -7930,9 +8211,6 @@ export function Chat({
 
     const userDelta = estimateTextTokens(messageText);
     lastUserTokensRef.current = userDelta;
-    // New user turn: keep lastPrompt so the first LLM round can estimate
-    // prefix cache; zero the loop accumulators (industrial Σ-over-steps).
-    tokenCacheRef.current = startTokenTurn(tokenCacheRef.current);
     if (userDelta > 0) {
       setTokens((prev) => mergeLocalTokens(prev, {
         prompt: (prev?.prompt ?? 0) + userDelta,
@@ -8189,6 +8467,10 @@ export function Chat({
       : undefined;
     void deliver(item.text, item.images ?? [], item.approvalMode ?? modeState.confirmedMode, undefined, undefined, opts)
       .then((outcome) => {
+        // Only the "send now" path returns busy without entering the generic
+        // 409 handler (which already re-queues a normal drained card). Re-adding
+        // every busy outcome duplicated the card with the 409 re-queue and made
+        // the queue look aggressive.
         if (outcome !== 'busy' || !item.forceSend) return;
         blockQueueDrainRef.current = true;
         setQueued((current) => (
@@ -8341,6 +8623,12 @@ export function Chat({
     }
   }
 
+  /** A mutation whose target was drained by compaction: say so instead of a raw 404. */
+  function mutationTargetCompacted(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /message not found|not found|404/i.test(message);
+  }
+
   async function handleSaveRewrite(sourceIndex: number, newText: string, newImages: ImageData[]) {
     const sid = activeIdRef.current || sessionId || activeSession?.id;
     const effectiveHash =
@@ -8366,6 +8654,7 @@ export function Chat({
             text: newText,
             images: newImages,
             expected_text: expectedText,
+            expected_message_id: targetMsg?.id,
             expected_role: 'user',
           });
           // 乐观更新：画布与内存缓存同步更新！
@@ -8392,7 +8681,12 @@ export function Chat({
           setBubbleEditDraft(null);
           clearBubbleEditDraft(sid);
         } catch (e) {
-          showToast(t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)), 'error');
+          showToast(
+            mutationTargetCompacted(e)
+              ? t('chat.messageCompacted')
+              : t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)),
+            'error',
+          );
         }
       },
     });
@@ -8423,12 +8717,27 @@ export function Chat({
       confirmLabel: t('confirm.confirmBtn'),
       cancelLabel: t('common.cancel'),
       onConfirm: async () => {
-        await truncateSession(effectiveHash, sid, {
-          target_index: sourceIndex,
-          expected_text: expectedText,
-          expected_role: 'user',
-          inclusive: false,
-        });
+        try {
+          const result = await truncateSession(effectiveHash, sid, {
+            target_index: sourceIndex,
+            target_message_id: targetMsg?.id,
+            expected_text: expectedText,
+            expected_role: 'user',
+            inclusive: false,
+          });
+          if (result.notFound) {
+            showToast(t('chat.messageCompacted'), 'error');
+            return;
+          }
+        } catch (e) {
+          showToast(
+            mutationTargetCompacted(e)
+              ? t('chat.messageCompacted')
+              : t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)),
+            'error',
+          );
+          return;
+        }
         // 回溯删掉了后续 agent 消息：会话级单例清单同步物理复位。
         clearSessionTodoState(sid);
         // 乐观截断：画布与内存缓存同步截断！
@@ -8481,16 +8790,26 @@ export function Chat({
       confirmLabel: t('confirm.confirmBtn'),
       cancelLabel: t('common.cancel'),
       onConfirm: async () => {
+        let missing = false;
         try {
-          await deleteSessionMessage(effectiveHash, sid, sourceIndex, {
+          const result = await deleteSessionMessage(effectiveHash, sid, sourceIndex, {
             delete_turn: true,
             expected_text: expected,
+            expected_message_id: targetMsg?.id,
             expected_role: 'user',
           });
-          // 删除整轮 agent 消息：会话级单例清单同步物理复位。
-          clearSessionTodoState(sid);
+          missing = result.notFound === true;
+          if (!missing) {
+            // 删除整轮 agent 消息：会话级单例清单同步物理复位。
+            clearSessionTodoState(sid);
+          }
         } catch (err) {
+          missing = mutationTargetCompacted(err);
           console.warn('[Chat] Failed to delete session turn on backend:', err);
+        }
+        if (missing) {
+          showToast(t('chat.messageCompacted'), 'error');
+          return;
         }
         let nextMessages: Message[] = [];
         setMessages((prev) => {
@@ -8554,12 +8873,27 @@ export function Chat({
       confirmLabel: t('confirm.confirmBtn'),
       cancelLabel: t('common.cancel'),
       onConfirm: async () => {
-        await truncateSession(effectiveHash, sid, {
-          target_index: userSourceIndex,
-          expected_text: userText,
-          expected_role: 'user',
-          inclusive: false,
-        });
+        try {
+          const result = await truncateSession(effectiveHash, sid, {
+            target_index: userSourceIndex,
+            target_message_id: userMsg.id,
+            expected_text: userText,
+            expected_role: 'user',
+            inclusive: false,
+          });
+          if (result.notFound) {
+            showToast(t('chat.messageCompacted'), 'error');
+            return;
+          }
+        } catch (e) {
+          showToast(
+            mutationTargetCompacted(e)
+              ? t('chat.messageCompacted')
+              : t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)),
+            'error',
+          );
+          return;
+        }
         // 重新生成 = 回溯这一轮：会话级单例清单同步物理复位。
         clearSessionTodoState(sid);
         let nextMessages: Message[] = [];
@@ -8615,16 +8949,26 @@ export function Chat({
       confirmLabel: t('confirm.confirmBtn'),
       cancelLabel: t('common.cancel'),
       onConfirm: async () => {
+        let missing = false;
         try {
-          await deleteSessionMessage(effectiveHash, sid, resolvedIndex, {
+          const result = await deleteSessionMessage(effectiveHash, sid, resolvedIndex, {
             delete_turn: false,
             expected_text: expected,
+            expected_message_id: targetMsg?.id,
             expected_role: 'assistant',
           });
-          // 删除 agent 轮次消息：会话级单例清单同步物理复位。
-          clearSessionTodoState(sid);
+          missing = result.notFound === true;
+          if (!missing) {
+            // 删除 agent 轮次消息：会话级单例清单同步物理复位。
+            clearSessionTodoState(sid);
+          }
         } catch (err) {
+          missing = mutationTargetCompacted(err);
           console.warn('[Chat] Failed to delete assistant message on backend:', err);
+        }
+        if (missing) {
+          showToast(t('chat.messageCompacted'), 'error');
+          return;
         }
         let nextMessages: Message[] = [];
         setMessages((prev) => {
@@ -8948,6 +9292,7 @@ export function Chat({
       );
       void truncateSession(effectiveHash, sid, {
         target_index: sourceIndex,
+        target_message_id: lastUserMsg.id,
         inclusive: false,
       }).catch(() => {});
     }
@@ -9538,11 +9883,7 @@ export function Chat({
                 const isEstimated = Boolean(tokens.cached_estimated);
                 const reasoning = tokens.reasoning ?? 0;
                 const total = tokens.total ?? (prompt + completion);
-                const loopPrompt = tokens.loop_prompt ?? tokenCacheRef.current.turnPromptSum ?? prompt;
-                const loopCached = tokens.loop_cached ?? tokenCacheRef.current.turnCachedSum ?? cached;
                 const stepPct = formatCacheHitRate(cached, prompt, isEstimated);
-                const loopPct = formatCacheHitRate(loopCached, loopPrompt, isEstimated);
-                const multiStep = loopPrompt > prompt;
                 const cachedPct = stepPct;
                 const pctOfLimit = contextLimit && contextLimit > 0 ? Math.min(100, Math.round((total / contextLimit) * 100)) : null;
                 const billable = completion + Math.max(0, prompt - cached);
@@ -9566,9 +9907,6 @@ export function Chat({
                   } else {
                     tooltipLines.push(`⚡ ${t('tokens.onlineCacheHit')}: ${cachedStr} (${stepPct} ${t('tokens.hitBadge')})`);
                   }
-                }
-                if (multiStep && loopPct) {
-                  tooltipLines.push(`⚡ ${t('tokens.loopSavingsLabel')}: ${loopCached.toLocaleString()} / ${loopPrompt.toLocaleString()} (${loopPct})`);
                 }
                 if (reasoning > 0) {
                   tooltipLines.push(`💭 ${t('tokens.reasoningTooltip', { n: reasoningStr })}`);
@@ -9690,21 +10028,6 @@ export function Chat({
                                 <span class="token-popover-row-badge">
                                   {stepPct} {isEstimated ? t('tokens.estBadge') : t('tokens.hitBadge')}
                                 </span>
-                              </div>
-                            </div>
-                          )}
-
-                          {multiStep && loopPct && (
-                            <div class="token-popover-row is-cached">
-                              <div class="token-popover-row-left">
-                                <span class="token-row-icon">⚡</span>
-                                <span class="token-row-label">{t('tokens.loopHitLabel')}</span>
-                              </div>
-                              <div class="token-popover-row-val-group">
-                                <span class="token-popover-row-val">
-                                  {loopCached.toLocaleString()} / {loopPrompt.toLocaleString()}
-                                </span>
-                                <span class="token-popover-row-badge">{loopPct}</span>
                               </div>
                             </div>
                           )}
@@ -10180,8 +10503,14 @@ export function Chat({
     );
   }
 
+  // A fully completed plan belongs to the finished turn and is archived onto the
+  // assistant. Keeping it sticky resurrects the old checklist above the NEXT
+  // loop (the "上一轮 todolist 贴画" symptom). The live document stays intact so
+  // commitActiveTodosIntoLastAssistant can still archive it at the terminal.
   const stickyTodoPanel =
-    activeTodos && activeTodos.length > 0 ? <SessionTodoPanel items={activeTodos} /> : null;
+    activeTodos && activeTodos.length > 0 && activeTodos.some((item) => item.status !== 'completed')
+      ? <SessionTodoPanel items={activeTodos} />
+      : null;
 
   return (
     <>
@@ -10226,20 +10555,35 @@ export function Chat({
           </div>
         )}
 
-        {hasOlder && (
-          <div class="history-load-older">
-            <button
-              type="button"
-              class="history-load-older-btn"
-              disabled={loadingOlder}
-              onClick={() => void loadOlderMessages()}
-            >
-              {loadingOlder
-                ? t('chat.loadingOlder')
-                : t('chat.loadOlder', { n: String(visibleOlderRemainingCount(historyOffsetRef.current, turnOutlineRef.current[0]?.index)) })}
-            </button>
-          </div>
-        )}
+        {hasOlder && (() => {
+          // Keep the button visible even when every visible question is on the
+          // canvas: the cursor may still be inside a >256-row turn whose tool
+          // rows have not loaded yet. Showing "0 questions left" would be a
+          // dead end, so that case uses the plain label.
+          const remaining =
+            turnOutline.length > 0
+              ? unloadedTurnCount
+              : visibleOlderRemainingCount(
+                  historyOffsetRef.current,
+                  turnOutlineRef.current[0]?.index,
+                );
+          return (
+            <div class="history-load-older">
+              <button
+                type="button"
+                class="history-load-older-btn"
+                disabled={loadingOlder}
+                onClick={() => void loadOlderMessages()}
+              >
+                {loadingOlder
+                  ? t('chat.loadingOlder')
+                  : remaining > 0
+                    ? t('chat.loadOlder', { n: String(remaining) })
+                    : t('chat.loadOlderNoCount')}
+              </button>
+            </div>
+          );
+        })()}
 
         {(() => {
           // Pre-compute per-turn text for assistant messages: collect all text
@@ -10341,7 +10685,8 @@ export function Chat({
               const turnIndex = msg.sourceIndex ?? historyOffsetRef.current + origIdx;
               const turnItem = turnNavByIndex.get(turnIndex);
               const anchorId = turnItem?.id ?? turnNavId(turnIndex);
-              const isEditing = editingSourceIndex === turnIndex;
+              const readOnlyBubble = msg.readOnly === true;
+              const isEditing = !readOnlyBubble && editingSourceIndex === turnIndex;
               const hasActiveDraft = isEditing && bubbleEditDraft?.sourceIndex === turnIndex;
               return (
                 <UserMessageView
@@ -10361,7 +10706,7 @@ export function Chat({
                   onDraftChange={(draftText, draftImages, draftModel) => {
                     handleBubbleDraftChange(turnIndex, draftText, draftImages, draftModel);
                   }}
-                  onStartEdit={() => {
+                  onStartEdit={readOnlyBubble ? undefined : () => {
                     const initDraft: BubbleEditDraft = {
                       sourceIndex: turnIndex,
                       text: messageText(msg),
@@ -10379,9 +10724,9 @@ export function Chat({
                     const sid = activeIdRef.current || sessionId || activeSession?.id;
                     if (sid) clearBubbleEditDraft(sid);
                   }}
-                  onSaveRewrite={(newText, newImages) => void handleSaveRewrite(turnIndex, newText, newImages)}
-                  onRollbackSubmit={(newText, newImages, tempModel) => void handleRollbackSubmit(turnIndex, newText, newImages, tempModel)}
-                  onDelete={() => void handleDeleteUserMessage(turnIndex, messageText(msg))}
+                  onSaveRewrite={readOnlyBubble ? undefined : (newText, newImages) => void handleSaveRewrite(turnIndex, newText, newImages)}
+                  onRollbackSubmit={readOnlyBubble ? undefined : (newText, newImages, tempModel) => void handleRollbackSubmit(turnIndex, newText, newImages, tempModel)}
+                  onDelete={readOnlyBubble ? undefined : () => void handleDeleteUserMessage(turnIndex, messageText(msg))}
                   models={modelCatalog}
                   currentModel={provider || defaultProviderName() || ''}
                   disabled={busy}
@@ -10439,8 +10784,8 @@ export function Chat({
                 isCompacting={isCompacting}
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
-                onRegenerate={isLastInTurn && !busy ? () => void handleRegenerateAssistant(msg.sourceIndex ?? origIdx, origIdx) : undefined}
-                onDelete={isLastInTurn && !busy ? () => void handleDeleteAssistantMessage(msg.sourceIndex ?? origIdx, origIdx) : undefined}
+                onRegenerate={msg.readOnly !== true && isLastInTurn && !busy ? () => void handleRegenerateAssistant(msg.sourceIndex ?? origIdx, origIdx) : undefined}
+                onDelete={msg.readOnly !== true && isLastInTurn && !busy ? () => void handleDeleteAssistantMessage(msg.sourceIndex ?? origIdx, origIdx) : undefined}
                 cwd={effectiveWorkingDir || cwd}
               />
             );
@@ -11228,6 +11573,11 @@ function AssistantMessageView({
             </span>
           </span>
         )}
+        {msg.readOnly === true && (
+          <span class="msg-readonly-badge" title={t('chat.readOnlyArchiveHint')}>
+            {t('chat.readOnlyArchive')}
+          </span>
+        )}
         {copyBtn}
       </div>
     </div>
@@ -11605,6 +11955,11 @@ function UserMessageView({
       </div>
       <div class="msg-footer-row user-footer-row">
         {timeLabel && <span class="msg-time msg-time-user" title={timeFull}>{timeLabel}</span>}
+        {msg.readOnly === true && (
+          <span class="msg-readonly-badge" title={t('chat.readOnlyArchiveHint')}>
+            {t('chat.readOnlyArchive')}
+          </span>
+        )}
         <div class="user-footer-actions">
           {copyBtn}
           {onStartEdit && !disabled && (

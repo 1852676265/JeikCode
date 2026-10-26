@@ -4,10 +4,22 @@
  * 解决切换与刷新白屏冷启动延迟。
  */
 
+/// Canvas projection schema. Bump when the display list's indexing changes
+/// (e.g. rebuilding the pre-compaction prefix from the raw transcript, or
+/// switching a session to the append-only display log). Old rows carry
+/// `sourceIndex` from a different coordinate system and must not be merged
+/// with the new server list.
+///
+/// v4: also drop canvases saved around the natural-steer race (a stale todo
+/// host / a dropped steer bubble). The server display log is authoritative;
+/// one cold refetch is cheaper than showing an old polluted canvas.
+export const CACHE_DISPLAY_VERSION = 4;
+
 export interface CachedSessionData {
   sessionId: string;
   projectHash: string;
   messages: any[];
+  displayVersion?: number;
   todos?: any[] | null;
   turns?: any[] | null;
   tokenUsage?: any | null;
@@ -82,7 +94,7 @@ export function hasMemorySession(projectHash: string, sessionId: string): boolea
 export function getMemorySession(projectHash: string, sessionId: string): CachedSessionData | null {
   const key = makeKey(projectHash, sessionId);
   const data = memoryCache.get(key);
-  if (data) {
+  if (data && data.displayVersion === CACHE_DISPLAY_VERSION) {
     // LRU: 刷新访问顺序
     memoryCache.delete(key);
     memoryCache.set(key, data);
@@ -111,7 +123,11 @@ export async function getSessionCache(
       const req = store.get(makeKey(projectHash, sessionId));
       req.onsuccess = () => {
         const result = req.result as CachedSessionData | undefined;
-        if (result && Array.isArray(result.messages)) {
+        if (
+          result &&
+          result.displayVersion === CACHE_DISPLAY_VERSION &&
+          Array.isArray(result.messages)
+        ) {
           // 回填至 L1 内存
           setMemorySession(projectHash, sessionId, result);
           resolve(result);
@@ -155,6 +171,7 @@ export async function saveSessionCache(
   const data: CachedSessionData = {
     sessionId,
     projectHash,
+    displayVersion: CACHE_DISPLAY_VERSION,
     messages,
     todos: todos ?? undefined,
     turns: turns ?? undefined,

@@ -77,7 +77,10 @@ function lastTailUser(messages: TailMessage[]): string {
  * 已经落盘（刷新能看见）时原样采用磁盘，避免乐观气泡和权威历史各画一条。
  */
 export function mergeDiskWithUnpersistedTail<T extends TailMessage>(disk: T[], canvas: T[]): T[] {
-  if (!transcriptHasOpenUserTurn(canvas)) return disk;
+  // A new loop may already contain reasoning/tools before its final text. The
+  // old turn's terminal reconcile must not mistake that for a settled turn and
+  // replace the canvas (steer bubble + new loop) with the stale disk tail.
+  if (!transcriptHasOpenUserTurn(canvas) && !transcriptHasInFlightAssistant(canvas)) return disk;
   const canvasUser = visibleUserText(lastTailUser(canvas));
   if (!canvasUser) return disk;
   const diskUser = visibleUserText(lastTailUser(disk));
@@ -723,7 +726,9 @@ export function transcriptHasInFlightAssistant(
     return message.parts.some((part) => {
       if (
         part.kind === 'tool' &&
-        (part.tool?.status === 'pending' || part.tool?.status === 'waiting_approval')
+        (part.tool?.status === 'pending' ||
+          part.tool?.status === 'running' ||
+          part.tool?.status === 'waiting_approval')
       ) {
         return true;
       }
@@ -957,28 +962,17 @@ export type TokenCacheState = {
   lastPrompt: number;
   /** True once the provider has reported `cached > 0` (telemetry is trusted). */
   providerReportsCache: boolean;
-  /** Sum of per-step prompts in the current user turn (industrial loop denominator). */
-  turnPromptSum: number;
-  /** Sum of per-step cache hits in the current user turn (industrial loop numerator). */
-  turnCachedSum: number;
 };
 
 export function createTokenCacheState(): TokenCacheState {
-  return { lastPrompt: 0, providerReportsCache: false, turnPromptSum: 0, turnCachedSum: 0 };
+  return { lastPrompt: 0, providerReportsCache: false };
 }
 
 export function resetTokenCacheState(baselinePrompt = 0): TokenCacheState {
   return {
     lastPrompt: Math.max(0, baselinePrompt),
     providerReportsCache: false,
-    turnPromptSum: 0,
-    turnCachedSum: 0,
   };
-}
-
-/** Keep prefix baseline across a new user turn; zero the loop accumulators. */
-export function startTokenTurn(state: TokenCacheState): TokenCacheState {
-  return { ...state, turnPromptSum: 0, turnCachedSum: 0 };
 }
 
 /** Provider KV-cache block size. A partial trailing block does not count as a hit. */
@@ -1047,8 +1041,6 @@ export function resolveTokenCache(
     nextState: {
       lastPrompt: prompt,
       providerReportsCache,
-      turnPromptSum: state.turnPromptSum + prompt,
-      turnCachedSum: state.turnCachedSum + cached,
     },
   };
 }
@@ -1085,8 +1077,6 @@ export function estimateCacheFromHistoryPrompt(
     cacheState: {
       lastPrompt: currentPrompt,
       providerReportsCache: false,
-      turnPromptSum: currentPrompt,
-      turnCachedSum: cached,
     },
   };
 }

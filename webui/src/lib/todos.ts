@@ -594,19 +594,70 @@ export function restoreStickyTodos(input: {
  */
 export function placeArchivedTodos<T extends {
   role: string;
-  parts: Array<{ kind: string; tool?: { id?: string }; items?: TodoItem[] }>;
+  isSteer?: boolean;
+  parts: Array<{ kind: string; text?: string; tool?: { id?: string }; items?: TodoItem[] }>;
 }>(
   messages: T[],
   items: TodoItem[],
   _revision: string | null,
 ): T[] {
   if (items.length === 0 || !items.every((item) => item.status === 'completed')) return messages;
-  let index = -1;
+  // A steer/new turn can already have an EMPTY assistant placeholder when the
+  // previous turn's terminal arrives. Attaching the completed plan to that
+  // placeholder makes it look glued to the top of the next loop. Prefer the
+  // latest assistant that actually owns content (final text first, then
+  // reasoning/tools), and fall back to a bare assistant only when nothing else
+  // exists.
+  const hasText = (index: number): boolean =>
+    messages[index]!.parts.some(
+      (part) => part.kind === 'text' && (part.text || '').trim().length > 0,
+    );
+  let lastUser = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === 'assistant') {
-      index = i;
+    if (messages[i]!.role === 'user') {
+      lastUser = i;
       break;
     }
+  }
+  let withText = -1;
+  let withContent = -1;
+  let lastAssistant = -1;
+  let afterLastUser = -1;
+  let beforeLastUserWithText = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== 'assistant') continue;
+    if (lastAssistant < 0) lastAssistant = i;
+    const meaningful = message.parts.filter((part) => part.kind !== 'todo_list');
+    const text = hasText(i);
+    if (withText < 0 && text) withText = i;
+    if (
+      withContent < 0 &&
+      (text || meaningful.some((part) => part.kind === 'tool' || part.kind === 'reasoning'))
+    ) {
+      withContent = i;
+    }
+    if (lastUser >= 0) {
+      if (i > lastUser) {
+        if (afterLastUser < 0) afterLastUser = i;
+      } else if (i < lastUser && text && beforeLastUserWithText < 0) {
+        beforeLastUserWithText = i;
+      }
+    }
+  }
+  // Normal completion: the assistant after the last user owns the answer.
+  // A steer/new turn may already have an EMPTY placeholder after that user;
+  // in that case the plan belongs to the previous answer instead.
+  const lastUserIsSteer =
+    lastUser >= 0 && (messages[lastUser] as { isSteer?: boolean }).isSteer === true;
+  let index = -1;
+  if (afterLastUser >= 0) {
+    index =
+      beforeLastUserWithText >= 0 && (lastUserIsSteer || !hasText(afterLastUser))
+        ? beforeLastUserWithText
+        : afterLastUser;
+  } else {
+    index = withText >= 0 ? withText : withContent >= 0 ? withContent : lastAssistant;
   }
   if (index < 0) return messages;
   const current = messages[index]!;

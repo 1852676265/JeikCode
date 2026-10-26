@@ -6,6 +6,7 @@ import {
   dedupeTurnOutline,
   filterTurnNavItems,
   hasOlderVisibleMessages,
+  remainingUnloadedTurns,
   resolveActiveTurnId,
   truncateTurnNavLabel,
   turnNavId,
@@ -219,6 +220,18 @@ test('hasOlderVisibleMessages and visibleOlderRemainingCount exclude invisible s
   // 5. 新建会话（offset=0）
   assert.equal(hasOlderVisibleMessages({ offset: 0, firstTurnIndex }), false);
   assert.equal(visibleOlderRemainingCount(0, firstTurnIndex), 0);
+});
+
+test('remainingUnloadedTurns counts questions, not raw tool rows', () => {
+  const turns = [{ index: 8 }, { index: 40 }, { index: 120 }];
+  const messages = [
+    { role: 'user', sourceIndex: 8 },
+    { role: 'assistant', sourceIndex: 9 },
+    { role: 'user', sourceIndex: 40 },
+    { role: 'assistant', sourceIndex: 41 },
+  ];
+  assert.equal(remainingUnloadedTurns(turns, messages), 1);
+  assert.equal(remainingUnloadedTurns([], messages), 0);
 });
 
 test('dedupeTurnOutline cleans duplicate trailing questions from optimistic echo races', () => {

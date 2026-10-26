@@ -14,12 +14,15 @@ import {
   paintUserMessage,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
+  cachedHeadIsContiguous,
+  resolveHistoryOffset,
   spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
   stampUserClientInputId,
   stampUserSourceIndex,
   withAssistantIdentity,
 } from './sessionProjection.ts';
+import { upsertToolPart } from './toolRows.ts';
 
 const plan = [
   { content: '写测试', status: 'completed' as const },
@@ -965,6 +968,70 @@ test('mergeOlderMessages 正确处理在途/无 sourceIndex 的实时末尾消�
   assert.equal(merged[2]?.id, 'a-live');
 });
 
+test('mergeOlderMessages 不会把无 sourceIndex 的旧缓存提问移到末尾（乱序回归）', () => {
+  // 旧版 L1/L2 缓存里前面的历史行没有绝对下标；加载更早页时旧实现会把这些行
+  // 当成“在途消息”排到末尾，表现为第一条提问漂到 48 条之后。
+  const prev = [
+    { role: 'user', id: 'old-question', parts: [{ kind: 'text' as const, text: '最早的问题' }] },
+    { role: 'assistant', id: 'a-100', sourceIndex: 100 },
+    { role: 'user', id: 'u-101', sourceIndex: 101 },
+    { role: 'assistant', id: 'live-tail', parts: [{ kind: 'text' as const, text: '正在输出' }] },
+  ];
+  const older = [{ role: 'user', id: 'u-50', sourceIndex: 50 }];
+
+  const merged = mergeOlderMessages(prev, older);
+  assert.deepEqual(
+    merged.map((m) => m.id),
+    ['old-question', 'u-50', 'a-100', 'u-101', 'live-tail'],
+  );
+  assert.equal(merged[0]?.id, 'old-question', '无下标的旧历史必须保持在顶部');
+  assert.equal(merged[merged.length - 1]?.id, 'live-tail', '实时尾行必须留在末尾');
+});
+
+test('cachedHeadIsContiguous 拒绝与权威尾页之间有空档的旧缓存', () => {
+  // A far head + the tail still has a hole in the middle; "load older" walks
+  // backward from 300 and would never fill 301..622.
+  assert.equal(cachedHeadIsContiguous([{ sourceIndex: 300 }, { sourceIndex: 623 }], 624), false);
+  assert.equal(cachedHeadIsContiguous([{ sourceIndex: 300 }, { sourceIndex: 500 }], 624), false);
+  assert.equal(cachedHeadIsContiguous([{ sourceIndex: 700 }], 624), true);
+  assert.equal(cachedHeadIsContiguous([], 624), false);
+
+  // A dense cache that reaches the tail stays usable.
+  const dense = Array.from({ length: 48 }, (_, index) => ({ sourceIndex: 576 + index }));
+  assert.equal(cachedHeadIsContiguous(dense, 624), true);
+  // Small gaps caused by filtered internal rows are tolerated.
+  assert.equal(
+    cachedHeadIsContiguous([{ sourceIndex: 600 }, { sourceIndex: 620 }, { sourceIndex: 623 }], 624),
+    true,
+  );
+});
+
+test('resolveHistoryOffset 冷启动优先使用缓存里更早的真实下标，忽略越过尾页的旧下标', () => {
+  // 画布缓存已展开到 384，API 仍返回 48 条尾页 offset=576。
+  assert.equal(
+    resolveHistoryOffset({
+      cachedMessages: [{ sourceIndex: 384 }, { sourceIndex: 500 }, { sourceIndex: 700 }],
+      cachedOffset: 384,
+      diskOffset: 576,
+    }),
+    384,
+  );
+  // 压缩后旧缓存的 700 已越界（新数组尾部只到 576）：不能拿它当游标。
+  assert.equal(
+    resolveHistoryOffset({
+      cachedMessages: [{ sourceIndex: 700 }],
+      cachedOffset: 700,
+      diskOffset: 576,
+    }),
+    576,
+  );
+  // 无缓存时保持服务端尾页偏移。
+  assert.equal(
+    resolveHistoryOffset({ cachedMessages: [], cachedOffset: undefined, diskOffset: 576 }),
+    576,
+  );
+});
+
 test('spliceAuthoritativeDiskTail 仅保留更早的历史 Head 并用权威磁盘切片无损替换尾部', () => {
   // 画布包含 Turn 1 (0..35), Turn 2 (36..75), 以及内存中未完成的 Turn 3 (76..100)
   const canvas = [
@@ -1053,6 +1120,16 @@ test('sanitizeCanvasMessages 自动自愈连续重复的用户提问气泡和夹
   assert.equal(cleaned[1]?.role, 'user');
   assert.equal(cleaned[2]?.role, 'assistant');
   assert.equal(cleaned[2]?.parts?.length, 0);
+});
+
+test('sanitizeCanvasMessages 保留不同绝对下标下用户真实连发的同一句话', () => {
+  const messages = [
+    { role: 'user', sourceIndex: 1, parts: [{ kind: 'text' as const, text: '你好' }] },
+    { role: 'assistant', sourceIndex: 2, parts: [] },
+    { role: 'user', sourceIndex: 3, parts: [{ kind: 'text' as const, text: '你好' }] },
+  ];
+  const cleaned = sanitizeCanvasMessages(messages);
+  assert.equal(cleaned.filter((m) => m.role === 'user').length, 2);
 });
 
 test('paintUserMessage 在前一个提问完全相同且助手未结回答时拒绝重复追加', () => {
@@ -1299,3 +1376,188 @@ test('stampUserSourceIndex 用身份帧的绝对下标只回填无下标的回�
   assert.equal(reordered[1]!.sourceIndex, 55);
 });
 
+
+// ─── 回合终态「整轮重放」回归 ───
+// 真实会话 852b3cba（23 轮 / 34 次工具调用 / 65 条消息）：模型在整个 loop 里只吐思考与工具，
+// 直到最后一轮才有正文。直播期正文是「结算」的唯一依据，于是一轮又一轮的思考/工具全部画进
+// 发送时那条空的助手占位行（它带着猜出来的 sourceIndex = turnIndex + 1）。
+// 回合终态 `syncSessionCacheFromDisk` 做权威尾部拼接时，这条「整轮累积行」因为下标小于
+// diskOffset 被当成更早历史保留，而磁盘尾部（offset=17）又把同样的轮次画一遍 ——
+// 用户看到的就是「回答与工具调用被整体重放」。
+function liveMegaRowCanvas(answer: string) {
+  let canvas: Array<{ role: string; id?: string; sourceIndex?: number; parts: any[] }> = [
+    { role: 'user', id: 'u-q', sourceIndex: 0, parts: [{ kind: 'text', text: '看看这个 issue' }] },
+    // Chat.tsx send 路径：乐观占位行带 sourceIndex（修复后不再带）。
+    { role: 'assistant', id: undefined, sourceIndex: 1, parts: [] },
+  ];
+  for (let round = 1; round <= 3; round += 1) {
+    const mid = `m-${round}`;
+    canvas = withAssistantIdentity(
+      paintAssistantReasoning(canvas as never, `第${round}轮思考`, false, mid, `${mid}:1:reasoning`),
+      mid,
+      `${mid}:1:reasoning`,
+    ) as typeof canvas;
+    const last = canvas[canvas.length - 1]!;
+    // addToolToLastAssistant：末行未结算（无正文）→ 追进同一行。
+    canvas = [
+      ...canvas.slice(0, -1),
+      {
+        ...last,
+        parts: upsertToolPart(last.parts, {
+          id: `call-${round}`,
+          name: 'read',
+          args: '{}',
+          status: 'done',
+        }),
+      },
+    ];
+  }
+  canvas = withAssistantIdentity(
+    paintAssistantText(canvas as never, answer, false, 'm-3', 'm-3:2:text'),
+    'm-3',
+    'm-3:2:text',
+  ) as typeof canvas;
+  return canvas;
+}
+
+function diskRow(spec: {
+  role: string;
+  index: number;
+  id: string;
+  text?: string;
+  reasoning?: string;
+  tools?: string[];
+}) {
+  const parts: any[] = [];
+  if (spec.reasoning) {
+    parts.push({ kind: 'reasoning', text: spec.reasoning, id: `${spec.id}:1:reasoning` });
+  }
+  if (spec.text) {
+    parts.push({ kind: 'text', text: spec.text, id: `${spec.id}:${spec.reasoning ? 2 : 1}:text` });
+  }
+  for (const toolId of spec.tools ?? []) {
+    parts.push({ kind: 'tool', tool: { id: toolId, name: 'read', args: '{}', status: 'done' } });
+  }
+  return { role: spec.role, id: spec.id, sourceIndex: spec.index, parts };
+}
+
+test('回合终态对账：直播期整轮累积的助手行绝不与权威尾部叠加成第二份回答', () => {
+  const answer = '最终回答：与滑动超时无关，是上游连接空闲超时。';
+  const canvas = liveMegaRowCanvas(answer);
+
+  // 权威尾部：offset=17，pinned 开场提问（绝对下标 7）+ 17..20。
+  // 同一轮 loop 的思考/工具既在画布上的累积行里，也在切片里。
+  const diskTail = [
+    diskRow({ role: 'user', index: 7, id: 'u-q', text: '看看这个 issue' }),
+    diskRow({ role: 'tool', index: 17, id: 'r-17', text: '工具输出 17' }),
+    diskRow({ role: 'assistant', index: 18, id: 'm-1', reasoning: '第1轮思考', tools: ['call-1'] }),
+    diskRow({ role: 'assistant', index: 19, id: 'm-2', reasoning: '第2轮思考', tools: ['call-2'] }),
+    diskRow({ role: 'assistant', index: 20, id: 'm-3', reasoning: '第3轮思考', text: answer }),
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 17);
+  const answers = spliced.filter((message) =>
+    message.parts?.some((part: any) => part.kind === 'text' && part.text === answer),
+  );
+  assert.equal(answers.length, 1, '同一条回答绝不能被渲染两份');
+
+  const toolIds = spliced.flatMap((message) =>
+    (message.parts ?? [])
+      .filter((part: any) => part.kind === 'tool')
+      .map((part: any) => part.tool.id),
+  );
+  assert.deepEqual(toolIds, ['call-1', 'call-2'], '工具调用必须按权威切片各出现一次');
+});
+
+test('修复后的直播画布：占位行没有绝对下标，整行交给权威切片', () => {
+  const answer = '最终回答：与滑动超时无关，是上游连接空闲超时。';
+  // 发送路径不再给流式占位行盖 sourceIndex（它还没落盘，绝对下标只有磁盘/身份帧才有）。
+  const canvas = liveMegaRowCanvas(answer).map((message) =>
+    message.role === 'assistant' ? { ...message, sourceIndex: undefined } : message,
+  );
+  const diskTail = [
+    diskRow({ role: 'user', index: 7, id: 'u-q', text: '看看这个 issue' }),
+    diskRow({ role: 'assistant', index: 18, id: 'm-1', reasoning: '第1轮思考', tools: ['call-1'] }),
+    diskRow({ role: 'assistant', index: 19, id: 'm-2', reasoning: '第2轮思考', tools: ['call-2'] }),
+    diskRow({ role: 'assistant', index: 20, id: 'm-3', reasoning: '第3轮思考', text: answer }),
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 17);
+  assert.equal(
+    spliced.filter((m) => m.parts?.some((p: any) => p.kind === 'text' && p.text === answer)).length,
+    1,
+  );
+  // 权威切片之前的提问行（猜的下标 0 < offset）仍可在头部，但只能出现一份。
+  assert.equal(spliced.filter((m) => m.role === 'user').length, 1);
+});
+
+test('旧缓存自愈：累积行的首个 round 已在窗口外时，按段身份剔除重复内容', () => {
+  const answer = '最终回答：与滑动超时无关，是上游连接空闲超时。';
+  const canvas = liveMegaRowCanvas(answer);
+  // 切片从第 2 轮开始：累积行的行级 id（m-1）不在切片里，只能靠 part id / call id 剔除。
+  const diskTail = [
+    diskRow({ role: 'assistant', index: 19, id: 'm-2', reasoning: '第2轮思考', tools: ['call-2'] }),
+    diskRow({ role: 'assistant', index: 20, id: 'm-3', reasoning: '第3轮思考', tools: ['call-3'], text: answer }),
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, 18);
+  assert.equal(
+    spliced.filter((m) => m.parts?.some((p: any) => p.kind === 'text' && p.text === answer)).length,
+    1,
+    '回答只能出现一次',
+  );
+  const head = spliced.find((m) => m.role === 'assistant')!;
+  assert.deepEqual(
+    head.parts.map((p: any) => (p.kind === 'tool' ? p.tool.id : p.kind)),
+    ['reasoning', 'call-1'],
+    '窗口外的第 1 轮保留，窗口内的第 2/3 轮交给权威切片',
+  );
+});
+
+// ─── 与「无下标直播行」相关的缓存并集回归 ───
+// 直播占位行/流式助手行不再带猜测下标后，落缓存时的「L1 全量画布 ∪ 可视 48 条窗口」
+// 会把同一条无下标行带上两份。合并必须原地收敛，绝不能把它插到历史最前面。
+test('缓存并集：无下标直播行不得被提到时间线顶部，同一行只保留一份', () => {
+  const history = [
+    { role: 'user', id: 'u-7', sourceIndex: 7, parts: [{ kind: 'text' as const, text: '上一问' }] },
+    { role: 'assistant', id: 'a-8', sourceIndex: 8, parts: [{ kind: 'text' as const, text: '上一答' }] },
+  ];
+  const question = { role: 'user', id: 'u-9', sourceIndex: 9, parts: [{ kind: 'text' as const, text: '这一问' }] };
+  // L1 全量画布：占位行已收到部分正文
+  const live = { role: 'assistant', parts: [{ kind: 'text' as const, text: '回答前半段' }] };
+  const cached = [...history, question, live];
+  // 可视窗口：同一批行（同一引用）
+  const merged = mergeOlderMessages(cached, [question, live]);
+
+  assert.equal(merged.length, cached.length, '同一条直播行不能被并成两份');
+  assert.equal(merged[merged.length - 1], live, '直播行必须仍在时间线末尾');
+  assert.equal(merged.filter((m) => m.role === 'assistant').length, 2);
+});
+
+test('缓存并集：流式进度更长的副本原地替换旧副本，位置不变', () => {
+  const history = [
+    { role: 'assistant', id: 'a-8', sourceIndex: 8, parts: [{ kind: 'text' as const, text: '上一答' }] },
+  ];
+  const stale = { role: 'assistant', parts: [{ kind: 'text' as const, text: '回答前半段' }] };
+  const fresh = { role: 'assistant', parts: [{ kind: 'text' as const, text: '回答前半段和后半段' }] };
+  const merged = mergeOlderMessages([...history, stale], [...history, stale, fresh]);
+
+  assert.equal(merged.length, 2, '同一条流式行只保留一份');
+  assert.equal(merged[1], fresh, '保留进度更长的那份');
+  assert.equal(merged[0]?.id, 'a-8', '带下标的更早历史位置不变');
+});
+
+test('旧缓存的无下标历史页仍插在带下标历史之前（原语义不回退）', () => {
+  const canvas = [
+    { role: 'user', id: 'u-7', sourceIndex: 7, parts: [{ kind: 'text' as const, text: '窗口内提问' }] },
+    { role: 'assistant', id: 'a-8', sourceIndex: 8, parts: [{ kind: 'text' as const, text: '窗口内回答' }] },
+  ];
+  const legacyPage = [
+    { role: 'user', parts: [{ kind: 'text' as const, text: '旧缓存提问' }] },
+    { role: 'assistant', parts: [{ kind: 'text' as const, text: '旧缓存回答' }] },
+  ];
+  const merged = mergeOlderMessages(canvas, legacyPage);
+  assert.equal(merged.length, 4);
+  assert.equal(merged[0]?.parts?.[0]?.text, '旧缓存提问');
+  assert.equal(merged[2]?.id, 'u-7');
+});

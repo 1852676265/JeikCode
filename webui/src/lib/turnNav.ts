@@ -195,6 +195,27 @@ export function visibleOlderRemainingCount(offset: number, firstTurnIndex?: numb
   return Math.max(0, offset - threshold);
 }
 
+/**
+ * 尚未加载到画布上的提问数（按服务端大纲的绝对 index 对账）。
+ *
+ * 旧计数器用「offset - 首问下标」算原始行数；一个回合往往包含几十上百条
+ * tool/tool_result 行，会被误显示成「还剩 568 条消息」。这里只数真正能在
+ * 右栏和画布上看到的提问，加载按钮的数字才与用户感知一致。
+ */
+export function remainingUnloadedTurns(
+  turns: { index: number }[],
+  messages: { role: string; sourceIndex?: number }[],
+): number {
+  if (turns.length === 0) return 0;
+  const loaded = new Set<number>();
+  for (const message of messages) {
+    if (message.role === 'user' && typeof message.sourceIndex === 'number') {
+      loaded.add(message.sourceIndex);
+    }
+  }
+  return turns.reduce((count, turn) => count + (loaded.has(turn.index) ? 0 : 1), 0);
+}
+
 export interface TurnNavScrollMetrics {
   scrollTop: number;
   clientHeight: number;

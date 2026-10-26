@@ -890,6 +890,62 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
   ];
 }
 
+/** 权威切片里已出现过的身份（行 id / part id / 工具 call id）。 */
+interface TailIdentity {
+  ids: Set<string>;
+  partIds: Set<string>;
+  toolIds: Set<string>;
+}
+
+function collectTailIdentity<T extends { sourceIndex?: number; id?: string }>(rows: T[]): TailIdentity {
+  const identity: TailIdentity = {
+    ids: new Set<string>(),
+    partIds: new Set<string>(),
+    toolIds: new Set<string>(),
+  };
+  for (const row of rows) {
+    if (row.id) identity.ids.add(row.id);
+    const parts = (row as { parts?: MsgPart[] }).parts;
+    if (!Array.isArray(parts)) continue;
+    for (const part of parts) {
+      if (part.kind === 'tool') {
+        if (part.tool?.id) identity.toolIds.add(part.tool.id);
+        continue;
+      }
+      if ((part.kind === 'text' || part.kind === 'reasoning') && part.id) {
+        identity.partIds.add(part.id);
+      }
+    }
+  }
+  return identity;
+}
+
+/**
+ * 剔除头部行里已经由权威切片渲染的段；整行都被切片覆盖时返回 null。
+ *
+ * 行级 id 命中 → 整行丢弃；否则只丢掉「同一 part id / 同一工具 call id」的段。
+ * 共存只能说明这行是在途聚合行（例如模型连续 20 多轮只吐思考与工具时，全部段都落在
+ * 发送时那条占位行上），保留它就会让整轮回答在权威尾部之后再渲染一遍。
+ */
+function pruneDuplicatedTailContent<T extends { sourceIndex?: number; id?: string }>(
+  row: T,
+  identity: TailIdentity,
+): T | null {
+  if (row.id && identity.ids.has(row.id)) return null;
+  const parts = (row as { parts?: MsgPart[] }).parts;
+  if (!Array.isArray(parts) || parts.length === 0) return row;
+  const kept = parts.filter((part) => {
+    if (part.kind === 'tool') return !(part.tool?.id && identity.toolIds.has(part.tool.id));
+    if (part.kind === 'text' || part.kind === 'reasoning') {
+      return !(part.id && identity.partIds.has(part.id));
+    }
+    return true;
+  });
+  if (kept.length === parts.length) return row;
+  if (kept.length === 0) return null;
+  return { ...row, parts: kept } as T;
+}
+
 /**
  * 用磁盘返回的权威尾部切片（diskTail）安全替换画布/缓存的尾部，同时严格保留
  * 画布中早于该切片起始偏移（sourceIndex < diskOffset）的更早历史头部（olderHead）。
@@ -902,6 +958,11 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
  * 若画布本身已具有早先历史（olderHead.length > 0），早先提问已处于其天然时序位置（在回答
  * 之前），绝不能从 olderHead 中剔除挪到 diskTail 头部（否则造成提问倒插到回答下方！）。
  * 只有画布无早先历史时，才采用 pinnedInTail。拼接后严格按 sourceIndex 升序对齐与去重。
+ *
+ * 第三个铁律：头部行不能夹带权威切片里已有的内容。推流期一条助手行可能聚了整轮多个
+ * round（模型连续只吐思考与工具时不会结算），这种行一旦因为早期猜出来的下标被当成
+ * 「更早历史」保留，整轮回答就会在权威尾部之后重放一遍。因此先按行 id / part id /
+ * 工具 call id 把切片已渲染的部分从头部剔除，再拼接。
  */
 export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id?: string }>(
   canvas: T[],
@@ -922,9 +983,19 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
     }
   }
 
-  const olderHead = canvas.filter((message) => {
-    return typeof message.sourceIndex === 'number' && message.sourceIndex < diskOffset;
-  });
+  // 权威切片已经渲染过的身份。头部行只是「切片之前的更早历史」，一旦它身上带着
+  // 切片里的同一份内容，就说明这行是推流期拼出来的在途行（一轮多 round 时思考/工具
+  // 全堆在同一条助手消息里），绝不能连同权威副本再渲染一遍。
+  //
+  // 只按 actualTail 建身份集：pinned 行（sourceIndex < diskOffset）在头部存在时会被
+  // 丢弃，不能因为它把画布上同一条提问的本地行（可能带附件）也一起排除。
+  const tailIdentity = collectTailIdentity(actualTail);
+  const olderHead: T[] = [];
+  for (const message of canvas) {
+    if (typeof message.sourceIndex !== 'number' || message.sourceIndex >= diskOffset) continue;
+    const pruned = pruneDuplicatedTailContent(message, tailIdentity);
+    if (pruned) olderHead.push(pruned);
+  }
 
   const baseHead = olderHead.length > 0 ? olderHead : pinnedInTail;
   const combined = [...baseHead, ...actualTail];
@@ -955,9 +1026,9 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
  * 3. 清理掉夹在连续重复提问之间的无用空 assistant 占位符；
  * 4. 确保从 IndexedDB 或历史缓存加载出来的画布是纯净无污染的。
  */
-export function sanitizeCanvasMessages<T extends { role: string; parts?: MsgPart[] }>(
-  messages: T[],
-): T[] {
+export function sanitizeCanvasMessages<
+  T extends { role: string; parts?: MsgPart[]; sourceIndex?: number },
+>(messages: T[]): T[] {
   if (!messages || messages.length <= 1) return messages;
   const result: T[] = [];
   for (let i = 0; i < messages.length; i++) {
@@ -1000,7 +1071,15 @@ export function sanitizeCanvasMessages<T extends { role: string; parts?: MsgPart
         const prevText = visibleUserText(
           prevUser.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
         );
-        if (userTextsMatch(prevText, curText)) {
+        // 两条都是落盘历史且绝对下标不同 → 用户确实连发了同一句话，必须保留。
+        // 只有同一行（同下标）或身份未知的旧缓存/乐观回显才折叠。
+        const sameAbsoluteRow =
+          typeof prevUser.sourceIndex === 'number' &&
+          typeof cur.sourceIndex === 'number' &&
+          prevUser.sourceIndex === cur.sourceIndex;
+        const identityUnknown =
+          typeof prevUser.sourceIndex !== 'number' || typeof cur.sourceIndex !== 'number';
+        if ((sameAbsoluteRow || identityUnknown) && userTextsMatch(prevText, curText)) {
           // 清除上一个重复提问留下的空助手（如果有的话）
           while (result.length > 0) {
             const tail = result[result.length - 1];
@@ -1056,24 +1135,227 @@ export function mergeOlderMessages<
   if (!older || older.length === 0) return prev;
   if (!prev || prev.length === 0) return older;
 
+  const indexedPrev = prev.filter(
+    (m): m is T & { sourceIndex: number } => typeof m.sourceIndex === 'number',
+  );
+  const prevIsSorted = indexedPrev.every(
+    (m, i) => i === 0 || m.sourceIndex >= indexedPrev[i - 1]!.sourceIndex,
+  );
+  if (!prevIsSorted) {
+    // Dirty/legacy canvas: keep the deterministic full sort. Index-less rows go
+    // last here on purpose; the ordered path below is the normal case.
+    return mergeOlderMessagesSorted(prev, older);
+  }
+
+  // Ordered path: INSERT older rows into prev instead of re-sorting everything.
+  // Re-sorting used to move index-less rows (older L1/L2 caches written before
+  // absolute indices existed) to the very end, so the first question appeared
+  // below later answers. Insertion preserves every existing row's position;
+  // only the newly loaded rows move into their chronological slot.
+  const result = prev.slice();
+  const seenIds = new Set<string>();
+  const seenIndices = new Set<number>();
+  for (const m of result) {
+    if (m.id) seenIds.add(m.id);
+    if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
+  }
+
+  for (const m of older) {
+    if (m.id && seenIds.has(m.id)) continue;
+    if (typeof m.sourceIndex === 'number' && seenIndices.has(m.sourceIndex)) continue;
+    // 兼容旧缓存 / 回放恢复出来的行：既无 id 又无绝对下标时，用「文本 + 时间戳」
+    // 与更早历史对账。否则同一条提问会被当成新消息重复插入。
+    if (m.role === 'user') {
+      if (
+        !m.id &&
+        typeof m.sourceIndex !== 'number' &&
+        result.some((candidate) => sameUserRow(candidate, m))
+      ) {
+        continue;
+      }
+      // 反向对账：画布上已有的无下标旧行若与这条权威提问是同一句，删掉旧行，
+      // 让带绝对下标的版本入座（否则旧行会留在原位形成重复气泡）。
+      if (m.id || typeof m.sourceIndex === 'number') {
+        for (let i = result.length - 1; i >= 0; i--) {
+          const candidate = result[i]!;
+          if (
+            candidate.role === 'user' &&
+            !candidate.id &&
+            typeof candidate.sourceIndex !== 'number' &&
+            sameUserRow(candidate, m)
+          ) {
+            result.splice(i, 1);
+          }
+        }
+      }
+    }
+
+    let insertAt: number;
+    if (typeof m.sourceIndex === 'number') {
+      insertAt = result.findIndex(
+        (candidate) =>
+          typeof candidate.sourceIndex === 'number' && candidate.sourceIndex > m.sourceIndex!,
+      );
+      if (insertAt < 0) {
+        // No greater indexed row: insert after the last indexed row but BEFORE
+        // the trailing index-less live rows (streaming assistant, optimistic user).
+        insertAt = result.length;
+        while (insertAt > 0 && typeof result[insertAt - 1]!.sourceIndex !== 'number') {
+          insertAt -= 1;
+        }
+      }
+    } else {
+      // 无下标行的两种来源：尚未落盘的直播行（流式助手气泡 / 乐观提问），或整页
+      // 都没有绝对下标的旧缓存历史。同一条直播行会同时出现在 L1 全量画布和可视
+      // 窗口里（落缓存时取并集），且两份进度可能不同 —— 先按「角色 + 工具调用序列」
+      // 对账，文本互为前缀即同一行，保留更新（更长）的那份，绝不能在时间线顶部
+      // 多出一条空气泡。提问行走上面的 sameUserRow（文本 + 时间戳），不能被这里
+      // 按纯文本吞掉——同文不同发是两条真消息。
+      const liveMatch = m.role === 'user' ? null : findIndexLessRow(result, m);
+      if (liveMatch) {
+        if (liveMatch.disposition === 'skip') continue;
+        result[liveMatch.index] = m;
+        if (m.id) seenIds.add(m.id);
+        continue;
+      }
+      // 位置：画布尾部本身是无下标行时，它属于正在进行的回合 → 接在末尾；
+      // 否则按旧缓存语义插到带下标历史之前。
+      const tailIsIndexLess =
+        result.length > 0 && typeof result[result.length - 1]!.sourceIndex !== 'number';
+      if (tailIsIndexLess) {
+        insertAt = result.length;
+      } else {
+        insertAt = result.findIndex((candidate) => typeof candidate.sourceIndex === 'number');
+        if (insertAt < 0) insertAt = result.length;
+      }
+    }
+
+    result.splice(insertAt, 0, m);
+    if (m.id) seenIds.add(m.id);
+    if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
+  }
+
+  return result;
+}
+
+/**
+ * 无下标行的流式身份：角色 + 工具调用序列 + 文本/思考拼接。
+ *
+ * 没有 `id`、也没有绝对下标的行只可能是「尚未落盘」或「旧缓存」。同一条直播行在
+ * L1 全量画布与可视窗口里各有一份，且两份的流式进度可能不同，所以文本用前缀关系
+ * 判定同一行：短的是长的前缀 → 同一行，保留更长的那份。
+ */
+function indexLessRowShape(row: { parts?: MsgPart[] }): { tools: string; text: string } {
+  const tools: string[] = [];
+  let text = '';
+  for (const part of row.parts ?? []) {
+    if (part.kind === 'tool') tools.push(part.tool?.id ?? '');
+    else if (part.kind === 'text' || part.kind === 'reasoning') text += part.text || '';
+  }
+  return { tools: tools.join('\u0000'), text };
+}
+
+function findIndexLessRow<T extends { role?: string; parts?: MsgPart[] }>(
+  rows: T[],
+  incoming: T,
+): { index: number; disposition: 'skip' | 'replace' } | null {
+  const want = indexLessRowShape(incoming);
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (row.role !== incoming.role) continue;
+    const have = indexLessRowShape(row);
+    if (have.tools !== want.tools) continue;
+    if (have.text === want.text) return { index: i, disposition: 'skip' };
+    if (want.text.startsWith(have.text)) return { index: i, disposition: 'replace' };
+    if (have.text.startsWith(want.text)) return { index: i, disposition: 'skip' };
+  }
+  return null;
+}
+
+/**
+ * Does the cached canvas actually reach the authoritative tail?
+ *
+ * Splicing a cached head that ends hundreds of rows before `diskOffset` leaves
+ * a hole between the two windows: the page is rendered, but everything between
+ * the cache head and the disk tail is missing. Such a cache must be discarded
+ * in favour of the tail (a contiguous cache ends at `diskOffset - 1` or overlaps
+ * the tail with newer rows).
+ */
+export function cachedHeadIsContiguous(
+  cachedMessages: Array<{ sourceIndex?: number }> | undefined,
+  diskOffset: number,
+): boolean {
+  if (!cachedMessages || cachedMessages.length === 0) return false;
+  const indices = Array.from(
+    new Set(
+      cachedMessages
+        .map((message) => message.sourceIndex)
+        .filter((index): index is number => typeof index === 'number'),
+    ),
+  ).sort((a, b) => a - b);
+  if (indices.length === 0) return false;
+
+  // A cached HEAD + the authoritative TAIL with a missing middle used to pass
+  // the max-only check. "Load older" walks BACKWARD from the cached head, so
+  // that hole would never be filled. Display lists can legitimately skip a few
+  // filtered internal rows, but a missing page is tens of raw rows; reject a
+  // gap larger than half a display page.
+  const MAX_INTERNAL_GAP = 24;
+  for (let i = 1; i < indices.length; i++) {
+    if (indices[i]! - indices[i - 1]! - 1 > MAX_INTERNAL_GAP) return false;
+  }
+  return indices[indices.length - 1]! >= diskOffset - 1;
+}
+
+/**
+ * Resolve the paging cursor for a cold start that already has an L1/L2 canvas.
+ *
+ * The API always answers with a 48-row tail offset. If the cache holds earlier
+ * pages, that offset is AHEAD of the canvas head: the next "load earlier"
+ * fetches rows already rendered, adds nothing, and only walks the cursor back
+ * after several dead clicks. Use the earliest index actually present on the
+ * canvas, but never a stale index beyond the authoritative tail offset (old
+ * array indices after compaction).
+ */
+export function resolveHistoryOffset(input: {
+  cachedMessages?: Array<{ sourceIndex?: number }>;
+  cachedOffset?: number;
+  diskOffset: number;
+}): number {
+  const candidates: number[] = [];
+  for (const message of input.cachedMessages ?? []) {
+    if (typeof message.sourceIndex === 'number') {
+      if (Number.isFinite(message.sourceIndex) && message.sourceIndex >= 0) {
+        candidates.push(message.sourceIndex);
+      }
+    }
+  }
+  if (
+    typeof input.cachedOffset === 'number' &&
+    Number.isFinite(input.cachedOffset) &&
+    input.cachedOffset >= 0
+  ) {
+    candidates.push(input.cachedOffset);
+  }
+  const valid = candidates.filter((index) => index <= input.diskOffset);
+  return valid.length > 0 ? Math.min(...valid) : input.diskOffset;
+}
+
+/** Legacy fallback for a dirty (non-ascending) canvas: stable full sort. */
+function mergeOlderMessagesSorted<
+  T extends { id?: string; sourceIndex?: number; role?: string; parts?: MsgPart[]; ts?: number },
+>(prev: T[], older: T[]): T[] {
   const seenIds = new Set<string>();
   const seenIndices = new Set<number>();
   const merged: T[] = [];
-
-  // 先把 older 依次放入（older 是更早的历史，其内部自然有序）
   for (const m of older) {
     if (m.id) seenIds.add(m.id);
     if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
     merged.push(m);
   }
-
-  // 检查 prev 中的消息
   for (const m of prev) {
     if (m.id && seenIds.has(m.id)) continue;
     if (typeof m.sourceIndex === 'number' && seenIndices.has(m.sourceIndex)) continue;
-    // 兼容旧缓存 / 回放恢复出来的行：既无 id 又无绝对下标时，用「文本 + 时间戳」
-    // 与更早历史对账。否则它会被当成“在途新消息”排到末尾 —— 用户看到的就是
-    // “第一条提问被渲染到了后面（48 条附近）”。
     if (
       m.role === 'user' &&
       !m.id &&
@@ -1086,25 +1368,17 @@ export function mergeOlderMessages<
     if (typeof m.sourceIndex === 'number') seenIndices.add(m.sourceIndex);
     merged.push(m);
   }
-
-  // 对所有包含 sourceIndex 的历史消息进行稳定升序排序，无 sourceIndex 的在途实时消息排在末尾
   const indexed = merged.map((item, originalIdx) => ({ item, originalIdx }));
   indexed.sort((a, b) => {
     const aIdx = typeof a.item.sourceIndex === 'number' ? a.item.sourceIndex : null;
     const bIdx = typeof b.item.sourceIndex === 'number' ? b.item.sourceIndex : null;
-
     if (aIdx !== null && bIdx !== null) {
       if (aIdx !== bIdx) return aIdx - bIdx;
       return a.originalIdx - b.originalIdx;
     }
-    if (aIdx !== null && bIdx === null) {
-      return -1;
-    }
-    if (aIdx === null && bIdx !== null) {
-      return 1;
-    }
+    if (aIdx !== null && bIdx === null) return -1;
+    if (aIdx === null && bIdx !== null) return 1;
     return a.originalIdx - b.originalIdx;
   });
-
   return indexed.map((x) => x.item);
 }

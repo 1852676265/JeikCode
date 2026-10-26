@@ -16,7 +16,6 @@ import {
   estimateCacheFromHistoryPrompt,
   createTokenCacheState,
   resetTokenCacheState,
-  startTokenTurn,
   clampCachedToPrompt,
   isStackedTurnBillingUsage,
   userMessageAlreadyOnCanvas,
@@ -112,6 +111,24 @@ test('disk catch-up keeps a send-now user bubble that is not on disk yet', () =>
     { role: 'assistant', parts: [{ kind: 'text', text: '最终回复正文' }] },
   ];
   assert.deepEqual(mergeDiskWithUnpersistedTail(disk, settledCanvasWithSteer), disk);
+});
+
+test('mergeDiskWithUnpersistedTail keeps an in-flight steer turn', () => {
+  const previous = { role: 'user', parts: [{ kind: 'text', text: '上一问' }] };
+  const previousDone = { role: 'assistant', parts: [{ kind: 'text', text: '上一答' }] };
+  const disk = [previous, previousDone];
+  const steer = { role: 'user', parts: [{ kind: 'text', text: 'steer 自然发出' }] };
+  const live = {
+    role: 'assistant',
+    parts: [
+      { kind: 'reasoning', text: '新 loop 思考' },
+      { kind: 'tool', tool: { id: 'call-new', name: 'run_command', status: 'pending' } },
+    ],
+  };
+  const merged = mergeDiskWithUnpersistedTail(disk, [...disk, steer, live]);
+  assert.equal(merged.length, 4);
+  assert.equal(merged[2], steer);
+  assert.equal(merged[3], live);
 });
 
 test('user echo already on canvas is not appended again', () => {
@@ -458,23 +475,6 @@ test('empty usage events do not wipe the prefix baseline', () => {
   const firstRound = resolveTokenCache({ prompt: 201_000, cached: 0 }, wiped.nextState);
   assert.ok(firstRound.cached > 0, 'first round after send must estimate prefix cache');
   assert.equal(firstRound.cached_estimated, true);
-});
-
-test('industrial loop hit rate matches the 5-step agent example', () => {
-  let state = startTokenTurn(createTokenCacheState());
-  const steps = [
-    { prompt: 5_000, cached: 0 },
-    { prompt: 6_000, cached: 5_000 },
-    { prompt: 7_000, cached: 6_000 },
-    { prompt: 8_000, cached: 7_000 },
-    { prompt: 9_000, cached: 8_000 },
-  ];
-  for (const step of steps) {
-    state = resolveTokenCache(step, state).nextState;
-  }
-  assert.equal(state.turnPromptSum, 35_000);
-  assert.equal(state.turnCachedSum, 26_000);
-  assert.equal(formatCacheHitRate(26_000, 35_000), '74%');
 });
 
 test('local prompt bumps keep estimated cache aligned with prior usage', () => {
