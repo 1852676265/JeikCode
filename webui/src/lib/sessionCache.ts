@@ -13,7 +13,7 @@
 /// v4: also drop canvases saved around the natural-steer race (a stale todo
 /// host / a dropped steer bubble). The server display log is authoritative;
 /// one cold refetch is cheaper than showing an old polluted canvas.
-export const CACHE_DISPLAY_VERSION = 4;
+export const CACHE_DISPLAY_VERSION = 5;
 
 export interface CachedSessionData {
   sessionId: string;

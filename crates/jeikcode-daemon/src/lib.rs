@@ -805,19 +805,21 @@ mod transcript_display_tests {
         let second = turn(2, 200, "Q2", "A2");
 
         let rows = display_prefix_from_transcript(&[first, second], Some(150), None);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].role, "user");
         assert_eq!(rows[0].content, "Q1");
         assert_eq!(rows[0].created_at, None);
         assert_eq!(rows[1].role, "assistant");
-        assert_eq!(rows[1].content, "A1");
-        assert_eq!(rows[1].created_at, Some(100));
+        assert_eq!(rows[1].id.as_deref(), Some("transcript-1-assistant-tools"));
         let call = rows[1].tool_calls.as_ref().unwrap()[0].clone();
         assert_eq!(call.id, "transcript-1-tool-0");
         assert_eq!(rows[2].role, "tool");
         assert_eq!(rows[2].content, "R1");
         assert_eq!(rows[2].tool_result.as_ref().unwrap().call_id, call.id);
         assert!(rows[2].tool_result.as_ref().unwrap().success);
+        assert_eq!(rows[3].role, "assistant");
+        assert_eq!(rows[3].content, "A1");
+        assert_eq!(rows[3].created_at, Some(100));
     }
 
     #[test]
@@ -5692,42 +5694,76 @@ fn display_prefix_from_transcript(
                 display: format_tool_args(&tool.name, &tool.args),
             })
             .collect();
-        let has_assistant = !turn.assistant.trim().is_empty()
-            || !turn.reasoning.trim().is_empty()
-            || !calls.is_empty();
-        if !has_assistant {
+        let has_tools = !calls.is_empty();
+        let has_text = !turn.assistant.trim().is_empty();
+        let has_reasoning = !turn.reasoning.trim().is_empty();
+        if !has_tools && !has_text && !has_reasoning {
             continue;
         }
-        rows.push(MessageInfo {
-            role: "assistant".into(),
-            id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
-            content: cap_display_field(turn.assistant.clone()),
-            reasoning: (!turn.reasoning.trim().is_empty())
-                .then(|| cap_display_field(turn.reasoning.clone())),
-            synthetic: false,
-            internal_origin: Some(DISPLAY_ORIGIN.into()),
-            tool_calls: (!calls.is_empty()).then_some(calls),
-            tool_result: None,
-            artifacts: None,
-            images: None,
-            created_at: u64::try_from(turn.ts).ok(),
-            elapsed_ms: None,
-        });
-        for (index, tool) in turn.tools.iter().enumerate() {
+        if has_tools {
+            // Phase 1: Tool execution message (thinking + tool calls)
             rows.push(MessageInfo {
-                role: "tool".into(),
-                id: Some(format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id)),
-                content: cap_display_field(tool.result.clone()),
-                reasoning: None,
+                role: "assistant".into(),
+                id: Some(format!("{ID_PREFIX}-{}-assistant-tools", turn.turn_id)),
+                content: String::new(),
+                reasoning: has_reasoning.then(|| cap_display_field(turn.reasoning.clone())),
+                synthetic: false,
+                internal_origin: Some(DISPLAY_ORIGIN.into()),
+                tool_calls: Some(calls),
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: u64::try_from(turn.ts).ok(),
+                elapsed_ms: None,
+            });
+            for (index, tool) in turn.tools.iter().enumerate() {
+                rows.push(MessageInfo {
+                    role: "tool".into(),
+                    id: Some(format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id)),
+                    content: cap_display_field(tool.result.clone()),
+                    reasoning: None,
+                    synthetic: false,
+                    internal_origin: Some(DISPLAY_ORIGIN.into()),
+                    tool_calls: None,
+                    tool_result: Some(ToolResultInfo {
+                        call_id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
+                        success: !tool.is_error,
+                        summary: tool_result_summary(&tool.result),
+                        line_count: tool.result.lines().count(),
+                    }),
+                    artifacts: None,
+                    images: None,
+                    created_at: u64::try_from(turn.ts).ok(),
+                    elapsed_ms: None,
+                });
+            }
+            // Phase 2: Final reply message (concluding answer text)
+            if has_text {
+                rows.push(MessageInfo {
+                    role: "assistant".into(),
+                    id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
+                    content: cap_display_field(turn.assistant.clone()),
+                    reasoning: None,
+                    synthetic: false,
+                    internal_origin: Some(DISPLAY_ORIGIN.into()),
+                    tool_calls: None,
+                    tool_result: None,
+                    artifacts: None,
+                    images: None,
+                    created_at: u64::try_from(turn.ts).ok(),
+                    elapsed_ms: None,
+                });
+            }
+        } else {
+            rows.push(MessageInfo {
+                role: "assistant".into(),
+                id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
+                content: cap_display_field(turn.assistant.clone()),
+                reasoning: has_reasoning.then(|| cap_display_field(turn.reasoning.clone())),
                 synthetic: false,
                 internal_origin: Some(DISPLAY_ORIGIN.into()),
                 tool_calls: None,
-                tool_result: Some(ToolResultInfo {
-                    call_id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
-                    success: !tool.is_error,
-                    summary: tool_result_summary(&tool.result),
-                    line_count: tool.result.lines().count(),
-                }),
+                tool_result: None,
                 artifacts: None,
                 images: None,
                 created_at: u64::try_from(turn.ts).ok(),

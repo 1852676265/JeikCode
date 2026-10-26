@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.3 (2026-10-27)
+
+- **[UI History & Turn Sequencing] Decoupled tool execution and turn conclusion in transcript reconstruction**:
+  - Reconstructed pre-compaction history turns now separate intermediate tool calls and outputs from the final concluding text response instead of collapsing them into a single compound row, strictly matching live turn ordering (prompt -> reasoning -> tool executions -> concluding response -> next prompt).
+  - Fixed pre-compaction tool cards appearing below the final answer text or hanging immediately above subsequent user prompts at turn boundaries.
+  - Bumped display transcript schema version (`DISPLAY_VERSION = 2`) to automatically re-backfill legacy sessions with the decoupled sequential format.
+  - Bumped frontend cache schema version (`CACHE_DISPLAY_VERSION = 5`) to evict stale inverted caches and cleanly refetch sequential server history.
+
+---
+
+- **[界面历史与回合时序] 重构转录中的工具调用与回合答复彻底解耦**:
+  - 修复压缩前历史转录回填时将中间工具调用与最终总结长文合并为单条记录的问题，严格解耦为阶段一（工具调用与输出）与阶段二（最终答复正文），还原自然真实时序（提问 → 思考 → 工具执行 → 最终答复 → 下一条提问）。
+  - 消除旧转录中工具卡片被甩在总结答复下方、直接紧贴下一轮用户提问气泡引发的倒插和割裂异象。
+  - 升级服务端展示账本协议版本（`DISPLAY_VERSION = 2`），自动原子重构历史旧会话的展示格式。
+  - 升级前端本地缓存架构版本（`CACHE_DISPLAY_VERSION = 5`），自动淘汰存在旧坐标系倒错隐患的浏览器旧缓存，确保冷启动与刷新拉取纯净新序列。
+
 ## v7.3.1-beta.2 (2026-10-26)
 
 - **[UI History & Context Compaction] Append-only display transcript keeps the full conversation visible**:
