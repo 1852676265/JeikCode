@@ -7433,7 +7433,9 @@ mod tests {
             .replace('\\', "/");
         // Both streams leave the pipe for the file AND the process stays silent long
         // enough for a couple of heartbeat ticks.
-        let command = format!(r#"sleep 0.12 > \"{log}\" 2>&1; echo done >> \"{log}\""#);
+        // Use real shell quotes (a raw `\"` is a literal backslash + quote on
+        // POSIX, so bash would look for a filename that includes the quotes).
+        let command = format!(r#"sleep 0.12 > "{log}" 2>&1; echo done >> "{log}""#);
         let args = serde_json::json!({ "command": command }).to_string();
         let started = Instant::now();
         let r = BashTool.execute(&args, &cx).await;
