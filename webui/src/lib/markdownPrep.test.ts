@@ -559,6 +559,35 @@ test('genuine nested language-tagged fence is still promoted (regression guard)'
   assert.match(promoted, /^```bash$/m);     // 内层语言标签围栏保持不变
 });
 
+test('indented code block with nested code fences under list item is not sliced by gluedFence into stray backticks', () => {
+  const sample = [
+    '3. **代码块 100% 深度豁免验证**：',
+    '   - 输入包含代码块：',
+    '     ```python',
+    '     Instructions from OpenAI:',
+    '     ```python',
+    '     import openai',
+    '     from anthropic import Anthropic',
+    '     # Supported by Tencent and Huawei',
+    '     client = openai.OpenAI()',
+    '     ```',
+    '     End of instructions.',
+    '     ```',
+    '   - 结果：代码块外部的说明性文本 `Instructions from OpenAI:` 被准确清洗替换为...',
+  ].join('\n');
+
+  const out = markdownToHtml(sample);
+  // 1. 外部 4 围栏不应被错误拆分为单个反引号
+  assert.doesNotMatch(out, /输入包含代码块：\s*`/);
+  assert.doesNotMatch(out, /End of instructions\.\s*`/);
+  // 2. 整个代码块应完整包裹，后续列表项不应被错误吞进代码块
+  assert.match(out, /<div class="code-block-wrapper has-language">/);
+  assert.match(out, /<code class="language-python">/);
+  assert.match(out, /Instructions from OpenAI:/);
+  assert.match(out, /client = openai\.OpenAI\(\)/);
+  assert.match(out, /<li>结果：代码块外部的说明性文本/);
+});
+
 
 
 

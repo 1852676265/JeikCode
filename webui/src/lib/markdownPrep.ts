@@ -803,7 +803,7 @@ export function preprocessMarkdown(raw: string): string {
         if (/^(?: {4}|\t)(?:#{1,6}\s+|[-*_]{3,}\s*$)/.test(line)) {
           line = line.replace(/^(?: {4}|\t)/, '');
         }
-      } else if (/^(?: {4}|\t)(?:```|~~~)/.test(line)) {
+      } else if (/^(?: {4}|\t)(?:`{3,}|~{3,})/.test(line)) {
         lastListIndent = -1;
         line = line.replace(/^(?: {4}|\t)/, '');
       } else {
@@ -827,7 +827,10 @@ export function preprocessMarkdown(raw: string): string {
     // 进而导致代码块容器失效，内部内容直接被外泄渲染为大号标题和普通正文，或导致闭合 ``` 反向误判吞噬后续文本！
     // 自动将其拆解为独立两行（前置文本行 + 纯净代码块开启行）。
     if (!inFence) {
-      const gluedFence = line.match(/^(\s*[^`~].*?)\s*((?:```|~~~)[a-zA-Z0-9_-]*\s*)$/);
+      const isPureFenceLine = /^\s*(?:>{1,}\s*)*(`{3,}|~{3,})/.test(line);
+      const gluedFence = !isPureFenceLine
+        ? line.match(/^(\s*[^`~].*?[^`~\s])\s*((?:`{3,}|~{3,})[a-zA-Z0-9_-]*\s*)$/)
+        : null;
       if (
         gluedFence &&
         gluedFence[1].trim() &&
