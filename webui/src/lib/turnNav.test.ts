@@ -4,10 +4,12 @@ import {
   buildTurnNavItems,
   buildTurnNavItemsFromOutline,
   filterTurnNavItems,
+  hasOlderVisibleMessages,
   resolveActiveTurnId,
   truncateTurnNavLabel,
   turnNavId,
   turnNavScrollTop,
+  visibleOlderRemainingCount,
 } from './turnNav.ts';
 
 test('turnNavId is stable per user-turn ordinal', () => {
@@ -192,4 +194,28 @@ test('resolveActiveTurnId does not skip a short question just below the marker',
     resolveActiveTurnId(items, topOf, { scrollTop: 0, clientHeight: 600, scrollHeight: 2000 }),
     'a',
   );
+});
+
+test('hasOlderVisibleMessages and visibleOlderRemainingCount exclude invisible system prefix', () => {
+  // 场景：首个用户提问在 index=8，前 8 条（0..7）为不可见 System/synthetic 指令
+  const firstTurnIndex = 8;
+
+  // 1. 冷启动打开时 offset=745 (远大于 8)
+  assert.equal(hasOlderVisibleMessages({ offset: 745, firstTurnIndex }), true);
+  assert.equal(visibleOlderRemainingCount(745, firstTurnIndex), 737);
+
+  // 2. 点击第二问 (index=32)，offset=32，上面还包含第一问
+  assert.equal(hasOlderVisibleMessages({ offset: 32, firstTurnIndex }), true);
+  assert.equal(visibleOlderRemainingCount(32, firstTurnIndex), 24);
+
+  // 3. 点击第一问 (index=8)，offset=8，上面全为系统指令，无任何可见消息
+  assert.equal(hasOlderVisibleMessages({ offset: 8, firstTurnIndex }), false);
+  assert.equal(visibleOlderRemainingCount(8, firstTurnIndex), 0);
+
+  // 4. 画布已包含首个提问（canvasHasFirstTurn: true）时，绝不渲染气泡
+  assert.equal(hasOlderVisibleMessages({ offset: 32, firstTurnIndex, canvasHasFirstTurn: true }), false);
+
+  // 5. 新建会话（offset=0）
+  assert.equal(hasOlderVisibleMessages({ offset: 0, firstTurnIndex }), false);
+  assert.equal(visibleOlderRemainingCount(0, firstTurnIndex), 0);
 });

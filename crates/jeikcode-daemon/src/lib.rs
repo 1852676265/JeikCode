@@ -1350,6 +1350,8 @@ struct ActiveChatOperation {
     /// Drained by the projection when a `Steered` event lands, so the wire can
     /// echo the id and let the WebUI reconcile an in-flight steer after refresh.
     steer_client_ids: std::collections::VecDeque<Option<String>>,
+    /// FIFO of arrival timestamps for `/chat/steer` submits awaiting fold.
+    steer_timestamps: std::collections::VecDeque<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -1497,6 +1499,7 @@ impl ActiveChatRegistry {
                 seq_base,
                 steer_tx: None,
                 steer_client_ids: std::collections::VecDeque::new(),
+                steer_timestamps: std::collections::VecDeque::new(),
             },
         );
 
@@ -2099,28 +2102,40 @@ impl ActiveChatRegistry {
         index.operations.get(operation_id)?.steer_tx.clone()
     }
 
-    /// Record a `/chat/steer` submit's client correlation id (FIFO; `None` when
-    /// the client sent none) so the turn projection can echo it on `steered`.
-    async fn record_steer_client_id(&self, alias: &str, client_input_id: Option<String>) {
+    /// Record a `/chat/steer` submit's client correlation id and timestamp (FIFO)
+    /// so the turn projection can echo them on `steered`.
+    async fn record_steer_metadata(
+        &self,
+        alias: &str,
+        client_input_id: Option<String>,
+        created_at: Option<u64>,
+    ) {
         let mut index = self.inner.write().await;
         if let Some(operation_id) = index.aliases.get(alias).cloned() {
             if let Some(operation) = index.operations.get_mut(&operation_id) {
                 operation.steer_client_ids.push_back(client_input_id);
+                operation.steer_timestamps.push_back(created_at);
             }
         }
     }
 
-    /// Drain up to `count` recorded steer client ids for the operation (FIFO),
-    /// padding with `None` so the returned list always aligns 1:1 with the folded
-    /// inputs reported by the kernel.
-    async fn take_steer_client_ids(&self, operation_id: &str, count: usize) -> Vec<Option<String>> {
+    /// Drain up to `count` recorded steer client ids and timestamps for the operation (FIFO).
+    async fn take_steer_metadata(
+        &self,
+        operation_id: &str,
+        count: usize,
+    ) -> (Vec<Option<String>>, Vec<Option<u64>>) {
         let mut index = self.inner.write().await;
         let Some(operation) = index.operations.get_mut(operation_id) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        (0..count)
+        let ids = (0..count)
             .map(|_| operation.steer_client_ids.pop_front().unwrap_or(None))
-            .collect()
+            .collect();
+        let timestamps = (0..count)
+            .map(|_| operation.steer_timestamps.pop_front().unwrap_or(None))
+            .collect();
+        (ids, timestamps)
     }
 
     /// Remove only the exact operation that finished. A late cleanup from an
@@ -6874,6 +6889,8 @@ pub enum ChatEvent {
         /// steer card/bubble to the persisted message by id across a refresh.
         #[serde(default)]
         client_input_ids: Vec<Option<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        timestamps: Vec<Option<u64>>,
     },
     /// Tool call completed
     #[serde(rename = "tool_result")]
@@ -8874,6 +8891,7 @@ impl ChatRuntimeProjector {
                     count,
                     inputs,
                     client_input_ids: Vec::new(),
+                    timestamps: Vec::new(),
                 });
                 events
             }
@@ -9628,13 +9646,16 @@ pub(crate) async fn process_chat_request(
             if let ChatEvent::Steered {
                 count,
                 client_input_ids,
+                timestamps,
                 ..
             } = &mut chat_event
             {
                 if client_input_ids.is_empty() {
-                    *client_input_ids = active_chats
-                        .take_steer_client_ids(&operation_id, *count)
+                    let (ids, ts) = active_chats
+                        .take_steer_metadata(&operation_id, *count)
                         .await;
+                    *client_input_ids = ids;
+                    *timestamps = ts;
                 }
             }
             if matches!(
@@ -10340,6 +10361,8 @@ struct ChatSteerRequest {
     /// WebUI can promote an optimistic steer to the persisted message by id.
     #[serde(default)]
     client_input_id: Option<String>,
+    #[serde(default)]
+    created_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11595,11 +11618,10 @@ async fn chat_steer(
             }),
         );
     };
-    // Record the client correlation id BEFORE submitting, so a fast round-boundary
-    // fold cannot emit `steered` before the id is available to echo.
+    // Record the client correlation id and timestamp BEFORE submitting
     state
         .active_chats
-        .record_steer_client_id(&req.session_id, req.client_input_id.clone())
+        .record_steer_metadata(&req.session_id, req.client_input_id.clone(), req.created_at)
         .await;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let pending = live_api::PendingChatSteer {

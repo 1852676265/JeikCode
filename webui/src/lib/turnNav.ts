@@ -112,6 +112,35 @@ export function filterTurnNavItems(items: TurnNavItem[], query: string): TurnNav
   return items.filter((it) => it.text.toLowerCase().includes(q));
 }
 
+/**
+ * 是否还有更早的【可见】历史消息未加载。
+ *
+ * 核心架构防线：
+ * 会话前缀（0..firstTurnIndex）通常全为 System prompts 与 synthetic 技能/MCP 指令（例如前 8 条全不可见）。
+ * 此时当 offset 已经抵达或越过首个用户提问（offset <= firstTurnIndex），或者画布顶部已经绘制了
+ * 首个提问时，上方剩余的仅为不可见系统指令，绝不能向用户展示「还剩 8 条」幽灵气泡或允许向空展开。
+ */
+export function hasOlderVisibleMessages(input: {
+  offset: number;
+  firstTurnIndex?: number;
+  canvasHasFirstTurn?: boolean;
+}): boolean {
+  if (input.offset <= 0) return false;
+  const threshold = input.firstTurnIndex ?? 0;
+  if (input.offset <= threshold) return false;
+  if (input.canvasHasFirstTurn) return false;
+  return true;
+}
+
+/**
+ * 剩余未加载的【可见】消息数量（扣除会话开头的不可见系统指令前缀）。
+ */
+export function visibleOlderRemainingCount(offset: number, firstTurnIndex?: number): number {
+  if (offset <= 0) return 0;
+  const threshold = firstTurnIndex ?? 0;
+  return Math.max(0, offset - threshold);
+}
+
 export interface TurnNavScrollMetrics {
   scrollTop: number;
   clientHeight: number;

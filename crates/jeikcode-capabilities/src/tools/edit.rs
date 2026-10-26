@@ -2011,8 +2011,24 @@ fn best_window_by_token_bag(
             hits += 1;
         }
     }
+    let boundary_score = |start_idx: usize| -> i32 {
+        let mut b = 0;
+        if let Some(first) = old_tokens.first() {
+            if file.tokens.get(start_idx).map(|s| s.as_str()) == Some(first.as_str()) {
+                b += 2;
+            }
+        }
+        if let Some(last) = old_tokens.last() {
+            if file.tokens.get(start_idx + w - 1).map(|s| s.as_str()) == Some(last.as_str()) {
+                b += 1;
+            }
+        }
+        b
+    };
+
     let mut best_hits = hits;
     let mut best_i = 0usize;
+    let mut best_boundary = boundary_score(0);
 
     for start in 1..=m.saturating_sub(w) {
         let drop = file.tokens[start - 1].as_str();
@@ -2032,9 +2048,11 @@ fn best_window_by_token_bag(
                 hits += 1;
             }
         }
-        if hits > best_hits {
+        let cur_b = boundary_score(start);
+        if hits > best_hits || (hits == best_hits && cur_b > best_boundary) {
             best_hits = hits;
             best_i = start;
+            best_boundary = cur_b;
         }
     }
 
@@ -2186,21 +2204,21 @@ fn build_structured_mismatch_diff(
                     let act = changes[scan_idx + 1].value().trim_end_matches(['\r', '\n']);
                     if discrepancy.is_none() {
                         let hint = if exp.trim() == act.trim() {
-                            "Notice whitespace/indentation mismatch".to_string()
+                            "Notice whitespace/indentation mismatch between old_string and actual file".to_string()
                         } else if exp.starts_with(act) && !act.is_empty() {
                             let extra = &exp[act.len()..];
                             format!(
-                                "Notice extra trailing characters in your input: {:?}",
+                                "Notice extra trailing characters in your old_string: {:?}",
                                 extra
                             )
                         } else if act.starts_with(exp) && !exp.is_empty() {
                             let missing = &act[exp.len()..];
                             format!(
-                                "Notice missing trailing characters from actual file: {:?}",
+                                "Notice trailing characters omitted from your old_string (present in actual file): {:?}",
                                 missing
                             )
                         } else {
-                            "Notice character mismatch on this line".to_string()
+                            "Notice character mismatch on this line between old_string and actual file".to_string()
                         };
 
                         discrepancy = Some(ExactDiscrepancy {
@@ -2237,7 +2255,10 @@ fn build_structured_mismatch_diff(
                         line_no: scan_line,
                         expected: String::new(),
                         actual: act.to_string(),
-                        hint: format!("Notice missing line from actual file: {:?}", act),
+                        hint: format!(
+                            "Notice line present in file but omitted from your old_string: {:?}",
+                            act
+                        ),
                     });
                 }
                 scan_line += 1;
@@ -2327,9 +2348,19 @@ fn build_structured_mismatch_diff(
     out.push_str(EDIT_DIFF_PROTOCOL_LEGEND);
 
     if let Some(disc) = discrepancy {
+        let old_repr = if disc.expected.is_empty() {
+            "<missing / line omitted in old_string>".to_string()
+        } else {
+            format!("{:?}", disc.expected)
+        };
+        let file_repr = if disc.actual.is_empty() {
+            "<none / not in actual file>".to_string()
+        } else {
+            format!("{:?}", disc.actual)
+        };
         out.push_str(&format!(
-            "👉 Exact Line Discrepancy (around line {}):\n  expected : {:?}\n  actual   : {:?}\n  ({})\n\n",
-            disc.line_no, disc.expected, disc.actual, disc.hint
+            "👉 Exact Line Discrepancy (around line {}):\n  conflict in old_string : {}\n  actual in file on disk : {}\n  ({})\n\n",
+            disc.line_no, old_repr, file_repr, disc.hint
         ));
     }
 
@@ -4463,7 +4494,7 @@ fn b() { 2 }
 
         assert!(hint.contains("in scripts/test.md"));
         assert!(hint.contains("👉 Exact Line Discrepancy"));
-        assert!(hint.contains("Notice extra trailing characters in your input: \"}],path:\""));
+        assert!(hint.contains("Notice extra trailing characters in your old_string: \"}],path:\""));
         assert!(hint.contains(
             "Below is the discrepancy between your old_string and the actual file content:"
         ));
@@ -4546,6 +4577,28 @@ fn b() { 2 }
         assert!(
             hint.contains("```diff"),
             "hint should still retain expanded diff: {hint}"
+        );
+    }
+
+    #[test]
+    fn test_token_bag_window_boundary_tie_break_avoids_bogus_discrepancy() {
+        let content = "import { test } from 'node:test';\nimport assert from 'node:assert';\nimport {\n  buildTurnNavItems,\n  buildTurnNavItemsFromOutline,\n  filterTurnNavItems,\n  resolveActiveTurnId,\n  truncateTurnNavLabel,\n  turnNavId,\n  turnNavScrollTop,\n} from './turnNav.ts';\n\ntest('turnNavId is stable', () => {});\n";
+        let file_norm = NormalizedFile::new(content);
+
+        // old_string 从 import { 开始，但多写了 compactTurnNavText
+        let old_string = "import {\n  buildTurnNavItems,\n  buildTurnNavItemsFromOutline,\n  compactTurnNavText,\n  filterTurnNavItems,\n  resolveActiveTurnId,\n  truncateTurnNavLabel,\n  turnNavId,\n  turnNavScrollTop,\n} from './turnNav.ts';";
+        let hint = find_closest_match_snippet(None, &file_norm, old_string).unwrap();
+
+        // 核心验证：必须准确定位到真正冲突的 compactTurnNavText 所在行（第 6 行），
+        // 绝不能因为平局先到先得误将第 2 行的 import assert 当作 expected: "" 误报！
+        assert!(hint.contains("compactTurnNavText"), "hint: {hint}");
+        assert!(
+            !hint.contains("import assert"),
+            "hint should not claim line 2 import assert is mismatched: {hint}"
+        );
+        assert!(
+            hint.contains("conflict in old_string : \"  compactTurnNavText,\""),
+            "hint: {hint}"
         );
     }
 

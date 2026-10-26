@@ -602,6 +602,12 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
       if (index >= 0) {
         const next = parts.slice();
         const p = next[index] as { kind: 'text'; text: string; id?: string };
+        const existing = (p.text || '').trim();
+        const incoming = content.trim();
+        // 关键防线：即使 replay 为 false（网络重连/未打序号），若整段长内容已完全存在，绝不重复翻倍追加
+        if (incoming.length > 20 && (existing === incoming || existing.endsWith(incoming))) {
+          return parts;
+        }
         next[index] = { ...p, text: (p.text || '') + content };
         return next;
       }
@@ -609,6 +615,11 @@ function mergeTextIntoParts(parts: MsgPart[], content: string, replay: boolean, 
     const tail = parts[parts.length - 1];
     const isDifferentPart = !!tail && tail.kind === 'text' && !!tail.id && !!partId && tail.id !== partId;
     if (tail && tail.kind === 'text' && !isDifferentPart) {
+      const existing = (tail.text || '').trim();
+      const incoming = content.trim();
+      if (incoming.length > 20 && (existing === incoming || existing.endsWith(incoming))) {
+        return parts;
+      }
       const next = parts.slice();
       next[next.length - 1] = { kind: 'text', text: (tail.text || '') + content, id: tail.id ?? partId };
       return next;

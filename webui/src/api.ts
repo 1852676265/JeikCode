@@ -217,7 +217,7 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null> }
+  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null>; timestamps?: Array<number | null> }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
@@ -393,6 +393,7 @@ export async function postChatSteer(
   message: string,
   images?: ImageData[],
   clientInputId?: string,
+  createdAt?: number,
 ): Promise<void> {
   const resp = await apiFetch('/chat/steer', {
     method: 'POST',
@@ -402,6 +403,7 @@ export async function postChatSteer(
       message,
       ...(images && images.length ? { images } : {}),
       ...(clientInputId ? { client_input_id: clientInputId } : {}),
+      ...(createdAt ? { created_at: createdAt } : {}),
     }),
   });
   let body: { accepted?: boolean; error?: string } = {};

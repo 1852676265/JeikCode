@@ -66,7 +66,7 @@ import {
   FRONTEND_COMMANDS,
   type SlashHandlers,
 } from '../lib/slashCommands';
-import { buildTurnNavItems, buildTurnNavItemsFromOutline, compactTurnNavText, filterTurnNavItems, resolveActiveTurnId, turnNavId, turnNavScrollTop } from '../lib/turnNav';
+import { buildTurnNavItems, buildTurnNavItemsFromOutline, compactTurnNavText, filterTurnNavItems, hasOlderVisibleMessages, resolveActiveTurnId, turnNavId, turnNavScrollTop, visibleOlderRemainingCount } from '../lib/turnNav';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForSessionOrigin } from '../lib/modeSwitch';
 import { randomUUID } from '../lib/randomId';
@@ -375,6 +375,7 @@ interface QueuedMessage {
    * drain 必须照发，不能因为文本已经在画布上就把卡片丢掉。
    */
   forceSend?: boolean;
+  createdAt?: number;
 }
 
 /** Concatenate all text segments (error-detection, skill-title, search, etc.). */
@@ -2257,21 +2258,23 @@ export function Chat({
       void tick();
     }, 8000);
   }
-  function ensureAssistantBubbleForWatch() {
+  function ensureAssistantBubbleForWatch(targetId?: string) {
     setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      const lastSettled = last && last.role === 'assistant' && last.parts?.some(
-        (p) => (p.kind === 'text' && (p.text || '').trim().length > 0)
-      );
-      if (last && last.role === 'assistant' && !lastSettled) {
+      // 1. 如果当前帧所属的目标 assistant 已经存在于画布上，绝不能再新增空气泡
+      if (targetId && prev.some((m) => m.role === 'assistant' && m.id === targetId)) {
         return prev;
       }
-      const next = [
-        ...prev,
-        { role: 'assistant' as const, parts: [] },
-      ];
-      messagesRef.current = next;
-      return next;
+      const last = prev[prev.length - 1];
+      // 2. 只有画布为空或最后一条消息是 user 时，才需要开启初始的 assistant 气泡
+      if (!last || last.role === 'user') {
+        const next = [
+          ...prev,
+          { role: 'assistant' as const, parts: [] },
+        ];
+        messagesRef.current = next;
+        return next;
+      }
+      return prev;
     });
   }
   /** 这条 watch 对应的页偏移。正在看的会话用实时偏移，后台会话用切走时记下的偏移。 */
@@ -2552,7 +2555,7 @@ export function Chat({
                     continue;
                   }
                   if (frame.type === 'text' || frame.type === 'reasoning') {
-                    ensureAssistantBubbleForWatch();
+                    ensureAssistantBubbleForWatch(frame.message_id);
                   }
                   // Reattach after refresh / sidebar switch. Server replay includes
                   // permission_request / user_input_request for every non-Auto mode that
@@ -3067,7 +3070,7 @@ export function Chat({
             onLiveTurnDone?.();
           }
           if (frame.type === 'text' || frame.type === 'reasoning') {
-            ensureAssistantBubbleForWatch();
+            ensureAssistantBubbleForWatch(frame.message_id);
           }
           if (skipSecondHandle) {
             timelineFollow.changed();
@@ -3560,15 +3563,16 @@ export function Chat({
       turnNavPinUntilRef.current = 0;
       const cachedOffset = sessionId ? (historyOffsetBySessionRef.current.get(sessionId) ?? 0) : 0;
       const cachedTotal = sessionId ? (historyTotalBySessionRef.current.get(sessionId) ?? 0) : 0;
+      const cachedOutline = sessionId ? turnOutlineBySessionRef.current.get(sessionId) : undefined;
+      const firstTurnIdx = cachedOutline?.[0]?.index ?? 0;
       const cachedHasOlder = sessionId
-        ? (cachedOffset > 0 || (hasOlderBySessionRef.current.get(sessionId) === true))
+        ? (hasOlderVisibleMessages({ offset: cachedOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: cached?.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) }) || (hasOlderBySessionRef.current.get(sessionId) === true))
         : false;
       setHasOlder(cachedHasOlder);
       setLoadingOlder(false);
       historyOffsetRef.current = cachedOffset;
       historyTotalRef.current = cachedTotal;
       pendingJumpIdRef.current = null;
-      const cachedOutline = sessionId ? turnOutlineBySessionRef.current.get(sessionId) : undefined;
       setTurnOutline(cachedOutline ?? []);
 
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
@@ -3635,20 +3639,20 @@ export function Chat({
       }
       timelineFollow.jump();
 
+      const cachedTurns = turnOutlineBySessionRef.current.get(sessionId);
+      if (cachedTurns && cachedTurns.length > 0) {
+        setTurnOutline(cachedTurns);
+      }
+      const firstTurnIdx = cachedTurns?.[0]?.index ?? 0;
       const savedOffset = historyOffsetBySessionRef.current.get(sessionId) ?? 0;
       const savedTotal = historyTotalBySessionRef.current.get(sessionId) ?? 0;
       const savedHasOlder =
-        savedOffset > 0 ||
+        hasOlderVisibleMessages({ offset: savedOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: cached?.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) }) ||
         (hasOlderBySessionRef.current.get(sessionId) === true) ||
         (activeSession?.id === sessionId && (activeSession.message_count ?? 0) > cached.length);
       historyOffsetRef.current = savedOffset;
       historyTotalRef.current = savedTotal;
       setHasOlder(savedHasOlder);
-
-      const cachedTurns = turnOutlineBySessionRef.current.get(sessionId);
-      if (cachedTurns && cachedTurns.length > 0) {
-        setTurnOutline(cachedTurns);
-      }
       const cachedProv = providerCacheRef.current.get(sessionId);
       if (cachedProv) {
         setProvider(cachedProv);
@@ -3716,7 +3720,8 @@ export function Chat({
           if (idb.historyOffset !== undefined) {
             const diskOffset = idb.historyOffset;
             const diskTotal = idb.historyTotal ?? (idb.messages.length + diskOffset);
-            const olderExists = diskOffset > 0;
+            const firstTurnIdx = idb.turns?.[0]?.index ?? 0;
+            const olderExists = hasOlderVisibleMessages({ offset: diskOffset, firstTurnIndex: firstTurnIdx });
             historyOffsetRef.current = diskOffset;
             historyTotalRef.current = diskTotal;
             setHasOlder(olderExists);
@@ -3781,6 +3786,24 @@ export function Chat({
               restoreProviderForSession(loadId);
             }
           }
+          // 无论当前会话是否处于实时推流（serverActive），服务端的全局元数据（大纲、总数、偏移）
+          // 始终具有权威完整性，必须立刻更新！不能锁在 canvasEmpty / serverActive 门禁内部，
+          // 否则异地冷启动接入运行中会话时大纲会丢失（退化为仅有推流的 3-5 条）且无法向上加载历史！
+          const totalOnDisk = sessionResult.value.message_count ?? (sessionResult.value.messages.length + (sessionResult.value.offset ?? 0));
+          const diskOffset = sessionResult.value.offset ?? 0;
+          const firstTurnIdx = sessionResult.value.turns?.[0]?.index ?? 0;
+          const olderExists = hasOlderVisibleMessages({ offset: diskOffset, firstTurnIndex: firstTurnIdx });
+          historyTotalRef.current = totalOnDisk;
+          historyOffsetRef.current = diskOffset;
+          setHasOlder(olderExists);
+          historyOffsetBySessionRef.current.set(loadId, diskOffset);
+          historyTotalBySessionRef.current.set(loadId, totalOnDisk);
+          hasOlderBySessionRef.current.set(loadId, olderExists);
+          if (sessionResult.value.turns && sessionResult.value.turns.length > 0) {
+            setTurnOutline(sessionResult.value.turns);
+            turnOutlineBySessionRef.current.set(loadId, sessionResult.value.turns);
+          }
+
           // Live reconnect restores from the /live snapshot. Disk history can
           // race that snapshot (stale, missing in-flight turns) and must not
           // overlay a canvas that already has turns. If the live projection is
@@ -3794,22 +3817,9 @@ export function Chat({
           if (!isLiveSession || canvasEmpty || serverActive === false) {
             const loaded = sessionMessagesToDisplay(
               sessionResult.value.messages,
-              sessionResult.value.offset ?? 0,
+              diskOffset,
               sessionResult.value.pinned_user_index,
             );
-            const totalOnDisk = sessionResult.value.message_count ?? loaded.length;
-            const diskOffset = sessionResult.value.offset ?? 0;
-            const olderExists = diskOffset > 0;
-            historyTotalRef.current = totalOnDisk;
-            historyOffsetRef.current = diskOffset;
-            setHasOlder(olderExists);
-            historyOffsetBySessionRef.current.set(loadId, diskOffset);
-            historyTotalBySessionRef.current.set(loadId, totalOnDisk);
-            hasOlderBySessionRef.current.set(loadId, olderExists);
-            if (sessionResult.value.turns && sessionResult.value.turns.length > 0) {
-              setTurnOutline(sessionResult.value.turns);
-              turnOutlineBySessionRef.current.set(loadId, sessionResult.value.turns);
-            }
             // 运行中的会话磁盘尚未落盘本轮未结消息，绝不能用落后磁盘历史覆盖缓存！
             if (serverActive === false) {
               void saveSessionCache(
@@ -5124,9 +5134,10 @@ export function Chat({
   }
 
   function foldSteeredInputs(
-    inputs: { text: string; images?: ImageData[]; message_id?: string }[],
+    inputs: { text: string; images?: ImageData[]; message_id?: string; created_at?: number }[],
     clientInputIds?: Array<string | null>,
     targetSessionId?: string,
+    timestamps?: Array<number | null | undefined>,
   ) {
     const steeredInputs = (inputs ?? []).map((input) => ({
       text: stripSteerEnvelopeForDisplay(input.text || ''),
@@ -5226,7 +5237,7 @@ export function Chat({
           role: 'user',
           parts: [{ kind: 'text', text: cleanText }],
           images: resolvedImages,
-          ts: now,
+          ts: timestamps?.[i] ?? matchedItem?.createdAt ?? now,
           isSteer: true,
           sourceIndex: turnIndex,
           turnNavOrdinal: turnOrdinal,
@@ -5359,7 +5370,8 @@ export function Chat({
       const older = sessionMessagesToDisplay(detail.messages, detail.offset ?? index);
       const newOffset = detail.offset ?? index;
       const newTotal = detail.message_count ?? historyTotalRef.current;
-      const olderExists = newOffset > 0;
+      const firstTurnIdx = detail.turns?.[0]?.index ?? (turnOutlineRef.current[0]?.index ?? 0);
+      const olderExists = hasOlderVisibleMessages({ offset: newOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: older.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) });
       historyOffsetRef.current = newOffset;
       historyTotalRef.current = newTotal;
       setHasOlder(olderExists);
@@ -5464,7 +5476,8 @@ export function Chat({
       const older = sessionMessagesToDisplay(detail.messages, detail.offset ?? nextOffset);
       const newOffset = detail.offset ?? nextOffset;
       const newTotal = detail.message_count ?? historyTotalRef.current;
-      const olderExists = newOffset > 0;
+      const firstTurnIdx = detail.turns?.[0]?.index ?? (turnOutlineRef.current[0]?.index ?? 0);
+      const olderExists = hasOlderVisibleMessages({ offset: newOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: older.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) });
       historyOffsetRef.current = newOffset;
       historyTotalRef.current = newTotal;
       setHasOlder(olderExists);
@@ -5527,7 +5540,8 @@ export function Chat({
       ) {
         const newTotal = detail.message_count ?? detail.messages.length;
         const newOffset = detail.offset ?? historyOffsetRef.current;
-        const olderExists = (detail.offset ?? 0) > 0;
+        const firstTurnIdx = detail.turns?.[0]?.index ?? (turnOutlineRef.current[0]?.index ?? 0);
+        const olderExists = hasOlderVisibleMessages({ offset: detail.offset ?? 0, firstTurnIndex: firstTurnIdx });
         historyTotalRef.current = newTotal;
         historyOffsetRef.current = newOffset;
         setHasOlder(olderExists);
@@ -6018,7 +6032,7 @@ export function Chat({
    */
   function applyEventToSessionCache(targetSid: string, event: SSEEvent) {
     if (event.type === 'steered') {
-      foldSteeredInputs(event.inputs ?? [], event.client_input_ids, targetSid);
+      foldSteeredInputs(event.inputs ?? [], event.client_input_ids, targetSid, (event as any).timestamps);
       return;
     }
     if (event.type === 'context_compacted') {
@@ -6479,7 +6493,7 @@ export function Chat({
       }
 
       case 'steered': {
-        foldSteeredInputs(event.inputs ?? [], event.client_input_ids);
+        foldSteeredInputs(event.inputs ?? [], event.client_input_ids, undefined, (event as any).timestamps);
         break;
       }
 
@@ -7915,6 +7929,7 @@ export function Chat({
         images: images.length ? images : undefined,
         approvalMode: modeState.confirmedMode,
         kind: 'queue',
+        createdAt: Date.now(),
       };
       setQueued((q) => [...q, card]);
       recordAcceptedInput(); // Accepted into this session's next-turn queue.
@@ -8103,7 +8118,7 @@ export function Chat({
 
     updateTargetQueued((item) => ({ ...item, kind: 'steering' as const, clientInputId }));
     try {
-      await postChatSteer(targetSid, q.text, q.images, clientInputId);
+      await postChatSteer(targetSid, q.text, q.images, clientInputId, q.createdAt ?? Date.now());
       // 成功投递后，卡片保留并更新为 'steer' 状态（展示「转向已排队 · 等待当前步骤完成」与取消按钮）！
       updateTargetQueued((item) => ({ ...item, kind: 'steer' as const }));
     } catch (error) {
@@ -10194,7 +10209,7 @@ export function Chat({
             >
               {loadingOlder
                 ? t('chat.loadingOlder')
-                : t('chat.loadOlder', { n: String(historyOffsetRef.current) })}
+                : t('chat.loadOlder', { n: String(visibleOlderRemainingCount(historyOffsetRef.current, turnOutlineRef.current[0]?.index)) })}
             </button>
           </div>
         )}
