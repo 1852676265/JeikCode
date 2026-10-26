@@ -3534,14 +3534,27 @@ export function Chat({
       timelineFollow.reset();
       if (cached && cached.length > 0) {
         const cleanCached = sanitizeCanvasMessages(cached);
-        // 清洗结果必须回写缓存：同一次 effect 后面的 warm 分支会用缓存重新上屏，
-        // 只改画布不改缓存的话，sanitize 会被原始引用立刻覆盖。
         if (sessionId) messageCacheRef.current.set(sessionId, cleanCached);
-        messagesRef.current = cleanCached;
-        setMessages(cleanCached);
+
+        // 主流极致性能优化：会话切换时默认展示最新 48 条活动窗口，
+        // 彻底终结 1000+ 条历史消息、上万 DOM 节点与几十兆 Base64 图片在切会话时一次性重载卡死！
+        // 早先历史在内存中完整保留，用户向上滑动或点击展开时 0ms 瞬间补齐。
+        let displayTail = cleanCached;
+        let windowOffset = (sessionId ? historyOffsetBySessionRef.current.get(sessionId) : 0) ?? 0;
+        if (cleanCached.length > HISTORY_PAGE) {
+          displayTail = cleanCached.slice(-HISTORY_PAGE);
+          const firstTail = displayTail[0];
+          if (firstTail && typeof firstTail.sourceIndex === 'number') {
+            windowOffset = firstTail.sourceIndex;
+          } else {
+            windowOffset = Math.max(0, cleanCached.length - HISTORY_PAGE);
+          }
+        }
+
+        messagesRef.current = displayTail;
+        setMessages(displayTail);
         canvasReadySessionIdRef.current = sessionId;
         flushPreMountStreamBuffer(sessionId);
-        // Schedule the cached history after layout without overriding reader intent.
         pinTimelineToBottom(1200);
       } else {
         const localActive = sessionId && (localTurnSessionsRef.current.has(sessionId) || backgroundRunningSessionsRef.current.has(sessionId));
@@ -3630,8 +3643,21 @@ export function Chat({
       // 上屏前清洗并回写，保证下一轮终态对账基于干净画布拼接（重复不会累积）。
       const cleanCached = sanitizeCanvasMessages(cached);
       messageCacheRef.current.set(sessionId, cleanCached);
-      messagesRef.current = cleanCached;
-      setMessages(cleanCached);
+
+      let displayTail = cleanCached;
+      let windowOffset = historyOffsetBySessionRef.current.get(sessionId) ?? 0;
+      if (cleanCached.length > HISTORY_PAGE) {
+        displayTail = cleanCached.slice(-HISTORY_PAGE);
+        const firstTail = displayTail[0];
+        if (firstTail && typeof firstTail.sourceIndex === 'number') {
+          windowOffset = firstTail.sourceIndex;
+        } else {
+          windowOffset = Math.max(0, cleanCached.length - HISTORY_PAGE);
+        }
+      }
+
+      messagesRef.current = displayTail;
+      setMessages(displayTail);
       canvasReadySessionIdRef.current = sessionId;
       flushPreMountStreamBuffer(sessionId);
       if (scrollRef.current) {
@@ -3644,7 +3670,8 @@ export function Chat({
         setTurnOutline(cachedTurns);
       }
       const firstTurnIdx = cachedTurns?.[0]?.index ?? 0;
-      const savedOffset = historyOffsetBySessionRef.current.get(sessionId) ?? 0;
+
+      const savedOffset = windowOffset;
       const savedTotal = historyTotalBySessionRef.current.get(sessionId) ?? 0;
       const savedHasOlder =
         hasOlderVisibleMessages({ offset: savedOffset, firstTurnIndex: firstTurnIdx, canvasHasFirstTurn: cached?.some((m) => typeof m.sourceIndex === 'number' && m.sourceIndex <= firstTurnIdx) }) ||

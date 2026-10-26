@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import {
   buildTurnNavItems,
   buildTurnNavItemsFromOutline,
+  dedupeTurnOutline,
   filterTurnNavItems,
   hasOlderVisibleMessages,
   resolveActiveTurnId,
@@ -218,4 +219,23 @@ test('hasOlderVisibleMessages and visibleOlderRemainingCount exclude invisible s
   // 5. 新建会话（offset=0）
   assert.equal(hasOlderVisibleMessages({ offset: 0, firstTurnIndex }), false);
   assert.equal(visibleOlderRemainingCount(0, firstTurnIndex), 0);
+});
+
+test('dedupeTurnOutline cleans duplicate trailing questions from optimistic echo races', () => {
+  // 真实复现截图中的大纲末尾重复条目：
+  const dirtyTurns = [
+    { ordinal: 42, index: 1179, text: '现在还有个问题 就是点击会话的时候 会话比较长的时候速度很慢' },
+    { ordinal: 43, index: 1198, text: '<user-query> 要对比延迟数据测试方案对比 看看怎' },
+    { ordinal: 44, index: 1211, text: '<user-query> 直接找几个大历史列表的sessio' },
+    { ordinal: 45, index: 1217, text: '现在还有个问题 就是点击会话的时候 会话比较长的时候速度很慢' },
+    { ordinal: 46, index: 1218, text: '要对比延迟数据测试方案对比 看看怎么保证我们状态一致性的情况' },
+    { ordinal: 47, index: 1220, text: '直接找几个大历史列表的session之间的来回切换 对照试验' },
+  ];
+
+  const deduped = dedupeTurnOutline(dirtyTurns);
+  assert.equal(deduped.length, 3, '重复条目必须被彻底去重，由 6 条变为 3 条');
+  assert.equal(deduped[0].index, 1179);
+  assert.equal(deduped[1].index, 1198);
+  assert.equal(deduped[2].index, 1211);
+  assert.ok(deduped[1].text.includes('状态一致性'), '被截断的 steer 提问应自动升级为完整文本');
 });

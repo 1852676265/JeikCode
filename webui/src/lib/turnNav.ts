@@ -47,11 +47,70 @@ export function truncateTurnNavLabel(text: string, max = DEFAULT_MAX_LABEL): str
   return compact.slice(0, Math.max(1, max - 1)) + '…';
 }
 
+/**
+ * 提问大纲去重与规范化（彻底解决乐观发送/回放对账导致的尾部 2~3 条提问重复问题）。
+ *
+ * 核心规则：
+ * 1. 绝对下标去重（同一 index 只保留一个条目）；
+ * 2. 文本语义去重：若两条条目的提问文本完全一致，或其中一条是另一条的截断前缀（例如 steer 提问被信封切掉一截），
+ *    合并为单一真实条目，保留更早的权威 index 与更完整的内容；
+ * 3. 严格按 index 升序排列。
+ */
+export function dedupeTurnOutline<T extends { index: number; text: string; ordinal?: number }>(
+  turns: T[],
+): T[] {
+  if (!turns || turns.length <= 1) return turns || [];
+  const result: T[] = [];
+  for (const t of turns) {
+    const c = compactTurnNavText(
+      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(t.text)),
+    );
+    if (!c) continue;
+
+    // 检查是否已有完全匹配、相似、或包含关系的提问
+    const matchIdx = result.findIndex((prev) => {
+      if (prev.index === t.index) return true;
+      const prevC = compactTurnNavText(
+        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(prev.text)),
+      );
+      if (prevC === c) return true;
+      // 允许前缀包含匹配（至少 8 个字符，避免单字误伤）
+      if (
+        prevC.length >= 8 &&
+        c.length >= 8 &&
+        (prevC.startsWith(c) || c.startsWith(prevC))
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    if (matchIdx >= 0) {
+      const existing = result[matchIdx]!;
+      const existingC = compactTurnNavText(
+        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(existing.text)),
+      );
+      // 如果当前项文本更完整，升级文本内容；下标保留更小（更靠前）的权威下标
+      if (c.length > existingC.length) {
+        result[matchIdx] = {
+          ...t,
+          index: Math.min(existing.index, t.index),
+          ordinal: existing.ordinal ?? t.ordinal,
+        };
+      }
+    } else {
+      result.push({ ...t });
+    }
+  }
+  return result.sort((a, b) => a.index - b.index);
+}
+
 export function buildTurnNavItemsFromOutline(
   turns: { ordinal?: number; index: number; text: string }[],
 ): TurnNavItem[] {
   const items: TurnNavItem[] = [];
-  for (const turn of turns) {
+  const cleanTurns = dedupeTurnOutline(turns);
+  for (const turn of cleanTurns) {
     // Older sessions may not mark injected user rows as synthetic. Keep the
     // server outline aligned with the same rows history rendering suppresses.
     if (isInternalHistoryUserMessage(turn.text)) continue;
@@ -60,11 +119,6 @@ export function buildTurnNavItemsFromOutline(
     );
     const label = truncateTurnNavLabel(text);
     if (!label) continue;
-    // New daemons provide an ordinal that stays stable when failed turns add
-    // diagnostic rows to the raw transcript. Older daemons fall back to the
-    // visible outline order, which has the same semantics.
-    // `ordinal` stays metadata only. The anchor id must be the absolute index so
-    // the rail id equals the canvas row id (`sourceIndex`) on every page.
     const ordinal = turn.ordinal ?? items.length;
     items.push({ id: turnNavId(turn.index), ordinal, index: turn.index, label, text });
   }
