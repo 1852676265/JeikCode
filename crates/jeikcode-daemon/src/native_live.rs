@@ -378,8 +378,13 @@ pub async fn ensure_registry_runner(
         return Err(format!("provider {provider_name:?} not found"));
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
-    let runtime_config: CodingRuntimeConfig =
+    let mut runtime_config: CodingRuntimeConfig =
         crate::live_api::live_runtime_config(&config, &provider_name, &working_dir, telemetry);
+    crate::live_api::apply_session_effort_override(
+        &mut runtime_config,
+        &working_dir,
+        Some(&session_id),
+    );
 
     let session_mode = if let Ok(snapshot) = load_snapshot(&working_dir, &session_id) {
         let _ = take_session_draft(&session_id);
@@ -1150,8 +1155,13 @@ pub async fn ensure_headless_runtime(
         return Err(format!("provider {provider_name:?} not found"));
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
-    let runtime_config: CodingRuntimeConfig =
+    let mut runtime_config: CodingRuntimeConfig =
         crate::live_api::live_runtime_config(&config, &provider_name, &working_dir, telemetry);
+    crate::live_api::apply_session_effort_override(
+        &mut runtime_config,
+        &working_dir,
+        requested_session_id.as_deref(),
+    );
     let (session_mode, initial_snapshot) = match requested_session_id {
         Some(id) => {
             let snapshot = load_snapshot(&working_dir, &id)?;

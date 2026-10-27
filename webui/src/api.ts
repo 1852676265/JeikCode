@@ -951,6 +951,9 @@ export interface SessionMeta {
   file_size?: number;
   approval_mode?: ApprovalMode | null;
   preferred_model?: string | null;
+  /** Per-session reasoning effort; absent means "inherit the provider default". */
+  reasoning_effort?: string | null;
+  thinking_budget?: number | null;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -1027,6 +1030,9 @@ export interface SessionDetail {
   preferred_model?: string | null;
   /** Per-session approval mode ("build" | "accept_edits" | "bypass" | "plan"). Absent on older sessions. */
   approval_mode?: ApprovalMode | null;
+  /** Per-session reasoning effort; absent means "inherit the provider default". */
+  reasoning_effort?: string | null;
+  thinking_budget?: number | null;
   /** Last-request occupancy for the footer (persists across restart). Not turn-cumulative billing. */
   token_usage?: SessionTokenUsage | null;
   /** `manual` / `scheduled` / `protocol`. Protocol sessions are observed in Auto. */

@@ -86,6 +86,12 @@ static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::
 static SESSION_APPROVAL_MODES: StdMutex<Option<HashMap<String, ApprovalMode>>> =
     StdMutex::new(None);
 
+/// 已知磁盘上也没有持久化模式的会话（负缓存）。避免会话列表逐行渲染时反复
+/// 扫描会话目录做无意义的磁盘回填。`live_set_session_approval_mode` 会清除对应项。
+static SESSION_APPROVAL_MODE_MISSES: std::sync::LazyLock<
+    StdMutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
 /// 读取当前全局生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
 pub(crate) fn live_current_approval_mode() -> ApprovalMode {
@@ -93,45 +99,86 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 }
 
 /// 读取指定 session 的审批模式；若未单独指定则回退到全局默认模式。
+///
+/// 性能：内存命中为 O(1)；磁盘回填只做一次（命中后写入内存，未命中则记入
+/// 负缓存，避免会话列表逐行渲染时反复扫描会话目录）。
 pub(crate) fn live_session_approval_mode(session_id: Option<&str>) -> ApprovalMode {
-    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        let sid = sid.trim();
-        let guard = SESSION_APPROVAL_MODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(map) = guard.as_ref() {
-            if let Some(mode) = map.get(sid) {
-                return *mode;
-            }
-        }
-        drop(guard);
-        // 若内存未命中，从磁盘会话元数据（SessionMeta）中读取持久化的模式
-        if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
-            let manager = jeikcode_capabilities::session::SessionManager::for_project(
-                &resolved.meta.working_dir,
-            );
-            if let Ok(meta) = manager.read_meta(sid) {
-                if let Some(mode_str) = meta.approval_mode.as_deref() {
-                    let parsed = match mode_str.trim().to_ascii_lowercase().as_str() {
-                        "build" => Some(ApprovalMode::Build),
-                        "accept_edits" => Some(ApprovalMode::AcceptEdits),
-                        "bypass" | "auto" => Some(ApprovalMode::Auto),
-                        "plan" => Some(ApprovalMode::Plan),
-                        _ => None,
-                    };
-                    if let Some(mode) = parsed {
-                        let mut guard = SESSION_APPROVAL_MODES
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let map = guard.get_or_insert_with(HashMap::new);
-                        map.insert(sid.to_string(), mode);
-                        return mode;
-                    }
-                }
-            }
+    let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return live_current_approval_mode();
+    };
+    if let Some(mode) = cached_session_approval_mode(sid) {
+        return mode;
+    }
+    if session_approval_mode_known_absent(sid) {
+        return live_current_approval_mode();
+    }
+    // 磁盘回填需要定位会话所属项目桶（仅首次、且不在列表热路径上）。
+    let resolved = crate::resolve_session_by_id(sid).ok().flatten();
+    let Some(resolved) = resolved else {
+        mark_session_approval_mode_absent(sid);
+        return live_current_approval_mode();
+    };
+    let manager =
+        jeikcode_capabilities::session::SessionManager::for_project(&resolved.meta.working_dir);
+    if let Ok(meta) = manager.read_meta(sid) {
+        if let Some(mode) = parse_approval_mode_wire(meta.approval_mode.as_deref()) {
+            remember_session_approval_mode(sid, mode);
+            return mode;
         }
     }
+    mark_session_approval_mode_absent(sid);
     live_current_approval_mode()
+}
+
+pub(crate) fn parse_approval_mode_wire(raw: Option<&str>) -> Option<ApprovalMode> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "build" => Some(ApprovalMode::Build),
+        "accept_edits" => Some(ApprovalMode::AcceptEdits),
+        "bypass" | "auto" => Some(ApprovalMode::Auto),
+        "plan" => Some(ApprovalMode::Plan),
+        _ => None,
+    }
+}
+
+fn cached_session_approval_mode(sid: &str) -> Option<ApprovalMode> {
+    let guard = SESSION_APPROVAL_MODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|map| map.get(sid).copied())
+}
+
+/// 仅查内存热态（不触及磁盘）：供会话列表/增量行等热路径使用。
+pub(crate) fn live_session_approval_mode_cached(session_id: Option<&str>) -> Option<ApprovalMode> {
+    session_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(cached_session_approval_mode)
+}
+
+fn remember_session_approval_mode(sid: &str, mode: ApprovalMode) {
+    let mut guard = SESSION_APPROVAL_MODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(sid.to_string(), mode);
+    if let Ok(mut misses) = SESSION_APPROVAL_MODE_MISSES.lock() {
+        misses.remove(sid);
+    }
+}
+
+fn session_approval_mode_known_absent(sid: &str) -> bool {
+    SESSION_APPROVAL_MODE_MISSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(sid)
+}
+
+fn mark_session_approval_mode_absent(sid: &str) {
+    SESSION_APPROVAL_MODE_MISSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sid.to_string());
 }
 
 /// Force the process-wide live approval mode (used by `serve --yolo` → Auto).
@@ -142,11 +189,7 @@ pub(crate) fn live_set_approval_mode(mode: ApprovalMode) {
 /// 设置指定 session 的审批模式；若 session_id 为 None 则更新全局默认模式。
 pub(crate) fn live_set_session_approval_mode(session_id: Option<&str>, mode: ApprovalMode) {
     if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        let mut guard = SESSION_APPROVAL_MODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(sid.trim().to_string(), mode);
+        remember_session_approval_mode(sid.trim(), mode);
     } else {
         *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     }
@@ -162,6 +205,11 @@ pub(crate) fn live_clear_session_approval_mode(session_id: &str) {
         if let Some(map) = guard.as_mut() {
             map.remove(sid);
         }
+        drop(guard);
+        SESSION_APPROVAL_MODE_MISSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(sid);
     }
 }
 
@@ -803,6 +851,32 @@ pub(crate) fn live_runtime_config(
     runtime
 }
 
+/// Overlay this session's own reasoning-effort choice onto its runtime config.
+///
+/// Effort is otherwise provider-wide in `config.toml`; scoping it to the session
+/// keeps two concurrently running sessions on the same provider from silently
+/// rewriting each other's thinking intensity.
+pub(crate) fn apply_session_effort_override(
+    runtime: &mut jeikcode_coding::CodingRuntimeConfig,
+    working_dir: &Path,
+    session_id: Option<&str>,
+) {
+    let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    // 直接读已知项目桶内的 meta：一次小块读，不做会话目录扫描。
+    let manager = jeikcode_capabilities::session::SessionManager::for_project(working_dir);
+    let Ok(meta) = manager.read_meta(sid) else {
+        return;
+    };
+    if meta.reasoning_effort.is_some() {
+        runtime.reasoning_effort = meta.reasoning_effort;
+    }
+    if meta.thinking_budget.is_some() {
+        runtime.thinking_budget = meta.thinking_budget;
+    }
+}
+
 fn send_chat_runtime_error(
     events: &mpsc::UnboundedSender<CodingRuntimeEvent>,
     message: impl Into<String>,
@@ -1299,8 +1373,10 @@ pub(crate) async fn run_chat_turn_v2(
                 // which resolves `rx` below — emitting it after the await would
                 // deadlock every interactive Build turn (busy cursor, no card).
                 // Re-read live mode so a mid-turn switch to Auto skips the card
-                // and unparks a waiter within the poll interval.
-                let current_mode = live_current_approval_mode();
+                // and unparks a waiter within the poll interval. Session-scoped:
+                // another session's Auto must never bypass THIS session's gate.
+                let session_mode = || live_session_approval_mode(Some(&session_id));
+                let current_mode = session_mode();
                 let mut accepted_envelope = None;
                 let (decision, persist_requested) = match &permission_responders {
                     None => (fallback_approval_decision(current_mode), false),
@@ -1361,7 +1437,7 @@ pub(crate) async fn run_chat_turn_v2(
                                                 // alive and ACK only after `handle.respond` succeeds below.
                                                 let submission = envelope.submission();
                                                 accepted_envelope = Some(envelope);
-                                                if live_current_approval_mode() == ApprovalMode::Auto {
+                                                if session_mode() == ApprovalMode::Auto {
                                                     let _ = handle.set_mode(jeikcode_coding::RuntimeMode::Auto).await;
                                                 }
                                                 let persist = submission.persist
@@ -1381,7 +1457,7 @@ pub(crate) async fn run_chat_turn_v2(
                                         }
                                     }
                                     ChatPermissionDriverEvent::ModePoll => {
-                                        if live_current_approval_mode() == ApprovalMode::Auto {
+                                        if session_mode() == ApprovalMode::Auto {
                                             let _ = handle.set_mode(jeikcode_coding::RuntimeMode::Auto).await;
                                             responders.unregister(&session_id, &approval_id);
                                             break (PermissionDecision::AllowOnce, false);
@@ -2295,7 +2371,7 @@ pub(crate) async fn live_stream(
         wd.clone(),
         state.telemetry.clone(),
         live_current_provider(),
-        native_runtime_mode(live_current_approval_mode()),
+        native_runtime_mode(live_session_approval_mode(sid.as_deref())),
         sid,
     )
     .await
@@ -2844,7 +2920,7 @@ pub(crate) async fn live_message(
                     wd.clone(),
                     state.telemetry.clone(),
                     bootstrap_provider.clone(),
-                    native_runtime_mode(live_current_approval_mode()),
+                    native_runtime_mode(live_session_approval_mode(Some(&session_id))),
                     session_id.clone(),
                 )
                 .await
@@ -2990,7 +3066,7 @@ pub(crate) async fn live_message(
         live_current_working_dir(&working_dir),
         state.telemetry.clone(),
         bootstrap_provider,
-        native_runtime_mode(live_current_approval_mode()),
+        native_runtime_mode(live_session_approval_mode(sid.as_deref())),
         sid,
     )
     .await
@@ -3427,9 +3503,23 @@ async fn apply_live_mode_scoped(session_id: Option<&str>, mode: ApprovalMode) ->
             let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
         }
     }
-    if let Some(sid) = session_id {
-        if let Some(handle) = crate::native_live::existing_runner_handle(sid) {
-            let _ = handle.set_mode(native_runtime_mode(mode)).await;
+    // Registry-backed runners (background sessions / detached turns) own their own
+    // `mode` gate. A remote switch must reach the EXACT session's running handle,
+    // even while this daemon's live binding is projecting another transcript.
+    let registry = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+    match session_id.filter(|s| !s.trim().is_empty()) {
+        Some(sid) => {
+            let key = sid.trim().to_string();
+            if let Some(handle) = registry.handle(&key) {
+                let _ = handle.set_mode(native_runtime_mode(mode)).await;
+            }
+        }
+        None => {
+            for entry in registry.list_all() {
+                if let Some(handle) = registry.handle(&entry.session_id) {
+                    let _ = handle.set_mode(native_runtime_mode(mode)).await;
+                }
+            }
         }
     }
     true
@@ -3442,18 +3532,24 @@ pub(crate) async fn approval_mode_set(
     let session_id = req.session_id.as_deref();
     let ok = apply_live_mode_scoped(session_id, req.mode).await;
     if req.mode == ApprovalMode::Auto {
-        state
-            .pending_permissions
-            .deliver_all(PermissionDecision::AllowOnce);
-        if let Ok(binding) = crate::native_live::binding() {
-            let affects_binding = match session_id {
-                Some(sid) => binding.session_id == sid,
-                None => true,
-            };
-            if affects_binding {
+        match session_id.filter(|s| !s.trim().is_empty()) {
+            Some(sid) => {
+                state
+                    .pending_permissions
+                    .deliver_all_for_session(sid.trim(), PermissionDecision::AllowOnce);
                 jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                    &binding.session_id,
+                    sid.trim(),
                 );
+            }
+            None => {
+                state
+                    .pending_permissions
+                    .deliver_all(PermissionDecision::AllowOnce);
+                if let Ok(binding) = crate::native_live::binding() {
+                    jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
+                        &binding.session_id,
+                    );
+                }
             }
         }
     }
@@ -3478,18 +3574,24 @@ pub(crate) async fn live_mode(
     let session_id = req.session_id.as_deref();
     let ok = apply_live_mode_scoped(session_id, req.mode).await;
     if req.mode == ApprovalMode::Auto {
-        state
-            .pending_permissions
-            .deliver_all(PermissionDecision::AllowOnce);
-        if let Ok(binding) = crate::native_live::binding() {
-            let affects_binding = match session_id {
-                Some(sid) => binding.session_id == sid,
-                None => true,
-            };
-            if affects_binding {
+        match session_id.filter(|s| !s.trim().is_empty()) {
+            Some(sid) => {
+                state
+                    .pending_permissions
+                    .deliver_all_for_session(sid.trim(), PermissionDecision::AllowOnce);
                 jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                    &binding.session_id,
+                    sid.trim(),
                 );
+            }
+            None => {
+                state
+                    .pending_permissions
+                    .deliver_all(PermissionDecision::AllowOnce);
+                if let Ok(binding) = crate::native_live::binding() {
+                    jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
+                        &binding.session_id,
+                    );
+                }
             }
         }
     }
@@ -3619,14 +3721,34 @@ pub(crate) async fn live_reasoning_effort(
     };
     let config = commit.snapshot.config.clone();
 
-    // 多会话 Registry 模式：若提供了 session_id，立即对该活跃会话执行热重载
+    // Session-scoped intensity: remember this session's own choice so a sibling
+    // session on the same provider cannot silently inherit it.
+    if let Some(sid) = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
+            let stored_effort = effort.clone();
+            let stored_budget = if clear_budget { None } else { budget_val };
+            let _ = jeikcode_capabilities::session::SessionManager::for_project(
+                &resolved.meta.working_dir,
+            )
+            .update_meta(sid, |meta| {
+                meta.reasoning_effort = stored_effort.clone();
+                meta.thinking_budget = stored_budget;
+            });
+        }
+    }
     let registry = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
     if let Some(ref sid) = req.session_id {
         if let Some(handle) = registry.handle(sid) {
             let working_dir = { state.project.read().await.working_dir.clone() };
             let wd = live_current_working_dir(&working_dir);
-            let runtime_config =
+            let mut runtime_config =
                 live_runtime_config(&config, &target, &wd, state.telemetry.clone());
+            apply_session_effort_override(&mut runtime_config, &wd, Some(sid));
             let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
             let _ = handle.reassemble_provider(next).await;
             if let Ok(fp) = crate::native_live::provider_fingerprint(&config, &target) {

@@ -107,12 +107,29 @@ export function App() {
           return;
         }
         if (event.type !== 'review_resolved') return;
-        setPending((cur: any | null) =>
-          cur && event.approval_id && cur.approval_id === event.approval_id ? null : cur,
-        );
-        setLiveReview((cur) =>
-          cur && cur.sessionId === event.session_id && !cur.userInput ? null : cur,
-        );
+        setPending((cur: any | null) => {
+          if (!cur) return cur;
+          if (event.approval_id && cur.approval_id === event.approval_id) return null;
+          if (event.request_id != null && cur.request_id === event.request_id) return null;
+          return cur;
+        });
+        setLiveReview((cur) => {
+          if (!cur) return cur;
+          if (!event.session_id || cur.sessionId !== event.session_id) return cur;
+          // 审批卡（permission）与提问卡（user input）都必须能被异地解决事件关掉；
+          // 否则另一实例已放行的卡片会在此永久停留，形成幽灵审批。
+          if (!cur.userInput) {
+            // 审批卡的解析事件带 approval_id；带 request_id 时按调用方请求号精确匹配。
+            if (event.approval_id) return null;
+            if (event.request_id != null && cur.permission?.request_id !== event.request_id) {
+              return cur;
+            }
+            return null;
+          }
+          const rid = (cur.userInput as any)?.request_id;
+          if (event.request_id != null && rid !== event.request_id) return cur;
+          return null;
+        });
       }),
     [sessionId],
   );

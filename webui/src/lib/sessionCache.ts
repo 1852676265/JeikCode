@@ -29,6 +29,8 @@ export interface CachedSessionData {
   mtime_ms?: number;
   approvalMode?: string | null;
   preferredModel?: string | null;
+  reasoningEffort?: string | null;
+  thinkingBudget?: number | null;
 }
 
 const DB_NAME = 'jeikcode_cache';
@@ -203,21 +205,28 @@ export async function saveSessionCache(
   historyTotal?: number,
   approvalMode?: string | null,
   preferredModel?: string | null,
+  reasoningEffort?: string | null,
+  thinkingBudget?: number | null,
 ): Promise<void> {
+  // 保留上一次写入的会话级配置：调用方大多只更新消息，不能因未传而抹掉
+  // approvalMode / preferredModel / reasoningEffort 等持久字段。
+  const previous = memoryCache.get(makeKey(projectHash, sessionId));
   const data: CachedSessionData = {
     sessionId,
     projectHash,
     displayVersion: CACHE_DISPLAY_VERSION,
     messages,
     todos: todos ?? undefined,
-    turns: turns ?? undefined,
+    turns: turns ?? previous?.turns,
     tokenUsage: tokenUsage ?? undefined,
-    historyOffset,
-    historyTotal,
+    historyOffset: historyOffset ?? previous?.historyOffset,
+    historyTotal: historyTotal ?? previous?.historyTotal,
     timestamp: Date.now(),
     mtime_ms,
-    approvalMode: approvalMode ?? undefined,
-    preferredModel: preferredModel ?? undefined,
+    approvalMode: approvalMode ?? previous?.approvalMode,
+    preferredModel: preferredModel ?? previous?.preferredModel,
+    reasoningEffort: reasoningEffort ?? previous?.reasoningEffort,
+    thinkingBudget: thinkingBudget ?? previous?.thinkingBudget,
   };
 
   // 1. 同步更新 L1 内存
@@ -237,6 +246,46 @@ export async function saveSessionCache(
   } catch (err) {
     console.warn('[SessionCache] Failed to write to IndexedDB:', err);
   }
+}
+
+/**
+ * 就地更新会话缓存中的“会话级配置”字段（模型 / 模式 / 强度），不触碰消息画布。
+ *
+ * 用于下拉框一行变更就立即落库：即使随后切走会话或刷新，也不会被另一会话的
+ * 选择或全局默认值覆盖。若尚无缓存条目则静默跳过（首屏拉取会补全）。
+ */
+export function updateSessionCacheMeta(
+  projectHash: string,
+  sessionId: string,
+  patch: {
+    approvalMode?: string | null;
+    preferredModel?: string | null;
+    reasoningEffort?: string | null;
+    thinkingBudget?: number | null;
+  },
+): void {
+  const key = makeKey(projectHash, sessionId);
+  const current = memoryCache.get(key);
+  if (!current) return;
+  const next: CachedSessionData = {
+    ...current,
+    approvalMode:
+      patch.approvalMode !== undefined ? (patch.approvalMode ?? undefined) : current.approvalMode,
+    preferredModel:
+      patch.preferredModel !== undefined
+        ? (patch.preferredModel ?? undefined)
+        : current.preferredModel,
+    reasoningEffort:
+      patch.reasoningEffort !== undefined
+        ? (patch.reasoningEffort ?? undefined)
+        : current.reasoningEffort,
+    thinkingBudget:
+      patch.thinkingBudget !== undefined
+        ? (patch.thinkingBudget ?? undefined)
+        : current.thinkingBudget,
+    timestamp: Date.now(),
+  };
+  setMemorySession(projectHash, sessionId, next);
 }
 
 /**

@@ -1166,6 +1166,8 @@ mod global_events_tests {
                 origin: "manual".into(),
                 approval_mode: None,
                 preferred_model: None,
+                reasoning_effort: None,
+                thinking_budget: None,
             },
         })
         .unwrap();
@@ -1408,6 +1410,12 @@ pub struct SessionDetail {
     /// Per-session approval mode ("build" | "accept_edits" | "bypass" | "plan"). Absent on older sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    /// Per-session reasoning effort. Absent means "inherit the provider default".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Per-session custom thinking budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
     /// Footer occupancy from the last completed turn (`used_tokens` / last request).
     /// Must not be turn-cumulative `model_usage` billing, or restart paints over-budget.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2810,6 +2818,10 @@ pub(crate) struct SessionRowWire {
     pub approval_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
 }
 
 /// Build the incremental session row for one stored session. `None` when the
@@ -2836,12 +2848,15 @@ pub(crate) fn session_row_wire(
         origin: origin.to_string(),
         approval_mode: meta.approval_mode.clone().or_else(|| {
             Some(
-                live_api::live_session_approval_mode(Some(session_id))
+                live_api::live_session_approval_mode_cached(Some(session_id))
+                    .unwrap_or_else(live_api::live_current_approval_mode)
                     .wire()
                     .to_string(),
             )
         }),
         preferred_model: meta.preferred_model.clone(),
+        reasoning_effort: meta.reasoning_effort.clone(),
+        thinking_budget: meta.thinking_budget,
     })
 }
 
@@ -2870,12 +2885,15 @@ pub(crate) fn session_row_wire_in_bucket(
         origin: origin.to_string(),
         approval_mode: meta.approval_mode.clone().or_else(|| {
             Some(
-                live_api::live_session_approval_mode(Some(session_id))
+                live_api::live_session_approval_mode_cached(Some(session_id))
+                    .unwrap_or_else(live_api::live_current_approval_mode)
                     .wire()
                     .to_string(),
             )
         }),
         preferred_model: meta.preferred_model.clone(),
+        reasoning_effort: meta.reasoning_effort.clone(),
+        thinking_budget: meta.thinking_budget,
     })
 }
 
@@ -4350,6 +4368,11 @@ fn effective_chat_approval_mode_scoped(
     request_mode: Option<crate::approval_mode::ApprovalMode>,
     session_id: Option<&str>,
 ) -> crate::approval_mode::ApprovalMode {
+    // 会话级模式优先：它来自用户显式切换（含异地广播）。请求体里的
+    // `approval_mode` 可能是另一实例上的陈旧副本，绝不能反向覆盖。
+    if let Some(mode) = live_api::live_session_approval_mode_cached(session_id) {
+        return mode;
+    }
     request_mode.unwrap_or_else(|| live_api::live_session_approval_mode(session_id))
 }
 
@@ -4511,6 +4534,10 @@ pub struct SessionSummary {
     pub approval_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
 }
 
 fn catalog_scan_in_root(
@@ -4531,11 +4558,15 @@ fn catalog_scan_in_root(
 fn catalog_entry_to_session_summary(
     entry: &jeikcode_capabilities::session::CatalogEntry,
 ) -> SessionSummary {
-    let preferred_model =
-        jeikcode_capabilities::session::SessionManager::for_project(&entry.working_dir)
-            .read_meta(&entry.id)
-            .ok()
-            .and_then(|m| m.preferred_model);
+    let meta = jeikcode_capabilities::session::SessionManager::for_project(&entry.working_dir)
+        .read_meta(&entry.id)
+        .ok();
+    let preferred_model = meta.as_ref().and_then(|m| m.preferred_model.clone());
+    // 磁盘元数据优先；仅当缺失时才看内存热态（不再回扫会话目录）。
+    let approval_mode = meta
+        .as_ref()
+        .and_then(|m| live_api::parse_approval_mode_wire(m.approval_mode.as_deref()))
+        .or_else(|| live_api::live_session_approval_mode_cached(Some(&entry.id)));
     SessionSummary {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -4545,11 +4576,14 @@ fn catalog_entry_to_session_summary(
         message_count: entry.message_count,
         file_size: 0,
         approval_mode: Some(
-            live_api::live_session_approval_mode(Some(&entry.id))
+            approval_mode
+                .unwrap_or_else(live_api::live_current_approval_mode)
                 .wire()
                 .to_string(),
         ),
         preferred_model,
+        reasoning_effort: meta.as_ref().and_then(|m| m.reasoning_effort.clone()),
+        thinking_budget: meta.as_ref().and_then(|m| m.thinking_budget),
     }
 }
 
@@ -5441,6 +5475,8 @@ async fn get_session_detail(
                             .to_string(),
                     )
                 }),
+                reasoning_effort: session.meta.reasoning_effort.clone(),
+                thinking_budget: session.meta.thinking_budget,
                 token_usage,
                 origin: session.meta.origin,
                 todos,
@@ -5468,6 +5504,8 @@ async fn get_session_detail(
                         .wire()
                         .to_string(),
                 ),
+                reasoning_effort: None,
+                thinking_budget: None,
                 token_usage: None,
                 origin: jeikcode_capabilities::session::SessionOrigin::Manual,
                 todos: Vec::new(),
@@ -10920,6 +10958,7 @@ pub(crate) async fn process_chat_request(
         let shared_mcp_reg = Some(mcp_pool.registry(&working_dir).await);
         let mut runtime_cfg =
             live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry.clone());
+        live_api::apply_session_effort_override(&mut runtime_cfg, &working_dir, Some(&session_id));
         runtime_cfg.shared_mcp_registry = shared_mcp_reg;
         runtime_cfg.extra_system_append = req.extra_system_append.clone();
         runtime_cfg.session_display_name = req.session_title.clone();
@@ -13317,8 +13356,8 @@ async fn chat_pending(
     let (permission, user_input) = state.active_chats.pending_interactive(&session_id).await;
     // Auto never parks on tool approval. A leftover pending_permission.json from
     // Build must not resurrect a ghost card after the user switched to Auto.
-    let auto_mode =
-        live_api::live_current_approval_mode() == crate::approval_mode::ApprovalMode::Auto;
+    let auto_mode = live_api::live_session_approval_mode(Some(&session_id))
+        == crate::approval_mode::ApprovalMode::Auto;
     let mut permission_json = if auto_mode {
         None
     } else {
@@ -20560,6 +20599,37 @@ mod channel_mode_tests {
             effective_chat_approval_mode(None),
             crate::approval_mode::ApprovalMode::Auto
         );
+    }
+
+    /// Regression: switching one session to Auto must gate THAT session's turns,
+    /// even while another instance still posts a stale `approval_mode: build`.
+    /// Previously the request copy won, so the pill said Auto while the runtime
+    /// kept asking for approvals.
+    #[test]
+    fn session_scoped_mode_overrides_a_stale_request_mode() {
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Build);
+        live_api::live_set_session_approval_mode(
+            Some("sess-auto"),
+            crate::approval_mode::ApprovalMode::Auto,
+        );
+
+        assert_eq!(
+            effective_chat_approval_mode_scoped(
+                Some(crate::approval_mode::ApprovalMode::Build),
+                Some("sess-auto"),
+            ),
+            crate::approval_mode::ApprovalMode::Auto
+        );
+        // A sibling session keeps its own (unset → global) truth.
+        assert_eq!(
+            effective_chat_approval_mode_scoped(
+                Some(crate::approval_mode::ApprovalMode::Build),
+                Some("sess-other"),
+            ),
+            crate::approval_mode::ApprovalMode::Build
+        );
+        live_api::live_clear_session_approval_mode("sess-auto");
     }
 
     #[test]

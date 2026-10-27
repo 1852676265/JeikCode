@@ -85,6 +85,9 @@ export function ModelSelector({
   onChange,
   onDefaultChange,
   sessionId,
+  sessionEffort,
+  sessionBudget,
+  onEffortChange,
   direction = 'down',
   onOpenModelConfig,
 }: {
@@ -92,6 +95,12 @@ export function ModelSelector({
   onChange: (p: string) => void;
   onDefaultChange?: (p: string) => void;
   sessionId?: string | null;
+  /** This session's own reasoning effort; `undefined` inherits the provider default. */
+  sessionEffort?: string | null;
+  /** This session's own thinking budget; `undefined` inherits the provider default. */
+  sessionBudget?: number | null;
+  /** Mirror a local effort choice into the per-session cache (survives view switches). */
+  onEffortChange?: (effort: string | null, budget: number | null) => void;
   direction?: 'up' | 'down';
   onOpenModelConfig?: () => void;
 }) {
@@ -266,26 +275,39 @@ export function ModelSelector({
   useEffect(() => {
     setEffortOverride(undefined);
     setBudgetOverride(undefined);
-    // 初始化当前模型的 budget 状态：仅当模型确实配置了大于 0 的 thinking_budget 时才标记为 checked
-    if (current?.thinking_budget && current.thinking_budget > 0) {
-      const eff = current.reasoning_effort?.toLowerCase() || 'medium';
+    // 初始化当前会话/模型的 budget 状态：会话自带预算优先，否则继承 provider 默认。
+    const effectiveBudget = sessionBudget !== undefined ? sessionBudget : current?.thinking_budget;
+    if (effectiveBudget && effectiveBudget > 0) {
+      const eff =
+        (sessionEffort !== undefined ? sessionEffort : current?.reasoning_effort)?.toLowerCase() ||
+        'medium';
       setBudgetChecked({ [eff]: true });
-      setBudgetInputs({ [eff]: current.thinking_budget });
+      setBudgetInputs({ [eff]: effectiveBudget });
     } else {
       setBudgetChecked({});
       setBudgetInputs({});
     }
-  }, [current?.provider, current?.thinking_budget, current?.reasoning_effort]);
+  }, [
+    current?.provider,
+    current?.thinking_budget,
+    current?.reasoning_effort,
+    sessionEffort,
+    sessionBudget,
+  ]);
 
   const effort =
     effortOverride !== undefined
       ? effortOverride
-      : (current?.reasoning_effort ?? null);
+      : (sessionEffort !== undefined
+        ? sessionEffort
+        : (current?.reasoning_effort ?? null));
 
   const activeBudget =
     budgetOverride !== undefined
       ? budgetOverride
-      : (current?.thinking_budget ?? null);
+      : (sessionBudget !== undefined
+        ? sessionBudget
+        : (current?.thinking_budget ?? null));
 
   // 提供商与模型按提供商分组
   const providerGroups = useMemo(() => {
@@ -413,6 +435,11 @@ export function ModelSelector({
       setBudgetOverride(budgetVal);
     }
     if (!keepOpen) setEffortOpen(false);
+    // 先就地回写会话级缓存，切走再切回时不被其他会话的强度覆盖。
+    onEffortChange?.(
+      lvl,
+      lvl === 'off' || lvl === null || clearBudget ? null : (budgetVal ?? activeBudget ?? null),
+    );
 
     if (current) {
       void postLiveReasoningEffort(
@@ -424,6 +451,7 @@ export function ModelSelector({
       ).catch((err) => {
         setEffortOverride(prevEffort);
         setBudgetOverride(prevBudget);
+        onEffortChange?.(prevEffort, prevBudget);
         console.error('Failed to update reasoning effort', err);
       });
     }

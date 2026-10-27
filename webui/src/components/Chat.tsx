@@ -176,6 +176,7 @@ import {
   saveSessionCache,
   clearAllSessionCache,
   getMemorySession,
+  updateSessionCacheMeta,
 } from '../lib/sessionCache';
 import { gitStore, type GitProjectState } from '../lib/gitStore';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
@@ -1883,6 +1884,37 @@ export function Chat({
   const providerCacheRef = useRef(new Map<string, string>());
   const NEW_SESSION_MODE_KEY = '__new__';
   const modeCacheRef = useRef(new Map<string, ApprovalMode>());
+  const effortCacheRef = useRef(new Map<string, { effort: string | null; budget: number | null }>());
+  const [sessionEffort, setSessionEffort] = useState<string | null | undefined>(undefined);
+  const [sessionBudget, setSessionBudget] = useState<number | null | undefined>(undefined);
+  const rememberSessionEffort = useCallback(
+    (sid: string | null, effort: string | null, budget: number | null) => {
+      setSessionEffort(effort);
+      setSessionBudget(budget);
+      if (sid) {
+        effortCacheRef.current.set(sid, { effort, budget });
+        const hash = projectHashBySessionRef.current.get(sid) || viewedProjectHashRef.current;
+        if (hash) {
+          updateSessionCacheMeta(hash, sid, { reasoningEffort: effort, thinkingBudget: budget });
+        }
+      }
+    },
+    [],
+  );
+  const restoreSessionEffort = useCallback(
+    (sid: string | null, fallback: { effort?: string | null; budget?: number | null } | null) => {
+      const cached = sid ? effortCacheRef.current.get(sid) : undefined;
+      if (cached) {
+        setSessionEffort(cached.effort);
+        setSessionBudget(cached.budget);
+        return;
+      }
+      // 会话自己存过强度就用它；否则回退到 provider 继承（undefined）。
+      setSessionEffort(fallback?.effort ?? undefined);
+      setSessionBudget(fallback?.budget ?? undefined);
+    },
+    [],
+  );
   const modeCacheKey = useCallback(
     (sid: string | null) => sid ?? NEW_SESSION_MODE_KEY,
     [],
@@ -3326,6 +3358,15 @@ export function Chat({
           }
           return;
         }
+        // 另一个实例刚弹出了待交互卡：对当前会话做一次定向 pending 拉取
+        // （单会话、小请求），避免本实例漏帧而永久看不到卡片。
+        if (event.type === 'review_asked') {
+          const sid = activeIdRef.current;
+          if (sid && event.session_id === sid) {
+            restorePendingInteractive(sid, sessionGenerationRef.current);
+          }
+          return;
+        }
         if (event.type === 'activity') {
           const sid = activeIdRef.current;
           if (sid && event.session_id === sid) {
@@ -3535,6 +3576,12 @@ export function Chat({
       restoreProviderForSession(
         sessionId,
         activeSession?.id === sessionId ? activeSession.preferred_model : null,
+      );
+      restoreSessionEffort(
+        sessionId,
+        activeSession?.id === sessionId
+          ? { effort: activeSession.reasoning_effort, budget: activeSession.thinking_budget }
+          : null,
       );
       restoreModeForSession(
         sessionId,
@@ -4010,6 +4057,13 @@ export function Chat({
               providerPinnedRef.current = true;
             }
           }
+          if (idb.reasoningEffort !== undefined || idb.thinkingBudget !== undefined) {
+            rememberSessionEffort(
+              loadId,
+              (idb.reasoningEffort as string | null) ?? null,
+              (idb.thinkingBudget as number | null) ?? null,
+            );
+          }
           if (idb.tokenUsage) {
             applySessionTokens(loadId, idb.messages, idb.tokenUsage);
           }
@@ -4063,6 +4117,17 @@ export function Chat({
             } else {
               restoreProviderForSession(loadId);
             }
+          }
+          if (
+            !effortCacheRef.current.has(loadId) &&
+            (sessionResult.value.reasoning_effort !== undefined ||
+              sessionResult.value.thinking_budget !== undefined)
+          ) {
+            rememberSessionEffort(
+              loadId,
+              sessionResult.value.reasoning_effort ?? null,
+              sessionResult.value.thinking_budget ?? null,
+            );
           }
           // 无论当前会话是否处于实时推流（serverActive），服务端的全局元数据（大纲、总数、偏移）
           // 始终具有权威完整性，必须立刻更新！不能锁在 canvasEmpty / serverActive 门禁内部，
@@ -4465,13 +4530,20 @@ export function Chat({
       });
     };
 
+    // 远程模式变更：无论当前视口在哪，都先落地到会话级缓存（内存 + IndexedDB），
+    // 这样切回该会话时立即命中，不会退回旧值。广播是低频事件，写一次可忽略不计。
+    const persistRemoteMode = (sid: string | null | undefined, mode: ApprovalMode) => {
+      if (!sid) return;
+      modeCacheRef.current.set(sid, mode);
+      const hash = projectHashBySessionRef.current.get(sid) || viewedProjectHashRef.current;
+      if (hash) updateSessionCacheMeta(hash, sid, { approvalMode: mode });
+    };
+
     const handleCustomEvent = (e: Event) => {
       const detail = (e as CustomEvent<ApprovalMode | { mode: ApprovalMode; session_id?: string }>).detail;
       const mode = typeof detail === 'string' ? detail : detail?.mode;
       const targetSessionId = typeof detail === 'object' ? detail?.session_id : undefined;
-      if (targetSessionId && mode) {
-        modeCacheRef.current.set(targetSessionId, mode);
-      }
+      if (targetSessionId && mode) persistRemoteMode(targetSessionId, mode);
       if (!targetSessionId || targetSessionId === activeIdRef.current) {
         if (mode) applyIncomingMode(mode);
       }
@@ -4480,9 +4552,7 @@ export function Chat({
     const handleRemoteSessionMode = (e: Event) => {
       const detail = (e as CustomEvent<{ session_id?: string | null; mode: ApprovalMode }>).detail;
       if (!detail || !detail.mode) return;
-      if (detail.session_id) {
-        modeCacheRef.current.set(detail.session_id, detail.mode);
-      }
+      persistRemoteMode(detail.session_id, detail.mode);
       if (!detail.session_id || detail.session_id === activeIdRef.current) {
         applyIncomingMode(detail.mode);
       }
@@ -4497,9 +4567,7 @@ export function Chat({
         bc = new BroadcastChannel('jeikcode_approval_mode');
         bc.onmessage = (ev) => {
           if (ev.data?.type === 'mode' && ev.data.mode) {
-            if (ev.data.session_id) {
-              modeCacheRef.current.set(ev.data.session_id, ev.data.mode);
-            }
+            persistRemoteMode(ev.data.session_id, ev.data.mode);
             if (!ev.data.session_id || ev.data.session_id === activeIdRef.current) {
               applyIncomingMode(ev.data.mode);
             }
@@ -6057,21 +6125,32 @@ export function Chat({
     if (modeState.pendingMode) return;
     const nextState = beginModeSwitch(modeState, m);
     if (nextState === modeState) return;
+    // Capture the origin session: the round-trip may outlive a view switch and
+    // must never apply its result to whichever session the user moved to.
+    const targetSid = sessionId ?? null;
+    const stillOnTarget = () => (activeIdRef.current ?? null) === targetSid;
     setModeState(nextState);
     if (!protocolSessionRef.current) nativeModeRef.current = m;
-    if (sessionId) {
-      modeCacheRef.current.set(sessionId, m);
+    if (targetSid) {
+      modeCacheRef.current.set(targetSid, m);
+      const hash = projectHashBySessionRef.current.get(targetSid) || viewedProjectHashRef.current;
+      if (hash) updateSessionCacheMeta(hash, targetSid, { approvalMode: m });
     }
     if (m === 'bypass') {
       setLivePending(null);
       onPermissionResolved?.(null);
     }
-    void postLiveMode(m, sessionId)
+    void postLiveMode(m, targetSid)
       .then((confirmed) => {
-        setModeState((cur) => completeModeSwitch(cur, confirmed));
-        if (sessionId) {
-          modeCacheRef.current.set(sessionId, confirmed);
+        // The cache is per-session and always authoritative for that session.
+        if (targetSid) {
+          modeCacheRef.current.set(targetSid, confirmed);
+          const hash =
+            projectHashBySessionRef.current.get(targetSid) || viewedProjectHashRef.current;
+          if (hash) updateSessionCacheMeta(hash, targetSid, { approvalMode: confirmed });
         }
+        if (!stillOnTarget()) return;
+        setModeState((cur) => completeModeSwitch(cur, confirmed));
         onConfirmed?.(confirmed);
         if (confirmed === 'bypass') {
           setLivePending(null);
@@ -6085,6 +6164,8 @@ export function Chat({
         }
       })
       .catch(() => {
+        if (targetSid) modeCacheRef.current.set(targetSid, modeState.confirmedMode);
+        if (!stillOnTarget()) return;
         setModeState((cur) => failModeSwitch(cur));
         pushCommandNotice(t('cmd.mode.failed'));
       });
@@ -6094,6 +6175,11 @@ export function Chat({
   function switchProvider(name: string) {
     providerPinnedRef.current = true;
     providerCacheRef.current.set(providerCacheKey(sessionId), name);
+    const targetSid = sessionId ?? null;
+    if (targetSid) {
+      const hash = projectHashBySessionRef.current.get(targetSid) || viewedProjectHashRef.current;
+      if (hash) updateSessionCacheMeta(hash, targetSid, { preferredModel: name });
+    }
     const previous = provider;
     setProvider(name);
     void postLiveProvider(name, sessionId).then((res) => {
@@ -10481,6 +10567,11 @@ export function Chat({
           onChange={(p) => switchProvider(p)}
           onDefaultChange={followDefaultProvider}
           sessionId={sessionId ?? activeIdRef.current}
+          sessionEffort={sessionEffort}
+          sessionBudget={sessionBudget}
+          onEffortChange={(effort, budget) =>
+            rememberSessionEffort(sessionId ?? activeIdRef.current, effort, budget)
+          }
           direction="down"
           onOpenModelConfig={onOpenModelConfig}
         />

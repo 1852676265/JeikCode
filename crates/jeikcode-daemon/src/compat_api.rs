@@ -525,6 +525,18 @@ fn list_project_sessions(working_dir: &std::path::Path) -> Vec<(String, SessionS
             .read_meta(&entry.id)
             .ok()
             .and_then(|m| m.preferred_model),
+            reasoning_effort: jeikcode_capabilities::session::SessionManager::for_project(
+                &entry.working_dir,
+            )
+            .read_meta(&entry.id)
+            .ok()
+            .and_then(|m| m.reasoning_effort),
+            thinking_budget: jeikcode_capabilities::session::SessionManager::for_project(
+                &entry.working_dir,
+            )
+            .read_meta(&entry.id)
+            .ok()
+            .and_then(|m| m.thinking_budget),
         };
         out.push((entry.project_bucket, summary));
     }

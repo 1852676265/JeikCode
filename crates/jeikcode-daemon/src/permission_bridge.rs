@@ -304,11 +304,25 @@ impl PermissionResponders {
     /// Resolve every approval that is pending *now* (used when switching to Auto).
     /// Expired tombstones remain until turn cleanup.
     pub fn deliver_all(&self, decision: PermissionDecision) -> usize {
+        self.deliver_all_scoped(None, decision)
+    }
+
+    /// Resolve pending approvals for ONE session only (used when a remote client
+    /// switches that session to Auto). Other sessions waiting on a human decision
+    /// must stay parked — a process-wide sweep here would silently auto-approve
+    /// unrelated background turns.
+    pub fn deliver_all_for_session(&self, session_id: &str, decision: PermissionDecision) -> usize {
+        self.deliver_all_scoped(Some(session_id), decision)
+    }
+
+    fn deliver_all_scoped(&self, session_id: Option<&str>, decision: PermissionDecision) -> usize {
         let mut guard = self.inner.write().unwrap();
         let keys: Vec<_> = guard
             .iter()
             .filter_map(|(key, value)| {
-                matches!(value, PermissionResponderEntry::Pending(_)).then(|| key.clone())
+                let in_scope = session_id.is_none_or(|sid| key.0 == sid);
+                (in_scope && matches!(value, PermissionResponderEntry::Pending(_)))
+                    .then(|| key.clone())
             })
             .collect();
         let resolved_keys = keys.clone();
@@ -566,6 +580,27 @@ mod tests {
             ),
             PermissionDelivery::Absent
         ));
+    }
+
+    #[tokio::test]
+    async fn deliver_all_for_session_leaves_other_sessions_parked() {
+        let reg = PermissionResponders::new();
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        reg.register("sess-1".into(), "call-1".into(), "bash".into(), tx1);
+        reg.register("sess-2".into(), "call-2".into(), "write".into(), tx2);
+
+        // 只放行 sess-1：另一个后台会话必须继续等人决策，绝不能被顺手 auto。
+        let count = reg.deliver_all_for_session("sess-1", PermissionDecision::AllowOnce);
+        assert_eq!(count, 1);
+        assert_eq!(
+            rx1.await.unwrap().accept().decision,
+            PermissionDecision::AllowOnce
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "sess-2 must stay parked after a session-scoped Auto switch"
+        );
     }
 
     #[tokio::test]

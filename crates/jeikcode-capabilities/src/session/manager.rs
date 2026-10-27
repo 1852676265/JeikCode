@@ -442,6 +442,14 @@ pub struct SessionMeta {
     /// different models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    /// Reasoning effort last chosen for this session ("off" / "low" / ... / "max").
+    /// Overrides the provider-wide `config.toml` value for this session only, so
+    /// changing the intensity in one session never rewrites a sibling's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Custom thinking budget paired with [`Self::reasoning_effort`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
     /// Mode last chosen for this session (e.g. "build", "accept_edits", "bypass", "plan").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
@@ -471,6 +479,8 @@ impl SessionMeta {
             detached_unattributed_tokens: 0,
             origin: SessionOrigin::Manual,
             preferred_model: None,
+            reasoning_effort: None,
+            thinking_budget: None,
             approval_mode: None,
         }
     }
