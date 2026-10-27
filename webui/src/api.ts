@@ -275,6 +275,8 @@ export type SSEEvent =
   | { type: 'session_renamed'; session_id: string; name: string }
   | { type: 'session_status'; session_id?: string; status: string }
   | { type: 'command_output'; text: string }
+  /** 本会话待发卡片队列的权威全量快照（`push_to_session_queue` 等带内来源）。 */
+  | { type: 'queue_updated'; session_id: string; items: QueuedMessageApiItem[] }
   | SessionMutationEvent;
 
 export interface ModelInfo {
@@ -518,6 +520,10 @@ export interface QueuedMessageApiItem {
   images?: ImageData[];
   kind: 'queue' | 'steering' | 'steer';
   approval_mode?: ApprovalMode;
+  /** 卡片创建时间（epoch ms）：跨端 / 刷新恢复保留原始排队时间。 */
+  createdAt?: number;
+  /** 立即发送已画上气泡、但当时投递被退回：drain 必须照发。 */
+  forceSend?: boolean;
 }
 
 export async function getChatQueue(sessionId: string): Promise<QueuedMessageApiItem[]> {
@@ -2125,6 +2131,38 @@ export type GlobalWireEvent =
   | { type: 'review_asked'; session_id: string }
   /** 待交互已解决：按 id 就地从所有实例的通知卡片中移除。 */
   | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number }
+  /**
+   * 该会话的待发卡片队列（排队 / 转向中 / 转向已排队）发生变化：
+   * 创建、点转向、取消、被内核消费都算。只带会话 id，客户端对该会话做一次
+   * 定向 `/chat/queue` 拉取并就地更新本地卡片，不做整表重拉。
+   */
+  | { type: 'queue_updated'; session_id: string }
+  /**
+   * 中途转向已被内核 fold（即将在下一轮请求生效）：携带权威输入。
+   * 活跃视图由 `/chat/watch` 的 `steered` 帧落笔（带光标与归位锚点）；
+   * 本事件用于**其它会话/其它客户端**把这条提问提前写进该会话的本地画布缓存，
+   * 保证切过去或冷启动时用户气泡已经在里面。
+   */
+  | {
+      type: 'steer_folded';
+      session_id: string;
+      /** 只带文本/身份：图片本体可能是一整张 base64，绝不进全局通道。 */
+      inputs: Array<{ text: string; message_id?: string; has_images?: boolean }>;
+      client_input_ids?: Array<string | null>;
+      timestamps?: Array<number | null>;
+    }
+  /**
+   * 模型配置变更（会话聊天模型 / 提供商 / 模型 id / 思考强度 / 思考预算）。
+   * `effort` 存在时两字段都是快照（`null` = 继承模型默认）；
+   * `deferred` = 本轮仍在跑，参数已落盘、下一轮生效。
+   */
+  | {
+      type: 'model_config';
+      session_id?: string | null;
+      provider?: string;
+      effort?: { reasoning_effort: string | null; thinking_budget: number | null };
+      deferred?: boolean;
+    }
   /** 全局配置热重载信号（如 CLI 执行 jeikcode ghimg 或后台配置更新）。 */
   | { type: 'config_reloaded' }
   /** 侧栏项目可见性（隐藏/钉住/运行中自动恢复），跨实例就地对齐。 */

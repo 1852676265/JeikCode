@@ -1050,6 +1050,54 @@ pub fn commit_todo_board(session_id: &str, items: &[TodoItem]) -> TodoBoard {
     board
 }
 
+/// 撤销/回溯后的清单重建：**保留板身份**（id 不变、seq 单调递增），
+/// 只把 items 换成“剩余转录”的推导结果。
+///
+/// 与 `clear_todo_board` + `commit_todo_board` 的差别：
+/// - `clear` 会把槽的 board 置空，重建后 id 漂移、seq 归 1；任何把 `(board_id, seq)`
+///   当版本号的消费者（现在没有，但很容易出现）会把重建结果误判成“更旧/另起一板”；
+/// - 这里 id 与 seq 都单调向前，撤销永远不会被看成回退。
+///
+/// - 推导为空（整轮被删干净）→ 板随之关闭（`closed = true`，磁盘 `.todo` 由
+///   `persist_todo_board` 删除），下次真开新计划才是全新身份；
+/// - 槽不存在（新进程尚未装载该会话）→ 返回 `None`，调用方退回 clear/commit。
+pub fn rebind_todo_board(session_id: &str, items: &[TodoItem]) -> Option<TodoBoard> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    let slot = guard.get_mut(session_id)?;
+    if items.is_empty() {
+        // 整轮被删干净：板随之关闭（禁止旧槽/磁盘快照复活），身份到此结束。
+        slot.board = None;
+        slot.closed = true;
+        return None;
+    }
+    slot.closed = false;
+    let board = match slot.board.take() {
+        Some(mut existing) => {
+            existing.seq = existing.seq.saturating_add(1);
+            existing.items = items.to_vec();
+            existing
+        }
+        None => TodoBoard {
+            id: format!(
+                "todo-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(1)
+            ),
+            seq: 1,
+            items: items.to_vec(),
+        },
+    };
+    slot.board = Some(board.clone());
+    Some(board)
+}
+
 /// Explicit wipe (`/todo clear`). Readers afterwards see no live checklist.
 pub fn clear_todo_board(session_id: &str) {
     let mut guard = todo_registry()
@@ -1550,6 +1598,128 @@ mod tests {
         purge_todo_board(sid);
     }
 
+    /// 回溯重建：先 `clear` 关旧板（防旧槽/磁盘快照复活），再按“剩余转录”的推导结果
+    /// `commit` 回去。这是跨轮次回溯的正确语义：只回退被删掉的那些动作，
+    /// 更早轮次建立/修改过的项原样保留。
+    #[test]
+    fn rewound_board_recommits_the_remaining_transcript() {
+        let sid = "rewind-rebuild";
+        purge_todo_board(sid);
+        commit_todo_board(
+            sid,
+            &[TodoItem {
+                content: "A 轮计划".into(),
+                status: TodoStatus::Completed,
+            }],
+        );
+
+        // 回溯：旧板先关掉（禁止幽灵复活）……
+        clear_todo_board(sid);
+        assert!(read_todo_board(sid).is_none());
+
+        // ……再按剩余转录重建（这些项来自更早的轮次，必须留住）。
+        let rebuilt = vec![TodoItem {
+            content: "A 轮计划".into(),
+            status: TodoStatus::InProgress,
+        }];
+        let board = commit_todo_board(sid, &rebuilt);
+        assert_eq!(board.items, rebuilt);
+        assert_eq!(
+            read_todo_board(sid).map(|b| b.items),
+            Some(rebuilt),
+            "rebuild after clear must be readable"
+        );
+        assert!(
+            !todo_session_is_closed(sid),
+            "重建后的板必须是活的，下一轮还能继续折叠动作"
+        );
+        purge_todo_board(sid);
+    }
+
+    /// 撤销重建走原地重绑：板身份（id）不变、seq 只增不减，
+    /// 任何把 `(board_id, seq)` 当版本号的消费者都不会把撤销看成回退。
+    #[test]
+    fn rebind_keeps_board_identity_and_monotonic_seq() {
+        let sid = "rewind-rebind";
+        purge_todo_board(sid);
+        let first = commit_todo_board(
+            sid,
+            &[TodoItem {
+                content: "A 轮计划".into(),
+                status: TodoStatus::InProgress,
+            }],
+        );
+
+        // steer 轮只改了两项 → 回溯后用剩余转录推导出的状态重绑。
+        let rebuilt = vec![
+            TodoItem {
+                content: "A 轮计划".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "A 轮补充项".into(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        let board = rebind_todo_board(sid, &rebuilt).expect("live slot must rebind in place");
+        assert_eq!(board.id, first.id, "板身份必须保留");
+        assert_eq!(board.seq, first.seq + 1, "seq 只增不减");
+        assert_eq!(read_todo_board(sid).map(|b| b.items), Some(rebuilt));
+        assert!(!todo_session_is_closed(sid), "重建后的板是活的");
+
+        // 再回溯一次：seq 继续前进，id 仍然不变。
+        let again = rebind_todo_board(
+            sid,
+            &[TodoItem {
+                content: "A 轮计划".into(),
+                status: TodoStatus::Pending,
+            }],
+        )
+        .expect("second rebind");
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.seq, first.seq + 2);
+        purge_todo_board(sid);
+    }
+
+    /// 整轮被删干净（推导为空）：板关闭且拒绝旧磁盘快照复活；
+    /// 槽不存在时返回 None，让调用方退回 clear/commit 兜底。
+    #[test]
+    fn rebind_with_empty_fold_closes_the_board() {
+        let sid = "rewind-rebind-empty";
+        purge_todo_board(sid);
+        assert!(
+            rebind_todo_board(sid, &[]).is_none(),
+            "no slot → caller falls back"
+        );
+        commit_todo_board(
+            sid,
+            &[TodoItem {
+                content: "将被删光的计划".into(),
+                status: TodoStatus::InProgress,
+            }],
+        );
+        assert!(rebind_todo_board(sid, &[]).is_none());
+        assert!(read_todo_board(sid).is_none(), "关闭后不得再有清单");
+        assert!(todo_session_is_closed(sid));
+
+        restore_todo_board(
+            sid,
+            TodoBoard {
+                id: "todo-ghost-rebind".into(),
+                seq: 7,
+                items: vec![TodoItem {
+                    content: "幽灵步骤".into(),
+                    status: TodoStatus::Pending,
+                }],
+            },
+        );
+        assert!(
+            read_todo_board(sid).is_none(),
+            "撤销清空后旧板不得被磁盘/旧槽复活"
+        );
+        purge_todo_board(sid);
+    }
+
     #[test]
     fn parse_valid_full_list() {
         let todos = parse_todos(r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#).unwrap();
@@ -1658,6 +1828,55 @@ mod tests {
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].content, "new"); // LAST wins
         assert_eq!(todos[0].status, TodoStatus::InProgress);
+    }
+
+    /// 与 WebUI 的 `todoRewind.test.ts` 同一场景：跨轮次回溯只回退被删掉的动作，
+    /// 更早轮次的计划必须留住（单轮内建了又整轮删干净才是空）。
+    /// 这里锁住**生产折叠**（derive_current_todos）的输出。
+    #[test]
+    fn rewind_after_steer_keeps_the_earlier_turns_plan() {
+        let call = |id: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "todowrite".into(),
+                    arguments: args.into(),
+                }],
+            )
+        };
+        let plan = r#"{"todos":[{"content":"读取项目结构","status":"in_progress"},{"content":"修复渲染","status":"pending"}]}"#;
+        let advance = r#"{"action":"update","id":1,"status":"completed"}"#;
+        let add = r#"{"action":"add","content":"补充单元测试"}"#;
+        let promote = r#"{"action":"update","id":2,"status":"in_progress"}"#;
+
+        let mut msgs = vec![
+            Message::user("帮我把这个项目跑起来"),
+            call("t1", plan),
+            call("t2", advance),
+            // steer 也是真实用户消息（非 synthetic），因此算轮次边界。
+            Message::user("接下来帮我改渲染"),
+            call("t3", add),
+            call("t4", promote),
+        ];
+        let full = derive_current_todos(&msgs);
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[0].status, TodoStatus::Completed);
+        assert_eq!(full[1].status, TodoStatus::InProgress);
+        assert_eq!(full[2].status, TodoStatus::Pending);
+
+        // 删除 steer 整轮（提问 + 之后的消息）：A 轮状态原样保留。
+        msgs.truncate(3);
+        let rolled_back = derive_current_todos(&msgs);
+        assert_eq!(rolled_back.len(), 2, "跨轮次回溯不得一刀切清空");
+        assert_eq!(rolled_back[0].content, "读取项目结构");
+        assert_eq!(rolled_back[0].status, TodoStatus::Completed);
+        assert_eq!(rolled_back[1].content, "修复渲染");
+        assert_eq!(rolled_back[1].status, TodoStatus::Pending);
+
+        // 单轮内建了又整轮删干净 → 空（与旧行为等价）。
+        assert!(derive_current_todos(&[]).is_empty());
+        assert!(derive_current_todos(&msgs[0..1]).is_empty());
     }
 
     #[test]

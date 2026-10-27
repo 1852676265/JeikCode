@@ -1656,6 +1656,23 @@ impl LiveViewHub {
                     terminal: None,
                     status: None,
                 });
+                // 中途转向已并入本轮：广播到全局，让没在看该会话的客户端也把它
+                // 写进本地画布缓存（切过去 / 冷启动时用户气泡已在）。
+                if let LiveViewEvent::Steered {
+                    inputs,
+                    client_input_ids,
+                    ..
+                } = &event
+                {
+                    crate::publish_global(crate::GlobalWireEvent::SteerFolded {
+                        session_id: session_id.clone(),
+                        inputs: inputs
+                            .iter()
+                            .map(crate::SteerFoldedInputWire::from_kernel)
+                            .collect(),
+                        client_input_ids: client_input_ids.clone(),
+                    });
+                }
             }
             _ => {}
         }

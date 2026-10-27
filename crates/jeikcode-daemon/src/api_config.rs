@@ -148,13 +148,20 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<String, String> {
 /// Apply one config delta to the latest on-disk snapshot. Provider/config API
 /// handlers should use this instead of load-mutate-save to avoid lost updates
 /// when an IDE and TUI write concurrently.
+///
+/// 落盘成功后广播 `config_reloaded`：语言/主题/模型/提供商/思考参数等**任何**
+/// 界面设置都是同一份 config，别的实例必须立即重读，而不是等手动 reload 或冷启动。
 pub(crate) fn update_config(
     mutate: impl FnOnce(&mut Config) -> anyhow::Result<()>,
 ) -> Result<Config, String> {
-    ConfigStore::default_store()
+    let result = ConfigStore::default_store()
         .update(mutate)
         .map(|commit| commit.snapshot.config)
-        .map_err(|e| format!("Failed to update config: {e:#}"))
+        .map_err(|e| format!("Failed to update config: {e:#}"));
+    if result.is_ok() {
+        crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+    }
+    result
 }
 
 // ============================================================================
@@ -211,6 +218,8 @@ pub(crate) async fn set_language(Json(body): Json<LanguageBody>) -> impl IntoRes
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
     };
+    // 语言（小地球）也是全局设置：别的实例/标签页必须立即跟随，冷启动再读同一个 config。
+    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
     Json(config_response(&config)).into_response()
 }
 
@@ -230,8 +239,7 @@ pub(crate) async fn set_auto_git_sync(Json(body): Json<AutoGitSyncBody>) -> impl
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
     };
-    // 复用既有 config_reloaded 失效总线，让其它实例/标签页即时对齐该开关。
-    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+    // update_config 已统一广播 config_reloaded（语言/主题/模型/提供商同一份 config）。
     Json(config_response(&config)).into_response()
 }
 

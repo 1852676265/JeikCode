@@ -39,6 +39,12 @@ const HISTORY_PAGE = 48;
 /** 「立即发送」程序化停止标记的有效期：后端 /chat/stop 的 stop_and_wait 上限仅 2.5s。 */
 const PROGRAMMATIC_STOP_MARK_TTL_MS = 15000;
 /**
+ * 上一轮 done 后，判定「转向卡是否已被内核自然发出」的宽限窗口。
+ * 内核会在轮末把残留 steer 缓冲落成新一轮；若本端同期把它改回 queue 再 drain，
+ * 就是一次 POST 抢占/重启那一轮（同一条回答跑两遍）。必须在窗口后再定性。
+ */
+const STEER_NATURAL_DRAIN_GRACE_MS = 1500;
+/**
  * 页面长时间隐藏（手机后台挂起、系统休眠）后才允许失焦重连 watch。
  * 短暂失焦（截图工具、切窗口回来）绝不断开重连：重连会强制后端重放整轮事件
  * （subscribe_live_with_replay），把已画完的正文/思考再落一遍。
@@ -247,13 +253,16 @@ import {
 } from '../lib/turnTimer';
 import {
   acknowledgeLiveSteers,
+  dropFoldedQueuedCards,
   pendingSteersToDraft,
+  resolveLingeringSteers,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
 import { onGlobalEvent } from '../lib/globalEvents';
 import {
   acceptReplayFrame,
   createReplayFold,
+  replayFrameAnchor,
   replayFrameOnCanvas,
 } from '../lib/replayFold';
 import {
@@ -398,6 +407,13 @@ function sameImageSet(a?: ImageData[], b?: ImageData[]): boolean {
   const right = b ?? [];
   if (left.length !== right.length) return false;
   return left.every((img, i) => img.media_type === right[i]?.media_type && img.data === right[i]?.data);
+}
+
+/** 回放帧落到的助手行（轮编号优先，其次工具 call id）。
+ *  空锚点（`{}`，无任何身份）与未命中一样交给上一条帧，保持“最近的助手行”。 */
+function anchorForSteer(event: SSEEvent): TurnUserAnchor | undefined {
+  const anchor = replayFrameAnchor(event);
+  return anchor.messageId || anchor.toolId ? anchor : undefined;
 }
 
 /** True on touch-first viewports: the soft keyboard's Enter is a real newline. */
@@ -1506,6 +1522,104 @@ export function Chat({
     if (sid) persistSessionQueue(sid, next);
     setQueuedState(next);
   }
+
+  /**
+   * 权威卡片队列落地（跨端广播 / 本会话 `queue_updated` 帧）。
+   *
+   * 卡片生命周期（创建 → 点转向 → 转为用户气泡）必须在每个端一致可见，
+   * 但队列的真相在后端：收到信号后拉一次全量，本地只做两件事：
+   * 1. 丢掉已进入正文的卡片（已消费的转向不能复活）；
+   * 2. 保留本端还在 HTTP 飞行中的 `steering` 卡片（服务端尚未收到它）。
+   * 只写本地三处（内存映射 / localStorage / 前台 state），**不回写后端** ——
+   * 否则“广播 → 回写 → 再广播”会回声。
+   */
+  function applyServerQueue(sid: string, serverItems: QueuedMessageApiItem[] | null | undefined) {
+    if (!sid || !Array.isArray(serverItems)) return;
+    const isCurrentView = activeIdRef.current === sid;
+    const known = [
+      ...(isCurrentView ? messagesRef.current : []),
+      ...(messageCacheRef.current.get(sid) ?? []),
+    ];
+    const canvasUserMsgs = known.filter((m) => m.role === 'user');
+    const canvasTexts = canvasUserMsgs.flatMap(
+      (m) => m.parts?.filter((p) => p.kind === 'text').map((p) => visibleUserText(p.text || '').trim()) ?? [],
+    );
+    const items = (serverItems.map(deserializeQueuedCard) as unknown as QueuedMessage[]).filter((item) => {
+      const clean = visibleUserText(item.text).trim();
+      if (clean && canvasTexts.some((text) => text === clean || userTextsMatch(text, clean))) return false;
+      if (!clean && item.images && item.images.length > 0) {
+        return !canvasUserMsgs.some((m) => sameImageSet(m.images, item.images));
+      }
+      return true;
+    });
+    const local = isCurrentView ? queuedRef.current : (queuedBySessionRef.current.get(sid) ?? []);
+    const serverIds = new Set(items.map((item) => String(item.id)));
+    const now = Date.now();
+    const next = [
+      ...items,
+      // 本端还没被服务端看到的卡片：HTTP 飞行中的转向，以及刚创建、镜像写入
+      // 仍在途的卡片（≤3s）。否则一次对端广播会把它们暂时抹掉，造成闪烁。
+      ...local.filter(
+        (item) =>
+          !serverIds.has(String(item.id)) &&
+          (item.kind === 'steering' || (item.createdAt != null && now - item.createdAt < 3000)),
+      ),
+    ];
+    if (next.length > 0) queuedBySessionRef.current.set(sid, next);
+    else queuedBySessionRef.current.delete(sid);
+    saveQueuedToStorage(queuedBySessionRef.current);
+    if (isCurrentView) {
+      queuedRef.current = next;
+      setQueuedState(next);
+    }
+  }
+
+  /** 按后端队列拉取并落地（只用于 `queue_updated` 这类轻量失效信号）。 */
+  function refreshQueuedFromServer(sid: string) {
+    if (!sid) return;
+    void getChatQueue(sid)
+      .then((serverItems) => applyServerQueue(sid, serverItems))
+      .catch(() => {});
+  }
+
+  /**
+   * 上一轮结束后仍留在队列里的 `steer`/`steering` 卡片：可能是内核正把它落成
+   * 新一轮的“自然发出”，也可能真的没被消费。延迟一拍再判定，避免本端 drain
+   * 与内核抢同一句话（同一条回答跑两遍）。
+   * - 会话重新跑起来 / 气泡已在画布上 → 卡片销毁；
+   * - 否则降级为普通排队卡，由 drain 接管，保证不会被默默丢掉。
+   */
+  function resolveLingeringSteerCards(sid: string) {
+    if (!sid) return;
+    const isCurrentView = activeIdRef.current === sid;
+    const items = isCurrentView ? queuedRef.current : (queuedBySessionRef.current.get(sid) ?? []);
+    const lingering = items.filter((item) => item.kind === 'steer' || item.kind === 'steering');
+    if (lingering.length === 0) return;
+    const running =
+      (isCurrentView && busyRef.current) ||
+      localTurnSessionsRef.current.has(sid) ||
+      backgroundRunningSessionsRef.current.has(sid);
+    const known = [
+      ...(isCurrentView ? messagesRef.current : []),
+      ...(messageCacheRef.current.get(sid) ?? []),
+    ];
+    const isOnCanvas = (item: QueuedMessage): boolean => {
+      const clean = visibleUserText(item.text).trim();
+      if (clean) {
+        return known.some(
+          (m) =>
+            m.role === 'user' &&
+            m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', clean)),
+        );
+      }
+      return !!(
+        item.images &&
+        item.images.length > 0 &&
+        known.some((m) => m.role === 'user' && sameImageSet(m.images, item.images))
+      );
+    };
+    updateQueuedForSession(sid, (list) => resolveLingeringSteers(list, running, isOnCanvas));
+  }
   const queueIdRef = useRef(0);
   // Stop restores the queue into the composer. Block one drain so a busy→idle
   // render cannot send those messages before the cleared queue commits.
@@ -1785,21 +1899,35 @@ export function Chat({
   }
 
   /**
-   * 删除/回溯等物理改写转录尾部之后，会话级单例清单必须整体复位：
-   * 后端已 `clear_todo_board`（内存板置 closed + 删磁盘 `.todo`，随 mutation 广播），
-   * 前端同步清掉 sticky 画板、live 文档与幂等键。否则残留的未完成项会被下一个回合
-   * 继承，agent 会带着已经不存在的计划继续跑（状态错乱）。
+   * 转录被物理回退（回溯 / 删除整轮 / 删除回答 / 停止回落）之后重新对齐清单。
    *
-   * 与上面“完成态不清幂等键”的防线不冲突：这里是转录被物理回退，那些 callId 对应的
-   * 行已经不存在了，旧键留着只会保护幽灵帧。
+   * 旧策略是一刀切清空：同一轮内建立又删除时没错，但跨轮次会误杀 —— A 轮建立的计划
+   * 若只在 steer 之后被改过几项，回溯掉 steer 之后的消息不该把 A 轮的计划一起清掉。
+   * 现在后端按「剩余转录」重新推导 todo 板（derive_current_todos），前端直接拉回权威清单：
+   * 该操作消息之前的动作原样保留，被删掉的动作自然消失；整轮删完则为空（与旧行为等价）。
+   *
+   * 不动幂等键：被删行的 callId 留着无害（防旧帧重放），剩余行仍需保护。
    */
-  function clearSessionTodoState(sessionId: string | null | undefined) {
+  function resyncTodosAfterMutation(sessionId: string | null | undefined) {
     if (!sessionId) return;
-    // active 会话：连带清掉输入框上方的 sticky 画板；后台会话：清掉会话级缓存。
-    writeLiveTodo(sessionId, null);
-    activeTodosBySessionRef.current.delete(sessionId);
-    appliedTodoIdsFor(sessionId).clear();
-    persistAppliedTodoIds();
+    const hash =
+      projectHashBySessionRef.current.get(sessionId) ||
+      (sessionId === activeIdRef.current ? viewedProjectHashRef.current : null) ||
+      activeSession?.project_hash ||
+      '';
+    if (!hash) {
+      // 拿不到 project hash（极早期）→ 先清本地文档，下次会话加载以服务端为准重建。
+      writeLiveTodo(sessionId, null);
+      return;
+    }
+    void getSession(hash, sessionId, { tail: 1 })
+      .then((detail) => {
+        const items = Array.isArray(detail?.todos) ? detail.todos : [];
+        writeLiveTodo(sessionId, reduceLiveTodo(null, { type: 'hydrate', items }));
+      })
+      .catch(() => {
+        writeLiveTodo(sessionId, null);
+      });
   }
   function adoptStickyFromMessages(
     sessionId: string | null | undefined,
@@ -2597,6 +2725,10 @@ export function Chat({
         const attachCursor = readStreamCursor(loadId);
         const attachAfterSeq = resolveAfterSeq(attachCursor, messagesRef.current.length === 0);
         const attachNeedsDedup = attachAfterSeq === undefined;
+        // 回放里最近一帧落到的助手行。补回的 `steered` 提问要插在它后面：
+        // 刷新后画布回到了这一轮的旧快照，而 steer 之后的正文已经在上，
+        // 追加到末尾会让追问倒插到回答下面。
+        let steerAnchor: TurnUserAnchor | undefined;
 
         try {
           await watchChatSession(
@@ -2662,6 +2794,7 @@ export function Chat({
                       opts: {
                         requireReplayDedup: attachNeedsDedup || typeof frame.seq === 'number',
                         repeatUserAfterSettled: false,
+                        steerAnchor: frame.type === 'steered' ? steerAnchor : undefined,
                       },
                     });
                     continue;
@@ -2678,7 +2811,10 @@ export function Chat({
                   handleEvent(frame, {
                     requireReplayDedup: attachNeedsDedup || typeof frame.seq === 'number',
                     repeatUserAfterSettled: false,
+                    steerAnchor: frame.type === 'steered' ? steerAnchor : undefined,
                   });
+                  // 记账：这一帧落到哪条助手行 —— 下一个 steered 要插在它后面。
+                  steerAnchor = frame.type === 'steered' ? undefined : anchorForSteer(frame);
                   timelineFollow.changed();
                   if (
                     frame.type === 'done' ||
@@ -3147,6 +3283,8 @@ export function Chat({
       : -1;
     const idleNeedsDedup = idleAfterSeq === undefined;
     const fold = createReplayFold();
+    // 回放里最近一帧落到的助手行：补回的 `steered` 提问插在它后面（见 foldSteeredInputs）。
+    let steerAnchor: TurnUserAnchor | undefined;
     void watchChatSession(
       loadId,
       (event) => {
@@ -3214,6 +3352,7 @@ export function Chat({
               opts: {
                 requireReplayDedup: idleNeedsDedup || typeof frame.seq === 'number',
                 repeatUserAfterSettled: false,
+                steerAnchor: frame.type === 'steered' ? steerAnchor : undefined,
               },
             });
             continue;
@@ -3271,7 +3410,10 @@ export function Chat({
           // Restore permission/user-input for every non-Auto mode that parks.
           handleEvent(frame, {
             requireReplayDedup: idleNeedsDedup || typeof frame.seq === 'number',
+            steerAnchor: frame.type === 'steered' ? steerAnchor : undefined,
           });
+          // 记账：这一帧落到哪条助手行 —— 下一个 steered 要插在它后面。
+          steerAnchor = frame.type === 'steered' ? undefined : anchorForSteer(frame);
           // Keep the main scroller pinned while we are following (user can scroll
           // up mid-turn to release follow).
           timelineFollow.changed();
@@ -3379,6 +3521,94 @@ export function Chat({
           const sid = activeIdRef.current;
           if (sid && event.session_id === sid) {
             restorePendingInteractive(sid, sessionGenerationRef.current);
+          }
+          return;
+        }
+        // 其它端刚改了该会话的待发卡片（创建 / 点转向 / 取消 / 已被内核消费）：
+        // 拉一次单会话队列并就地落地 —— 卡片的三个阶段都要跨端一致。
+        if (event.type === 'queue_updated') {
+          refreshQueuedFromServer(event.session_id);
+          return;
+        }
+        // 其它端把中途转向并入了正在跑的回合：把这条提问提前写进该会话的
+        // 本地画布缓存（活跃视图由 /chat/watch 的 `steered` 帧负责归位落笔），
+        // 这样切过去或冷启动时用户气泡已经在里面。
+        if (event.type === 'steer_folded') {
+          const sid = event.session_id;
+          // 活跃视图由 `/chat/watch` 的 `steered` 帧统一消费卡片并归位落笔（它还带着
+          // 本地卡片上的原图与排队时间）；全局事件只负责后台会话。
+          if (!sid || activeIdRef.current === sid) return;
+          // 1) 画布缓存：把这条提问提前写进去，切过去 / 冷启动时用户气泡已经在里面。
+          foldSteeredInputs(
+            event.inputs ?? [],
+            event.client_input_ids,
+            sid,
+            event.timestamps,
+            { skipQueued: true },
+          );
+          // 2) 卡片缓存：内核已消费它（可能是“自然销毁”，用户没点任何按钮），
+          // 广播一到就必须从本端暂存队列里删掉，否则切过去它会复活成待发卡片。
+          const cachedQueue = queuedBySessionRef.current.get(sid) ?? [];
+          const foldedInputs = (event.inputs ?? []).map((input) => ({
+            text: input.text,
+            // 广播不带图片本体；图片由本端队列卡片 / 磁盘补齐。
+            images: [],
+          }));
+          const prunedQueue = dropFoldedQueuedCards(
+            cachedQueue,
+            foldedInputs,
+            event.client_input_ids ?? [],
+          );
+          if (prunedQueue !== cachedQueue) {
+            if (prunedQueue.length > 0) queuedBySessionRef.current.set(sid, prunedQueue);
+            else queuedBySessionRef.current.delete(sid);
+            saveQueuedToStorage(queuedBySessionRef.current);
+          }
+          return;
+        }
+        // 模型配置（会话模型 / 提供商 / 模型 id / 思考强度 / 预算）在任意实例变更：
+        // 各端只改自己的会话缓存与下拉框，绝不回写后端（避免回声）。
+        if (event.type === 'model_config') {
+          const sid = event.session_id ?? null;
+          const isActive = sid != null && activeIdRef.current === sid;
+          const hash = sid
+            ? (projectHashBySessionRef.current.get(sid) ?? (isActive ? viewedProjectHashRef.current : null))
+            : null;
+          if (event.provider) {
+            const provider = event.provider;
+            if (sid) {
+              providerCacheRef.current.set(sid, provider);
+              if (hash) updateSessionCacheMeta(hash, sid, { preferredModel: provider });
+              if (isActive) {
+                setProvider(provider);
+                providerPinnedRef.current = true;
+              }
+            } else if (activeIdRef.current == null && !providerPinnedRef.current) {
+              // 新会话默认模型变了（尚未进入具体会话/尚未固定选择）。
+              setProvider(provider);
+            }
+          }
+          if (event.effort) {
+            const effort = event.effort.reasoning_effort ?? null;
+            const budget = event.effort.thinking_budget ?? null;
+            if (sid) {
+              effortCacheRef.current.set(sid, { effort, budget });
+              if (hash) {
+                updateSessionCacheMeta(hash, sid, { reasoningEffort: effort, thinkingBudget: budget });
+              }
+              if (isActive) {
+                setSessionEffort(effort);
+                setSessionBudget(budget);
+              }
+            } else {
+              // 无会话作用域 = 模型默认强度变了：当前会话自己没有显式覆盖时才跟随，
+              // 否则它的会话级选择优先（下一轮仍按会话元数据生效）。
+              const activeSid = activeIdRef.current;
+              if (!activeSid || !effortCacheRef.current.has(activeSid)) {
+                setSessionEffort(effort);
+                setSessionBudget(budget);
+              }
+            }
           }
           return;
         }
@@ -3730,28 +3960,20 @@ export function Chat({
         (item) => !queuedItemOnCanvas(item),
       );
       setQueued(stashedQueued);
-      // 异步与后端同步队列（跨设备/换手机打开该会话时无缝同步恢复）
+      // 异步与后端同步队列（跨设备/换手机打开该会话时无缝同步恢复）。
+      // 后端是“哪些卡片真的会被发送”的权威：本地存储里已被对端消费的旧卡片
+      // 必须在这里被剔除，否则刷新/冷启动会把已转向成功的卡片复活并再发一次。
       if (sessionId) {
-        void getChatQueue(sessionId).then((serverItems) => {
-          if (activeIdRef.current === sessionId && serverItems && serverItems.length > 0) {
-            setQueued((current) => {
-              // 排除已经在正文消息流中出现的已发送提问，杜绝已被消费的卡片复活
-              const validServerItems = (serverItems.map(deserializeQueuedCard) as unknown as QueuedMessage[]).filter(
-                (item) => !queuedItemOnCanvas(item),
-              );
-              if (validServerItems.length === 0) return current;
-              if (current.length === 0) {
-                return validServerItems;
-              }
-              // 合并服务端队列项，避免重复
-              const existingIds = new Set(current.map((item) => String(item.id)));
-              const existingTexts = new Set(current.map((item) => visibleUserText(item.text).trim()));
-              const toAdd = validServerItems.filter(
-                (item) => !existingIds.has(String(item.id)) && !existingTexts.has(visibleUserText(item.text).trim())
-              );
-              return toAdd.length > 0 ? [...current, ...toAdd] : current;
-            });
+        const queueSid = sessionId;
+        const queueGeneration = sessionGenerationRef.current;
+        void getChatQueue(queueSid).then((serverItems) => {
+          if (
+            activeIdRef.current !== queueSid ||
+            sessionGenerationRef.current !== queueGeneration
+          ) {
+            return;
           }
+          applyServerQueue(queueSid, serverItems);
         });
       }
       setLivePending(null);
@@ -4899,6 +5121,7 @@ export function Chat({
               ts: msg.created_at,
               elapsedMs: msg.elapsed_ms,
               id: msg.id,
+              sourceIndex,
             });
           }
           continue;
@@ -5666,7 +5889,7 @@ export function Chat({
     clientInputIds?: Array<string | null>,
     targetSessionId?: string,
     timestamps?: Array<number | null | undefined>,
-    opts?: { replay?: boolean; anchor?: TurnUserAnchor },
+    opts?: { replay?: boolean; anchor?: TurnUserAnchor; skipQueued?: boolean },
   ) {
     const steeredInputs = (inputs ?? []).map((input) => ({
       text: stripSteerEnvelopeForDisplay(input.text || ''),
@@ -5701,11 +5924,17 @@ export function Chat({
       return nextQueued;
     };
 
-    if (sid) {
-      updateQueuedForSession(sid, updateQueuedList);
-    }
-    if (isCurrentView) {
-      setQueued(updateQueuedList);
+    if (sid && opts?.skipQueued) {
+      // 跨端广播回写缓存时：只借本地卡片补齐原图/时间戳，不修改也不回写队列 ——
+      // 队列真相在后端，此时回写可能把对端刚落地的卡片覆盖掉。
+      updateQueuedList(queuedBySessionRef.current.get(sid) ?? []);
+    } else {
+      if (sid) {
+        updateQueuedForSession(sid, updateQueuedList);
+      }
+      if (isCurrentView) {
+        setQueued(updateQueuedList);
+      }
     }
 
     // 2. 将转向消息作为真实普通用户消息发送并追加到会话中，并在其后紧跟新的 assistant 占位
@@ -7751,8 +7980,7 @@ export function Chat({
               );
             });
           };
-          setQueued((q) => q
-            .filter((item) => {
+          setQueued((q) => q.filter((item) => {
               if (item.kind !== 'steer' && item.kind !== 'steering') return true;
               if (matchesFoldedSteer(item)) return false;
               const merged = messagesRef.current.some((m) => {
@@ -7762,12 +7990,15 @@ export function Chat({
                 return !!clean && m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text, clean));
               });
               return !merged;
-            })
-            .map((item) => (
-              item.kind === 'steer' || item.kind === 'steering'
-                ? { ...item, kind: 'queue' as const }
-                : item
-            )));
+            }));
+          // 「自然发出」：上一轮结束后内核会把这个转向从缓冲落成新一轮（用户气泡由
+          // `user` 回显画出）。此刻若立刻改回 queue 再 drain，就是本端用一次 POST
+          // 抢占/重启那一轮 —— 表现就是同一条回答被跑两遍。延迟一拍再判定：
+          // 期间会话重新跑起来或气泡出现 → 卡片销毁；真的没被消费 → 才降级排队。
+          const drainSid = event.session_id || doneSid;
+          if (drainSid) {
+            window.setTimeout(() => resolveLingeringSteerCards(drainSid), STEER_NATURAL_DRAIN_GRACE_MS);
+          }
           if (event.session_id) foldedSteersBySessionRef.current.delete(event.session_id);
         }
 
@@ -7801,6 +8032,12 @@ export function Chat({
             postSystemNotifyFn: postSystemNotify,
           });
         }
+        break;
+      }
+
+      case 'queue_updated': {
+        // 本会话待发卡片的权威全量：创建 / 点转向 / 取消 / 被内核消费都在内。
+        applyServerQueue(event.session_id, event.items);
         break;
       }
 
@@ -8057,11 +8294,11 @@ export function Chat({
         // 否则带旧游标重连会把变更前发出的旧帧补回来 —— 已删内容会复活。
         clearStreamCursor(mutation.session_id);
         clearStreamCursor(mutation.session_id, 'sync');
-        // 删除/回溯物理改写了转录尾部：会话级单例清单已在后端物理清空，
-        // 前端必须同步复位（sticky 画板 / live 文档 / 幂等键），否则残留的未完成项
-        // 会被下一个回合继承，导致 agent 状态错乱。（patch 是原地改文本，不动清单）
+        // 删除/回溯物理改写了转录尾部：后端已按剩余转录重推 todo 板，
+        // 前端拉回权威清单 —— 更早轮次建立/修改过的项不能被误杀。
+        // （patch 是原地改文本，不动清单）
         if (mutation.action === 'delete' || mutation.action === 'truncate') {
-          clearSessionTodoState(mutation.session_id);
+          resyncTodosAfterMutation(mutation.session_id);
         }
         // Mutation events carry the persisted message id. Prefer it over the
         // numeric source_index: the event's source_index is a KERNEL snapshot
@@ -9342,8 +9579,8 @@ export function Chat({
           );
           return;
         }
-        // 回溯删掉了后续 agent 消息：会话级单例清单同步物理复位。
-        clearSessionTodoState(sid);
+        // 回溯删掉了后续 agent 消息：清单回退到这些动作发生之前（不是全清）。
+        resyncTodosAfterMutation(sid);
         // 乐观截断：画布与内存缓存同步截断！
         let truncated: Message[] = [];
         setMessages((prev) => {
@@ -9404,8 +9641,8 @@ export function Chat({
           });
           missing = result.notFound === true;
           if (!missing) {
-            // 删除整轮 agent 消息：会话级单例清单同步物理复位。
-            clearSessionTodoState(sid);
+            // 删除整轮 agent 消息：清单回退到这些动作发生之前（不是全清）。
+            resyncTodosAfterMutation(sid);
           }
         } catch (err) {
           missing = mutationTargetCompacted(err);
@@ -9498,8 +9735,8 @@ export function Chat({
           );
           return;
         }
-        // 重新生成 = 回溯这一轮：会话级单例清单同步物理复位。
-        clearSessionTodoState(sid);
+        // 重新生成 = 回溯这一轮：清单回退到这些动作发生之前（不是全清）。
+        resyncTodosAfterMutation(sid);
         let nextMessages: Message[] = [];
         setMessages((prev) => {
           const next = prev.slice(0, userMsgIdx);
@@ -9563,8 +9800,8 @@ export function Chat({
           });
           missing = result.notFound === true;
           if (!missing) {
-            // 删除 agent 轮次消息：会话级单例清单同步物理复位。
-            clearSessionTodoState(sid);
+            // 删除 agent 轮次消息：清单回退到这些动作发生之前（不是全清）。
+            resyncTodosAfterMutation(sid);
           }
         } catch (err) {
           missing = mutationTargetCompacted(err);
@@ -9876,8 +10113,8 @@ export function Chat({
       activeSession?.project_hash ||
       '';
     if (sid && effectiveHash) {
-      // 回落到输入框 = 物理回退这一轮：会话级单例清单必须同步物理复位。
-      clearSessionTodoState(sid);
+      // 回落到输入框 = 物理回退这一轮：清单回退到这些动作发生之前（不是全清）。
+      resyncTodosAfterMutation(sid);
       messageCacheRef.current.set(sid, rolledBackMsgs);
       const filteredOutline = turnOutlineRef.current.filter(
         (t) => t.index !== sourceIndex && t.index < sourceIndex,

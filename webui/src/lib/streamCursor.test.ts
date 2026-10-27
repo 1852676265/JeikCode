@@ -59,3 +59,27 @@ test('存储不可用（隐私模式）时退化为无游标，不抛异常', ()
   clearStreamCursor('s-1', 'watch', null);
   assert.equal(readStreamCursor('s-1', 'watch', null), null);
 });
+
+test('游标不跨页面文档：刷新后一律视为无游标，走全量补发', () => {
+  const storage = fakeStorage();
+  writeStreamCursor('s-1', 9, 'watch', storage, 'doc-a');
+  assert.deepEqual(readStreamCursor('s-1', 'watch', storage, 'doc-a'), { seq: 9 });
+
+  // 刷新（新文档）后画布来自防抖的 L2 缓存，可能落后于游标：
+  // 此时绝不续传，否则服务器会跳过 `steered` 这类从未画上的边界帧。
+  assert.equal(readStreamCursor('s-1', 'watch', storage, 'doc-b'), null);
+  assert.equal(
+    resolveAfterSeq(readStreamCursor('s-1', 'watch', storage, 'doc-b'), false),
+    undefined,
+    '有历史但无（有效）游标 → 全量补发',
+  );
+
+  // 旧文档的记录不能阻碍新文档重新记账（同一键只保留当前文档的游标）。
+  writeStreamCursor('s-1', 3, 'watch', storage, 'doc-b');
+  assert.deepEqual(readStreamCursor('s-1', 'watch', storage, 'doc-b'), { seq: 3 });
+  assert.equal(
+    readStreamCursor('s-1', 'watch', storage, 'doc-a'),
+    null,
+    '被新文档覆盖后，旧文档也不能再续传',
+  );
+});

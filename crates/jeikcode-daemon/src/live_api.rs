@@ -3361,6 +3361,18 @@ pub(crate) struct LiveProviderReq {
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
 /// 该端点仍是 live runtime 的即时切换接口；TUI `/model` 另会更新新会话默认值。
+///
+/// 同一份选择必须广播到所有实例（`model_config`）：它们各自的下拉框与会话缓存
+/// 都按这一份渲染；本轮仍在跑时按 `deferred` 接受，停止后下一轮自然生效。
+fn model_config_ok(
+    session_id: Option<&str>,
+    provider: &str,
+    deferred: bool,
+) -> Json<serde_json::Value> {
+    crate::publish_model_config(session_id, Some(provider), None, deferred);
+    Json(serde_json::json!({ "ok": true, "deferred": deferred }))
+}
+
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
@@ -3433,7 +3445,7 @@ pub(crate) async fn live_provider(
             &req.provider,
             &requested_fingerprint,
         ) {
-            return Json(serde_json::json!({ "ok": true }));
+            return model_config_ok(requested_session_id.as_deref(), &requested_provider, false);
         }
         let runtime_config = chat_runtime_config(
             &config,
@@ -3448,16 +3460,14 @@ pub(crate) async fn live_provider(
         )
         .await
         {
-            Ok(_) => return Json(serde_json::json!({ "ok": true })),
+            Ok(_) => {
+                return model_config_ok(requested_session_id.as_deref(), &requested_provider, false)
+            }
             // A turn is running: reassembling the provider would hard-kill it and drop
-            // the interrupted turn's context. Surface a distinct flag so the client can
-            // revert its optimistic selection and tell the user to stop the turn first.
+            // the interrupted turn's context. The selection is already persisted to the
+            // session metadata, so accept it as deferred instead of rolling the UI back.
             Err(crate::live_hub::HubError::ActiveTurn) => {
-                return Json(serde_json::json!({
-                    "ok": false,
-                    "active_turn": true,
-                    "error": "a turn is running; stop it before switching the model",
-                }));
+                return model_config_ok(requested_session_id.as_deref(), &requested_provider, true);
             }
             // View identity drifted from the execution session (e.g. `/webui`
             // landing switched the hub VIEW). Reload the unique handle below.
@@ -3483,24 +3493,20 @@ pub(crate) async fn live_provider(
         .as_deref()
         .and_then(crate::native_live::existing_runner_handle);
     let Some(handle) = unique else {
-        return Json(serde_json::json!({ "ok": true }));
+        return model_config_ok(requested_session_id.as_deref(), &requested_provider, false);
     };
     let cached_fp = requested_session_id.as_deref().and_then(|id| {
         jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global()
             .provider_fingerprint(&id.to_string())
     });
     if cached_fp.as_deref() == Some(requested_fingerprint.as_str()) {
-        return Json(serde_json::json!({ "ok": true }));
+        return model_config_ok(requested_session_id.as_deref(), &requested_provider, false);
     }
     match handle.status().phase {
         jeikcode_coding::RuntimePhase::InTurn
         | jeikcode_coding::RuntimePhase::WaitingApproval
         | jeikcode_coding::RuntimePhase::Reconfiguring => {
-            return Json(serde_json::json!({
-                "ok": false,
-                "active_turn": true,
-                "error": "a turn is running; stop it before switching the model",
-            }));
+            return model_config_ok(requested_session_id.as_deref(), &requested_provider, true);
         }
         _ => {}
     }
@@ -3521,13 +3527,11 @@ pub(crate) async fn live_provider(
                 jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global()
                     .set_provider_fingerprint(&session_id.to_string(), Some(requested_fingerprint));
             }
-            Json(serde_json::json!({ "ok": true }))
+            model_config_ok(requested_session_id.as_deref(), &requested_provider, false)
         }
-        Err(jeikcode_coding::RuntimeError::Busy) => Json(serde_json::json!({
-            "ok": false,
-            "active_turn": true,
-            "error": "a turn is running; stop it before switching the model",
-        })),
+        Err(jeikcode_coding::RuntimeError::Busy) => {
+            model_config_ok(requested_session_id.as_deref(), &requested_provider, true)
+        }
         Err(error) => Json(serde_json::json!({
             "ok": false,
             "error": format!("provider reload rejected: {error}"),
@@ -3773,6 +3777,8 @@ pub(crate) async fn live_reasoning_effort(
     let mut previous_effort = None;
     let mut provider_missing = false;
     let clear_budget = req.clear_thinking_budget;
+    // 本轮仍在跑时的“已接受、下一轮生效”标记（见下方 reload 的 ActiveTurn 分支）。
+    let mut deferred = false;
     let commit = match store.update(|config| {
         target = requested
             .clone()
@@ -3837,15 +3843,16 @@ pub(crate) async fn live_reasoning_effort(
 
     // Session-scoped intensity: remember this session's own choice so a sibling
     // session on the same provider cannot silently inherit it.
-    if let Some(sid) = req
+    let stored_effort = effort.clone();
+    let stored_budget = if clear_budget { None } else { budget_val };
+    let session_scope = req
         .session_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
+        .map(str::to_string);
+    if let Some(sid) = session_scope.as_deref() {
         if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
-            let stored_effort = effort.clone();
-            let stored_budget = if clear_budget { None } else { budget_val };
             let _ = jeikcode_capabilities::session::SessionManager::for_project(
                 &resolved.meta.working_dir,
             )
@@ -3890,34 +3897,50 @@ pub(crate) async fn live_reasoning_effort(
             Err(error) => Err(crate::live_hub::HubError::RuntimeRejected(error)),
         };
         if let Err(error) = reload_result {
-            // Roll back the persisted effort (the reload that would apply it was
-            // refused). Surface the same active_turn flag as /live/provider.
-            let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
-            let rollback_error =
-                match store.update_if_revision(&commit.snapshot.revision, |config| {
-                    config.update_selection_reasoning(&target, |r| {
-                        *r.reasoning_effort = previous_effort.clone();
-                    });
-                    Ok(())
-                }) {
-                    Ok(Some(_)) | Ok(None) => None,
-                    Err(error) => Some(error.to_string()),
-                };
-            return Json(serde_json::json!({
-                "ok": false,
-                "active_turn": active_turn,
-                "error": match rollback_error {
-                    Some(rollback) => format!(
-                        "provider reload rejected: {error:?}; config rollback failed: {rollback}"
-                    ),
-                    None => format!("provider reload rejected: {error:?}"),
-                },
-            }))
-            .into_response();
+            match error {
+                // 本轮仍在跑：重组 runtime 会把当前回合硬杀。强度已经落盘（provider 配置
+                // + 本会话元数据），用户停止后的下一轮重读即生效，因此按 deferred 接受。
+                crate::live_hub::HubError::ActiveTurn => deferred = true,
+                other => {
+                    // 真正的拒绝（无法稍后生效）：回滚已持久化的强度，如实报错。
+                    let rollback_error =
+                        match store.update_if_revision(&commit.snapshot.revision, |config| {
+                            config.update_selection_reasoning(&target, |r| {
+                                *r.reasoning_effort = previous_effort.clone();
+                            });
+                            Ok(())
+                        }) {
+                            Ok(Some(_)) | Ok(None) => None,
+                            Err(error) => Some(error.to_string()),
+                        };
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": match rollback_error {
+                            Some(rollback) => format!(
+                                "provider reload rejected: {other:?}; config rollback failed: {rollback}"
+                            ),
+                            None => format!("provider reload rejected: {other:?}"),
+                        },
+                    }))
+                    .into_response();
+                }
+            }
         }
     }
 
-    Json(serde_json::json!({ "ok": true })).into_response()
+    // 思考强度/预算是“模型参数”：所有实例的下拉框与会话缓存必须跟着变。
+    crate::publish_model_config(
+        session_scope.as_deref(),
+        Some(&target),
+        Some(crate::ModelEffortWire {
+            reasoning_effort: stored_effort,
+            thinking_budget: stored_budget,
+        }),
+        deferred,
+    );
+    // provider 级默认强度也变了：让各端重读模型列表（默认 effort/预算展示同源）。
+    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+    Json(serde_json::json!({ "ok": true, "deferred": deferred })).into_response()
 }
 
 #[derive(serde::Deserialize)]

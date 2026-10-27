@@ -133,6 +133,12 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
 
     const handleReload = () => {
       getConfig().then((cfg) => {
+        // 语言（小地球）是全局设置：别的实例改了要立刻跟随；
+        // 本端刚点过（版本已推进）则以本地选择为准，避免慢请求回写旧值。
+        if (version === selectionVersion.current) {
+          const next = normalizeServerLang(cfg.language);
+          if (next) setLangState(next);
+        }
         if (typeof cfg.github_logo === 'boolean') {
           setGithubLogo(cfg.github_logo);
         }

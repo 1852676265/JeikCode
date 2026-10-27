@@ -21,6 +21,7 @@ import {
   sameUserRow,
   stampUserClientInputId,
   stampUserSourceIndex,
+  steerInsertAfterAnchor,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 import { upsertToolPart } from './toolRows.ts';
@@ -1643,4 +1644,98 @@ test('sameUserRow accurately matches image-only user messages with identical ima
   };
   assert.equal(sameUserRow(a, b), true);
   assert.equal(sameUserRow(a, c), false);
+});
+
+// ── 刷新后回放补回的 steer 提问要回到被打断的那一轮之后 ──
+// 丢了气泡的旧快照上，steer 之后的正文已经画好；如果当成新回合追加到末尾，
+// 用户提问就会倒插到自己的回答下面。回放是严格有序的，锚点就是它前面最后一帧
+// 落到的助手行。
+test('steerInsertAfterAnchor 把回放补回的转向插在被打断的那一轮之后', () => {
+  const canvas = [
+    { role: 'user', id: 'u-1', sourceIndex: 0, parts: [{ kind: 'text' as const, text: '上一问' }] },
+    {
+      role: 'assistant',
+      id: 'm-1',
+      sourceIndex: 1,
+      parts: [{ kind: 'text' as const, text: '上一轮最终正文', id: 'm-1:1:text' }],
+    },
+    // steer 之后的 loop（直播行：只有 wire 身份，没有转录下标）
+    {
+      role: 'assistant',
+      id: 'm-2',
+      parts: [{ kind: 'text' as const, text: '让我想想....', id: 'm-2:1:text' }],
+    },
+    {
+      role: 'assistant',
+      id: 'm-3',
+      parts: [{ kind: 'text' as const, text: '1+1=2', id: 'm-3:1:text' }],
+    },
+  ];
+
+  // 锚点 = 回放里 steered 前面最后一帧落到的助手行（m-1）→ 插在它之后。
+  const insertAt = steerInsertAfterAnchor(canvas, { messageId: 'm-1' });
+  assert.equal(insertAt, 2);
+  const withBubble = canvas.slice();
+  withBubble.splice(insertAt, 0, {
+    role: 'user',
+    id: 'm-steer',
+    isSteer: true,
+    parts: [{ kind: 'text' as const, text: '接下来帮我干xxx' }],
+  } as (typeof canvas)[number]);
+  assert.deepEqual(
+    withBubble.map((m) => (m.role === 'user' ? m.parts[0]?.text : (m as { id?: string }).id)),
+    ['上一问', 'm-1', '接下来帮我干xxx', 'm-2', 'm-3'],
+    '提问必须落在上一轮正文之后、steer 之后的 loop 之前',
+  );
+
+  // 工具帧锚点：那一轮只有工具调用时也要能定位。
+  const toolCanvas = [
+    {
+      role: 'assistant',
+      id: 'm-t',
+      parts: [{ kind: 'tool' as const, tool: { id: 'call-1', name: 'read', args: '{}', status: 'done' as const } }],
+    },
+  ];
+  assert.equal(steerInsertAfterAnchor(toolCanvas, { toolId: 'call-1' }), 1);
+
+  // 定位不到（锚点还没画上 / 没有锚点）→ -1，调用方按新回合追加到末尾。
+  assert.equal(steerInsertAfterAnchor(canvas, { messageId: 'm-missing' }), -1);
+  assert.equal(steerInsertAfterAnchor(canvas, undefined), -1);
+});
+
+test('spliceAuthoritativeDiskTail 保留历史轮次中的黄色通知在原有轮次位置不被拖拽到会话末尾', () => {
+  // 第 1 轮：用户：“你好”，AI 出错产生黄色通知
+  // 第 2 轮：用户：“你好 再发一次”，AI 出错产生黄色通知
+  // 第 3 轮：用户：“好像连接上了”，AI 恢复正常回答（落盘）
+  const canvas = [
+    { role: 'user', id: 'u-1', sourceIndex: 0, parts: [{ kind: 'text' as const, text: '你好' }] },
+    { role: 'assistant', id: 'a-1', parts: [{ kind: 'notice' as const, text: 'API错误' }] },
+    { role: 'user', id: 'u-2', sourceIndex: 1, parts: [{ kind: 'text' as const, text: '你好 再发一次' }] },
+    { role: 'assistant', id: 'a-2', parts: [{ kind: 'notice' as const, text: '上游断流' }] },
+    { role: 'user', id: 'u-3', sourceIndex: 2, parts: [{ kind: 'text' as const, text: '好像连接上了' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 3, parts: [{ kind: 'text' as const, text: '对啊 恢复了' }] },
+  ];
+
+  const diskTail = [
+    { role: 'user', id: 'u-3', sourceIndex: 2, parts: [{ kind: 'text' as const, text: '好像连接上了' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 3, parts: [{ kind: 'text' as const, text: '对啊 恢复了' }] },
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas as any, diskTail as any, 2);
+  const cleaned = sanitizeCanvasMessages(spliced);
+
+  // 验证时序：历史 notice 必须紧随所属提问，绝对不能全部堆叠在第 3 轮回答（a-3）后面！
+  const rolesAndTexts = cleaned.map((m) => {
+    const text = m.parts?.[0]?.text;
+    return `${m.role}:${text}`;
+  });
+
+  assert.deepEqual(rolesAndTexts, [
+    'user:你好',
+    'assistant:API错误',
+    'user:你好 再发一次',
+    'assistant:上游断流',
+    'user:好像连接上了',
+    'assistant:对啊 恢复了',
+  ]);
 });

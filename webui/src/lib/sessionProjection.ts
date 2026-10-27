@@ -424,6 +424,36 @@ export interface TurnUserAnchor {
   toolId?: string;
 }
 
+/**
+ * 回放补回的中途转向（`steered`）的落位：紧跟在「被 steer 打断的那一轮」助手行之后。
+ *
+ * 刷新后画布又回到了这一轮的旧快照，steer 的气泡要么丢了、要么根本没落盘；
+ * 它的后续正文（新一轮 loop）却已经在画布上。若直接追加，追问就会倒插到回答下面。
+ * 回放是严格有序的：`anchor` 就是它前面最后一帧落到的助手行。
+ *
+ * 返回 -1 表示定位不到那一行（整段还没画上 / 本帧前面没有助手内容），
+ * 调用方按「新回合追加到尾部」兜底。
+ */
+export function steerInsertAfterAnchor(
+  messages: Array<{ role: string; id?: string; parts?: MsgPart[] }>,
+  anchor?: TurnUserAnchor,
+): number {
+  if (!anchor) return -1;
+  if (anchor.messageId) {
+    const idx = identifiedAssistantIndex(messages, anchor.messageId);
+    if (idx >= 0) return idx + 1;
+  }
+  if (anchor.toolId) {
+    const idx = messages.findIndex(
+      (message) =>
+        message.role === 'assistant' &&
+        message.parts?.some((part) => part.kind === 'tool' && part.tool.id === anchor.toolId),
+    );
+    if (idx >= 0) return idx + 1;
+  }
+  return -1;
+}
+
 function turnAnchorIndex<T extends ProjectionMessage>(messages: T[], before?: TurnUserAnchor): number {
   if (before?.messageId) {
     const idx = identifiedAssistantIndex(messages, before.messageId);
@@ -871,9 +901,12 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
         return next;
       }
       const next = messages.slice();
+      const userMsg = messages[user];
+      const inheritedSrc = typeof userMsg?.sourceIndex === 'number' ? userMsg.sourceIndex + 1 : undefined;
       next.splice(user + 1, 0, {
         role: 'assistant',
         parts: [{ kind: 'notice', text }],
+        sourceIndex: inheritedSrc,
       } as unknown as T);
       return next;
     }
@@ -888,9 +921,15 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
     };
     return next;
   }
+  const lastMsg = messages[messages.length - 1];
+  const lastSrc = typeof lastMsg?.sourceIndex === 'number' ? lastMsg.sourceIndex + 1 : undefined;
   return [
     ...messages,
-    { role: 'assistant', parts: [{ kind: 'notice', text }] } as unknown as T,
+    {
+      role: 'assistant',
+      parts: [{ kind: 'notice', text }],
+      sourceIndex: lastSrc,
+    } as unknown as T,
   ];
 }
 
@@ -995,8 +1034,21 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   // 丢弃，不能因为它把画布上同一条提问的本地行（可能带附件）也一起排除。
   const tailIdentity = collectTailIdentity(actualTail);
   const olderHead: T[] = [];
+  let currentTurnSourceIndex: number | undefined = undefined;
+
   for (const message of canvas) {
-    if (typeof message.sourceIndex !== 'number' || message.sourceIndex >= diskOffset) continue;
+    if (typeof message.sourceIndex === 'number') {
+      currentTurnSourceIndex = message.sourceIndex;
+    }
+    // 权威切片起始偏移（diskOffset）判定：若当前所属轮次的下标已经 >= diskOffset，跳过
+    if (typeof currentTurnSourceIndex === 'number' && currentTurnSourceIndex >= diskOffset) {
+      continue;
+    }
+    // 若整行既无 sourceIndex，也无任何前驱轮次下标支撑，跳过
+    if (typeof currentTurnSourceIndex !== 'number' && typeof message.sourceIndex !== 'number') {
+      continue;
+    }
+
     let pruned = pruneDuplicatedTailContent(message, tailIdentity);
     if (pruned) {
       // 若画布行缺失图片（如推流期从无图广播事件生成），而权威磁盘 pinned 提问带图，自动补全图片
@@ -1017,10 +1069,25 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   const baseHead = olderHead.length > 0 ? olderHead : pinnedInTail;
   const combined = [...baseHead, ...actualTail];
 
+  // 拓扑平滑时序权重：有绝对 sourceIndex 则使用其真实值；无 sourceIndex 的行
+  // 继承其前驱行的时序权重（+0.01），严格保留其在原始轮次中的相对位置，
+  // 杜绝因无 sourceIndex 被当作 Infinity 导致上一轮的黄色通知被无脑拖拽堆叠至全会话末尾！
+  const sortWeights = new Map<T, number>();
+  let runningWeight = 0;
+  for (const m of combined) {
+    if (typeof m.sourceIndex === 'number') {
+      runningWeight = m.sourceIndex;
+      sortWeights.set(m, runningWeight);
+    } else {
+      runningWeight += 0.01;
+      sortWeights.set(m, runningWeight);
+    }
+  }
+
   combined.sort((a, b) => {
-    const aSrc = typeof a.sourceIndex === 'number' ? a.sourceIndex : Infinity;
-    const bSrc = typeof b.sourceIndex === 'number' ? b.sourceIndex : Infinity;
-    return aSrc - bSrc;
+    const aW = sortWeights.get(a) ?? (typeof a.sourceIndex === 'number' ? a.sourceIndex : Infinity);
+    const bW = sortWeights.get(b) ?? (typeof b.sourceIndex === 'number' ? b.sourceIndex : Infinity);
+    return aW - bW;
   });
 
   const seenIds = new Set<string>();
@@ -1083,7 +1150,8 @@ export function sanitizeCanvasMessages<
               (p) =>
                 (p.kind === 'text' && (p.text || '').trim()) ||
                 p.kind === 'tool' ||
-                p.kind === 'reasoning',
+                p.kind === 'reasoning' ||
+                p.kind === 'notice',
             )
           ) {
             hasMeaningfulAssistant = true;

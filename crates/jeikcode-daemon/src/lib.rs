@@ -2769,6 +2769,42 @@ pub(crate) enum GlobalWireEvent {
     /// 定向 pending 拉取（单会话、小请求），避免重拉整表。
     #[serde(rename = "review_asked")]
     ReviewAsked { session_id: String },
+    /// 会话待发卡片队列（排队 / 转向中 / 转向已排队）变化：创建、点转向、取消、
+    /// 被内核消费都算。只带会话 id，客户端对该会话做一次定向 `/chat/queue` 拉取，
+    /// 既不背大 payload，也不重拉整表。
+    #[serde(rename = "queue_updated")]
+    QueueUpdated { session_id: String },
+    /// 中途转向已被内核 fold：携带权威输入。活跃视图由 `/chat/watch` 的 `steered`
+    /// 帧落笔（带光标与归位锚点）；本事件让**其它会话/其它客户端**把这条提问提前
+    /// 写进该会话的本地画布缓存，切过去或冷启动时用户气泡已经在里面。
+    ///
+    /// 只传文本/身份，**不传图片本体**（可能是一整张 base64）：各端自己队列卡片里
+    /// 就有原图，随后的 `queue_updated` 也会把已被消费的卡片收走。
+    #[serde(rename = "steer_folded")]
+    SteerFolded {
+        session_id: String,
+        inputs: Vec<SteerFoldedInputWire>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        client_input_ids: Vec<Option<String>>,
+    },
+    /// 模型配置变更（会话聊天模型 / 思考强度 / 思考预算）。
+    ///
+    /// 只带**本会话实际生效的值**：`provider` 为模型选择 id，`effort` 存在时
+    /// 两个字段都按快照下发（`null` = 显式清空/继承模型默认）。其它客户端据此更新
+    /// 下拉框与会话缓存；本轮仍在跑时参数已落盘，停止后下一轮自然生效。
+    #[serde(rename = "model_config")]
+    ModelConfig {
+        /// `Some` = 会话级；`None` = 新会话默认模型变了。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<ModelEffortWire>,
+        /// 本轮仍在跑，参数已落盘、下一轮生效（仅作 UI 提示，不参与合并）。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        deferred: bool,
+    },
     /// 待交互卡片已解决：客户端直接就地移除卡片。
     #[serde(rename = "review_resolved")]
     ReviewResolved {
@@ -2804,6 +2840,34 @@ pub(crate) enum GlobalWireEvent {
     /// 跟随 `mode`；为 false 时各会话恢复自己的模式。
     #[serde(rename = "mode_global")]
     ModeGlobal { enabled: bool, mode: String },
+}
+
+/// 一次模型参数变更里携带的思考强度/预算快照（两字段都序列化，`null` 即清空）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct ModelEffortWire {
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<u32>,
+}
+
+/// 全局 `steer_folded` 里的单条转向：只带跨端匹配所需的轻量字段。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SteerFoldedInputWire {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// 是否带图（图片本体不进全局通道）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_images: bool,
+}
+
+impl SteerFoldedInputWire {
+    pub(crate) fn from_kernel(input: &jeikcode_kernel::event::SteeredInput) -> Self {
+        Self {
+            text: input.text.clone(),
+            message_id: input.message_id.clone(),
+            has_images: !input.images.is_empty(),
+        }
+    }
 }
 
 /// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
@@ -2910,6 +2974,24 @@ pub(crate) fn global_events() -> &'static tokio::sync::broadcast::Sender<GlobalW
         let (tx, _) = tokio::sync::broadcast::channel(GLOBAL_EVENTS_CAP);
         tx
     })
+}
+
+/// Broadcast a model-config change to every instance. `session_id = None` means the
+/// new-session default model changed; `effort = None` means the event only carries a
+/// provider switch. `deferred` tells the UI the turn in flight keeps its assembled
+/// provider and the values apply from the next turn.
+pub(crate) fn publish_model_config(
+    session_id: Option<&str>,
+    provider: Option<&str>,
+    effort: Option<ModelEffortWire>,
+    deferred: bool,
+) {
+    publish_global(GlobalWireEvent::ModelConfig {
+        session_id: session_id.map(str::to_string),
+        provider: provider.map(str::to_string),
+        effort,
+        deferred,
+    });
 }
 
 /// Broadcast an invalidation signal. No subscribers / lagged receivers are fine:
@@ -3119,6 +3201,24 @@ pub(crate) fn fanout_chat_events_for_session(
                             running: true,
                             terminal: None,
                             status: None,
+                        });
+                    }
+                }
+                ChatEvent::Steered {
+                    inputs,
+                    client_input_ids,
+                    ..
+                } => {
+                    // 中途转向已并入本轮：异地客户端即使没在看这个会话，也要把这条
+                    // 提问写进它自己的本地画布缓存（切过去 / 冷启动时气泡已在）。
+                    if let Some(sid) = current_sid.clone() {
+                        publish_global(GlobalWireEvent::SteerFolded {
+                            session_id: sid,
+                            inputs: inputs
+                                .iter()
+                                .map(SteerFoldedInputWire::from_kernel)
+                                .collect(),
+                            client_input_ids: client_input_ids.clone(),
                         });
                     }
                 }
@@ -3392,6 +3492,8 @@ impl AppState {
             images: None,
             kind: "queue".to_string(),
             approval_mode: None,
+            created_at: None,
+            force_send: None,
         });
         let cloned_list = list.clone();
         if let Some(path) = session_queue_file_path(&sid) {
@@ -3412,6 +3514,9 @@ impl AppState {
                 },
             )
             .await;
+        // 会话总线只覆盖“正Watch着这个会话”的客户端。正在看其它会话的实例
+        // 也必须知道卡片变了，否则切过去时看到的是过期队列。
+        publish_global(GlobalWireEvent::QueueUpdated { session_id: sid });
     }
 }
 
@@ -5317,10 +5422,12 @@ async fn get_session_detail(
                             if records[p_idx].turn_id < snapshot_last_turn
                                 || (records[p_idx].turn_id == snapshot_last_turn && mark_latest)
                             {
-                                if let Some(id) = p_msg.id.as_deref() {
-                                    if !snapshot_ids.contains(id) {
-                                        p_msg.internal_origin =
-                                            Some("transcript_archive".to_string());
+                                if p_msg.internal_origin.is_none() {
+                                    if let Some(id) = p_msg.id.as_deref() {
+                                        if !snapshot_ids.contains(id) {
+                                            p_msg.internal_origin =
+                                                Some("transcript_archive".to_string());
+                                        }
                                     }
                                 }
                             }
@@ -5335,10 +5442,12 @@ async fn get_session_detail(
                             if record.turn_id < snapshot_last_turn
                                 || (record.turn_id == snapshot_last_turn && mark_latest)
                             {
-                                if let Some(id) = msg.id.as_deref() {
-                                    if !snapshot_ids.contains(id) {
-                                        msg.internal_origin =
-                                            Some("transcript_archive".to_string());
+                                if msg.internal_origin.is_none() {
+                                    if let Some(id) = msg.id.as_deref() {
+                                        if !snapshot_ids.contains(id) {
+                                            msg.internal_origin =
+                                                Some("transcript_archive".to_string());
+                                        }
                                     }
                                 }
                             }
@@ -7516,11 +7625,21 @@ async fn delete_session_message(
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
         meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
-        // 删除/回溯物理改写了权威转录：agent 的会话级单例清单属于被删掉的那一轮，
-        // 必须同步物理清空（内存板置 closed；磁盘 `.todo` 由下面 save_snapshot 内部的
-        // persist_todo_board 一并删除）。否则残留的未完成清单会被下一个回合继承，
-        // 让 agent 带着已经不存在的计划继续跑（状态错乱）。
-        jeikcode_capabilities::tools::clear_todo_board(&id);
+        // 删除/回溯只应回退「被删掉的那些 todo 动作」，不能一刀切清空：
+        // A 轮建立的计划如果只在后轮 steer 之后被改过几项，删掉后轮消息绝不该连带清空 A 轮。
+        // 按**剩余转录**重新推导（单轮内建立又删除 → 推导为空，与旧行为等价），
+        // 并原地重绑：板身份（id + 单调 seq）保留，撤销不会被看成“另起一板/版本回退”。
+        // 槽不存在（新进程尚未装载该会话）才退回 clear/commit；
+        // 磁盘 `.todo` 由下面 save_snapshot 内部的 persist_todo_board 按新板重写。
+        let derived_todos =
+            jeikcode_capabilities::tools::derive_current_todos(&snapshot.messages);
+        if jeikcode_capabilities::tools::rebind_todo_board(&id, &derived_todos).is_none() {
+            if derived_todos.is_empty() {
+                jeikcode_capabilities::tools::clear_todo_board(&id);
+            } else {
+                jeikcode_capabilities::tools::commit_todo_board(&id, &derived_todos);
+            }
+        }
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7642,11 +7761,21 @@ async fn truncate_session(
         meta.updated_at = jeikcode_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
         meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
-        // 删除/回溯物理改写了权威转录：agent 的会话级单例清单属于被删掉的那一轮，
-        // 必须同步物理清空（内存板置 closed；磁盘 `.todo` 由下面 save_snapshot 内部的
-        // persist_todo_board 一并删除）。否则残留的未完成清单会被下一个回合继承，
-        // 让 agent 带着已经不存在的计划继续跑（状态错乱）。
-        jeikcode_capabilities::tools::clear_todo_board(&id);
+        // 删除/回溯只应回退「被删掉的那些 todo 动作」，不能一刀切清空：
+        // A 轮建立的计划如果只在后轮 steer 之后被改过几项，删掉后轮消息绝不该连带清空 A 轮。
+        // 按**剩余转录**重新推导（单轮内建立又删除 → 推导为空，与旧行为等价），
+        // 并原地重绑：板身份（id + 单调 seq）保留，撤销不会被看成“另起一板/版本回退”。
+        // 槽不存在（新进程尚未装载该会话）才退回 clear/commit；
+        // 磁盘 `.todo` 由下面 save_snapshot 内部的 persist_todo_board 按新板重写。
+        let derived_todos =
+            jeikcode_capabilities::tools::derive_current_todos(&snapshot.messages);
+        if jeikcode_capabilities::tools::rebind_todo_board(&id, &derived_todos).is_none() {
+            if derived_todos.is_empty() {
+                jeikcode_capabilities::tools::clear_todo_board(&id);
+            } else {
+                jeikcode_capabilities::tools::commit_todo_board(&id, &derived_todos);
+            }
+        }
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -11782,7 +11911,7 @@ struct ChatSteerRequest {
     created_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedMessageItem {
     pub id: serde_json::Value,
     pub text: String,
@@ -11792,6 +11921,13 @@ pub struct QueuedMessageItem {
     pub kind: String, // "queue" | "steering" | "steered"
     #[serde(default)]
     pub approval_mode: Option<String>,
+    /// 卡片创建时间（epoch ms）。webui 的 `createdAt`：跨端 / 刷新恢复时保留
+    /// 原始排队时间，不要因为一次中转就重置成“现在”。
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<u64>,
+    /// 立即发送已画上气泡、但投递被退回的卡片必须照发（webui 的 `forceSend`）。
+    #[serde(default, rename = "forceSend")]
+    pub force_send: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11853,26 +11989,128 @@ async fn get_chat_queue(Query(q): Query<ChatQueueQuery>) -> impl IntoResponse {
     Json(serde_json::json!([]))
 }
 
+/// 队列内容是否实质变化。跨端“广播 → 对端拉取 → 原样回写”会造成回声，
+/// 因此只在内容真的变了才广播。
+fn queue_content_changed(
+    previous: Option<&Vec<QueuedMessageItem>>,
+    next: &[QueuedMessageItem],
+) -> bool {
+    match previous {
+        Some(prev) => prev.as_slice() != next,
+        None => !next.is_empty(),
+    }
+}
+
 async fn update_chat_queue(Json(req): Json<ChatQueueUpdateRequest>) -> impl IntoResponse {
     let sid = req.session_id.trim().to_string();
     if !sid.is_empty() {
         let map = get_session_queues_map().await;
-        let mut writer = map.write().await;
-        if req.items.is_empty() {
-            writer.remove(&sid);
-            if let Some(path) = session_queue_file_path(&sid) {
-                let _ = tokio::fs::remove_file(path).await;
+        let changed = {
+            let mut writer = map.write().await;
+            let changed = queue_content_changed(writer.get(&sid), &req.items);
+            if req.items.is_empty() {
+                writer.remove(&sid);
+            } else {
+                writer.insert(sid.clone(), req.items.clone());
             }
-        } else {
-            writer.insert(sid.clone(), req.items.clone());
-            if let Some(path) = session_queue_file_path(&sid) {
+            changed
+        };
+        if changed {
+            let path = session_queue_file_path(&sid);
+            if req.items.is_empty() {
+                if let Some(path) = path {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+            } else if let Some(path) = path {
                 if let Ok(json_str) = serde_json::to_string_pretty(&req.items) {
                     let _ = tokio::fs::write(path, json_str).await;
                 }
             }
+            // 广播放在锁外：对端收到信号会再拉 `/chat/queue`，绝不能在持锁期间等它。
+            // 只带会话 id：卡片里的图片可能是整张 base64，不背进全局通道。
+            publish_global(GlobalWireEvent::QueueUpdated { session_id: sid });
         }
     }
     Json(serde_json::json!({ "success": true }))
+}
+
+#[cfg(test)]
+mod chat_queue_tests {
+    use super::*;
+
+    fn item(text: &str, kind: &str) -> QueuedMessageItem {
+        QueuedMessageItem {
+            id: serde_json::Value::String(text.to_string()),
+            text: text.to_string(),
+            images: None,
+            kind: kind.to_string(),
+            approval_mode: None,
+            created_at: None,
+            force_send: None,
+        }
+    }
+
+    /// 广播 → 对端拉取 → 原样回写：内容没变就绝不能再广播，否则回声不止。
+    /// 而卡片的三个阶段（创建 / 点转向 / 自然销毁）只要内容真的变了就必须广播。
+    #[test]
+    fn queue_broadcast_only_fires_on_a_real_change() {
+        let empty: Vec<QueuedMessageItem> = Vec::new();
+        assert!(!queue_content_changed(None, &empty), "空队列不是变化");
+        assert!(!queue_content_changed(Some(&empty), &empty));
+
+        let card = item("帮我看看这份日志", "steer");
+        assert!(
+            queue_content_changed(None, std::slice::from_ref(&card)),
+            "新建卡片"
+        );
+        assert!(queue_content_changed(
+            Some(&empty),
+            std::slice::from_ref(&card)
+        ));
+
+        let same = vec![card.clone()];
+        assert!(
+            !queue_content_changed(Some(&same), std::slice::from_ref(&card)),
+            "对端回写同一份队列不得再广播"
+        );
+
+        let steering = vec![item("帮我看看这份日志", "steering")];
+        assert!(
+            queue_content_changed(Some(&same), &steering),
+            "点转向：卡片状态变化要广播"
+        );
+
+        assert!(
+            queue_content_changed(Some(&same), &empty),
+            "自然销毁：卡片消失要广播"
+        );
+    }
+
+    /// 全局 `steer_folded` 只带轻量字段：图片本体（可能是一整张 base64）
+    /// 绝不跟着广播跑到每个实例，否则一次带图转向会把所有连接打爆。
+    #[test]
+    fn steer_folded_broadcast_drops_image_bodies() {
+        let input = jeikcode_kernel::event::SteeredInput {
+            text: "<user-query>\n看这张图\n</user-query>\n\n[jeikcode-steer]\n".into(),
+            images: vec![jeikcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "BASE64-BODY-SHOULD-STAY-LOCAL".into(),
+            }],
+            message_id: Some("m-steer".into()),
+        };
+        let event = GlobalWireEvent::SteerFolded {
+            session_id: "s-1".into(),
+            inputs: vec![SteerFoldedInputWire::from_kernel(&input)],
+            client_input_ids: vec![Some("web-1".into())],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "steer_folded");
+        assert_eq!(json["session_id"], "s-1");
+        assert_eq!(json["inputs"][0]["message_id"], "m-steer");
+        assert_eq!(json["inputs"][0]["has_images"], true);
+        assert!(json["inputs"][0].get("images").is_none());
+        assert!(!json.to_string().contains("BASE64-BODY-SHOULD-STAY-LOCAL"));
+    }
 }
 
 #[derive(Debug, Deserialize)]

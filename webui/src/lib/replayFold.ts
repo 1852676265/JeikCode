@@ -91,7 +91,12 @@ export function replayFrameOnCanvas(messages: ReplayFoldMessage[], event: SSEEve
   }
 }
 
-function anchorOf(event: SSEEvent): ReplayFoldAnchor {
+/**
+ * 这一帧落到的那条助手行（轮编号优先，其次工具 call id）。
+ * 回放侧用它判定折叠锚点；客户端用它把补回的 `steered` 提问插回被打断的那一轮
+ * 之后，而不是追加到时间线末尾。
+ */
+export function replayFrameAnchor(event: SSEEvent): ReplayFoldAnchor {
   switch (event.type) {
     case 'text':
     case 'reasoning':
@@ -108,6 +113,10 @@ function anchorOf(event: SSEEvent): ReplayFoldAnchor {
     default:
       return {};
   }
+}
+
+function anchorOf(event: SSEEvent): ReplayFoldAnchor {
+  return replayFrameAnchor(event);
 }
 
 function isTurnUser(event: SSEEvent): boolean {
