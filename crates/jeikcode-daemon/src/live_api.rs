@@ -1428,6 +1428,14 @@ pub(crate) async fn run_chat_turn_v2(
                     }
                     Some(Err(_)) => {
                         persist_after_start.remove(&approval.call_id);
+                        // The runtime refused the queued decision (its request was
+                        // already timed out or the generation was replaced), so the
+                        // approval did NOT take effect. Downgrade the applied
+                        // tombstone: a retried POST must be told "expired", never
+                        // "already applied".
+                        if let Some(responders) = permission_responders.as_ref() {
+                            responders.expire(&session_id, &approval_id);
+                        }
                         // Dropping an unacknowledged envelope closes the HTTP ACK
                         // channel, so `/chat/permission` reports failure instead of
                         // claiming that a rejected/cancelled request was accepted.

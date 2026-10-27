@@ -21,6 +21,89 @@ export interface PendingLike {
   generation?: number;
 }
 
+/**
+ * Wire result of `POST /chat/permission`.
+ *
+ * `success: false` alone never says *why* delivery failed, and the two failure
+ * classes need opposite UI behaviour:
+ *   - `expired`             → the approval can never be applied again → retire the card.
+ *   - `already_resolved`    → this exact approval already took effect (a retried POST
+ *                             after a lost reply, or another WebUI instance) → retire it and
+ *                             report which decision actually won.
+ *   - neither               → delivery was not confirmed (network / wedged turn) → keep the
+ *                             card retryable instead of stranding it.
+ */
+export interface PermissionDecisionResult {
+  success: boolean;
+  already_resolved?: boolean;
+  /** Wire spelling of the decision that actually took effect. */
+  applied?: string;
+  expired?: boolean;
+  error?: string;
+}
+
+export type PermissionRetiredReason = 'expired' | 'already_resolved';
+
+export interface PermissionRetiredInfo {
+  reason: PermissionRetiredReason;
+  applied?: string;
+}
+
+/** Raised by a decision callback when the card can never be applied again. */
+export class PermissionRetiredError extends Error {
+  readonly info: PermissionRetiredInfo;
+
+  constructor(info: PermissionRetiredInfo) {
+    super(`permission request ${info.reason}`);
+    this.name = 'PermissionRetiredError';
+    this.info = info;
+  }
+}
+
+/** Wire spelling of the button the user pressed (`PermissionDecision::from_value`). */
+export function wireDecision(decision: string): 'allow' | 'allow_always' | 'deny' {
+  if (decision === 'always_allow' || decision === 'allow_persist') return 'allow_always';
+  return decision === 'deny' ? 'deny' : 'allow';
+}
+
+/** Did the decision the user pressed actually take effect? Unknown ⇒ assume yes. */
+export function decisionTookEffect(requested: string, applied?: string): boolean {
+  if (!applied) return true;
+  return wireDecision(requested) === applied;
+}
+
+/** A non-null value means the displayed card is a ghost: retire it, never retry it. */
+export function permissionRetiredInfo(
+  result: PermissionDecisionResult,
+): PermissionRetiredInfo | null {
+  if (result.expired) return { reason: 'expired' };
+  if (result.already_resolved) return { reason: 'already_resolved', applied: result.applied };
+  return null;
+}
+
+/**
+ * Does the server still park on exactly this approval? Backs the resume
+ * reconciliation: a card left untouched for hours can outlive its approval
+ * (another client answered it, the turn ended), and the SSE that would have
+ * cleared it may itself have died silently. Keeping the card in that case leaves
+ * a modal whose buttons can never succeed.
+ */
+export function stillPendingApproval(
+  pending: { approval_id?: string | null; call_id?: string | null } | null | undefined,
+  identity: { approval_id?: string | null; call_id?: string | null } | null | undefined,
+): boolean {
+  if (!pending) return false;
+  const pendingApproval = pending.approval_id?.trim();
+  const pendingCall = pending.call_id?.trim();
+  const approvalId = identity?.approval_id?.trim();
+  const callId = identity?.call_id?.trim();
+  if (approvalId && pendingApproval) return approvalId === pendingApproval;
+  if (callId && pendingCall) return callId === pendingCall;
+  // Cannot correlate the two shapes: keep the card rather than silently dropping
+  // a prompt that may still be live.
+  return true;
+}
+
 export function resolvePendingAfterDecision<T extends PendingLike>(
   current: T | null,
   decidedCallId: string,

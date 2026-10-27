@@ -36,6 +36,7 @@ import {
   createSession,
   getSession,
   getActiveChatSessions,
+  getChatPending,
   checkUpdate,
   fetchUpgradeDiffs,
   UpdateCheckResponse,
@@ -79,10 +80,26 @@ export function App() {
   // 跨实例增量流（每实例一条）：侧栏/通知 dock 各自订阅自己需要的增量，
   // 全程按 id 就地 upsert/remove，无周期性轮询、无整表重拉。
   useEffect(() => startGlobalEventStream(), []);
-  // 待交互卡在别处被解决时，同步清掉本实例正在展示的卡片状态。
+  // 待交互卡在别处被解决时，同步清掉本实例正在展示的卡片状态；重连 sync 时对齐当前会话状态。
   useEffect(
     () =>
       onGlobalEvent((event) => {
+        if (event.type === 'sync') {
+          if (sessionId) {
+            void getChatPending(sessionId)
+              .then((p: any) => {
+                setPending((cur: any | null) => {
+                  if (!cur || cur.session_id !== sessionId) return cur;
+                  if (!p.permission || p.permission.approval_id !== cur.approval_id) {
+                    return null;
+                  }
+                  return cur;
+                });
+              })
+              .catch(() => {});
+          }
+          return;
+        }
         if (event.type !== 'review_resolved') return;
         setPending((cur: any | null) =>
           cur && event.approval_id && cur.approval_id === event.approval_id ? null : cur,
@@ -91,7 +108,7 @@ export function App() {
           cur && cur.sessionId === event.session_id && !cur.userInput ? null : cur,
         );
       }),
-    [],
+    [sessionId],
   );
   const dismissLiveReview = useRef({
     permission: (_runtimeInstanceId: string, _generation: number, _requestId: number, _callId: string) => {},

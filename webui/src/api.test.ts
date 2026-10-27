@@ -624,3 +624,120 @@ test('getConfig parses a successful config payload', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('handleAuthExpiredReload triggers reload once and throttles within 15s', async () => {
+  const { handleAuthExpiredReload, resetAuthReloadState } = await import('./api.ts');
+  const store = new Map<string, string>();
+  let reloadedCount = 0;
+  const mockStorage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, val: string) => store.set(key, val),
+    removeItem: (key: string) => store.delete(key),
+  };
+  const mockLocation = {
+    reload: () => {
+      reloadedCount += 1;
+    },
+  };
+
+  (globalThis as any).window = { location: mockLocation, sessionStorage: mockStorage };
+  (globalThis as any).sessionStorage = mockStorage;
+
+  try {
+    resetAuthReloadState();
+    assert.equal(handleAuthExpiredReload(), true);
+    assert.equal(reloadedCount, 1);
+
+    // Second call within 15s debounce window must be rejected
+    assert.equal(handleAuthExpiredReload(), false);
+    assert.equal(reloadedCount, 1);
+
+    // Resetting state allows next reload
+    resetAuthReloadState();
+    assert.equal(handleAuthExpiredReload(), true);
+    assert.equal(reloadedCount, 2);
+  } finally {
+    delete (globalThis as any).window;
+    delete (globalThis as any).sessionStorage;
+  }
+});
+
+test('streamGlobalEvents parses events and handles keepalive comments cleanly', async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"type":"sync"}\n\n'));
+      controller.enqueue(encoder.encode(':keepalive ping\n\n'));
+      controller.enqueue(encoder.encode('data: {"type":"review_resolved","session_id":"s1","approval_id":"a1"}\n\n'));
+      controller.close();
+    },
+  });
+
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    assert.equal(String(url), '/events');
+    return new Response(stream, { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { streamGlobalEvents } = await import('./api.ts');
+    const seen: any[] = [];
+    await streamGlobalEvents((ev) => {
+      seen.push(ev);
+    });
+
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].type, 'sync');
+    assert.equal(seen[1].type, 'review_resolved');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('streamGlobalEvents exits cleanly when signal is aborted', async () => {
+  const originalFetch = globalThis.fetch;
+  const abort = new AbortController();
+  const encoder = new TextEncoder();
+  let timer: NodeJS.Timeout | null = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"type":"sync"}\n\n'));
+      timer = setTimeout(() => {
+        try {
+          controller.enqueue(encoder.encode('data: {"type":"review_asked","session_id":"s1","approval_id":"a1","tool_name":"bash"}\n\n'));
+        } catch {}
+      }, 50);
+    },
+    cancel() {
+      if (timer) clearTimeout(timer);
+    },
+  });
+
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(url), '/events');
+    if (init?.signal) {
+      init.signal.addEventListener('abort', () => {
+        if (timer) clearTimeout(timer);
+      });
+    }
+    return new Response(stream, { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { streamGlobalEvents } = await import('./api.ts');
+    const seen: any[] = [];
+    const promise = streamGlobalEvents((ev) => {
+      seen.push(ev);
+      abort.abort();
+    }, abort.signal);
+
+    await assert.rejects(promise, /aborted/i);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].type, 'sync');
+  } finally {
+    if (timer) clearTimeout(timer);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+

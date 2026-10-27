@@ -634,6 +634,7 @@ export const ja: Record<keyof typeof en, string> = {
   'perm.approve': 'Approve',
   'perm.args': 'Arguments',
   'perm.deny': 'Deny',
+  'perm.stale': 'This approval was already handled or expired. Please retry the operation.',
   'perm.title': 'Tool approval request',
   'preview.background': 'Click the background to close',
   'preview.clearAll': 'Close All',

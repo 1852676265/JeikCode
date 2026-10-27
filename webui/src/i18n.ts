@@ -697,6 +697,7 @@ const zh = {
   'perm.approve': '批准',
   'perm.alwaysAllow': '本会话总是允许',
   'perm.allowPersist': '永久允许此工具',
+  'perm.stale': '该审批已处理或已失效，请重新发起操作。',
 
   // User input card
   'ask.title': '询问输入',
@@ -1789,6 +1790,7 @@ export const en: Record<MsgKey, string> = {
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
   'perm.allowPersist': 'Always allow this tool',
+  'perm.stale': 'This approval was already handled or expired. Please retry the operation.',
 
   // User input card
   'ask.title': 'Input Request',

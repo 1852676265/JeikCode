@@ -630,6 +630,7 @@ export const vi: Record<keyof typeof en, string> = {
   'perm.approve': 'Phê duyệt',
   'perm.alwaysAllow': 'Luôn cho phép trong phiên này',
   'perm.allowPersist': 'Luôn cho phép công cụ này',
+  'perm.stale': 'Yêu cầu phê duyệt đã được xử lý hoặc đã hết hiệu lực. Vui lòng thử lại thao tác.',
   'ask.title': 'Yêu cầu nhập thông tin',
   'userInput.submit': 'Gửi',
   'userInput.skip': 'Bỏ qua',

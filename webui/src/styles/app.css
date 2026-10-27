@@ -7775,6 +7775,14 @@ body {
   border-radius: 999px;
   padding: 0 18px;
 }
+/* Delivery failure that is still retryable: the card stays actionable, but the
+   failure must be visible — a silent one reads as "the buttons are dead". */
+.permission-error {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--app-error-foreground, #e05c5c);
+}
 
 /* === UserInputCard (request_user_input tool) === */
 /* Option row: wraps a radio/checkbox + label body inline; the whole label is

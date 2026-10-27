@@ -634,6 +634,7 @@ export const zhTw: Record<keyof typeof en, string> = {
   'perm.approve': '批準',
   'perm.args': '参數',
   'perm.deny': '拒绝',
+  'perm.stale': '該審批已處理或已失效，請重新發起操作。',
   'perm.title': '工具请求批準',
   'preview.background': '點击背景關闭',
   'preview.clearAll': '清空全部预览',

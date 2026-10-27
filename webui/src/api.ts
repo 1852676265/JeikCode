@@ -2,6 +2,7 @@
 
 import type { Lang } from './i18n';
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
+import type { PermissionDecisionResult } from './lib/pendingPermission.ts';
 
 // Serve / webui bootstrap: `/?token=<uuid>` is handed off via HttpOnly cookie
 // AND left visible on first paint so we can stash it for Authorization.
@@ -111,6 +112,41 @@ function authHeaders(): Record<string, string> {
   return h;
 }
 
+const RELOAD_DEBOUNCE_MS = 15_000;
+const LAST_401_RELOAD_KEY = 'jeikcode_last_401_reload';
+
+/**
+ * 异地浏览器在长期挂起或后端重启后，若凭据失效触发 401，
+ * 触发一次自动刷新以重新从 URL/Cookie 协商凭据并对齐服务端最新状态。
+ * 使用 15 秒防抖（sessionStorage 记录），严禁在凭据完全无效时死循环高频刷新。
+ */
+export function handleAuthExpiredReload(): boolean {
+  if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
+  try {
+    const raw = sessionStorage.getItem(LAST_401_RELOAD_KEY);
+    const last = raw ? Number.parseInt(raw, 10) : 0;
+    const now = Date.now();
+    if (Number.isFinite(last) && now - last < RELOAD_DEBOUNCE_MS) {
+      return false;
+    }
+    sessionStorage.setItem(LAST_401_RELOAD_KEY, String(now));
+    window.location.reload();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resetAuthReloadState(): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.removeItem(LAST_401_RELOAD_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Same-origin fetch that always includes cookies (HttpOnly token handoff)
  * and merges auth headers. Remote LAN clients need both cookie + Bearer.
@@ -125,6 +161,9 @@ async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promi
     const resp = await fetch(input, { ...init, credentials: 'include', headers });
     if (resp.status === 401) {
       console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', input);
+      handleAuthExpiredReload();
+    } else if (resp.ok) {
+      resetAuthReloadState();
     }
     return resp;
   } catch (err: any) {
@@ -832,12 +871,32 @@ export async function streamChat(
   }
 }
 
+/**
+ * Hard upper bound for a decision POST. Approval delivery is a tiny request, but
+ * the card latches its buttons while it is in flight: a half-open connection
+ * (long-idle NAT/relay drop, suspended desktop webview) that never answers would
+ * otherwise leave the card permanently unclickable with no error.
+ */
+const PERMISSION_DECISION_TIMEOUT_MS = 15_000;
+
+function permissionDecisionSignal(): AbortSignal | undefined {
+  if (typeof AbortSignal === 'undefined') return undefined;
+  const AbortSignalAny = AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal };
+  if (typeof AbortSignalAny.timeout === 'function') {
+    return AbortSignalAny.timeout(PERMISSION_DECISION_TIMEOUT_MS);
+  }
+  if (typeof AbortController === 'undefined') return undefined;
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), PERMISSION_DECISION_TIMEOUT_MS);
+  return controller.signal;
+}
+
 export async function respondPermission(
   sessionId: string,
   approvalId: string,
   decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
   toolName?: string,
-): Promise<{ success: boolean }> {
+): Promise<PermissionDecisionResult> {
   const resp = await apiFetch('/chat/permission', {
     method: 'POST',
     headers: {
@@ -845,8 +904,39 @@ export async function respondPermission(
       ...authHeaders(),
     },
     body: JSON.stringify({ session_id: sessionId, approval_id: approvalId, decision, tool_name: toolName }),
+    signal: permissionDecisionSignal(),
   });
-  return resp.json();
+  // The daemon answers every decision with a JSON verdict (success / expired /
+  // already_resolved). A non-JSON body is a transport-level surprise, not a
+  // verdict — surface it as a retryable failure instead of guessing.
+  const text = await resp.text();
+  let body: unknown = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+  }
+  if (body && typeof body === 'object') {
+    const verdict = body as {
+      success?: unknown;
+      already_resolved?: unknown;
+      applied?: unknown;
+      expired?: unknown;
+      error?: unknown;
+    };
+    return {
+      success: verdict.success === true,
+      already_resolved: verdict.already_resolved === true,
+      applied: typeof verdict.applied === 'string' ? verdict.applied : undefined,
+      expired: verdict.expired === true,
+      error: typeof verdict.error === 'string' ? verdict.error : undefined,
+    };
+  }
+  throw new Error(
+    resp.ok ? 'permission decision returned an invalid payload' : `permission decision failed: HTTP ${resp.status}`,
+  );
 }
 
 // --- Session types ---
@@ -2037,34 +2127,100 @@ export type GlobalWireEvent =
   /** 会话审批模式变更（跨实例全局广播） */
   | { type: 'session_mode'; session_id?: string | null; mode: ApprovalMode };
 
+const GLOBAL_EVENTS_IDLE_TIMEOUT_MS = 30_000;
+
 /** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
 export async function streamGlobalEvents(
   onEvent: (event: GlobalWireEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const resp = await apiFetch('/events', { headers: authHeaders(), signal });
-  if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  const streamAbort = new AbortController();
+  const onParentAbort = () => streamAbort.abort();
+  if (signal) {
+    if (signal.aborted) streamAbort.abort();
+    else signal.addEventListener('abort', onParentAbort, { once: true });
   }
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
-      if (!dataLine) continue;
-      const jsonStr = dataLine.slice('data:'.length).trim();
-      if (!jsonStr) continue;
-      try {
-        onEvent(JSON.parse(jsonStr) as GlobalWireEvent);
-      } catch {
-        /* keep-alive / malformed frame */
+
+  let lastActivity = Date.now();
+  // 活性看门狗：后端 /events 每 15 秒发送一次 ping 心跳。
+  // 若超过 30 秒没有任何网络数据（含 15s keepalive ping），判定底层 TCP 连接已处于半开假死状态，
+  // 主动 abort 中断当前 reader，促使外部自动重连并触发 Sync 增量校准。
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastActivity > GLOBAL_EVENTS_IDLE_TIMEOUT_MS) {
+      streamAbort.abort();
+    }
+  }, 4000);
+  if (typeof (watchdog as any).unref === 'function') {
+    (watchdog as any).unref();
+  }
+
+  // 视口唤醒自愈：设备从休眠/熄屏恢复时立即检测是否超时，不等下一次 4s interval tick
+  const checkWakeup = () => {
+    if (typeof document !== 'undefined' && !document.hidden) {
+      if (Date.now() - lastActivity > GLOBAL_EVENTS_IDLE_TIMEOUT_MS) {
+        streamAbort.abort();
       }
+    }
+  };
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', checkWakeup);
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', checkWakeup);
+    window.addEventListener('online', checkWakeup);
+  }
+
+  let readerCancelHandler: (() => void) | null = null;
+  try {
+    const resp = await apiFetch('/events', { headers: authHeaders(), signal: streamAbort.signal });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    }
+    const reader = resp.body!.getReader();
+    readerCancelHandler = () => {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+    };
+    streamAbort.signal.addEventListener('abort', readerCancelHandler, { once: true });
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      lastActivity = Date.now();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
+        if (!dataLine) continue;
+        const jsonStr = dataLine.slice('data:'.length).trim();
+        if (!jsonStr) continue;
+        try {
+          onEvent(JSON.parse(jsonStr) as GlobalWireEvent);
+        } catch {
+          /* keep-alive / malformed frame */
+        }
+      }
+    }
+    if (signal?.aborted) {
+      const error = new Error('global events aborted');
+      error.name = 'AbortError';
+      throw error;
+    }
+  } finally {
+    clearInterval(watchdog);
+    if (signal) signal.removeEventListener('abort', onParentAbort);
+    if (readerCancelHandler) {
+      streamAbort.signal.removeEventListener('abort', readerCancelHandler);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', checkWakeup);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', checkWakeup);
+      window.removeEventListener('online', checkWakeup);
     }
   }
 }

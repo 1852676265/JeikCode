@@ -397,9 +397,14 @@ fn resolve_page_indices<T>(
     let start = if offset < total && is_user_start(&items[offset]) {
         offset
     } else {
-        (0..offset).rev().find(|&i| is_user_start(&items[i])).unwrap_or(offset)
+        (0..offset)
+            .rev()
+            .find(|&i| is_user_start(&items[i]))
+            .unwrap_or(offset)
     };
-    let next = (end..total).find(|&i| is_user_start(&items[i])).unwrap_or(end);
+    let next = (end..total)
+        .find(|&i| is_user_start(&items[i]))
+        .unwrap_or(end);
     (total, start, start, next, None)
 }
 
@@ -421,11 +426,8 @@ fn take_session_page(
     mut messages: Vec<MessageInfo>,
     query: &SessionDetailQuery,
 ) -> (usize, usize, Vec<MessageInfo>, Option<usize>) {
-    let (total, offset, start, end, pinned) = resolve_page_indices(
-        &messages,
-        is_visible_user_turn_start,
-        query,
-    );
+    let (total, offset, start, end, pinned) =
+        resolve_page_indices(&messages, is_visible_user_turn_start, query);
     if let Some(idx) = pinned {
         let pinned_msg = messages[idx].clone();
         let mut window: Vec<MessageInfo> = messages.drain(start..end).collect();
@@ -1331,7 +1333,11 @@ fn session_records_user_outline(
             if !record.role.eq_ignore_ascii_case("user") || record.synthetic {
                 return None;
             }
-            let text = record.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            let text = record
+                .content
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if text.is_empty() {
                 return None;
             }
@@ -5195,7 +5201,8 @@ async fn get_session_detail(
                 .filter(|(meta, _)| meta.last_turn_id >= snapshot_last_turn);
             let (turns, message_count, offset, messages, pinned_user_index) =
                 if let Some((meta, records)) = display {
-                    let elapsed = display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
+                    let elapsed =
+                        display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
                     // A hook-created log begins at the first user turn; a backfill
                     // already contains the session-start prefix. Prepend the prefix
                     // only in the former case so indices stay stable across upgrades.
@@ -5224,7 +5231,9 @@ async fn get_session_detail(
                     if prefix_len == 0 {
                         let (total, offset, start, end, pinned) = resolve_page_indices(
                             &records,
-                            |r| is_visible_user_turn_start_content(&r.role, r.synthetic, &r.content),
+                            |r| {
+                                is_visible_user_turn_start_content(&r.role, r.synthetic, &r.content)
+                            },
                             &query,
                         );
                         let snapshot_ids: std::collections::HashSet<&str> = session
@@ -5246,7 +5255,8 @@ async fn get_session_detail(
                             {
                                 if let Some(id) = p_msg.id.as_deref() {
                                     if !snapshot_ids.contains(id) {
-                                        p_msg.internal_origin = Some("transcript_archive".to_string());
+                                        p_msg.internal_origin =
+                                            Some("transcript_archive".to_string());
                                     }
                                 }
                             }
@@ -5263,7 +5273,8 @@ async fn get_session_detail(
                             {
                                 if let Some(id) = msg.id.as_deref() {
                                     if !snapshot_ids.contains(id) {
-                                        msg.internal_origin = Some("transcript_archive".to_string());
+                                        msg.internal_origin =
+                                            Some("transcript_archive".to_string());
                                     }
                                 }
                             }
@@ -5302,7 +5313,8 @@ async fn get_session_detail(
                             std::path::Path::new(&session.meta.working_dir),
                             &session.meta.id,
                         );
-                        let (message_count, offset, window, pinned) = take_session_page(full_messages, &query);
+                        let (message_count, offset, window, pinned) =
+                            take_session_page(full_messages, &query);
                         (turns, message_count, offset, window, pinned)
                     }
                 } else {
@@ -5349,7 +5361,8 @@ async fn get_session_detail(
                         .and_then(|path| std::fs::metadata(path).ok())
                         .is_some_and(|metadata| {
                             metadata.len()
-                                > jeikcode_capabilities::session::display::MAX_DISPLAY_READ_BYTES as u64
+                                > jeikcode_capabilities::session::display::MAX_DISPLAY_READ_BYTES
+                                    as u64
                         });
                     if !turn_running && !messages.is_empty() && !display_too_large {
                         let records: Vec<_> = messages
@@ -13340,6 +13353,11 @@ pub struct PermissionDecisionRequest {
     pub tool_name: Option<String>,
 }
 
+/// How long `/chat/permission` waits for the running turn to actually consume the
+/// queued decision before reporting an unconfirmed (retryable) outcome. The runtime
+/// consumes in microseconds; this only fires for a wedged turn.
+const PERMISSION_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 async fn chat_permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionDecisionRequest>,
@@ -13380,17 +13398,37 @@ async fn chat_permission(
             // A queued oneshot value can still lose a race with the driver's
             // request timeout. Report success only after the driver consumes
             // this exact decision; timeout/cancel drops the acknowledgement.
-            return match accepted.await {
-                Ok(()) => Json(serde_json::json!({ "success": true })),
-                Err(_) => Json(serde_json::json!({
+            // Bound that wait: an unbounded await turns a wedged runtime into a
+            // browser request that never settles, and the card's buttons stay
+            // disabled with no way back.
+            return match tokio::time::timeout(PERMISSION_ACK_WAIT, accepted).await {
+                Ok(Ok(())) => Json(serde_json::json!({ "success": true })),
+                Ok(Err(_)) => Json(serde_json::json!({
                     "success": false,
+                    "expired": true,
                     "error": "permission request expired"
                 })),
+                Err(_) => Json(serde_json::json!({
+                    "success": false,
+                    "error": "permission decision was not acknowledged in time; retry"
+                })),
             };
+        }
+        permission_bridge::PermissionDelivery::AlreadyResolved { decision: applied } => {
+            // Idempotent replay of an approval that already took effect this turn
+            // (lost HTTP reply over a long-idle connection, a second WebUI
+            // instance, a retried click). Never deliver twice and never mutate
+            // MCP/config policy here — just let the stale card retire.
+            return Json(serde_json::json!({
+                "success": true,
+                "already_resolved": true,
+                "applied": permission_bridge::decision_wire(applied),
+            }));
         }
         permission_bridge::PermissionDelivery::Expired => {
             return Json(serde_json::json!({
                 "success": false,
+                "expired": true,
                 "error": "permission request expired"
             }));
         }
@@ -13403,6 +13441,7 @@ async fn chat_permission(
     if active_operation.is_some() {
         return Json(serde_json::json!({
             "success": false,
+            "expired": true,
             "error": "stale or unknown permission request"
         }));
     }
@@ -13419,6 +13458,7 @@ async fn chat_permission(
             if permission_bridge::approval_id_for_pending(&pending) != approval_id {
                 return Json(serde_json::json!({
                     "success": false,
+                    "expired": true,
                     "error": "stale or unknown permission request"
                 }));
             }
@@ -13427,6 +13467,7 @@ async fn chat_permission(
     }
     Json(serde_json::json!({
         "success": false,
+        "expired": true,
         "error": "permission request is no longer active; retry the operation"
     }))
 }
@@ -17214,6 +17255,32 @@ mod tests {
             .unwrap();
         let accepted_body: serde_json::Value = serde_json::from_slice(&accepted_bytes).unwrap();
         assert_eq!(accepted_body["success"], true);
+
+        // A retried POST for the same approval (its reply was lost over a long-idle
+        // connection, the app was suspended, or another WebUI instance clicked too)
+        // must report the truth instead of "stale or unknown permission request" —
+        // otherwise the card can never be dismissed again.
+        let replay_response = chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: "approval-accept".into(),
+                decision: "deny".into(),
+                tool_name: None,
+            }),
+        )
+        .await
+        .into_response();
+        let replay_bytes = axum::body::to_bytes(replay_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replay_body: serde_json::Value = serde_json::from_slice(&replay_bytes).unwrap();
+        assert_eq!(replay_body["success"], true);
+        assert_eq!(replay_body["already_resolved"], true);
+        assert_eq!(
+            replay_body["applied"], "allow",
+            "a retry reports the decision that actually took effect, never the retried one"
+        );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.pending_permissions.register(

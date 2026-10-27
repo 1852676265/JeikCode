@@ -3249,6 +3249,13 @@ export function Chat({
   useEffect(
     () =>
       onGlobalEvent((event) => {
+        if (event.type === 'sync') {
+          const sid = activeIdRef.current;
+          if (sid) {
+            restorePendingInteractive(sid, sessionGenerationRef.current);
+          }
+          return;
+        }
         if (event.type === 'activity') {
           const sid = activeIdRef.current;
           if (sid && event.session_id === sid) {

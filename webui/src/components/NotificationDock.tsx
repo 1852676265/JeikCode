@@ -41,6 +41,12 @@ import { onGlobalEvent } from '../lib/globalEvents';
 import { useT } from '../settings';
 import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
+import { showToast } from './Toast';
+import {
+  PermissionRetiredError,
+  permissionRetiredInfo,
+  stillPendingApproval,
+} from '../lib/pendingPermission';
 
 export interface LiveReviewState {
   sessionId: string | null;
@@ -114,6 +120,8 @@ export function NotificationDock({
   const [polled, setPolled] = useState<PolledPrompt[]>([]);
   const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
   const [toasts, setToasts] = useState<TerminalToast[]>([]);
+  /** A decision POST is in flight: resume-reconciliation must never race it. */
+  const decisionInFlight = useRef(false);
   const seenSeq = useRef(new Map<string, number>());
   const primedSeq = useRef(false);
   const recent = useRef(new Map<string, number>());
@@ -303,6 +311,11 @@ export function NotificationDock({
     // review_asked 只对该会话做一次定向 pending 拉取（单会话小请求）；
     // review_resolved 按 id 就地移除；activity.terminal 直接推右下角通知。
     return onGlobalEvent((event) => {
+      if (event.type === 'sync') {
+        // 重连 / 唤醒对账：与服务端单真值进行绝对校准，消除半开断线期间遗留的幽灵审批卡片
+        void reconcileAuthoritativePending({ force: true });
+        return;
+      }
       if (event.type === 'session_upsert') {
         const row = event.session;
         setHints((prev) => ({
@@ -495,6 +508,68 @@ export function NotificationDock({
   const liveUserInput = liveReview?.userInput ?? null;
   const liveSessionId = liveReview?.sessionId ?? null;
   const chatPerm = allowPermission ? chatPermission : null;
+  const chatPermRef = useRef(chatPerm);
+  chatPermRef.current = chatPerm;
+
+  async function reconcileAuthoritativePending(opts?: { force?: boolean }) {
+    if (!opts?.force && typeof document !== 'undefined' && document.hidden) return;
+    if (decisionInFlight.current) return;
+
+    let runtime: Awaited<ReturnType<typeof getRuntimeSessions>> = [];
+    let active: string[] = [];
+    try {
+      const [nextRuntime, nextActive] = await Promise.all([
+        getRuntimeSessions(),
+        getActiveChatSessions(),
+      ]);
+      runtime = nextRuntime;
+      active = nextActive;
+    } catch {
+      return;
+    }
+
+    const ids = new Set(active);
+    for (const row of runtime) {
+      if (row.activity === 'waiting_approval' || row.activity === 'waiting_user_input') {
+        ids.add(row.session_id);
+      }
+    }
+    if (activeSession?.id) ids.add(activeSession.id);
+    if (chatPermRef.current?.session_id) ids.add(chatPermRef.current.session_id);
+
+    const prompts = await Promise.all(
+      [...ids].map(async (sessionId) => {
+        try {
+          const pending = await getChatPending(sessionId);
+          return { sessionId, permission: pending.permission, userInput: pending.user_input } satisfies PolledPrompt;
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    const validPrompts = prompts.filter((item): item is PolledPrompt => item !== null);
+    setPolled(validPrompts);
+
+    // 对前台正展示的 chatPerm 进行绝对真值校准：
+    // 若服务端最新 pending 已无此 approval_id，说明已在异地端处理或已失效，就地撤卡并提示。
+    const currentChatPerm = chatPermRef.current;
+    if (currentChatPerm) {
+      const sid = currentChatPerm.session_id;
+      const targetPrompt = validPrompts.find((p) => p.sessionId === sid);
+      const serverPending = targetPrompt?.permission;
+      if (!stillPendingApproval(serverPending, { approval_id: currentChatPerm.approval_id, call_id: currentChatPerm.call_id })) {
+        dismissCardLocally(
+          `chat:${permissionInstanceKey(sid, currentChatPerm)}`,
+          sid,
+          currentChatPerm.call_id,
+          currentChatPerm.approval_id,
+        );
+        onDismissChatPermission();
+        showToast(tRef.current('perm.stale'), 'info');
+      }
+    }
+  }
 
   const permissionCards: Array<{
     key: string;
@@ -598,6 +673,28 @@ export function NotificationDock({
       pingReview(`ask:${card.sessionId}:${card.req.request_id}`, card.sessionId, detail, true);
     }
   }, [mode, permissionCards.map((card) => card.key).join('|'), questionCards.map((card) => card.key).join('|')]);
+
+  // 卡片可能比审批活得更久：用户把弹窗晾了几个小时后，该审批可能早已在别的实例
+  // 被处理（或回合已结束），而本该清掉它的 SSE 可能已经静默断连——留在屏幕上的
+  // 卡片看起来还能点，实际每次都撞在已被消费的路由上。用户回来的那一刻（窗口
+  // 重新获得焦点 / 页面恢复可见）向 daemon 复核一次，确认不再是同一个审批就撤掉。
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let lastCheck = 0;
+    const verify = () => {
+      const now = Date.now();
+      // 焦点事件会连发（alt-tab / devtools），2s 内只复核一次。
+      if (now - lastCheck < 2000) return;
+      lastCheck = now;
+      void reconcileAuthoritativePending({ force: true });
+    };
+    window.addEventListener('focus', verify);
+    document.addEventListener('visibilitychange', verify);
+    return () => {
+      window.removeEventListener('focus', verify);
+      document.removeEventListener('visibilitychange', verify);
+    };
+  }, []);
 
   const interactiveCards: Array<
     | { kind: 'permission'; card: (typeof permissionCards)[0] }
@@ -771,25 +868,40 @@ export function NotificationDock({
                 onDismissChatPermission();
             }}
             onDecide={async (decision, toolName) => {
-              if (currentCard.card.live) {
-                await postLivePermission(
+              decisionInFlight.current = true;
+              try {
+                if (currentCard.card.live) {
+                  await postLivePermission(
+                    decision,
+                    toolName,
+                    currentCard.card.sessionId,
+                    currentCard.card.runtime_instance_id,
+                    currentCard.card.generation,
+                    currentCard.card.request_id,
+                  );
+                  return;
+                }
+                const result = await respondPermission(
+                  currentCard.card.sessionId,
+                  currentCard.card.approval_id ?? '',
                   decision,
                   toolName,
-                  currentCard.card.sessionId,
-                  currentCard.card.runtime_instance_id,
-                  currentCard.card.generation,
-                  currentCard.card.request_id,
                 );
-                return;
+                const retired = permissionRetiredInfo(result);
+                if (retired) {
+                  // Already applied (lost reply / another client) or dead for good:
+                  // retrying this exact approval can never succeed. The card retires
+                  // and explains why through `onRetired`.
+                  throw new PermissionRetiredError(retired);
+                }
+                if (!result.success) {
+                  throw new Error(result.error ?? 'permission request is no longer pending');
+                }
+              } finally {
+                decisionInFlight.current = false;
               }
-              const result = await respondPermission(
-                currentCard.card.sessionId,
-                currentCard.card.approval_id ?? '',
-                decision,
-                toolName,
-              );
-              if (!result.success) throw new Error('permission request is no longer pending');
             }}
+            onRetired={() => showToast(tRef.current('perm.stale'), 'info')}
           />
         </section>
       );
