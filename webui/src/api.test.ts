@@ -112,6 +112,48 @@ test('live mode still rejects protocol-level failures', async () => {
   }
 });
 
+test('postLiveMode forwards the global switch and reports the confirmed state', async () => {
+  const originalFetch = globalThis.fetch;
+  let sentBody: any = null;
+  globalThis.fetch = (async (_url: any, init: any) => {
+    sentBody = JSON.parse(init.body);
+    return new Response(
+      JSON.stringify({ ok: true, mode: 'plan', global: true }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const { postLiveMode } = await import('./api.ts');
+    const mode = await postLiveMode('plan', 'sess-1', true);
+    assert.equal(mode, 'plan');
+    assert.equal(sentBody.global, true);
+    assert.equal(sentBody.session_id, 'sess-1');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('postLiveMode omits the global field when the switch is not being toggled', async () => {
+  const originalFetch = globalThis.fetch;
+  let sentBody: any = null;
+  globalThis.fetch = (async (_url: any, init: any) => {
+    sentBody = JSON.parse(init.body);
+    return new Response(
+      JSON.stringify({ ok: true, mode: 'build', global: false }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const { postLiveMode } = await import('./api.ts');
+    await postLiveMode('build', 'sess-1');
+    assert.equal('global' in sentBody, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveUserInput rejects an answer the runtime did not accept', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(

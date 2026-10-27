@@ -92,6 +92,27 @@ static SESSION_APPROVAL_MODE_MISSES: std::sync::LazyLock<
     StdMutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
 
+/// 全局模式开关（默认关闭）。
+///
+/// 开启后 **所有会话** 统一使用 `LIVE_APPROVAL_MODE`，各自记录的会话级模式暂时忽略；
+/// 关闭后各会话恢复自己的模式。只影响交互式会话（WebUI / TUI），
+/// `/v1/*` 等 API 端点始终由 `force_approval_mode` 决定，与本开关无关。
+static GLOBAL_APPROVAL_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 全局模式开关当前是否开启。
+pub(crate) fn live_global_mode_enabled() -> bool {
+    GLOBAL_APPROVAL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// 切换全局模式开关。`mode` 提供时同时把该模式设为全局模式。
+pub(crate) fn live_set_global_mode_enabled(enabled: bool, mode: Option<ApprovalMode>) {
+    GLOBAL_APPROVAL_OVERRIDE.store(enabled, std::sync::atomic::Ordering::Release);
+    if let Some(mode) = mode {
+        *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+}
+
 /// 读取当前全局生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
 pub(crate) fn live_current_approval_mode() -> ApprovalMode {
@@ -103,6 +124,10 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 /// 性能：内存命中为 O(1)；磁盘回填只做一次（命中后写入内存，未命中则记入
 /// 负缓存，避免会话列表逐行渲染时反复扫描会话目录）。
 pub(crate) fn live_session_approval_mode(session_id: Option<&str>) -> ApprovalMode {
+    // 全局开关开启：所有会话统一跟随全局模式，忽略会话级记录。
+    if live_global_mode_enabled() {
+        return live_current_approval_mode();
+    }
     let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
         return live_current_approval_mode();
     };
@@ -149,6 +174,11 @@ fn cached_session_approval_mode(sid: &str) -> Option<ApprovalMode> {
 
 /// 仅查内存热态（不触及磁盘）：供会话列表/增量行等热路径使用。
 pub(crate) fn live_session_approval_mode_cached(session_id: Option<&str>) -> Option<ApprovalMode> {
+    // 全局开关开启时没有“会话级真相”：返回 None 让调用方落到全局模式，
+    // 否则旧的会话级缓存会反向覆盖全局选择。
+    if live_global_mode_enabled() {
+        return None;
+    }
     session_id
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -517,9 +547,17 @@ pub fn live_set_mode(mode: ApprovalMode) {
 
 /// 设置 live 视图审批模式（可指定 session_id）；若命中活跃 binding 则下发 `SetMode`，
 /// 同时持久化至会话元数据并通过全局事件总线广播给所有异地客户端。
+///
+/// 全局开关开启时，任何切换都被提升为全局切换：不写会话级记录、不落盘、
+/// 广播也不带 session_id（所有实例将整条视线对齐到同一模式）。
 pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
-    live_set_session_approval_mode(session_id, mode);
-    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+    let target: Option<&str> = if live_global_mode_enabled() {
+        None
+    } else {
+        session_id.filter(|s| !s.trim().is_empty())
+    };
+    live_set_session_approval_mode(target, mode);
+    if let Some(sid) = target {
         let sid = sid.trim();
         if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
             let _ = jeikcode_capabilities::session::SessionManager::for_project(
@@ -531,7 +569,7 @@ pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
         }
     }
     if let Ok(binding) = crate::native_live::binding() {
-        let affects_binding = match session_id {
+        let affects_binding = match target {
             Some(sid) => binding.session_id == sid,
             None => true,
         };
@@ -545,7 +583,7 @@ pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
         }
     }
     crate::publish_global(crate::GlobalWireEvent::SessionMode {
-        session_id: session_id.map(str::to_string),
+        session_id: target.map(str::to_string),
         mode: mode.wire().to_string(),
     });
 }
@@ -563,6 +601,7 @@ impl ScopedApprovalModeForTest {
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        live_set_global_mode_enabled(false, None);
         live_set_mode(ApprovalMode::Build);
         if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
             *map = None;
@@ -574,6 +613,7 @@ impl ScopedApprovalModeForTest {
 #[cfg(test)]
 impl Drop for ScopedApprovalModeForTest {
     fn drop(&mut self) {
+        live_set_global_mode_enabled(false, None);
         live_set_mode(ApprovalMode::Build);
         if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
             *map = None;
@@ -3464,6 +3504,10 @@ pub(crate) struct LiveModeReq {
     /// 目标 session id；提供时将模式隔离记录在该会话上，避免污染其他项目/会话。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 全局模式开关。`Some(true/false)` 表示同时切换开关；`None` 表示只改模式。
+    /// 开启后所有会话统一跟随本模式，且不再写会话级记录。
+    #[serde(default)]
+    pub global: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -3477,6 +3521,8 @@ pub(crate) struct ApprovalModeQuery {
 pub(crate) struct ApprovalModeResp {
     pub ok: bool,
     pub mode: ApprovalMode,
+    /// 全局模式开关当前是否开启（前端胶囊状态）。
+    pub global: bool,
 }
 
 pub(crate) async fn approval_mode_get(
@@ -3485,6 +3531,7 @@ pub(crate) async fn approval_mode_get(
     Json(ApprovalModeResp {
         ok: true,
         mode: live_session_approval_mode(query.session_id.as_deref()),
+        global: live_global_mode_enabled(),
     })
 }
 
@@ -3530,9 +3577,45 @@ pub(crate) async fn approval_mode_set(
     Json(req): Json<LiveModeReq>,
 ) -> impl IntoResponse {
     let session_id = req.session_id.as_deref();
-    let ok = apply_live_mode_scoped(session_id, req.mode).await;
+    let ok = apply_mode_request(&state, &req).await;
+    Json(ApprovalModeResp {
+        ok,
+        mode: live_session_approval_mode(session_id),
+        global: live_global_mode_enabled(),
+    })
+}
+
+/// Shared handler body for `/approval_mode` 与 `/live/mode`。
+///
+/// 顺序语义：先切换全局开关（若请求携带），再按“当前是否全局”决定作用域。
+/// 全局开启时，任何模式切换都是全局切换；关闭时恢复各会话自己的模式并重下发给
+/// 正在运行的 runner，保证后台会话不被全局态残留污染。
+async fn apply_mode_request(state: &AppState, req: &LiveModeReq) -> bool {
+    let was_global = live_global_mode_enabled();
+    if let Some(enabled) = req.global {
+        live_set_global_mode_enabled(enabled, Some(req.mode));
+    }
+    let now_global = live_global_mode_enabled();
+    let scope: Option<&str> = if now_global {
+        None
+    } else {
+        req.session_id.as_deref().filter(|s| !s.trim().is_empty())
+    };
+    let ok = apply_live_mode_scoped(scope, req.mode).await;
+
+    if req.global.is_some() && was_global != now_global {
+        if !now_global {
+            // 关闭全局：把每个会话原本记录的模式重新下发给各自的 runner。
+            reapply_per_session_modes().await;
+        }
+        crate::publish_global(crate::GlobalWireEvent::ModeGlobal {
+            enabled: now_global,
+            mode: live_current_approval_mode().wire().to_string(),
+        });
+    }
+
     if req.mode == ApprovalMode::Auto {
-        match session_id.filter(|s| !s.trim().is_empty()) {
+        match scope {
             Some(sid) => {
                 state
                     .pending_permissions
@@ -3553,10 +3636,22 @@ pub(crate) async fn approval_mode_set(
             }
         }
     }
-    Json(ApprovalModeResp {
-        ok,
-        mode: live_session_approval_mode(session_id),
-    })
+    ok
+}
+
+/// 关闭全局开关后，把各会话恢复为自己的模式（仅影响正在运行的 runner）。
+async fn reapply_per_session_modes() {
+    let registry = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+    for entry in registry.list_all() {
+        if let Some(handle) = registry.handle(&entry.session_id) {
+            let mode = live_session_approval_mode(Some(&entry.session_id));
+            let _ = handle.set_mode(native_runtime_mode(mode)).await;
+        }
+    }
+    if let Ok(binding) = crate::native_live::binding() {
+        let mode = live_session_approval_mode(Some(&binding.session_id));
+        let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
+    }
 }
 
 /// POST /live/mode — webui 底栏「模式」pill 切换审批模式
@@ -3572,32 +3667,11 @@ pub(crate) async fn live_mode(
     Json(req): Json<LiveModeReq>,
 ) -> impl IntoResponse {
     let session_id = req.session_id.as_deref();
-    let ok = apply_live_mode_scoped(session_id, req.mode).await;
-    if req.mode == ApprovalMode::Auto {
-        match session_id.filter(|s| !s.trim().is_empty()) {
-            Some(sid) => {
-                state
-                    .pending_permissions
-                    .deliver_all_for_session(sid.trim(), PermissionDecision::AllowOnce);
-                jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                    sid.trim(),
-                );
-            }
-            None => {
-                state
-                    .pending_permissions
-                    .deliver_all(PermissionDecision::AllowOnce);
-                if let Ok(binding) = crate::native_live::binding() {
-                    jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                        &binding.session_id,
-                    );
-                }
-            }
-        }
-    }
+    let ok = apply_mode_request(&state, &req).await;
     Json(ApprovalModeResp {
         ok,
         mode: live_session_approval_mode(session_id),
+        global: live_global_mode_enabled(),
     })
 }
 
@@ -4361,7 +4435,10 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&body).expect("approval mode response json");
 
-        assert_eq!(value, serde_json::json!({ "ok": true, "mode": "bypass" }));
+        assert_eq!(
+            value,
+            serde_json::json!({ "ok": true, "mode": "bypass", "global": false })
+        );
     }
 
     #[tokio::test]
@@ -4380,7 +4457,7 @@ mod tests {
         let val_default: serde_json::Value = serde_json::from_slice(&body_default).expect("json");
         assert_eq!(
             val_default,
-            serde_json::json!({ "ok": true, "mode": "build" })
+            serde_json::json!({ "ok": true, "mode": "build", "global": false })
         );
 
         // Scoped query for session-alpha returns isolated Plan mode.
@@ -4393,7 +4470,10 @@ mod tests {
             .await
             .expect("read response body");
         let val_alpha: serde_json::Value = serde_json::from_slice(&body_alpha).expect("json");
-        assert_eq!(val_alpha, serde_json::json!({ "ok": true, "mode": "plan" }));
+        assert_eq!(
+            val_alpha,
+            serde_json::json!({ "ok": true, "mode": "plan", "global": false })
+        );
 
         // Other session without explicit override falls back to global Build mode.
         let resp_beta = approval_mode_get(axum::extract::Query(ApprovalModeQuery {
@@ -4405,7 +4485,10 @@ mod tests {
             .await
             .expect("read response body");
         let val_beta: serde_json::Value = serde_json::from_slice(&body_beta).expect("json");
-        assert_eq!(val_beta, serde_json::json!({ "ok": true, "mode": "build" }));
+        assert_eq!(
+            val_beta,
+            serde_json::json!({ "ok": true, "mode": "build", "global": false })
+        );
 
         // Clearing session-alpha restores fallback to default mode.
         live_clear_session_approval_mode("session-alpha");
@@ -4420,8 +4503,67 @@ mod tests {
         let val_cleared: serde_json::Value = serde_json::from_slice(&body_cleared).expect("json");
         assert_eq!(
             val_cleared,
-            serde_json::json!({ "ok": true, "mode": "build" })
+            serde_json::json!({ "ok": true, "mode": "build", "global": false })
         );
+    }
+
+    #[test]
+    fn global_mode_switch_overrides_every_session_and_reverts_cleanly() {
+        let _guard = ScopedApprovalModeForTest::new();
+        live_set_session_approval_mode(Some("sess-a"), ApprovalMode::Plan);
+        live_set_session_approval_mode(Some("sess-b"), ApprovalMode::AcceptEdits);
+
+        // 默认关闭：各会话独立。
+        assert!(!live_global_mode_enabled());
+        assert_eq!(
+            live_session_approval_mode(Some("sess-a")),
+            ApprovalMode::Plan
+        );
+
+        // 开启全局：所有会话统一跟随全局模式，会话级记录被暂时忽略。
+        live_set_global_mode_enabled(true, Some(ApprovalMode::Auto));
+        assert!(live_global_mode_enabled());
+        assert_eq!(
+            live_session_approval_mode(Some("sess-a")),
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            live_session_approval_mode(Some("sess-b")),
+            ApprovalMode::Auto
+        );
+        // 全局开启时不再暴露会话级真相（避免反向覆盖）。
+        assert!(live_session_approval_mode_cached(Some("sess-a")).is_none());
+
+        // 关闭全局：各会话恢复自己的记录。
+        live_set_global_mode_enabled(false, None);
+        assert!(!live_global_mode_enabled());
+        assert_eq!(
+            live_session_approval_mode(Some("sess-a")),
+            ApprovalMode::Plan
+        );
+        assert_eq!(
+            live_session_approval_mode(Some("sess-b")),
+            ApprovalMode::AcceptEdits
+        );
+    }
+
+    #[test]
+    fn mode_global_event_serializes_its_switch_state() {
+        let on = serde_json::to_value(crate::GlobalWireEvent::ModeGlobal {
+            enabled: true,
+            mode: "plan".into(),
+        })
+        .unwrap();
+        assert_eq!(on["type"], "mode_global");
+        assert_eq!(on["enabled"], true);
+        assert_eq!(on["mode"], "plan");
+
+        let off = serde_json::to_value(crate::GlobalWireEvent::ModeGlobal {
+            enabled: false,
+            mode: "build".into(),
+        })
+        .unwrap();
+        assert_eq!(off["enabled"], false);
     }
 
     #[tokio::test]

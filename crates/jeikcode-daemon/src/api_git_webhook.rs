@@ -590,6 +590,9 @@ pub(crate) async fn execute_git_workflow(
                 false, // interactive_user_input
                 terminal_sent_inner,
                 true, // keep_raw_markdown
+                // Webhook-driven automation is API-owned: forced Auto, never the
+                // interactive global mode switch.
+                Some(crate::approval_mode::ApprovalMode::Auto),
             )
             .await
         })

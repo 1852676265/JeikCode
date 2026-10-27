@@ -50,6 +50,15 @@ export function emitGlobalEvent(event: GlobalWireEvent): void {
       );
     } catch {}
   }
+  if (event.type === 'mode_global') {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('jeikcode:mode_global_changed', {
+          detail: { enabled: event.enabled, mode: event.mode },
+        }),
+      );
+    } catch {}
+  }
   for (const listener of [...listeners]) {
     try {
       listener(event);

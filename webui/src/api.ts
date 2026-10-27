@@ -2106,6 +2106,8 @@ export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 export interface ApprovalModeResponse {
   ok: boolean;
   mode: ApprovalMode;
+  /** 全局模式开关当前是否开启（所有会话统一跟随 `mode`）。 */
+  global: boolean;
 }
 
 /**
@@ -2132,7 +2134,9 @@ export type GlobalWireEvent =
   /** 终端会话变更（创建 / 关闭 / 清空），跨实例项目级全量广播 */
   | { type: 'terminal_updated'; cwd: string }
   /** 会话审批模式变更（跨实例全局广播） */
-  | { type: 'session_mode'; session_id?: string | null; mode: ApprovalMode };
+  | { type: 'session_mode'; session_id?: string | null; mode: ApprovalMode }
+  /** 全局模式开关变更：开启后所有会话统一跟随 `mode`。 */
+  | { type: 'mode_global'; enabled: boolean; mode: ApprovalMode };
 
 const GLOBAL_EVENTS_IDLE_TIMEOUT_MS = 30_000;
 
@@ -2415,15 +2419,24 @@ function getModeBroadcastChannel(): BroadcastChannel | null {
   return modeBroadcastChannel;
 }
 
-export function broadcastApprovalMode(mode: ApprovalMode, sessionId?: string | null): void {
+export function broadcastApprovalMode(
+  mode: ApprovalMode,
+  sessionId?: string | null,
+  global?: boolean,
+): void {
   if (typeof window !== 'undefined') {
     window.dispatchEvent(
       new CustomEvent('jeikcode:approval_mode_changed', {
-        detail: { mode, session_id: sessionId ?? undefined },
+        detail: { mode, session_id: sessionId ?? undefined, global },
       }),
     );
     try {
-      getModeBroadcastChannel()?.postMessage({ type: 'mode', mode, session_id: sessionId ?? undefined });
+      getModeBroadcastChannel()?.postMessage({
+        type: 'mode',
+        mode,
+        session_id: sessionId ?? undefined,
+        global,
+      });
     } catch {
       // ignore
     }
@@ -2432,28 +2445,43 @@ export function broadcastApprovalMode(mode: ApprovalMode, sessionId?: string | n
 
 /** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
  *  session state — the next turn's PermissionDecider follows it; broadcast to
- *  other tabs. */
-export async function postLiveMode(mode: ApprovalMode, sessionId?: string | null): Promise<ApprovalMode> {
+ *  other tabs. `global` toggles the cross-session override switch. */
+export async function postLiveMode(
+  mode: ApprovalMode,
+  sessionId?: string | null,
+  global?: boolean,
+): Promise<ApprovalMode> {
   const resp = await apiFetch('/approval_mode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ mode, session_id: sessionId || undefined }),
+    body: JSON.stringify({
+      mode,
+      session_id: sessionId || undefined,
+      global: global === undefined ? undefined : global,
+    }),
   });
   if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
   if (!body.ok) throw new Error('live runtime rejected the mode switch');
-  broadcastApprovalMode(body.mode, sessionId);
+  broadcastApprovalMode(body.mode, sessionId, body.global);
   return body.mode;
 }
 
 export async function getApprovalMode(sessionId?: string | null): Promise<ApprovalMode> {
+  return (await getApprovalModeState(sessionId)).mode;
+}
+
+/** Mode + global-switch state in one round-trip (cold start / focus / switch). */
+export async function getApprovalModeState(
+  sessionId?: string | null,
+): Promise<{ mode: ApprovalMode; global: boolean }> {
   const url = sessionId
     ? `/approval_mode?session_id=${encodeURIComponent(sessionId)}`
     : '/approval_mode';
   const resp = await apiFetch(url, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`get mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
-  return body.mode;
+  return { mode: body.mode, global: !!body.global };
 }
 
 /** Set the `reasoning_effort` and optional `thinking_budget` for a provider.

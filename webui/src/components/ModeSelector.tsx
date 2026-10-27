@@ -16,10 +16,16 @@ const MODE_OPTIONS: { val: ApprovalMode; label: MsgKey; desc: MsgKey }[] = [
 export function ModeSelector({
   value,
   disabled = false,
+  globalEnabled = false,
+  onToggleGlobal,
   onChange,
 }: {
   value: ApprovalMode;
   disabled?: boolean;
+  /** 全局开关当前状态：开启后所有会话统一使用 `value`。 */
+  globalEnabled?: boolean;
+  /** 切换全局开关；未提供时不渲染底部开关。 */
+  onToggleGlobal?: (enabled: boolean) => void;
   onChange: (m: ApprovalMode) => void;
 }) {
   const t = useT();
@@ -71,6 +77,30 @@ export function ModeSelector({
               <span class="mode-item-desc">{t(o.desc)}</span>
             </button>
           ))}
+          {onToggleGlobal && (
+            <div class="mode-global-row">
+              <div class="mode-global-text">
+                <span class="mode-global-label">{t('mode.global')}</span>
+                <span class="mode-global-desc">{t('mode.global.desc')}</span>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={globalEnabled ? 'true' : 'false'}
+                aria-label={t('mode.global')}
+                title={t('mode.global.desc')}
+                class={'mode-global-switch' + (globalEnabled ? ' on' : '')}
+                disabled={disabled}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (disabled) return;
+                  onToggleGlobal(!globalEnabled);
+                }}
+              >
+                <span class="mode-global-knob" />
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

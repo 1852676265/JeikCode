@@ -353,6 +353,8 @@ const zh = {
   'mode.auto.desc': '⚠ 自动批准所有操作，含改文件/跑命令',
   'mode.plan': 'Plan',
   'mode.plan.desc': '只读探索，先出方案',
+  'mode.global': '全局',
+  'mode.global.desc': '所有会话统一使用此模式（API 端点不受影响）',
 
   // Reasoning effort selector（中英文同一套英文文案，避免「关闭思考 (off)」这类夹杂）
   'effort.label': 'Effort',
@@ -1454,6 +1456,8 @@ export const en: Record<MsgKey, string> = {
   'mode.auto.desc': '⚠ Auto-approve everything, incl. edits/commands',
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.global': 'Global',
+  'mode.global.desc': 'All sessions follow this mode (API endpoints unaffected)',
 
   // Reasoning effort selector
   'effort.label': 'Effort',

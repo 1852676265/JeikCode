@@ -307,6 +307,8 @@ export const vi: Record<keyof typeof en, string> = {
   'mode.auto.desc': '⚠ Tự duyệt tất cả, kể cả chỉnh sửa và lệnh',
   'mode.plan': 'Lập kế hoạch',
   'mode.plan.desc': 'Chỉ đọc — tìm hiểu và lập kế hoạch trước',
+  'mode.global': 'Toàn cục',
+  'mode.global.desc': 'Mọi phiên dùng chung chế độ này (API không bị ảnh hưởng)',
   'effort.label': 'Mức suy luận',
   'effort.default': 'Mặc định',
   'effort.off': 'Off',

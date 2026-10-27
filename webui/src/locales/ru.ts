@@ -595,6 +595,8 @@ export const ru: Record<keyof typeof en, string> = {
   'mode.label': 'Mode',
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.global': 'Глобально',
+  'mode.global.desc': 'Все сессии следуют этому режиму (конечные точки API не затрагиваются)',
   'model.label': 'Model',
   'model.searchPlaceholder': 'Search providers or models...',
   'notify.action.collapse': 'Collapse ▲',

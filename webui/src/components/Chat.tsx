@@ -44,7 +44,7 @@ const PROGRAMMATIC_STOP_MARK_TTL_MS = 15000;
  * （subscribe_live_with_replay），把已画完的正文/思考再落一遍。
  */
 const WATCH_REATTACH_AFTER_HIDDEN_MS = 60000;
-import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
+import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, getApprovalModeState, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
 import { showToast } from './Toast';
@@ -2029,6 +2029,10 @@ export function Chat({
   // 由 /live snapshot + 'mode' 事件同步，切换调 postLiveMode（当前回合立即生效）。
   // confirmedMode 是 daemon 已确认值。--host 新建会话默认 Build；协议会话观察时显示 Auto。
   const [modeState, setModeState] = useState(() => initModeState('build' as ApprovalMode));
+  /** 全局模式开关（默认关闭）。开启后所有会话统一跟随 `modeState.confirmedMode`。 */
+  const [globalModeEnabled, setGlobalModeEnabled] = useState(false);
+  const globalModeRef = useRef(false);
+  globalModeRef.current = globalModeEnabled;
   const nativeModeRef = useRef<ApprovalMode>('build');
   const protocolSessionRef = useRef(false);
   const [pendingAttach, setPendingAttach] = useState<PendingAttach[]>(() =>
@@ -3587,6 +3591,12 @@ export function Chat({
         sessionId,
         activeSession?.id === sessionId ? (activeSession.approval_mode as ApprovalMode) : null,
       );
+      // 全局开关开启时，所有会话共用同一个模式：忽略会话级缓存/元数据，
+      // 直接沿用当前已确认的全局模式，避免切回旧会话时退回旧值。
+      if (globalModeRef.current) {
+        nativeModeRef.current = modeState.confirmedMode;
+        setModeState(initModeState(modeState.confirmedMode));
+      }
 
       // 恢复新会话的输入框草稿
       const nextDraft = loadComposerDraft(sessionId);
@@ -3921,7 +3931,11 @@ export function Chat({
       const cachedMode =
         modeCacheRef.current.get(sessionId) ||
         (activeSession?.id === sessionId ? (activeSession.approval_mode as ApprovalMode) : null);
-      if (cachedMode) {
+      if (globalModeRef.current) {
+        // 全局开关开启：所有会话共用同一模式，忽略会话级残留。
+        nativeModeRef.current = modeState.confirmedMode;
+        setModeState(initModeState(modeState.confirmedMode));
+      } else if (cachedMode) {
         nativeModeRef.current = cachedMode;
         setModeState(initModeState(cachedMode));
       } else {
@@ -4267,7 +4281,11 @@ export function Chat({
           const origin = sessionResult.value.origin;
           protocolSessionRef.current = origin === 'protocol';
           const sessionMode = sessionResult.value.approval_mode;
-          if (!modeState.pendingMode) {
+          if (!modeState.pendingMode && globalModeRef.current) {
+            // 全局开关开启：不读会话级记录，统一沿用当前全局模式。
+            nativeModeRef.current = modeState.confirmedMode;
+            setModeState(initModeState(modeState.confirmedMode));
+          } else if (!modeState.pendingMode) {
             const targetMode = sessionMode
               ? sessionMode
               : origin === 'protocol'
@@ -4506,13 +4524,22 @@ export function Chat({
     let cancelled = false;
     const initialSid = activeIdRef.current;
     if (!modeCacheRef.current.has(initialSid || '')) {
-      getApprovalMode(initialSid || undefined)
+      getApprovalModeState(initialSid || undefined)
         .then((current) => {
-          if (cancelled || protocolSessionRef.current) return;
+          if (cancelled) return;
+          setGlobalModeEnabled(current.global);
+          if (protocolSessionRef.current) return;
           if (initialSid && modeCacheRef.current.has(initialSid)) return;
-          nativeModeRef.current = current;
-          setModeState(initModeState(current));
-          if (initialSid) modeCacheRef.current.set(initialSid, current);
+          nativeModeRef.current = current.mode;
+          setModeState(initModeState(current.mode));
+          if (initialSid) modeCacheRef.current.set(initialSid, current.mode);
+        })
+        .catch(() => {});
+    } else {
+      // 缓存命中也要对齐全局开关（例如刷新前已开启全局）。
+      getApprovalModeState(initialSid || undefined)
+        .then((current) => {
+          if (!cancelled) setGlobalModeEnabled(current.global);
         })
         .catch(() => {});
     }
@@ -4558,8 +4585,31 @@ export function Chat({
       }
     };
 
+    // 全局开关播：开启时所有会话统一跟随广播模式；关闭时把当前会话恢复成
+    // 自己的模式（向服务端定向拉一次，成本极小，不会轮询）。
+    const handleGlobalModeSwitch = (e: Event) => {
+      const detail = (e as CustomEvent<{ enabled: boolean; mode: ApprovalMode }>).detail;
+      if (!detail) return;
+      setGlobalModeEnabled(!!detail.enabled);
+      if (detail.enabled) {
+        if (detail.mode) applyIncomingMode(detail.mode);
+        return;
+      }
+      const sid = activeIdRef.current;
+      if (!sid) return;
+      getApprovalModeState(sid)
+        .then((cur) => {
+          if (activeIdRef.current !== sid) return;
+          modeCacheRef.current.set(sid, cur.mode);
+          nativeModeRef.current = cur.mode;
+          setModeState(initModeState(cur.mode));
+        })
+        .catch(() => {});
+    };
+
     window.addEventListener('jeikcode:approval_mode_changed', handleCustomEvent);
     window.addEventListener('jeikcode:session_mode_changed', handleRemoteSessionMode);
+    window.addEventListener('jeikcode:mode_global_changed', handleGlobalModeSwitch);
 
     let bc: BroadcastChannel | null = null;
     try {
@@ -4567,6 +4617,9 @@ export function Chat({
         bc = new BroadcastChannel('jeikcode_approval_mode');
         bc.onmessage = (ev) => {
           if (ev.data?.type === 'mode' && ev.data.mode) {
+            if (typeof ev.data.global === 'boolean') {
+              setGlobalModeEnabled(ev.data.global);
+            }
             persistRemoteMode(ev.data.session_id, ev.data.mode);
             if (!ev.data.session_id || ev.data.session_id === activeIdRef.current) {
               applyIncomingMode(ev.data.mode);
@@ -4589,9 +4642,11 @@ export function Chat({
         Date.now() - pageHiddenSinceRef.current >= WATCH_REATTACH_AFTER_HIDDEN_MS;
       pageHiddenSinceRef.current = null;
       {
-        getApprovalMode(activeIdRef.current ?? undefined)
+        getApprovalModeState(activeIdRef.current ?? undefined)
           .then((current) => {
-            if (!cancelled) applyIncomingMode(current);
+            if (cancelled) return;
+            setGlobalModeEnabled(current.global);
+            applyIncomingMode(current.mode);
           })
           .catch(() => {});
 
@@ -4643,6 +4698,7 @@ export function Chat({
       cancelled = true;
       window.removeEventListener('jeikcode:approval_mode_changed', handleCustomEvent);
       window.removeEventListener('jeikcode:session_mode_changed', handleRemoteSessionMode);
+      window.removeEventListener('jeikcode:mode_global_changed', handleGlobalModeSwitch);
       window.removeEventListener('focus', refreshOnFocus);
       document.removeEventListener('visibilitychange', refreshOnFocus);
       try {
@@ -6129,9 +6185,12 @@ export function Chat({
     // must never apply its result to whichever session the user moved to.
     const targetSid = sessionId ?? null;
     const stillOnTarget = () => (activeIdRef.current ?? null) === targetSid;
+    // 全局开启时，切换改变的是全局模式，不写入任何会话级缓存：
+    // 关掉全局后各会话必须能回到自己原来的模式。
+    const writeSessionCache = !globalModeRef.current;
     setModeState(nextState);
     if (!protocolSessionRef.current) nativeModeRef.current = m;
-    if (targetSid) {
+    if (targetSid && writeSessionCache) {
       modeCacheRef.current.set(targetSid, m);
       const hash = projectHashBySessionRef.current.get(targetSid) || viewedProjectHashRef.current;
       if (hash) updateSessionCacheMeta(hash, targetSid, { approvalMode: m });
@@ -6140,10 +6199,10 @@ export function Chat({
       setLivePending(null);
       onPermissionResolved?.(null);
     }
-    void postLiveMode(m, targetSid)
+    void postLiveMode(m, targetSid, undefined)
       .then((confirmed) => {
         // The cache is per-session and always authoritative for that session.
-        if (targetSid) {
+        if (targetSid && writeSessionCache) {
           modeCacheRef.current.set(targetSid, confirmed);
           const hash =
             projectHashBySessionRef.current.get(targetSid) || viewedProjectHashRef.current;
@@ -6164,9 +6223,46 @@ export function Chat({
         }
       })
       .catch(() => {
-        if (targetSid) modeCacheRef.current.set(targetSid, modeState.confirmedMode);
+        if (targetSid && writeSessionCache) {
+          modeCacheRef.current.set(targetSid, modeState.confirmedMode);
+        }
         if (!stillOnTarget()) return;
         setModeState((cur) => failModeSwitch(cur));
+        pushCommandNotice(t('cmd.mode.failed'));
+      });
+  }
+
+  /**
+   * 切换「全局」胶囊开关。
+   *
+   * 开启：把当前确认模式提升为全局，所有会话（含后台运行中）立即跟随；
+   * 关闭：各会话恢复自己记录的模式，并重新拉取当前会话的真实模式。
+   * 两次都是单次 RPC，无轮询。
+   */
+  function toggleGlobalMode(enabled: boolean) {
+    const previous = globalModeRef.current;
+    if (previous === enabled) return;
+    setGlobalModeEnabled(enabled);
+    const targetSid = sessionId ?? null;
+    const requested = modeState.confirmedMode;
+    void postLiveMode(requested, targetSid, enabled)
+      .then((confirmed) => {
+        setModeState(initModeState(confirmed));
+        nativeModeRef.current = confirmed;
+        if (enabled) return;
+        // 关闭全局：恢复当前会话自己的模式（服务端已按会话重下发）。
+        if (!targetSid) return;
+        void getApprovalModeState(targetSid)
+          .then((cur) => {
+            if (activeIdRef.current !== targetSid) return;
+            modeCacheRef.current.set(targetSid, cur.mode);
+            nativeModeRef.current = cur.mode;
+            setModeState(initModeState(cur.mode));
+          })
+          .catch(() => {});
+      })
+      .catch(() => {
+        setGlobalModeEnabled(previous);
         pushCommandNotice(t('cmd.mode.failed'));
       });
   }
@@ -10501,6 +10597,8 @@ export function Chat({
           <ModeSelector
             value={modeState.displayMode}
             disabled={Boolean(modeState.pendingMode)}
+            globalEnabled={globalModeEnabled}
+            onToggleGlobal={toggleGlobalMode}
             onChange={(m) => switchMode(m)}
           />
           <div class="input-turn-controls">

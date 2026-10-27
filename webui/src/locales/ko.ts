@@ -595,6 +595,8 @@ export const ko: Record<keyof typeof en, string> = {
   'mode.label': 'Mode',
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.global': '전역',
+  'mode.global.desc': '모든 세션이 이 모드를 따릅니다 (API 엔드포인트는 영향을 받지 않음)',
   'model.label': 'Model',
   'model.searchPlaceholder': 'Search providers or models...',
   'notify.action.collapse': 'Collapse ▲',

@@ -595,6 +595,8 @@ export const es: Record<keyof typeof en, string> = {
   'mode.label': 'Mode',
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.global': 'Global',
+  'mode.global.desc': 'Todas las sesiones siguen este modo (los endpoints de API no se ven afectados)',
   'model.label': 'Model',
   'model.searchPlaceholder': 'Search providers or models...',
   'notify.action.collapse': 'Collapse ▲',

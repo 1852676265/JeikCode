@@ -1087,6 +1087,9 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
                 interactive_user_input,
                 terminal_sent_inner,
                 true,
+                // API turns always force Auto: the WebUI global mode switch must
+                // never leak into /v1/* behaviour.
+                policy.force_approval_mode,
             )
             .await
         })

@@ -595,6 +595,8 @@ export const zhTw: Record<keyof typeof en, string> = {
   'mode.label': '模式',
   'mode.plan': 'Plan',
   'mode.plan.desc': '只讀探索，先出方案',
+  'mode.global': '全域',
+  'mode.global.desc': '所有工作階段統一使用此模式（API 端點不受影響）',
   'model.label': '模型',
   'model.searchPlaceholder': '搜尋提供商或模型...',
   'notify.action.collapse': '收起 ▲',

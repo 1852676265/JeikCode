@@ -11017,6 +11017,68 @@ body {
 }
 .mode-selector-trigger.mode-bypass .effort-prefix { color: inherit; }
 
+/* ── Global override switch (bottom of the mode dropdown) ───────────────
+   Pinned to the bottom of the list; a hairline separator makes it read as a
+   setting rather than a fifth mode. Off by default. */
+.mode-global-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 8px 8px 4px;
+  border-top: 1px solid var(--app-border-subtle, color-mix(in srgb, var(--app-secondary-foreground) 18%, transparent));
+  cursor: default;
+  /* 菜单最大高度 280px 且可滚动：开关钉在底部，永远无需滚动才能看到。 */
+  position: sticky;
+  bottom: -4px;
+  z-index: 1;
+  background: var(--app-menu-background);
+}
+.mode-global-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mode-global-label {
+  font-size: 13px;
+  color: var(--app-primary-foreground);
+}
+.mode-global-desc {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--app-secondary-foreground);
+}
+.mode-global-switch {
+  flex: 0 0 auto;
+  position: relative;
+  width: 34px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--app-input-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-secondary-foreground) 20%, transparent);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.mode-global-switch.on {
+  background: var(--app-brand, #2563eb);
+  border-color: var(--app-brand, #2563eb);
+}
+.mode-global-switch:disabled { opacity: 0.5; cursor: not-allowed; }
+.mode-global-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 120ms ease;
+}
+.mode-global-switch.on .mode-global-knob { transform: translateX(16px); }
+
 .model-item.active {
   background: var(--app-list-active-background);
   color: var(--app-primary-foreground);

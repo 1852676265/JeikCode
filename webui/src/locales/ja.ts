@@ -595,6 +595,8 @@ export const ja: Record<keyof typeof en, string> = {
   'mode.label': 'Mode',
   'mode.plan': 'Plan',
   'mode.plan.desc': 'Read-only — explore and plan first',
+  'mode.global': 'グローバル',
+  'mode.global.desc': 'すべてのセッションがこのモードに従います（API エンドポイントは影響を受けません）',
   'model.label': 'Model',
   'model.searchPlaceholder': 'Search providers or models...',
   'notify.action.collapse': 'Collapse ▲',

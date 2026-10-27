@@ -2800,6 +2800,10 @@ pub(crate) enum GlobalWireEvent {
         session_id: Option<String>,
         mode: String,
     },
+    /// 全局模式开关变更（跨实例全局广播）。`enabled` 为 true 时所有会话统一
+    /// 跟随 `mode`；为 false 时各会话恢复自己的模式。
+    #[serde(rename = "mode_global")]
+    ModeGlobal { enabled: bool, mode: String },
 }
 
 /// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
@@ -4364,10 +4368,29 @@ fn effective_chat_approval_mode(
     effective_chat_approval_mode_scoped(request_mode, None)
 }
 
+/// Final approval mode for one `/chat` turn.
+///
+/// 优先级：策略强制（API / YOLO）> 全局开关 > 会话级 > 请求体 > 进程级默认。
+/// `forced` 必须压过全局开关：否则 WebUI 切到全局 Plan 会连累 `/v1/*` 自动化。
+fn resolve_turn_approval_mode(
+    forced: Option<crate::approval_mode::ApprovalMode>,
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+    session_id: Option<&str>,
+) -> crate::approval_mode::ApprovalMode {
+    match forced {
+        Some(forced) => forced,
+        None => effective_chat_approval_mode_scoped(request_mode, session_id),
+    }
+}
+
 fn effective_chat_approval_mode_scoped(
     request_mode: Option<crate::approval_mode::ApprovalMode>,
     session_id: Option<&str>,
 ) -> crate::approval_mode::ApprovalMode {
+    // 全局开关开启：所有会话统一，请求体里的旧副本也不再影响。
+    if live_api::live_global_mode_enabled() {
+        return live_api::live_current_approval_mode();
+    }
     // 会话级模式优先：它来自用户显式切换（含异地广播）。请求体里的
     // `approval_mode` 可能是另一实例上的陈旧副本，绝不能反向覆盖。
     if let Some(mode) = live_api::live_session_approval_mode_cached(session_id) {
@@ -10546,6 +10569,8 @@ async fn chat_stream(
                     interactive_user_input,
                     inner_terminal_sent,
                     false,
+                    // YOLO/native policy wins over the WebUI global switch.
+                    policy.force_approval_mode,
                 )
                 .await
             })
@@ -10696,9 +10721,15 @@ pub(crate) async fn process_chat_request(
     interactive_user_input: bool,
     terminal_sent: Arc<std::sync::atomic::AtomicBool>,
     keep_raw_markdown: bool,
+    // 策略强制的审批模式（API / YOLO）。非空时压过一切：包括全局开关与会话级
+    // 模式，保证 `/v1/*` 等 API 端点不受 WebUI 全局开关影响。
+    forced_approval_mode: Option<crate::approval_mode::ApprovalMode>,
 ) -> anyhow::Result<()> {
-    let approval_mode =
-        effective_chat_approval_mode_scoped(req.approval_mode, req.session_id.as_deref());
+    let approval_mode = resolve_turn_approval_mode(
+        forced_approval_mode,
+        req.approval_mode,
+        req.session_id.as_deref(),
+    );
     // Load config
     let config = jeikcode_config::ConfigStore::default_store().read()?.config;
     jeikcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
@@ -18392,6 +18423,7 @@ mod tests {
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -19117,6 +19149,7 @@ mod tests {
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             false,
+            None,
         )
         .await
         .expect("chat request succeeds");
@@ -20630,6 +20663,43 @@ mod channel_mode_tests {
             crate::approval_mode::ApprovalMode::Build
         );
         live_api::live_clear_session_approval_mode("sess-auto");
+    }
+
+    /// API isolation: the WebUI global switch must never change `/v1/*` behaviour.
+    /// Forced (API / YOLO) wins over the global switch; native turns follow it.
+    #[test]
+    fn forced_api_mode_is_immune_to_the_global_switch() {
+        use crate::approval_mode::ApprovalMode;
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_global_mode_enabled(true, Some(ApprovalMode::Plan));
+
+        // Compat API: forced Auto must survive a global Plan switch.
+        assert_eq!(
+            resolve_turn_approval_mode(
+                Some(ApprovalMode::Auto),
+                Some(ApprovalMode::Build),
+                Some("s1")
+            ),
+            ApprovalMode::Auto
+        );
+        // WebUI turn: follows the global switch, ignoring session/request copies.
+        assert_eq!(
+            resolve_turn_approval_mode(None, Some(ApprovalMode::Build), Some("s1")),
+            ApprovalMode::Plan
+        );
+
+        // Global off: the session's own mode is back in charge.
+        live_api::live_set_global_mode_enabled(false, None);
+        live_api::live_set_session_approval_mode(Some("s1"), ApprovalMode::AcceptEdits);
+        assert_eq!(
+            resolve_turn_approval_mode(None, Some(ApprovalMode::Build), Some("s1")),
+            ApprovalMode::AcceptEdits
+        );
+        // Forced still wins.
+        assert_eq!(
+            resolve_turn_approval_mode(Some(ApprovalMode::Auto), None, Some("s1")),
+            ApprovalMode::Auto
+        );
     }
 
     #[test]
