@@ -3449,12 +3449,27 @@ mod tests {
     fn friendly_http_error_wraps_billing_and_auth_codes() {
         // Shared across provider protocols; lives in the parent `provider` module.
         use super::super::friendly_http_error;
-        // 402 欠费: concise actionable headline + the code; raw English detail is
-        // dropped (redundant, and this short form folds into the summary line).
+        // The headline comes from the i18n catalog, so assert the WRAPPING contract
+        // instead of a fixed language: `{headline} (HTTP <code>)` with the raw
+        // upstream detail dropped (it is redundant next to the headline).
+        // Pinning a literal translation here made this test fail whenever the
+        // active locale was not the one the assertion was written in.
+        let balance = jeikcode_config::i18n::format_agent_status_insufficient_balance();
         assert_eq!(
             friendly_http_error(402, "Insufficient Balance"),
-            "账户余额不足（HTTP 402）"
+            format!("{balance} (HTTP 402)")
         );
+        assert!(
+            !friendly_http_error(402, "Insufficient Balance").contains("Insufficient Balance"),
+            "raw upstream detail must be folded away"
+        );
+        // 401 is auth. Headline from the catalog, code preserved.
+        let unauthorized = jeikcode_config::i18n::format_agent_status_unauthorized();
+        assert_eq!(
+            friendly_http_error(401, " nope "),
+            format!("{unauthorized} (HTTP 401)")
+        );
+        assert!(!unauthorized.is_empty());
         // 403 is NOT necessarily auth: JeikCode also uses it for session-concurrency
         // conflicts. Preserve the structured reason instead of inventing an API-key error.
         assert_eq!(
@@ -3464,7 +3479,6 @@ mod tests {
             ),
             "HTTP 403: [jeikcode_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
         );
-        assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
         assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");
