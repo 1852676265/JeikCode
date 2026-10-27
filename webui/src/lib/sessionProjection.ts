@@ -69,6 +69,76 @@ export function identifiedAssistantIndex(
 }
 
 /**
+ * Assistant row that still belongs to the CURRENT turn: the last assistant
+ * after the last user prompt. System notices / diagnostics can sit after it;
+ * appending to the literal last row would open a second bubble for the same
+ * answer whenever such a row lands mid-stream.
+ */
+export function sameTurnAssistantIndex(messages: Array<{ role: string }>): number {
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]!.role === 'user') {
+      lastUser = i;
+      break;
+    }
+  }
+  for (let i = messages.length - 1; i > lastUser; i -= 1) {
+    if (messages[i]!.role === 'assistant') return i;
+  }
+  return -1;
+}
+
+/** Tool calls, notices and checklists keep the chronological order. */
+const PART_MERGE_BARRIER = new Set(['tool', 'notice', 'rate_limited', 'todo_list']);
+
+/**
+ * A new LLM round inside the SAME turn must continue the previous reasoning /
+ * body instead of opening another part. Otherwise the canvas shows two
+ * Thinking blocks and a body split in half (the "思考/正文分叉" bug).
+ *
+ * Only interspersed text/reasoning may be crossed; a tool call or a notice
+ * between them is a hard boundary and keeps its own part.
+ */
+export function coalesceRoundParts(parts: MsgPart[]): MsgPart[] {
+  let changed = false;
+  const out: MsgPart[] = [];
+  for (const part of parts) {
+    if (part.kind === 'text' || part.kind === 'reasoning') {
+      let target = -1;
+      for (let i = out.length - 1; i >= 0; i -= 1) {
+        const previous = out[i]!;
+        if (previous.kind === part.kind) {
+          target = i;
+          break;
+        }
+        if (PART_MERGE_BARRIER.has(previous.kind)) break;
+      }
+      if (target >= 0) {
+        const previous = out[target] as { kind: 'text' | 'reasoning'; text: string; id?: string };
+        const incoming = part as { text: string; id?: string };
+        // Same round prefix = the provider alternated reasoning/text inside ONE
+        // round; keep the alternation. A different round (new message id) is the
+        // boundary that used to fork the answer - continue the previous block.
+        const previousRound = previous.id ? previous.id.split(':')[0] : null;
+        const incomingRound = incoming.id ? incoming.id.split(':')[0] : null;
+        if (previousRound && incomingRound && previousRound === incomingRound) {
+          out.push(part);
+          continue;
+        }
+        out[target] = {
+          ...previous,
+          text: (previous.text || '') + (incoming.text || ''),
+        } as MsgPart;
+        changed = true;
+        continue;
+      }
+    }
+    out.push(part);
+  }
+  return changed ? out : parts;
+}
+
+/**
  * Bind the STORED identity of the user prompt to its optimistic bubble.
  *
  * A refresh/switch/replay must keep the bubble on the same id the transcript
@@ -137,11 +207,10 @@ export function withAssistantIdentity<T extends ProjectionMessage>(
     ? msgs.findIndex((m) => m.role === 'assistant' && m.id === messageId)
     : -1;
   if (idx < 0) {
-    const lastIdx = msgs.length - 1;
-    const last = msgs[lastIdx];
-    if (!last || last.role !== 'assistant') return msgs;
-    if (messageId && last.id && last.id !== messageId) return msgs;
-    idx = lastIdx;
+    idx = sameTurnAssistantIndex(msgs);
+    if (idx < 0) return msgs;
+    const last = msgs[idx];
+    if (messageId && last?.id && last.id !== messageId) return msgs;
   }
   // 同一 message_id 绝不能在两条消息上共存：重复 key 会让 Preact 复用错 DOM，
   // 表现为“老回合的一部分回复渲染到新消息里”。
@@ -593,8 +662,9 @@ export function paintAssistantText<T extends ProjectionMessage>(
 ): T[] {
   const target = identifiedAssistantIndex(messages, targetId);
   if (target >= 0) {
-    const parts = mergeTextIntoParts(messages[target]!.parts, content, replay, partId);
-    if (!parts) return messages;
+    const merged = mergeTextIntoParts(messages[target]!.parts, content, replay, partId);
+    if (!merged) return messages;
+    const parts = replay ? merged : coalesceRoundParts(merged);
     const next = messages.slice();
     next[target] = { ...messages[target]!, parts };
     return next;
@@ -605,15 +675,19 @@ export function paintAssistantText<T extends ProjectionMessage>(
     if (!content) return messages;
     return [{ role: 'assistant', parts: [{ kind: 'text', text: content }] } as unknown as T];
   }
-  let last = messages[messages.length - 1]!;
-  let base = messages;
-  if (!last || last.role !== 'assistant') {
-    last = { role: 'assistant', parts: [] } as unknown as T;
-    base = [...messages, last];
-  }
-  const parts = mergeTextIntoParts(last.parts, content, replay, partId);
-  if (!parts) return messages;
-  return [...base.slice(0, -1), { ...last, parts }];
+  // 同一回合里可能有系统通知插在 assistant 之后；此时「最后一条」不是 assistant，
+  // 但续写仍属于本轮回答，必须落回本轮气泡，绝不能新开一条（否则正文被劈成两半）。
+  const owner = sameTurnAssistantIndex(messages);
+  const base: T[] = owner >= 0
+    ? messages
+    : [...messages, { role: 'assistant', parts: [] } as unknown as T];
+  const idx = owner >= 0 ? owner : base.length - 1;
+  const merged = mergeTextIntoParts(base[idx]!.parts, content, replay, partId);
+  if (!merged) return messages;
+  const parts = replay ? merged : coalesceRoundParts(merged);
+  const next = base.slice();
+  next[idx] = { ...base[idx]!, parts };
+  return next;
 }
 
 /** 合并一段正文增量；返回 null 表示重播去重后无新内容可落笔。
@@ -716,23 +790,25 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
 
   const target = identifiedAssistantIndex(messages, targetId);
   if (target >= 0) {
-    const parts = mergeReasoningIntoParts(messages[target]!.parts, content, replay, partId);
-    if (!parts) return messages;
+    const merged = mergeReasoningIntoParts(messages[target]!.parts, content, replay, partId);
+    if (!merged) return messages;
+    const parts = replay ? merged : coalesceRoundParts(merged);
     const next = messages.slice();
     next[target] = { ...messages[target]!, parts };
     return next;
   }
   // 身份未命中：同 paintAssistantText —— 未命中的帧就是画布上还没有的轮，直接落笔。
-
-  let last = messages[messages.length - 1];
-  let base = messages;
-  if (!last || last.role !== 'assistant') {
-    last = { role: 'assistant', parts: [] } as unknown as T;
-    base = [...messages, last];
-  }
-  const parts = mergeReasoningIntoParts(last.parts, content, replay, partId);
-  if (!parts) return messages;
-  return [...base.slice(0, -1), { ...last, parts }];
+  const owner = sameTurnAssistantIndex(messages);
+  const base: T[] = owner >= 0
+    ? messages
+    : [...messages, { role: 'assistant', parts: [] } as unknown as T];
+  const idx = owner >= 0 ? owner : base.length - 1;
+  const merged = mergeReasoningIntoParts(base[idx]!.parts, content, replay, partId);
+  if (!merged) return messages;
+  const parts = replay ? merged : coalesceRoundParts(merged);
+  const next = base.slice();
+  next[idx] = { ...base[idx]!, parts };
+  return next;
 }
 
 /** 合并一段思考增量；返回 null 表示重播去重后无新内容可落笔。 */

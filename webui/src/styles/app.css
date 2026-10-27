@@ -4936,8 +4936,19 @@ body {
   -webkit-user-select: text !important;
 }
 
-/* 引用文件路径与超链接胶囊：高级微浮动动效、手形光标与划选自适应 */
-.markdown-root :not(pre) > code.file-path-badge,
+/* 引用文件路径与超链接胶囊：高级微浮动动效、手形光标与划选自适应。
+   ★ 行内 code 徽章必须保持 display:inline：inline-block 会让 0.18em 的纵向
+   padding 进入行盒，徽章类在流式渲染中每帧被加/移除时行高会来回变化 2px+，
+   表现为“每个字上下抖动”。链接从一开始就带样式，不存在这种切换，可保留
+   inline-block 的胶囊观感。 */
+.markdown-root :not(pre) > code.file-path-badge {
+  display: inline;
+  cursor: pointer;
+  transition: box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              background 0.18s ease,
+              color 0.18s ease;
+}
+
 .markdown-root a[href] {
   display: inline-block;
   vertical-align: baseline;
@@ -4947,9 +4958,6 @@ body {
               background 0.18s ease,
               color 0.18s ease;
   will-change: transform, box-shadow;
-}
-
-.markdown-root a[href] {
   color: var(--app-link-color, #58a6ff);
   text-decoration: none !important;
   border-radius: 4px;
@@ -4960,7 +4968,6 @@ body {
 .markdown-root :not(pre) > code.file-path-badge:focus,
 .markdown-root :not(pre) > code.file-path-badge:focus-visible {
   outline: none;
-  transform: translateY(-1.5px);
   background: rgba(255, 255, 255, 0.16) !important;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(255, 255, 255, 0.18);
 }
@@ -4976,7 +4983,10 @@ body {
   box-shadow: 0 4px 10px rgba(56, 139, 253, 0.2), 0 0 0 1px rgba(56, 139, 253, 0.3);
 }
 
-.markdown-root :not(pre) > code.file-path-badge:active,
+.markdown-root :not(pre) > code.file-path-badge:active {
+  cursor: text;
+}
+
 .markdown-root a[href]:active {
   transform: translateY(0.5px) scale(0.985);
   cursor: text;

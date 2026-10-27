@@ -276,6 +276,7 @@ import {
   paintCachedAssistantDelta,
   ensureWorkingAssistant,
   paintUserMessage,
+  sameTurnAssistantIndex,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
   cachedHeadIsContiguous,
@@ -6971,13 +6972,18 @@ export function Chat({
         messagesRef.current = updated;
         return updated;
       }
-      // 历史中不存在：新工具。若末尾是 assistant 且未封口回答则追加；若已回答完毕或末尾是 user（如 Steer）则安全开启新 assistant。
-      const last = prev[prev.length - 1];
-      const lastSettled = last && last.role === 'assistant' && last.parts?.some(
+      // 历史中不存在：新工具。若本轮 assistant 尚未封口回答则追加；若已回答完毕或
+      // 末尾已经开了新回合（user）则安全开启新 assistant。用「本回合的 assistant」
+      // 而不是字面最后一行：中途插入的 system 通知会把最后一行变成非 assistant，
+      // 按字面判断会把同一个回答劈成两条。
+      const ownerIdx = sameTurnAssistantIndex(prev);
+      const tail = ownerIdx >= 0 ? prev[ownerIdx] : undefined;
+      const lastSettled = !!tail && tail.parts?.some(
         (p) => (p.kind === 'text' && (p.text || '').trim().length > 0)
       );
-      if (last && last.role === 'assistant' && !lastSettled) {
-        next = [...prev.slice(0, -1), { ...last, parts: upsertToolPart(last.parts, tool) }];
+      if (tail && !lastSettled) {
+        next = prev.slice();
+        next[ownerIdx] = { ...tail, parts: upsertToolPart(tail.parts, tool) };
       } else {
         next = [
           ...prev,
@@ -7217,17 +7223,20 @@ export function Chat({
       }
     }
 
-    let last = next[next.length - 1];
-    const lastSettled = last && last.role === 'assistant' && last.parts?.some(
+    // 本回合的 assistant 可能不是字面最后一行（system/notice 会插在它后面）；
+    // 按字面判断会给同一轮回答新开一条消息，表现就是思考/正文分叉。
+    const ownerIdx = sameTurnAssistantIndex(next);
+    let last = ownerIdx >= 0 ? next[ownerIdx] : undefined;
+    const lastSettled = !!last && last.parts?.some(
       (p) => (p.kind === 'text' && (p.text || '').trim().length > 0)
     );
 
-    if (!last || last.role !== 'assistant' || (event.type === 'tool_start' && lastSettled)) {
+    if (!last || (event.type === 'tool_start' && lastSettled)) {
       last = { role: 'assistant', parts: [] };
       next.push(last);
     } else {
       last = { ...last, parts: last.parts ? [...last.parts] : [] };
-      next[next.length - 1] = last;
+      next[ownerIdx] = last;
     }
 
     switch (event.type) {

@@ -1,5 +1,5 @@
 import DOMPurify from 'dompurify';
-import { useMemo, useRef, useEffect, useState } from 'preact/hooks';
+import { useMemo, useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { render } from 'preact';
 import { createPortal } from 'preact/compat';
 import { markdownToHtml } from '../lib/markdownRender';
@@ -141,6 +141,22 @@ function rewriteImageSources(html: string, basePath?: string, cwd?: string): str
   return doc.body.innerHTML;
 }
 
+/** Deepest trailing text node of a rendered markdown root (append target). */
+function lastTextNode(root: Element): Text | null {
+  let node: Node | null = root.lastChild;
+  while (node) {
+    if (node.nodeType === Node.TEXT_NODE) return node as Text;
+    if (node.lastChild) {
+      node = node.lastChild;
+      continue;
+    }
+    while (node && node !== root && !node.previousSibling) node = node.parentNode;
+    if (!node || node === root) return null;
+    node = node.previousSibling;
+  }
+  return null;
+}
+
 export function Markdown({
   content,
   search,
@@ -180,6 +196,39 @@ export function Markdown({
     }
     return { renderedHtml: prepped, matchCount: 0 };
   }, [content, search, basePath, cwd]);
+
+  /**
+   * Streaming markdown must NOT replace the whole subtree on every token.
+   * A plain-text append only extends the last text node; keeping the nodes
+   * (and their layout) intact is what stops the per-character vertical
+   * jitter, the collapsed images, and the "formatting flickers while
+   * streaming" symptom. Structural changes still fall back to innerHTML.
+   */
+  const appliedHtmlRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const next = renderedHtml;
+    const prev = appliedHtmlRef.current;
+    appliedHtmlRef.current = next;
+    if (prev === null) {
+      root.innerHTML = next;
+      return;
+    }
+    if (prev === next) return;
+    // Pure append of inactive text: extend the trailing text node only.
+    if (prev.length > 0 && next.startsWith(prev) && prev[prev.length - 1] !== '>') {
+      const suffix = next.slice(prev.length);
+      if (suffix && suffix.length <= 64 && !/[<>&"'*_`\[\]#|~{}$\\]/.test(suffix)) {
+        const tail = lastTextNode(root);
+        if (tail) {
+          tail.appendData(suffix);
+          return;
+        }
+      }
+    }
+    root.innerHTML = next;
+  }, [renderedHtml]);
 
   useEffect(() => {
     onMatchCountChange?.(matchCount);
@@ -231,7 +280,9 @@ export function Markdown({
   }, [renderedHtml, isDark, lang, basePath]);
 
   // 智能扫描并标记画布上的文件引用胶囊徽章与 Web 链接，赋予高级胶囊动效、手形与无障碍聚焦
-  useEffect(() => {
+  // useLayoutEffect：类名必须在本次绘制前落好，否则每个 token 会先画一帧无徽章、
+  // 再画一帧有徽章（两帧布局差 = 流式期间的“格式抖动”）。
+  useLayoutEffect(() => {
     if (!rootRef.current) return;
     const codes = rootRef.current.querySelectorAll<HTMLElement>(':not(pre) > code');
     codes.forEach((code) => {
@@ -644,7 +695,6 @@ export function Markdown({
         onClick={onClick}
         onContextMenu={onContextMenu}
         onKeyDown={onKeyDown}
-        dangerouslySetInnerHTML={{ __html: renderedHtml }}
       />
       {fileBadgeMenu && typeof document !== 'undefined' && createPortal(
         <div

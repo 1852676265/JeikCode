@@ -12,6 +12,8 @@ import {
   paintAssistantNotice,
   paintCachedAssistantDelta,
   paintUserMessage,
+  coalesceRoundParts,
+  sameTurnAssistantIndex,
   placeRecoveredTurnUsers,
   mergeOlderMessages,
   cachedHeadIsContiguous,
@@ -1738,4 +1740,79 @@ test('spliceAuthoritativeDiskTail 保留历史轮次中的黄色通知在原有�
     'user:好像连接上了',
     'assistant:对啊 恢复了',
   ]);
+});
+
+// ── 同一回合跨 round 的思考/正文不得分叉 ─────────────────────────────────
+
+test('同一回合的新 round 继续上一次思考和正文，不再生成第二个思考块', () => {
+  let msgs: any[] = [];
+  msgs = paintAssistantReasoning(msgs, '思考一。', false, 'm1', 'm1:1:reasoning');
+  msgs = paintAssistantText(msgs, '正文一。', false, 'm1', 'm1:2:text');
+  // 第二轮 round：新的 message_id / part_id，中间没有工具调用。
+  msgs = paintAssistantReasoning(msgs, '思考二。', false, 'm2', 'm2:1:reasoning');
+  msgs = paintAssistantText(msgs, '正文二。', false, 'm2', 'm2:2:text');
+
+  assert.equal(msgs.length, 1);
+  assert.deepEqual(msgs[0].parts.map((p: any) => p.kind), ['reasoning', 'text']);
+  assert.equal(msgs[0].parts[0].text, '思考一。思考二。');
+  assert.equal(msgs[0].parts[1].text, '正文一。正文二。');
+});
+
+test('工具调用是硬边界：工具前后的正文必须保持两段', () => {
+  const parts = [
+    { kind: 'text', text: '前半。' },
+    { kind: 'tool', tool: { id: 't1', name: 'read', args: '{}', status: 'done' } },
+    { kind: 'text', text: '后半。' },
+  ] as any[];
+  assert.equal(coalesceRoundParts(parts), parts);
+});
+
+test('通知也是边界：跨越通知的思考不合并', () => {
+  const parts = [
+    { kind: 'reasoning', text: '先想。' },
+    { kind: 'notice', text: '提示' },
+    { kind: 'reasoning', text: '再想。' },
+  ] as any[];
+  assert.equal(coalesceRoundParts(parts), parts);
+});
+
+test('assistant 之后插入的 system 通知不会把续写劈成新气泡', () => {
+  const msgs: any[] = [
+    { role: 'user', parts: [{ kind: 'text', text: 'q' }] },
+    { role: 'assistant', id: 'm1', parts: [{ kind: 'text', text: '正文一。' }] },
+    { role: 'system', parts: [{ kind: 'notice', text: 'notice' }] },
+  ];
+  const next = paintAssistantText(msgs, '正文二。', false, 'm2', 'm2:1:text');
+  assert.equal(next.length, 3);
+  assert.equal(next[1].parts[0].text, '正文一。正文二。');
+  assert.equal(next[2].role, 'system');
+});
+
+test('新的用户回合仍然会新开 assistant 行', () => {
+  const msgs: any[] = [
+    { role: 'user', parts: [{ kind: 'text', text: 'q1' }] },
+    { role: 'assistant', id: 'm1', parts: [{ kind: 'text', text: 'a1' }] },
+    { role: 'user', parts: [{ kind: 'text', text: 'q2' }] },
+  ];
+  const next = paintAssistantText(msgs, 'a2', false, 'm2', 'm2:1:text');
+  assert.equal(next.length, 4);
+  assert.equal(next[3].role, 'assistant');
+  assert.equal(next[3].parts[0].text, 'a2');
+});
+
+test('sameTurnAssistantIndex 跳过末尾 system 行，但遇到新用户行就停止', () => {
+  const withNotice = [{ role: 'user' }, { role: 'assistant' }, { role: 'system' }];
+  assert.equal(sameTurnAssistantIndex(withNotice), 1);
+  assert.equal(sameTurnAssistantIndex([...withNotice, { role: 'user' }]), -1);
+});
+
+test('合并后的回合重放保持幂等', () => {
+  let msgs: any[] = [];
+  msgs = paintAssistantReasoning(msgs, '思考一。', false, 'm1', 'm1:1:reasoning');
+  msgs = paintAssistantText(msgs, '正文一。', false, 'm1', 'm1:2:text');
+  msgs = paintAssistantReasoning(msgs, '思考二。', false, 'm2', 'm2:1:reasoning');
+  msgs = paintAssistantText(msgs, '正文二。', false, 'm2', 'm2:2:text');
+
+  const replayed = paintAssistantText(msgs, '正文一。正文二。', true, 'm2', 'm2:2:text');
+  assert.equal(replayed, msgs);
 });
