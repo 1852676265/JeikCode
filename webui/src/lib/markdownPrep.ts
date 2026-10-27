@@ -552,6 +552,10 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
+function escapeHtmlPreservingBreaks(text: string): string {
+  return escapeHtml(text).replace(/&lt;(\s*br\s*\/?\s*)&gt;/gi, '<$1>');
+}
+
 /** Unicode punctuation — CommonMark flanking rules treat these like ASCII punct. */
 function isUnicodePunctuation(ch: string): boolean {
   return /\p{P}/u.test(ch);
@@ -618,7 +622,7 @@ export function repairCjkPunctuationEmphasis(text: string): string {
         !isUnicodeWhitespace(next) &&
         !isUnicodePunctuation(next);
       if (openBroken || closeBroken) {
-        out.push(`<strong>${escapeHtml(inner)}</strong>`);
+        out.push(`<strong>${escapeHtmlPreservingBreaks(inner)}</strong>`);
       } else {
         out.push(source.slice(start, end + marker.length));
       }
@@ -685,13 +689,37 @@ function applyInlineMarkdown(source: string, footnoteIds: Map<string, number>): 
       }
       // ==高亮==：GFM 没有，但模型经常输出。避开 === 标题线。
       text = text.replace(/==([^=\n]+?)==/g, (_m, inner: string) => {
-        return `<mark class="md-highlight">${escapeHtml(inner)}</mark>`;
+        return `<mark class="md-highlight">${escapeHtmlPreservingBreaks(inner)}</mark>`;
       });
       // 中文弯引号等标点紧贴 **…** 时 CommonMark 不认强调，预转成 <strong>。
       text = repairCjkPunctuationEmphasis(text);
       return text;
     });
   }).join('\n');
+}
+
+/**
+ * 规范化各类变体换行标签为标准 HTML `<br>`：
+ * 针对模型常在表格单元格或正文中输出的转义/实体变体（如 `&lt;br&gt;`、`\<br>`、`\\<br>`、全角 `＜br＞` 等），
+ * 统一在代码围栏和行内代码反引号之外将其规范化为标准 `<br>`，
+ * 使得 marked 与 WebUI 能够正确将其渲染为真实折行，避免向用户暴露裸露字符。
+ */
+export function normalizeBreakTags(line: string): string {
+  if (!line) return '';
+  const lower = line.toLowerCase();
+  if (
+    !lower.includes('<br') &&
+    !lower.includes('&lt;br') &&
+    !lower.includes('＜br')
+  ) {
+    return line;
+  }
+  return mapInlineOutsideBackticks(line, (chunk) => {
+    return chunk
+      .replace(/\\*&lt;\s*br\s*\/?\s*&gt;/gi, '<br>')
+      .replace(/\\+<\s*br\s*\/?\s*>/gi, '<br>')
+      .replace(/＜\s*br\s*\/?\s*＞/gi, '<br>');
+  });
 }
 
 export function repairUnclosedFences(source: string): string {
@@ -910,6 +938,7 @@ export function preprocessMarkdown(raw: string): string {
     line = replaceFullwidthPipes(line);
     line = fixAtxHeading(line);
     line = normalizeTaskCheckboxes(line);
+    line = normalizeBreakTags(line);
     const trimmed = line.trim();
 
     const footnoteDef = trimmed.match(/^\[\^([^\]]+)\]:\s*(.*)$/);

@@ -6,6 +6,7 @@ import {
   fenceOpen,
   isLanguageLikeInfo,
   isTableDelimiterLine,
+  normalizeBreakTags,
   preprocessMarkdown,
   promoteNestedCodeFences,
   splitTableCells,
@@ -94,6 +95,29 @@ test('fullwidth pipes are normalized into a table', () => {
   assert.match(out, /<table>/);
   assert.match(out, /<th>左<\/th>/);
   assert.match(out, /<td>a<\/td>/);
+});
+
+test('normalizeBreakTags repairs html entity, escaped, and fullwidth br tags outside code', () => {
+  const line = '| A | &lt;br&gt; | \\<br> | ＜br＞ | `<br>` |';
+  assert.equal(normalizeBreakTags(line), '| A | <br> | <br> | <br> | `<br>` |');
+});
+
+test('table with escaped and entity br variants renders with proper html line breaks', () => {
+  const markdown = [
+    '| 账号 | 状态 |',
+    '|---|---|',
+    '| ULTRA | ❌ 没有徽章&lt;br&gt;❌ 没有配额条\\<br>❌ 报错 503 |',
+  ].join('\n');
+  const out = html(markdown);
+  assert.match(out, /<table>/);
+  assert.match(out, /<td>❌ 没有徽章<br>❌ 没有配额条<br>❌ 报错 503<\/td>/);
+});
+
+test('breaks inside bold or cjk punctuation emphasis spans survive without html entity corruption', () => {
+  const markdown = '（**“第一项”<br>“第二项”**）';
+  const out = html(markdown);
+  assert.match(out, /<br>/);
+  assert.doesNotMatch(out, /&lt;br&gt;/);
 });
 
 test('tables inside fenced code are not rewritten', () => {
