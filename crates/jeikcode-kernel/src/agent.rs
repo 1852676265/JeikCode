@@ -14,6 +14,7 @@ use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ProgressSink, ToolCall, ToolContext, ToolResult};
 use futures::StreamExt;
+use jeikcode_config::i18n;
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -204,9 +205,12 @@ const REPEAT_LOOP_NUDGE: &str =
 /// reminders is enough to call it stuck without dying on the first retry.
 const ECHO_NUDGE_AT: u32 = 2;
 const ECHO_STOP_AT: u32 = 4;
-const ECHO_LOOP_NUDGE: &str = "你死循环了，请你重新思考你的动作。";
-const ECHO_LOOP_NUDGE_FINAL: &str =
-    "你死循环了，请你重新思考你的动作。若再重复相同工具和参数，本回合将停止。";
+fn echo_loop_nudge() -> String {
+    i18n::format_agent_echo_loop_nudge()
+}
+fn echo_loop_nudge_final() -> String {
+    i18n::format_agent_echo_loop_warning()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolCallOutcome {
@@ -402,16 +406,16 @@ fn strip_leading_parameter_tail(input: &str) -> (String, bool) {
 /// message sniff for transport errors that carry no status. Mirrors v1's
 /// `public_error_reason` but only for the transient (retryable) classes — the
 /// only ones that reach the retry notice.
-fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
+fn retry_reason(e: &crate::stream::ProviderError) -> String {
     match e.http_status {
-        Some(429) => "请求过于频繁或额度已用尽",
-        Some(500 | 502 | 503 | 504 | 529) => "上游服务暂时不可用",
+        Some(429) => i18n::format_agent_status_rate_limited(),
+        Some(500 | 502 | 503 | 504 | 529) => i18n::format_agent_status_upstream_unavailable(),
         _ => {
             let m = e.message.to_ascii_lowercase();
             if m.contains("timeout") || m.contains("timed out") {
-                "模型响应超时"
+                i18n::format_agent_status_response_timeout()
             } else {
-                "网络连接失败"
+                i18n::format_agent_status_connection_failed()
             }
         }
     }
@@ -519,47 +523,37 @@ fn empty_exhaustion_message(
     already_advised: bool,
 ) -> String {
     if saw_malformed {
-        return format!(
-            "模型连续 {max_retries} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。"
-        );
+        return i18n::format_agent_exhausted_malformed(max_retries);
     }
     // u64 to avoid overflow on the *10 / *9 scaling for very large windows.
     let budget = input_watermark_budget(ctx_window);
     let near_or_over_window = budget > 0 && (est_prompt_tokens as u64) * 10 >= (budget as u64) * 9;
     if thinking_only {
         if near_or_over_window && already_advised {
-            return format!(
-                "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。"
-            );
+            return i18n::format_agent_exhausted_thinking_over_window_intro(max_retries);
         } else if near_or_over_window {
-            return format!(
-                "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。当前请求约 {}K tokens，已接近或超过模型上下文窗口（约 {}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。",
+            return i18n::format_agent_exhausted_thinking_over_window_size(
+                max_retries,
                 est_prompt_tokens / 1000,
                 ctx_window / 1000,
             );
         } else {
-            return format!(
-                "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。可直接重试，或稍后再试。"
-            );
+            return i18n::format_agent_exhausted_thinking_generic(max_retries);
         }
     }
     if near_or_over_window && already_advised {
         // The pre-send over-window advisory already explained the size cause and
         // the remedy this turn — don't repeat the full size-blame. Keep a SHORT
         // terminal that points back to it.
-        format!(
-            "模型连续 {max_retries} 次返回空响应。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。"
-        )
+        i18n::format_agent_exhausted_empty_over_window_intro(max_retries)
     } else if near_or_over_window {
-        format!(
-            "模型连续 {max_retries} 次返回空响应。当前请求约 {}K tokens，已接近或超过模型上下文窗口（约 {}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。",
+        i18n::format_agent_exhausted_empty_over_window_size(
+            max_retries,
             est_prompt_tokens / 1000,
             ctx_window / 1000,
         )
     } else {
-        format!(
-            "模型连续 {max_retries} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
-        )
+        i18n::format_agent_exhausted_empty_generic(max_retries)
     }
 }
 
@@ -671,8 +665,7 @@ fn over_window_advisory(
     if ctx_window == 0 || (est_prompt_tokens as u64) < (watermark_limit as u64) {
         return None;
     }
-    Some(format!(
-        "请求约 {}K tokens 已达上下文水位（窗口约 {}K − 水位缓冲 {}K）：请精简输入或换用更大窗口的模型。",
+    Some(i18n::format_agent_over_window(
         est_prompt_tokens / 1000,
         ctx_window / 1000,
         ctx_window.saturating_sub(watermark_limit) / 1000,
@@ -2892,10 +2885,13 @@ impl RunningAgent {
                 Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
-                    self.rt.emit(AgentEvent::Warning(format!(
-                        "API error {}，{wait} 秒后重试({provider_retry}/{MAX_PROVIDER_RETRIES})...",
-                        retry_reason(&e)
-                    )));
+                    self.rt
+                        .emit(AgentEvent::Warning(i18n::format_agent_retry_api(
+                            &retry_reason(&e),
+                            wait,
+                            provider_retry as u32,
+                            MAX_PROVIDER_RETRIES as u32,
+                        )));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the full delay.
                     tokio::select! {
@@ -3025,9 +3021,10 @@ impl RunningAgent {
                                 let retry_budget = self.first_token_retries;
                                 if first_token_retries < retry_budget {
                                     first_token_retries += 1;
-                                    self.rt.emit(AgentEvent::Warning(format!(
-                                        "模型延迟高:{} 秒内无响应,正在重试({}/{})…",
-                                        first_token_secs, first_token_retries, retry_budget
+                                    self.rt.emit(AgentEvent::Warning(i18n::format_agent_retry_first_token(
+                                        first_token_secs,
+                                        first_token_retries as u32,
+                                        retry_budget as u32,
                                     )));
                                     tokio::select! {
                                         biased;
@@ -3040,9 +3037,9 @@ impl RunningAgent {
                                     retry_this_round = true;
                                     break;
                                 }
-                                let msg = format!(
-                                    "模型延迟过高,请稍后再试(连续 {} 次在 {} 秒内未收到首token)",
-                                    retry_budget, first_token_secs
+                                let msg = i18n::format_agent_model_high_latency_terminal(
+                                    retry_budget as u32,
+                                    first_token_secs,
                                 );
                                 self.hooks.on_error(&msg).await;
                                 self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
@@ -3468,14 +3465,24 @@ impl RunningAgent {
                     let wait = empty_retry_wait_secs(thinking_only, empty_retries);
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
                     // from a truly EMPTY one — different upstream faults, different wording.
-                    let notice = if thinking_only && wait == 0 {
-                        format!("模型只返回了思考，正在重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
-                    } else if thinking_only {
-                        format!("模型只返回了思考，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    let notice = if thinking_only {
+                        i18n::format_agent_retry_thinking(
+                            empty_retries as u32,
+                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            wait,
+                        )
                     } else if saw_malformed {
-                        format!("响应格式异常，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                        i18n::format_agent_retry_malformed(
+                            empty_retries as u32,
+                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            wait,
+                        )
                     } else {
-                        format!("模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                        i18n::format_agent_retry_empty(
+                            empty_retries as u32,
+                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            wait,
+                        )
                     };
                     self.rt.emit(AgentEvent::Warning(notice));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
@@ -4399,13 +4406,13 @@ impl RunningAgent {
                 echo_nudged = true;
                 let last_reminder = echo_rounds + 1 >= ECHO_STOP_AT;
                 let nudge = if last_reminder {
-                    ECHO_LOOP_NUDGE_FINAL
+                    echo_loop_nudge_final()
                 } else {
-                    ECHO_LOOP_NUDGE
+                    echo_loop_nudge()
                 };
                 self.rt
                     .emit(AgentEvent::Warning(format!("possible echo loop: {nudge}")));
-                convo.push(Message::synthetic_user(nudge.to_string()));
+                convo.push(Message::synthetic_user(nudge));
             }
             let echo_streak_active = echo_rounds > 1;
 
@@ -4989,11 +4996,17 @@ mod empty_retry_wait_tests {
 }
 
 #[cfg(test)]
+static I18N_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod empty_exhaustion_message_tests {
-    use super::empty_exhaustion_message;
+    use super::{empty_exhaustion_message, I18N_TEST_LOCK};
+    use jeikcode_config::i18n::{self, Locale};
 
     #[test]
     fn size_aware_when_near_or_over_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         // 339k prompt into a 200k window (170%) must blame request size, NOT
         // assert it's context-independent.
         let m = empty_exhaustion_message(false, false, 339_000, 200_000, 5, false);
@@ -5006,6 +5019,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn upstream_framing_when_comfortably_within_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, false, 5_000, 200_000, 5, false);
         assert!(
             m.contains("与上下文长度无关"),
@@ -5016,6 +5031,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn unknown_window_cannot_claim_over_size() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         // window unknown (0) — never attribute to size even with a huge estimate.
         let m = empty_exhaustion_message(false, false, 999_999, 0, 5, false);
         assert!(
@@ -5026,6 +5043,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn malformed_keeps_distinct_wording_and_no_size_blame() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(true, false, 339_000, 200_000, 5, false);
         assert!(m.contains("无法解析"), "malformed keeps its wording: {m}");
         assert!(
@@ -5036,6 +5055,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn already_advised_avoids_duplicating_the_full_size_blame() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         // When the pre-send over-window advisory already fired this turn, the
         // exhaustion terminal must be SHORT and reference it — not repeat the
         // full "约 NNN K tokens … 接近或超过窗口" blurb (the double-show fix).
@@ -5053,6 +5074,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn thinking_only_framing_when_comfortably_within_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, true, 5_000, 200_000, 5, false);
         assert!(
             m.contains("只返回了思考"),
@@ -5070,6 +5093,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn thinking_only_size_aware_when_near_or_over_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, true, 339_000, 200_000, 5, false);
         assert!(
             m.contains("只返回了思考"),
@@ -5081,6 +5106,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn thinking_only_when_already_advised() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, true, 339_000, 200_000, 5, true);
         assert!(
             m.contains("只返回了思考"),
@@ -5088,6 +5115,19 @@ mod empty_exhaustion_message_tests {
         );
         assert!(m.contains("如开头"), "points back to advisory: {m}");
         assert!(m.contains("/compact"), "actionable suggestion: {m}");
+    }
+
+    #[test]
+    fn exhaustion_message_in_english() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::En);
+        let m = empty_exhaustion_message(true, false, 100_000, 200_000, 3, false);
+        assert!(m.contains("unparseable"), "english malformed message: {m}");
+        let m_think = empty_exhaustion_message(false, true, 5_000, 200_000, 3, false);
+        assert!(
+            m_think.contains("only returned thinking"),
+            "english thinking message: {m_think}"
+        );
     }
 }
 
@@ -5121,6 +5161,8 @@ mod over_window_advisory_tests {
 
     #[test]
     fn advisory_is_actionable_and_one_line() {
+        let _guard = super::I18N_TEST_LOCK.lock().unwrap();
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::ZhCn);
         let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
         assert!(!m.contains('\n'), "must be a single line: {m}");
         assert!(m.contains("窗口"), "must name the window: {m}");
@@ -5135,6 +5177,21 @@ mod over_window_advisory_tests {
         assert!(
             !m.contains("/compact"),
             "must NOT suggest /compact (already ran): {m}"
+        );
+    }
+
+    #[test]
+    fn advisory_in_english() {
+        let _guard = super::I18N_TEST_LOCK.lock().unwrap();
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::En);
+        let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
+        assert!(
+            m.contains("watermark"),
+            "english advisory mentions watermark: {m}"
+        );
+        assert!(
+            m.contains("window"),
+            "english advisory mentions window: {m}"
         );
     }
 

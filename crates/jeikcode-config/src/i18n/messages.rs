@@ -1789,4 +1789,57 @@ pub enum Msg<'a> {
     AgentPreRequestNotAppendOnly {
         stored: usize,
     },
+    /// Agent echo/tool loop course correction nudge.
+    AgentEchoLoopNudge,
+    /// Agent echo/tool loop terminal warning.
+    AgentEchoLoopWarning,
+    /// Terminal timeout: consecutive failures without receiving a first token.
+    AgentModelHighLatencyTerminal {
+        retries: u32,
+        secs: u64,
+    },
+    /// Model exhausted retries returning unparseable responses.
+    AgentExhaustedMalformed {
+        max: u32,
+    },
+    /// Model exhausted retries returning only thinking, request over window (intro).
+    AgentExhaustedThinkingOverWindowIntro {
+        max: u32,
+    },
+    /// Model exhausted retries returning only thinking, request over window (size aware).
+    AgentExhaustedThinkingOverWindowSize {
+        max: u32,
+        prompt_k: u32,
+        window_k: u32,
+    },
+    /// Model exhausted retries returning only thinking (generic).
+    AgentExhaustedThinkingGeneric {
+        max: u32,
+    },
+    /// Model exhausted retries returning empty response, request over window (intro).
+    AgentExhaustedEmptyOverWindowIntro {
+        max: u32,
+    },
+    /// Model exhausted retries returning empty response, request over window (size aware).
+    AgentExhaustedEmptyOverWindowSize {
+        max: u32,
+        prompt_k: u32,
+        window_k: u32,
+    },
+    /// Model exhausted retries returning empty response (generic).
+    AgentExhaustedEmptyGeneric {
+        max: u32,
+    },
+    /// HTTP 429 status reason.
+    AgentStatusRateLimited,
+    /// HTTP 5xx / 529 status reason.
+    AgentStatusUpstreamUnavailable,
+    /// Model response timeout reason.
+    AgentStatusResponseTimeout,
+    /// Network connection failed reason.
+    AgentStatusConnectionFailed,
+    /// Account balance insufficient reason.
+    AgentStatusInsufficientBalance,
+    /// API key unauthorized reason.
+    AgentStatusUnauthorized,
 }

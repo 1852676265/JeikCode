@@ -125,6 +125,123 @@ pub fn format_compaction_interrupted() -> String {
     t(Msg::CompactInterrupted).into_owned()
 }
 
+pub fn format_agent_retry_empty(attempt: u32, max: u32, wait: u64) -> String {
+    t(Msg::AgentRetryEmpty { attempt, max, wait }).into_owned()
+}
+
+pub fn format_agent_retry_thinking(attempt: u32, max: u32, wait: u64) -> String {
+    t(Msg::AgentRetryThinking { attempt, max, wait }).into_owned()
+}
+
+pub fn format_agent_retry_malformed(attempt: u32, max: u32, wait: u64) -> String {
+    t(Msg::AgentRetryMalformed { attempt, max, wait }).into_owned()
+}
+
+pub fn format_agent_retry_first_token(secs: u64, attempt: u32, max: u32) -> String {
+    t(Msg::AgentRetryFirstToken { secs, attempt, max }).into_owned()
+}
+
+pub fn format_agent_retry_api(reason: &str, wait: u64, attempt: u32, max: u32) -> String {
+    t(Msg::AgentRetryApi {
+        reason,
+        wait,
+        attempt,
+        max,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_over_window(estimate_k: u32, window_k: u32, buffer_k: u32) -> String {
+    t(Msg::AgentOverWindow {
+        estimate_k,
+        window_k,
+        buffer_k,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_echo_loop_nudge() -> String {
+    t(Msg::AgentEchoLoopNudge).into_owned()
+}
+
+pub fn format_agent_echo_loop_warning() -> String {
+    t(Msg::AgentEchoLoopWarning).into_owned()
+}
+
+pub fn format_agent_model_high_latency_terminal(retries: u32, secs: u64) -> String {
+    t(Msg::AgentModelHighLatencyTerminal { retries, secs }).into_owned()
+}
+
+pub fn format_agent_exhausted_malformed(max: u32) -> String {
+    t(Msg::AgentExhaustedMalformed { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_thinking_over_window_intro(max: u32) -> String {
+    t(Msg::AgentExhaustedThinkingOverWindowIntro { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_thinking_over_window_size(
+    max: u32,
+    prompt_k: u32,
+    window_k: u32,
+) -> String {
+    t(Msg::AgentExhaustedThinkingOverWindowSize {
+        max,
+        prompt_k,
+        window_k,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_exhausted_thinking_generic(max: u32) -> String {
+    t(Msg::AgentExhaustedThinkingGeneric { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_empty_over_window_intro(max: u32) -> String {
+    t(Msg::AgentExhaustedEmptyOverWindowIntro { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_empty_over_window_size(
+    max: u32,
+    prompt_k: u32,
+    window_k: u32,
+) -> String {
+    t(Msg::AgentExhaustedEmptyOverWindowSize {
+        max,
+        prompt_k,
+        window_k,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_exhausted_empty_generic(max: u32) -> String {
+    t(Msg::AgentExhaustedEmptyGeneric { max }).into_owned()
+}
+
+pub fn format_agent_status_rate_limited() -> String {
+    t(Msg::AgentStatusRateLimited).into_owned()
+}
+
+pub fn format_agent_status_upstream_unavailable() -> String {
+    t(Msg::AgentStatusUpstreamUnavailable).into_owned()
+}
+
+pub fn format_agent_status_response_timeout() -> String {
+    t(Msg::AgentStatusResponseTimeout).into_owned()
+}
+
+pub fn format_agent_status_connection_failed() -> String {
+    t(Msg::AgentStatusConnectionFailed).into_owned()
+}
+
+pub fn format_agent_status_insufficient_balance() -> String {
+    t(Msg::AgentStatusInsufficientBalance).into_owned()
+}
+
+pub fn format_agent_status_unauthorized() -> String {
+    t(Msg::AgentStatusUnauthorized).into_owned()
+}
+
 fn fmt_compaction_tokens(tokens: usize) -> String {
     if tokens >= 1_000 {
         format!("{:.1}K", tokens as f64 / 1_000.0)

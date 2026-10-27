@@ -199,11 +199,11 @@ pub(crate) fn strip_tool_result_diff_for_model(text: &str) -> std::borrow::Cow<'
 /// `HTTP {code}: {detail}` (the detail is the only signal there).
 pub(crate) fn friendly_http_error(code: u16, detail: &str) -> String {
     let headline = match code {
-        401 => "API key 未授权或已失效",
-        402 => "账户余额不足",
+        401 => jeikcode_config::i18n::format_agent_status_unauthorized(),
+        402 => jeikcode_config::i18n::format_agent_status_insufficient_balance(),
         _ => return format!("HTTP {code}: {detail}"),
     };
-    format!("{headline}（HTTP {code}）")
+    format!("{headline} (HTTP {code})")
 }
 
 /// Recursively clean and normalize tool parameter schemas for universal LLM wire compatibility

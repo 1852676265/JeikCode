@@ -863,15 +863,15 @@ export function CodeEditorTab({
                 onClick={async () => {
                   try {
                     await openFileWithOs(filePath);
-                    showToast('已调用系统默认应用打开', 'success');
+                    showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
                   } catch (err: any) {
-                    showToast(`打开失败: ${err?.message || err}`, 'error');
+                    showToast(t('preview.openWithDefaultAppFailed', { error: err?.message || err }), 'error');
                   }
                 }}
-                title="使用系统默认应用打开"
+                title={t('preview.openWithDefaultApp')}
               >
                 <span class="editor-btn-icon">🚀</span>
-                <span class="editor-btn-text">系统应用</span>
+                <span class="editor-btn-text">{t('preview.openWithDefaultApp')}</span>
               </button>
               <button
                 type="button"
@@ -879,15 +879,15 @@ export function CodeEditorTab({
                 onClick={async () => {
                   try {
                     await revealInFileExplorer(filePath);
-                    showToast('已在资源管理器中显示', 'success');
+                    showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
                   } catch (err: any) {
-                    showToast(`定位失败: ${err?.message || err}`, 'error');
+                    showToast(t('preview.revealDirFailed', { error: err?.message || err }), 'error');
                   }
                 }}
-                title="在系统资源管理器中定位"
+                title={t('explorer.revealInOs')}
               >
                 <span class="editor-btn-icon">📁</span>
-                <span class="editor-btn-text">定位文件</span>
+                <span class="editor-btn-text">{t('explorer.revealInOs')}</span>
               </button>
             </>
           )}
@@ -901,15 +901,15 @@ export function CodeEditorTab({
                 onClick={async () => {
                   try {
                     await openFileWithOs(filePath);
-                    showToast('已调用系统默认应用打开', 'success');
+                    showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
                   } catch (err: any) {
-                    showToast(`打开失败: ${err?.message || err}`, 'error');
+                    showToast(t('preview.openWithDefaultAppFailed', { error: err?.message || err }), 'error');
                   }
                 }}
-                title="使用系统默认应用打开"
+                title={t('preview.openWithDefaultApp')}
               >
                 <span class="editor-btn-icon">🚀</span>
-                <span class="editor-btn-text">系统应用</span>
+                <span class="editor-btn-text">{t('preview.openWithDefaultApp')}</span>
               </button>
               <button
                 type="button"
@@ -917,15 +917,15 @@ export function CodeEditorTab({
                 onClick={async () => {
                   try {
                     await revealInFileExplorer(filePath);
-                    showToast('已在资源管理器中显示', 'success');
+                    showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
                   } catch (err: any) {
-                    showToast(`定位失败: ${err?.message || err}`, 'error');
+                    showToast(t('preview.revealDirFailed', { error: err?.message || err }), 'error');
                   }
                 }}
-                title="在系统资源管理器中定位"
+                title={t('explorer.revealInOs')}
               >
                 <span class="editor-btn-icon">📁</span>
-                <span class="editor-btn-text">定位文件</span>
+                <span class="editor-btn-text">{t('explorer.revealInOs')}</span>
               </button>
             </>
           )}
@@ -1220,13 +1220,13 @@ export function CodeEditorTab({
                   onClick={async () => {
                     try {
                       await openFileWithOs(filePath);
-                      showToast('已调用系统默认应用打开', 'success');
+                      showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
                     } catch (err: any) {
-                      showToast(`打开失败: ${err?.message || err}`, 'error');
+                      showToast(t('preview.openWithDefaultAppFailed', { error: err?.message || err }), 'error');
                     }
                   }}
                 >
-                  <span>🚀 用系统默认应用打开</span>
+                  <span>🚀 {t('preview.openWithDefaultApp')}</span>
                 </button>
                 <button
                   type="button"
@@ -1234,13 +1234,13 @@ export function CodeEditorTab({
                   onClick={async () => {
                     try {
                       await revealInFileExplorer(filePath);
-                      showToast('已在资源管理器中显示', 'success');
+                      showToast(t('preview.revealDirSuccess', { path: fileName }), 'success');
                     } catch (err: any) {
-                      showToast(`定位失败: ${err?.message || err}`, 'error');
+                      showToast(t('preview.revealDirFailed', { error: err?.message || err }), 'error');
                     }
                   }}
                 >
-                  <span>📁 在资源管理器中显示</span>
+                  <span>📁 {t('explorer.revealInOs')}</span>
                 </button>
               </div>
             </div>

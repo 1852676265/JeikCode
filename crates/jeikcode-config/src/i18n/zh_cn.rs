@@ -1330,5 +1330,29 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 "pre_request 不是只追加：出站前缀与已存的 {stored} 条消息不一致 — 这会破坏本次请求的 \
                  provider 前缀缓存（pre_request hook 只能追加尾部提醒）"
             ).into(),
+        Msg::AgentEchoLoopNudge => "你死循环了，请你重新思考你的动作。".into(),
+        Msg::AgentEchoLoopWarning => "你死循环了，请你重新思考你的动作。若再重复相同工具和参数，本回合将停止。".into(),
+        Msg::AgentModelHighLatencyTerminal { retries, secs } =>
+            format!("模型延迟过高,请稍后再试(连续 {retries} 次在 {secs} 秒内未收到首token)").into(),
+        Msg::AgentExhaustedMalformed { max } =>
+            format!("模型连续 {max} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。").into(),
+        Msg::AgentExhaustedThinkingOverWindowIntro { max } =>
+            format!("模型连续 {max} 次只返回了思考、未给出正文或工具。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。").into(),
+        Msg::AgentExhaustedThinkingOverWindowSize { max, prompt_k, window_k } =>
+            format!("模型连续 {max} 次只返回了思考、未给出正文或工具。当前请求约 {prompt_k}K tokens，已接近或超过模型上下文窗口（约 {window_k}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。").into(),
+        Msg::AgentExhaustedThinkingGeneric { max } =>
+            format!("模型连续 {max} 次只返回了思考、未给出正文或工具。可直接重试，或稍后再试。").into(),
+        Msg::AgentExhaustedEmptyOverWindowIntro { max } =>
+            format!("模型连续 {max} 次返回空响应。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。").into(),
+        Msg::AgentExhaustedEmptyOverWindowSize { max, prompt_k, window_k } =>
+            format!("模型连续 {max} 次返回空响应。当前请求约 {prompt_k}K tokens，已接近或超过模型上下文窗口（约 {window_k}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。").into(),
+        Msg::AgentExhaustedEmptyGeneric { max } =>
+            format!("模型连续 {max} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。").into(),
+        Msg::AgentStatusRateLimited => "请求过于频繁或额度已用尽".into(),
+        Msg::AgentStatusUpstreamUnavailable => "上游服务暂时不可用".into(),
+        Msg::AgentStatusResponseTimeout => "模型响应超时".into(),
+        Msg::AgentStatusConnectionFailed => "网络连接失败".into(),
+        Msg::AgentStatusInsufficientBalance => "账户余额不足".into(),
+        Msg::AgentStatusUnauthorized => "API key 未授权或已失效".into(),
     }
 }

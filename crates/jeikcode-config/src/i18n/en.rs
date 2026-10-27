@@ -1355,5 +1355,29 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  stored message(s) — this poisons the provider prefix cache for this request \
                  (a pre_request hook may only APPEND tail reminders)"
             ).into(),
+        Msg::AgentEchoLoopNudge => "You are in a loop. Please reconsider your actions.".into(),
+        Msg::AgentEchoLoopWarning => "You are in a loop. Please reconsider your actions. Repeating the same tool and arguments again will stop this turn.".into(),
+        Msg::AgentModelHighLatencyTerminal { retries, secs } =>
+            format!("Model latency is too high, please try again later ({retries} consecutive attempts without first token in {secs}s)").into(),
+        Msg::AgentExhaustedMalformed { max } =>
+            format!("Model returned unparseable responses {max} times consecutively (sporadic upstream issue). You can retry directly or try again later.").into(),
+        Msg::AgentExhaustedThinkingOverWindowIntro { max } =>
+            format!("Model only returned thinking without text or tools for {max} consecutive times. As noted earlier, this request exceeds the model's context window — please trim input or /compact and retry.").into(),
+        Msg::AgentExhaustedThinkingOverWindowSize { max, prompt_k, window_k } =>
+            format!("Model only returned thinking without text or tools for {max} consecutive times. Current request is ~{prompt_k}K tokens, near or exceeding model window (~{window_k}K), likely due to an oversized request. Consider /compact or trimming input.").into(),
+        Msg::AgentExhaustedThinkingGeneric { max } =>
+            format!("Model only returned thinking without text or tools for {max} consecutive times. You can retry directly or try again later.").into(),
+        Msg::AgentExhaustedEmptyOverWindowIntro { max } =>
+            format!("Model returned empty responses {max} times consecutively. As noted earlier, this request exceeds the model's context window — please trim input or /compact and retry.").into(),
+        Msg::AgentExhaustedEmptyOverWindowSize { max, prompt_k, window_k } =>
+            format!("Model returned empty responses {max} times consecutively. Current request is ~{prompt_k}K tokens, near or exceeding model window (~{window_k}K), likely due to an oversized request. Consider /compact or trimming input.").into(),
+        Msg::AgentExhaustedEmptyGeneric { max } =>
+            format!("Model returned empty responses {max} times consecutively (sporadic upstream issue, unrelated to context length). You can retry directly or try again later.").into(),
+        Msg::AgentStatusRateLimited => "Request rate limit exceeded or quota exhausted".into(),
+        Msg::AgentStatusUpstreamUnavailable => "Upstream service is temporarily unavailable".into(),
+        Msg::AgentStatusResponseTimeout => "Model response timed out".into(),
+        Msg::AgentStatusConnectionFailed => "Network connection failed".into(),
+        Msg::AgentStatusInsufficientBalance => "Insufficient account balance".into(),
+        Msg::AgentStatusUnauthorized => "API key is unauthorized or has expired".into(),
     }
 }

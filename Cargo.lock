@@ -2137,6 +2137,7 @@ version = "7.3.1-beta.4"
 dependencies = [
  "async-trait",
  "futures",
+ "jeikcode-config",
  "serde",
  "serde_json",
  "tokio",

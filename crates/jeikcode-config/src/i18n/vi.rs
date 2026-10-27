@@ -1261,6 +1261,22 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         | Msg::AgentStreamReconnecting { .. }
         | Msg::AgentResponseTruncated
         | Msg::AgentUnsupportedSnapshot { .. }
-        | Msg::AgentPreRequestNotAppendOnly { .. } => super::en::en(msg),
+        | Msg::AgentPreRequestNotAppendOnly { .. }
+        | Msg::AgentEchoLoopNudge
+        | Msg::AgentEchoLoopWarning
+        | Msg::AgentModelHighLatencyTerminal { .. }
+        | Msg::AgentExhaustedMalformed { .. }
+        | Msg::AgentExhaustedThinkingOverWindowIntro { .. }
+        | Msg::AgentExhaustedThinkingOverWindowSize { .. }
+        | Msg::AgentExhaustedThinkingGeneric { .. }
+        | Msg::AgentExhaustedEmptyOverWindowIntro { .. }
+        | Msg::AgentExhaustedEmptyOverWindowSize { .. }
+        | Msg::AgentExhaustedEmptyGeneric { .. }
+        | Msg::AgentStatusRateLimited
+        | Msg::AgentStatusUpstreamUnavailable
+        | Msg::AgentStatusResponseTimeout
+        | Msg::AgentStatusConnectionFailed
+        | Msg::AgentStatusInsufficientBalance
+        | Msg::AgentStatusUnauthorized => super::en::en(msg),
     }
 }

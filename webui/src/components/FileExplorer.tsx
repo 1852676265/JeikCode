@@ -680,7 +680,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
       return;
     }
     if (/[\\/:*?"<>|]/.test(trimmed)) {
-      showToast('名称不能包含非法字符 (/ \\ : * ? " < > |)', 'error');
+      showToast(t('explorer.invalidName'), 'error');
       return;
     }
     try {
@@ -689,11 +689,11 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
         new_name: trimmed,
       });
       setRenameModal({ open: false, node: null, currentName: '' });
-      showToast(`已重命名为 "${trimmed}"`, 'success');
+      showToast(t('explorer.renameSuccess', { name: trimmed }), 'success');
       void refreshTree(true);
       window.dispatchEvent(new CustomEvent('jeikcode:worktree_touch'));
     } catch (err: any) {
-      showToast(`重命名失败: ${err?.message || err}`, 'error');
+      showToast(t('explorer.renameFailed', { error: err?.message || err }), 'error');
     }
   };
 
@@ -721,12 +721,12 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
     setSelectedPaths(new Set());
     setLastSelectedPath(null);
     if (successCount > 0) {
-      showToast(`已删除 ${successCount} 个项目`, 'success');
+      showToast(t('explorer.deleteSuccess', { n: successCount }), 'success');
       void refreshTree(true);
       window.dispatchEvent(new CustomEvent('jeikcode:worktree_touch'));
     }
     if (failCount > 0) {
-      showToast(`${failCount} 个项目删除失败`, 'error');
+      showToast(t('explorer.deleteFailed', { n: failCount }), 'error');
     }
   };
 
@@ -1011,7 +1011,7 @@ export function FileExplorer({ cwd, onOpenFile, activeFilePath }: FileExplorerPr
                     <button
                       type="button"
                       class="search-toggle-btn"
-                      onClick={() => showToast('已执行批量替换', 'success')}
+                      onClick={() => showToast(t('editor.replaceAllSuccess', { n: 0 }), 'success')}
                       title="全部替换 (Ctrl+Alt+Enter)"
                     >
                       🔁
