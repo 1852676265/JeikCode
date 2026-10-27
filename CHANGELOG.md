@@ -21,6 +21,32 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.5 (2026-10-27)
+
+- **[Approval Mode & Model Selection] Per-session isolation, a global override switch, and runtime fidelity**:
+  - Fixed a state split where the mode pill showed Auto while the running session still asked for approvals; runtime creation, mid-turn permission polling, and pending-card queries now all read the session's own mode.
+  - Switching sessions no longer resets the approval mode — warm switches, refreshes, and cold starts restore each session's own choice consistently.
+  - Added a **Global** switch at the bottom of the mode menu (off by default). When enabled, every session follows one shared mode and all clients mirror the switch instantly; turning it off anywhere restores each session's own mode everywhere. API conversations are never affected.
+  - Model selection is now fully per-session: switching models in an existing session only affects that session, while a new session's model is promoted to the global default only after its first response actually starts streaming.
+  - Thinking intensity (reasoning effort and budget) is stored per session, so changing it in one conversation no longer rewrites a sibling using the same provider.
+- **[Chat Experience] Smoother streaming, smarter outline labels, and clearer notices**:
+  - Question outline labels now ellipsize at the real available width, so widening the panel reveals more of each question instead of a fixed character cut.
+  - Stabilized auto-follow and scroll anchoring while a reply streams and when a turn ends, avoiding jumps after refresh or reattach.
+  - Unified retry advisories and in-app toasts across all supported languages.
+
+---
+
+- **[审批模式与模型选择] 会话级隔离、全局开关与运行时一致性**:
+  - 修复“模式显示 Auto、实际仍在等待审批”的状态分裂：运行时创建、回合内权限轮询与待交互卡片查询现在统一读取该会话自己的模式。
+  - 切换会话不再把审批模式重置——热切换、刷新与冷启动都能稳定还原各会话自己的选择。
+  - 模式菜单底部新增 **全局** 开关（默认关闭）。开启后所有会话统一跟随同一模式，所有客户端开关即时同步；在任意一端关闭，所有实例都恢复各会话自己的模式。API 对话端点完全不受影响。
+  - 模型选择实现完整的会话级隔离：在已有会话中切换模型只影响该会话；新建会话的模型仅在其首条回复真正开始输出后才提升为全局默认。
+  - 思考强度（reasoning effort 与预算）按会话保存，调整一个会话不再改写使用同一提供商的其它会话。
+- **[聊天体验] 更顺滑的流式输出、更合理的导航标签与更清晰的提示**:
+  - 提问导航标签改为按真实可用宽度省略，拉宽面板即可看到更多内容，不再固定截断字数。
+  - 优化回复流式输出与回合结束时的自动跟随与滚动锚定，避免刷新或重新接入后的跳动。
+  - 统一所有支持语言下的重试提示与应用内通知文案。
+
 ## v7.3.1-beta.4 (2026-10-27)
 
 - **[Session Management & Approval Sync] Cross-client approval mode synchronization & remote recovery**:
