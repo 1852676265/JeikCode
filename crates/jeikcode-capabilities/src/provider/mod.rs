@@ -142,6 +142,47 @@ pub(crate) fn push_system_coalesced(out: &mut Vec<Value>, text: &str) {
     out.push(json!({ "role": "system", "content": text }));
 }
 
+/// Strips the unified-diff section from successful file modification tool results
+/// before projecting them into the model context layer.
+///
+/// This maintains clean context separation:
+/// - Presentation layer (TUI, WebUI, display log) retains the full diff for user inspection.
+/// - Model context layer receives only the concise success acknowledgement, preventing
+///   diff-marker context degradation, token bloating, and prompt-cache invalidation.
+pub(crate) fn strip_tool_result_diff_for_model(text: &str) -> std::borrow::Cow<'_, str> {
+    // Only strip if it looks like a successful file edit/write result
+    let is_edit_success = (text.contains("has been updated successfully")
+        || text.contains("has been created")
+        || text.contains("Edited ")
+        || text.contains("Created ")
+        || text.contains("Overwrote "))
+        && !text.contains("failed")
+        && !text.contains("error:")
+        && !text.contains("Error:");
+
+    if !is_edit_success {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    // Look for unified diff start markers
+    let diff_markers = ["\n--- a/", "\n--- ", "\n@@ -", "\ndiff --git "];
+    let mut cut_idx = None;
+    for marker in &diff_markers {
+        if let Some(idx) = text.find(marker) {
+            cut_idx = Some(cut_idx.map_or(idx, |cur: usize| cur.min(idx)));
+        }
+    }
+
+    if let Some(idx) = cut_idx {
+        let concise = text[..idx].trim_end();
+        if !concise.is_empty() {
+            return std::borrow::Cow::Owned(concise.to_string());
+        }
+    }
+
+    std::borrow::Cow::Borrowed(text)
+}
+
 /// Map an HTTP error status to a plain-language headline so the TUI shows the
 /// *cause*, not a bare `HTTP 401:` (which, when the server returns an empty
 /// body, carried no hint at all). Shared by every provider protocol
@@ -440,5 +481,35 @@ mod wire_dump_tests {
         // goggles preserves type: "array" and items (vital for Gemini API)
         assert_eq!(props["goggles"]["type"], "array");
         assert_eq!(props["goggles"]["items"], json!({ "type": "string" }));
+    }
+
+    #[test]
+    fn test_strip_tool_result_diff_for_model() {
+        use super::strip_tool_result_diff_for_model;
+
+        // 1. Successful edit with diff: diff is stripped, concise success is kept
+        let full_edit = "The file src/main.rs has been updated successfully (1 replacement). Edited successfully.\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n-old\n+new";
+        let model_view = strip_tool_result_diff_for_model(full_edit);
+        assert_eq!(
+            model_view,
+            "The file src/main.rs has been updated successfully (1 replacement). Edited successfully."
+        );
+
+        // 2. Edit with auto-heal note: note and success kept, diff stripped
+        let heal_edit = "⚠️ **[Auto-heal Note]**: A conflict was resolved.\n\nThe file src/lib.rs has been updated successfully (2 replacements).\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,2 +10,2 @@\n-a\n+b";
+        let heal_model_view = strip_tool_result_diff_for_model(heal_edit);
+        assert_eq!(
+            heal_model_view,
+            "⚠️ **[Auto-heal Note]**: A conflict was resolved.\n\nThe file src/lib.rs has been updated successfully (2 replacements)."
+        );
+
+        // 3. Failed edit: preserved entirely for error diagnosis
+        let failed_edit = "edit: hunk 1/1 failed. old_string not found in file.";
+        let failed_model_view = strip_tool_result_diff_for_model(failed_edit);
+        assert_eq!(failed_model_view, failed_edit);
+
+        // 4. Non-edit output: preserved entirely
+        let read_output = "Line 1\nLine 2\nLine 3";
+        assert_eq!(strip_tool_result_diff_for_model(read_output), read_output);
     }
 }

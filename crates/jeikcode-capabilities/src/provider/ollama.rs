@@ -397,7 +397,8 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
             }
             Role::Tool => {
                 // Tool RESULT. Ollama matches by ORDER (no tool_call_id on the wire).
-                out.push(json!({ "role": "tool", "content": m.text }));
+                let model_content = super::strip_tool_result_diff_for_model(&m.text);
+                out.push(json!({ "role": "tool", "content": model_content }));
             }
         }
     }

@@ -702,10 +702,11 @@ fn format_messages(
                 while i < messages.len() && messages[i].role == Role::Tool {
                     let tr = &messages[i];
                     if let Some(id) = tr.tool_call_id.as_deref().filter(|s| !s.is_empty()) {
+                        let model_content = super::strip_tool_result_diff_for_model(&tr.text);
                         blocks.push(json!({
                             "type": "tool_result",
                             "tool_use_id": id,
-                            "content": tr.text,
+                            "content": model_content,
                             "is_error": tr.is_error,
                         }));
                     }

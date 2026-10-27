@@ -736,10 +736,11 @@ fn tool_name_for(messages: &[Message], idx: usize) -> String {
 }
 
 fn function_response_part(m: &Message, name: &str) -> Value {
-    let response: Value = serde_json::from_str(m.text.trim())
+    let model_text = super::strip_tool_result_diff_for_model(&m.text);
+    let response: Value = serde_json::from_str(model_text.trim())
         .ok()
         .filter(Value::is_object)
-        .unwrap_or_else(|| json!({ "result": m.text }));
+        .unwrap_or_else(|| json!({ "result": model_text }));
     let mut fr = Map::new();
     fr.insert("name".into(), json!(name));
     fr.insert("response".into(), response);

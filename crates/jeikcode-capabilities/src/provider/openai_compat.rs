@@ -1016,7 +1016,8 @@ fn format_messages(
                 };
                 // NOTE: `is_error` has no OpenAI-compatible wire field; the error text
                 // is already inside `content`.
-                out.push(json!({ "role": "tool", "tool_call_id": id, "content": m.text }));
+                let model_content = super::strip_tool_result_diff_for_model(&m.text);
+                out.push(json!({ "role": "tool", "tool_call_id": id, "content": model_content }));
             }
         }
     }

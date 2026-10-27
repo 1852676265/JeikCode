@@ -117,7 +117,6 @@ impl Tool for EditFileTool {
         crate::tools::repair::merge_edit_file_args(args_list)
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let t0 = std::time::Instant::now();
         // 调用方是否真的传了非空 `edits[]`（而非便捷形）。必须在归一化前判定：
         // 归一化会把顶层 old/new 对合成进 edits[]，之后无法再区分两者。
         let caller_passed_edits = serde_json::from_str::<serde_json::Value>(args)
@@ -312,7 +311,6 @@ impl Tool for EditFileTool {
         #[cfg(feature = "codeintel")]
         crate::codeintel::notify_code_index_file_changed(&path, Some(&buf));
         let diff = build_compact_diff(&original, &buf, Some(&path));
-        let cost_time = t0.elapsed();
         let kind_note = if kinds.len() == 1 {
             if kinds[0] == "exact" {
                 String::new()
@@ -323,13 +321,13 @@ impl Tool for EditFileTool {
             format!(" ({} hunks: {})", kinds.len(), kinds.join(", "))
         };
 
-        let mut out = format!("> ⏱️ **Cost Time**: {:.2?}ms\n\n", cost_time.as_millis());
+        let mut out = String::new();
 
         if !auto_healed_old_strings.is_empty() {
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             let latest_str = auto_healed_old_strings.join("\n---\n");
             out.push_str(&format!(
-                "⚠️ **[自动安全修改提示]**：\n你的 old_string 存在冲突，已为你自动执行成功后的安全修改，请你下次如果修改涉及到这块old str 请记得使用新的old str 不用去读源文件。\n\n当前位置最新的实际 old_string 为：\n```{ext}\n{latest_str}\n```\n\n本次修改已成功！以下为最终生效的差异：\n\n"
+                "⚠️ **[Auto-heal Note]**: A conflict in old_string was safely resolved and applied. If future edits touch this section, use the latest content below:\n```{ext}\n{latest_str}\n```\n\nEdit applied successfully!\n\n"
             ));
         }
 
@@ -339,11 +337,14 @@ impl Tool for EditFileTool {
             out.push('\n');
         }
         out.push_str(&format!(
-            "Edited {} ({total} replacement{}{kind_note})\n{}",
+            "The file {} has been updated successfully ({total} replacement{}{kind_note}). Edited successfully.",
             crate::pathnorm::to_display(&path),
             if total == 1 { "" } else { "s" },
-            diff,
         ));
+        if !diff.is_empty() {
+            out.push('\n');
+            out.push_str(&diff);
+        }
         return ok(out);
     }
 }
@@ -3840,22 +3841,23 @@ fn b() { 2 }
             .await;
         assert!(!r.is_error, "auto-heal must succeed: {}", r.content);
         assert!(
-            r.content.contains("⚠️ **[自动安全修改提示]**："),
+            r.content.contains("⚠️ **[Auto-heal Note]**:"),
             "should contain the warning header: {}",
             r.content
         );
         assert!(
-            r.content.contains("你的 old_string 存在冲突，已为你自动执行成功后的安全修改，请你下次如果修改涉及到这块old str 请记得使用新的old str 不用去读源文件。"),
-            "should contain exact user-specified notice: {}",
+            r.content
+                .contains("A conflict in old_string was safely resolved and applied."),
+            "should contain exact notice: {}",
             r.content
         );
         assert!(
-            r.content.contains("当前位置最新的实际 old_string 为："),
+            r.content.contains("use the latest content below:"),
             "should contain latest actual old_string section: {}",
             r.content
         );
         assert!(
-            r.content.contains("本次修改已成功！以下为最终生效的差异："),
+            r.content.contains("Edit applied successfully!"),
             "should contain success summary: {}",
             r.content
         );
@@ -3889,7 +3891,7 @@ fn b() { 2 }
             .await;
         assert!(!r.is_error, "exact match must succeed: {}", r.content);
         assert!(
-            !r.content.contains("自动安全修改提示"),
+            !r.content.contains("Auto-heal Note"),
             "exact match should NOT emit auto-heal notice: {}",
             r.content
         );
@@ -3996,7 +3998,7 @@ fn b() { 2 }
             r3.content
         );
         assert!(
-            r3.content.contains("⚠️ **[自动安全修改提示]**："),
+            r3.content.contains("⚠️ **[Auto-heal Note]**:"),
             "should emit auto-heal notice: {}",
             r3.content
         );
@@ -4181,7 +4183,7 @@ fn b() { 2 }
             r2.content
         );
         assert!(
-            r2.content.contains("⚠️ **[自动安全修改提示]**："),
+            r2.content.contains("⚠️ **[Auto-heal Note]**:"),
             "should emit auto-heal notice: {}",
             r2.content
         );

@@ -562,10 +562,11 @@ fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: boo
                 let Some(id) = m.tool_call_id.as_deref().filter(|s| !s.is_empty()) else {
                     continue;
                 };
+                let model_content = super::strip_tool_result_diff_for_model(&m.text);
                 out.push(json!({
                     "type": "function_call_output",
                     "call_id": id,
-                    "output": m.text,
+                    "output": model_content,
                 }));
             }
         }

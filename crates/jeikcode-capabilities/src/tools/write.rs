@@ -48,7 +48,6 @@ impl Tool for WriteFileTool {
         String::new()
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let t0 = std::time::Instant::now();
         let a: Args =
             match parse_tool_args("write", args, r#"{"path":"<path>","content":"<text>"}"#)
                 .or_else(|_| {
@@ -124,11 +123,7 @@ impl Tool for WriteFileTool {
             }
             None => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
         };
-        let cost_time = t0.elapsed();
-        ok(format!(
-            "> ⏱️ **Cost Time**: {:.2?}ms\n\n{msg}",
-            cost_time.as_millis()
-        ))
+        ok(msg)
     }
 }
 
