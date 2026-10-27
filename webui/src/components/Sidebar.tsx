@@ -731,6 +731,25 @@ export function Sidebar({
         });
         return;
       }
+      if (event.type === 'session_mode') {
+        if (!event.session_id) return;
+        setSessions((cur) =>
+          cur.map((s) => (s.id === event.session_id ? { ...s, approval_mode: event.mode } : s))
+        );
+        setProjectSessionsMap((prev) => {
+          let changed = false;
+          const next: typeof prev = {};
+          for (const [hash, list] of Object.entries(prev)) {
+            const updated = list.map((s) =>
+              s.id === event.session_id ? { ...s, approval_mode: event.mode } : s
+            );
+            if (updated !== list) changed = true;
+            next[hash] = updated;
+          }
+          return changed ? next : prev;
+        });
+        return;
+      }
       if (event.type === 'session_deleted') {
         const removed = new Set([event.session_id]);
         setSessions((cur) => removeSessionRows(cur, removed));

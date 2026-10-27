@@ -1121,13 +1121,23 @@ export function sanitizeCanvasMessages<
   return result;
 }
 
+function sameImages(
+  a?: unknown[],
+  b?: unknown[],
+): boolean {
+  const left = a ?? [];
+  const right = b ?? [];
+  if (left.length !== right.length) return false;
+  return left.every((img: any, i) => img?.media_type === (right[i] as any)?.media_type && img?.data === (right[i] as any)?.data);
+}
+
 /**
  * 旧缓存 / 回放恢复出来的提问行既没有 id 也没有 sourceIndex：
- * 用「文本 + 时间戳（≤ 3s，缺失时间戳则保守视为同一行）」判断是不是同一条提问。
+ * 用「文本 + 时间戳（≤ 3s，缺失时间戳则保守视为同一行）」或「图片指纹 + 时间戳」判断是不是同一条提问。
  */
-function sameUserRow(
-  a: { role?: string; parts?: MsgPart[]; ts?: number },
-  b: { role?: string; parts?: MsgPart[]; ts?: number },
+export function sameUserRow(
+  a: { role?: string; parts?: MsgPart[]; ts?: number; images?: unknown[] },
+  b: { role?: string; parts?: MsgPart[]; ts?: number; images?: unknown[] },
 ): boolean {
   if (a.role !== 'user' || b.role !== 'user') return false;
   const textOf = (message: { parts?: MsgPart[] }): string =>
@@ -1139,7 +1149,21 @@ function sameUserRow(
     );
   const left = textOf(a);
   const right = textOf(b);
-  if (!left || !right || !userTextsMatch(left, right)) return false;
+  const hasText = !!left && !!right;
+  const hasImages =
+    Array.isArray((a as any).images) &&
+    (a as any).images.length > 0 &&
+    Array.isArray((b as any).images) &&
+    (b as any).images.length > 0;
+
+  if (hasText) {
+    if (!userTextsMatch(left, right)) return false;
+  } else if (hasImages) {
+    if (!sameImages((a as any).images, (b as any).images)) return false;
+  } else {
+    return false;
+  }
+
   if (a.ts && b.ts) return Math.abs(a.ts - b.ts) <= 3000;
   return true;
 }

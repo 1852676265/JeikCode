@@ -18,6 +18,7 @@ import {
   resolveHistoryOffset,
   spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
+  sameUserRow,
   stampUserClientInputId,
   stampUserSourceIndex,
   withAssistantIdentity,
@@ -1619,4 +1620,27 @@ test('spliceAuthoritativeDiskTail 为头部行自动补全权威 pinned 切片�
   assert.equal(spliced[0]?.id, 'u-7');
   assert.equal((spliced[0] as any)?.images?.length, 1);
   assert.equal((spliced[0] as any)?.images?.[0]?.data, 'imgbase64');
+});
+
+test('sameUserRow accurately matches image-only user messages with identical images', () => {
+  const a = {
+    role: 'user',
+    parts: [{ kind: 'text' as const, text: '' }],
+    images: [{ media_type: 'image/png', data: 'dataA' }],
+    ts: 1000,
+  };
+  const b = {
+    role: 'user',
+    parts: [{ kind: 'text' as const, text: '' }],
+    images: [{ media_type: 'image/png', data: 'dataA' }],
+    ts: 2000,
+  };
+  const c = {
+    role: 'user',
+    parts: [{ kind: 'text' as const, text: '' }],
+    images: [{ media_type: 'image/png', data: 'dataB' }],
+    ts: 1000,
+  };
+  assert.equal(sameUserRow(a, b), true);
+  assert.equal(sameUserRow(a, c), false);
 });

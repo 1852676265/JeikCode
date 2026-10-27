@@ -514,6 +514,11 @@ fn list_project_sessions(working_dir: &std::path::Path) -> Vec<(String, SessionS
             updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
             message_count: entry.message_count,
             file_size: 0,
+            approval_mode: Some(
+                crate::live_api::live_session_approval_mode(Some(&entry.id))
+                    .wire()
+                    .to_string(),
+            ),
         };
         out.push((entry.project_bucket, summary));
     }

@@ -4502,6 +4502,8 @@ pub struct SessionSummary {
     pub message_count: usize,
     #[serde(default)]
     pub file_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 fn catalog_scan_in_root(
@@ -4530,6 +4532,11 @@ fn catalog_entry_to_session_summary(
         updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
         message_count: entry.message_count,
         file_size: 0,
+        approval_mode: Some(
+            live_api::live_session_approval_mode(Some(&entry.id))
+                .wire()
+                .to_string(),
+        ),
     }
 }
 

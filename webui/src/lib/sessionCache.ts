@@ -27,6 +27,7 @@ export interface CachedSessionData {
   historyTotal?: number;
   timestamp: number;
   mtime_ms?: number;
+  approvalMode?: string | null;
 }
 
 const DB_NAME = 'jeikcode_cache';
@@ -199,6 +200,7 @@ export async function saveSessionCache(
   tokenUsage?: any | null,
   historyOffset?: number,
   historyTotal?: number,
+  approvalMode?: string | null,
 ): Promise<void> {
   const data: CachedSessionData = {
     sessionId,
@@ -212,6 +214,7 @@ export async function saveSessionCache(
     historyTotal,
     timestamp: Date.now(),
     mtime_ms,
+    approvalMode: approvalMode ?? undefined,
   };
 
   // 1. 同步更新 L1 内存

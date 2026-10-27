@@ -100,6 +100,12 @@ export function App() {
           }
           return;
         }
+        if (event.type === 'session_mode') {
+          if (event.session_id && sessionId === event.session_id) {
+            setActiveSession((prev) => (prev ? { ...prev, approval_mode: event.mode } : prev));
+          }
+          return;
+        }
         if (event.type !== 'review_resolved') return;
         setPending((cur: any | null) =>
           cur && event.approval_id && cur.approval_id === event.approval_id ? null : cur,

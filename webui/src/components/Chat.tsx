@@ -1877,6 +1877,45 @@ export function Chat({
   const providerPinnedRef = useRef(false);
   const NEW_SESSION_PROVIDER_KEY = '__new__';
   const providerCacheRef = useRef(new Map<string, string>());
+  const NEW_SESSION_MODE_KEY = '__new__';
+  const modeCacheRef = useRef(new Map<string, ApprovalMode>());
+  const modeCacheKey = useCallback(
+    (sid: string | null) => sid ?? NEW_SESSION_MODE_KEY,
+    [],
+  );
+  const restoreModeForSession = useCallback(
+    (sid: string | null, fallbackMode?: ApprovalMode | null, isProtocol?: boolean) => {
+      if (isProtocol) {
+        nativeModeRef.current = 'bypass';
+        setModeState(initModeState('bypass'));
+        return;
+      }
+      const cached = modeCacheRef.current.get(modeCacheKey(sid));
+      if (cached) {
+        nativeModeRef.current = cached;
+        setModeState(initModeState(cached));
+        return;
+      }
+      if (fallbackMode) {
+        modeCacheRef.current.set(modeCacheKey(sid), fallbackMode);
+        nativeModeRef.current = fallbackMode;
+        setModeState(initModeState(fallbackMode));
+        return;
+      }
+      if (sid) {
+        getApprovalMode(sid)
+          .then((m) => {
+            if (activeIdRef.current === sid) {
+              modeCacheRef.current.set(modeCacheKey(sid), m);
+              nativeModeRef.current = m;
+              setModeState(initModeState(m));
+            }
+          })
+          .catch(() => {});
+      }
+    },
+    [modeCacheKey],
+  );
   const localTurnSessionsRef = useRef(new Set<string>());
   const backgroundRunningSessionsRef = useRef(new Set<string>());
   /** Project bucket for a session we may finish off-screen. */
@@ -3361,6 +3400,9 @@ export function Chat({
       if (prevId && provider) {
         providerCacheRef.current.set(prevId, provider);
       }
+      if (prevId) {
+        modeCacheRef.current.set(prevId, modeState.confirmedMode);
+      }
       if (pendingSteersRef.current.length > 0 && prevId) {
         pendingSteersBySessionRef.current.set(prevId, [...pendingSteersRef.current]);
       }
@@ -3460,6 +3502,10 @@ export function Chat({
         preMountStreamBufferRef.current.set(sessionId, []);
       }
       restoreProviderForSession(sessionId);
+      restoreModeForSession(
+        sessionId,
+        activeSession?.id === sessionId ? (activeSession.approval_mode as ApprovalMode) : null,
+      );
 
       // 恢复新会话的输入框草稿
       const nextDraft = loadComposerDraft(sessionId);
@@ -3789,6 +3835,23 @@ export function Chat({
         setProvider(cachedProv);
         providerPinnedRef.current = true;
       }
+      const cachedMode =
+        modeCacheRef.current.get(sessionId) ||
+        (activeSession?.id === sessionId ? (activeSession.approval_mode as ApprovalMode) : null);
+      if (cachedMode) {
+        nativeModeRef.current = cachedMode;
+        setModeState(initModeState(cachedMode));
+      } else {
+        getApprovalMode(sessionId)
+          .then((current) => {
+            if (activeIdRef.current === sessionId) {
+              modeCacheRef.current.set(sessionId, current);
+              nativeModeRef.current = current;
+              setModeState(initModeState(current));
+            }
+          })
+          .catch(() => {});
+      }
       const isRunning =
         backgroundRunningSessionsRef.current.has(sessionId) ||
         localTurnSessionsRef.current.has(sessionId);
@@ -3896,6 +3959,13 @@ export function Chat({
             applySessionStickyTodos(loadId, idb.todos);
           } else {
             applySessionStickyTodos(loadId, null);
+          }
+          if (idb.approvalMode) {
+            modeCacheRef.current.set(loadId, idb.approvalMode as ApprovalMode);
+            if (activeIdRef.current === loadId && !modeState.pendingMode) {
+              nativeModeRef.current = idb.approvalMode as ApprovalMode;
+              setModeState(initModeState(idb.approvalMode as ApprovalMode));
+            }
           }
           if (idb.tokenUsage) {
             applySessionTokens(loadId, idb.messages, idb.tokenUsage);
@@ -4092,9 +4162,12 @@ export function Chat({
               ? sessionMode
               : origin === 'protocol'
               ? modeForSessionOrigin(origin)
-              : nativeModeRef.current;
+              : modeCacheRef.current.get(loadId)
+              ?? (activeSession?.id === loadId ? (activeSession.approval_mode as ApprovalMode) : null)
+              ?? 'build';
             nativeModeRef.current = targetMode;
             setModeState(initModeState(targetMode));
+            modeCacheRef.current.set(loadId, targetMode);
           }
         } else if (!isLiveSession) {
           // Draft / brand-new empty sessions 404 on disk until first persist —
@@ -4107,6 +4180,7 @@ export function Chat({
             getApprovalMode(loadId)
               .then((current) => {
                 if (activeIdRef.current === loadId) {
+                  modeCacheRef.current.set(loadId, current);
                   nativeModeRef.current = current;
                   setModeState(initModeState(current));
                 }
@@ -4319,13 +4393,18 @@ export function Chat({
 
   useEffect(() => {
     let cancelled = false;
-    getApprovalMode()
-      .then((current) => {
-        if (cancelled || protocolSessionRef.current) return;
-        nativeModeRef.current = current;
-        setModeState(initModeState(current));
-      })
-      .catch(() => {});
+    const initialSid = activeIdRef.current;
+    if (!modeCacheRef.current.has(initialSid || '')) {
+      getApprovalMode(initialSid || undefined)
+        .then((current) => {
+          if (cancelled || protocolSessionRef.current) return;
+          if (initialSid && modeCacheRef.current.has(initialSid)) return;
+          nativeModeRef.current = current;
+          setModeState(initModeState(current));
+          if (initialSid) modeCacheRef.current.set(initialSid, current);
+        })
+        .catch(() => {});
+    }
 
     const applyIncomingMode = (nextMode: ApprovalMode) => {
       if (cancelled || protocolSessionRef.current) return;
@@ -4344,6 +4423,9 @@ export function Chat({
       const detail = (e as CustomEvent<ApprovalMode | { mode: ApprovalMode; session_id?: string }>).detail;
       const mode = typeof detail === 'string' ? detail : detail?.mode;
       const targetSessionId = typeof detail === 'object' ? detail?.session_id : undefined;
+      if (targetSessionId && mode) {
+        modeCacheRef.current.set(targetSessionId, mode);
+      }
       if (!targetSessionId || targetSessionId === activeIdRef.current) {
         if (mode) applyIncomingMode(mode);
       }
@@ -4352,6 +4434,9 @@ export function Chat({
     const handleRemoteSessionMode = (e: Event) => {
       const detail = (e as CustomEvent<{ session_id?: string | null; mode: ApprovalMode }>).detail;
       if (!detail || !detail.mode) return;
+      if (detail.session_id) {
+        modeCacheRef.current.set(detail.session_id, detail.mode);
+      }
       if (!detail.session_id || detail.session_id === activeIdRef.current) {
         applyIncomingMode(detail.mode);
       }
@@ -4366,6 +4451,9 @@ export function Chat({
         bc = new BroadcastChannel('jeikcode_approval_mode');
         bc.onmessage = (ev) => {
           if (ev.data?.type === 'mode' && ev.data.mode) {
+            if (ev.data.session_id) {
+              modeCacheRef.current.set(ev.data.session_id, ev.data.mode);
+            }
             if (!ev.data.session_id || ev.data.session_id === activeIdRef.current) {
               applyIncomingMode(ev.data.mode);
             }
@@ -4593,12 +4681,16 @@ export function Chat({
           typeof lastLoaded?.sourceIndex === 'number' && lastLoaded.sourceIndex === sourceIndex;
         const missingAbsoluteRow =
           typeof lastLoaded?.sourceIndex !== 'number' || typeof sourceIndex !== 'number';
-        if (
+        const hasVisible = !!visible;
+        const hasImages = Array.isArray(msg.images) && msg.images.length > 0;
+        const isDuplicateUser =
           lastLoaded &&
           lastLoaded.role === 'user' &&
           (sameAbsoluteRow || missingAbsoluteRow) &&
-          lastLoaded.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', visible))
-        ) {
+          (hasVisible
+            ? lastLoaded.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', visible))
+            : hasImages && sameImageSet(lastLoaded.images, msg.images));
+        if (isDuplicateUser) {
           continue;
         }
         const turnNavOrdinal = userTurnOrdinal++;
@@ -5519,6 +5611,11 @@ export function Chat({
         messagesRef.current = next;
         if (sid) {
           messageCacheRef.current.set(sid, next);
+          const ph = activeSession?.project_hash || projectHashBySessionRef.current.get(sid) || viewedProjectHashRef.current || '';
+          if (ph) {
+            const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
+            void saveSessionCache(ph, sid, next, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+          }
         }
         return next;
       });
@@ -5527,6 +5624,10 @@ export function Chat({
       if (msgs.length > 0) {
         const next = foldIntoMessageList(msgs);
         messageCacheRef.current.set(sid, next);
+        const ph = projectHashBySessionRef.current.get(sid) || viewedProjectHashRef.current || '';
+        if (ph) {
+          void saveSessionCache(ph, sid, next, undefined, undefined, undefined, tokensAuthoritativeRef.current);
+        }
       }
     }
 
@@ -5896,6 +5997,9 @@ export function Chat({
     if (nextState === modeState) return;
     setModeState(nextState);
     if (!protocolSessionRef.current) nativeModeRef.current = m;
+    if (sessionId) {
+      modeCacheRef.current.set(sessionId, m);
+    }
     if (m === 'bypass') {
       setLivePending(null);
       onPermissionResolved?.(null);
@@ -5903,6 +6007,9 @@ export function Chat({
     void postLiveMode(m, sessionId)
       .then((confirmed) => {
         setModeState((cur) => completeModeSwitch(cur, confirmed));
+        if (sessionId) {
+          modeCacheRef.current.set(sessionId, confirmed);
+        }
         onConfirmed?.(confirmed);
         if (confirmed === 'bypass') {
           setLivePending(null);
@@ -6792,6 +6899,11 @@ export function Chat({
         // re-append or drop the optimistic empty assistant (that made text /
         // reasoning appends no-op while sticky todos still updated).
         const userText = visibleUserText(event.content);
+        const hasImages = Array.isArray(event.images) && event.images.length > 0;
+        // 关键防呆拦截：若既无可见文本也无图片附件，绝不能画空气泡！
+        if (!userText && !hasImages) {
+          break;
+        }
         // 优先按服务端回传的客户端关联键精确认领（`/chat` 的 `request_id`）；
         // 无 id（legacy / 第三方端）才退化为文本比对。
         const echoIdx = findPendingSelfEchoIndex(pendingSelfEchoRef.current, event);
@@ -8644,7 +8756,14 @@ export function Chat({
     ];
     messagesRef.current = next;
     const sid = activeIdRef.current ?? sessionId;
-    if (sid) messageCacheRef.current.set(sid, next);
+    if (sid) {
+      messageCacheRef.current.set(sid, next);
+      const ph = activeSession?.project_hash || projectHashBySessionRef.current.get(sid) || viewedProjectHashRef.current || '';
+      if (ph) {
+        const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
+        void saveSessionCache(ph, sid, next, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+      }
+    }
     setMessages(next);
     timelineFollow.jump();
   }
