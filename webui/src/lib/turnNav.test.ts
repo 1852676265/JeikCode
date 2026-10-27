@@ -8,6 +8,7 @@ import {
   hasOlderVisibleMessages,
   remainingUnloadedTurns,
   resolveActiveTurnId,
+  TURN_NAV_LABEL_SAFETY_MAX,
   truncateTurnNavLabel,
   turnNavId,
   turnNavScrollTop,
@@ -23,6 +24,26 @@ test('truncateTurnNavLabel collapses whitespace and ellipsizes', () => {
   assert.equal(truncateTurnNavLabel('abcdefghij', 6), 'abcde…');
   assert.equal(truncateTurnNavLabel('short', 28), 'short');
   assert.equal(truncateTurnNavLabel('   '), '');
+});
+
+// The rail is user-resizable: the visual ellipsis belongs to CSS at the real
+// available width, not to a fixed character count baked into the label.
+test('outline labels are not hard-truncated at the old fixed width', () => {
+  const long = '这是一个很长很长的提问'.repeat(10);
+  const fromMessages = buildTurnNavItems([{ role: 'user', text: long, sourceIndex: 0 }]);
+  assert.equal(fromMessages[0].label, long);
+  assert.equal(fromMessages[0].text, long);
+
+  const fromOutline = buildTurnNavItemsFromOutline([{ index: 0, text: long }]);
+  assert.equal(fromOutline[0].label, long);
+});
+
+test('outline labels keep a safety ceiling for pathological prompts', () => {
+  const huge = 'z'.repeat(TURN_NAV_LABEL_SAFETY_MAX + 40);
+  const items = buildTurnNavItems([{ role: 'user', text: huge }]);
+  assert.equal(items[0].label.length, TURN_NAV_LABEL_SAFETY_MAX);
+  assert.ok(items[0].label.endsWith('…'));
+  assert.equal(items[0].text, huge);
 });
 
 test('buildTurnNavItems keeps user questions in order and skips empty/system', () => {

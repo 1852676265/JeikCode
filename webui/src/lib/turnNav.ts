@@ -15,13 +15,25 @@ export interface TurnNavItem {
   /** Absolute index in the raw persisted transcript, used for history loading
    *  and as the canonical anchor identity (unique across pages). */
   index: number;
-  /** Truncated label shown in the outline. */
+  /** Outline label. Kept (near-)intact on purpose: the rail is resizable, so the
+   *  visual ellipsis must be decided by CSS at the real available width instead
+   *  of a fixed character count. */
   label: string;
   /** Full compacted question text for search. */
   text: string;
 }
 
 const DEFAULT_MAX_LABEL = 28;
+
+/**
+ * Safety ceiling for the outline label (characters).
+ *
+ * The rail is user-resizable, so truncation belongs to CSS
+ * (`text-overflow: ellipsis` on the real width). This cap only exists to keep a
+ * pathological multi-KB prompt from becoming a huge layout box; normal
+ * questions never reach it.
+ */
+export const TURN_NAV_LABEL_SAFETY_MAX = 500;
 
 /**
  * Anchor DOM id for one user turn.
@@ -117,7 +129,7 @@ export function buildTurnNavItemsFromOutline(
     const text = compactTurnNavText(
       stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(turn.text)),
     );
-    const label = truncateTurnNavLabel(text);
+    const label = truncateTurnNavLabel(text, TURN_NAV_LABEL_SAFETY_MAX);
     if (!label) continue;
     const ordinal = turn.ordinal ?? items.length;
     items.push({ id: turnNavId(turn.index), ordinal, index: turn.index, label, text });
@@ -136,7 +148,7 @@ export function buildTurnNavItems(
     const text = compactTurnNavText(
       stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(msg.text)),
     );
-    const label = truncateTurnNavLabel(text);
+    const label = truncateTurnNavLabel(text, TURN_NAV_LABEL_SAFETY_MAX);
     if (!label) continue;
     // History rendering filters synthetic messages and folds tool-result rows
     // into their assistant. Prefer the raw transcript index carried through
