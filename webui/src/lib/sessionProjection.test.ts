@@ -1561,3 +1561,25 @@ test('旧缓存的无下标历史页仍插在带下标历史之前（原语义�
   assert.equal(merged[0]?.parts?.[0]?.text, '旧缓存提问');
   assert.equal(merged[2]?.id, 'u-7');
 });
+
+test('spliceAuthoritativeDiskTail 为头部行自动补全权威 pinned 切片里的图片', () => {
+  const canvas = [
+    { role: 'user', id: 'u-7', sourceIndex: 7, parts: [{ kind: 'text' as const, text: '推流期无图提问' }] },
+    { role: 'assistant', id: 'a-8', sourceIndex: 8, parts: [{ kind: 'text' as const, text: '回答' }] },
+  ];
+  const diskTail = [
+    {
+      role: 'user',
+      id: 'u-7',
+      sourceIndex: 7,
+      parts: [{ kind: 'text' as const, text: '权威提问' }],
+      images: [{ media_type: 'image/png', data: 'imgbase64' }],
+    },
+    { role: 'assistant', id: 'a-20', sourceIndex: 20, parts: [{ kind: 'text' as const, text: '最新答复' }] },
+  ];
+  const spliced = spliceAuthoritativeDiskTail(canvas as any, diskTail as any, 20);
+  assert.equal(spliced.length, 3);
+  assert.equal(spliced[0]?.id, 'u-7');
+  assert.equal((spliced[0] as any)?.images?.length, 1);
+  assert.equal((spliced[0] as any)?.images?.[0]?.data, 'imgbase64');
+});

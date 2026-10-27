@@ -3812,7 +3812,39 @@ export function Chat({
       setLoading(false);
     }
     if (!projectHash || !activeSession || activeSession.id !== sessionId) {
-      // SSE 可能先把 id 推过来；等 activeSession 对齐后再加载，期间保持落地页。
+      // 0ms 离线首屏加速：在 projectHash / activeSession 尚在远程解析期间，优先按 sessionId
+      // 从本地 IndexedDB 0ms 秒出历史画布，彻底拔除等待网络解析导致的前置空白！
+      if (!hideLoadChrome && sessionId && !messageCacheRef.current.has(sessionId)) {
+        const earlySid = sessionId;
+        const earlyGen = sessionGenerationRef.current;
+        void getSessionCache('', earlySid).then((idb) => {
+          if (
+            idb &&
+            idb.messages.length > 0 &&
+            activeIdRef.current === earlySid &&
+            sessionGenerationRef.current === earlyGen
+          ) {
+            if (!messageCacheRef.current.has(earlySid)) {
+              const clean = sanitizeCanvasMessages(idb.messages);
+              messageCacheRef.current.set(earlySid, clean);
+              messagesRef.current = clean;
+              setMessages(clean);
+              setLoading(false);
+              if (idb.projectHash) {
+                projectHashBySessionRef.current.set(earlySid, idb.projectHash);
+              }
+              if (idb.turns && idb.turns.length > 0) {
+                turnOutlineBySessionRef.current.set(earlySid, idb.turns);
+                setTurnOutline(idb.turns);
+              }
+              if (scrollRef.current) {
+                scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+              }
+              timelineFollow.jump();
+            }
+          }
+        });
+      }
       return;
     }
 
@@ -4374,14 +4406,20 @@ export function Chat({
                 const watcherAlive = !!watcher && !watcher.signal.aborted;
                 if (watcherAlive && !hiddenForLong) return;
                 if (
-                  abortRef.current === null &&
-                  activeStreamRequestIdRef.current === null &&
-                  !localTurnSessionsRef.current.has(sid)
+                  hiddenForLong ||
+                  (abortRef.current === null &&
+                    activeStreamRequestIdRef.current === null &&
+                    !localTurnSessionsRef.current.has(sid))
                 ) {
                   startDetachedHistoryPoll(projectHash, sid, sessionGenerationRef.current);
                 }
               } else {
-                // 空闲态视口恢复：保持推流监听通道自愈，绝不主动读磁盘覆盖内存画布
+                // 后台切回时服务端已空闲，但客户端仍在 busy / 跑时钟：立即收尾对账，停止空跑
+                if (busyRef.current || localTurnSessionsRef.current.has(sid)) {
+                  localTurnSessionsRef.current.delete(sid);
+                  backgroundRunningSessionsRef.current.delete(sid);
+                  settleDiskCatchUp(projectHash, sid);
+                }
               }
             })
             .catch(() => {});
@@ -6770,6 +6808,7 @@ export function Chat({
             return {
               role: 'user' as const,
               parts: [{ kind: 'text', text: userText }],
+              images: event.images && event.images.length > 0 ? event.images : undefined,
               ts: userTs,
               sourceIndex: turnIndex,
               turnNavOrdinal: turnOrdinal,
@@ -10595,10 +10634,8 @@ export function Chat({
         >
         <div class="timeline-inner">
         {messages.length === 0 && !historyHint && !restoring && loading && (
-          <div class="messages-empty">
-            <div>
-              {t('chat.startHint')}
-            </div>
+          <div class="messages-empty messages-loading" role="status" aria-live="polite">
+            <span class="codex-shimmer-status">{t('chat.loadingOlder')}</span>
           </div>
         )}
 

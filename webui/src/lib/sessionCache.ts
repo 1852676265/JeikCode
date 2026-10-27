@@ -105,13 +105,22 @@ export function getMemorySession(projectHash: string, sessionId: string): Cached
 
 /**
  * 异步获取会话缓存：优先 L1 内存，次选 L2 IndexedDB (1~3ms)
+ * 当 projectHash 未知时（如冷启动首帧），自动按 sessionId 检索，实现真正的 0ms 离线秒出。
  */
 export async function getSessionCache(
   projectHash: string,
   sessionId: string,
 ): Promise<CachedSessionData | null> {
-  const mem = getMemorySession(projectHash, sessionId);
-  if (mem) return mem;
+  if (projectHash) {
+    const mem = getMemorySession(projectHash, sessionId);
+    if (mem) return mem;
+  } else {
+    for (const data of memoryCache.values()) {
+      if (data.sessionId === sessionId && data.displayVersion === CACHE_DISPLAY_VERSION) {
+        return data;
+      }
+    }
+  }
 
   const db = await getDB();
   if (!db) return null;
@@ -120,22 +129,45 @@ export async function getSessionCache(
     try {
       const tx = db.transaction(STORE_SESSIONS, 'readonly');
       const store = tx.objectStore(STORE_SESSIONS);
-      const req = store.get(makeKey(projectHash, sessionId));
-      req.onsuccess = () => {
-        const result = req.result as CachedSessionData | undefined;
-        if (
-          result &&
-          result.displayVersion === CACHE_DISPLAY_VERSION &&
-          Array.isArray(result.messages)
-        ) {
-          // 回填至 L1 内存
-          setMemorySession(projectHash, sessionId, result);
-          resolve(result);
-        } else {
-          resolve(null);
-        }
-      };
-      req.onerror = () => resolve(null);
+      if (projectHash) {
+        const req = store.get(makeKey(projectHash, sessionId));
+        req.onsuccess = () => {
+          const result = req.result as CachedSessionData | undefined;
+          if (
+            result &&
+            result.displayVersion === CACHE_DISPLAY_VERSION &&
+            Array.isArray(result.messages)
+          ) {
+            setMemorySession(projectHash, sessionId, result);
+            resolve(result);
+          } else {
+            resolve(null);
+          }
+        };
+        req.onerror = () => resolve(null);
+      } else {
+        const req = store.openCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (cursor) {
+            const result = cursor.value as CachedSessionData | undefined;
+            if (
+              result &&
+              result.sessionId === sessionId &&
+              result.displayVersion === CACHE_DISPLAY_VERSION &&
+              Array.isArray(result.messages)
+            ) {
+              setMemorySession(result.projectHash, sessionId, result);
+              resolve(result);
+              return;
+            }
+            cursor.continue();
+          } else {
+            resolve(null);
+          }
+        };
+        req.onerror = () => resolve(null);
+      }
     } catch {
       resolve(null);
     }

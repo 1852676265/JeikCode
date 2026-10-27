@@ -31,7 +31,7 @@ sysinfo = "0.33"
 axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "compression-br"] }
 futures = "0.3"
 
 # Serialization

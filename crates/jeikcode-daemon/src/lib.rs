@@ -88,6 +88,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use jeikcode_auth as auth;
@@ -357,6 +359,50 @@ fn apply_session_message_window<T>(
     )
 }
 
+fn is_visible_user_turn_start_content(role: &str, synthetic: bool, content: &str) -> bool {
+    role.eq_ignore_ascii_case("user")
+        && !synthetic
+        && !(content.contains("[jeikcode-steer]")
+            || (content.contains("<user-query>") && content.contains("</user-query>")))
+}
+
+fn resolve_page_indices<T>(
+    items: &[T],
+    is_user_start: impl Fn(&T) -> bool,
+    query: &SessionDetailQuery,
+) -> (usize, usize, usize, usize, Option<usize>) {
+    let total = items.len();
+    if let Some(n) = query.tail.filter(|n| *n > 0) {
+        let offset = total.saturating_sub(n);
+        if offset == 0 {
+            return (total, 0, 0, total, None);
+        }
+        let turn_start = if is_user_start(&items[offset]) {
+            Some(offset)
+        } else {
+            (0..offset).rev().find(|&i| is_user_start(&items[i]))
+        };
+        if let Some(start) = turn_start {
+            return (total, start, start, total, None);
+        }
+        let pinned = (0..offset).rev().find(|&i| is_user_start(&items[i]));
+        return (total, offset, offset, total, pinned);
+    }
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    if limit == usize::MAX {
+        return (total, offset, offset, total, None);
+    }
+    let end = offset.saturating_add(limit).min(total);
+    let start = if offset < total && is_user_start(&items[offset]) {
+        offset
+    } else {
+        (0..offset).rev().find(|&i| is_user_start(&items[i])).unwrap_or(offset)
+    };
+    let next = (end..total).find(|&i| is_user_start(&items[i])).unwrap_or(end);
+    (total, start, start, next, None)
+}
+
 fn last_visible_user_before(messages: &[MessageInfo], end: usize) -> Option<usize> {
     (0..end)
         .rev()
@@ -375,65 +421,23 @@ fn take_session_page(
     mut messages: Vec<MessageInfo>,
     query: &SessionDetailQuery,
 ) -> (usize, usize, Vec<MessageInfo>, Option<usize>) {
-    let total = messages.len();
-    if let Some(n) = query.tail.filter(|n| *n > 0) {
-        let offset = total.saturating_sub(n);
-        if offset == 0 {
-            return (total, 0, messages, None);
-        }
-        let turn_start = if is_visible_user_turn_start(&messages[offset]) {
-            Some(offset)
-        } else {
-            last_visible_user_before(&messages, offset)
-        };
-        if let Some(start) = turn_start {
-            let window = messages.split_off(start);
-            return (total, start, window, None);
-        }
-        let mut window: Vec<MessageInfo> = messages.drain(offset..).collect();
-        let pinned = if window
-            .first()
-            .is_some_and(|msg| !is_visible_user_turn_start(msg))
-        {
-            (0..messages.len())
-                .rev()
-                .find(|&i| is_visible_user_turn_start(&messages[i]))
-        } else {
-            None
-        };
-        if let Some(idx) = pinned {
-            let user = messages.remove(idx);
-            window.insert(0, user);
-        }
-        return (total, offset, window, pinned);
+    let (total, offset, start, end, pinned) = resolve_page_indices(
+        &messages,
+        is_visible_user_turn_start,
+        query,
+    );
+    if let Some(idx) = pinned {
+        let pinned_msg = messages[idx].clone();
+        let mut window: Vec<MessageInfo> = messages.drain(start..end).collect();
+        window.insert(0, pinned_msg);
+        return (total, offset, window, Some(idx));
     }
-    let offset = query.offset.unwrap_or(0).min(total);
-    let limit = query.limit.unwrap_or(usize::MAX);
-    if limit == usize::MAX {
-        return (
-            total,
-            offset,
-            messages.into_iter().skip(offset).collect(),
-            None,
-        );
-    }
-    let end = offset.saturating_add(limit).min(total);
-    // Snap an older page to turn boundaries as well. Otherwise a page starting
-    // on a tool result drops that result (its assistant call lives in the newer
-    // page), and a page ending after a tool call loses the result to the next
-    // page. Complete turns keep every call/result pair in one conversion pass.
-    let start = if offset < total && is_visible_user_turn_start(&messages[offset]) {
-        offset
+    let window = if start == 0 && end == total {
+        messages
     } else {
-        last_visible_user_before(&messages, offset).unwrap_or(offset)
+        messages.drain(start..end).collect()
     };
-    let next = first_visible_user_from(&messages, end).unwrap_or(end);
-    // Always return the complete snapped turn, even when it is larger than the
-    // nominal page. Splitting an oversized turn leaves call/result or
-    // question/answer halves in different pages, and a pinned header cannot
-    // fill the missing middle in the backward paging direction.
-    let window = messages.drain(start..next).collect();
-    (total, start, window, None)
+    (total, offset, window, None)
 }
 
 #[cfg(test)]
@@ -1316,6 +1320,42 @@ fn session_user_outline(messages: &[MessageInfo]) -> Vec<SessionTurnOutline> {
         .collect()
 }
 
+fn session_records_user_outline(
+    records: &[jeikcode_capabilities::session::DisplayRecord],
+    index_offset: usize,
+) -> Vec<SessionTurnOutline> {
+    records
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            if !record.role.eq_ignore_ascii_case("user") || record.synthetic {
+                return None;
+            }
+            let text = record.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if text.is_empty() {
+                return None;
+            }
+            let text = if text.chars().count() > OUTLINE_TEXT_CAP {
+                format!(
+                    "{}…",
+                    text.chars()
+                        .take(OUTLINE_TEXT_CAP.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                text
+            };
+            Some((index_offset + idx, text))
+        })
+        .enumerate()
+        .map(|(ordinal, (index, text))| SessionTurnOutline {
+            ordinal,
+            index,
+            text,
+        })
+        .collect()
+}
+
 fn cap_display_field(s: String) -> String {
     if s.len() <= DISPLAY_FIELD_CAP {
         return s;
@@ -1619,6 +1659,7 @@ struct AdmittedUser {
     /// 客户端关联键（`/chat` 的 `request_id`）。回传到 `ChatEvent::User`，让发送端
     /// 按身份认领自己的乐观气泡，而不是退化到文本比对。
     client_input_id: Option<String>,
+    images: Vec<ImageData>,
 }
 
 /// One admitted `/chat` operation. Aliases include both the persisted session id
@@ -1956,6 +1997,7 @@ impl ActiveChatRegistry {
                             order: None,
                             turn_ordinal: None,
                             client_input_id: admitted.client_input_id.clone(),
+                            images: (!admitted.images.is_empty()).then(|| admitted.images.clone()),
                         },
                     ),
                 );
@@ -2075,6 +2117,7 @@ impl ActiveChatRegistry {
         operation_id: &str,
         content: String,
         created_at: Option<u64>,
+        images: Vec<ImageData>,
     ) {
         if let Some(op) = self.inner.write().await.operations.get_mut(operation_id) {
             let created = created_at.or((op.started_at > 0).then_some(op.started_at));
@@ -2083,6 +2126,7 @@ impl ActiveChatRegistry {
                 content,
                 created_at: created,
                 client_input_id,
+                images,
             });
         }
     }
@@ -2129,6 +2173,7 @@ impl ActiveChatRegistry {
             order: None,
             turn_ordinal: None,
             client_input_id: admitted.client_input_id,
+            images: (!admitted.images.is_empty()).then(|| admitted.images),
         });
     }
 
@@ -4027,6 +4072,13 @@ fn dangerous_tools_enabled() -> bool {
     std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
 }
 
+fn compression_layer() -> CompressionLayer<impl Predicate + Clone> {
+    CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+        .compress_when(DefaultPredicate::new().and(NotForContentType::new("text/event-stream")))
+}
+
 fn cors_layer() -> CorsLayer {
     // Loopback-only was correct when the daemon only ever bound 127.0.0.1.
     // `jeikcode serve --host 0.0.0.0` (and LAN binds) serve the SPA from a
@@ -5141,120 +5193,183 @@ async fn get_session_detail(
             // to the snapshot projection and is backfilled below.
             let display = read_display_cached(&display_manager, &session.meta.id)
                 .filter(|(meta, _)| meta.last_turn_id >= snapshot_last_turn);
-            let mut messages = if let Some((meta, records)) = display {
-                let elapsed = display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
-                // A hook-created log begins at the first user turn; a backfill
-                // already contains the session-start prefix. Prepend the prefix
-                // only in the former case so indices stay stable across upgrades.
-                let already_prefixed = meta.backfilled
-                    || records.first().is_some_and(|record| {
-                        record.role.eq_ignore_ascii_case("system")
-                            || (record.role.eq_ignore_ascii_case("user") && record.synthetic)
-                    });
-                let mut messages = if already_prefixed {
-                    Vec::new()
-                } else {
-                    display_prefix_messages(&session)
-                };
-                let prefix_len = messages.len();
-                messages.extend(records.iter().enumerate().map(|(index, record)| {
-                    let mut message = display_record_to_message_info(record);
-                    if let Some(duration) = elapsed.get(&index) {
-                        message.elapsed_ms = Some(*duration);
-                    }
-                    message
-                }));
-                // Compaction drains model context but the display log keeps the
-                // old rows. Mark records that no longer exist in the snapshot so
-                // the UI disables edit/delete/regenerate instead of sending an id
-                // the mutation API can no longer find.
-                let snapshot_ids: std::collections::HashSet<&str> = session
-                    .snapshot
-                    .messages
-                    .iter()
-                    .filter_map(|message| message.id.as_deref())
-                    .collect();
-                mark_display_only_archive_rows(
-                    records.as_slice(),
-                    &mut messages[prefix_len..],
-                    &snapshot_ids,
-                    snapshot_last_turn,
-                    // If the session is idle and the log is not ahead of the
-                    // snapshot, a missing id on the last turn is genuinely
-                    // drained (not a snapshot-save race). Mark it too.
-                    !turn_running && meta.last_turn_id <= snapshot_last_turn,
-                );
-                attach_display_images(
-                    &mut messages,
-                    std::path::Path::new(&session.meta.working_dir),
-                    &session.meta.id,
-                );
-                messages
-            } else {
-                let mut messages = match merge_catalog_session_messages_for_display(&session) {
-                    Ok(messages) => messages,
-                    Err(error) => {
-                        let msg = format!("Failed to load session: {error}");
-                        return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-                    }
-                };
-                // Compaction drains model context from the snapshot, but the raw
-                // transcript is append-only. Rebuild the pre-compaction display
-                // prefix from it so the question rail and canvas never lose turns
-                // after a refresh. Presentation entries already merged into the
-                // list are display-only rows: the splice keeps any that are not
-                // covered by the rebuilt transcript.
-                if let Some(anchor) = messages.iter().position(|message| {
-                    message.role.eq_ignore_ascii_case("user")
-                        && message.synthetic
-                        && jeikcode_capabilities::compaction::is_compaction_anchor_text(
-                            &message.content,
-                        )
-                }) {
-                    if let Some(turns) = load_display_transcript(&hash, &session.meta.id) {
-                        let boundary = messages[anchor + 1..].iter().find(|message| {
-                            message.role.eq_ignore_ascii_case("user") && !message.synthetic
+            let (turns, message_count, offset, messages, pinned_user_index) =
+                if let Some((meta, records)) = display {
+                    let elapsed = display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
+                    // A hook-created log begins at the first user turn; a backfill
+                    // already contains the session-start prefix. Prepend the prefix
+                    // only in the former case so indices stay stable across upgrades.
+                    let already_prefixed = meta.backfilled
+                        || records.first().is_some_and(|record| {
+                            record.role.eq_ignore_ascii_case("system")
+                                || (record.role.eq_ignore_ascii_case("user") && record.synthetic)
                         });
-                        let prefix = display_prefix_from_transcript(
-                            &turns,
-                            boundary.and_then(|message| message.created_at),
-                            boundary.map(|message| message.content.as_str()),
+                    let prefix = if already_prefixed {
+                        Vec::new()
+                    } else {
+                        display_prefix_messages(&session)
+                    };
+                    let prefix_len = prefix.len();
+
+                    // 1. 全会话大纲零开销提取：直接从 DisplayRecord 提炼，确保右栏大纲与 "(13 questions left)" 100% 精确，
+                    // 并且无需将整仓几千行无用工具行堆分配转化为 MessageInfo。
+                    let mut turns = session_user_outline(&prefix);
+                    let record_turns = session_records_user_outline(&records, prefix_len);
+                    let turns_offset = turns.len();
+                    turns.extend(record_turns.into_iter().map(|mut t| {
+                        t.ordinal += turns_offset;
+                        t
+                    }));
+
+                    if prefix_len == 0 {
+                        let (total, offset, start, end, pinned) = resolve_page_indices(
+                            &records,
+                            |r| is_visible_user_turn_start_content(&r.role, r.synthetic, &r.content),
+                            &query,
                         );
-                        messages = splice_compacted_display(messages, prefix);
+                        let snapshot_ids: std::collections::HashSet<&str> = session
+                            .snapshot
+                            .messages
+                            .iter()
+                            .filter_map(|message| message.id.as_deref())
+                            .collect();
+                        let mark_latest = !turn_running && meta.last_turn_id <= snapshot_last_turn;
+
+                        let mut window_messages = Vec::with_capacity(end.saturating_sub(start) + 1);
+                        if let Some(p_idx) = pinned {
+                            let mut p_msg = display_record_to_message_info(&records[p_idx]);
+                            if let Some(duration) = elapsed.get(&p_idx) {
+                                p_msg.elapsed_ms = Some(*duration);
+                            }
+                            if records[p_idx].turn_id < snapshot_last_turn
+                                || (records[p_idx].turn_id == snapshot_last_turn && mark_latest)
+                            {
+                                if let Some(id) = p_msg.id.as_deref() {
+                                    if !snapshot_ids.contains(id) {
+                                        p_msg.internal_origin = Some("transcript_archive".to_string());
+                                    }
+                                }
+                            }
+                            window_messages.push(p_msg);
+                        }
+                        for (index, record) in records[start..end].iter().enumerate() {
+                            let actual_idx = start + index;
+                            let mut msg = display_record_to_message_info(record);
+                            if let Some(duration) = elapsed.get(&actual_idx) {
+                                msg.elapsed_ms = Some(*duration);
+                            }
+                            if record.turn_id < snapshot_last_turn
+                                || (record.turn_id == snapshot_last_turn && mark_latest)
+                            {
+                                if let Some(id) = msg.id.as_deref() {
+                                    if !snapshot_ids.contains(id) {
+                                        msg.internal_origin = Some("transcript_archive".to_string());
+                                    }
+                                }
+                            }
+                            window_messages.push(msg);
+                        }
+                        attach_display_images(
+                            &mut window_messages,
+                            std::path::Path::new(&session.meta.working_dir),
+                            &session.meta.id,
+                        );
+                        (turns, total, offset, window_messages, pinned)
+                    } else {
+                        let mut full_messages = prefix;
+                        full_messages.extend(records.iter().enumerate().map(|(index, record)| {
+                            let mut message = display_record_to_message_info(record);
+                            if let Some(duration) = elapsed.get(&index) {
+                                message.elapsed_ms = Some(*duration);
+                            }
+                            message
+                        }));
+                        let snapshot_ids: std::collections::HashSet<&str> = session
+                            .snapshot
+                            .messages
+                            .iter()
+                            .filter_map(|message| message.id.as_deref())
+                            .collect();
+                        mark_display_only_archive_rows(
+                            records.as_slice(),
+                            &mut full_messages[prefix_len..],
+                            &snapshot_ids,
+                            snapshot_last_turn,
+                            !turn_running && meta.last_turn_id <= snapshot_last_turn,
+                        );
+                        attach_display_images(
+                            &mut full_messages,
+                            std::path::Path::new(&session.meta.working_dir),
+                            &session.meta.id,
+                        );
+                        let (message_count, offset, window, pinned) = take_session_page(full_messages, &query);
+                        (turns, message_count, offset, window, pinned)
                     }
-                }
-                // One-time upgrade path for sessions created before the display
-                // log existed. Only settled sessions are materialized so a live
-                // turn is never frozen into the log half-way. If an existing log
-                // is already beyond the readable ceiling, do not rewrite it on
-                // every read (the next read would fail the same way).
-                let display_too_large = display_manager
-                    .display_path(&session.meta.id)
-                    .ok()
-                    .and_then(|path| std::fs::metadata(path).ok())
-                    .is_some_and(|metadata| {
-                        metadata.len()
-                            > jeikcode_capabilities::session::display::MAX_DISPLAY_READ_BYTES as u64
-                    });
-                if !turn_running && !messages.is_empty() && !display_too_large {
-                    let records: Vec<_> = messages
-                        .iter()
-                        .enumerate()
-                        .map(|(index, message)| {
-                            display_record_from_message_info(&session.meta.id, index, message)
-                        })
-                        .collect();
-                    let _ = display_manager.write_display_backfill(
-                        &session.meta.id,
-                        &records,
-                        snapshot_last_turn,
-                    );
-                }
-                messages
-            };
-            let turns = session_user_outline(&messages);
-            let (message_count, offset, messages, pinned_user_index) =
-                take_session_page(messages, &query);
+                } else {
+                    let mut messages = match merge_catalog_session_messages_for_display(&session) {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            let msg = format!("Failed to load session: {error}");
+                            return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                        }
+                    };
+                    // Compaction drains model context from the snapshot, but the raw
+                    // transcript is append-only. Rebuild the pre-compaction display
+                    // prefix from it so the question rail and canvas never lose turns
+                    // after a refresh. Presentation entries already merged into the
+                    // list are display-only rows: the splice keeps any that are not
+                    // covered by the rebuilt transcript.
+                    if let Some(anchor) = messages.iter().position(|message| {
+                        message.role.eq_ignore_ascii_case("user")
+                            && message.synthetic
+                            && jeikcode_capabilities::compaction::is_compaction_anchor_text(
+                                &message.content,
+                            )
+                    }) {
+                        if let Some(turns) = load_display_transcript(&hash, &session.meta.id) {
+                            let boundary = messages[anchor + 1..].iter().find(|message| {
+                                message.role.eq_ignore_ascii_case("user") && !message.synthetic
+                            });
+                            let prefix = display_prefix_from_transcript(
+                                &turns,
+                                boundary.and_then(|message| message.created_at),
+                                boundary.map(|message| message.content.as_str()),
+                            );
+                            messages = splice_compacted_display(messages, prefix);
+                        }
+                    }
+                    // One-time upgrade path for sessions created before the display
+                    // log existed. Only settled sessions are materialized so a live
+                    // turn is never frozen into the log half-way. If an existing log
+                    // is already beyond the readable ceiling, do not rewrite it on
+                    // every read (the next read would fail the same way).
+                    let display_too_large = display_manager
+                        .display_path(&session.meta.id)
+                        .ok()
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .is_some_and(|metadata| {
+                            metadata.len()
+                                > jeikcode_capabilities::session::display::MAX_DISPLAY_READ_BYTES as u64
+                        });
+                    if !turn_running && !messages.is_empty() && !display_too_large {
+                        let records: Vec<_> = messages
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| {
+                                display_record_from_message_info(&session.meta.id, index, message)
+                            })
+                            .collect();
+                        let _ = display_manager.write_display_backfill(
+                            &session.meta.id,
+                            &records,
+                            snapshot_last_turn,
+                        );
+                    }
+                    let turns = session_user_outline(&messages);
+                    let (message_count, offset, messages, pinned_user_index) =
+                        take_session_page(messages, &query);
+                    (turns, message_count, offset, messages, pinned_user_index)
+                };
             let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let todos = if let Some(board) = jeikcode_capabilities::tools::read_todo_board(&id) {
                 if jeikcode_capabilities::tools::list_fully_completed(&board.items) && !turn_running
@@ -7893,6 +8008,9 @@ pub enum ChatEvent {
         /// 气泡，而不是靠文本比对；缺失时才退化为文本密等（legacy / 第三方客户端）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_input_id: Option<String>,
+        /// 多模态图片附件列表，确保广播到全网订阅端（如 PC 端观察者）时完整渲染图片缩略图
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageData>>,
     },
     /// The STORED identity of the real user prompt this turn runs on (from the
     /// kernel `UserMessage` boundary). Identity-only — the visible bubble is
@@ -10645,6 +10763,14 @@ pub(crate) async fn process_chat_request(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let display_images: Vec<ImageData> = images
+            .iter()
+            .map(|i| ImageData {
+                media_type: i.media_type.clone(),
+                data: i.data.clone(),
+                missing: false,
+            })
+            .collect();
         let mut conv = conversation.lock().await;
         let mut user_msg = if images.is_empty() {
             Message::user(runtime_text.clone())
@@ -10665,7 +10791,12 @@ pub(crate) async fn process_chat_request(
         // client correlation id (text matching only as a legacy fallback).
         let created_at = (created_at > 0).then_some(created_at);
         active_chats
-            .record_user_message(&operation_id, runtime_text.clone(), created_at)
+            .record_user_message(
+                &operation_id,
+                runtime_text.clone(),
+                created_at,
+                display_images.clone(),
+            )
             .await;
         // 回传客户端关联键（`/chat` 的 `request_id`）：发送端据此按身份认领自己的
         // 乐观气泡，无需要靠文本比对（文本只作 legacy / 无 id 的兜底）。
@@ -10681,6 +10812,7 @@ pub(crate) async fn process_chat_request(
             order: None,
             turn_ordinal: None,
             client_input_id,
+            images: (!display_images.is_empty()).then_some(display_images),
         });
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
@@ -14037,6 +14169,14 @@ fn bind_failure_is_busy(err: &anyhow::Error) -> bool {
         || text.contains("occupied")
         || text.contains("os error 98")
         || text.contains("os error 10048")
+        || text.contains("os error 10013")
+}
+
+fn is_bind_in_use_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AddrInUse
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+        || err.raw_os_error() == Some(10013)
+        || err.raw_os_error() == Some(10048)
 }
 
 /// `serve` 不走端口扫描。升级后继进程在前代刚退出时重试同一地址，失败就退出，
@@ -14106,7 +14246,7 @@ async fn bind_scanning_ports(
                 Ok(probe) => {
                     drop(probe);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -14116,7 +14256,7 @@ async fn bind_scanning_ports(
             let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
             let primary = match api_config::bind_listener(v4, false) {
                 Ok(listener) => listener,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -14153,7 +14293,7 @@ async fn bind_scanning_ports(
                 Ok(probe) => {
                     drop(probe);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -14162,7 +14302,7 @@ async fn bind_scanning_ports(
             let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
             let primary = match api_config::bind_listener(v6, true) {
                 Ok(listener) => listener,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -14187,7 +14327,7 @@ async fn bind_scanning_ports(
                     let actual = listener.local_addr()?.port();
                     return Ok((listener, None, actual));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -14200,7 +14340,7 @@ async fn bind_scanning_ports(
                     let actual = listener.local_addr()?.port();
                     return Ok((listener, None, actual));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -15810,7 +15950,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .with_state(state.clone())
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))
-        .layer(cors_layer());
+        .layer(cors_layer())
+        .layer(compression_layer());
     let _ = router_slot.set(app.clone());
 
     // Spawn idle timeout watchdog task
@@ -17590,6 +17731,7 @@ mod tests {
             order: None,
             turn_ordinal: None,
             client_input_id: None,
+            images: None,
         };
         let _ = bus.send(user_event);
 
@@ -17724,6 +17866,7 @@ mod tests {
                 &admission.operation_id,
                 "hello".into(),
                 Some(1_700_000_000_000),
+                Vec::new(),
             )
             .await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -17758,10 +17901,18 @@ mod tests {
             order: None,
             turn_ordinal: None,
             client_input_id: Some("req-9".into()),
+            images: Some(vec![ImageData {
+                media_type: "image/png".into(),
+                data: "abc123base64".into(),
+                missing: false,
+            }]),
         })
         .unwrap();
         assert_eq!(json["type"], "user");
         assert_eq!(json["created_at"], 42);
+        assert_eq!(json["client_input_id"], "req-9");
+        assert_eq!(json["images"][0]["media_type"], "image/png");
+        assert_eq!(json["images"][0]["data"], "abc123base64");
         assert_eq!(json["client_input_id"], "req-9");
 
         // 身份回传事件：与可见气泡分离的纯身份通道。

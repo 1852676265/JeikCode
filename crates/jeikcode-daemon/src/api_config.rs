@@ -1665,7 +1665,7 @@ mod tests {
             assert_eq!(i18n::current_locale(), locale);
         }
         let before = std::fs::read(store.path()).unwrap();
-        for invalid in ["fr", "vi-VN-extra", "", "vi_US"] {
+        for invalid in ["invalid_lang", "vi-VN-extra", "", "vi_US"] {
             assert!(super::parse_language(invalid).is_err());
             assert_eq!(std::fs::read(store.path()).unwrap(), before);
             assert_eq!(i18n::current_locale(), Locale::ZhCn);
@@ -2048,6 +2048,7 @@ mod tests {
         let mut state = crate::tests::chat_test_state(&home);
         state.bind_host = "0.0.0.0".into();
         state.bind_port = 13457;
+        state.initial_enforce_token = true;
         state.webui_tokens.register("old-token");
         state.webui_tokens.set_display("old-token");
         state

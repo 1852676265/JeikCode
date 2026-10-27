@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getMemorySession,
+  getSessionCache,
   hasMemorySession,
   saveSessionCache,
   appendMessageToSessionCache,
@@ -38,5 +39,14 @@ test('sessionCache preserves turns outline', async () => {
   const mem = getMemorySession(p, s);
   assert.ok(mem);
   assert.deepEqual(mem?.turns, turns);
+
+  // 验证当 projectHash 为空时，按 sessionId 能够成功检索命中（冷启动离线秒出保障）
+  const offline = await getSessionCache('', s);
+  assert.ok(offline);
+  assert.equal(offline?.sessionId, s);
+  assert.equal(offline?.projectHash, p);
+  assert.equal(offline?.messages.length, 1);
+  assert.equal(offline?.messages[0].content, 'Q1');
+
   await clearAllSessionCache();
 });

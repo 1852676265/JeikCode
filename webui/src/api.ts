@@ -205,7 +205,7 @@ export type SSEEvent =
   | { type: 'session_assigned'; session_id: string }
   /** `after_seq = -1`（新会话）的握手帧：不补发，只告知起始游标。 */
   | { type: 'session_start'; session_id?: string; cursor: number }
-  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number; client_input_id?: string }
+  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number; client_input_id?: string; images?: ImageData[] }
   | { type: 'user_identified'; message_id: string; turn_ordinal?: number; absolute_index?: number }
   | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
   | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }

@@ -993,8 +993,21 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   const olderHead: T[] = [];
   for (const message of canvas) {
     if (typeof message.sourceIndex !== 'number' || message.sourceIndex >= diskOffset) continue;
-    const pruned = pruneDuplicatedTailContent(message, tailIdentity);
-    if (pruned) olderHead.push(pruned);
+    let pruned = pruneDuplicatedTailContent(message, tailIdentity);
+    if (pruned) {
+      // 若画布行缺失图片（如推流期从无图广播事件生成），而权威磁盘 pinned 提问带图，自动补全图片
+      const pinnedMatch = pinnedInTail.find(
+        (p) =>
+          typeof p.sourceIndex === 'number' &&
+          p.sourceIndex === (pruned as any).sourceIndex &&
+          Array.isArray((p as any).images) &&
+          (p as any).images.length > 0,
+      );
+      if (pinnedMatch && (!(pruned as any).images || (pruned as any).images.length === 0)) {
+        pruned = { ...pruned, images: (pinnedMatch as any).images };
+      }
+      olderHead.push(pruned);
+    }
   }
 
   const baseHead = olderHead.length > 0 ? olderHead : pinnedInTail;
