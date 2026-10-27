@@ -21,6 +21,38 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.6 (2026-10-28)
+
+- **[Chat Experience] One answer, one bubble - and a steady streaming transcript**:
+  - A new model round inside the same turn now continues the existing thinking and reply instead of starting a second block, so answers are no longer split into two "Thinking" sections with the body cut in half.
+  - Fixed the streaming text jitter: the reply no longer rebuilds its whole Markdown block for every character, so lines stay put while text arrives and formatting no longer flickers mid-stream.
+  - File-path badges are now layout-neutral and applied before the frame is painted.
+  - A system notice landing mid-answer no longer forks the continuation into a new bubble.
+- **[Model Context & Native Protocols] One user block for frozen context and the real prompt**:
+  - Gemini, Responses and Ollama now fold adjacent user turns into a single user entry with ordered parts, matching the Anthropic adapter, so skills / MCP instructions / memory / project rules and the actual prompt no longer arrive as a chain of adjacent user messages.
+  - Empty model rounds are no longer sent upstream, keeping user and model turns strictly alternating after a dropped or interrupted reply.
+- **[Session & Steering] Consistent steering and model settings across clients**:
+  - Steering messages and per-session model / thinking-effort choices stay in sync across desktop, browser and mobile instances.
+  - Rewinding a conversation restores its task checklist correctly instead of leaving stale items behind.
+- **[Reliability] Clearer interruption notices**:
+  - Mid-stream interruptions and connection drops now show localized notices in every supported language.
+
+---
+
+- **[聊天体验] 一个回答一个气泡，流式输出保持平稳**:
+  - 同一回合内模型的新一轮输出会继续沿用已有的思考与正文，不再把回答拆成两个「Thinking」块和两段正文。
+  - 修复流式文字抖动：回复不再在每收到一个字符时重建整块 Markdown，行位置保持稳定，输入过程中格式也不再闪烁。
+  - 文件路径徽章改为布局中性，并在绘制前应用。
+  - 回答中途出现的系统通知不再把续写分叉到新的气泡。
+- **[模型上下文与原生协议] 冻结上下文与真实提问合并为同一个 user 块**:
+  - Gemini、Responses 与 Ollama 现在把相邻 user 轮折叠为同一个 user 条目下的有序 part（与 Anthropic 适配器一致），skills / MCP 指令 / memory / 项目规范与真实提问不再作为一串相邻 user 消息发送。
+  - 空模型轮不再发往上游，断线或中断丢失回复后 user 与 model 仍保持严格交替。
+- **[会话与转向] 多端一致的转向与模型设置**:
+  - 转向消息与会话级模型 / 思考强度在桌面、浏览器与移动端之间保持同步。
+  - 回退对话时正确恢复任务清单，不再残留旧条目。
+- **[稳定性] 更清晰的中断提示**:
+  - 流式中断与连接断开会在所有支持语言下显示本地化提示。
+
 ## v7.3.1-beta.5 (2026-10-27)
 
 - **[Approval Mode & Model Selection] Per-session isolation, a global override switch, and runtime fidelity**:
