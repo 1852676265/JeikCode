@@ -2850,14 +2850,10 @@ pub(crate) fn session_row_wire(
         updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
         message_count: meta.message_count,
         origin: origin.to_string(),
-        approval_mode: meta.approval_mode.clone().or_else(|| {
-            Some(
-                live_api::live_session_approval_mode_cached(Some(session_id))
-                    .unwrap_or_else(live_api::live_current_approval_mode)
-                    .wire()
-                    .to_string(),
-            )
-        }),
+        approval_mode: Some(live_api::live_display_approval_mode_wire(
+            session_id,
+            meta.approval_mode.as_deref(),
+        )),
         preferred_model: meta.preferred_model.clone(),
         reasoning_effort: meta.reasoning_effort.clone(),
         thinking_budget: meta.thinking_budget,
@@ -2887,14 +2883,10 @@ pub(crate) fn session_row_wire_in_bucket(
         updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
         message_count: meta.message_count,
         origin: origin.to_string(),
-        approval_mode: meta.approval_mode.clone().or_else(|| {
-            Some(
-                live_api::live_session_approval_mode_cached(Some(session_id))
-                    .unwrap_or_else(live_api::live_current_approval_mode)
-                    .wire()
-                    .to_string(),
-            )
-        }),
+        approval_mode: Some(live_api::live_display_approval_mode_wire(
+            session_id,
+            meta.approval_mode.as_deref(),
+        )),
         preferred_model: meta.preferred_model.clone(),
         reasoning_effort: meta.reasoning_effort.clone(),
         thinking_budget: meta.thinking_budget,
@@ -4585,11 +4577,11 @@ fn catalog_entry_to_session_summary(
         .read_meta(&entry.id)
         .ok();
     let preferred_model = meta.as_ref().and_then(|m| m.preferred_model.clone());
-    // 磁盘元数据优先；仅当缺失时才看内存热态（不再回扫会话目录）。
-    let approval_mode = meta
-        .as_ref()
-        .and_then(|m| live_api::parse_approval_mode_wire(m.approval_mode.as_deref()))
-        .or_else(|| live_api::live_session_approval_mode_cached(Some(&entry.id)));
+    // 全局开关优先，其余情况磁盘元数据 > 内存热态（不再回扫会话目录）。
+    let approval_mode = live_api::live_display_approval_mode_wire(
+        &entry.id,
+        meta.as_ref().and_then(|m| m.approval_mode.as_deref()),
+    );
     SessionSummary {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -4598,12 +4590,7 @@ fn catalog_entry_to_session_summary(
         updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
         message_count: entry.message_count,
         file_size: 0,
-        approval_mode: Some(
-            approval_mode
-                .unwrap_or_else(live_api::live_current_approval_mode)
-                .wire()
-                .to_string(),
-        ),
+        approval_mode: Some(approval_mode),
         preferred_model,
         reasoning_effort: meta.as_ref().and_then(|m| m.reasoning_effort.clone()),
         thinking_budget: meta.as_ref().and_then(|m| m.thinking_budget),
@@ -5491,13 +5478,10 @@ async fn get_session_detail(
                         .rev()
                         .find_map(|s| s.model_usage.first().map(|m| m.provider_id.clone()))
                 }),
-                approval_mode: session.meta.approval_mode.clone().or_else(|| {
-                    Some(
-                        live_api::live_session_approval_mode(Some(&id))
-                            .wire()
-                            .to_string(),
-                    )
-                }),
+                approval_mode: Some(live_api::live_display_approval_mode_wire(
+                    &id,
+                    session.meta.approval_mode.as_deref(),
+                )),
                 reasoning_effort: session.meta.reasoning_effort.clone(),
                 thinking_budget: session.meta.thinking_budget,
                 token_usage,

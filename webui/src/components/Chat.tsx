@@ -2033,6 +2033,8 @@ export function Chat({
   const [globalModeEnabled, setGlobalModeEnabled] = useState(false);
   const globalModeRef = useRef(false);
   globalModeRef.current = globalModeEnabled;
+  /** 由渲染作用域赋值；事件处理器通过 ref 调用以拿到最新闭包。 */
+  const applyOwnSessionModeRef = useRef<(sid: string) => void>(() => {});
   const nativeModeRef = useRef<ApprovalMode>('build');
   const protocolSessionRef = useRef(false);
   const [pendingAttach, setPendingAttach] = useState<PendingAttach[]>(() =>
@@ -4597,14 +4599,9 @@ export function Chat({
       }
       const sid = activeIdRef.current;
       if (!sid) return;
-      getApprovalModeState(sid)
-        .then((cur) => {
-          if (activeIdRef.current !== sid) return;
-          modeCacheRef.current.set(sid, cur.mode);
-          nativeModeRef.current = cur.mode;
-          setModeState(initModeState(cur.mode));
-        })
-        .catch(() => {});
+      // 恢复本会话自己的模式。优先用本地已知值（0 请求），只有在缓存与会话
+      // 元数据都缺失时才拉一次，避免「关闭全局」引发多端请求风暴。
+      applyOwnSessionModeRef.current(sid);
     };
 
     window.addEventListener('jeikcode:approval_mode_changed', handleCustomEvent);
@@ -6233,11 +6230,39 @@ export function Chat({
   }
 
   /**
+   * 全局关闭后恢复该会话自己的模式。
+   *
+   * 优先读本地已知值（会话级缓存 → 会话列表元数据），均为 0 网络；
+   * 只有两者都缺失（例如本端从未看过该会话）时才拉一次 `/approval_mode`。
+   * 这样「关闭全局」的代价是一条广播帧，而不是 N 个会话的请求。
+   */
+  function applyOwnSessionMode(sid: string) {
+    // 只用会话级缓存：会话列表元数据在全局开启期间被服务端报成了全局值，
+    // 此刻读它会拿到刚刚失效的全局模式。缓存缺失时多拉一次，依然是一次小请求。
+    const local = modeCacheRef.current.get(sid) ?? null;
+    if (local) {
+      if (activeIdRef.current !== sid) return;
+      nativeModeRef.current = local;
+      setModeState(initModeState(local));
+      return;
+    }
+    getApprovalModeState(sid)
+      .then((cur) => {
+        if (activeIdRef.current !== sid) return;
+        modeCacheRef.current.set(sid, cur.mode);
+        nativeModeRef.current = cur.mode;
+        setModeState(initModeState(cur.mode));
+      })
+      .catch(() => {});
+  }
+  applyOwnSessionModeRef.current = applyOwnSessionMode;
+
+  /**
    * 切换「全局」胶囊开关。
    *
    * 开启：把当前确认模式提升为全局，所有会话（含后台运行中）立即跟随；
-   * 关闭：各会话恢复自己记录的模式，并重新拉取当前会话的真实模式。
-   * 两次都是单次 RPC，无轮询。
+   * 关闭：各会话恢复自己记录的模式（本地已知值即可，无需逐会话拉取）。
+   * 两次都是单次 RPC + 一条广播，无轮询。
    */
   function toggleGlobalMode(enabled: boolean) {
     const previous = globalModeRef.current;
@@ -6251,15 +6276,7 @@ export function Chat({
         nativeModeRef.current = confirmed;
         if (enabled) return;
         // 关闭全局：恢复当前会话自己的模式（服务端已按会话重下发）。
-        if (!targetSid) return;
-        void getApprovalModeState(targetSid)
-          .then((cur) => {
-            if (activeIdRef.current !== targetSid) return;
-            modeCacheRef.current.set(targetSid, cur.mode);
-            nativeModeRef.current = cur.mode;
-            setModeState(initModeState(cur.mode));
-          })
-          .catch(() => {});
+        if (targetSid) applyOwnSessionMode(targetSid);
       })
       .catch(() => {
         setGlobalModeEnabled(previous);

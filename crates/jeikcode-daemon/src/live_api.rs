@@ -165,6 +165,28 @@ pub(crate) fn parse_approval_mode_wire(raw: Option<&str>) -> Option<ApprovalMode
     }
 }
 
+/// 已知 working_dir 时的会话模式解析：只读该会话的 meta，不做任何目录扫描。
+fn live_session_approval_mode_in_dir(working_dir: &Path, session_id: &str) -> ApprovalMode {
+    if live_global_mode_enabled() {
+        return live_current_approval_mode();
+    }
+    if let Some(mode) = cached_session_approval_mode(session_id) {
+        return mode;
+    }
+    if session_approval_mode_known_absent(session_id) {
+        return live_current_approval_mode();
+    }
+    let manager = jeikcode_capabilities::session::SessionManager::for_project(working_dir);
+    if let Ok(meta) = manager.read_meta(session_id) {
+        if let Some(mode) = parse_approval_mode_wire(meta.approval_mode.as_deref()) {
+            remember_session_approval_mode(session_id, mode);
+            return mode;
+        }
+    }
+    mark_session_approval_mode_absent(session_id);
+    live_current_approval_mode()
+}
+
 fn cached_session_approval_mode(sid: &str) -> Option<ApprovalMode> {
     let guard = SESSION_APPROVAL_MODES
         .lock()
@@ -183,6 +205,22 @@ pub(crate) fn live_session_approval_mode_cached(session_id: Option<&str>) -> Opt
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(cached_session_approval_mode)
+}
+
+/// 一个会话在 UI 上应该显示的审批模式线格值。
+///
+/// 全局开关优先：开启时任何会话行/详情都必须报全局值，否则客户端冷启动会
+/// 从磁盘读到**自己原来的旧模式**，短暂闪回后再被广播纠正。
+/// 关闭时：磁盘记录 > 内存热态 > 进程默认。
+pub(crate) fn live_display_approval_mode_wire(session_id: &str, meta_mode: Option<&str>) -> String {
+    if live_global_mode_enabled() {
+        return live_current_approval_mode().wire().to_string();
+    }
+    parse_approval_mode_wire(meta_mode)
+        .or_else(|| live_session_approval_mode_cached(Some(session_id)))
+        .unwrap_or_else(live_current_approval_mode)
+        .wire()
+        .to_string()
 }
 
 fn remember_session_approval_mode(sid: &str, mode: ApprovalMode) {
@@ -3640,16 +3678,18 @@ async fn apply_mode_request(state: &AppState, req: &LiveModeReq) -> bool {
 }
 
 /// 关闭全局开关后，把各会话恢复为自己的模式（仅影响正在运行的 runner）。
+/// 复杂度 = O(当前正在运行的 runtime)，与磁盘上的会话总数无关；
+/// 每个会话只读自己已知 working_dir 下的一个小 meta 文件，不做目录扫描。
 async fn reapply_per_session_modes() {
     let registry = jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global();
     for entry in registry.list_all() {
         if let Some(handle) = registry.handle(&entry.session_id) {
-            let mode = live_session_approval_mode(Some(&entry.session_id));
+            let mode = live_session_approval_mode_in_dir(&entry.working_dir, &entry.session_id);
             let _ = handle.set_mode(native_runtime_mode(mode)).await;
         }
     }
     if let Ok(binding) = crate::native_live::binding() {
-        let mode = live_session_approval_mode(Some(&binding.session_id));
+        let mode = live_session_approval_mode_in_dir(&binding.working_dir, &binding.session_id);
         let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
     }
 }
@@ -4545,6 +4585,32 @@ mod tests {
             live_session_approval_mode(Some("sess-b")),
             ApprovalMode::AcceptEdits
         );
+    }
+
+    /// Session rows/details must report the GLOBAL mode while the switch is on;
+    /// otherwise a cold start reads the session's stale disk value and flashes
+    /// the old mode before the broadcast corrects it.
+    #[test]
+    fn display_mode_helper_reports_global_while_switch_is_on() {
+        let _guard = ScopedApprovalModeForTest::new();
+        live_set_session_approval_mode(Some("s1"), ApprovalMode::Plan);
+        assert_eq!(live_display_approval_mode_wire("s1", Some("plan")), "plan");
+
+        live_set_global_mode_enabled(true, Some(ApprovalMode::Auto));
+        assert_eq!(
+            live_display_approval_mode_wire("s1", Some("plan")),
+            "bypass",
+            "session row must follow the global switch"
+        );
+        assert_eq!(
+            live_display_approval_mode_wire("never-seen", None),
+            "bypass"
+        );
+
+        live_set_global_mode_enabled(false, None);
+        assert_eq!(live_display_approval_mode_wire("s1", Some("plan")), "plan");
+        // Meta absent → in-memory session cache still wins over the process default.
+        assert_eq!(live_display_approval_mode_wire("s1", None), "plan");
     }
 
     #[test]
