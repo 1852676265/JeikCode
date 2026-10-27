@@ -1842,7 +1842,11 @@ export function Chat({
     messagesRef.current = next;
     messageCacheRef.current.set(sid, next);
     writeLiveTodo(sid, settled.next);
+    // 归档会把 todo 面板从输入区搬进正文：高度变化必须走阅读锚点事务，
+    // 否则浏览器按像素保留 scrollTop，滚动条会自己跳到中间。
+    timelineFollowRef.current?.beginSwap();
     setMessages(next);
+    timelineFollowRef.current?.endSwap();
   }
   function archiveBackgroundTodos(sessionId: string) {
     if (!sessionId || sessionId === activeIdRef.current) return;
@@ -2776,7 +2780,9 @@ export function Chat({
       if (!canvas || canvas.length === 0) {
         messagesRef.current = disk;
         messageCacheRef.current.set(id, disk);
+        timelineFollowRef.current?.beginSwap();
         setMessages(disk);
+        timelineFollowRef.current?.endSwap();
       }
     }
     if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
@@ -2792,7 +2798,12 @@ export function Chat({
     liveLifecycleRef.current = { running: false, terminalConsumed: true };
     transitionChatRecovery({ type: 'authoritative_terminal' });
     commitActiveTodosIntoLastAssistant();
-    writeLiveTodo(id, reduceLiveTodo(null, { type: 'hydrate', items: detail.todos ?? [] }));
+    // 已结束的回合不再把磁盘里“已完成”的历史清单灌回输入区上方（否则 sticky
+    // 面板会在归档之后又弹回来，容器高度来回变化）；仅保留未完成项用于中断恢复。
+    const remainingTodos = (detail.todos ?? []).filter((item) => item.status !== 'completed');
+    if (remainingTodos.length > 0) {
+      writeLiveTodo(id, reduceLiveTodo(null, { type: 'hydrate', items: remainingTodos }));
+    }
     seedAppliedTodoIds(id, todoCallIdsFromMessages(messagesRef.current));
     return fresh.running;
   }
@@ -2848,8 +2859,11 @@ export function Chat({
       );
       if (activeIdRef.current === sid) {
         messagesRef.current = cleanMerged;
+        // 磁盘对账会整表替换画布：锚定阅读位置，避免终态时滚动条跳走。
+        timelineFollowRef.current?.beginSwap();
         commitActiveTodosIntoLastAssistant();
         setMessages(messagesRef.current);
+        timelineFollowRef.current?.endSwap();
         if (detail.turns && detail.turns.length > 0) {
           turnOutlineBySessionRef.current.set(sid, detail.turns);
           setTurnOutline(detail.turns);
@@ -3707,7 +3721,7 @@ export function Chat({
         setMessages(displayTail);
         canvasReadySessionIdRef.current = sessionId;
         flushPreMountStreamBuffer(sessionId);
-        pinTimelineToBottom(1200);
+        pinTimelineToBottom();
       } else {
         const localActive = sessionId && (localTurnSessionsRef.current.has(sessionId) || backgroundRunningSessionsRef.current.has(sessionId));
         if (localActive && messagesRef.current.length > 0) {
@@ -4144,7 +4158,7 @@ export function Chat({
               setMessages(displayMessages);
               canvasReadySessionIdRef.current = loadId;
               flushPreMountStreamBuffer(loadId);
-              pinTimelineToBottom(1200);
+              pinTimelineToBottom();
             } else {
               canvasReadySessionIdRef.current = loadId;
               flushPreMountStreamBuffer(loadId);
@@ -4335,8 +4349,9 @@ export function Chat({
 
   // History responses may arrive after the user starts reading: only the
   // session reset (above), or an explicit jump/send, may re-enable following.
-  const pinTimelineToBottom = (_forceDuration = 1200) => timelineFollow.changed();
-  const scrollToBottom = (_behavior: ScrollBehavior = 'auto') => timelineFollow.jump();
+  const pinTimelineToBottom = () => timelineFollow.changed();
+  const scrollToBottom = (behavior: ScrollBehavior = 'smooth') =>
+    timelineFollow.jump({ smooth: behavior === 'smooth' });
   useEffect(() => {
     timelineFollow.changed();
   }, [messages, tokens, timelineFollow]);
@@ -4957,6 +4972,13 @@ export function Chat({
   );
   const turnNavPinUntilRef = useRef(0);
   const turnNavScrollCleanupRef = useRef<(() => void) | null>(null);
+  /** Absolute turn offsets are scroll-invariant; only re-measure when the
+   *  transcript height or the outline changes. Avoids O(turns) forced layout
+   *  on every scroll event while the reader browses history. */
+  const turnNavOffsetCacheRef = useRef<{ key: string; tops: Map<string, number> }>({
+    key: '',
+    tops: new Map(),
+  });
 
   // Track whether the current workspace has any git repositories (single repo or multi-repo)
   const [hasGitRepos, setHasGitRepos] = useState<boolean>(false);
@@ -5451,12 +5473,21 @@ export function Chat({
     const items = turnNavItemsRef.current;
     if (!root || items.length === 0) return;
     const rootRect = root.getBoundingClientRect();
+    const cacheKey = `${root.scrollHeight}|${items.length}`;
+    if (turnNavOffsetCacheRef.current.key !== cacheKey) {
+      turnNavOffsetCacheRef.current = { key: cacheKey, tops: new Map() };
+    }
+    const tops = turnNavOffsetCacheRef.current.tops;
     const next = resolveActiveTurnId(
       items,
       (id) => {
+        const cached = tops.get(id);
+        if (cached !== undefined) return cached;
         const el = root.querySelector(`[data-turn-nav="${id}"]`);
         if (!el) return undefined;
-        return el.getBoundingClientRect().top - rootRect.top + root.scrollTop;
+        const top = el.getBoundingClientRect().top - rootRect.top + root.scrollTop;
+        tops.set(id, top);
+        return top;
       },
       { scrollTop: root.scrollTop, clientHeight: root.clientHeight, scrollHeight: root.scrollHeight },
     );
@@ -6422,11 +6453,22 @@ export function Chat({
   }
 
   function finalizePendingToolsOnCanvas() {
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.role === 'assistant' ? { ...m, parts: finalizeToolsAfterTurn(m.parts) } : m,
-      ),
-    );
+    const follow = timelineFollowRef.current;
+    follow?.beginSwap();
+    setMessages((prev) => {
+      let changed = false;
+      const next = prev.map((m) => {
+        if (m.role !== 'assistant') return m;
+        const parts = finalizeToolsAfterTurn(m.parts);
+        if (parts === m.parts) return m;
+        changed = true;
+        return { ...m, parts };
+      });
+      if (!changed) return prev;
+      messagesRef.current = next;
+      return next;
+    });
+    follow?.endSwap();
   }
 
   function closeOpenArtifactFence() {
@@ -7956,7 +7998,7 @@ export function Chat({
     approvalMode: ApprovalMode = modeState.confirmedMode,
     onAccepted?: (acceptedSessionId?: string) => void,
     overrideProvider?: string,
-    opts?: { alreadyOnCanvas?: boolean; preserveCanvasOnBusy?: boolean },
+    opts?: { alreadyOnCanvas?: boolean; preserveCanvasOnBusy?: boolean; jumpToBottom?: boolean },
   ): Promise<'ok' | 'busy' | 'error'> {
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(
@@ -7968,10 +8010,10 @@ export function Chat({
     }
     // 画到上一条消息尾部只发生在正式 stop 且全部勾完之后，不在发送下一条时提前归档。
     if (sessionId) idleWatchFlashDisconnectsRef.current.delete(sessionId);
-    // Actually sending a message (immediate OR drained from the queue) re-engages
-    // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
-    // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
-    timelineFollow.jump();
+    // Actually sending a message re-engages auto-follow when the user asked for
+    // it. Queue cards drained in the background must NOT yank a reader who is
+    // scrolled up; the explicit jump fires only for real sends.
+    if (opts?.jumpToBottom !== false) timelineFollow.jump();
 
     // 后台静默检测 Git 仓库支持情况（更新 hasGitRepos 标识，严格保留用户当前选择的右侧面板游标/Tab，禁止重置）
     if (effectiveWorkingDir) {
@@ -8739,8 +8781,8 @@ export function Chat({
     if (!queuedRef.current.some((entry) => entry.id === item.id)) return;
     setQueued((current) => current.filter((entry) => entry.id !== item.id));
     const opts = item.forceSend
-      ? { alreadyOnCanvas: true, preserveCanvasOnBusy: true as const }
-      : undefined;
+      ? { alreadyOnCanvas: true, preserveCanvasOnBusy: true as const, jumpToBottom: false as const }
+      : { jumpToBottom: false as const };
     void deliver(item.text, item.images ?? [], item.approvalMode ?? modeState.confirmedMode, undefined, undefined, opts)
       .then((outcome) => {
         // Only the "send now" path returns busy without entering the generic
@@ -11145,6 +11187,20 @@ export function Chat({
         </div>
       </div>
 
+      {/* Jump-to-bottom: anchored inside the chat column (never over the
+          inspector panel or the composer) and only on the chat tab. */}
+      {showJumpBtn && activeMainTabId === 'chat' && (
+        <button
+          type="button"
+          class={'jump-to-bottom' + (busy ? ' is-streaming' : '')}
+          onClick={() => scrollToBottom('smooth')}
+          title={t('chat.jumpToBottom')}
+          aria-label={t('chat.jumpToBottom')}
+        >
+          <span class="jump-to-bottom-arrow" aria-hidden="true">↓</span>
+        </button>
+      )}
+
       {/* VSCode Diff Viewer or Code Editor Stage */}
       {activeMainTabId !== 'chat' && (() => {
         const currentDiffTab = diffTabs.find((t) => t.id === activeMainTabId);
@@ -11558,18 +11614,6 @@ export function Chat({
         </div>
       )}
 
-      {/* Jump-to-bottom: shown only when the user has scrolled up (follow released). */}
-      {showJumpBtn && (
-        <button
-          class="jump-to-bottom"
-          onClick={() => scrollToBottom('smooth')}
-          title={t('chat.jumpToBottom')}
-          aria-label={t('chat.jumpToBottom')}
-        >
-          ↓
-        </button>
-      )}
-
       {/* Floating input */}
       {persistenceWarning && (
         <div class="persistence-warning" role="status">
@@ -11853,7 +11897,7 @@ function AssistantMessageView({
           </span>
         )}
         {isLastInTurn && streaming && liveElapsedMs != null && (
-          <span class="msg-time is-live" aria-live="polite">
+          <span class="msg-time is-live">
             <span class="msg-turn-elapsed">
               {t('chat.turnElapsedLive', { time: formatTurnElapsed(liveElapsedMs) })}
             </span>
@@ -12423,6 +12467,9 @@ function ToolRowView({
   const userCollapsedRef = useRef(false);
   const userManuallyExpandedRef = useRef(false);
   const outputRef = useRef<HTMLPreElement>(null);
+  /** 输出窗自己也有滚动条：用户上滑阅读时必须停止自动贴底，否则每个 chunk
+   *  都会把他弹回底部，和外层时间线一起形成逐帧抖动。 */
+  const outputFollowRef = useRef(true);
   const hasSubtasks = !!(tool.subtasks && tool.subtasks.length > 0);
   const category = toolCategory(tool.name);
   const glyph = toolGlyph(tool.name);
@@ -12468,7 +12515,19 @@ function ToolRowView({
   }, [tool.status]);
 
   useEffect(() => {
+    const el = outputRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      outputFollowRef.current =
+        el.scrollHeight - el.scrollTop - el.clientHeight <= 48;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [expanded]);
+
+  useEffect(() => {
     if (!expanded || !tool.output || !outputRef.current) return;
+    if (!outputFollowRef.current) return;
     outputRef.current.scrollTop = outputRef.current.scrollHeight;
   }, [expanded, tool.output]);
 

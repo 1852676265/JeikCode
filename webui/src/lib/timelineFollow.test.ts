@@ -42,13 +42,16 @@ function setup(resize = true) {
   const following = { current: true };
   let jump = false;
   const follow = createTimelineFollow(following, (show) => { jump = show; });
-  const flush = () => {
+  const flushOnce = () => {
     const pending = [...frames.values()];
     frames.clear();
     for (const callback of pending) callback(0);
   };
+  const flush = () => {
+    for (let i = 0; i < 16 && frames.size > 0; i += 1) flushOnce();
+  };
   return {
-    element, following, follow, frames, observers, flush,
+    element, following, follow, frames, observers, flushOnce, flush,
     get jump() { return jump; },
     attach() { follow.attach(element as unknown as HTMLElement); },
     cleanup() {
@@ -113,19 +116,24 @@ test('programmatic scroll events after content growth do not pause follow', () =
   } finally { s.cleanup(); }
 });
 
-test('manual scrollbar and touch release follow; manual bottom resumes', () => {
+test('manual scrollbar and touch release follow; a gesture at the true bottom resumes', () => {
   const s = setup();
   try {
     s.attach(); s.flush();
+    // A scrollbar drag starts with pointerdown; the initial follow only ignores
+    // layout-driven deltas, not gestures.
+    s.element.emit('pointerdown');
     s.element.top = 250; s.element.emit('scroll');
     assert.equal(s.following.current, false);
-    s.element.top = 780; s.element.emit('scroll');
+    // A held scrollbar thumb is a gesture; only the true bottom re-pins.
+    s.element.emit('pointerdown');
+    s.element.top = 800; s.element.emit('scroll');
     assert.equal(s.following.current, true);
     s.element.emit('touchstart', { touches: [{ clientY: 10 }] });
     s.element.emit('touchmove', { touches: [{ clientY: 40 }] });
     assert.equal(s.following.current, false);
     s.follow.changed(); s.flush();
-    assert.equal(s.element.scrollTop, 780);
+    assert.equal(s.element.scrollTop, 800);
   } finally { s.cleanup(); }
 });
 
@@ -152,7 +160,7 @@ test('session reset cancels stale RAF; late history does not reset reading inten
   } finally { s.cleanup(); }
 });
 
-test('near-bottom upward wheel stays paused until downward scroll or explicit jump', () => {
+test('near-bottom upward wheel stays paused until a gesture reaches the true bottom or jumps', () => {
   const s = setup();
   try {
     s.attach(); s.flush();
@@ -169,7 +177,8 @@ test('near-bottom upward wheel stays paused until downward scroll or explicit ju
     assert.equal(s.following.current, false);
     s.element.top = 770; s.element.emit('scroll');
     assert.equal(s.following.current, false);
-    s.element.top = 800; s.element.emit('scroll');
+    // 820 is the true bottom (1020 - 200).
+    s.element.top = 820; s.element.emit('scroll');
     assert.equal(s.following.current, true);
     s.element.emit('wheel', { deltaY: -10 });
     s.element.top = 790; s.element.emit('scroll');
@@ -216,7 +225,7 @@ test('plain pointer click does not suspend follow; undelivered scrollbar movemen
   } finally { s.cleanup(); }
 });
 
-test('prevented and independently consumed nested wheels do not pause the timeline', () => {
+test('prevented wheels are ignored; wheels consumed inside a nested pane release the outer follow', () => {
   const s = setup();
   const saved = Object.getOwnPropertyDescriptor(globalThis, 'getComputedStyle');
   try {
@@ -234,7 +243,10 @@ test('prevented and independently consumed nested wheels do not pause the timeli
     Object.assign(wheel, { deltaY: -20 });
     Object.defineProperty(wheel, 'target', { value: child });
     s.element.dispatchEvent(wheel);
-    assert.equal(s.following.current, true);
+    // Reading inside a tool output / reasoning pane is reader intent.
+    assert.equal(s.following.current, false);
+    assert.equal(s.jump, true);
+    // At the child's edge the movement hands off to the outer timeline.
     child.scrollTop = 0;
     s.element.dispatchEvent(wheel);
     assert.equal(s.following.current, false);
@@ -245,7 +257,7 @@ test('prevented and independently consumed nested wheels do not pause the timeli
   }
 });
 
-test('nested touch scrolling preserves follow until the child hands off at its edge', () => {
+test('nested touch starts inside the child but hands off at its edge', () => {
   const s = setup();
   const saved = Object.getOwnPropertyDescriptor(globalThis, 'getComputedStyle');
   try {
@@ -262,15 +274,14 @@ test('nested touch scrolling preserves follow until the child hands off at its e
     };
     s.element.emit('touchstart', { touches: [{ clientY: 10 }] });
     move(40);
-    assert.equal(s.following.current, true);
-    assert.equal(s.jump, false);
-    child.scrollTop = 0;
-    // Đổi hướng sau khi con cuộn phải dùng vị trí chạm mới nhất.
-    move(30);
-    assert.equal(s.following.current, true);
-    move(35);
     assert.equal(s.following.current, false);
     assert.equal(s.jump, true);
+    child.scrollTop = 0;
+    // Moving back down does not resurrect follow; the outer stays released.
+    move(30);
+    assert.equal(s.following.current, false);
+    s.follow.jump(); s.flush();
+    assert.equal(s.following.current, true);
   } finally {
     if (saved) Object.defineProperty(globalThis, 'getComputedStyle', saved);
     else Reflect.deleteProperty(globalThis, 'getComputedStyle');
@@ -320,10 +331,12 @@ test('without ResizeObserver mutations and captured resource load still follow',
   try {
     s.attach(); s.flush();
     s.element.scrollHeight = 1400;
-    s.observers[0].callback(); s.flush();
+    s.observers[0].callback();
+    s.flush();
     assert.equal(s.element.scrollTop, 1200);
     s.element.scrollHeight = 1700;
-    s.element.emit('load'); s.flush();
+    s.element.emit('load');
+    s.flush();
     assert.equal(s.element.scrollTop, 1500);
   } finally { s.cleanup(); }
 });
@@ -342,12 +355,15 @@ test('upward wheel at distance 30 cancels pending resize; downward wheel waits f
     s.flush();
     assert.equal(s.element.scrollTop, 770);
     s.element.emit('wheel', { deltaY: 10 });
-    s.observers[0].callback(); s.flush();
+    s.observers[0].callback();
+    s.flush();
     assert.equal(s.following.current, false);
     assert.equal(s.element.scrollTop, 770);
-    s.element.top = 780; s.element.emit('scroll');
+    // 1000 - 200 is the true bottom; a gesture there resumes.
+    s.element.top = 800; s.element.emit('scroll');
     assert.equal(s.following.current, true);
-    s.observers[0].callback(); s.flush();
+    s.observers[0].callback();
+    s.flush();
     assert.equal(s.element.scrollTop, 800);
   } finally { s.cleanup(); }
 });
@@ -383,13 +399,13 @@ test('nested geometry without DOM styles consumes wheels until its directional e
       s.element.dispatchEvent(event);
     };
     emit(-10);
-    assert.equal(s.following.current, true);
+    assert.equal(s.following.current, false);
     child.scrollTop = 0; emit(-10);
     assert.equal(s.following.current, false);
     child.scrollTop = 400; emit(10);
     assert.equal(s.following.current, false);
-    s.element.top = 790; s.element.emit('scroll');
-    assert.equal(s.following.current, false);
+    s.element.emit('pointerdown');
+    s.element.top = 700; s.element.emit('scroll');
     s.element.top = 800; s.element.emit('scroll');
     assert.equal(s.following.current, true);
   } finally {
@@ -456,7 +472,8 @@ test('streaming content growth while scrolled to middle stays completely station
     s.attach(); s.flush();
     assert.equal(s.element.scrollTop, 800);
 
-    // User scrolls up to middle (scrollTop = 400)
+    // User scrolls up to middle (scrollTop = 400) with a scrollbar drag.
+    s.element.emit('pointerdown');
     s.element.top = 400;
     s.element.emit('scroll');
     assert.equal(s.following.current, false);
@@ -474,5 +491,118 @@ test('streaming content growth while scrolled to middle stays completely station
     // Still in middle, remains stable
     assert.equal(s.element.scrollTop, 400);
     assert.equal(s.following.current, false);
+  } finally { s.cleanup(); }
+});
+
+// ── New regression coverage ────────────────────────────────────────────────
+
+test('hiding the container (display:none) never releases follow', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    assert.equal(s.element.scrollTop, 800);
+
+    // Chrome zeroes scrollTop and dispatches a scroll event when a scrollable
+    // element becomes display:none.
+    s.element.clientHeight = 0;
+    s.element.scrollHeight = 0;
+    s.element.top = 0;
+    s.element.emit('scroll');
+    assert.equal(s.following.current, true);
+
+    // Returning restores the old position; that must not look like intent.
+    s.element.clientHeight = 200;
+    s.element.scrollHeight = 1200;
+    s.element.top = 1000;
+    s.observers[0].callback();
+    s.element.emit('scroll');
+    s.flush();
+    assert.equal(s.following.current, true);
+    assert.equal(s.element.scrollTop, 1000);
+  } finally { s.cleanup(); }
+});
+
+test('layout clamp while following is not reader intent', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    // Content above shrinks (panel toggle / markdown reflow) -> browser clamps.
+    s.element.scrollHeight = 700;
+    s.element.top = 500;
+    s.element.emit('scroll');
+    assert.equal(s.following.current, true);
+    s.follow.changed(); s.flush();
+    assert.equal(s.element.scrollTop, 500);
+  } finally { s.cleanup(); }
+});
+
+test('initial follow survives position loss but a real gesture still releases', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    // Cache canvas was replaced by a shorter live snapshot (no gesture).
+    s.element.top = 400;
+    s.element.emit('scroll');
+    assert.equal(s.following.current, true);
+
+    s.element.emit('wheel', { deltaY: -20 });
+    assert.equal(s.following.current, false);
+  } finally { s.cleanup(); }
+});
+
+test('ctrl/cmd wheel (page zoom) is not reader intent', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    s.element.emit('wheel', { deltaY: -120, ctrlKey: true });
+    assert.equal(s.following.current, true);
+    s.element.emit('wheel', { deltaY: -120, metaKey: true });
+    assert.equal(s.following.current, true);
+  } finally { s.cleanup(); }
+});
+
+test('a programmatic descent cannot re-enable follow; a gesture can', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    s.follow.pause();
+    s.element.top = 600; s.element.emit('scroll');
+    assert.equal(s.following.current, false);
+    // No gesture: still released.
+    s.element.top = 800; s.element.emit('scroll');
+    assert.equal(s.following.current, false);
+    // Pointer drag is a gesture and the true bottom re-pins.
+    s.element.emit('pointerdown');
+    s.element.top = 700; s.element.emit('scroll');
+    s.element.top = 800; s.element.emit('scroll');
+    assert.equal(s.following.current, true);
+  } finally { s.cleanup(); }
+});
+
+test('a single huge insertion glides instead of whipping a whole screen', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    assert.equal(s.element.scrollTop, 800);
+    // One batch adds ten viewports of content.
+    s.element.scrollHeight = 3000;
+    s.follow.changed();
+    s.flushOnce();
+    assert.equal(s.element.scrollTop, 1000);
+    assert.ok(s.frames.size > 0);
+    s.flush();
+    assert.equal(s.element.scrollTop, 2800);
+  } finally { s.cleanup(); }
+});
+
+test('canvas swap keeps the reader pinned when the viewport was at the bottom', () => {
+  const s = setup();
+  try {
+    s.attach(); s.flush();
+    s.follow.beginSwap();
+    s.element.scrollHeight = 2000;
+    s.follow.endSwap();
+    s.flush();
+    assert.equal(s.element.scrollTop, 1800);
   } finally { s.cleanup(); }
 });

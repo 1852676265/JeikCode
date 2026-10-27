@@ -2185,6 +2185,9 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   overflow-anchor: none;
+  /* Trackpad rubber-band must not emit rebound deltas that look like a
+     reader scrolling up. */
+  overscroll-behavior: contain;
   padding: 20px 24px 8px;
   gap: 0;
   min-width: 0;
@@ -12588,12 +12591,13 @@ body {
   margin-right: 2px;
 }
 
-/* Jump-to-bottom pill: shown when the user scrolls up during streaming (auto-follow
-   released). Fixed above the input bar; theme-safe via var fallbacks. */
+/* Jump-to-bottom pill: anchored inside `.chat-main-column` (which is
+   position:relative), so it can never cover the inspector panel or the
+   composer. It is rendered only on the chat tab. */
 .jump-to-bottom {
-  position: fixed;
-  right: 28px;
-  bottom: 96px;
+  position: absolute;
+  right: 20px;
+  bottom: 16px;
   z-index: 20;
   width: 36px;
   height: 36px;
@@ -12612,6 +12616,34 @@ body {
   transition: opacity 0.15s ease, transform 0.15s ease;
 }
 .jump-to-bottom:hover { opacity: 1; transform: translateY(-1px); }
+.jump-to-bottom:focus-visible {
+  outline: 2px solid var(--app-brand, #38bdf8);
+  outline-offset: 2px;
+}
+/* Still generating while the reader is parked above the tail. */
+.jump-to-bottom.is-streaming::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--app-brand, #38bdf8);
+  animation: jump-to-bottom-pulse 1.2s ease-in-out infinite;
+}
+@keyframes jump-to-bottom-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+@media (max-width: 720px) {
+  .jump-to-bottom { right: 12px; bottom: 12px; width: 32px; height: 32px; font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .jump-to-bottom,
+  .jump-to-bottom:hover { transition: none; transform: none; }
+  .jump-to-bottom.is-streaming::after { animation: none; opacity: 1; }
+}
 
 .top-model-row {
   display: inline-flex;
