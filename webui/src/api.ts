@@ -950,6 +950,7 @@ export interface SessionMeta {
   message_count: number;
   file_size?: number;
   approval_mode?: ApprovalMode | null;
+  preferred_model?: string | null;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {

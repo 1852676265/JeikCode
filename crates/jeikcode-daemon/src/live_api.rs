@@ -2248,7 +2248,11 @@ fn session_is_established(working_dir: &Path, session_id: &str) -> bool {
         .is_some_and(|meta| meta.message_count > 0 || meta.turn_count > 0)
 }
 
-fn persist_session_preferred_model(working_dir: &Path, session_id: &str, provider: &str) {
+pub(crate) fn persist_session_preferred_model(
+    working_dir: &Path,
+    session_id: &str,
+    provider: &str,
+) {
     let _ = jeikcode_capabilities::session::SessionManager::for_project(working_dir).update_meta(
         session_id,
         |meta| {
@@ -3228,9 +3232,14 @@ pub(crate) async fn live_provider(
     let established = requested_session_id
         .as_deref()
         .is_some_and(|id| session_is_established(&working_dir, id));
-    if established {
-        if let Some(session_id) = requested_session_id.as_deref() {
+    if let Some(session_id) = requested_session_id.as_deref() {
+        if established {
             persist_session_preferred_model(&working_dir, session_id, &requested_provider);
+        } else {
+            crate::native_live::set_session_draft_provider(
+                session_id.to_string(),
+                requested_provider.clone(),
+            );
         }
     } else {
         let _ = jeikcode_config::ConfigStore::default_store().update(|cfg| {
@@ -4314,6 +4323,47 @@ mod tests {
             }
             other => panic!("expected SessionMode event, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn live_provider_scoped_to_session_draft_does_not_mutate_global_config() {
+        let home = crate::tests::ScopedChatHome::new();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "default_provider = \"base-model\"\n",
+        )
+        .unwrap();
+
+        let initial_default = jeikcode_config::ConfigStore::default_store()
+            .read()
+            .unwrap()
+            .config
+            .default_provider
+            .clone();
+
+        crate::native_live::set_session_draft_provider(
+            "draft-provider-test".to_string(),
+            "special-isolated-model".to_string(),
+        );
+
+        assert_eq!(
+            crate::native_live::get_session_draft_provider("draft-provider-test").as_deref(),
+            Some("special-isolated-model")
+        );
+
+        let after_default = jeikcode_config::ConfigStore::default_store()
+            .read()
+            .unwrap()
+            .config
+            .default_provider
+            .clone();
+        assert_eq!(initial_default, after_default);
+
+        assert_eq!(
+            crate::native_live::take_session_draft_provider("draft-provider-test").as_deref(),
+            Some("special-isolated-model")
+        );
+        assert!(crate::native_live::get_session_draft_provider("draft-provider-test").is_none());
     }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the

@@ -1165,6 +1165,7 @@ mod global_events_tests {
                 message_count: 3,
                 origin: "manual".into(),
                 approval_mode: None,
+                preferred_model: None,
             },
         })
         .unwrap();
@@ -2807,6 +2808,8 @@ pub(crate) struct SessionRowWire {
     pub origin: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
 }
 
 /// Build the incremental session row for one stored session. `None` when the
@@ -2838,6 +2841,7 @@ pub(crate) fn session_row_wire(
                     .to_string(),
             )
         }),
+        preferred_model: meta.preferred_model.clone(),
     })
 }
 
@@ -2871,6 +2875,7 @@ pub(crate) fn session_row_wire_in_bucket(
                     .to_string(),
             )
         }),
+        preferred_model: meta.preferred_model.clone(),
     })
 }
 
@@ -4504,6 +4509,8 @@ pub struct SessionSummary {
     pub file_size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
 }
 
 fn catalog_scan_in_root(
@@ -4524,6 +4531,11 @@ fn catalog_scan_in_root(
 fn catalog_entry_to_session_summary(
     entry: &jeikcode_capabilities::session::CatalogEntry,
 ) -> SessionSummary {
+    let preferred_model =
+        jeikcode_capabilities::session::SessionManager::for_project(&entry.working_dir)
+            .read_meta(&entry.id)
+            .ok()
+            .and_then(|m| m.preferred_model);
     SessionSummary {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -4537,6 +4549,7 @@ fn catalog_entry_to_session_summary(
                 .wire()
                 .to_string(),
         ),
+        preferred_model,
     }
 }
 
@@ -5413,7 +5426,14 @@ async fn get_session_detail(
                 pinned_user_index,
                 turns,
                 messages,
-                preferred_model: session.meta.preferred_model.clone(),
+                preferred_model: session.meta.preferred_model.clone().or_else(|| {
+                    session
+                        .meta
+                        .turn_stats
+                        .iter()
+                        .rev()
+                        .find_map(|s| s.model_usage.first().map(|m| m.provider_id.clone()))
+                }),
                 approval_mode: session.meta.approval_mode.clone().or_else(|| {
                     Some(
                         live_api::live_session_approval_mode(Some(&id))
@@ -10710,9 +10730,17 @@ pub(crate) async fn process_chat_request(
         } else {
             (uuid::Uuid::new_v4().to_string(), Vec::new(), true)
         };
+    let is_first_turn_for_default = is_new_session || initial_messages.is_empty();
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
+    let initial_preferred = if is_new_session {
+        crate::native_live::take_session_draft_provider(&session_id)
+            .or_else(|| Some(provider_name.clone()))
+    } else {
+        live_api::persist_session_preferred_model(&working_dir, &session_id, &provider_name);
+        None
+    };
     publish_chat_session_assignment(
         &working_dir,
         &session_id,
@@ -10720,6 +10748,7 @@ pub(crate) async fn process_chat_request(
         &event_tx,
         req.session_title.as_deref(),
         Some(&req.message),
+        initial_preferred.as_deref(),
     )?;
     if !is_new_session
         && req
@@ -10940,8 +10969,31 @@ pub(crate) async fn process_chat_request(
         keep_raw_markdown,
         ..ChatRuntimeProjector::default()
     };
+    let mut first_ttft_promoted = false;
+    let effective_provider_for_default = provider_name.clone();
+
     while let Some(event) = runtime_event_rx.recv().await {
         for mut chat_event in projector.project_runtime(event, &perm_session_key) {
+            if !first_ttft_promoted && is_first_turn_for_default {
+                if matches!(
+                    chat_event,
+                    ChatEvent::TextDelta { .. }
+                        | ChatEvent::ReasoningDelta { .. }
+                        | ChatEvent::ToolCallStarted { .. }
+                        | ChatEvent::ToolBatchStarted { .. }
+                ) {
+                    first_ttft_promoted = true;
+                    let target_prov = effective_provider_for_default.clone();
+                    let _ = jeikcode_config::ConfigStore::default_store().update(|cfg| {
+                        if cfg.selection_exists(&target_prov) {
+                            cfg.default_model = Some(target_prov.clone());
+                            cfg.default_provider = target_prov.clone();
+                        }
+                        Ok(())
+                    });
+                    publish_global(GlobalWireEvent::ConfigReloaded);
+                }
+            }
             // Echo the recorded client correlation ids on a steer fold, so the
             // WebUI can reconcile an in-flight steer (id → persisted message).
             if let ChatEvent::Steered {
@@ -11027,6 +11079,7 @@ fn publish_chat_session_assignment(
     event_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_title: Option<&str>,
     first_user_prompt: Option<&str>,
+    preferred_model: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut provisional_name = None;
     if is_new_session {
@@ -11039,6 +11092,7 @@ fn publish_chat_session_assignment(
             now,
         );
         meta.owner = jeikcode_capabilities::session::StorageOwner::Native;
+        meta.preferred_model = preferred_model.map(str::to_string);
         meta.approval_mode = Some(
             live_api::live_session_approval_mode(Some(session_id))
                 .wire()
@@ -16881,6 +16935,10 @@ mod tests {
                 _home: home,
             }
         }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
     }
 
     fn chat_test_telemetry(home: &ScopedChatHome) -> Arc<Telemetry> {
@@ -16945,6 +17003,7 @@ mod tests {
             &event_tx,
             Some("jeik"),
             None,
+            None,
         )
         .unwrap();
 
@@ -16992,6 +17051,7 @@ mod tests {
             &event_tx,
             None,
             Some("帮我写一个快速排序算法"),
+            None,
         )
         .unwrap();
 
@@ -17025,6 +17085,7 @@ mod tests {
             true,
             &event_tx,
             Some("default"),
+            None,
             None,
         );
 

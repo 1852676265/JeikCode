@@ -1931,22 +1931,39 @@ export function Chat({
     (sid: string | null) => sid ?? NEW_SESSION_PROVIDER_KEY,
     [],
   );
-  const restoreProviderForSession = useCallback((sid: string | null) => {
-    const cached = providerCacheRef.current.get(providerCacheKey(sid));
-    if (cached) {
-      setProvider(cached);
-      providerPinnedRef.current = true;
-      return;
-    }
-    setProvider(defaultProviderName());
-    providerPinnedRef.current = false;
-  }, [defaultProviderName, providerCacheKey]);
-  const followDefaultProvider = useCallback((name: string) => {
-    if (providerPinnedRef.current) return;
-    // Only follow global default on the new-session landing page.
-    if (activeIdRef.current) return;
-    setProvider(name);
-  }, []);
+  const restoreProviderForSession = useCallback(
+    (sid: string | null, fallbackPreferred?: string | null) => {
+      const cached = providerCacheRef.current.get(providerCacheKey(sid));
+      if (cached) {
+        setProvider(cached);
+        providerPinnedRef.current = true;
+        return;
+      }
+      if (fallbackPreferred) {
+        setProvider(fallbackPreferred);
+        providerCacheRef.current.set(providerCacheKey(sid), fallbackPreferred);
+        providerPinnedRef.current = true;
+        return;
+      }
+      setProvider(defaultProviderName());
+      providerPinnedRef.current = false;
+    },
+    [defaultProviderName, providerCacheKey],
+  );
+  const followDefaultProvider = useCallback(
+    (name: string) => {
+      if (providerPinnedRef.current) return;
+      // 只有在空会话落地页（无消息、无历史）时才跟随全局默认模型！已有会话坚决不跟随！
+      const isNewLanding =
+        !activeIdRef.current ||
+        (activeSession?.id === activeIdRef.current &&
+          (activeSession?.message_count ?? 0) === 0 &&
+          messagesRef.current.length === 0);
+      if (!isNewLanding) return;
+      setProvider(name);
+    },
+    [activeSession],
+  );
 
   useEffect(() => {
     let active = true;
@@ -3501,7 +3518,10 @@ export function Chat({
       if (sessionId) {
         preMountStreamBufferRef.current.set(sessionId, []);
       }
-      restoreProviderForSession(sessionId);
+      restoreProviderForSession(
+        sessionId,
+        activeSession?.id === sessionId ? activeSession.preferred_model : null,
+      );
       restoreModeForSession(
         sessionId,
         activeSession?.id === sessionId ? (activeSession.approval_mode as ApprovalMode) : null,
@@ -3830,7 +3850,9 @@ export function Chat({
       // switch thought everything was loaded and never offered "load earlier".
       historyOffsetBySessionRef.current.set(sessionId, savedOffset);
       hasOlderBySessionRef.current.set(sessionId, savedHasOlder);
-      const cachedProv = providerCacheRef.current.get(sessionId);
+      const cachedProv =
+        providerCacheRef.current.get(sessionId) ||
+        (activeSession?.id === sessionId ? activeSession.preferred_model : null);
       if (cachedProv) {
         setProvider(cachedProv);
         providerPinnedRef.current = true;
@@ -3967,6 +3989,13 @@ export function Chat({
               setModeState(initModeState(idb.approvalMode as ApprovalMode));
             }
           }
+          if (idb.preferredModel) {
+            providerCacheRef.current.set(loadId, idb.preferredModel);
+            if (activeIdRef.current === loadId) {
+              setProvider(idb.preferredModel);
+              providerPinnedRef.current = true;
+            }
+          }
           if (idb.tokenUsage) {
             applySessionTokens(loadId, idb.messages, idb.tokenUsage);
           }
@@ -4011,7 +4040,9 @@ export function Chat({
             providerCacheRef.current.set(loadId, preferred);
             providerPinnedRef.current = true;
           } else {
-            const cachedProv = providerCacheRef.current.get(loadId);
+            const cachedProv =
+              providerCacheRef.current.get(loadId) ||
+              (activeSession?.id === loadId ? activeSession.preferred_model : null);
             if (cachedProv) {
               setProvider(cachedProv);
               providerPinnedRef.current = true;

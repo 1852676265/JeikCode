@@ -186,6 +186,34 @@ pub fn session_draft_working_dir(session_id: &str) -> Option<PathBuf> {
         .cloned()
 }
 
+static SESSION_DRAFT_PROVIDERS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
+
+fn session_draft_providers() -> &'static StdMutex<HashMap<String, String>> {
+    SESSION_DRAFT_PROVIDERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub fn set_session_draft_provider(session_id: String, provider: String) {
+    session_draft_providers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id, provider);
+}
+
+pub fn get_session_draft_provider(session_id: &str) -> Option<String> {
+    session_draft_providers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+}
+
+pub fn take_session_draft_provider(session_id: &str) -> Option<String> {
+    session_draft_providers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id)
+}
+
 pub(crate) fn runtime_start_is_session_in_use(error: &jeikcode_coding::RuntimeStartError) -> bool {
     matches!(
         error,

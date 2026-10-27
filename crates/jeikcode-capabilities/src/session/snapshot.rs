@@ -1025,6 +1025,11 @@ impl LifecycleHooks for SnapshotHook {
             meta.updated_at = now;
             meta.turn_count = meta.turn_count.saturating_add(1);
             meta.message_count = msg_count as u32;
+            if let Some(attr) = attribution.as_ref() {
+                if !attr.provider_id.is_empty() {
+                    meta.preferred_model = Some(attr.provider_id.clone());
+                }
+            }
             // Only legacy position-only stats can be judged by message count.
             // Native stats have stable turn ids and are reindexed exclusively by
             // the explicit compaction/undo seams.
