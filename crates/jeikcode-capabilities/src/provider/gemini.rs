@@ -607,10 +607,17 @@ fn format_contents(
                 i += 1;
             }
             Role::Assistant => {
-                contents.push(json!({
-                    "role": "model",
-                    "parts": model_parts(m, echo_thinking),
-                }));
+                // An empty model round (a failed / interrupted stream that persisted nothing
+                // replayable) must NOT become a wire turn: Gemini rejects empty `parts`, and
+                // dropping it lets the surrounding user turns stay adjacent so the merge
+                // below reconstructs a single user block (the lost reply never happened).
+                let parts = model_parts(m, echo_thinking);
+                if !parts.is_empty() {
+                    contents.push(json!({
+                        "role": "model",
+                        "parts": parts,
+                    }));
+                }
                 i += 1;
             }
             Role::Tool => {
@@ -624,7 +631,56 @@ fn format_contents(
             }
         }
     }
+    let contents = merge_consecutive_user(contents);
     (system_blocks, contents)
+}
+
+/// Merge consecutive `role:"user"` wire entries into ONE with concatenated discrete parts.
+/// Aligns with Anthropic's discrete block merging so that frozen synthetic user prefixes
+/// (project instructions, memory, skills) and user prompts stay as distinct parts
+/// within a single initial user turn.
+fn merge_consecutive_user(contents: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(contents.len());
+    for item in contents {
+        let is_user = item.get("role").and_then(Value::as_str) == Some("user");
+        let prev_user = out
+            .last()
+            .and_then(|p| p.get("role").and_then(Value::as_str))
+            == Some("user");
+        if is_user && prev_user {
+            let last = out.last_mut().unwrap();
+            let mut last_parts = last
+                .get("parts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let item_parts = item
+                .get("parts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            if last_parts.len() == 1
+                && last_parts[0].get("text").and_then(Value::as_str) == Some("")
+                && !item_parts.is_empty()
+            {
+                last_parts.clear();
+            }
+            if !(item_parts.len() == 1
+                && item_parts[0].get("text").and_then(Value::as_str) == Some("")
+                && !last_parts.is_empty())
+            {
+                last_parts.extend(item_parts);
+            }
+            if last_parts.is_empty() {
+                last_parts.push(json!({ "text": "" }));
+            }
+            last["parts"] = Value::Array(last_parts);
+        } else {
+            out.push(item);
+        }
+    }
+    out
 }
 
 fn user_parts(m: &Message, vision: bool) -> Vec<Value> {
@@ -716,9 +772,6 @@ fn model_parts(m: &Message, echo_thinking: bool) -> Vec<Value> {
             part.insert("thoughtSignature".into(), json!(sig));
         }
         parts.push(Value::Object(part));
-    }
-    if parts.is_empty() {
-        parts.push(json!({ "text": "" }));
     }
     parts
 }
@@ -1141,13 +1194,112 @@ mod tests {
         );
 
         let contents = body["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 2);
+        assert_eq!(
+            contents.len(),
+            1,
+            "consecutive user messages must merge into a single user turn"
+        );
         assert_eq!(contents[0]["role"], json!("user"));
-        assert!(contents[0]["parts"][0]["text"]
+        let user_parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(user_parts.len(), 2, "must preserve discrete parts");
+        assert!(user_parts[0]["text"]
             .as_str()
             .unwrap()
             .contains("AUTHORITATIVE PROJECT INSTRUCTIONS"));
-        assert_eq!(contents[1]["parts"][0]["text"], json!("hello"));
+        assert_eq!(user_parts[1]["text"], json!("hello"));
+    }
+
+    #[test]
+    fn test_instructions_memory_and_user_input_merge_as_discrete_parts() {
+        let c = cfg("gemini-3-flash");
+        let msgs = vec![
+            Message::system("<environment>env</environment>"),
+            Message::synthetic_user("<available_skills>skills</available_skills>"),
+            Message::synthetic_user(
+                "=== AUTHORITATIVE PROJECT INSTRUCTIONS & KNOWLEDGE (*.md) ===\nagents",
+            ),
+            Message::synthetic_user("=== MEMORY ===\n- prefers concise answers"),
+            Message::user("how does auth work?"),
+        ];
+        let body = build_request_body(
+            &c,
+            &msgs,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(
+            contents.len(),
+            1,
+            "all consecutive user blocks merge into one user entry"
+        );
+        assert_eq!(contents[0]["role"], json!("user"));
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4, "preserves 4 discrete parts");
+        assert_eq!(
+            parts[0]["text"],
+            json!("<available_skills>skills</available_skills>")
+        );
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("AUTHORITATIVE PROJECT INSTRUCTIONS"));
+        assert_eq!(
+            parts[2]["text"],
+            json!("=== MEMORY ===\n- prefers concise answers")
+        );
+        assert_eq!(parts[3]["text"], json!("how does auth work?"));
+    }
+
+    #[test]
+    fn lost_model_round_merges_users_while_a_real_reply_keeps_turns_alternating() {
+        let c = cfg("gemini-3-flash");
+        // Failed round (disconnect / provider error): nothing replayable was persisted for
+        // the model, so the two user messages stay adjacent and fold into ONE user turn.
+        let lost = vec![
+            Message::user("first question"),
+            Message::assistant("", vec![]),
+            Message::user("retry"),
+        ];
+        let body = build_request_body(
+            &c,
+            &lost,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(
+            contents.len(),
+            1,
+            "an empty model round must not break the user merge"
+        );
+        assert_eq!(contents[0]["role"], json!("user"));
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], json!("first question"));
+        assert_eq!(parts[1]["text"], json!("retry"));
+
+        // Normal round: a real reply keeps user / model turns separate and alternating.
+        let ok = vec![
+            Message::user("first question"),
+            Message::assistant("answer", vec![]),
+            Message::user("follow up"),
+        ];
+        let body = build_request_body(
+            &c,
+            &ok,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], json!("user"));
+        assert_eq!(contents[1]["role"], json!("model"));
+        assert_eq!(contents[1]["parts"][0]["text"], json!("answer"));
+        assert_eq!(contents[2]["role"], json!("user"));
     }
 
     #[test]

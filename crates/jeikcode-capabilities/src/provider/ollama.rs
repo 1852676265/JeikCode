@@ -359,9 +359,6 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
             Role::System => super::push_system_coalesced(&mut out, &m.text),
             Role::User => {
                 let text = crate::reminder::unwrap_strong_reminders(&m.text);
-                let mut obj = Map::new();
-                obj.insert("role".into(), json!("user"));
-                obj.insert("content".into(), json!(text));
                 // Ollama images are BARE base64 strings (no data: URL prefix).
                 let imgs: Vec<Value> = m
                     .images
@@ -369,12 +366,15 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
                     .filter(|i| !i.data.is_empty())
                     .map(|i| json!(i.data))
                     .collect();
-                if !imgs.is_empty() {
-                    obj.insert("images".into(), json!(imgs));
-                }
-                out.push(Value::Object(obj));
+                push_user_coalesced(&mut out, &text, imgs);
             }
             Role::Assistant => {
+                // A lost model round must not become an empty assistant turn: many chat
+                // templates reject it, and dropping it keeps the surrounding user turns
+                // adjacent so `push_user_coalesced` folds them into ONE user block.
+                if m.text.is_empty() && m.tool_calls.is_empty() {
+                    continue;
+                }
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("assistant"));
                 obj.insert("content".into(), json!(m.text));
@@ -403,6 +403,42 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
         }
     }
     out
+}
+
+/// Coalesce consecutive `role:"user"` entries into ONE. Ollama has no content-block
+/// array on the wire, so discrete parts join with a blank line and images concatenate in
+/// order. This keeps the frozen prefix (skills / MCP / memory / project instructions) and
+/// the real prompt inside a single user turn, mirroring the Anthropic / Gemini /
+/// Responses block shapes instead of emitting one adjacent user per part.
+fn push_user_coalesced(out: &mut Vec<Value>, text: &str, images: Vec<Value>) {
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some("user") {
+            let prev = last.get("content").and_then(Value::as_str).unwrap_or("");
+            let joined = if prev.is_empty() || text.is_empty() {
+                format!("{prev}{text}")
+            } else {
+                format!("{prev}\n\n{text}")
+            };
+            last["content"] = json!(joined);
+            if !images.is_empty() {
+                let mut all = last
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                all.extend(images);
+                last["images"] = Value::Array(all);
+            }
+            return;
+        }
+    }
+    let mut obj = Map::new();
+    obj.insert("role".into(), json!("user"));
+    obj.insert("content".into(), json!(text));
+    if !images.is_empty() {
+        obj.insert("images".into(), Value::Array(images));
+    }
+    out.push(Value::Object(obj));
 }
 
 /// Build the `/api/chat` request body. Deterministic (BTreeMap-backed `Map`).
@@ -675,6 +711,42 @@ mod tests {
             json!({"role":"system","content":"persona\n\nMEMORY\n- fact"})
         );
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
+    }
+
+    #[test]
+    fn coalesces_consecutive_user_messages_into_one_turn() {
+        // frozen prefix (skills / project instructions) + the real prompt must land in ONE
+        // user turn — Ollama has no block array, so parts join with a blank line.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::synthetic_user("<available_skills>s</available_skills>"),
+            Message::synthetic_user(
+                "=== AUTHORITATIVE PROJECT INSTRUCTIONS & KNOWLEDGE (*.md) ===\nagents",
+            ),
+            Message::user("hello"),
+        ];
+        let out = format_messages(&msgs);
+        assert_eq!(
+            out.iter().filter(|v| v["role"] == "user").count(),
+            1,
+            "{out:?}"
+        );
+        assert_eq!(
+            out[1],
+            json!({"role":"user","content":"<available_skills>s</available_skills>\n\n=== AUTHORITATIVE PROJECT INSTRUCTIONS & KNOWLEDGE (*.md) ===\nagents\n\nhello"})
+        );
+    }
+
+    #[test]
+    fn lost_model_round_is_dropped_and_users_coalesce() {
+        let msgs = vec![
+            Message::user("first"),
+            Message::assistant("", vec![]),
+            Message::user("retry"),
+        ];
+        let out = format_messages(&msgs);
+        assert_eq!(out.len(), 1, "an empty assistant turn must be dropped");
+        assert_eq!(out[0], json!({"role":"user","content":"first\n\nretry"}));
     }
 
     #[test]

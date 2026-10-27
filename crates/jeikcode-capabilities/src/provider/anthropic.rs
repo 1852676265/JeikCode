@@ -691,7 +691,14 @@ fn format_messages(
                 continue;
             }
             Role::Assistant => {
-                out.push(format_assistant_message(m, echo_thinking, is_official));
+                // An empty model round (failed / interrupted stream that persisted nothing
+                // replayable) is dropped instead of becoming `content:""` — Anthropic rejects
+                // empty content, and dropping it keeps the surrounding user turns adjacent so
+                // `merge_consecutive_user` reconstructs one user block (the lost reply never
+                // happened).
+                if let Some(msg) = format_assistant_message(m, echo_thinking, is_official) {
+                    out.push(msg);
+                }
                 i += 1;
                 continue;
             }
@@ -814,7 +821,8 @@ fn format_user_message(m: &Message) -> Value {
 /// An `assistant` message. Plain text (no tool calls, no echoed thinking) → `content`
 /// STRING. Otherwise an ARRAY in Anthropic's required order: signed thinking blocks
 /// (only when `echo_thinking`), then the text block, then `tool_use` blocks.
-fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool) -> Value {
+/// `None` when the message carries nothing for the wire (a lost reply).
+fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool) -> Option<Value> {
     let mut parts: Vec<Value> = Vec::new();
     let mut has_thinking_blocks = false;
 
@@ -877,7 +885,10 @@ fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool)
 
     if m.tool_calls.is_empty() && !has_thinking_blocks {
         // Pure-text assistant turn without thinking — keep it a STRING.
-        return json!({ "role": "assistant", "content": m.text });
+        if m.text.is_empty() {
+            return None;
+        }
+        return Some(json!({ "role": "assistant", "content": m.text }));
     }
 
     if !m.text.is_empty() {
@@ -892,7 +903,10 @@ fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool)
             .unwrap_or_else(|| json!({}));
         parts.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.name, "input": input }));
     }
-    json!({ "role": "assistant", "content": parts })
+    if parts.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": "assistant", "content": parts }))
 }
 
 fn effort_str(e: &ReasoningEffort) -> &str {
@@ -2666,6 +2680,27 @@ mod tests {
             head.contains("user-agent: jeikcode/9.9.9"),
             "product UA must be sent: {head}"
         );
+    }
+
+    #[test]
+    fn lost_model_round_is_dropped_and_users_merge() {
+        let msgs = vec![
+            Message::user("first"),
+            Message::assistant("", vec![]),
+            Message::user("retry"),
+        ];
+        let (sys, out) = format_messages(&msgs, false);
+        assert!(sys.is_empty());
+        assert_eq!(out.len(), 1, "an empty assistant turn must be dropped");
+        assert_eq!(out[0]["role"], "user");
+        let content = out[0]["content"].as_array().expect("must be blocks");
+        assert_eq!(
+            content.len(),
+            2,
+            "both user messages stay as discrete blocks"
+        );
+        assert_eq!(content[0]["text"], "first");
+        assert_eq!(content[1]["text"], "retry");
     }
 
     #[test]

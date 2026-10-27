@@ -10,7 +10,7 @@
 //!   - `include: ["reasoning.encrypted_content"]` + replay of signed reasoning items
 //!     with stable `id`s;
 //!   - `prompt_cache_key` + `x-session-id` for gateway affinity;
-//!   - consecutive user items are NOT merged;
+//!   - consecutive user items merge into one user entry with discrete content parts (input_text/input_image);
 //!   - `store: false` (full input is resent; cache is prefix-based, not stored-response).
 
 use super::openai_compat::{build_http_client, resolve_wire_effort, SwappableClient};
@@ -435,7 +435,8 @@ fn build_request_body(
     Value::Object(body)
 }
 
-/// Map kernel history onto Responses `input[]`. Consecutive users stay consecutive.
+/// Map kernel history onto Responses `input[]`. Consecutive user items merge into ONE
+/// user message with discrete content parts, aligning with Claude & Gemini.
 fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: bool) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
@@ -571,7 +572,42 @@ fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: boo
             }
         }
     }
+    merge_consecutive_user(out)
+}
+
+/// Merge consecutive `role:"user"` wire entries into ONE with concatenated discrete parts.
+/// Preserves discrete input_text / input_image block boundaries so that frozen synthetic user
+/// prefixes (project instructions, memory, skills) and user prompts stay as distinct parts
+/// within a single initial user turn.
+fn merge_consecutive_user(input: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(input.len());
+    for item in input {
+        let is_user = item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user");
+        let prev_user = out.last().is_some_and(|p| {
+            p.get("type").and_then(Value::as_str) == Some("message")
+                && p.get("role").and_then(Value::as_str) == Some("user")
+        });
+        if is_user && prev_user {
+            let last = out.last_mut().unwrap();
+            let mut last_parts =
+                content_to_parts(last.get("content").cloned().unwrap_or(Value::Null));
+            let item_parts = content_to_parts(item.get("content").cloned().unwrap_or(Value::Null));
+            last_parts.extend(item_parts);
+            last["content"] = Value::Array(last_parts);
+        } else {
+            out.push(item);
+        }
+    }
     out
+}
+
+fn content_to_parts(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(arr) => arr,
+        Value::String(s) if !s.is_empty() => vec![json!({ "type": "input_text", "text": s })],
+        _ => vec![],
+    }
 }
 
 #[derive(Default)]
@@ -938,7 +974,7 @@ mod tests {
     use jeikcode_kernel::provider::ReasoningEffort;
 
     #[test]
-    fn format_input_keeps_consecutive_users_and_native_tool_items() {
+    fn format_input_merges_consecutive_users_as_discrete_parts_and_preserves_native_tool_items() {
         let msgs = vec![
             Message::system("sys"),
             Message::synthetic_user("<system-reminder>\ndate\n</system-reminder>"),
@@ -957,13 +993,27 @@ mod tests {
         assert_eq!(out[0]["type"], "message");
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[2]["role"], "user");
-        assert_eq!(out[2]["content"], "query");
-        assert_eq!(out[3]["type"], "message");
-        assert_eq!(out[4]["type"], "function_call");
+        let content_parts = out[1]["content"]
+            .as_array()
+            .expect("must be array of parts");
+        assert_eq!(
+            content_parts.len(),
+            2,
+            "consecutive users merge into 2 parts"
+        );
+        assert_eq!(content_parts[0]["type"], "input_text");
+        assert_eq!(
+            content_parts[0]["text"],
+            "<system-reminder>\ndate\n</system-reminder>"
+        );
+        assert_eq!(content_parts[1]["type"], "input_text");
+        assert_eq!(content_parts[1]["text"], "query");
+        assert_eq!(out[2]["type"], "message");
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[3]["type"], "function_call");
+        assert_eq!(out[3]["call_id"], "c1");
+        assert_eq!(out[4]["type"], "function_call_output");
         assert_eq!(out[4]["call_id"], "c1");
-        assert_eq!(out[5]["type"], "function_call_output");
-        assert_eq!(out[5]["call_id"], "c1");
     }
 
     #[test]
