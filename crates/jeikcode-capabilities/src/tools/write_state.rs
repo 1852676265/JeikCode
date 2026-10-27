@@ -220,18 +220,18 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
         Ok(b) => b,
         Err(e) => {
             return format!(
-                "❌ **[写入拦截：目标文件未读取确认]**\n\
-                 欲写入的文件已存在（`{display_path}`），但处于【未读取状态】。\n\
-                 请读取确认欲写入文件内容后再写入！（无法读取磁盘内容: {e}）"
+                "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+                 The target file `{display_path}` already exists and has not been read in this conversation.\n\
+                 Please read and confirm the file contents before overwriting it. (Failed to read disk contents: {e})"
             );
         }
     };
 
     if super::looks_binary(&bytes) {
         return format!(
-            "❌ **[写入拦截：目标文件未读取确认]**\n\
-             欲写入的文件已存在（`{display_path}`，二进制文件 {} 字节），且处于【未读取状态】。\n\
-             请读取确认欲写入文件内容后再写入！",
+            "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+             The target file `{display_path}` already exists (binary file, {} bytes) and has not been read in this conversation.\n\
+             Please read and confirm the file contents before overwriting it.",
             bytes.len()
         );
     }
@@ -242,9 +242,9 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
             Some(s) => std::borrow::Cow::Owned(s),
             None => {
                 return format!(
-                    "❌ **[写入拦截：目标文件未读取确认]**\n\
-                     欲写入的文件已存在（`{display_path}`，无法解析为文本），且处于【未读取状态】。\n\
-                     请读取确认欲写入文件内容后再写入！"
+                    "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+                     The target file `{display_path}` already exists (cannot be parsed as text) and has not been read in this conversation.\n\
+                     Please read and confirm the file contents before overwriting it."
                 );
             }
         },
@@ -276,23 +276,23 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
         let remaining = total - DEFAULT_READ_LIMIT;
         format!(
             "[Showing lines 1-{display_count} of {total}. {remaining} lines remaining.]\n\
-             ⚠️ **提示**：目标文件共有 {total} 行，当前已截断显示前 {display_count} 行，尚有 {remaining} 行未读取。\
-             请全部读取完（使用 `read` 配合 offset={}, limit=1500）确认后再写入！",
+             ⚠️ **Note**: The target file contains {total} lines in total; currently showing the first {display_count} lines ({remaining} lines remaining).\
+             Please read the complete file (using `read` with offset={}, limit=1500) before writing.",
             DEFAULT_READ_LIMIT + 1
         )
     } else {
         record_read_confirmed(path);
         format!(
-            "[Showing lines 1-{total} of {total} (全量内容)]\n\
-             提示：以上为目标文件的全量内容（共 {total} 行）。当前已将该文件状态更新为【已读】，请确认欲写入文件内容后直接再次调用 `write` 写入。"
+            "[Showing lines 1-{total} of {total} (complete content)]\n\
+             Note: The above displays the complete content of the target file ({total} lines total). The file state has now been marked as read. Please confirm your intended changes and call `write` again to proceed."
         )
     };
 
     format!(
-        "❌ **[写入拦截：目标文件未读取确认]**\n\
-         欲写入的文件已存在（`{display_path}`），且当前处于【未读取状态】。\n\
-         根据安全规范：在覆盖写入已存在的文件之前，必须先使用 `read` 读取确认该文件的当前内容！请读取确认欲写入文件内容后再写入。\n\n\
-         已直接为你返回目标文件最新前 {display_count} 行内容：\n\
+        "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+         The target file `{display_path}` already exists and has not been read in this conversation.\n\
+         Safety rule: Before overwriting an existing file, you must first inspect its current content using `read`! Please verify the existing content before writing.\n\n\
+         The first {display_count} lines of the current file content have been returned below for your inspection:\n\
          ```\n\
          {rendered_lines}```\n\
          {footer}"

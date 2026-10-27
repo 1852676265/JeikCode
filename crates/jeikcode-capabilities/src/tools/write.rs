@@ -80,11 +80,9 @@ impl Tool for WriteFileTool {
             return err(refusal_msg);
         }
 
-        // Capture pre-existing line count for an overwrite diff message.
-        let old_lines = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .map(|s| s.lines().count());
+        // Capture pre-existing content and line count for an overwrite diff message.
+        let old_content = tokio::fs::read_to_string(&path).await.ok();
+        let old_lines = old_content.as_ref().map(|s| s.lines().count());
 
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -107,10 +105,10 @@ impl Tool for WriteFileTool {
 
         let msg = match old_lines {
             Some(old) => {
-                let diff = new_lines as i64 - old as i64;
-                let sign = if diff >= 0 { "+" } else { "" };
+                let diff_count = new_lines as i64 - old as i64;
+                let sign = if diff_count >= 0 { "+" } else { "" };
                 let mut m = format!(
-                    "Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff})"
+                    "Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff_count})"
                 );
                 // Warn on a large shrink — the model may have dropped content.
                 if old > 20 && new_lines < old / 2 {
@@ -118,6 +116,13 @@ impl Tool for WriteFileTool {
                         "\n⚠ WARNING: file shrank by {}%. Verify no important content was lost.",
                         100 - (new_lines * 100 / old)
                     ));
+                }
+                if let Some(old_text) = old_content.as_deref() {
+                    let diff = super::edit::build_compact_diff(old_text, &a.content, Some(&path));
+                    if !diff.is_empty() {
+                        m.push('\n');
+                        m.push_str(&diff);
+                    }
                 }
                 m
             }
@@ -176,6 +181,25 @@ mod tests {
             "{}",
             r.content
         );
+        assert!(
+            r.content.contains("--- a/"),
+            "output should retain unified diff for presentation: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("+++ b/"),
+            "output should retain unified diff for presentation: {}",
+            r.content
+        );
+        let model_view = crate::provider::strip_tool_result_diff_for_model(&r.content);
+        assert!(
+            !model_view.contains("--- a/"),
+            "model view must strip diff: {model_view}"
+        );
+        assert!(
+            model_view.contains("was 3 lines, now 5 lines, +2"),
+            "model view must retain concise summary: {model_view}"
+        );
     }
 
     #[tokio::test]
@@ -224,18 +248,20 @@ mod tests {
             "writing to unread existing file must be intercepted"
         );
         assert!(
-            r.content.contains("写入拦截：目标文件未读取确认"),
+            r.content
+                .contains("Write Intercepted: File Unread Confirmation Required"),
             "{}",
             r.content
         );
         assert!(
-            r.content.contains("请读取确认欲写入文件内容后再写入"),
+            r.content
+                .contains("Please verify the existing content before writing"),
             "{}",
             r.content
         );
         assert!(r.content.contains("1→line 1"), "{}", r.content);
         assert!(r.content.contains("line 2"), "{}", r.content);
-        assert!(r.content.contains("全量内容"), "{}", r.content);
+        assert!(r.content.contains("complete content"), "{}", r.content);
 
         // Verify disk content was untouched
         let disk = std::fs::read_to_string(&target).unwrap();
@@ -284,7 +310,7 @@ mod tests {
             r.content
         );
         assert!(
-            r.content.contains("尚有 100 行未读取。请全部读取完（使用 `read` 配合 offset=1501, limit=1500）确认后再写入！"),
+            r.content.contains("Please read the complete file (using `read` with offset=1501, limit=1500) before writing."),
             "{}",
             r.content
         );
@@ -404,7 +430,7 @@ mod tests {
             "Turn 2 write without read must be intercepted: {}",
             r2.content
         );
-        assert!(r2.content.contains("写入拦截：目标文件未读取确认"));
+        assert!(r2.content.contains("Write Intercepted: File Unread Confirmation Required"));
 
         // Turn 2: Read then write -> succeeds!
         crate::tools::write_state::record_read(&target);
@@ -443,7 +469,7 @@ mod tests {
             )
             .await;
         assert!(r.is_error, "write after edit must be intercepted");
-        assert!(r.content.contains("写入拦截：目标文件未读取确认"));
+        assert!(r.content.contains("Write Intercepted: File Unread Confirmation Required"));
 
         // Read again, then write -> succeeds
         crate::tools::write_state::record_read(&target);

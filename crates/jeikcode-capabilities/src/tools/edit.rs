@@ -1342,7 +1342,7 @@ async fn write_encoded(
 /// and NEW whole-file contents, capped so a large edit can't flood the model
 /// context / transcript. The TUI re-parses this into a line-numbered, color-
 /// coded diff block; the model reads it as a normal unified diff.
-fn build_compact_diff(old_file: &str, new_file: &str, path: Option<&std::path::Path>) -> String {
+pub(crate) fn build_compact_diff(old_file: &str, new_file: &str, path: Option<&std::path::Path>) -> String {
     const MAX_DIFF_LINES: usize = 60;
     let mut config = similar::TextDiff::configure();
     config.timeout(std::time::Duration::from_millis(200));
