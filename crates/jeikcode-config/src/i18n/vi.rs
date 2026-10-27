@@ -1277,6 +1277,10 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         | Msg::AgentStatusResponseTimeout
         | Msg::AgentStatusConnectionFailed
         | Msg::AgentStatusInsufficientBalance
-        | Msg::AgentStatusUnauthorized => super::en::en(msg),
+        | Msg::AgentStatusUnauthorized
+        | Msg::StreamReadRetryExhausted { .. }
+        | Msg::StreamReadPartialResponse
+        | Msg::StreamReadResetHint
+        | Msg::StreamReadDetailsPrefix => super::en::en(msg),
     }
 }

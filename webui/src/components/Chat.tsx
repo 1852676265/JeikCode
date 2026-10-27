@@ -275,8 +275,10 @@ import {
   sanitizeCanvasMessages,
   stampUserClientInputId,
   stampUserSourceIndex,
+  steerInsertAfterAnchor,
   visibleToolChunk,
   withAssistantIdentity,
+  type TurnUserAnchor,
 } from '../lib/sessionProjection';
 import {
   clearStreamCursor,
@@ -1524,6 +1526,13 @@ export function Chat({
   const pendingSteersRef = useRef(pendingSteers);
   pendingSteersRef.current = pendingSteers;
   const pendingSteersBySessionRef = useRef(new Map<string, PendingLiveSteer[]>());
+  // 已被内核 fold（`steered` 回执）的转向指纹，保留到本回合终态。
+  // 终态判断排队卡是否已经并入本轮时必须先看这份账本：画布可能因刷新/缓存落后丢了气泡，
+  // 但内核确实已经消费过这条转向；只看画布会把它当成未发送再 drain 一遍，
+  // 模型会对同一条指令回答两次（表现为结算后最新回答重复一份）。
+  const foldedSteersBySessionRef = useRef(
+    new Map<string, Array<{ text: string; images?: ImageData[]; clientInputId?: string }>>(),
+  );
   function setPendingSteers(
     update: PendingLiveSteer[] | ((current: PendingLiveSteer[]) => PendingLiveSteer[]),
   ) {
@@ -4214,7 +4223,13 @@ export function Chat({
               // canvas stuck on the old 48-row window after a refresh.
               if (serverActive === false) {
                 const spliced = spliceAuthoritativeDiskTail(currentCached!, loaded, diskOffset);
-                displayMessages = sanitizeCanvasMessages(spliced);
+                // 磁盘尾部是结算后的权威，但「磁盘还没落盘的最后一问」只存在于画布缓存里：
+                // 刚发出的提问、刚被内核 fold 的中途转向（它要等回合终态才写进 display 日志）、
+                // 以及新一轮 loop 已流出的正文。短会话的尾部切片 offset=0 时 splice 会整张
+                // 采用磁盘，直接拿它上屏就会把用户气泡抹掉、新一轮正文贴到上一条回答下面。
+                // 与回合终态对账（`syncSessionCacheFromDisk`）用同一套补尾规则。
+                const rescued = mergeDiskWithUnpersistedTail(spliced, currentCached!);
+                displayMessages = sanitizeCanvasMessages(rescued);
                 messagesRef.current = displayMessages;
                 messageCacheRef.current.set(loadId, displayMessages);
                 setMessages(displayMessages);
@@ -5651,6 +5666,7 @@ export function Chat({
     clientInputIds?: Array<string | null>,
     targetSessionId?: string,
     timestamps?: Array<number | null | undefined>,
+    opts?: { replay?: boolean; anchor?: TurnUserAnchor },
   ) {
     const steeredInputs = (inputs ?? []).map((input) => ({
       text: stripSteerEnvelopeForDisplay(input.text || ''),
@@ -5696,6 +5712,12 @@ export function Chat({
     const foldIntoMessageList = (prev: Message[]): Message[] => {
       let next = prev.slice();
       const now = Date.now();
+      // 回放补回的转向插回「被打断的那一轮」之后：anchor 是回放里它前面最后一帧
+      // 落到的助手行。绝不能追加到时间线末尾——那一轮的后续正文早已在画布上，
+      // 追问会倒插到回答下面。定位不到时退回“新回合追加到尾部”。
+      let insertion = opts?.replay === true
+        ? steerInsertAfterAnchor(next, opts?.anchor)
+        : -1;
       for (let i = 0; i < steeredInputs.length; i++) {
         const s = steeredInputs[i];
         let cleanText = s.text.trim();
@@ -5766,7 +5788,7 @@ export function Chat({
           rememberTurnOutline(cleanText || '[图片]', turnIndex, turnOrdinal);
         }
 
-        next.push({
+        const userRow: Message = {
           role: 'user',
           parts: [{ kind: 'text', text: cleanText }],
           images: resolvedImages,
@@ -5776,14 +5798,17 @@ export function Chat({
           turnNavOrdinal: turnOrdinal,
           // 内核身份优先；旧 daemon 无此字段时退回本地 client id。
           id: s.messageId ?? clientInputIds?.[i] ?? undefined,
-        });
-        next.push({
-          role: 'assistant',
-          parts: [],
-          // 不盖 sourceIndex：这条流式占位行尚未落盘，绝对下标只有落盘/身份帧才有
-          // 权威值。猜一个下标会让终态对账把它当成「已结算的更早历史」保留下来，
-          // 与权威尾部里同一轮次叠成两份（整轮回答被重放）。
-        });
+        };
+        // 不盖 sourceIndex：这条流式占位行尚未落盘，绝对下标只有落盘/身份帧才有
+        // 权威值。猜一个下标会让终态对账把它当成「已结算的更早历史」保留下来，
+        // 与权威尾部里同一轮次叠成两份（整轮回答被重放）。
+        const placeholder: Message = { role: 'assistant', parts: [] };
+        if (insertion >= 0) {
+          next.splice(insertion, 0, userRow, placeholder);
+          insertion += 2;
+        } else {
+          next.push(userRow, placeholder);
+        }
       }
       return next;
     };
@@ -5831,6 +5856,18 @@ export function Chat({
 
     // 4. 消费 pendingSteers
     if (sid) {
+      // 账本：内核已回执 fold 的转向（即使画布上暂时看不到它，也绝不能再投递一次）。
+      const ledger = foldedSteersBySessionRef.current.get(sid) ?? [];
+      for (let i = 0; i < steeredInputs.length; i++) {
+        ledger.push({
+          text: steeredInputs[i].text,
+          images: steeredInputs[i].images.length > 0
+            ? steeredInputs[i].images
+            : matchedQueuedItems[i]?.images,
+          clientInputId: clientInputIds?.[i] ?? undefined,
+        });
+      }
+      foldedSteersBySessionRef.current.set(sid, ledger);
       const curSteers = pendingSteersBySessionRef.current.get(sid) ?? [];
       const nextSteers = acknowledgeLiveSteers(curSteers, steeredInputs, clientInputIds);
       if (nextSteers.length > 0) {
@@ -7114,7 +7151,7 @@ export function Chat({
   /** @param opts.observerOnly Reserved for pure third-party observers that must
    *  not own interactive modals. /chat/watch reattach after refresh MUST call
    *  without this flag so Build-mode permission_request is restored. */
-  function handleEvent(event: SSEEvent, opts?: { observerOnly?: boolean; requireReplayDedup?: boolean; repeatUserAfterSettled?: boolean }) {
+  function handleEvent(event: SSEEvent, opts?: { observerOnly?: boolean; requireReplayDedup?: boolean; repeatUserAfterSettled?: boolean; steerAnchor?: TurnUserAnchor }) {
     const observerOnly = opts?.observerOnly === true;
     const requireReplayDedup = opts?.requireReplayDedup === true;
     switch (event.type) {
@@ -7232,7 +7269,17 @@ export function Chat({
       }
 
       case 'steered': {
-        foldSteeredInputs(event.inputs ?? [], event.client_input_ids, undefined, (event as any).timestamps);
+        foldSteeredInputs(
+          event.inputs ?? [],
+          event.client_input_ids,
+          undefined,
+          (event as any).timestamps,
+          {
+            // 带 seq 的是回放帧：它可能是在刷新后补回来的（画布上的气泡已经丢了）。
+            replay: typeof (event as { seq?: number }).seq === 'number',
+            anchor: opts?.steerAnchor,
+          },
+        );
         break;
       }
 
@@ -7682,9 +7729,32 @@ export function Chat({
 
           // 未被回合内并入的转向消息，还原为普通排队消息，回合结束后由 drain 自动发送；
           // 但已并入正文（文本/图片命中画布）的卡片必须直接销毁，绝不复活成 queue。
+          // 画布不是唯一依据：刷新/缓存落后会把已并入的气泡弄丢，此时要以内核回执账本为准，
+          // 否则同一条转向会被当成未发送再跑一轮（重复回答）。
+          const foldedLedger = event.session_id
+            ? (foldedSteersBySessionRef.current.get(event.session_id) ?? [])
+            : [];
+          const matchesFoldedSteer = (item: QueuedMessage): boolean => {
+            const clean = visibleUserText(item.text).trim();
+            return foldedLedger.some((folded) => {
+              if (item.clientInputId && folded.clientInputId && item.clientInputId === folded.clientInputId) {
+                return true;
+              }
+              const foldedText = visibleUserText(folded.text).trim();
+              if (clean && foldedText && userTextsMatch(clean, foldedText)) return true;
+              return !!(
+                item.images &&
+                item.images.length > 0 &&
+                folded.images &&
+                folded.images.length > 0 &&
+                sameImageSet(item.images, folded.images)
+              );
+            });
+          };
           setQueued((q) => q
             .filter((item) => {
               if (item.kind !== 'steer' && item.kind !== 'steering') return true;
+              if (matchesFoldedSteer(item)) return false;
               const merged = messagesRef.current.some((m) => {
                 if (m.role !== 'user') return false;
                 if (item.images && item.images.length > 0 && sameImageSet(m.images, item.images)) return true;
@@ -7698,6 +7768,7 @@ export function Chat({
                 ? { ...item, kind: 'queue' as const }
                 : item
             )));
+          if (event.session_id) foldedSteersBySessionRef.current.delete(event.session_id);
         }
 
         closeOpenArtifactFence();
@@ -7763,6 +7834,9 @@ export function Chat({
           setBusyAndClock(false);
           restoreQueuedToComposer(); // 用户主动停止：排队内容回到输入框，而不是丢掉
         }
+        // 取消 = 内核回滚到 turn 开始（本轮 fold 的转向随内存历史一起丢弃），
+        // 账本必须同步作废，否则恢复成 queue 的卡片会被当成“已并入”而永久不再发送。
+        if (stoppedSid) foldedSteersBySessionRef.current.delete(stoppedSid);
         closeOpenArtifactFence();
         finalizePendingToolsOnCanvas();
         commitActiveTodosIntoLastAssistant();
@@ -7802,6 +7876,7 @@ export function Chat({
           turnStartedAtBySessionRef.current.delete(activeIdRef.current);
         }
         setBusyAndClock(false);
+        if (activeIdRef.current) foldedSteersBySessionRef.current.delete(activeIdRef.current);
         // Recover the previous tail after the failed turn settles. The timer
         // re-checks busy/local-turn, so it cannot clobber a surviving new turn.
         {

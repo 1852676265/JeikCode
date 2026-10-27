@@ -1842,4 +1842,14 @@ pub enum Msg<'a> {
     AgentStatusInsufficientBalance,
     /// API key unauthorized reason.
     AgentStatusUnauthorized,
+    /// Stream read interrupted and reconnect exhausted.
+    StreamReadRetryExhausted {
+        attempts: u32,
+    },
+    /// Stream read interrupted mid-response, preserving partial output to avoid replay.
+    StreamReadPartialResponse,
+    /// OS error 10054 (connection reset) proxy hint.
+    StreamReadResetHint,
+    /// Details prefix.
+    StreamReadDetailsPrefix,
 }

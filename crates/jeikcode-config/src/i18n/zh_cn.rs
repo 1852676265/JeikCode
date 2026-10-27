@@ -1354,5 +1354,12 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::AgentStatusConnectionFailed => "网络连接失败".into(),
         Msg::AgentStatusInsufficientBalance => "账户余额不足".into(),
         Msg::AgentStatusUnauthorized => "API key 未授权或已失效".into(),
+        Msg::StreamReadRetryExhausted { attempts } =>
+            format!("网络连接中断:远端关闭或重置了连接,自动重连 {attempts} 次后仍失败,可重试。").into(),
+        Msg::StreamReadPartialResponse =>
+            "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复,可继续。".into(),
+        Msg::StreamReadResetHint =>
+            "此错误常见于公司网络或代理环境,请检查代理/VPN/防火墙设置后重试。".into(),
+        Msg::StreamReadDetailsPrefix => "详情: ".into(),
     }
 }

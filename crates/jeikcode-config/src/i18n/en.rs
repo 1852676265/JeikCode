@@ -1379,5 +1379,12 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::AgentStatusConnectionFailed => "Network connection failed".into(),
         Msg::AgentStatusInsufficientBalance => "Insufficient account balance".into(),
         Msg::AgentStatusUnauthorized => "API key is unauthorized or has expired".into(),
+        Msg::StreamReadRetryExhausted { attempts } =>
+            format!("Network connection interrupted: remote host closed or reset connection, reconnect failed after {attempts} attempts. You can retry.").into(),
+        Msg::StreamReadPartialResponse =>
+            "Response interrupted: not auto-replayed to prevent duplicated output or tool execution; safe partial response preserved, you can continue.".into(),
+        Msg::StreamReadResetHint =>
+            "This error is common in corporate network or proxy environments; please check proxy/VPN/firewall settings.".into(),
+        Msg::StreamReadDetailsPrefix => "Details: ".into(),
     }
 }

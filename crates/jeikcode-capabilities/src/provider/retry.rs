@@ -293,18 +293,15 @@ pub(crate) fn stream_read_error_message(
         // wrapped in the "网络连接中断" framing that fits RetryExhausted.
         let lead = match recovery {
             StreamReadRecovery::RetryExhausted { attempts } => {
-                format!("网络连接中断:远端关闭或重置了连接,自动重连 {attempts} 次后仍失败,可重试。")
+                jeikcode_config::i18n::format_stream_read_retry_exhausted(attempts)
             }
             StreamReadRecovery::PartialResponse => {
-                "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复,可继续。"
-                    .to_string()
+                jeikcode_config::i18n::format_stream_read_partial_response()
             }
         };
-        format!(
-            "{lead}{}详情: {}",
-            connection_reset_hint(err),
-            err_chain(err)
-        )
+        let hint = connection_reset_hint(err);
+        let details_prefix = jeikcode_config::i18n::format_stream_read_details_prefix();
+        format!("{lead}{hint}{details_prefix}{}", err_chain(err))
     } else {
         format!("stream read error: {}", err_chain(err))
     }
@@ -315,15 +312,15 @@ pub(crate) fn stream_read_error_message(
 /// server fault, so point the user at the actionable cause. Empty for other
 /// transport drops (macOS `os error 54` / Linux `104`), where a proxy hint would
 /// misdirect. Matches on the numeric code so it is locale-independent.
-fn connection_reset_hint(err: &(dyn std::error::Error + 'static)) -> &'static str {
+fn connection_reset_hint(err: &(dyn std::error::Error + 'static)) -> String {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cur {
         if e.to_string().contains("os error 10054") {
-            return "此错误常见于公司网络或代理环境,请检查代理/VPN/防火墙设置后重试。";
+            return jeikcode_config::i18n::format_stream_read_reset_hint();
         }
         cur = e.source();
     }
-    ""
+    String::new()
 }
 
 /// Parse `Retry-After` (RFC 7231 §7.1.3) into a wait duration. Handles BOTH forms:
@@ -643,6 +640,7 @@ mod tests {
             chain_has_transient_io(&e),
             "ETIMEDOUT buried in the chain is a transport drop"
         );
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::ZhCn);
         let msg = stream_read_error_message(&e, StreamReadRecovery::RetryExhausted { attempts: 2 });
         assert!(
             msg.contains("网络连接中断"),
@@ -786,6 +784,7 @@ mod tests {
             ErrorKind::ConnectionReset,
             "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
         ));
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::ZhCn);
         let msg = stream_read_error_message(&e, StreamReadRecovery::RetryExhausted { attempts: 2 });
         assert!(
             msg.contains("网络连接中断"),
@@ -810,11 +809,32 @@ mod tests {
         assert!(!partial.contains("网络连接中断"));
         // The 10054 hint is cause-scoped, so it rides both recovery modes.
         assert!(partial.contains("公司网络或代理环境"));
+
+        // Validate English locale outputs
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::En);
+        let partial_en = stream_read_error_message(&e, StreamReadRecovery::PartialResponse);
+        assert!(
+            partial_en.contains("Response interrupted"),
+            "english partial response lead: {partial_en}"
+        );
+        assert!(
+            partial_en.contains("not auto-replayed"),
+            "english partial response reason: {partial_en}"
+        );
+        assert!(
+            partial_en.contains("Details: "),
+            "english details prefix: {partial_en}"
+        );
+        assert!(
+            partial_en.contains("corporate network or proxy"),
+            "english reset hint: {partial_en}"
+        );
     }
 
     #[test]
     fn non_10054_transport_drop_omits_the_corporate_network_hint() {
         use std::io::{Error, ErrorKind};
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::ZhCn);
         // macOS ECONNRESET (os error 54) is a generic transport drop — the
         // proxy/VPN hint would misdirect, so it must NOT appear.
         let e = Wrap(Error::new(

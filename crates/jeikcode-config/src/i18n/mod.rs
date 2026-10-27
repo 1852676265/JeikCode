@@ -242,6 +242,22 @@ pub fn format_agent_status_unauthorized() -> String {
     t(Msg::AgentStatusUnauthorized).into_owned()
 }
 
+pub fn format_stream_read_retry_exhausted(attempts: u32) -> String {
+    t(Msg::StreamReadRetryExhausted { attempts }).into_owned()
+}
+
+pub fn format_stream_read_partial_response() -> String {
+    t(Msg::StreamReadPartialResponse).into_owned()
+}
+
+pub fn format_stream_read_reset_hint() -> String {
+    t(Msg::StreamReadResetHint).into_owned()
+}
+
+pub fn format_stream_read_details_prefix() -> String {
+    t(Msg::StreamReadDetailsPrefix).into_owned()
+}
+
 fn fmt_compaction_tokens(tokens: usize) -> String {
     if tokens >= 1_000 {
         format!("{:.1}K", tokens as f64 / 1_000.0)
