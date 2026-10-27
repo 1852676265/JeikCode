@@ -131,6 +131,26 @@ test('mergeDiskWithUnpersistedTail keeps an in-flight steer turn', () => {
   assert.equal(merged[3], live);
 });
 
+test('mergeDiskWithUnpersistedTail keeps an in-flight image-only user or steer turn without text', () => {
+  const previous = { role: 'user', parts: [{ kind: 'text', text: '上一问' }] };
+  const previousDone = { role: 'assistant', parts: [{ kind: 'text', text: '上一答' }] };
+  const disk = [previous, previousDone];
+  const imageOnlySteer = {
+    role: 'user',
+    parts: [{ kind: 'text', text: '' }],
+    images: [{ media_type: 'image/png', data: 'base64-image-data' }],
+  };
+  const live = {
+    role: 'assistant',
+    parts: [],
+  };
+  const canvas = [...disk, imageOnlySteer, live];
+  const merged = mergeDiskWithUnpersistedTail(disk, canvas);
+  assert.equal(merged.length, 4);
+  assert.equal(merged[2], imageOnlySteer);
+  assert.equal(merged[3], live);
+});
+
 test('user echo already on canvas is not appended again', () => {
   const user = { role: 'user', parts: [{ kind: 'text', text: '你好啊' }] };
   const assistant = { role: 'assistant', parts: [{ kind: 'text', text: '你好' }] };

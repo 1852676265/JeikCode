@@ -506,10 +506,14 @@ export function placeRecoveredTurnUsers<T extends ProjectionMessage>(
     if (userMessageAlreadyOnCanvas(next, event.content, userTs)) continue;
     const isSteer = isSteerUserMessage({ role: 'user', content: event.content });
     const userText = visibleUserText(event.content);
+    const eventImages = Array.isArray((event as any).images) && (event as any).images.length > 0 ? (event as any).images : undefined;
+    // 关键防呆：若既无可见文本也无图片附件，绝不能生成空用户气泡！
+    if (!userText && !eventImages) continue;
     const row = {
       role: 'user',
       parts: [{ kind: 'text', text: userText }],
       ts: userTs,
+      ...(eventImages ? { images: eventImages } : {}),
       ...(isSteer ? { isSteer: true } : {}),
       ...(typeof event.source_index === 'number' ? { sourceIndex: event.source_index } : {}),
       ...(event.message_id ? { id: event.message_id } : {}),
@@ -1058,6 +1062,12 @@ export function sanitizeCanvasMessages<
       const curText = visibleUserText(
         cur.parts?.filter((p) => p.kind === 'text').map((p) => p.text || '').join('') ?? '',
       );
+      const curImages = (cur as any).images;
+      const hasCurImages = Array.isArray(curImages) && curImages.length > 0;
+      // 防呆：既无可见文本也无图片附件的空用户气泡直接剔除
+      if (!curText && !hasCurImages) {
+        continue;
+      }
       let prevUser: T | null = null;
       let hasMeaningfulAssistant = false;
       for (let j = result.length - 1; j >= 0; j--) {

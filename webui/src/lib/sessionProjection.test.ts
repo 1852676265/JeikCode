@@ -1132,6 +1132,19 @@ test('sanitizeCanvasMessages 保留不同绝对下标下用户真实连发的同
   assert.equal(cleaned.filter((m) => m.role === 'user').length, 2);
 });
 
+test('sanitizeCanvasMessages 自动清除既无文本也无图片的幽灵空用户气泡，保留纯图片用户气泡', () => {
+  const messages = [
+    { role: 'user', parts: [{ kind: 'text' as const, text: '' }] }, // 幽灵空用户气泡
+    { role: 'user', parts: [{ kind: 'text' as const, text: '' }], images: [{ media_type: 'image/png', data: 'data' }] }, // 纯图片用户气泡
+    { role: 'assistant', parts: [{ kind: 'text' as const, text: '收到图片' }] },
+  ];
+  const cleaned = sanitizeCanvasMessages(messages as any);
+  assert.equal(cleaned.length, 2);
+  assert.equal(cleaned[0].role, 'user');
+  assert.ok(Array.isArray((cleaned[0] as any).images));
+  assert.equal(cleaned[1].role, 'assistant');
+});
+
 test('paintUserMessage 在前一个提问完全相同且助手未结回答时拒绝重复追加', () => {
   const base = [
     { role: 'user', parts: [{ kind: 'text' as const, text: '继续任务' }] },
@@ -1331,6 +1344,30 @@ test('placeRecoveredTurnUsers 用绝对下标把被折叠线切掉的提问放�
     { type: 'user', content: '完全没有见过的提问', created_at: 2000 },
   ]);
   assert.equal(appended.length, 4);
+});
+
+test('placeRecoveredTurnUsers 携带并保留图片附件，不生成空文本无图的幽灵气泡', () => {
+  const canvas = [
+    { role: 'user', id: 'm-u1', parts: [{ kind: 'text' as const, text: '第一问' }] },
+    { role: 'assistant', id: 'm-a1', parts: [{ kind: 'text' as const, text: '第一答' }] },
+  ];
+  const withImages = placeRecoveredTurnUsers(canvas as any, [
+    {
+      type: 'user',
+      content: '',
+      images: [{ media_type: 'image/png', data: 'test-img' }],
+      created_at: 3000,
+    },
+  ]);
+  assert.equal(withImages.length, 4);
+  assert.equal(withImages[2].role, 'user');
+  assert.deepEqual((withImages[2] as any).images, [{ media_type: 'image/png', data: 'test-img' }]);
+
+  // 既无文本也无图片的幽灵事件被跳过
+  const withGhost = placeRecoveredTurnUsers(canvas as any, [
+    { type: 'user', content: '', created_at: 4000 },
+  ]);
+  assert.equal(withGhost.length, 2);
 });
 
 test('mergeOlderMessages 把无 sourceIndex 的回放提问按文本+时间戳并入更早历史', () => {

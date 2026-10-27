@@ -1730,13 +1730,17 @@ impl RunningAgent {
                 AgentCommand::CancelSteer { text } => {
                     if let Some(target) = &text {
                         let trimmed = target.trim();
-                        pending.retain(|cmd| match cmd {
-                            AgentCommand::SendMessage { text: cmd_text, .. } => {
-                                let cmd_trimmed = cmd_text.trim();
-                                !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
-                            }
-                            _ => true,
-                        });
+                        if trimmed.is_empty() {
+                            pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
+                        } else {
+                            pending.retain(|cmd| match cmd {
+                                AgentCommand::SendMessage { text: cmd_text, .. } => {
+                                    let cmd_trimmed = cmd_text.trim();
+                                    !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
+                                }
+                                _ => true,
+                            });
+                        }
                     } else {
                         pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
                     }
@@ -2138,13 +2142,17 @@ impl RunningAgent {
                 AgentCommand::CancelSteer { text } => {
                     if let Some(target) = &text {
                         let trimmed = target.trim();
-                        pending.retain(|cmd| match cmd {
-                            AgentCommand::SendMessage { text: cmd_text, .. } => {
-                                let cmd_trimmed = cmd_text.trim();
-                                !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
-                            }
-                            _ => true,
-                        });
+                        if trimmed.is_empty() {
+                            pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
+                        } else {
+                            pending.retain(|cmd| match cmd {
+                                AgentCommand::SendMessage { text: cmd_text, .. } => {
+                                    let cmd_trimmed = cmd_text.trim();
+                                    !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
+                                }
+                                _ => true,
+                            });
+                        }
                     } else {
                         pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
                     }

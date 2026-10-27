@@ -54,7 +54,7 @@ export function shouldAdoptDiskTranscript(input: {
 }
 
 type TailPart = { kind: string; text?: string };
-type TailMessage = { role: string; parts: TailPart[] };
+type TailMessage = { role: string; parts: TailPart[]; images?: unknown[] };
 
 function tailPlain(message: TailMessage | undefined): string {
   if (!message) return '';
@@ -62,6 +62,16 @@ function tailPlain(message: TailMessage | undefined): string {
     .filter((part) => part.kind === 'text')
     .map((part) => part.text || '')
     .join('');
+}
+
+function sameTailImages(
+  a?: unknown[],
+  b?: unknown[],
+): boolean {
+  const left = a ?? [];
+  const right = b ?? [];
+  if (left.length !== right.length) return false;
+  return left.every((img: any, i) => img?.media_type === (right[i] as any)?.media_type && img?.data === (right[i] as any)?.data);
 }
 
 function lastTailUser(messages: TailMessage[]): string {
@@ -81,10 +91,7 @@ export function mergeDiskWithUnpersistedTail<T extends TailMessage>(disk: T[], c
   // old turn's terminal reconcile must not mistake that for a settled turn and
   // replace the canvas (steer bubble + new loop) with the stale disk tail.
   if (!transcriptHasOpenUserTurn(canvas) && !transcriptHasInFlightAssistant(canvas)) return disk;
-  const canvasUser = visibleUserText(lastTailUser(canvas));
-  if (!canvasUser) return disk;
-  const diskUser = visibleUserText(lastTailUser(disk));
-  if (diskUser === canvasUser || userTextsMatch(diskUser, canvasUser)) return disk;
+
   let lastUser = -1;
   for (let i = canvas.length - 1; i >= 0; i--) {
     if (canvas[i]?.role === 'user') {
@@ -93,6 +100,29 @@ export function mergeDiskWithUnpersistedTail<T extends TailMessage>(disk: T[], c
     }
   }
   if (lastUser < 0) return disk;
+
+  const lastUserMsg = canvas[lastUser];
+  const canvasUser = visibleUserText(tailPlain(lastUserMsg));
+  const hasCanvasImages = Array.isArray(lastUserMsg?.images) && lastUserMsg.images.length > 0;
+  if (!canvasUser && !hasCanvasImages) return disk;
+
+  let lastDiskUser = -1;
+  for (let i = disk.length - 1; i >= 0; i--) {
+    if (disk[i]?.role === 'user') {
+      lastDiskUser = i;
+      break;
+    }
+  }
+  if (lastDiskUser >= 0) {
+    const lastDiskUserMsg = disk[lastDiskUser];
+    const diskUser = visibleUserText(tailPlain(lastDiskUserMsg));
+    const hasDiskImages = Array.isArray(lastDiskUserMsg?.images) && lastDiskUserMsg.images.length > 0;
+
+    const textMatches = !!canvasUser && !!diskUser && (diskUser === canvasUser || userTextsMatch(diskUser, canvasUser));
+    const imageMatches = !canvasUser && !diskUser && hasCanvasImages && hasDiskImages && sameTailImages(lastDiskUserMsg.images, lastUserMsg?.images);
+    if (textMatches || imageMatches) return disk;
+  }
+
   return [...disk, ...canvas.slice(lastUser)];
 }
 

@@ -5433,14 +5433,26 @@ export function Chat({
             : undefined;
 
         // 若为纯图片转向，剥离占位文案，直接以纯图片气泡展示
-        if (cleanText === '（用户附加了新的图片）' && resolvedImages && resolvedImages.length > 0) {
+        if (
+          (cleanText === '（用户附加了新的图片）' || cleanText === '(The user attached image(s))') &&
+          resolvedImages &&
+          resolvedImages.length > 0
+        ) {
           cleanText = '';
         }
 
         if (!cleanText && (!resolvedImages || resolvedImages.length === 0)) continue;
 
         const alreadyPresent = next.some(
-          (m) => m.role === 'user' && m.parts?.some((p) => p.kind === 'text' && (p.text.trim() === cleanText || userTextsMatch(p.text, cleanText)))
+          (m) =>
+            m.role === 'user' &&
+            (cleanText
+              ? m.parts?.some(
+                  (p) =>
+                    p.kind === 'text' &&
+                    (p.text.trim() === cleanText || userTextsMatch(p.text, cleanText)),
+                )
+              : sameImageSet(m.images, resolvedImages)),
         );
         if (alreadyPresent) {
           // 乐观气泡已存在（本地发送时已画）：清 pending 标记 + 采纳落盘身份，
@@ -5449,11 +5461,19 @@ export function Chat({
           next = next.map((m) => {
             const isMatch =
               m.role === 'user' &&
-              m.parts?.some(
-                (p) => p.kind === 'text' && (p.text.trim() === cleanText || userTextsMatch(p.text, cleanText)),
-              );
+              (cleanText
+                ? m.parts?.some(
+                    (p) =>
+                      p.kind === 'text' &&
+                      (p.text.trim() === cleanText || userTextsMatch(p.text, cleanText)),
+                  )
+                : sameImageSet(m.images, resolvedImages));
             if (isMatch) {
-              const patched: Message = { ...m, pendingSteerId: undefined };
+              const patched: Message = {
+                ...m,
+                images: m.images && m.images.length > 0 ? m.images : resolvedImages,
+                pendingSteerId: undefined,
+              };
               // 唯一性守卫：同一个落盘 id 绝不贴到第二条消息上。
               if (storedId && !next.some((other) => other.id === storedId)) {
                 patched.id = storedId;
@@ -7974,16 +7994,21 @@ export function Chat({
     // 立即发送在点击时已经画过用户气泡：这里只补一个空的 assistant，避免再叠一条。
     const turnIndex = nextTurnNavIndex();
     const turnOrdinal = nextTurnNavOrdinal();
-    const paintedAlready = opts?.alreadyOnCanvas === true && messagesRef.current.some((m) => (
-      m.role === 'user' && m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', text))
-    ));
-    if (!paintedAlready) rememberTurnOutline(text, turnIndex, turnOrdinal);
+    const cleanText = visibleUserText(text).trim();
+    const paintedAlready = opts?.alreadyOnCanvas === true && messagesRef.current.some((m) => {
+      if (m.role !== 'user') return false;
+      if (cleanText) {
+        return m.parts.some((p) => p.kind === 'text' && userTextsMatch(p.text || '', cleanText));
+      }
+      return images.length > 0 && sameImageSet(m.images, images);
+    });
+    if (!paintedAlready) rememberTurnOutline(cleanText || (images.length > 0 ? '[图片]' : ''), turnIndex, turnOrdinal);
     setMessages((prev) => {
       let next: Message[] = prev;
       if (!paintedAlready) {
         next = [
           ...prev,
-          { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, sourceIndex: turnIndex, turnNavOrdinal: turnOrdinal },
+          { role: 'user', parts: [{ kind: 'text', text: cleanText }], images: images.length ? images : undefined, ts: now, sourceIndex: turnIndex, turnNavOrdinal: turnOrdinal },
           // 流式占位行不盖 sourceIndex：它还没落盘，绝对下标只能来自磁盘投影或身份帧。
           // 猜出来的下标会让终态对账把整轮累积的思考/工具当成更早历史保留，
           // 与权威尾部里同一轮次叠成两份，表现为回合结束时回答被整体重放。
@@ -8596,15 +8621,20 @@ export function Chat({
     ))) {
       return;
     }
+    if (!clean && images.length > 0 && messagesRef.current.some((m) => (
+      m.role === 'user' && sameImageSet(m.images, images)
+    ))) {
+      return;
+    }
     const now = Date.now();
     const turnIndex = nextTurnNavIndex();
     const turnOrdinal = nextTurnNavOrdinal();
-    rememberTurnOutline(text, turnIndex, turnOrdinal);
+    rememberTurnOutline(clean || (images.length > 0 ? '[图片]' : ''), turnIndex, turnOrdinal);
     const next: Message[] = [
       ...messagesRef.current,
       {
         role: 'user',
-        parts: [{ kind: 'text', text }],
+        parts: [{ kind: 'text', text: clean }],
         images: images.length ? images : undefined,
         ts: now,
         isSteer: isSteer || isSteerUserMessage({ content: text }) ? true : undefined,
