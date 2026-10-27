@@ -21,6 +21,46 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.4 (2026-10-27)
+
+- **[Session Management & Approval Sync] Cross-client approval mode synchronization & remote recovery**:
+  - Persist approval mode per session on disk and automatically synchronize and broadcast mode transitions in real time across desktop, browser, and mobile clients via global SSE events.
+  - Resolved unresponsive approval cards after long idle periods across remote instances with idempotent delivery tombstones, 15-second request timeouts, dead card retirement, and automatic 401 re-negotiation.
+- **[Daemon & Performance Optimization] HTTP response compression, on-demand slice conversion & instant offline cold start**:
+  - Enabled Gzip and Brotli HTTP response compression for Axum routes (excluding SSE streams), cutting session payload transfer size by up to 90% over remote tunnels and mobile networks.
+  - Implemented zero-allocation turn outline extraction and on-demand message slicing, eliminating unnecessary heap allocations when browsing long conversations.
+  - Enabled instant IndexedDB cold-start cache rendering on mobile devices, displaying the conversation canvas in under 1ms without waiting for network resolution.
+  - Resolved mobile reconnect runaway timers and frozen stop buttons after long background suspensions via active stream watchdog and idle state settlement.
+- **[Tool Calling & Prompt Hygiene] Dual-track diff separation & cross-turn read confirmation grace**:
+  - Decoupled model context from presentation display for `edit` and `write` tools: stripped verbose unified diffs from model inputs to save tokens and preserve prompt cache, while retaining full diffs in TUI, WebUI, and logs for review.
+  - Introduced a one-turn read confirmation grace period for file write intercepts, preventing model write retry deadlocks after intercepting unread writes.
+  - Translated all internal write-state notices to standard English for Agent Core purity.
+- **[Chat UI & Multimodal Experience] Image steer preservation, markdown table cell breaks & flicker-free loading**:
+  - Fixed image-only steer messages vanishing or turning into blank bubbles on immediate send; preserved optimistic canvas bubbles and images across client reconciliation.
+  - Multimodal broadcast synchronization: included image attachments in live user broadcast events, preventing photos sent from mobile from being lost on observer clients.
+  - Enhanced Markdown table rendering across WebUI and TUI to support `<br>` and HTML entity line breaks with dynamic cell heights and aligned borders.
+  - Replaced premature empty conversation placeholders with smooth loading shimmer effects during session history fetch.
+
+---
+
+- **[会话管理与审批同步] 多端协同审批模式同步与长空闲自愈**:
+  - 实现会话级审批模式的磁盘持久化存储，并通过全局 SSE 事件总线跨桌面端、网页端与移动端实时广播与静默同步。
+  - 彻底解决远程浏览器实例长空闲后审批卡片无响应的异常，引入幂等确认墓碑、15 秒请求超时保护、无效卡片退役与 401 凭据失效全局自愈刷新。
+- **[服务性能与移动端优化] HTTP 响应压缩、按需切片转换与离线秒开**:
+  - 为 HTTP 服务启用 Gzip 与 Brotli 传输压缩（严格旁路 SSE 流式推流），在公网隧道与移动网络下将会话切片传输体积削减高达 90%。
+  - 引入零堆分配提问大纲提取与按需切片转换机制，浏览长会话时消除无谓内存开销，大幅降低内存占用。
+  - 支持移动端离线 IndexedDB 秒开渲染，冷启动时在 1 毫秒内即时呈现画布，无需前置网络等待。
+  - 强化移动端后台挂起唤醒恢复与看门狗，解决手机切后台唤醒后计时器空跑与停止按钮卡死问题。
+- **[工具调用与模型上下文] 差异输出双轨解耦与跨回合已读宽限保活**:
+  - 针对 `edit` 和 `write` 工具实现模型上下文层与界面展示层的双轨解耦：模型层剥离冗长 diff 以节省 Token 并保护 Prompt Cache，展示层（TUI、WebUI、日志）完整保留可视化差异对比。
+  - 为文件写入拦截引入单轮已读宽限保活机制，避免模型根据提示重试写入时因回合推进被重复拦截导致的死锁。
+  - 全面规范化写入拦截底层英文提示，保持 Agent Core 英文纯净性。
+- **[聊天体验与多模态渲染] 纯图片转向保活、表格多行折行与防闪烁优化**:
+  - 修复纯图片 steer 转向卡片在点击「立即发送」时气泡丢失或退化为空白气泡的缺陷，确保乐观气泡与图片附件在对账结算后完整保留。
+  - 补齐多端广播中的多模态图片负载，解决移动端发送图片在电脑端协同观察者视图中丢失的问题。
+  - 增强 WebUI 与终端 TUI 的 Markdown 表格渲染，全面支持 `<br>` 换行变体，保持动态行高与边框对齐。
+  - 优化历史拉取期间的空状态过渡，用微光加载动画替代过早渲染的空对话提示，杜绝清屏闪烁。
+
 ## v7.3.1-beta.3 (2026-10-27)
 
 - **[UI History & Turn Sequencing] Decoupled tool execution and turn conclusion in transcript reconstruction**:
