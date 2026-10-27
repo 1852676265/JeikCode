@@ -35,6 +35,10 @@ pub struct FileTurnState {
     pub read_confirmed: bool,
     /// Last file operation performed on this file in this turn.
     pub last_op: Option<FileOpKind>,
+    /// Turn ID at which an unread write intercept returned the full file content and
+    /// granted read confirmation. Survives into the immediately following turn (grace
+    /// period) so the model can retry `write` in the next turn as prompted.
+    pub confirmed_at_turn: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -116,10 +120,12 @@ pub fn record_read(path: &Path) {
             FileTurnState {
                 read_confirmed: false,
                 last_op: Some(FileOpKind::Read),
+                confirmed_at_turn: Some(turn),
             },
         );
     } else {
         entry.1.last_op = Some(FileOpKind::Read);
+        entry.1.confirmed_at_turn = Some(turn);
     }
 }
 
@@ -138,6 +144,7 @@ pub fn record_edit(path: &Path) {
             FileTurnState {
                 read_confirmed: false,
                 last_op: Some(FileOpKind::Edit),
+                confirmed_at_turn: None,
             },
         );
     } else {
@@ -157,6 +164,7 @@ pub fn record_write_success(path: &Path) {
     entry.0 = turn;
     entry.1.read_confirmed = true;
     entry.1.last_op = Some(FileOpKind::Write);
+    entry.1.confirmed_at_turn = None;
 }
 
 /// Record that a file has been confirmed read in this turn (e.g. by returning its full content on write intercept).
@@ -171,6 +179,7 @@ pub fn record_read_confirmed(path: &Path) {
     entry.0 = turn;
     entry.1.read_confirmed = true;
     entry.1.last_op = Some(FileOpKind::Read);
+    entry.1.confirmed_at_turn = Some(turn);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +204,20 @@ pub fn check_write_permitted(path: &Path) -> WritePermission {
         .entry(p)
         .or_insert((turn, FileTurnState::default()));
     if entry.0 != turn {
+        // If the immediately preceding turn granted a read confirmation (e.g. from an intercept
+        // that returned the full file content to the model), grant a one-turn grace period
+        // so the model's next-turn retry write succeeds as promised in the interception message.
+        let has_intercept_grace = (entry.1.read_confirmed
+            || entry.1.last_op == Some(FileOpKind::Read))
+            && entry.1.confirmed_at_turn.map_or(false, |t| t + 1 >= turn);
+
+        if has_intercept_grace {
+            entry.0 = turn;
+            entry.1.read_confirmed = true;
+            entry.1.last_op = Some(FileOpKind::Read);
+            return WritePermission::Allowed;
+        }
+
         // Reset for new turn
         *entry = (turn, FileTurnState::default());
         return WritePermission::RefusedUnread;

@@ -430,7 +430,9 @@ mod tests {
             "Turn 2 write without read must be intercepted: {}",
             r2.content
         );
-        assert!(r2.content.contains("Write Intercepted: File Unread Confirmation Required"));
+        assert!(r2
+            .content
+            .contains("Write Intercepted: File Unread Confirmation Required"));
 
         // Turn 2: Read then write -> succeeds!
         crate::tools::write_state::record_read(&target);
@@ -469,7 +471,9 @@ mod tests {
             )
             .await;
         assert!(r.is_error, "write after edit must be intercepted");
-        assert!(r.content.contains("Write Intercepted: File Unread Confirmation Required"));
+        assert!(r
+            .content
+            .contains("Write Intercepted: File Unread Confirmation Required"));
 
         // Read again, then write -> succeeds
         crate::tools::write_state::record_read(&target);
@@ -496,5 +500,62 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         let on_disk = std::fs::read_to_string(d.path().join("created.txt")).unwrap();
         assert_eq!(on_disk, "hello from create_file\n");
+    }
+
+    #[tokio::test]
+    async fn test_intercept_full_content_survives_across_turn_start_grace() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("intercept_retry.txt");
+        std::fs::write(&target, "existing line 1\nexisting line 2\n").unwrap();
+
+        // Turn 1: Force fresh turn
+        crate::tools::write_state::advance_turn_for_dir(d.path());
+
+        // Turn 1: Attempt write -> must be intercepted and return full content
+        let r1 = WriteFileTool
+            .execute(
+                r#"{"path":"intercept_retry.txt","content":"new content v1\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r1.is_error, "Turn 1 must be intercepted: {}", r1.content);
+        assert!(r1.content.contains("existing line 1"));
+        assert!(r1.content.contains("complete content"));
+
+        // Simulate Turn 2 start via actual LifecycleHooks (turn counter increments)
+        let hook = crate::tools::write_state::WriteStateHook::with_dir(d.path());
+        let mut convo = jeikcode_kernel::message::Conversation::new();
+        jeikcode_kernel::hook::LifecycleHooks::turn_start(&hook, &mut convo).await;
+
+        // Turn 2: Retried write must succeed across the turn boundary!
+        let r2 = WriteFileTool
+            .execute(
+                r#"{"path":"intercept_retry.txt","content":"new content v1\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            !r2.is_error,
+            "Turn 2 retry write must succeed via grace period: {}",
+            r2.content
+        );
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(on_disk, "new content v1\n");
+
+        // Simulate Turn 3 start (after successful write, grace is consumed)
+        jeikcode_kernel::hook::LifecycleHooks::turn_start(&hook, &mut convo).await;
+
+        // Turn 3: Attempt write without read must be intercepted again!
+        let r3 = WriteFileTool
+            .execute(
+                r#"{"path":"intercept_retry.txt","content":"blind overwrite\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            r3.is_error,
+            "Turn 3 blind write must be intercepted again: {}",
+            r3.content
+        );
     }
 }
