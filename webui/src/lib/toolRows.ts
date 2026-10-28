@@ -205,18 +205,42 @@ function isBashAwaitDecision(tool: ToolRow): boolean {
   );
 }
 
-/** Turn ended: settle leftover pending rows except a still-live bash await. */
-export function finalizeToolsAfterTurn(parts: MsgPart[]): MsgPart[] {
-  return parts.map((part) => {
-    if (part.kind !== 'tool' || part.tool.status !== 'pending') return part;
-    if (isBashAwaitDecision(part.tool)) return part;
+/**
+ * Turn ended: settle leftover pending rows except a still-live bash await.
+ *
+ * 只落成 `incomplete`（未完成），绝不猜 `done` / `error`：没有 `tool_result`
+ * 就说明我们根本不知道进程是正常退出、被杀掉还是结果帧丢在断网期。
+ * 把带输出的僵尸行标成「完成」正是「假完成」的来源；磁盘上真有结果时，
+ * 权威对账（`adoptAuthoritativeDiskTail`）会把整行替换成真实状态。
+ */
+export function finalizeToolsAfterTurn(
+  parts: MsgPart[],
+  opts?: {
+    /**
+     * 默认 true：`[bash-await-decision]` 行是“进程还活着、在等用户决定”，
+     * 回合收尾时必须保持 pending（这是审批卡的数据源）。
+     * 服务端已确认没有任何回合在跑时传 false：那种行也不可能再等到决定。
+     */
+    keepAwaitingBashDecision?: boolean;
+  },
+): MsgPart[] {
+  const keepAwait = opts?.keepAwaitingBashDecision !== false;
+  let changed = false;
+  const next = parts.map((part) => {
+    if (part.kind !== 'tool') return part;
+    // waiting_approval 也在内：回合已结束，不可能再有人点那张审批卡。
+    if (part.tool.status !== 'pending' && part.tool.status !== 'waiting_approval') return part;
+    if (keepAwait && isBashAwaitDecision(part.tool)) return part;
+    changed = true;
     return {
       kind: 'tool' as const,
       tool: {
         ...part.tool,
-        status: part.tool.output ? 'done' : 'error',
+        status: 'incomplete' as const,
         progress: undefined,
       },
     };
   });
+  // 幂等：没有任何需要收尾的行就返回原数组，避免调用方因“新数组”重渲染/重写缓存。
+  return changed ? next : parts;
 }

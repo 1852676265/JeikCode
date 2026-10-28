@@ -54,7 +54,7 @@ export function shouldAdoptDiskTranscript(input: {
 }
 
 type TailPart = { kind: string; text?: string };
-type TailMessage = { role: string; parts: TailPart[]; images?: unknown[] };
+type TailMessage = { role: string; parts: TailPart[]; images?: unknown[]; id?: string };
 
 function tailPlain(message: TailMessage | undefined): string {
   if (!message) return '';
@@ -82,15 +82,56 @@ function lastTailUser(messages: TailMessage[]): string {
 }
 
 /**
+ * 画布上「磁盘还没落盘」那段尾巴的起点。
+ *
+ * 先用消息身份（id）找最后一条画布与磁盘共有的行：它之后就是本轮还没写进
+ * display 日志的内容（中途转向 + 后续工具/正文）。只认最后一条 user 的话，
+ * 一次长回合里的多个 steer 只有最后一个能留下，更早的会被整段丢掉。
+ * 返回 -1 表示画布与磁盘没有身份交集（旧 daemon 无 id / 纯直播行）。
+ */
+function unpersistedTailStart(disk: TailMessage[], canvas: TailMessage[]): number {
+  const diskIds = new Set(disk.map((m) => m.id).filter((id): id is string => !!id));
+  if (diskIds.size === 0) return -1;
+  for (let i = canvas.length - 1; i >= 0; i--) {
+    const id = canvas[i]?.id;
+    if (id && diskIds.has(id)) return i + 1;
+  }
+  return -1;
+}
+
+/**
  * 磁盘对账不能抹掉「立即发送」刚画上、尚未落盘的用户回合。
  * 磁盘末条用户与画布末条用户还对不上时，把画布从该用户气泡起的尾巴接回去。
  * 已经落盘（刷新能看见）时原样采用磁盘，避免乐观气泡和权威历史各画一条。
+ *
+ * 定位优先按消息身份（id）：从「最后一条与磁盘共有的消息」之后整段接回。
+ * 只认最后一条 user 时，长回合里的多个中途转向只有最后一个能留下。
  */
-export function mergeDiskWithUnpersistedTail<T extends TailMessage>(disk: T[], canvas: T[]): T[] {
+export function mergeDiskWithUnpersistedTail<T extends TailMessage>(
+  disk: T[],
+  canvas: T[],
+  opts?: {
+    /**
+     * 磁盘切片是否覆盖了画布当前这一轮（默认 true）。
+     * 传 false = 磁盘还停在上一轮（daemon 正在收尾 / 重启丢了快照）：
+     * 此时画布上的 steer 与后续工具行是唯一副本，必须整段接回来，
+     * 否则刷新后 steer 卡和用户气泡一起消失，只剩工具行。
+     */
+    diskCoversTail?: boolean;
+  },
+): T[] {
   // A new loop may already contain reasoning/tools before its final text. The
   // old turn's terminal reconcile must not mistake that for a settled turn and
   // replace the canvas (steer bubble + new loop) with the stale disk tail.
-  if (!transcriptHasOpenUserTurn(canvas) && !transcriptHasInFlightAssistant(canvas)) return disk;
+  const openTail =
+    transcriptHasOpenUserTurn(canvas) || transcriptHasInFlightAssistant(canvas);
+  if (!openTail && opts?.diskCoversTail !== false) return disk;
+
+  // 身份定位优先：从「最后一条与磁盘共有的消息」之后整段接回（支持多个中途转向）。
+  const byIdentity = unpersistedTailStart(disk, canvas);
+  if (byIdentity >= 0) {
+    return byIdentity < canvas.length ? [...disk, ...canvas.slice(byIdentity)] : disk;
+  }
 
   let lastUser = -1;
   for (let i = canvas.length - 1; i >= 0; i--) {

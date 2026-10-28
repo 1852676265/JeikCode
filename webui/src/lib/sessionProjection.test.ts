@@ -1705,6 +1705,31 @@ test('steerInsertAfterAnchor 把回放补回的转向插在被打断的那一轮
   assert.equal(steerInsertAfterAnchor(canvas, undefined), -1);
 });
 
+test('spliceAuthoritativeDiskTail 不采信 steer 的本地猜下标（否则整段 steer 被判进窗口后丢失）', () => {
+  // steer 的 sourceIndex 是 fold 时按“当前窗口末尾”推算的，从来没被磁盘确认过。
+  // 一旦它比磁盘尾部窗口起点大，旧实现会把 steer 和它后面的直播行整段当成
+  // “窗口内已有”而丢弃，刷新后 steer 气泡凭空消失。
+  const canvas = [
+    { role: 'user', id: 'q', sourceIndex: 0, parts: [{ kind: 'text' as const, text: '持续巡检' }] },
+    { role: 'assistant', id: 'a0', sourceIndex: 1, parts: [{ kind: 'tool' as const, tool: { id: 'w-0', name: 'write', args: '{}', status: 'done' as const } }] },
+    { role: 'user', id: 'steer-1', isSteer: true, sourceIndex: 90, parts: [{ kind: 'text' as const, text: '改成 30s 一次' }] },
+    { role: 'assistant', id: 'a1', parts: [{ kind: 'tool' as const, tool: { id: 'bash-1', name: 'run_command', args: '{}', status: 'pending' as const } }] },
+  ];
+  // 磁盘窗口只覆盖 steer 之后的那一轮（起点 5），且已把工具行结算成 done。
+  const diskTail = [
+    { role: 'assistant', id: 'a1', sourceIndex: 5, parts: [{ kind: 'tool' as const, tool: { id: 'bash-1', name: 'run_command', args: '{}', status: 'done' as const, output: 'ok' } }] },
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas as any, diskTail as any, 5);
+  assert.deepEqual(spliced.map((m) => m.id), ['q', 'a0', 'steer-1', 'a1']);
+  assert.equal(spliced.filter((m) => m.isSteer).length, 1);
+  // 假死工具行必须被磁盘的 done 版本替换，绝不能继续挂着 pending
+  assert.equal(
+    spliced.some((m) => m.parts.some((p) => p.kind === 'tool' && p.tool?.status === 'pending')),
+    false,
+  );
+});
+
 test('spliceAuthoritativeDiskTail 保留历史轮次中的黄色通知在原有轮次位置不被拖拽到会话末尾', () => {
   // 第 1 轮：用户：“你好”，AI 出错产生黄色通知
   // 第 2 轮：用户：“你好 再发一次”，AI 出错产生黄色通知

@@ -4452,6 +4452,12 @@ body {
   color: var(--app-error-foreground);
 }
 
+/* 未完成 = 结果未知（工具被中断 / 结果帧丢失），不能当成失败也不能当成成功。 */
+.tool-group-badge.warning {
+  background: color-mix(in srgb, var(--app-warning-accent), transparent 82%);
+  color: var(--app-warning-accent);
+}
+
 .tool-group-actions {
   display: inline-flex;
   align-items: center;

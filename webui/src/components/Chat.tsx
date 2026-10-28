@@ -210,7 +210,6 @@ import {
   transcriptLatestUserInputIsResolved,
   transcriptToolCallIsResolved,
   mergeDiskWithUnpersistedTail,
-  shouldAdoptDiskTranscript,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
   resumeTurnStartedAt,
@@ -296,6 +295,12 @@ import {
   resolveAfterSeq,
   writeStreamCursor,
 } from '../lib/streamCursor';
+import {
+  lastAssistantTextLen,
+  ownsRunningLocalSend,
+  shouldAdoptAuthoritativeTail,
+  tailAssistantHasUnresolvedTools,
+} from '../lib/chatSettle';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -1147,15 +1152,6 @@ function displayToolName(name: string): string {
 // TUI 调用 /skill 时会把整段 SKILL.md 模板塞进用户消息，webui 历史里会把它
 // 渲染成一大坨原文；命中则返回标题文本用作折叠徽章标签，否则返回 null（普通气泡）。
 const SKILL_COLLAPSE_MIN = 400;
-function transcriptTextLen(messages: Array<{ parts: Array<{ kind: string; text?: string }> }>): number {
-  let total = 0;
-  for (const message of messages) {
-    for (const part of message.parts) {
-      if ((part.kind === 'text' || part.kind === 'reasoning') && part.text) total += part.text.length;
-    }
-  }
-  return total;
-}
 
 function lastUserPlain(messages: Array<{ role: string; parts: Array<{ kind: string; text?: string }> }>): string {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -2248,6 +2244,8 @@ export function Chat({
   const localActiveStreamsBySessionRef = useRef<Map<string, {
     abortController: AbortController;
     requestId: string;
+    /** `/chat/watch` 观察流注册的条目：只代表“看见它在跑”，不代表本端拥有回合。 */
+    watchOnly?: boolean;
   }>>(new Map());
   /** 按会话隔离待去重自身用户消息 echo */
   const pendingSelfEchoBySessionRef = useRef<Map<string, Array<{ id: string; text: string }>>>(new Map());
@@ -2564,6 +2562,16 @@ export function Chat({
       localActiveStreamsBySessionRef.current.has(sid)
     );
   }
+  /**
+   * 本端是否仍持有一条真正在收发的**发送**流。
+   *
+   * 权威磁盘对账只能被「本端确实还在发」否决；`/chat/watch` 观察流条目与后台观测
+   * 集合断网后永远收不到终态，拿它们当依据会让收尾永久无法发生（停止按钮常亮）。
+   */
+  function hasRunningLocalSend(sid: string | null | undefined): boolean {
+    if (!sid) return false;
+    return ownsRunningLocalSend(localActiveStreamsBySessionRef.current.get(sid));
+  }
   /** 回放帧的提问是否落在折叠线以上（右栏大纲里它的绝对下标早于当前窗口起点）。 */
   function replayQueryAboveFold(sessionId: string, event: SSEEvent): boolean {
     if (event.type !== 'user' || typeof event.content !== 'string') return false;
@@ -2679,6 +2687,8 @@ export function Chat({
     localActiveStreamsBySessionRef.current.set(loadId, {
       abortController: watchAbort,
       requestId: loadId,
+      // 观察流不是本端回合：它断网后永远不会更新，不能用来否决服务端的权威空闲结论。
+      watchOnly: true,
     });
 
     const effectiveProjectHash =
@@ -2706,6 +2716,9 @@ export function Chat({
     }
     // 本端是否已收到终态；决定流正常关闭后要不要补一次磁盘对账。
     let terminalSeen = false;
+    // 最后一帧（不含 15s 心跳）的时间。观察流在半开/待机状态下只有心跳，
+    // 终态帧可能永远到不了（手机挂起、daemon 重启、回放缓冲已随回合清空）。
+    let lastFrameAt = Date.now();
 
     // 带游标自愈推流循环 (Self-Healing Stream with Cursor)：
     // 彻底解决网络颠簸、TCP假死超时或无报错静默断流导致的“推流停止卡住”顽疾。
@@ -2736,6 +2749,7 @@ export function Chat({
             loadId,
             (event) => {
               retryCount = 0; // 成功收到有效事件立即重置重试计数器
+              lastFrameAt = Date.now();
               // 握手帧带 cursor。回放帧的 seq 要等决定落笔后再推进：
               // 折叠线以上先按住的帧如果提前记账，断线重连会把还没画上的新回合跳过。
               if (event.type === 'session_start') {
@@ -2896,12 +2910,133 @@ export function Chat({
       }
     };
 
-    void runStreamWithAutoRecovery();
+    // 静默看门狗：本端仍认为回合在跑，却超过 30s 没收到任何帧时，用磁盘权威兜底。
+    // 没有它，“连接还活着、只是永远没有下文”的会话会把停止按钮坑到用户手动停止为止。
+    const silenceProbe = window.setInterval(() => {
+      if (terminalSeen || watchAbort.signal.aborted || !effectiveProjectHash) return;
+      if (Date.now() - lastFrameAt < 30000) return;
+      lastFrameAt = Date.now();
+      void catchUpFromDisk(effectiveProjectHash, loadId, { force: true })
+        .then((running) => {
+          // 服务端确认已空闲：按终态收尾（磁盘对账已在 catchUpFromDisk 内完成）。
+          if (running !== false || terminalSeen) return;
+          terminalSeen = true;
+          settleToIdleWatch(effectiveProjectHash, loadId, sessionGenerationRef.current);
+        })
+        .catch(() => {});
+    }, 10000);
+
+    void runStreamWithAutoRecovery().finally(() => {
+      window.clearInterval(silenceProbe);
+    });
   }
   // ── Detached tick ── 2s 兜底:watch 实时流连着时只 append-only 补帧 (不抹
   // 流式增量),watch 断开时整体替换;同时监测 stillActive 终结回合。供
   // startDetachedHistoryPoll (切入已活跃会话) 与 startIdleWatch (原地升级)
   // 共用。
+  /**
+   * 采用磁盘权威尾部：把结算后的磁盘切片安全拼进画布/缓存。
+   *
+   * 只替换「切片覆盖到的尾部」：早于切片起点的更早历史、以及尚未落盘的乐观提问 /
+   * 新回合都原样保留（`spliceAuthoritativeDiskTail` + `mergeDiskWithUnpersistedTail`）。
+   * 终态对账与断流兜底共用这一条路径，避免两边各修一半。
+   */
+  function adoptAuthoritativeDiskTail(
+    hash: string,
+    sid: string,
+    diskTail: Message[],
+    diskOffset: number,
+    meta: {
+      todos?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+      turns?: SessionTurnOutline[];
+      token_usage?: SessionTokenUsage | null;
+    },
+  ): { messages: Message[]; keptUnpersistedTail: boolean } {
+    const canvas = activeIdRef.current === sid
+      ? messagesRef.current
+      : (messageCacheRef.current.get(sid) ?? []);
+    const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, diskOffset);
+    const merged = mergeDiskWithUnpersistedTail(spliced, canvas);
+    // 拼接与尾部合并后统一自愈一次：pinned 提问、相邻重复 user、空占位都可能在
+    // 历史缓存里留下重复节点。落缓存与上屏必须用同一份清洗后的数组，否则下一个
+    // 回合终态会拿脏画布再拼一次，重复会逐轮累积。
+    const clean = sanitizeCanvasMessages(merged);
+    messageCacheRef.current.set(sid, clean);
+    void saveSessionCache(hash, sid, clean, meta.todos, undefined, meta.turns, meta.token_usage);
+    if (activeIdRef.current === sid) {
+      messagesRef.current = clean;
+      // 磁盘对账会整表替换画布：锚定阅读位置，避免终态时滚动条跳走。
+      timelineFollowRef.current?.beginSwap();
+      commitActiveTodosIntoLastAssistant();
+      setMessages(clean);
+      timelineFollowRef.current?.endSwap();
+      if (meta.turns && meta.turns.length > 0) {
+        turnOutlineBySessionRef.current.set(sid, meta.turns);
+        setTurnOutline(meta.turns);
+      }
+      if (meta.token_usage) {
+        applySessionTokens(sid, clean, meta.token_usage);
+      }
+      applySessionStickyTodos(sid, null);
+    }
+    return { messages: clean, keptUnpersistedTail: clean.length !== diskTail.length };
+  }
+
+  /**
+   * 服务端已确认没有回合在跑：画布上仍挂着的 pending / waiting 工具行不会再有结果帧
+   * （daemon 重启、回放缓冲已随回合清空、或结果帧丢在断网期）。标成 incomplete，
+   * 绝不让它继续转圈；真正的结果出现在磁盘上时会被权威对账替换。
+   */
+  function finalizeOrphanPendingTools(sid: string) {
+    const settle = (list: Message[]): Message[] => {
+      let changed = false;
+      const next = list.map((message) => {
+        if (message.role !== 'assistant') return message;
+        const parts = finalizeToolsAfterTurn(message.parts, { keepAwaitingBashDecision: false });
+        if (parts === message.parts) return message;
+        changed = true;
+        return { ...message, parts };
+      });
+      return changed ? next : list;
+    };
+    const cached = messageCacheRef.current.get(sid);
+    if (cached) messageCacheRef.current.set(sid, settle(cached));
+    if (activeIdRef.current === sid) {
+      const next = settle(messagesRef.current);
+      if (next !== messagesRef.current) {
+        messagesRef.current = next;
+        setMessages(next);
+      }
+    }
+  }
+
+  /**
+   * 服务端已权威空闲：清掉本端所有“仍在运行”的残影。
+   *
+   * `backgroundRunningSessions` 与观察流条目只是“看见它跑过”的本地笔记：手机断网
+   * 后它们永远收不到终态。留着就会让 `settleToIdleWatch` / `catchUpFromDisk` 一直
+   * 早退，表现就是停止按钮与僵尸工具行永久保留，直到另一台设备发下一条消息把状态冲开。
+   */
+  function settleSessionRunningState(sid: string) {
+    localTurnSessionsRef.current.delete(sid);
+    backgroundRunningSessionsRef.current.delete(sid);
+    const stream = localActiveStreamsBySessionRef.current.get(sid);
+    if (!stream || stream.watchOnly) {
+      localActiveStreamsBySessionRef.current.delete(sid);
+    }
+    const watcher = sessionWatchersRef.current.get(sid);
+    if (watcher) {
+      watcher.abort();
+      sessionWatchersRef.current.delete(sid);
+    }
+    setBusyAndClock(false);
+    busyRef.current = false;
+    liveLifecycleRef.current = { running: false, terminalConsumed: true };
+    onLiveRunningChange?.(sid, false);
+    // 没有回合在跑了：残留的 pending 工具行不会再有结果帧，收尾成 incomplete。
+    finalizeOrphanPendingTools(sid);
+  }
+
   /** Live tokens win. Disk is touched only after the stream goes quiet, and
    *  only the transcript body is read when the file size or mtime changed. */
   async function catchUpFromDisk(
@@ -2930,11 +3065,8 @@ export function Chat({
         }
         // 新一轮已经在投递/运行（自动 drain 的 steer、立即发送的新回合）：
         // 这份“空闲”签名来自尚未登记新回合的磁盘，绝不能据此清掉 busy。
-        if (isLocalTurnInFlight(id)) return true;
-        setBusyAndClock(false);
-        busyRef.current = false;
-        onLiveRunningChange?.(id, false);
-        liveLifecycleRef.current = { running: false, terminalConsumed: true };
+        if (hasRunningLocalSend(id)) return true;
+        settleSessionRunningState(id);
         transitionChatRecovery({ type: 'authoritative_terminal' });
         commitActiveTodosIntoLastAssistant();
       }
@@ -2949,37 +3081,39 @@ export function Chat({
     }
 
     const detail = await getSession(hash, id, { tail: HISTORY_PAGE });
-    if (activeIdRef.current !== id || !detail || !Array.isArray(detail.messages)) return null;
+    if (activeIdRef.current !== id || !detail || !Array.isArray(detail.messages)) {
+      // 本次对账没落地（离线 / 切走了会话 / 解析失败）：绝不要留下签名，
+      // 否则下一次会以为“文件没变”而永久跳过读盘，尾段再也补不回来。
+      freshnessSigRef.current = '';
+      return null;
+    }
     const disk = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0, detail.pinned_user_index);
     const canvas = messagesRef.current;
     const diskHasUser = diskHasCanvasUser(disk, canvas);
     const diskSettled = diskHasUser && !transcriptHasInFlightAssistant(disk) && !fresh.running;
-    const adoptSettledDisk = !fresh.running && diskSettled && shouldAdoptDiskTranscript({
-      diskText: transcriptTextLen(disk),
-      canvasText: transcriptTextLen(canvas),
+    // 断线重连时画布永远非空：只要服务端已结算，就必须用磁盘权威尾部校正画布。
+    // 否则断流期间丢掉的 tool_result / 末段正文会永久停在「运行中」（只能靠刷新或手动停止恢复）。
+    if (shouldAdoptAuthoritativeTail({
+      running: fresh.running,
       diskHasUser,
-    });
-    if (adoptSettledDisk) {
-      // 权威磁盘落盘：仅在画布为空或尚未有内容时采用磁盘首屏；绝不拿截断切片逆向污染内存画布
-      if (!canvas || canvas.length === 0) {
-        messagesRef.current = disk;
-        messageCacheRef.current.set(id, disk);
-        timelineFollowRef.current?.beginSwap();
-        setMessages(disk);
-        timelineFollowRef.current?.endSwap();
-      }
+      diskSettled,
+      canvasInFlight: transcriptHasInFlightAssistant(canvas),
+      // 被收尾成 incomplete 的僵尸工具行也要允许磁盘权威结果把它整行换掉。
+      canvasUnresolvedTools: tailAssistantHasUnresolvedTools(canvas),
+      diskLastTextLen: lastAssistantTextLen(disk),
+      canvasLastTextLen: lastAssistantTextLen(canvas),
+    })) {
+      adoptAuthoritativeDiskTail(hash, id, disk, detail.offset ?? 0, detail);
     }
     if (consumesProgrammaticStopMark(programmaticStopMarkRef.current, id, Date.now())) {
       return true;
     }
     // 旧回合的终态对账绝不能收尾已经在跑的新回合（否则按钮变回发送箭头）。
-    if (isLocalTurnInFlight(id)) return true;
+    // 只认本端真正在收发的发送流：观察流条目断网后永不更新，不能拿来否决权威空闲。
+    if (hasRunningLocalSend(id)) return true;
     // 会话已停就收尾：停表、把本轮勾完的清单冻到尾部。
     // 服务端在空闲时不会再把已完成清单当作活跃画板返回，这里也不能把那份历史清单贴回输入框上方。
-    setBusyAndClock(false);
-    busyRef.current = false;
-    onLiveRunningChange?.(id, false);
-    liveLifecycleRef.current = { running: false, terminalConsumed: true };
+    settleSessionRunningState(id);
     transitionChatRecovery({ type: 'authoritative_terminal' });
     commitActiveTodosIntoLastAssistant();
     // 已结束的回合不再把磁盘里“已完成”的历史清单灌回输入区上方（否则 sticky
@@ -3006,55 +3140,24 @@ export function Chat({
    */
   const syncSessionCacheFromDisk = useCallback(async (hash: string, sid: string): Promise<boolean> => {
     if (!hash || !sid) return false;
-    // A previous turn's terminal must not reconcile the stale disk tail over a
-    // new turn (steer drain / immediate send) that is already in flight.
-    if (
-      localTurnSessionsRef.current.has(sid) ||
-      backgroundRunningSessionsRef.current.has(sid)
-    ) {
-      return true;
-    }
+    // 上一回合的终态绝不能把旧磁盘尾部对账到本端正在发送的新回合上。
+    // 只认真正在收发的发送流：观察流条目断网后永不更新，不能拦住后台缓存自愈。
+    if (hasRunningLocalSend(sid)) return true;
     try {
       const detail = await getSession(hash, sid, { tail: HISTORY_PAGE });
       if (!detail || !Array.isArray(detail.messages)) return false;
       const loaded = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0, detail.pinned_user_index);
-      const canvas = activeIdRef.current === sid
-        ? messagesRef.current
-        : (messageCacheRef.current.get(sid) ?? []);
       // 立即发送会先把用户气泡画上。停止触发的这次对账往往早于落盘，
-      // 直接覆盖会把气泡抹掉，直到刷新才从磁盘重新出现。
-      // 纯净对账：用磁盘权威落盘的尾部切片安全替换画布/缓存的尾部，保留更早历史，消除重复并补全断网期间错过的最终回答
-      const baseCanvas = spliceAuthoritativeDiskTail(canvas, loaded, detail.offset ?? 0);
-      const merged = mergeDiskWithUnpersistedTail(baseCanvas, canvas);
-      const keptUnpersistedTail = merged.length !== loaded.length;
-      // 拼接与尾部合并后统一自愈一次：pinned 提问、相邻重复 user、空占位都可能在
-      // 历史缓存里留下重复节点。落缓存与上屏必须用同一份清洗后的数组，否则下一个
-      // 回合终态会拿脏画布再拼一次，重复会逐轮累积。
-      const cleanMerged = sanitizeCanvasMessages(merged);
-      messageCacheRef.current.set(sid, cleanMerged);
-      void saveSessionCache(
+      // 直接覆盖会把气泡抹掉，直到刷新才从磁盘重新出现——
+      // 拼接时由 `mergeDiskWithUnpersistedTail` 保留未落盘的尾巴。
+      const { keptUnpersistedTail } = adoptAuthoritativeDiskTail(
         hash,
         sid,
-        cleanMerged,
-        detail.todos,
-        undefined,
-        detail.turns,
-        detail.token_usage,
+        loaded,
+        detail.offset ?? 0,
+        detail,
       );
       if (activeIdRef.current === sid) {
-        messagesRef.current = cleanMerged;
-        // 磁盘对账会整表替换画布：锚定阅读位置，避免终态时滚动条跳走。
-        timelineFollowRef.current?.beginSwap();
-        commitActiveTodosIntoLastAssistant();
-        setMessages(messagesRef.current);
-        timelineFollowRef.current?.endSwap();
-        if (detail.turns && detail.turns.length > 0) {
-          turnOutlineBySessionRef.current.set(sid, detail.turns);
-          setTurnOutline(detail.turns);
-        }
-        if (detail.token_usage) {
-          applySessionTokens(sid, messagesRef.current, detail.token_usage);
-        }
         const hasLocalSend =
           abortRef.current !== null ||
           activeStreamRequestIdRef.current !== null ||
@@ -3063,7 +3166,7 @@ export function Chat({
           setBusyAndClock(false);
           busyRef.current = false;
         }
-        applySessionStickyTodos(sid, null);
+        // 画布、大纲、token、sticky 清单已由 adoptAuthoritativeDiskTail 统一落定。
       }
       return true;
     } catch {
@@ -3076,10 +3179,16 @@ export function Chat({
     const attempt = (delay: number, triesLeft: number) => {
       window.setTimeout(() => {
         if (activeIdRef.current === sid) {
-          void catchUpFromDisk(projectHash, sid, { force: true }).then((running) => {
-            // false = 已确认空闲且完成对账；null/true 表示仍不确定（后端还在收尾）→ 重试。
-            if (running !== false && triesLeft > 0) attempt(800, triesLeft - 1);
-          });
+          void catchUpFromDisk(projectHash, sid, { force: true })
+            .then((running) => {
+              // false = 已确认空闲且完成对账；null/true 表示仍不确定（后端还在收尾）→ 重试。
+              if (running !== false && triesLeft > 0) attempt(800, triesLeft - 1);
+            })
+            // 手机断网时 getSessionFreshness / getSession 会直接 reject。
+            // 一次失败绝不能终止整条收尾链，否则停止按钮与僵尸工具行会留到用户手动停止。
+            .catch(() => {
+              if (triesLeft > 0) attempt(1600, triesLeft - 1);
+            });
         } else {
           // 后台会话：即使不在前台展示，流异常关闭后也必须同步磁盘并更新内存缓存
           void syncSessionCacheFromDisk(projectHash, sid);
@@ -4451,7 +4560,11 @@ export function Chat({
                 // 以及新一轮 loop 已流出的正文。短会话的尾部切片 offset=0 时 splice 会整张
                 // 采用磁盘，直接拿它上屏就会把用户气泡抹掉、新一轮正文贴到上一条回答下面。
                 // 与回合终态对账（`syncSessionCacheFromDisk`）用同一套补尾规则。
-                const rescued = mergeDiskWithUnpersistedTail(spliced, currentCached!);
+                const rescued = mergeDiskWithUnpersistedTail(spliced, currentCached!, {
+                  // 磁盘还停在上一轮（daemon 正在收尾 / 重启丢了快照）：画布上的 steer 与
+                  // 后续工具行是唯一副本，必须整段接回；否则刷新后 steer 气泡凭空消失。
+                  diskCoversTail: diskHasCanvasUser(loaded, currentCached!),
+                });
                 displayMessages = sanitizeCanvasMessages(rescued);
                 messagesRef.current = displayMessages;
                 messageCacheRef.current.set(loadId, displayMessages);
@@ -4913,11 +5026,30 @@ export function Chat({
                   startDetachedHistoryPoll(projectHash, sid, sessionGenerationRef.current);
                 }
               } else {
-                // 后台切回时服务端已空闲，但客户端仍在 busy / 跑时钟：立即收尾对账，停止空跑
-                if (busyRef.current || localTurnSessionsRef.current.has(sid)) {
-                  localTurnSessionsRef.current.delete(sid);
-                  backgroundRunningSessionsRef.current.delete(sid);
+                // 后台切回时服务端已空闲：本端所有“运行中”都只是断网/挂起期间的残影。
+                // 必须连「观察流仍挂着」「恢复态仍允许停止」一起收尾 —— 否则停止按钮与
+                // 僵尸工具行会一直保留，直到另一台设备发下一条消息把状态冲开。
+                const attachedWatcher = sessionWatchersRef.current.get(sid);
+                const staleLiveState =
+                  busyRef.current ||
+                  localTurnSessionsRef.current.has(sid) ||
+                  backgroundRunningSessionsRef.current.has(sid) ||
+                  liveLifecycleRef.current.running ||
+                  chatRecoveryPolicy(chatRecoveryRef.current).allowStop ||
+                  (!!attachedWatcher && !attachedWatcher.signal.aborted);
+                if (staleLiveState) {
+                  settleSessionRunningState(sid);
+                  transitionChatRecovery({ type: 'authoritative_terminal' });
+                  // 停止通道已经不可达；立刻用磁盘权威尾部把丢掉的尾段与工具终态补回。
                   settleDiskCatchUp(projectHash, sid);
+                } else if (hiddenForLong) {
+                  void catchUpFromDisk(projectHash, sid).catch(() => {});
+                }
+                if (staleLiveState || hiddenForLong) {
+                  // 挂起/断网后待机 watch 多半已被系统戒断：强制重挂，
+                  // 否则对端新回合永远推不过来（不拉新量）。
+                  stopIdleWatch();
+                  startIdleWatch(projectHash, sid, sessionGenerationRef.current, { replayIfLive: true });
                 }
               }
             })
@@ -4928,6 +5060,13 @@ export function Chat({
 
     window.addEventListener('focus', refreshOnFocus);
     document.addEventListener('visibilitychange', refreshOnFocus);
+    // 手机网络恢复不一定伴随 focus/visibility（熄屏直起、地铁出隧道）：
+    // 必须在 online 时走同一条唤醒自愈，否则断网期间的半开连接会让会话永远停在运行中。
+    const onOnline = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      refreshOnFocus();
+    };
+    window.addEventListener('online', onOnline);
 
     return () => {
       cancelled = true;
@@ -4936,6 +5075,7 @@ export function Chat({
       window.removeEventListener('jeikcode:mode_global_changed', handleGlobalModeSwitch);
       window.removeEventListener('focus', refreshOnFocus);
       document.removeEventListener('visibilitychange', refreshOnFocus);
+      window.removeEventListener('online', onOnline);
       try {
         bc?.close();
       } catch {
@@ -12905,7 +13045,9 @@ function ToolGroupView({ tools }: { tools: ToolRow[] }) {
   const [batchVersion, setBatchVersion] = useState(0);
 
   const doneCount = tools.filter((tool) => tool.status === 'done').length;
-  const errorCount = tools.filter((tool) => tool.status === 'error' || tool.status === 'incomplete').length;
+  // incomplete = 结果未知（工具被中断 / 结果帧丢失），既不是成功也不是失败。
+  const errorCount = tools.filter((tool) => tool.status === 'error').length;
+  const incompleteCount = tools.filter((tool) => tool.status === 'incomplete').length;
   const runningCount = tools.filter((tool) => tool.status === 'pending' || tool.status === 'waiting_approval').length;
 
   // 关键过滤：只有真正执行了写/编辑/全局替换类工具或命令时，才计入“修改文件数”；git diff 等只读检查绝不计入已修改文件数！
@@ -12941,6 +13083,11 @@ function ToolGroupView({ tools }: { tools: ToolRow[] }) {
             {errorCount > 0 && (
               <span class="tool-group-badge error">
                 {errorCount} {t('tool.failed')}
+              </span>
+            )}
+            {incompleteCount > 0 && (
+              <span class="tool-group-badge warning">
+                {incompleteCount} {t('tool.incomplete')}
               </span>
             )}
           </span>

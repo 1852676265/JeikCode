@@ -178,8 +178,18 @@ test('redirected shell heartbeat stays pending until the result arrives', () => 
   assert.equal(settled?.status, 'done');
 });
 
-test('finalizeToolsAfterTurn settles a pending redirected shell without a result', () => {
-  const next = finalizeToolsAfterTurn([
+test('finalizeToolsAfterTurn 不把无结果的僵尸工具行假完成（有输出也不行）', () => {
+  // 有输出但从来没收到 tool_result：进程可能是被停掉/杀掉的，不能声称「完成」。
+  const withOutput = finalizeToolsAfterTurn([
+    { kind: 'tool', tool: tool('zombie-with-output', { name: 'run_command', output: '[still running: 80s total (pid 9527)]' }) },
+  ]);
+  assert.equal(
+    withOutput[0]!.kind === 'tool' ? withOutput[0].tool.status : '',
+    'incomplete',
+    '有输出但无结果 ≠ 成功，必须落成未完成',
+  );
+
+  const withoutOutput = finalizeToolsAfterTurn([
     {
       kind: 'tool',
       tool: tool('redirect-no-result', {
@@ -188,7 +198,7 @@ test('finalizeToolsAfterTurn settles a pending redirected shell without a result
       }),
     },
   ]);
-  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'error');
+  assert.equal(withoutOutput[0]!.kind === 'tool' ? withoutOutput[0].tool.status : '', 'incomplete');
 });
 
 test('finalizeToolsAfterTurn settles leftover pending rows except live bash await', () => {
@@ -204,9 +214,9 @@ test('finalizeToolsAfterTurn settles leftover pending rows except live bash awai
     { kind: 'tool', tool: tool('empty', { name: 'grep' }) },
   ];
   const next = finalizeToolsAfterTurn(parts);
-  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'done');
+  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'incomplete');
   assert.equal(next[1]!.kind === 'tool' ? next[1].tool.status : '', 'pending');
-  assert.equal(next[2]!.kind === 'tool' ? next[2].tool.status : '', 'error');
+  assert.equal(next[2]!.kind === 'tool' ? next[2].tool.status : '', 'incomplete');
 });
 
 

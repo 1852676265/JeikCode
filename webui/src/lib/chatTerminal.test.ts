@@ -113,8 +113,49 @@ test('disk catch-up keeps a send-now user bubble that is not on disk yet', () =>
   assert.deepEqual(mergeDiskWithUnpersistedTail(disk, settledCanvasWithSteer), disk);
 });
 
-test('mergeDiskWithUnpersistedTail keeps an in-flight steer turn', () => {
-  const previous = { role: 'user', parts: [{ kind: 'text', text: '上一问' }] };
+test('mergeDiskWithUnpersistedTail：磁盘停在上一轮时不得抹掉画布已结算的 steer 尾巴', () => {
+  const disk = [
+    { role: 'user', id: 'q0', parts: [{ kind: 'text' as const, text: '上一问' }] },
+    { role: 'assistant', id: 'a0', parts: [{ kind: 'text' as const, text: '上一答' }] },
+  ];
+  const canvas = [
+    ...disk,
+    { role: 'user', id: 'steer-1', isSteer: true, parts: [{ kind: 'text' as const, text: '改成 30s 一次' }] },
+    { role: 'assistant', id: 'live-1', parts: [{ kind: 'text' as const, text: '巡检完成' }] },
+  ];
+  // 磁盘已覆盖这一轮：保持旧行为（采用磁盘，避免重复拼接锁死 busy）。
+  assert.deepEqual(mergeDiskWithUnpersistedTail(disk, canvas), disk);
+  // 磁盘还停在上一轮（daemon 收尾/重启）：steer 与最终回答是唯一副本，必须整段接回。
+  const kept = mergeDiskWithUnpersistedTail(disk, canvas, { diskCoversTail: false });
+  assert.deepEqual(kept.map((m) => m.id), ['q0', 'a0', 'steer-1', 'live-1']);
+});
+
+test('mergeDiskWithUnpersistedTail：多条未落盘 steer 按身份整段接回', () => {
+  const disk = [
+    { role: 'user', id: 'q0', parts: [{ kind: 'text' as const, text: '上一问' }] },
+    { role: 'assistant', id: 'a0', parts: [{ kind: 'text' as const, text: '上一答' }] },
+    { role: 'user', id: 'steer-1', isSteer: true, parts: [{ kind: 'text' as const, text: '第一次转向' }] },
+  ];
+  const canvas = [
+    ...disk,
+    {
+      role: 'assistant',
+      id: 'live-1',
+      parts: [{ kind: 'tool' as const, tool: { id: 'b1', name: 'run_command', status: 'pending' } }],
+    },
+    { role: 'user', id: 'steer-2', isSteer: true, parts: [{ kind: 'text' as const, text: '第二次转向' }] },
+    {
+      role: 'assistant',
+      id: 'live-2',
+      parts: [{ kind: 'tool' as const, tool: { id: 'b2', name: 'run_command', status: 'pending' } }],
+    },
+  ];
+  // 只认最后一条 user 时，第一次转向之后的 live-1 会被丢掉。
+  const merged = mergeDiskWithUnpersistedTail(disk, canvas);
+  assert.deepEqual(merged.map((m) => m.id), ['q0', 'a0', 'steer-1', 'live-1', 'steer-2', 'live-2']);
+});
+
+test('mergeDiskWithUnpersistedTail keeps an in-flight steer turn', () => {  const previous = { role: 'user', parts: [{ kind: 'text', text: '上一问' }] };
   const previousDone = { role: 'assistant', parts: [{ kind: 'text', text: '上一答' }] };
   const disk = [previous, previousDone];
   const steer = { role: 'user', parts: [{ kind: 'text', text: 'steer 自然发出' }] };

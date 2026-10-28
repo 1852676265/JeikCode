@@ -1083,7 +1083,7 @@ function pruneDuplicatedTailContent<T extends { sourceIndex?: number; id?: strin
  * 「更早历史」保留，整轮回答就会在权威尾部之后重放一遍。因此先按行 id / part id /
  * 工具 call id 把切片已渲染的部分从头部剔除，再拼接。
  */
-export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id?: string }>(
+export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id?: string; isSteer?: boolean }>(
   canvas: T[],
   diskTail: T[],
   diskOffset: number,
@@ -1110,36 +1110,53 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   // 丢弃，不能因为它把画布上同一条提问的本地行（可能带附件）也一起排除。
   const tailIdentity = collectTailIdentity(actualTail);
   const olderHead: T[] = [];
+  // 已越过权威窗口、但磁盘切片里没有的本地直播行（还没落盘的这一轮）。
+  // 绝不能因为「下标落在窗口内」就把它们丢掉：那正是断网重连/刷新后 steer 段
+  // 凭空消失、只剩工具行的根因。保留原顺序、排在权威尾部之后再按身份去重。
+  const overlayTail: T[] = [];
   let currentTurnSourceIndex: number | undefined = undefined;
 
   for (const message of canvas) {
-    if (typeof message.sourceIndex === 'number') {
-      currentTurnSourceIndex = message.sourceIndex;
+    // steer 行的绝对下标是 fold 时按当前窗口末尾推算出来的，从来没被磁盘确认过；
+    // 拿它当排序依据会把整段 steer 判成「窗口内」而丢弃或重排。只认真正的转录下标。
+    const trustedIndex =
+      typeof message.sourceIndex === 'number' && message.isSteer !== true
+        ? message.sourceIndex
+        : undefined;
+    if (typeof trustedIndex === 'number') {
+      currentTurnSourceIndex = trustedIndex;
     }
-    // 权威切片起始偏移（diskOffset）判定：若当前所属轮次的下标已经 >= diskOffset，跳过
-    if (typeof currentTurnSourceIndex === 'number' && currentTurnSourceIndex >= diskOffset) {
-      continue;
-    }
+    const insideWindow =
+      typeof currentTurnSourceIndex === 'number' && currentTurnSourceIndex >= diskOffset;
     // 若整行既无 sourceIndex，也无任何前驱轮次下标支撑，跳过
     if (typeof currentTurnSourceIndex !== 'number' && typeof message.sourceIndex !== 'number') {
       continue;
     }
 
     let pruned = pruneDuplicatedTailContent(message, tailIdentity);
-    if (pruned) {
-      // 若画布行缺失图片（如推流期从无图广播事件生成），而权威磁盘 pinned 提问带图，自动补全图片
-      const pinnedMatch = pinnedInTail.find(
-        (p) =>
-          typeof p.sourceIndex === 'number' &&
-          p.sourceIndex === (pruned as any).sourceIndex &&
-          Array.isArray((p as any).images) &&
-          (p as any).images.length > 0,
-      );
-      if (pinnedMatch && (!(pruned as any).images || (pruned as any).images.length === 0)) {
-        pruned = { ...pruned, images: (pinnedMatch as any).images };
-      }
-      olderHead.push(pruned);
+    if (!pruned) continue;
+    if (typeof trustedIndex === 'number' && trustedIndex >= diskOffset) {
+      // 有自己的转录下标且落在窗口内：这一段由磁盘切片负责，画布副本直接丢弃。
+      continue;
     }
+    if (insideWindow) {
+      // 没有可信下标的本地尾巴（直播行 / steer）落在了窗口之后：
+      // 它们是唯一副本，保留并固定在权威尾部之后。
+      overlayTail.push(pruned);
+      continue;
+    }
+    // 若画布行缺失图片（如推流期从无图广播事件生成），而权威磁盘 pinned 提问带图，自动补全图片
+    const pinnedMatch = pinnedInTail.find(
+      (p) =>
+        typeof p.sourceIndex === 'number' &&
+        p.sourceIndex === (pruned as any).sourceIndex &&
+        Array.isArray((p as any).images) &&
+        (p as any).images.length > 0,
+    );
+    if (pinnedMatch && (!(pruned as any).images || (pruned as any).images.length === 0)) {
+      pruned = { ...pruned, images: (pinnedMatch as any).images };
+    }
+    olderHead.push(pruned);
   }
 
   const baseHead = olderHead.length > 0 ? olderHead : pinnedInTail;
@@ -1151,8 +1168,11 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   const sortWeights = new Map<T, number>();
   let runningWeight = 0;
   for (const m of combined) {
-    if (typeof m.sourceIndex === 'number') {
-      runningWeight = m.sourceIndex;
+    // 同样只认真正的转录下标：steer 的本地猜值既不能参与窗口判定，也不能参与排序。
+    const trusted =
+      typeof m.sourceIndex === 'number' && m.isSteer !== true ? m.sourceIndex : undefined;
+    if (typeof trusted === 'number') {
+      runningWeight = trusted;
       sortWeights.set(m, runningWeight);
     } else {
       runningWeight += 0.01;
@@ -1174,6 +1194,12 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
     if (typeof m.sourceIndex === 'number' && seenSrc.has(m.sourceIndex)) continue;
     if (m.id) seenIds.add(m.id);
     if (typeof m.sourceIndex === 'number') seenSrc.add(m.sourceIndex);
+    result.push(m);
+  }
+  // 未落盘的本地尾巴固定在最后：它们是当前这一轮最新的内容。
+  for (const m of overlayTail) {
+    if (m.id && seenIds.has(m.id)) continue;
+    if (m.id) seenIds.add(m.id);
     result.push(m);
   }
   return result;
