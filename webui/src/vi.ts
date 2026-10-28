@@ -394,6 +394,7 @@ export const vi: Record<keyof typeof en, string> = {
   'attach.removeImage': 'Bỏ ảnh',
   'attach.removeFile': 'Bỏ tệp',
   'attach.tooLarge': 'Ảnh phải nhỏ hơn {mb}M; ảnh quá lớn đã được bỏ qua.',
+  'attach.undecodable': 'Không thể giải mã “{name}” trên trình duyệt này. Vui lòng chuyển sang JPG/PNG rồi tải lại.',
   'attach.dropHint': 'Thả tệp để tải lên',
   'attach.uploading': 'Đang tải lên {name} ({current}/{total}) {percent}%',
   'attach.uploadFailed': 'Không thể tải tệp đính kèm: {msg}',

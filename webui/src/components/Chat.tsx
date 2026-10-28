@@ -115,6 +115,8 @@ import {
   fileToImageData,
   formatUserMessageWithAttachments,
   isImageFile,
+  looksLikeHeif,
+  normalizeMimeType,
   type PendingAttach,
   type PendingFile,
   type PendingImage,
@@ -10534,18 +10536,32 @@ export function Chat({
   async function addLocalFiles(files: File[] | FileList) {
     const arr = Array.from(files);
     if (arr.length === 0) return;
-    const imageFiles = arr.filter((f) => isImageFile(f));
-    const otherFiles = arr.filter((f) => !isImageFile(f));
+    // 部分 webview / 剪贴板给出的 HEIC 既无 MIME 也无图片扩展名，只能按字节判定
+    const undecided = arr.filter((f) => !isImageFile(f) && !normalizeMimeType(f.type));
+    const heifBlobs = new Set(
+      (await Promise.all(undecided.map(async (f) => ((await looksLikeHeif(f)) ? f : null)))).filter(
+        (f): f is File => f !== null,
+      ),
+    );
+    const isImageAttachment = (f: File) => isImageFile(f) || heifBlobs.has(f);
+    const imageFiles = arr.filter(isImageAttachment);
+    const otherFiles = arr.filter((f) => !isImageAttachment(f));
     const oversizedImages = imageFiles.filter((f) => f.size > MAX_IMAGE_BYTES);
+    const allowedImages = imageFiles.filter((f) => f.size <= MAX_IMAGE_BYTES);
+    const parsedResults = await Promise.all(
+      allowedImages.map(async (file) => ({ file, image: await fileToImageData(file) })),
+    );
+    // 浏览器解不开的格式（如 Windows Chrome 上的 HEIC/TIFF）会被丢弃：必须明确告知用户，
+    // 否则表现为“上传了但什么都没发生”；也绝不能把原始字节错标 MIME 发给模型（那是坏图）。
+    const undecodable = parsedResults.filter((r) => !r.image).map((r) => r.file);
+    const parsed = parsedResults.map((r) => r.image).filter((x): x is ImageData => x !== null);
     if (oversizedImages.length > 0) {
       setAttachError(t('attach.tooLarge', { mb: String(MAX_IMAGE_MB) }));
+    } else if (undecodable.length > 0) {
+      setAttachError(t('attach.undecodable', { name: undecodable[0].name }));
     } else {
       setAttachError(null);
     }
-    const allowedImages = imageFiles.filter((f) => f.size <= MAX_IMAGE_BYTES);
-    const parsed = (await Promise.all(allowedImages.map(fileToImageData))).filter(
-      (x): x is ImageData => x !== null,
-    );
     const counts = countPending(pendingAttach);
     const nextImages = parsed.slice(0, Math.max(0, MAX_IMAGES - counts.images));
     const added: PendingAttach[] = [

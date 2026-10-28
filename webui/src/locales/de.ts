@@ -15,6 +15,7 @@ export const de: Record<keyof typeof en, string> = {
   'attach.skillsEmpty': 'No skills yet. Add one at .jeikcode/skills/<name>/SKILL.md, or ~/.jeikcode/skills/ to share globally.',
   'attach.skillsLoading': 'Loading…',
   'attach.tooLarge': 'Images must be under {mb}M; oversized images were skipped.',
+  'attach.undecodable': 'Cannot decode “{name}” in this browser. Convert it to JPG/PNG and try again.',
   'attach.uploadFailed': 'Failed to upload attachments: {msg}',
   'attach.uploading': 'Uploading {name} ({current}/{total}) {percent}%',
   'cap.global': 'Global',

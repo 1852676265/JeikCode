@@ -142,6 +142,7 @@ export function InlineBubbleEditor({
     const list = Array.from(files);
     const counts = countPending(pendingAttach);
     const added: PendingAttach[] = [];
+    const undecodable: string[] = [];
     setUploading(true);
     for (const file of list) {
       if (counts.images >= MAX_IMAGES) break;
@@ -154,10 +155,16 @@ export function InlineBubbleEditor({
             kind: 'image',
             image: img,
           });
+        } else {
+          // 浏览器解不开的格式（HEIC/TIFF 等）不会静默丢失，明确提示用户先转格式
+          undecodable.push(file.name);
         }
       }
     }
     setUploading(false);
+    if (undecodable.length > 0) {
+      showToast(t('attach.undecodable', { name: undecodable[0] }), 'error');
+    }
     if (added.length) {
       setPendingAttach((prev) => [...prev, ...added]);
     }

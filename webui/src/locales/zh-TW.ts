@@ -15,6 +15,7 @@ export const zhTw: Record<keyof typeof en, string> = {
   'attach.skillsEmpty': '暂無可用技能。在專案 .jeikcode/skills/<名称>/SKILL.md 添加技能，或放到 ~/.jeikcode/skills/ 全局共享。',
   'attach.skillsLoading': '載入中…',
   'attach.tooLarge': '圖片不能超过 {mb}M，已自動忽略超限圖片。',
+  'attach.undecodable': '無法解碼「{name}」：目前瀏覽器不支援該圖片格式，請先轉成 JPG/PNG 再上傳。',
   'attach.uploadFailed': '上傳附件失敗：{msg}',
   'attach.uploading': '正在上傳 {name}（{current}/{total}）{percent}%',
   'cap.global': '全局',
