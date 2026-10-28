@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const DEFAULT_MAX_CONCURRENT: usize = 3;
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
 /// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
 /// The TUI routes marker-prefixed chunks to the in-place spinner instead of scrollback.
@@ -335,7 +334,9 @@ pub struct TaskTool {
     make_capable_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
     make_explore_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
-    max_concurrent: usize,
+    /// `Some(n)` bounds how many children run at once; `None` = unbounded
+    /// (config `[subagent] max_concurrent = 0`).
+    max_concurrent: Option<usize>,
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
@@ -353,15 +354,20 @@ impl TaskTool {
             make_capable_provider: Box::new(make_capable_provider),
             make_explore_tools: Box::new(make_explore_tools),
             make_worker_tools: Box::new(make_worker_tools),
-            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            // Unbounded by default: the shipped config is `max_concurrent = 0`.
+            max_concurrent: None,
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
         }
     }
 
+    /// Bound how many children run at once. `0` removes the bound entirely —
+    /// every dispatched subtask starts immediately, and liveness is left to the
+    /// provider idle clocks, the per-child round cap, and explicit cancel.
+    /// Any other value is used as-is (no floor, so `1` means strictly serial).
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
-        self.max_concurrent = n.max(1);
+        self.max_concurrent = (n != 0).then_some(n);
         self
     }
 
@@ -482,7 +488,11 @@ impl Tool for TaskTool {
             };
         }
 
-        let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+        // `None` = unbounded: skip the semaphore entirely instead of handing out
+        // an effectively-infinite permit count.
+        let sem = self
+            .max_concurrent
+            .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
         let max_rounds = self.max_rounds;
         let tool_loop_policy = self.tool_loop_policy;
         let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
@@ -542,7 +552,16 @@ impl Tool for TaskTool {
             ));
 
             set.spawn(async move {
-                let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                // Unbounded mode carries no permit guard at all.
+                let _permit = match &sem {
+                    Some(sem) => Some(
+                        sem.clone()
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore not closed"),
+                    ),
+                    None => None,
+                };
                 // ↻ started — include a compact preview of WHAT this subtask is, so a live
                 // fan-out shows each child's job, not just its number.
                 progress.emit(subtask_progress_line(

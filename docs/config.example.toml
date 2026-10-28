@@ -290,7 +290,7 @@ no_fold_tools = [
 enabled = true          # 遗留字段，不生效（改这个不会关掉 subagent；用 JEIKCODE_SUBAGENT=0）
 initial_turns = 4       # 遗留字段，不生效
 max_turns = 12          # 遗留字段，不生效
-max_concurrent = 3      # 生效：并发子 agent 上限（下限 1）
+max_concurrent = 0      # 生效：并发子 agent 上限（0 = 不限制，默认；>0 表示上限）
 timeout_secs = 900      # 遗留字段：仍可解析，但不生效
 max_rounds = 200        # 生效：单个子任务模型轮次高水位（0=不设上限；继承上面的精确防护策略）
 

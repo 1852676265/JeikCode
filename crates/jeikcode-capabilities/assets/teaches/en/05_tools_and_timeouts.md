@@ -109,7 +109,7 @@ Environment variable overrides: `JEIKCODE_CONNECT_TIMEOUT_SECS`, `JEIKCODE_OPEN_
 
 ```toml
 [subagent]
-max_concurrent = 3              # Maximum concurrent subagents (default 3)
+max_concurrent = 0              # Maximum concurrent subagents (0 = unlimited, the default; >0 caps it)
 max_rounds = 230                # Maximum interaction rounds per subagent (0 = unlimited)
 ```
 

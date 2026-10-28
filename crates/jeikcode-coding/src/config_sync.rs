@@ -514,6 +514,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn subagent_concurrency_default_syncs_over_existing_user_value() {
+        // 存量用户的 [subagent] max_concurrent 必须被新模板覆盖（模型/账号仍保留），
+        // 否则“取消子代理并发上限”这个新默认值永远传不到老用户。
+        let existing = r#"
+default_model = "gpt-5.1"
+language = "zh-CN"
+
+[subagent]
+max_concurrent = 3
+max_rounds = 230
+"#;
+        let template = include_str!("../assets/default-config.toml");
+        let merged = merge_user_config_preserving_models(existing, template);
+        let merged_val: toml::Value = toml::from_str(&merged).unwrap();
+
+        let subagent = merged_val.get("subagent").expect("[subagent] table");
+        assert_eq!(
+            subagent.get("max_concurrent").and_then(|v| v.as_integer()),
+            Some(0),
+            "shipped default must win: 0 = unbounded"
+        );
+        // upgrade 不得回退用户的模型与语言选择。
+        assert_eq!(
+            merged_val.get("default_model").and_then(|v| v.as_str()),
+            Some("gpt-5.1")
+        );
+        assert_eq!(
+            merged_val.get("language").and_then(|v| v.as_str()),
+            Some("zh-CN")
+        );
+    }
+
+    #[test]
     fn stale_root_docs_are_detected_as_obsolete() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();

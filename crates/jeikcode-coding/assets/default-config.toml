@@ -15,7 +15,8 @@ offline_mode = "off"
 [subagent]
 # Live knobs: max_concurrent / max_rounds. enabled / initial_turns / max_turns /
 # timeout_secs are kept only so old config files still parse.
-max_concurrent = 3
+# max_concurrent: 0 = unbounded (no queueing) — the shipped default.
+max_concurrent = 0
 max_rounds = 230
 
 [loop_config]

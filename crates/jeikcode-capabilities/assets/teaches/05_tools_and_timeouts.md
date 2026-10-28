@@ -114,7 +114,7 @@ first_token_timeout_retries = 3 # 首 Token 超时后自动重试次数
 
 ```toml
 [subagent]
-max_concurrent = 3              # 最大并发子代理数（默认 3）
+max_concurrent = 0              # 最大并发子代理数（0 表示不限制，默认；>0 表示上限）
 max_rounds = 230                # 每个子代理最大交互轮次（0 表示无限制）
 ```
 

@@ -500,7 +500,9 @@ pub struct SubAgentConfig {
     pub initial_turns: usize,
     /// Vestigial (retired resilience path); not currently read.
     pub max_turns: usize,
-    /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
+    /// Max parallel subagents the `task` tool runs at once. Default `0` =
+    /// unbounded (every dispatched subtask starts immediately); set `N > 0`
+    /// to cap the batch at N concurrent children.
     pub max_concurrent: usize,
     /// Deprecated compatibility field. Subtasks no longer have a total wall-clock limit;
     /// provider idle timeouts, `max_rounds`, and explicit cancellation own liveness.
@@ -516,7 +518,7 @@ impl Default for SubAgentConfig {
             enabled: true,
             initial_turns: 4,
             max_turns: 12,
-            max_concurrent: 3,
+            max_concurrent: 0,
             // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
             max_rounds: 230,

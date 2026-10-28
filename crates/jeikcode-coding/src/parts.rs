@@ -1928,7 +1928,7 @@ pub fn subagent_runtime_knobs(
     let max_rounds = max_rounds_env
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(cfg.max_rounds);
-    (cfg.max_concurrent.max(1), max_rounds)
+    (cfg.max_concurrent, max_rounds)
 }
 
 #[cfg(test)]
@@ -1986,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
+    fn subagent_runtime_knobs_ignore_legacy_timeout_and_keep_zero_as_unbounded() {
         use super::subagent_runtime_knobs;
         use jeikcode_config::config::SubAgentConfig;
         let cfg = SubAgentConfig {
@@ -1995,16 +1995,16 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
-        assert_eq!(mc, 1, "max_concurrent is still floored to one");
+        assert_eq!(mc, 0, "zero is passed through and means unbounded");
         assert_eq!(rounds, 230);
     }
 
     #[test]
-    fn subagent_runtime_knobs_default_config_preserves_live_defaults() {
+    fn subagent_runtime_knobs_default_config_is_unbounded() {
         use super::subagent_runtime_knobs;
         use jeikcode_config::config::SubAgentConfig;
         let (mc, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
-        assert_eq!(mc, 3, "default max_concurrent unchanged");
+        assert_eq!(mc, 0, "default is unbounded — a fan-out never queues");
         assert_eq!(rounds, 230, "default child round high-water unchanged");
     }
 
