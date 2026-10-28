@@ -1001,7 +1001,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::OnboardingLanguageOptionZhCn => "简体中文 (Simplified Chinese)".into(),
         Msg::OnboardingSetupTitle => "想怎么开始？".into(),
         Msg::OnboardingNavHint =>
-            "1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过".into(),
+            "↑↓ 选择 · Enter 确认 · ← 返回 · Esc 跳过".into(),
         Msg::OnboardingConfirmClear =>
             "/welcome 会清屏。是否继续？[y/N]".into(),
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),

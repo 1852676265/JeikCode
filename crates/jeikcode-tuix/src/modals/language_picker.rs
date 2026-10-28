@@ -24,19 +24,15 @@ pub struct LanguagePicker {
 impl LanguagePicker {
     pub fn open() -> Self {
         let current = i18n::current_locale();
-        let options = vec![
-            (Locale::En, "English".to_string(), "en".to_string()),
-            (Locale::Vi, "Tiếng Việt".to_string(), "vi-VN".to_string()),
-            (Locale::ZhCn, "简体中文".to_string(), "zh_CN".to_string()),
-            (Locale::ZhTw, "繁體中文".to_string(), "zh_TW".to_string()),
-            (Locale::Ja, "日本語".to_string(), "ja".to_string()),
-            (Locale::Ko, "한국어".to_string(), "ko".to_string()),
-            (Locale::Ru, "Русский".to_string(), "ru".to_string()),
-            (Locale::Fr, "Français".to_string(), "fr".to_string()),
-            (Locale::Es, "Español".to_string(), "es".to_string()),
-            (Locale::De, "Deutsch".to_string(), "de".to_string()),
-            (Locale::Ar, "العربية".to_string(), "ar".to_string()),
-        ];
+        // Labels lead with the ASCII English name (see
+        // `Locale::display_label`): a terminal font without the native
+        // script paints only tofu for the parenthetical half, so the row
+        // must stay identifiable from its prefix. The trailing locale code
+        // is ASCII in every case and doubles as the `/language <code>` key.
+        let options: Vec<(Locale, String, String)> = Locale::ALL
+            .iter()
+            .map(|&locale| (locale, locale.display_label(), locale.to_string()))
+            .collect();
         let selected = options
             .iter()
             .position(|(loc, _, _)| *loc == current)
@@ -116,13 +112,13 @@ mod tests {
 
     // Vietnamese should be selected from the global locale.
     #[test]
-    fn open_selects_vietnamese_with_native_label() {
+    fn open_selects_vietnamese_with_english_led_label() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(Locale::Vi);
         let picker = LanguagePicker::open();
         assert_eq!(picker.selected, 1);
         assert_eq!(picker.options.len(), 11);
-        assert_eq!(picker.options[1].1, "Tiếng Việt");
+        assert_eq!(picker.options[1].1, "Vietnamese (Tiếng Việt)");
         assert_eq!(picker.options[1].2, "vi-VN");
         let msg = crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
             label: "Tiếng Việt",
@@ -138,6 +134,24 @@ mod tests {
         crate::i18n::set_locale(Locale::En);
         let picker = LanguagePicker::open();
         assert_eq!(picker.selected, 0); // En is first option
+    }
+
+    /// Same font-independence contract as onboarding: the label prefix is
+    /// ASCII, so the row survives a terminal that tofus the native script.
+    #[test]
+    fn every_option_label_starts_with_an_ascii_english_name() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
+        let picker = LanguagePicker::open();
+        for (locale, label, code) in &picker.options {
+            assert!(
+                label.starts_with(locale.english_name()),
+                "{label:?} must lead with {:?}",
+                locale.english_name()
+            );
+            assert!(locale.english_name().is_ascii());
+            assert_eq!(code, &locale.to_string(), "hint is the /language key");
+        }
     }
 
     /// Switching to zh_CN renders a Chinese confirmation line that

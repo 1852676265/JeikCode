@@ -85,6 +85,59 @@ impl Locale {
         }
     }
 
+    /// Every locale the product ships, in the order the language pickers
+    /// list them (English first, then the rest). Single source of truth for
+    /// the TUI onboarding wizard and the `/language` menu so the two can't
+    /// drift apart.
+    pub const ALL: &'static [Locale] = &[
+        Self::En,
+        Self::Vi,
+        Self::ZhCn,
+        Self::ZhTw,
+        Self::Ja,
+        Self::Ko,
+        Self::Ru,
+        Self::Fr,
+        Self::Es,
+        Self::De,
+        Self::Ar,
+    ];
+
+    /// Latin-script (English) name of the language — always ASCII.
+    ///
+    /// TUI pickers print this FIRST because the terminal font is unknown:
+    /// a Linux console or an X11 `fixed`-font xterm has no CJK coverage and
+    /// paints [`Self::native_name`] as `♦`/`□` tofu. The English half keeps
+    /// every row identifiable there.
+    pub fn english_name(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::Vi => "Vietnamese",
+            Self::ZhCn => "Simplified Chinese",
+            Self::ZhTw => "Traditional Chinese",
+            Self::Ja => "Japanese",
+            Self::Ko => "Korean",
+            Self::Ru => "Russian",
+            Self::Fr => "French",
+            Self::Es => "Spanish",
+            Self::De => "German",
+            Self::Ar => "Arabic",
+        }
+    }
+
+    /// Terminal-safe label: `<English name> (<native name>)`, or just the
+    /// English name when both are the same (English itself). The native
+    /// half is a recognition hint only — never the identifier.
+    pub fn display_label(self) -> String {
+        let english = self.english_name();
+        let native = self.native_name();
+        if english == native {
+            english.to_string()
+        } else {
+            format!("{english} ({native})")
+        }
+    }
+
     /// Canonical key shared by the daemon and language selectors.
     pub fn language_key(self) -> &'static str {
         match self {
@@ -260,6 +313,59 @@ mod tests {
             assert_eq!(Locale::from_u8(locale.as_u8()), locale);
         }
         assert_eq!(Locale::from_u8(99), Locale::En);
+    }
+
+    /// `ALL` is what both TUI pickers enumerate; a locale missing here is
+    /// unreachable from the UI, and a duplicate would render twice.
+    #[test]
+    fn all_covers_every_locale_exactly_once() {
+        assert_eq!(Locale::ALL.len(), 11);
+        assert_eq!(Locale::ALL[0], Locale::En, "English must stay first");
+        let mut seen = std::collections::HashSet::new();
+        for &locale in Locale::ALL {
+            assert!(seen.insert(locale), "{locale:?} listed twice");
+            assert_eq!(Locale::from_u8(locale.as_u8()), locale);
+            assert_eq!(locale.to_string().parse::<Locale>().unwrap(), locale);
+        }
+    }
+
+    /// The English name is the terminal-safe identifier: it must be ASCII
+    /// (so it survives a font with no CJK/Arabic coverage) and unique (so
+    /// no two rows become indistinguishable when the native half tofus).
+    #[test]
+    fn english_names_are_ascii_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for &locale in Locale::ALL {
+            let name = locale.english_name();
+            assert!(!name.is_empty(), "{locale:?} has no English name");
+            assert!(
+                name.is_ascii(),
+                "{locale:?} English name must be ASCII, got {name:?}"
+            );
+            assert!(seen.insert(name), "duplicate English name: {name:?}");
+        }
+        assert_eq!(seen.len(), Locale::ALL.len());
+    }
+
+    #[test]
+    fn display_label_leads_with_the_english_name() {
+        for &locale in Locale::ALL {
+            let label = locale.display_label();
+            assert!(
+                label.starts_with(locale.english_name()),
+                "{locale:?} label must lead with its English name: {label:?}"
+            );
+            assert!(
+                label.contains(locale.native_name()),
+                "{locale:?} label must keep the native name as a hint: {label:?}"
+            );
+        }
+        // English has no distinct native spelling to repeat.
+        assert_eq!(Locale::En.display_label(), "English");
+        assert_eq!(
+            Locale::ZhCn.display_label(),
+            "Simplified Chinese (简体中文)"
+        );
     }
 
     #[test]

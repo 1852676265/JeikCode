@@ -975,7 +975,7 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         Msg::OnboardingLanguageOptionZhCn => "简体中文".into(),
         Msg::OnboardingSetupTitle => "Bạn muốn thiết lập như thế nào?".into(),
         Msg::OnboardingNavHint =>
-            "1-3 chọn · Enter xác nhận · ← quay lại · Esc bỏ qua".into(),
+            "↑↓ chọn · Enter xác nhận · ← quay lại · Esc bỏ qua".into(),
         Msg::OnboardingConfirmClear =>
             "/welcome sẽ xóa màn hình. Tiếp tục? [y/N]".into(),
         Msg::CmdWelcomeDescription => "Chạy lại trình hướng dẫn ban đầu".into(),

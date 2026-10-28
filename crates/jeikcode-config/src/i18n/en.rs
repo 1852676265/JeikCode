@@ -1013,8 +1013,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::OnboardingLanguageOptionEn => "English".into(),
         Msg::OnboardingLanguageOptionZhCn => "简体中文 (Simplified Chinese)".into(),
         Msg::OnboardingSetupTitle => "How would you like to set up?".into(),
+        // Arrows, not a digit range: step 2 lists every shipped locale
+        // (11 rows, and the number-key shortcut only reaches 1-9).
         Msg::OnboardingNavHint =>
-            "1-3 select · Enter confirm · ← back · Esc skip".into(),
+            "↑↓ select · Enter confirm · ← back · Esc skip".into(),
         Msg::OnboardingConfirmClear =>
             "/welcome will clear the screen. Continue? [y/N]".into(),
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),

@@ -318,19 +318,11 @@ pub struct OnboardingWizard {
     pub(super) needs_confirm: bool,
 }
 
-pub const ONBOARDING_LANGUAGES: &[jeikcode_config::locale::Locale] = &[
-    jeikcode_config::locale::Locale::En,
-    jeikcode_config::locale::Locale::Vi,
-    jeikcode_config::locale::Locale::ZhCn,
-    jeikcode_config::locale::Locale::ZhTw,
-    jeikcode_config::locale::Locale::Ja,
-    jeikcode_config::locale::Locale::Ko,
-    jeikcode_config::locale::Locale::Ru,
-    jeikcode_config::locale::Locale::Fr,
-    jeikcode_config::locale::Locale::Es,
-    jeikcode_config::locale::Locale::De,
-    jeikcode_config::locale::Locale::Ar,
-];
+/// Languages offered by the wizard, in display order. Aliased to
+/// [`jeikcode_config::locale::Locale::ALL`] so `/language` and onboarding
+/// can never disagree about the set or the ordering.
+pub const ONBOARDING_LANGUAGES: &[jeikcode_config::locale::Locale] =
+    jeikcode_config::locale::Locale::ALL;
 
 impl OnboardingWizard {
     /// Standard constructor — `/welcome` with empty body. The 3-step
@@ -570,7 +562,12 @@ impl OnboardingWizard {
         out.push(t(Msg::OnboardingStepHeaderLanguage).into_owned());
         out.push(String::new());
 
-        // Native labels let users pick their preferred language before the UI is translated.
+        // Rows lead with the ASCII English name and append the native
+        // spelling as a recognition hint. The terminal font is still
+        // unknown at this point — a Linux console or an xterm using the
+        // classic `fixed` bitmap font has no CJK coverage and paints the
+        // native half as `♦`/`□` tofu — so the English name is what makes
+        // the row identifiable, never the native one alone.
         let mut content: Vec<String> = Vec::new();
         content.push(String::new());
         content.push(t(Msg::OnboardingLanguageTitleBilingual).into_owned());
@@ -579,7 +576,7 @@ impl OnboardingWizard {
         content.push(String::new());
         for (i, loc) in ONBOARDING_LANGUAGES.iter().enumerate() {
             let bullet = if i == self.language_idx { '●' } else { '○' };
-            content.push(format!("{bullet}  [{}] {}", i + 1, loc.native_name()));
+            content.push(format!("{bullet}  [{}] {}", i + 1, loc.display_label()));
         }
         content.push(String::new());
         content.push(t(Msg::OnboardingNavHint).into_owned());
@@ -1176,10 +1173,10 @@ mod tests {
 
     // ── Step 2 (Language) draw + apply tests ──
 
-    /// Bilingual title + 3 numbered options + nav hint all present in
+    /// Bilingual title + numbered options + nav hint all present in
     /// the rendered output.
     #[test]
-    fn language_layout_has_three_options_with_numbers() {
+    fn language_layout_has_numbered_options() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_language_lines(80, true);
@@ -1190,14 +1187,46 @@ mod tests {
             .join("\n");
         // Bilingual title (locale-independent).
         assert!(joined.contains("Choose your language / 选择语言"));
-        // Three numbered options.
+        // Numbered options: English name first, native spelling as a hint.
         assert!(joined.contains("[1] English"));
-        assert!(joined.contains("[2] Tiếng Việt"));
-        assert!(joined.contains("[3] 简体中文"));
+        assert!(joined.contains("[2] Vietnamese (Tiếng Việt)"));
+        assert!(joined.contains("[3] Simplified Chinese (简体中文)"));
         // Step header + indicator.
         assert!(joined.contains("Step 2/3 · Language"));
         // Nav hint.
-        assert!(joined.contains("1-3 select"));
+        assert!(joined.contains("select"));
+    }
+
+    /// Regression for the reported Linux bug: on a terminal whose font has
+    /// no CJK coverage (xterm with the classic `fixed` bitmap font, the
+    /// kernel VT console, …) the native half of every row renders as tofu.
+    /// Each row must still be identifiable from its ASCII prefix alone.
+    #[test]
+    fn every_language_row_is_identifiable_without_native_glyphs() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_language_lines(80, true);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (i, loc) in ONBOARDING_LANGUAGES.iter().enumerate() {
+            // Simulate a font that can only paint ASCII: drop every
+            // non-ASCII cell and the row must STILL name its language.
+            let ascii_row: String = joined
+                .lines()
+                .find(|l| l.contains(&format!("[{}] ", i + 1)))
+                .unwrap_or_else(|| panic!("row {} missing", i + 1))
+                .chars()
+                .filter(|c| c.is_ascii())
+                .collect();
+            assert!(
+                ascii_row.contains(loc.english_name()),
+                "row {} is unidentifiable without native glyphs: {ascii_row:?}",
+                i + 1
+            );
+        }
     }
 
     /// Selected marker `●` sits on the row matching language_idx;
@@ -1215,7 +1244,8 @@ mod tests {
             .map(|s| strip_sgr(s))
             .collect::<Vec<_>>()
             .join("\n");
-        // `●  [3] 简体中文` selected; `○  [2] Tiếng Việt` unselected.
+        // `●  [3] Simplified Chinese …` selected; `○  [2] Vietnamese …`
+        // unselected.
         let pos_filled = joined.find("●  [3]").expect("filled marker missing");
         let pos_hollow = joined.find("○  [2]").expect("hollow marker missing");
         assert!(
