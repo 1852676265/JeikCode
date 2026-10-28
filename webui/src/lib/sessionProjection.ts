@@ -1009,6 +1009,51 @@ export function paintAssistantNotice<T extends ProjectionMessage>(
   ];
 }
 
+/** 展示账本/磁盘快照里永远不会存在的“本地 UI 部件”。权威切片按行身份替换画布行时
+ *  必须把它们接回同一条消息，否则一次终态对账就会把压缩标记/通知冲掉
+ *  （todolist 另有 placeArchivedTodos 回贴，不在此列，避免复活旧清单）。 */
+const LOCAL_ONLY_PART_KINDS = new Set(['notice', 'rate_limited']);
+
+/** 把画布上同一条消息的本地部件补回权威行（保持原有相对顺序，磁盘行不动）。 */
+function withLocalOnlyParts<T extends { id?: string }>(row: T, canvasById: Map<string, T>): T {
+  if (!row.id) return row;
+  const local = canvasById.get(row.id);
+  if (!local || local === row) return row;
+  const localParts = ((local as { parts?: MsgPart[] }).parts ?? []).filter((part) =>
+    LOCAL_ONLY_PART_KINDS.has(part.kind),
+  );
+  if (localParts.length === 0) return row;
+  const diskParts = ((row as { parts?: MsgPart[] }).parts ?? []) as MsgPart[];
+  const alreadyThere = (part: MsgPart): boolean =>
+    diskParts.some(
+      (existing) =>
+        existing.kind === part.kind &&
+        // 同一段文本算同一条；限流卡只看是否已有同类提示。
+        (existing as { text?: string }).text === (part as { text?: string }).text,
+    );
+  const missing = localParts.filter((part) => !alreadyThere(part));
+  if (missing.length === 0) return row;
+  return { ...row, parts: [...diskParts, ...missing] };
+}
+
+/** 本地通知行（命令输出 / 压缩标记）在画布中的插入位置：钉在创建时的锚点之后。 */
+function localNoticeInsertIndex<T extends { id?: string; sourceIndex?: number }>(
+  rows: T[],
+  notice: { anchorId?: string; anchorSourceIndex?: number },
+): number {
+  if (notice.anchorId) {
+    const anchored = rows.findIndex((row) => row.id === notice.anchorId);
+    if (anchored >= 0) return anchored + 1;
+  }
+  if (typeof notice.anchorSourceIndex === 'number') {
+    const next = rows.findIndex(
+      (row) => typeof row.sourceIndex === 'number' && row.sourceIndex > notice.anchorSourceIndex!,
+    );
+    return next >= 0 ? next : rows.length;
+  }
+  return rows.length;
+}
+
 /** 权威切片里已出现过的身份（行 id / part id / 工具 call id）。 */
 interface TailIdentity {
   ids: Set<string>;
@@ -1083,7 +1128,16 @@ function pruneDuplicatedTailContent<T extends { sourceIndex?: number; id?: strin
  * 「更早历史」保留，整轮回答就会在权威尾部之后重放一遍。因此先按行 id / part id /
  * 工具 call id 把切片已渲染的部分从头部剔除，再拼接。
  */
-export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id?: string; isSteer?: boolean }>(
+export function spliceAuthoritativeDiskTail<
+  T extends {
+    sourceIndex?: number;
+    id?: string;
+    isSteer?: boolean;
+    role?: string;
+    anchorId?: string;
+    anchorSourceIndex?: number;
+  },
+>(
   canvas: T[],
   diskTail: T[],
   diskOffset: number,
@@ -1092,13 +1146,21 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   if (!diskTail || diskTail.length === 0) return canvas;
   if (diskOffset <= 0) return diskTail;
 
+  const canvasById = new Map<string, T>();
+  for (const row of canvas) {
+    if (row.id) canvasById.set(row.id, row);
+  }
+
+  // 权威行替换画布行时，把本地 UI 部件（通知 / 限流）接回同一条消息。
+  const withLocalParts = (row: T): T => withLocalOnlyParts(row, canvasById);
+
   const actualTail: T[] = [];
   const pinnedInTail: T[] = [];
   for (const message of diskTail) {
     if (typeof message.sourceIndex === 'number' && message.sourceIndex < diskOffset) {
-      pinnedInTail.push(message);
+      pinnedInTail.push(withLocalParts(message));
     } else {
-      actualTail.push(message);
+      actualTail.push(withLocalParts(message));
     }
   }
 
@@ -1114,9 +1176,19 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
   // 绝不能因为「下标落在窗口内」就把它们丢掉：那正是断网重连/刷新后 steer 段
   // 凭空消失、只剩工具行的根因。保留原顺序、排在权威尾部之后再按身份去重。
   const overlayTail: T[] = [];
+  // 带锚点的本地通知行（命令输出 / 压缩标记）：它们不属于直播尾巴，创建时就钉在
+  // 某一轮之后。必须按锚点归位，否则会被当成“未落盘尾巴”拖到会话末尾，
+  // 表现为每一轮的尾都已带着它（与先前黄色通知堆叠同一类问题）。
+  const anchoredNotices: T[] = [];
   let currentTurnSourceIndex: number | undefined = undefined;
 
   for (const message of canvas) {
+    const anchored =
+      message.role === 'system' || message.anchorId !== undefined || message.anchorSourceIndex !== undefined;
+    if (anchored) {
+      anchoredNotices.push(message);
+      continue;
+    }
     // steer 行的绝对下标是 fold 时按当前窗口末尾推算出来的，从来没被磁盘确认过；
     // 拿它当排序依据会把整段 steer 判成「窗口内」而丢弃或重排。只认真正的转录下标。
     const trustedIndex =
@@ -1201,6 +1273,20 @@ export function spliceAuthoritativeDiskTail<T extends { sourceIndex?: number; id
     if (m.id && seenIds.has(m.id)) continue;
     if (m.id) seenIds.add(m.id);
     result.push(m);
+  }
+  // 本地通知行按创建时的锚点归位（压缩标记冻结在发生压缩的那一轮尾部）。
+  // 同一锚点有多条时保持它们在画布上的先后顺序。
+  const byInsertIndex = new Map<number, T[]>();
+  for (const notice of anchoredNotices) {
+    if (notice.id && seenIds.has(notice.id)) continue;
+    if (notice.id) seenIds.add(notice.id);
+    const at = localNoticeInsertIndex(result, notice);
+    const bucket = byInsertIndex.get(at);
+    if (bucket) bucket.push(notice);
+    else byInsertIndex.set(at, [notice]);
+  }
+  for (const [at, rows] of [...byInsertIndex.entries()].sort((a, b) => b[0] - a[0])) {
+    result.splice(at, 0, ...rows);
   }
   return result;
 }

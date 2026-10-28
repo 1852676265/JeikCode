@@ -166,7 +166,9 @@ export function mergeDiskWithUnpersistedTail<T extends TailMessage>(
   // 身份定位优先：从「最后一条与磁盘共有的消息」之后整段接回（支持多个中途转向）。
   const byIdentity = unpersistedTailStart(disk, canvas);
   if (byIdentity >= 0) {
-    return byIdentity < canvas.length ? [...disk, ...canvas.slice(byIdentity)] : disk;
+    // spliced 已经按锚点放回过本地通知行（压缩标记等），接尾巴时避免同一对象再插一遍。
+    const tail = canvas.slice(byIdentity).filter((row) => !disk.includes(row));
+    return tail.length > 0 ? [...disk, ...tail] : disk;
   }
 
   let lastUser = -1;
@@ -200,7 +202,7 @@ export function mergeDiskWithUnpersistedTail<T extends TailMessage>(
     if (textMatches || imageMatches) return disk;
   }
 
-  return [...disk, ...canvas.slice(lastUser)];
+  return [...disk, ...canvas.slice(lastUser).filter((row) => !disk.includes(row))];
 }
 
 /**

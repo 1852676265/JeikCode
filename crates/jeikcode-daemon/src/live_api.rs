@@ -1907,6 +1907,11 @@ pub(crate) enum LiveWireEvent {
         /// live context meter immediately (no usage frame follows a compaction).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_after: Option<u32>,
+        /// 提示所属的 assistant / user 消息 id（管线身份），与 `/chat` 的
+        /// `ChatEvent::Warning` 同口径。缺省时客户端只能挂到“最后一条”，
+        /// 于是通知会跟着时间线尾巴逐轮漂移；带上锚点才能冻结在所属回合。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Auxiliary session persistence failed. Kept distinct from conversational
     /// warnings so browser clients render it outside the message timeline.
@@ -1987,6 +1992,9 @@ pub(crate) enum LiveWireEvent {
         /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
         #[serde(default)]
         server_message: Option<String>,
+        /// 与 `Warning` 相同的回合锚点：限流提示属于发生限流的那一轮。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
 }
 
@@ -2022,6 +2030,14 @@ impl NativeLiveWireProjector {
     /// `part_id` or a replay cannot converge the two runs separately.
     fn end_streaming_part(&mut self) {
         self.last_part_kind = None;
+    }
+
+    /// Anchor for a non-fatal notice (`warning` / `rate_limited`), mirroring the
+    /// `/chat` projector: the streaming assistant round if one exists, otherwise
+    /// the most recent assistant boundary. An idle manual compaction therefore
+    /// anchors to the turn it drained instead of the timeline tail.
+    fn notice_anchor(&self) -> Option<String> {
+        self.current_message_id.clone()
     }
 
     #[cfg(test)]
@@ -2200,6 +2216,7 @@ impl NativeLiveWireProjector {
                     LiveWireEvent::Warning {
                         message: mark,
                         tokens_after: Some(after_tokens as u32),
+                        message_id: self.notice_anchor(),
                     }
                 }
                 Kernel::CompactionFailed { error, .. } => {
@@ -2212,6 +2229,7 @@ impl NativeLiveWireProjector {
                     LiveWireEvent::Warning {
                         message: format!("Compaction failed: {error}"),
                         tokens_after: None,
+                        message_id: self.notice_anchor(),
                     }
                 }
                 Kernel::CompactionStarted { .. } => {
@@ -2230,6 +2248,7 @@ impl NativeLiveWireProjector {
                 Kernel::Warning(message) => LiveWireEvent::Warning {
                     message: crate::localize_agent_warning(&message),
                     tokens_after: None,
+                    message_id: self.notice_anchor(),
                 },
                 Kernel::RateLimited {
                     reset_at_display,
@@ -2243,6 +2262,7 @@ impl NativeLiveWireProjector {
                     secs_until_reset,
                     auto_resuming,
                     server_message,
+                    message_id: self.notice_anchor(),
                 },
                 Kernel::ToolCallStreaming { .. }
                 | Kernel::ToolBatchStarted { .. }
@@ -2366,6 +2386,7 @@ impl NativeLiveWireProjector {
                 LiveWireEvent::Warning {
                     message: crate::localize_agent_warning(&message),
                     tokens_after: None,
+                    message_id: self.notice_anchor(),
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::PersistenceWarning(message)) => {
@@ -2392,6 +2413,7 @@ impl NativeLiveWireProjector {
                     outcome.estimated_tokens_after,
                 ),
                 tokens_after: Some(outcome.estimated_tokens_after as u32),
+                message_id: self.notice_anchor(),
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Failed { error, .. },
@@ -5290,6 +5312,46 @@ mod tests {
         assert_eq!(json["reset_label"], "5h");
         assert_eq!(json["secs_until_reset"], 7200);
         assert_eq!(json["server_message"], "provider quota exhausted");
+    }
+
+    #[test]
+    fn native_live_projector_anchors_notices_to_the_streaming_round() {
+        use jeikcode_kernel::event::AgentEvent as Kernel;
+
+        let mut projector = NativeLiveWireProjector::default();
+        // 回合边界（AssistantMessage）只记录身份，本身不上屏。
+        assert!(projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(Kernel::AssistantMessage {
+                    message_id: "m-round".into(),
+                }),
+            ))
+            .is_none());
+
+        // 黄色提示必须携带该轮的 message_id，否则前端只能挂到“最后一条”，
+        // 压缩标记就会逐轮漂移到时间线尾部。
+        let warning = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(Kernel::Warning("conversation compacted".into())),
+            ))
+            .expect("warning must reach the live wire");
+        let json = serde_json::to_value(&warning).unwrap();
+        assert_eq!(json["type"], "warning");
+        assert_eq!(json["message_id"], "m-round");
+
+        let limited = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(Kernel::RateLimited {
+                    reset_at_display: "18:09".into(),
+                    reset_label: "5h".into(),
+                    secs_until_reset: Some(7200),
+                    auto_resuming: false,
+                    server_message: None,
+                }),
+            ))
+            .expect("rate limit must reach the live wire");
+        let json = serde_json::to_value(&limited).unwrap();
+        assert_eq!(json["message_id"], "m-round");
     }
 
     #[test]

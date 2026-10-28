@@ -1105,6 +1105,72 @@ test('spliceAuthoritativeDiskTail 在 offset <= 0 时直接全量采用磁盘', 
   assert.deepEqual(spliced, diskTail);
 });
 
+test('带锚点的本地通知行（压缩标记）对账后仍留在所属回合，不拖到会话末尾', () => {
+  // 第 2 轮回答之后用户点了 Compact：命令输出行被黄色压缩标记钉在 a-2 之后。
+  const notice = () => ({
+    role: 'system',
+    parts: [{ kind: 'notice' as const, text: '已压缩 · 摘要 12 条 · ~48.2K→~9.1K tok' }],
+    anchorId: 'a-2',
+    anchorSourceIndex: 51,
+  });
+  const turn = () => [
+    { role: 'user', id: 'u-2', sourceIndex: 50, parts: [{ kind: 'text' as const, text: '第二问' }] },
+    { role: 'assistant', id: 'a-2', sourceIndex: 51, parts: [{ kind: 'text' as const, text: '第二答' }] },
+  ];
+  const nextTurn = () => [
+    { role: 'user', id: 'u-3', sourceIndex: 52, parts: [{ kind: 'text' as const, text: '第三问' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 53, parts: [{ kind: 'text' as const, text: '第三答' }] },
+  ];
+
+  // 画布：上一轮 + 压缩标记 + 新一轮（已落盘）。磁盘只含真实转录行。
+  const canvas = [...turn(), notice(), ...nextTurn()];
+  const diskTail = [...turn(), ...nextTurn()];
+
+  const once = spliceAuthoritativeDiskTail(canvas, diskTail, 40) as any[];
+  assert.deepEqual(
+    once.map((m) => m.id ?? 'notice'),
+    ['u-2', 'a-2', 'notice', 'u-3', 'a-3'],
+    '压缩标记必须钉在 a-2 之后，而不是被当成未落盘尾巴拖到最后',
+  );
+
+  // 每次终态对账都会再拼一次：位置必须稳定，不能逐轮漂移/累积。
+  const twice = spliceAuthoritativeDiskTail(once as any, diskTail, 40) as any[];
+  assert.deepEqual(twice.map((m) => m.id ?? 'notice'), ['u-2', 'a-2', 'notice', 'u-3', 'a-3']);
+  assert.equal(twice.filter((m) => m.role === 'system').length, 1);
+});
+
+test('spliceAuthoritativeDiskTail 用权威行替换同一身份时保留本地 notice 部件', () => {
+  // 压缩发生在第 2 轮之后：标记作为 notice 部件挂在 a-2 上。
+  const canvas = [
+    { role: 'user', id: 'u-2', sourceIndex: 50, parts: [{ kind: 'text' as const, text: '第二问' }] },
+    {
+      role: 'assistant',
+      id: 'a-2',
+      sourceIndex: 51,
+      parts: [
+        { kind: 'text' as const, text: '第二答' },
+        { kind: 'notice' as const, text: '已压缩 · 摘要 12 条 · ~48.2K→~9.1K tok' },
+      ],
+    },
+    { role: 'user', id: 'u-3', sourceIndex: 52, parts: [{ kind: 'text' as const, text: '第三问' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 53, parts: [{ kind: 'text' as const, text: '第三答' }] },
+  ];
+  // 磁盘/展示账本永远没有 UI notice 部件。
+  const diskTail = [
+    { role: 'user', id: 'u-2', sourceIndex: 50, parts: [{ kind: 'text' as const, text: '第二问' }] },
+    { role: 'assistant', id: 'a-2', sourceIndex: 51, parts: [{ kind: 'text' as const, text: '第二答' }] },
+    { role: 'user', id: 'u-3', sourceIndex: 52, parts: [{ kind: 'text' as const, text: '第三问' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 53, parts: [{ kind: 'text' as const, text: '第三答' }] },
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas as any, diskTail as any, 40) as any[];
+  const answer = spliced.find((m) => m.id === 'a-2');
+  assert.deepEqual(answer.parts.map((p: any) => p.kind), ['text', 'notice']);
+  // 其他行不受影响，也不会把 notice 复制到最新一条。
+  assert.deepEqual(spliced.find((m) => m.id === 'a-3').parts.map((p: any) => p.kind), ['text']);
+  assert.equal(spliced.filter((m) => m.parts.some((p: any) => p.kind === 'notice')).length, 1);
+});
+
 test('sanitizeCanvasMessages 自动自愈连续重复的用户提问气泡和夹杂的空占位', () => {
   const dirty = [
     { role: 'assistant', parts: [{ kind: 'text' as const, text: '已完成' }] },

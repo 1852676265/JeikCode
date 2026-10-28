@@ -336,6 +336,11 @@ interface Message {
   /** Rebuilt from the append-only JSONL after compaction: display-only, no kernel
    *  row exists at this index, so edit/delete/regenerate must stay disabled. */
   readOnly?: boolean;
+  /** 本地通知行（命令输出 / 压缩标记）创建时钉住的回合身份。磁盘对账时据此把
+   *  它放回所属回合，而不是当成“未落盘直播尾巴”拖到会话末尾（那是压缩标记
+   *  逐轮跑到尾部的原因）。 */
+  anchorId?: string;
+  anchorSourceIndex?: number;
 }
 
 /**
@@ -1445,6 +1450,9 @@ export function Chat({
   // True for the entire duration of a /compact postCommand await so sendMessage
   // can refuse to fire while the session .json is being rewritten on disk.
   const compactingRef = useRef(false);
+  /** sync 模式 /compact 的“正在压缩”占位行：提交完成后再撤回，
+   *  真正的标记由提交成功的 `/live` Warning 提供。 */
+  const compactPendingNoteRef = useRef<Message | null>(null);
   // AI 执行中输入的消息排队于此，待当前回合 done 后依次自动发送（对齐 VSCode 插件）。
   // 初始化即从硬盘（localStorage）中水合恢复当前会话的队列消息（含未消费的转向消息），
   // 杜绝刷新页面时卡片瞬间丢失。
@@ -5473,17 +5481,52 @@ export function Chat({
   // 命令输出以独立 system 消息追加进转录，与 assistant 消息分离。
   // 若流式 assistant 回复正在进行（busy），把 notice 插到它之前，
   // 确保 appendToLastAssistant 始终以真正的 assistant 气泡为最后一条。
+  //
+  // 插入位置不是永久身份：磁盘对账会用权威切片重建画布，没有身份的通知行
+  // 会被当成“未落盘直播尾巴”拖到会话末尾（压缩标记逐轮跑到尾部就是这个）。
+  // 所以创建时就把“钉在哪一轮之后”记下来，对账时按锚点归位。
+  function noticeAnchorFrom(msgs: Message[]): Pick<Message, 'anchorId' | 'anchorSourceIndex'> {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const message = msgs[i]!;
+      if (message.role !== 'user' && message.role !== 'assistant') continue;
+      let anchorSourceIndex = message.sourceIndex;
+      if (typeof anchorSourceIndex !== 'number') {
+        for (let j = i; j >= 0; j--) {
+          const candidate = msgs[j]!.sourceIndex;
+          if (typeof candidate === 'number') {
+            anchorSourceIndex = candidate;
+            break;
+          }
+        }
+      }
+      return { anchorId: message.id, anchorSourceIndex };
+    }
+    return {};
+  }
+
   function pushCommandNotice(text: string) {
     setMessages((prev) => {
-      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now() };
       const last = prev[prev.length - 1];
       // Keep an in-flight streaming assistant reply as the last element so
       // appendToLastAssistant still targets IT, not this notice.
-      if (last && last.role === 'assistant' && busyRef.current) {
-        return [...prev.slice(0, -1), note, last];
-      }
-      return [...prev, note];
+      const keepLastAssistant = !!last && last.role === 'assistant' && busyRef.current;
+      const base = keepLastAssistant ? prev.slice(0, -1) : prev;
+      const note: Message = {
+        role: 'system',
+        parts: [{ kind: 'notice', text }],
+        ts: Date.now(),
+        ...noticeAnchorFrom(base),
+      };
+      return keepLastAssistant ? [...base, note, last] : [...base, note];
     });
+  }
+
+  /** sync 模式：压缩已提交（或已失败），撤回临时的“正在压缩…”占位行。 */
+  function retireCompactPendingNotice() {
+    const note = compactPendingNoteRef.current;
+    if (!note) return;
+    compactPendingNoteRef.current = null;
+    setMessages((prev) => (prev.includes(note) ? prev.filter((m) => m !== note) : prev));
   }
 
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
@@ -6916,11 +6959,16 @@ export function Chat({
             if (command === 'compact') {
               // Keep a handle on the pending notice so a failed dispatch can retract
               // it — otherwise a stale "Compacting…" line lingers next to the error.
+              // A successful pass retracts it too: the committed `/live` Warning is
+              // the real mark, and the pending line would otherwise stay glued to
+              // the transcript tail forever.
               const pendingNote: Message = {
                 role: 'system',
                 parts: [{ kind: 'notice', text: t('cmd.compact.pending') }],
                 ts: Date.now(),
+                ...noticeAnchorFrom(messagesRef.current),
               };
+              compactPendingNoteRef.current = pendingNote;
               setMessages((prev) => [...prev, pendingNote]);
               // Gate sendMessage while the dispatch is in flight, mirroring the
               // non-sync path (compactingRef guards the submit handler).
@@ -6931,11 +6979,12 @@ export function Chat({
                 const { accepted } = await postLiveCompact();
                 if (!accepted) {
                   setIsCompacting(false);
+                  retireCompactPendingNotice();
                   pushCommandNotice(t('cmd.compact.syncNoRuntime'));
                 }
               } catch (e) {
                 setIsCompacting(false);
-                setMessages((prev) => prev.filter((m) => m !== pendingNote));
+                retireCompactPendingNotice();
                 pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
               } finally {
                 compactingRef.current = false;
@@ -6946,7 +6995,16 @@ export function Chat({
             return;
           }
         }
-        if (command === 'compact') pushCommandNotice(t('cmd.compact.pending'));
+        if (command === 'compact') {
+          const pendingNote: Message = {
+            role: 'system',
+            parts: [{ kind: 'notice', text: t('cmd.compact.pending') }],
+            ts: Date.now(),
+            ...noticeAnchorFrom(messagesRef.current),
+          };
+          compactPendingNoteRef.current = pendingNote;
+          setMessages((prev) => [...prev, pendingNote]);
+        }
         const isCompact = command === 'compact';
         if (isCompact) compactingRef.current = true;
         // Immediate "Compacting..." indication, identical to a passive/auto pass.
@@ -6964,11 +7022,13 @@ export function Chat({
             });
           } catch (e) {
             if (isCompact) setIsCompacting(false);
+            if (isCompact) retireCompactPendingNotice();
             pushCommandNotice(t('chat.connError', { msg: e instanceof Error ? e.message : String(e) }));
             return;
           }
           if (res.kind === 'error') {
             if (isCompact) setIsCompacting(false);
+            if (isCompact) retireCompactPendingNotice();
             pushCommandNotice(res.message);
             return;
           }
@@ -6986,6 +7046,7 @@ export function Chat({
           }
           if (res.kind === 'compact') {
             setIsCompacting(false);
+            retireCompactPendingNotice();
             if (res.applied) {
               if (sessionId) await reloadSessionTranscript(sessionId);
               pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
@@ -7033,6 +7094,7 @@ export function Chat({
             // The non-live `/command compact` response is returned only after the
             // compaction committed/no-oped, so the pass is over by now.
             setIsCompacting(false);
+            retireCompactPendingNotice();
           }
         }
       },
@@ -8326,6 +8388,8 @@ export function Chat({
 
       case 'error':
         closeOpenArtifactFence();
+        // 压缩失败也走 Error：临时“正在压缩…”行同样要撤回。
+        retireCompactPendingNotice();
         {
           const errorText = t('chat.error', { msg: event.message });
           const anchor =
@@ -8379,6 +8443,8 @@ export function Chat({
         pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }), event.message_id);
         // /live path: a compaction notice carries the post-compaction token count.
         if (typeof event.tokens_after === 'number') {
+          // 真正标记已上屏，临时的“正在压缩…”行不再需要。
+          retireCompactPendingNotice();
           const prompt = Math.max(0, event.tokens_after);
           const cacheState = {
             lastPrompt: prompt,
@@ -8412,6 +8478,7 @@ export function Chat({
       case 'context_compacted': {
         // Compaction changed the context WITHOUT a usage frame: update the footer
         // meter right away instead of waiting for the next model response.
+        retireCompactPendingNotice();
         const prompt = Math.max(0, event.tokens);
         const cacheState = {
           lastPrompt: prompt,
