@@ -21,6 +21,42 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.7 (2026-10-28)
+
+- **[Session Reconnect] Phones and remote tabs no longer stay stuck after a long disconnect**:
+  - A turn that finished while the device was offline now settles as soon as the network returns: the stop button becomes the send arrow again and the transcript catches up on the final answer.
+  - Tool rows that were cut off mid-run no longer spin forever and are repaired from the authoritative history.
+  - Returning after a long background stay re-attaches the live stream automatically, so turns started on another device show up without a refresh.
+
+- **[Steered Turns] Mid-turn follow-ups keep their place in long conversations**:
+  - A steer bubble no longer jumps to the bottom of the transcript or disappears after a refresh when a turn contains dozens of long-running commands.
+  - Two or more steer bubbles in the same turn now stay in order, without duplicated prompts.
+
+- **[Tool Status] No more false "completed"**:
+  - A tool row whose result was never received is shown as "Incomplete" instead of "Done", and the tool group header counts incomplete rows separately from failures.
+  - When the authoritative result does exist in history, the row is corrected on the next reconciliation.
+
+- **[Bash Tool] Clearer failure for an invalid working directory**:
+  - Running a command with a missing or non-directory `cwd` (including a missing workspace folder) now returns an explicit error instead of an obscure failure.
+
+---
+
+- **[会话同步] 手机与远端标签页长时间断网后不再卡死**:
+  - 断网期间已经跑完的回合，恢复网络后会自动收尾：停止按钮变回发送箭头，并补齐断流期间错过的最终回答。
+  - 被中断的工具行不再永远转圈，会用权威历史自愈。
+  - 长时间挂起后重连会自动恢复实时推送，另一台设备发起的回合无需刷新即可看到。
+
+- **[中途转向] 长对话里的 steer 气泡不再错位或消失**:
+  - 当一回合包含大量长耗时命令时，steer 气泡不会再被排到时间线末尾，也不会在刷新后消失。
+  - 同一回合内的多条 steer 会保持正确顺序，不再出现重复提问气泡。
+
+- **[工具状态] 不再虚报「完成」**:
+  - 没有收到权威结果的工具行改为显示「未完成」，工具组标题也把未完成与失败分开计数。
+  - 磁盘上确实存在真实结果时，会在下一次对账时自动纠正。
+
+- **[Bash 工具] 非法工作目录给出明确报错**:
+  - 当 `cwd` 缺失或不是目录（包括工作区目录不存在）时，直接返回清晰错误，而不是难以定位的失败。
+
 ## v7.3.1-beta.6 (2026-10-28)
 
 - **[Chat Experience] One answer, one bubble - and a steady streaming transcript**:
