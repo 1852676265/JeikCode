@@ -8,6 +8,9 @@
 #   JEIKCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 #   JEIKCODE_MANIFEST_URL / JEIKCODE_DOWNLOAD_BASE  override update channel (optional)
+#   JEIKCODE_INSTALL_FONTS  1 = also install a CJK font package on a Linux desktop
+#                           that lacks one; 0 = never mention fonts.
+#                           Default: print an install hint only (non-blocking).
 #
 # IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
 # also update scripts/uninstall.sh AND
@@ -236,6 +239,114 @@ if [ -d "$JEIKCODE_HOME" ]; then
     else
         echo "    (非交互终端环境，将在首次启动 WebUI 或桌面端时提示配置文件更新)"
     fi
+fi
+
+# --- CJK font support (Linux desktops only) ---
+#
+# The TUI ships 11 UI locales, but it can only PAINT CJK when the terminal
+# font has the glyphs; without them Chinese/Japanese/Korean rows show up as
+# `♦`/`□` tofu. Two hard limits shape what this block may claim:
+#
+#   * Only the SYSTEM font set is probeable (fontconfig `fc-list`). Which font
+#     the terminal is configured to use cannot be queried from a shell, and a
+#     running terminal never adopts a newly installed font on its own.
+#   * Fonts only matter where the pixels are painted. An SSH session renders on
+#     the CLIENT (server fonts are irrelevant), a kernel VT console has no CJK
+#     glyphs no matter what is installed, and containers/CI inherit the host
+#     terminal. All three are skipped.
+#
+# Default is a non-blocking hint; the language picker itself stays usable
+# because every row leads with an ASCII English name. JEIKCODE_INSTALL_FONTS=1
+# additionally installs the distro package (sudo prompts on the controlling
+# terminal); =0 silences the block entirely.
+font_hint() {
+    echo ""
+    echo "Note: no CJK font was found on this system, so Chinese / Japanese /"
+    echo "      Korean UI text may render as boxes (tofu) in your terminal."
+    echo "      Install a CJK font and restart the terminal:"
+    echo "        Debian/Ubuntu: sudo apt install fonts-noto-cjk"
+    echo "        Fedora:        sudo dnf install google-noto-sans-cjk-fonts"
+    echo "        Arch:          sudo pacman -S noto-fonts-cjk"
+    echo "        openSUSE:      sudo zypper install noto-sans-cjk-fonts"
+    echo "      xterm on a bitmap font additionally needs a wide-char font (-fw)"
+    echo "      or an Xft font (-fa); terminals with fontconfig fallback (GNOME"
+    echo "      Terminal, konsole, kitty, wezterm, alacritty) work as-is."
+}
+
+has_cjk_font() {
+    for _font_lang in zh ja ko; do
+        if [ -n "$(fc-list -f '%{family}\n' ":lang=${_font_lang}" 2>/dev/null | head -n 1)" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_cjk_font() {
+    if command -v apt-get >/dev/null 2>&1; then
+        _font_install="DEBIAN_FRONTEND=noninteractive apt-get install -y fonts-noto-cjk"
+    elif command -v dnf >/dev/null 2>&1; then
+        _font_install="dnf install -y google-noto-sans-cjk-fonts"
+    elif command -v yum >/dev/null 2>&1; then
+        _font_install="yum install -y google-noto-sans-cjk-ttc-fonts"
+    elif command -v pacman >/dev/null 2>&1; then
+        _font_install="pacman -S --noconfirm noto-fonts-cjk"
+    elif command -v zypper >/dev/null 2>&1; then
+        _font_install="zypper --non-interactive install noto-sans-cjk-fonts"
+    elif command -v apk >/dev/null 2>&1; then
+        _font_install="apk add font-noto-cjk"
+    else
+        return 1
+    fi
+    # `curl | sh` feeds the SCRIPT on stdin, so the sudo prompt (and any
+    # package-manager question) must read from the controlling terminal.
+    if [ ! -r /dev/tty ]; then
+        return 1
+    fi
+    echo "==> Installing CJK font: $_font_install"
+    if [ "$(id -u)" -eq 0 ]; then
+        sh -c "$_font_install" < /dev/tty || return 1
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo sh -c "$_font_install" < /dev/tty || return 1
+    else
+        return 1
+    fi
+    # Rebuild the per-user fontconfig cache so the next terminal start sees it.
+    fc-cache -f >/dev/null 2>&1 || true
+    return 0
+}
+
+if [ "$os" = "linux" ] && [ "$is_openwrt" != 1 ]; then
+    case "${JEIKCODE_INSTALL_FONTS:-}" in
+        0|false|no) ;;
+        *)
+            if [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_TTY:-}" ]; then
+                : # rendered by the client terminal
+            elif [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then
+                : # WSL: Windows Terminal paints with the Windows font stack
+            elif [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${CI:-}" ]; then
+                : # container / CI — the host terminal owns rendering
+            elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+                : # kernel VT console: installed fonts add no glyphs
+            elif ! command -v fc-list >/dev/null 2>&1; then
+                : # no fontconfig — nothing to verify against
+            elif has_cjk_font; then
+                : # already covered
+            else
+                font_hint
+                case "${JEIKCODE_INSTALL_FONTS:-}" in
+                    1|true|yes)
+                        if install_cjk_font; then
+                            echo "==> CJK font installed. Restart your terminal to pick it up."
+                            echo "    (xterm on a bitmap font also needs -fw/-fa, as noted above.)"
+                        else
+                            echo "    (automatic install failed — run one of the commands above)"
+                        fi
+                        ;;
+                esac
+            fi
+            ;;
+    esac
 fi
 
 if [ "$os" = "windows" ]; then
