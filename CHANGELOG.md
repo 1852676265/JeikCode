@@ -21,6 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.10 (2026-10-29)
+
+- **[Context Compaction] The compaction marker now stays on the turn it belongs to**:
+  - After a manual or automatic compaction, the "compacted" marker stays at the end of the turn where the compaction happened instead of trailing the bottom of every later turn.
+  - The marker keeps its place through refreshes, session switches and reconnects.
+  - The temporary "Compacting…" line disappears once the pass finishes, whether it committed, found nothing to compact, or failed.
+
+- **[Notice Placement] Command output and advisories no longer drift to the transcript tail**:
+  - Question outlines, stop advisories, connection errors and other inline notices keep their position after history reloads.
+  - Repeated reconciliations no longer duplicate a notice or drag it below the newest answer.
+
+---
+
+- **[上下文压缩] 压缩标记固定在被压缩的那一轮**：
+  - 手动或自动压缩后，“已压缩”标记停在进行压缩的那一轮尾部，不再跟着之后每一轮的末尾漂移。
+  - 刷新、切换会话和断线重连后，标记仍停留在原来的位置。
+  - 临时的“正在压缩…”提示会在压缩结束后自动消失，无论是成功压缩、无需压缩还是压缩失败。
+
+- **[通知落位] 命令输出与黄色提示不再被拖到会话末尾**：
+  - 提问大纲、停止提示、连接错误等内联通知在历史重载后保持原位。
+  - 重复对账不会再复制提示，也不会把它拖到最新回答下方。
+
 ## v7.3.1-beta.9 (2026-10-28)
 
 - **[Tool Status] Cold starts no longer report a running command as Done**:
