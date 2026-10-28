@@ -282,41 +282,55 @@ impl Tool for BashTool {
                 crate::process_utils::rewrite_unquoted_windows_paths(&effective_command)
             }
         };
-        let (effective_cwd, cwd_advisory) = if let Some(ref raw_cwd) = a.cwd {
-            let trimmed = raw_cwd.trim().replace('\\', "/");
-            if trimmed.is_empty() {
-                (ctx.working_dir.clone(), None)
-            } else {
-                let resolved = super::resolve_path(&trimmed, &ctx.working_dir);
-                let meta = match tokio::fs::metadata(&resolved).await {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let hint = super::not_found_hint(&resolved, &ctx.working_dir).await;
+        let (effective_cwd, cwd_advisory) =
+            match a.cwd.as_deref().map(|s| s.trim().replace('\\', "/")) {
+                Some(trimmed) if !trimmed.is_empty() => {
+                    let resolved = super::resolve_path(&trimmed, &ctx.working_dir);
+                    let meta = match tokio::fs::metadata(&resolved).await {
+                        Ok(m) => m,
+                        Err(_) => {
+                            let hint = super::not_found_hint(&resolved, &ctx.working_dir).await;
+                            return err(format!(
+                                "bash: working directory not found: '{}'{hint}",
+                                trimmed
+                            ));
+                        }
+                    };
+                    if !meta.is_dir() {
                         return err(format!(
-                            "bash: working directory not found: '{}'{hint}",
+                            "bash: cwd must be a directory, but '{}' is a file",
                             trimmed
                         ));
                     }
-                };
-                if !meta.is_dir() {
-                    return err(format!(
-                        "bash: cwd must be a directory, but '{}' is a file",
-                        trimmed
-                    ));
+                    let advisory = if !resolved.starts_with(&ctx.working_dir) {
+                        Some(format!(
+                            "[advisory] Command executed in external directory outside workspace: {}\n",
+                            resolved.display()
+                        ))
+                    } else {
+                        None
+                    };
+                    (resolved, advisory)
                 }
-                let advisory = if !resolved.starts_with(&ctx.working_dir) {
-                    Some(format!(
-                        "[advisory] Command executed in external directory outside workspace: {}\n",
-                        resolved.display()
-                    ))
-                } else {
-                    None
-                };
-                (resolved, advisory)
-            }
-        } else {
-            (ctx.working_dir.clone(), None)
-        };
+                _ => {
+                    let meta = match tokio::fs::metadata(&ctx.working_dir).await {
+                        Ok(m) => m,
+                        Err(_) => {
+                            return err(format!(
+                                "bash: working directory not found: '{}'",
+                                ctx.working_dir.display()
+                            ));
+                        }
+                    };
+                    if !meta.is_dir() {
+                        return err(format!(
+                            "bash: cwd must be a directory, but '{}' is not a directory",
+                            ctx.working_dir.display()
+                        ));
+                    }
+                    (ctx.working_dir.clone(), None)
+                }
+            };
         let cwd = effective_cwd.clone();
         let rewritten_command = effective_command.clone();
         let advisory_note = cwd_advisory.clone();
@@ -8096,6 +8110,21 @@ mod tests {
             .execute(r#"{"command":"ls"}"#, &ctx(d.path()))
             .await;
         assert!(r.content.contains("marker.txt"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_working_dir_reports_clean_error() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("missing_workspace");
+        let r = BashTool
+            .execute(r#"{"command":"ls"}"#, &ctx(&missing))
+            .await;
+        assert!(r.is_error, "should fail when workspace dir does not exist");
+        assert!(
+            r.content.contains("working directory not found"),
+            "got: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
