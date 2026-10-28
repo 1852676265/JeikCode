@@ -117,6 +117,13 @@ test('bash await-decision keeps the original row pending', () => {
     toolResultStatus(true, '[bash-await-decision]\nPID: 1001\n', 'bash'),
     'pending',
   );
+  // Canonical tool name is run_command; `bash` is only an alias. A long
+  // foreground command (for example sleep) yields this marker while the
+  // process is still alive, so the canonical name must stay pending too.
+  assert.equal(
+    toolResultStatus(true, '[bash-await-decision]\nPID: 1001\n', 'run_command'),
+    'pending',
+  );
 });
 
 test('quoting [bash-await-decision] in a non-bash tool does not keep it running', () => {
@@ -219,6 +226,18 @@ test('finalizeToolsAfterTurn settles leftover pending rows except live bash awai
   assert.equal(next[2]!.kind === 'tool' ? next[2].tool.status : '', 'incomplete');
 });
 
+test('finalizeToolsAfterTurn keeps canonical run_command await-decision pending', () => {
+  const next = finalizeToolsAfterTurn([
+    {
+      kind: 'tool',
+      tool: tool('run-command', {
+        name: 'run_command',
+        output: '[bash-await-decision]\nPID: 1002\n',
+      }),
+    },
+  ]);
+  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'pending');
+});
 
 
 test('withTrailingTodoList appends or replaces a trailing todo_list part', () => {

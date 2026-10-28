@@ -4552,6 +4552,7 @@ export function Chat({
               sessionResult.value.messages,
               diskOffset,
               sessionResult.value.pinned_user_index,
+              { running: serverActive === true },
             );
             const canUseCache =
               !cacheShrank && !cacheHasGap && !!currentCached && currentCached.length > 0;
@@ -5233,6 +5234,7 @@ export function Chat({
     msgs: SessionMessage[],
     sourceOffset = 0,
     pinnedUserIndex?: number,
+    opts?: { running?: boolean },
   ): Message[] {
     const loaded: Message[] = [];
     // Running session-level todo list across turns.
@@ -5354,7 +5356,12 @@ export function Chat({
               name: tc.name,
               // Keep raw JSON for expand/debug, but UI prefers subtasks panel.
               args: rawArgs,
-              status: 'done',
+              // A cold-start slice can contain a tool call whose result is not in
+              // this page yet. On an explicitly running snapshot, start pending;
+              // historical slices keep the legacy done default so old completed
+              // turns are not downgraded to Incomplete. A real tool_result below
+              // still overrides both states.
+              status: opts?.running ? 'pending' : 'done',
               ...(subtasks ? { subtasks } : {}),
             },
           });

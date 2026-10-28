@@ -188,8 +188,9 @@ export function toolResultStatus(
   // Only a live bash pane uses this marker. Guide/docs tools quote the same
   // string; matching any output would leave them "运行中" with a blinking caret
   // after the call already finished.
+  const name = (toolName ?? '').toLowerCase();
   if (
-    (toolName ?? '').toLowerCase() === 'bash' &&
+    (name === 'bash' || name === 'run_command') &&
     output.includes('[bash-await-decision]')
   ) {
     return 'pending';
@@ -199,8 +200,9 @@ export function toolResultStatus(
 }
 
 function isBashAwaitDecision(tool: ToolRow): boolean {
+  const name = tool.name.toLowerCase();
   return (
-    tool.name.toLowerCase() === 'bash' &&
+    (name === 'bash' || name === 'run_command') &&
     (tool.output ?? '').includes('[bash-await-decision]')
   );
 }
