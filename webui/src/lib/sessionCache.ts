@@ -215,14 +215,17 @@ export function getMemorySession(projectHash: string, sessionId: string): Cached
 export async function getSessionCache(
   projectHash: string,
   sessionId: string,
+  opts?: { preferPersisted?: boolean },
 ): Promise<CachedSessionData | null> {
-  if (projectHash) {
-    const mem = getMemorySession(projectHash, sessionId);
-    if (mem) return mem;
-  } else {
-    for (const data of memoryCache.values()) {
-      if (data.sessionId === sessionId && data.displayVersion === CACHE_DISPLAY_VERSION) {
-        return data;
+  if (!opts?.preferPersisted) {
+    if (projectHash) {
+      const mem = getMemorySession(projectHash, sessionId);
+      if (mem) return mem;
+    } else {
+      for (const data of memoryCache.values()) {
+        if (data.sessionId === sessionId && data.displayVersion === CACHE_DISPLAY_VERSION) {
+          return data;
+        }
       }
     }
   }

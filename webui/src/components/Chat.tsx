@@ -2271,6 +2271,10 @@ export function Chat({
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
+  // One-shot layout settle for the initial tail. Async Markdown/tool-card
+  // expansion can finish after the first bottom write; do not keep re-pinning
+  // after the user starts loading older history.
+  const initialPinPendingRef = useRef(false);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
   const timelineFollowRef = useRef<ReturnType<typeof createTimelineFollow> | null>(null);
   if (!timelineFollowRef.current) {
@@ -4783,11 +4787,25 @@ export function Chat({
 
   // History responses may arrive after the user starts reading: only the
   // session reset (above), or an explicit jump/send, may re-enable following.
-  const pinTimelineToBottom = () => timelineFollow.changed();
+  const pinTimelineToBottom = () => {
+    initialPinPendingRef.current = true;
+    timelineFollow.changed();
+  };
   const scrollToBottom = (behavior: ScrollBehavior = 'smooth') =>
     timelineFollow.jump({ smooth: behavior === 'smooth' });
   useEffect(() => {
     timelineFollow.changed();
+    // Markdown/tool cards can grow after Preact's commit without a second
+    // ResizeObserver tick (notably remote cold starts). Settle ONLY the initial
+    // tail; never re-pin 350ms after an older-history prepend, which would
+    // destroy the reader's top anchor.
+    if (!initialPinPendingRef.current) return;
+    const settle = window.setTimeout(() => {
+      if (!initialPinPendingRef.current) return;
+      initialPinPendingRef.current = false;
+      timelineFollow.changed();
+    }, 350);
+    return () => window.clearTimeout(settle);
   }, [messages, tokens, timelineFollow]);
 
   // 消息变化且当前无精确 tokens（如切会话、加载历史）时，根据消息或内存快照恢复 tokens。
@@ -6462,6 +6480,11 @@ export function Chat({
     const projectHash = activeSession?.project_hash;
     const id = sessionId;
     if (!projectHash || !id || loadingOlder || historyOffsetRef.current <= 0) return;
+    // Loading history is reader intent: stop the bottom-follow and keep the
+    // pre-prepend reading anchor instead of letting the 350ms initial settle
+    // pull the transcript back to the tail.
+    initialPinPendingRef.current = false;
+    timelineFollow.pause();
     const generation = sessionGenerationRef.current;
     const prevOffset = historyOffsetRef.current;
     const page = Math.min(HISTORY_PAGE, prevOffset);
@@ -6471,7 +6494,16 @@ export function Chat({
     // in L1. Expand instantly from that in-memory copy before touching the disk:
     // this is the "早先历史在内存中完整保留，展开时 0ms 补齐" contract, and it
     // also avoids a disk page whose boundary could split tool calls from results.
-    const cachedFull = messageCacheRef.current.get(id);
+    let cachedFull = messageCacheRef.current.get(id);
+    // A session switch can leave L1 with only the 42-row active window while L2
+    // still has the complete 179-row canvas. Hydrate from IndexedDB before the
+    // network fallback so offline "load earlier" keeps working instead of
+    // ending in Failed to fetch with a half-filled transcript.
+    const cachedIdb = await getSessionCache(projectHash, id, { preferPersisted: true });
+    if (cachedIdb?.messages?.length && (!cachedFull || cachedIdb.messages.length > cachedFull.length)) {
+      cachedFull = sanitizeCanvasMessages(cachedIdb.messages);
+      messageCacheRef.current.set(id, cachedFull);
+    }
     if (cachedFull && cachedFull.length > 0) {
       const cachedOlder = cachedFull.filter(
         (m) => typeof m.sourceIndex === 'number' && m.sourceIndex >= nextOffset && m.sourceIndex < prevOffset,
