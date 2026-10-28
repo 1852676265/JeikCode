@@ -21,6 +21,54 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.8 (2026-10-28)
+
+- **[Message Display] Full message content is no longer truncated**:
+  - Long replies, reasoning, tool arguments and tool results now display in full; only genuine layout ellipsis remains.
+  - The question outline shows a short label while the complete prompt is resolved from the loaded transcript, so long questions stay readable without duplicate payloads.
+
+- **[Long Conversations] More stable tail loading and history paging**:
+  - Remote, local and cache-cleared cold starts now land on the latest message instead of an earlier position in the 48-message tail.
+  - Loading older messages keeps the reader's position instead of jumping to the bottom, and repeated paging remains ordered and duplicate-free.
+  - The complete cached transcript is reused when paging older history, so offline sessions can keep loading history without a network error.
+
+- **[Session Recovery] Reconnect, Stop and background commands behave consistently**:
+  - After a network drop, an idle session now catches up on messages added while the device was offline.
+  - Stopping a turn no longer makes the current question disappear or leaves the previous turn's content replayed at the tail.
+  - Background commands that already started survive a turn-level steer/stop, while an explicit stop still terminates them.
+
+- **[Subagents] Fewer approval-style interruptions**:
+  - The default subagent concurrency cap has been removed.
+  - Subtask rows now settle from the authoritative task output instead of remaining stuck in a running state.
+
+- **[Transport & Cache] Faster reloads and less bandwidth**:
+  - Session history requests use ETag revalidation and compressed responses.
+  - Session caches have bounded budgets and LRU cleanup, keeping long-running installations responsive.
+
+---
+
+- **[消息展示] 长内容不再被截断**:
+  - 长回复、思考、工具参数和工具结果现在完整显示，只保留必要的布局省略。
+  - 提问大纲展示短标签，完整提问从已加载会话中还原，长提问更易读且不重复传输。
+
+- **[长会话] 尾部加载与历史分页更稳定**:
+  - 远程、本机和清空缓存后的冷启动都会落到最新消息，而不是停在 48 条尾部的较早位置。
+  - 向上加载历史时保持阅读位置，不再跳到底部；连续分页保持顺序且无重复。
+  - 向上分页会复用完整本地缓存，断网时也能继续加载历史，不再出现网络错误。
+
+- **[会话恢复] 重连、停止和后台命令行为一致**:
+  - 断网恢复后，空闲会话会补齐断网期间新增的消息。
+  - 停止回合后，当前提问不再消失，上一轮内容也不会在尾部重放。
+  - 已经启动的后台命令不会因 turn 级 steer/stop 被杀死；显式停止仍会终止它们。
+
+- **[子代理] 减少审批式中断**:
+  - 移除默认子代理并发上限。
+  - 子任务行使用权威任务输出收尾，不再一直显示运行中。
+
+- **[传输与缓存] 更快刷新、更少带宽**:
+  - 会话历史请求支持 ETag 重新验证和压缩响应。
+  - 会话缓存增加容量预算与 LRU 清理，长期使用更稳定。
+
 ## v7.3.1-beta.7 (2026-10-28)
 
 - **[Session Reconnect] Phones and remote tabs no longer stay stuck after a long disconnect**:
