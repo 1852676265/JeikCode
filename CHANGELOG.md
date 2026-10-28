@@ -21,6 +21,44 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.1-beta.9 (2026-10-28)
+
+- **[Tool Status] Cold starts no longer report a running command as Done**:
+  - A long command that is still running stays Pending after a cold start or offline reconnect; it only turns Done when the authoritative result arrives.
+  - Historical completed tools remain Done, and shells waiting for a decision remain visibly running.
+
+- **[Authentication] Rotated tokens recover without a reload loop**:
+  - Rejected credentials are forgotten and retried with other stored credentials or cookies instead of reloading the page indefinitely.
+  - An expired-auth dialog validates a pasted access link before applying it, and other tabs pick up token rotation automatically.
+  - Event-stream reconnects stop retrying a rejected token.
+
+- **[Image Attachments] Uploads keep fidelity and HEIC works**:
+  - Screenshots and UI images stay lossless PNG, photos use high-quality JPEG, and transparent images keep their alpha channel.
+  - HEIC/HEIF images from phones and clipboard/webview blobs are decoded in the browser; undecodable files show a clear message instead of a broken image.
+
+- **[Linux & TUI] CJK rendering is recoverable on fresh installs**:
+  - The Linux installer detects missing CJK fonts and prints per-distro install hints; setting `JEIKCODE_INSTALL_FONTS=1` can install them automatically.
+  - Language pickers lead with English names so they remain readable even when the terminal font cannot render CJK glyphs.
+
+---
+
+- **[工具状态] 冷启动不再把运行中的命令显示为完成**:
+  - 长命令在冷启动或断网重连后保持运行中，只有收到权威结果才变为完成。
+  - 历史已完成的工具仍显示完成；等待决策的 shell 仍保持运行中。
+
+- **[认证] token 轮换后无需刷新即可自愈**:
+  - 被拒绝的凭据会被清除，并尝试其他已保存凭据或 Cookie，不再触发整页无限刷新。
+  - 认证失效弹窗会先校验粘贴的访问链接；其他标签页会自动接收 token 轮换。
+  - 事件流遇到被拒绝的 token 不再无限重连。
+
+- **[图片附件] 上传保持清晰度，支持 HEIC**:
+  - 截图与 UI 图片使用无损 PNG，照片使用高质量 JPEG，透明图片保留透明度。
+  - 手机 HEIC/HEIF、剪贴板与 WebView 图片可在浏览器内解码；无法解码时给出明确提示而不是坏图。
+
+- **[Linux 与 TUI] 新安装环境可恢复 CJK 显示**:
+  - Linux 安装脚本检测缺失的 CJK 字体并给出各发行版安装提示；设置 `JEIKCODE_INSTALL_FONTS=1` 可自动安装。
+  - 语言选择器以英文名开头，即使终端字体无法渲染 CJK 也能辨认。
+
 ## v7.3.1-beta.8 (2026-10-28)
 
 - **[Message Display] Full message content is no longer truncated**:
