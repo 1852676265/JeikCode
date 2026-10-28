@@ -158,7 +158,7 @@ import {
 } from '../lib/toolDisplay';
 import {
   applySubtaskProgress,
-  applySubtaskResultsFromOutput,
+  settleSubtasksFromOutput,
   subtasksFromTaskArgs,
   subtaskCounts,
   taskArgsSummary,
@@ -5333,21 +5333,10 @@ export function Chat({
               p.tool.output = output;
               p.tool.status = toolResultStatus(result.success, output, p.tool.name);
               todoResult = isTodoTool(p.tool.name);
-              // History path: fold `<task id=… state=completed>` into subtasks panel.
-              if (p.tool.subtasks && p.tool.subtasks.length > 0) {
-                p.tool.subtasks = applySubtaskResultsFromOutput(
-                  p.tool.subtasks,
-                  output,
-                );
-              } else if (p.tool.name === 'task') {
-                const seeded = subtasksFromTaskArgs(p.tool.args);
-                if (seeded) {
-                  p.tool.subtasks = applySubtaskResultsFromOutput(
-                    seeded,
-                    output,
-                  );
-                }
-              }
+              // Same settle rule as the live `tool_result` path (history + live must
+              // share one reconciliation rule, or the two views disagree).
+              const settledSubtasks = settleSubtasksFromOutput(p.tool, output);
+              if (settledSubtasks) p.tool.subtasks = settledSubtasks.subtasks;
               break outer;
             }
           }
@@ -7038,6 +7027,9 @@ export function Chat({
   function updateToolInLastAssistant(
     id: string,
     update: Partial<ToolRow>,
+    /** Optional second pass: derive extra fields from the CURRENT row (e.g. settle
+     *  subtask rows from the authoritative tool output). Return undefined for no-op. */
+    derive?: (tool: ToolRow) => Partial<ToolRow> | undefined,
   ) {
     setMessages((prev) => {
       if (prev.length === 0) return prev;
@@ -7046,7 +7038,10 @@ export function Chat({
         if (m.role === 'assistant' && m.parts?.some((p) => p.kind === 'tool' && p.tool?.id === id)) {
           const parts = m.parts.map((p) =>
             p.kind === 'tool' && p.tool?.id === id
-              ? { kind: 'tool' as const, tool: { ...p.tool, ...update } }
+              ? {
+                  kind: 'tool' as const,
+                  tool: { ...p.tool, ...update, ...(derive?.(p.tool) ?? {}) },
+                }
               : p,
           );
           const next = prev.slice();
@@ -7408,6 +7403,11 @@ export function Chat({
         if (toolPart && 'tool' in toolPart && toolPart.tool) {
           toolPart.tool.status = toolResultStatus(event.success, event.output, event.name);
           toolPart.tool.output = event.output;
+          // The panel is driven by ephemeral progress lines; a lost terminal one
+          // would leave the row `running` under a tool row that already says done.
+          // Settle from the authoritative `<task id=… state=…>` blocks here.
+          const settled = settleSubtasksFromOutput(toolPart.tool, event.output);
+          if (settled) toolPart.tool.subtasks = settled.subtasks;
         }
         messageCacheRef.current.set(targetSid, next);
         break;
@@ -7861,12 +7861,16 @@ export function Chat({
         break;
 
       case 'tool_result': {
-        updateToolInLastAssistant(event.id, {
-          status: toolResultStatus(event.success, event.output, event.name),
-          duration_ms: event.duration_ms,
-          output: event.output,
-          progress: undefined,
-        });
+        updateToolInLastAssistant(
+          event.id,
+          {
+            status: toolResultStatus(event.success, event.output, event.name),
+            duration_ms: event.duration_ms,
+            output: event.output,
+            progress: undefined,
+          },
+          (tool) => settleSubtasksFromOutput(tool, event.output),
+        );
         if (isTodoTool(event.name)) {
           const authoritativeFromOutput = parseTodosFromOutput(event.output);
           if (authoritativeFromOutput && authoritativeFromOutput.length > 0) {

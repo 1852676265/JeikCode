@@ -256,6 +256,35 @@ export function applySubtaskResultsFromOutput(
   return changed ? copy : items;
 }
 
+/**
+ * Settle a FINISHED `task` tool result into its subtask rows.
+ *
+ * The live panel is driven by ephemeral `tool_progress` lines, so a row only
+ * turns terminal when its `✓ done` / `✗ failed` line lands. Those lines are
+ * best-effort: a lost/deduped one used to leave the row stuck on `running`
+ * even though the tool result (and the header badge) already said done. This
+ * folds the authoritative `<task id=… state=…>` blocks back in, seeding from
+ * the dispatch args when the panel was never created.
+ *
+ * Returns `undefined` when there is nothing to settle, so callers can spread
+ * it into a patch without triggering a pointless re-render.
+ */
+export function settleSubtasksFromOutput(
+  tool: { name?: string; args?: string; subtasks?: SubtaskItem[] },
+  output: string | undefined,
+): { subtasks: SubtaskItem[] } | undefined {
+  if (!output) return undefined;
+  const seeded =
+    tool.subtasks && tool.subtasks.length > 0
+      ? tool.subtasks
+      : tool.name === 'task'
+        ? (subtasksFromTaskArgs(tool.args ?? '') ?? undefined)
+        : undefined;
+  if (!seeded || seeded.length === 0) return undefined;
+  const next = applySubtaskResultsFromOutput(seeded, output);
+  return next === seeded ? undefined : { subtasks: next };
+}
+
 /** Compact header detail for `task` (avoid dumping full JSON in the tool row). */
 export function taskArgsSummary(argsJson: string): string {
   const items = subtasksFromTaskArgs(argsJson);
