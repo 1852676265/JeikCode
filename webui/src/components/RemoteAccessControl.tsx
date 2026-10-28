@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { getRemoteAccess, postRemoteAccess, WEBUI_TOKEN_STORAGE_KEY, type RemoteAccessStatus } from '../api';
+import { getRemoteAccess, getToken, postRemoteAccess, type RemoteAccessStatus } from '../api';
 import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
@@ -229,14 +229,9 @@ export function RemoteAccessControl() {
       if (await probeOnce()) {
         let currentToken = targetToken;
         if (!currentToken && !noToken) {
-          try {
-            currentToken =
-              sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY)
-              || localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY)
-              || '';
-          } catch {
-            /* ignore */
-          }
+          // 统一走 getToken()：URL → 共享 localStorage → sessionStorage，
+          // 避免旧标签页里 per-tab 的过期 sessionStorage 覆盖轮换后的新 token。
+          currentToken = getToken();
         }
         const nextUrl = new URL(window.location.href);
         if (!samePort) nextUrl.port = String(targetPortNum);

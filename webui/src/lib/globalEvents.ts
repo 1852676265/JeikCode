@@ -81,8 +81,11 @@ export function startGlobalEventStream(): () => void {
         const { streamGlobalEvents } = await import('../api');
         await streamGlobalEvents(emitGlobalEvent, abort.signal);
         attempt = 0;
-      } catch {
+      } catch (err) {
         if (stopped || abort.signal.aborted) return;
+        // 凭据已被服务端拒绝：重连只会无限 401，交给认证遮罩引导用户换 token，
+        // 用户重新连接成功后会整页重载并重新启动本事件流。
+        if ((err as { name?: string } | null)?.name === 'AuthExpiredError') return;
       }
       if (stopped) return;
       attempt = Math.min(attempt + 1, 6);

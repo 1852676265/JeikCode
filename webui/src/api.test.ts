@@ -667,40 +667,98 @@ test('getConfig parses a successful config payload', async () => {
   }
 });
 
-test('handleAuthExpiredReload triggers reload once and throttles within 15s', async () => {
-  const { handleAuthExpiredReload, resetAuthReloadState } = await import('./api.ts');
-  const store = new Map<string, string>();
-  let reloadedCount = 0;
-  const mockStorage = {
-    getItem: (key: string) => store.get(key) ?? null,
-    setItem: (key: string, val: string) => store.set(key, val),
-    removeItem: (key: string) => store.delete(key),
-  };
-  const mockLocation = {
-    reload: () => {
-      reloadedCount += 1;
-    },
-  };
-
-  (globalThis as any).window = { location: mockLocation, sessionStorage: mockStorage };
-  (globalThis as any).sessionStorage = mockStorage;
+test('401 drops the rejected bearer and retries with the HttpOnly cookie', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; authorization: string | null }> = [];
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    calls.push({ url: String(url), authorization: headers.get('Authorization') });
+    if (calls.length === 1) {
+      return new Response('', { status: 401 });
+    }
+    assert.equal(headers.get('Authorization'), null, 'cookie-only retry must not replay the stale bearer');
+    return new Response(
+      JSON.stringify({ default_provider: 'claude-opus-4-6', language: 'zh-CN' }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  }) as typeof fetch;
 
   try {
-    resetAuthReloadState();
-    assert.equal(handleAuthExpiredReload(), true);
-    assert.equal(reloadedCount, 1);
-
-    // Second call within 15s debounce window must be rejected
-    assert.equal(handleAuthExpiredReload(), false);
-    assert.equal(reloadedCount, 1);
-
-    // Resetting state allows next reload
-    resetAuthReloadState();
-    assert.equal(handleAuthExpiredReload(), true);
-    assert.equal(reloadedCount, 2);
+    const { getConfig, isAuthExpired, resetAuthExpired } = await import('./api.ts');
+    resetAuthExpired();
+    const cfg = await getConfig();
+    assert.equal(cfg.default_provider, 'claude-opus-4-6');
+    assert.equal(calls.length, 2);
+    assert.match(String(calls[0].authorization), /test-token/);
+    assert.equal(isAuthExpired(), false);
   } finally {
-    delete (globalThis as any).window;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('permanently rejected credentials latch the auth gate without reloading', async () => {
+  const originalFetch = globalThis.fetch;
+  const previousWindow = (globalThis as any).window;
+  let calls = 0;
+  let reloads = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response('', { status: 401 });
+  }) as typeof fetch;
+  // The regression: 401 used to call location.reload(), which replayed the same
+  // stale token forever. Prove the gate latches and never reloads.
+  (globalThis as any).window = {
+    location: { reload: () => { reloads += 1; } },
+    addEventListener: () => {},
+  };
+
+  try {
+    const { getConfig, isAuthExpired, resetAuthExpired } = await import('./api.ts');
+    resetAuthExpired();
+    await assert.rejects(() => getConfig());
+    assert.equal(isAuthExpired(), true);
+    assert.equal(calls, 2, 'one original request + one cookie-only retry');
+    assert.equal(reloads, 0);
+
+    // Latched: later 401s must not keep retrying or reloading.
+    await assert.rejects(() => getConfig());
+    assert.equal(calls, 3);
+    assert.equal(reloads, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWindow === undefined) delete (globalThis as any).window;
+    else (globalThis as any).window = previousWindow;
+    const { resetAuthExpired } = await import('./api.ts');
+    resetAuthExpired();
+  }
+});
+
+test('applyWebuiToken validates a pasted access URL before persisting it', async () => {
+  const originalFetch = globalThis.fetch;
+  const store = new Map<string, string>();
+  const mockStorage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, val: string) => { store.set(key, val); },
+    removeItem: (key: string) => { store.delete(key); },
+  };
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(url), '/config');
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer new-token');
+    return new Response('{}', { status: 200 });
+  }) as typeof fetch;
+  (globalThis as any).sessionStorage = mockStorage;
+  (globalThis as any).localStorage = mockStorage;
+
+  try {
+    const { applyWebuiToken, isAuthExpired, resetAuthExpired, WEBUI_TOKEN_STORAGE_KEY } = await import('./api.ts');
+    resetAuthExpired();
+    await applyWebuiToken('http://192.168.1.20:13457/?token=new-token&session=abcd1234');
+    assert.equal(store.get(WEBUI_TOKEN_STORAGE_KEY), 'new-token');
+    assert.equal(isAuthExpired(), false);
+  } finally {
+    globalThis.fetch = originalFetch;
     delete (globalThis as any).sessionStorage;
+    delete (globalThis as any).localStorage;
   }
 });
 

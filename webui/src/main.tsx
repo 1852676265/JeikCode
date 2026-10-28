@@ -1,5 +1,6 @@
 import { render } from 'preact';
 import { App } from './app';
+import { AuthExpiredDialog } from './components/AuthExpiredDialog';
 import { SettingsProvider } from './settings';
 import { ensureRandomUUIDPolyfill } from './lib/randomId';
 import { initPageZoom, initEditorFontSize } from './lib/pageZoom';
@@ -35,6 +36,7 @@ initEditorFontSize();
 render(
   <SettingsProvider>
     <App />
+    <AuthExpiredDialog />
   </SettingsProvider>,
   document.getElementById('app')!,
 );

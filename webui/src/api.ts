@@ -8,10 +8,10 @@ import type { PermissionDecisionResult } from './lib/pendingPermission.ts';
 // AND left visible on first paint so we can stash it for Authorization.
 // Remote LAN clients often fail to attach the cookie alone (in-app WebViews,
 // privacy mode) — Bearer from sessionStorage / localStorage is the reliable
-// path. Strip the token from the address bar only after it is stored
-// (CWE-598). If storage is unavailable, keep ?token= so later fetches still
-// authenticate.
-/** Shared sessionStorage key for the webui access token (api + LoginButton). */
+// path. The address-bar token is stripped only after a protected request has
+// accepted it (CWE-598). If storage is unavailable, keep ?token= so later
+// fetches still authenticate.
+/** Shared storage key for the webui access token (api + RemoteAccessControl). */
 export const WEBUI_TOKEN_STORAGE_KEY = 'jeikcode_webui_token';
 
 function persistWebuiToken(value: string) {
@@ -27,15 +27,20 @@ function persistWebuiToken(value: string) {
   }
 }
 
+/**
+ * localStorage 是跨标签页共享的权威来源：另一个标签页通过新的 `/?token=`
+ * 交接成功后会把新 token 写进 localStorage。若这里优先读 per-tab 的
+ * sessionStorage，旧标签页会永远回放刷新前就该淘汰的旧 token（刷新也无效）。
+ */
 function storedWebuiToken(): string {
   try {
-    const session = sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY);
-    if (session) return session;
+    const shared = localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY);
+    if (shared) return shared;
   } catch {
     /* ignore */
   }
   try {
-    return localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '';
+    return sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '';
   } catch {
     return '';
   }
@@ -47,6 +52,29 @@ function tokenFromUrl(): string {
   } catch {
     return '';
   }
+}
+
+/** 从非 HttpOnly 的 token cookie 兜底读取（某些异地上网环境存储孤岛）。 */
+function tokenFromDocumentCookie(): string {
+  try {
+    if (typeof document === 'undefined' || !document.cookie) return '';
+    for (const pair of document.cookie.split(';')) {
+      const trimmed = pair.trim();
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) continue;
+      // 只认明确的 webui 令牌 cookie，避免把 csrf_token 之类误当 Bearer，
+      // 反而遮蔽服务端刚下发的有效 HttpOnly cookie。
+      const name = trimmed.slice(0, eq).trim();
+      if (name !== 'token' && name !== 'access_token' && !name.startsWith('jeikcode_webui')) {
+        continue;
+      }
+      const val = trimmed.slice(eq + 1).trim();
+      if (val) return val;
+    }
+  } catch {
+    /* ignore */
+  }
+  return '';
 }
 
 function stripTokenFromAddressBar() {
@@ -61,45 +89,56 @@ function stripTokenFromAddressBar() {
   }
 }
 
-function captureWebuiToken(): string {
-  const fromUrl = tokenFromUrl();
-  if (fromUrl) {
-    persistWebuiToken(fromUrl);
-    // Leave ?token= in the address bar when storage is unavailable (desktop
-    // WebView / private mode). Stripping first would 401 every later fetch.
-    if (storedWebuiToken() === fromUrl) stripTokenFromAddressBar();
-    return fromUrl;
+/** 存储不可用时把 token 写回地址栏，重载后仍能从 URL 完成认证。 */
+function setTokenInAddressBar(token: string) {
+  try {
+    const url = new URL(location.href);
+    url.searchParams.set('token', token);
+    history.replaceState(null, '', url.pathname + '?' + url.searchParams.toString() + url.hash);
+  } catch {
+    /* ignore */
   }
-  return storedWebuiToken();
 }
 
-captureWebuiToken();
+/** 从存储与地址栏中彻底移除一个已被服务端拒绝的 token。 */
+function forgetWebuiToken(value: string) {
+  const token = value.trim();
+  if (!token) return;
+  try {
+    if (sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) === token) {
+      sessionStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) === token) {
+      localStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const url = new URL(location.href);
+    if (url.searchParams.get('token') !== token) return;
+    url.searchParams.delete('token');
+    const q = url.searchParams.toString();
+    history.replaceState(null, '', url.pathname + (q ? `?${q}` : '') + url.hash);
+  } catch {
+    /* ignore */
+  }
+}
 
 function currentWebuiToken(): string {
   const fromUrl = tokenFromUrl();
-  if (fromUrl) {
-    persistWebuiToken(fromUrl);
-    return fromUrl;
-  }
+  if (fromUrl) return fromUrl;
   const stored = storedWebuiToken();
   if (stored) return stored;
-
-  // 兜底从 document.cookie 读取（解决某些异地浏览器或非隐身页面存储孤岛问题）
-  try {
-    if (typeof document !== 'undefined' && document.cookie) {
-      for (const pair of document.cookie.split(';')) {
-        const trimmed = pair.trim();
-        if (trimmed.startsWith('token=') || trimmed.includes('_token=')) {
-          const val = trimmed.split('=')[1]?.trim();
-          if (val) {
-            persistWebuiToken(val);
-            return val;
-          }
-        }
-      }
-    }
-  } catch {}
-
+  const fromCookie = tokenFromDocumentCookie();
+  if (fromCookie) {
+    persistWebuiToken(fromCookie);
+    return fromCookie;
+  }
   return '';
 }
 
@@ -112,39 +151,245 @@ function authHeaders(): Record<string, string> {
   return h;
 }
 
-const RELOAD_DEBOUNCE_MS = 15_000;
-const LAST_401_RELOAD_KEY = 'jeikcode_last_401_reload';
+export type AuthExpiredListener = (expired: boolean) => void;
 
-/**
- * 异地浏览器在长期挂起或后端重启后，若凭据失效触发 401，
- * 触发一次自动刷新以重新从 URL/Cookie 协商凭据并对齐服务端最新状态。
- * 使用 15 秒防抖（sessionStorage 记录），严禁在凭据完全无效时死循环高频刷新。
- */
-export function handleAuthExpiredReload(): boolean {
-  if (typeof window === 'undefined' || typeof window.location === 'undefined') return false;
-  try {
-    const raw = sessionStorage.getItem(LAST_401_RELOAD_KEY);
-    const last = raw ? Number.parseInt(raw, 10) : 0;
-    const now = Date.now();
-    if (Number.isFinite(last) && now - last < RELOAD_DEBOUNCE_MS) {
-      return false;
+let authExpired = false;
+const authExpiredListeners = new Set<AuthExpiredListener>();
+
+/** 当前页面已知的全部凭据均被服务端拒绝——必须让用户提供新令牌。 */
+export function isAuthExpired(): boolean {
+  return authExpired;
+}
+
+/** 订阅认证失效状态变化；返回取消订阅函数。 */
+export function onAuthExpiredChange(listener: AuthExpiredListener): () => void {
+  authExpiredListeners.add(listener);
+  return () => {
+    authExpiredListeners.delete(listener);
+  };
+}
+
+function setAuthExpired(next: boolean) {
+  if (authExpired === next) return;
+  authExpired = next;
+  for (const listener of [...authExpiredListeners]) {
+    try {
+      listener(next);
+    } catch {
+      /* isolate subscriber failures */
     }
-    sessionStorage.setItem(LAST_401_RELOAD_KEY, String(now));
-    window.location.reload();
-    return true;
+  }
+}
+
+function clearAuthExpired() {
+  setAuthExpired(false);
+}
+
+/** 测试/重连用的复位入口：清除“凭据已全部失效”的锁存状态。 */
+export function resetAuthExpired(): void {
+  setAuthExpired(false);
+}
+
+// 另一个标签页完成 token 轮换后，localStorage 的 storage 事件会在本标签页触发。
+// 立刻采纳新 token 并解除认证失效锁存，让旧标签页无需刷新即可自愈。
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== WEBUI_TOKEN_STORAGE_KEY || !event.newValue) return;
+    try {
+      sessionStorage.setItem(WEBUI_TOKEN_STORAGE_KEY, event.newValue);
+    } catch {
+      /* ignore */
+    }
+    clearAuthExpired();
+  });
+}
+
+/** 用一个受保护请求确认并采纳新凭据（地址栏 token 只有在确认后才剥离）。 */
+function confirmWebuiToken(value: string) {
+  const token = value.trim();
+  if (!token) return;
+  persistWebuiToken(token);
+  // 存储不可用（桌面 WebView / 隐私模式）时保留地址栏 token，否则后续请求会 401。
+  if (storedWebuiToken() === token) stripTokenFromAddressBar();
+  clearAuthExpired();
+}
+
+function tokenFromAuthorization(value: string | null): string {
+  const raw = (value ?? '').trim();
+  if (!raw) return '';
+  return raw.replace(/^bearer\s+/i, '').trim();
+}
+
+/** 除已拒绝的那个之外，本页还能尝试的其他凭据（按优先级）。 */
+function tokenCandidates(rejected: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (raw: string) => {
+    const token = raw.trim();
+    if (!token || token === rejected || seen.has(token)) return;
+    seen.add(token);
+    out.push(token);
+  };
+  push(tokenFromUrl());
+  try {
+    push(localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '');
+  } catch {
+    /* ignore */
+  }
+  try {
+    push(sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '');
+  } catch {
+    /* ignore */
+  }
+  push(tokenFromDocumentCookie());
+  return out;
+}
+
+function isPublicRequest(input: RequestInfo | URL): boolean {
+  const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  try {
+    return new URL(raw, 'http://localhost').pathname === '/health';
   } catch {
     return false;
   }
 }
 
-export function resetAuthReloadState(): void {
-  try {
-    if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.removeItem(LAST_401_RELOAD_KEY);
+/**
+ * 构造请求头。`bearer === undefined` 表示沿用当前凭据；传 `null` 表示本次
+ * 不带 Bearer（只用 HttpOnly cookie 重新协商）；传字符串表示指定候选凭据。
+ */
+function buildHeaders(init: RequestInit, bearer?: string | null): Headers {
+  const headers = new Headers(init.headers);
+  if (!headers.has('X-JeikCode-Client')) headers.set('X-JeikCode-Client', 'webui');
+  if (bearer === undefined) {
+    if (!headers.has('Authorization')) {
+      const token = currentWebuiToken();
+      if (token) headers.set('Authorization', 'Bearer ' + token);
     }
+  } else {
+    headers.delete('Authorization');
+    if (bearer) headers.set('Authorization', 'Bearer ' + bearer);
+  }
+  return headers;
+}
+
+async function sendWithToken(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  bearer: string | null,
+): Promise<Response> {
+  return fetch(input, { ...init, credentials: 'include', headers: buildHeaders(init, bearer) });
+}
+
+let recoveringUnauthorized = false;
+
+/**
+ * 401 自愈：绝不刷新页面（旧 token 仍会被存储回放，刷新只会无限循环）。
+ *
+ * 顺序：丢弃服务端刚拒绝的 token → 尝试其他已保存的候选 token（另一个
+ * 标签页可能已经轮换成功）→ 最后用 HttpOnly cookie 重试一次。全部失败才
+ * 锁存“认证失效”，交由 UI 让用户粘贴新访问链接/token。
+ */
+async function recoverUnauthorized(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  rejectedToken: string,
+  unauthorized: Response,
+): Promise<Response> {
+  if (authExpired || recoveringUnauthorized) return unauthorized;
+
+  recoveringUnauthorized = true;
+  try {
+    if (rejectedToken) forgetWebuiToken(rejectedToken);
+
+    for (const candidate of tokenCandidates(rejectedToken)) {
+      const retry = await sendWithToken(input, init, candidate);
+      if (retry.ok) {
+        confirmWebuiToken(candidate);
+        return retry;
+      }
+      if (retry.status !== 401) return retry;
+      forgetWebuiToken(candidate);
+    }
+
+    // Cookie 是 `/?token=` 交接后由服务端写入的 HttpOnly 凭据。旧 Bearer 会
+    // 在中间件里优先于 Cookie，把它遮蔽掉；去掉 Bearer 才能让新 Cookie 生效。
+    // 原本就没带 Bearer 说明 Cookie 已经被试过，无需重复请求。
+    if (!rejectedToken) {
+      setAuthExpired(true);
+      return unauthorized;
+    }
+    const cookieRetry = await sendWithToken(input, init, null);
+    if (cookieRetry.ok) {
+      clearAuthExpired();
+      return cookieRetry;
+    }
+    if (cookieRetry.status !== 401) return cookieRetry;
+
+    setAuthExpired(true);
+    return unauthorized;
+  } finally {
+    recoveringUnauthorized = false;
+  }
+}
+
+/**
+ * 校验并采纳用户粘贴的访问链接 / token（401 遮罩使用）。
+ * 校验请求本身必须先于持久化，避免把错误 token 写进共享存储污染其他标签页。
+ */
+export async function applyWebuiToken(raw: string): Promise<void> {
+  const token = parseTokenInput(raw);
+  if (!token) throw new Error('empty token');
+  const resp = await fetch('/config', {
+    credentials: 'include',
+    headers: {
+      'X-JeikCode-Client': 'webui',
+      Authorization: 'Bearer ' + token,
+    },
+  });
+  if (resp.status === 401 || resp.status === 403) throw new Error('invalid token');
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+  // 清掉所有被拒绝的旧值，再写入已验证的新 token（两端存储都覆盖）。
+  try {
+    sessionStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
   } catch {
     /* ignore */
   }
+  try {
+    localStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+  persistWebuiToken(token);
+  if (storedWebuiToken() === token) {
+    stripTokenFromAddressBar();
+  } else {
+    // 存储被禁用（隐私模式 / 受限 WebView）：把已验证的 token 留在地址栏，
+    // 否则随后的整页重载会丢失凭据并再次 401。
+    setTokenInAddressBar(token);
+  }
+  clearAuthExpired();
+}
+
+/** 接受裸 token、完整 `/?token=…` 链接或 `?token=…` 查询串。 */
+function parseTokenInput(raw: string): string {
+  const text = raw.trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    return (url.searchParams.get('token') ?? '').trim();
+  } catch {
+    /* not an absolute URL */
+  }
+  if (text.includes('token=')) {
+    try {
+      return (new URLSearchParams(text.replace(/^\?/, '')).get('token') ?? '').trim();
+    } catch {
+      /* not a query string */
+    }
+  }
+  return text;
 }
 
 /**
@@ -152,18 +397,22 @@ export function resetAuthReloadState(): void {
  * and merges auth headers. Remote LAN clients need both cookie + Bearer.
  */
 async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers);
-  const auth = authHeaders();
-  for (const [k, v] of Object.entries(auth)) {
-    if (!headers.has(k)) headers.set(k, v);
-  }
+  const headers = buildHeaders(init);
+  const sentToken = tokenFromAuthorization(headers.get('Authorization'));
   try {
     const resp = await fetch(input, { ...init, credentials: 'include', headers });
     if (resp.status === 401) {
       console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', input);
-      handleAuthExpiredReload();
-    } else if (resp.ok) {
-      resetAuthReloadState();
+      return await recoverUnauthorized(input, init, sentToken, resp);
+    }
+    if (resp.ok && !isPublicRequest(input)) {
+      if (sentToken) {
+        // 用受保护端点的成功响应确认该凭据，再写入存储/剥离地址栏 token。
+        confirmWebuiToken(sentToken);
+      } else {
+        // 无 Bearer 也能成功（Cookie 生效或已切到免 token 模式）：解除认证门。
+        clearAuthExpired();
+      }
     }
     return resp;
   } catch (err: any) {
@@ -2256,7 +2505,10 @@ export async function streamGlobalEvents(
   try {
     const resp = await apiFetch('/events', { headers: authHeaders(), signal: streamAbort.signal });
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      const error = new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      // 凭据被拒时重连只会反复 401；交给全局认证遮罩引导用户换 token。
+      if (resp.status === 401) error.name = 'AuthExpiredError';
+      throw error;
     }
     const reader = resp.body!.getReader();
     readerCancelHandler = () => {
