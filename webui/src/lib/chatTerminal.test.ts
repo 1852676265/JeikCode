@@ -23,6 +23,8 @@ import {
   reconcileRunningTranscript,
   unpaintedReplaySuffix,
   mergeDiskWithUnpersistedTail,
+  mergeAuthoritativeTail,
+  diskCoversCanvasTail,
   shouldAdoptDiskTranscript,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
@@ -43,6 +45,7 @@ import {
   userTextsMatch,
   findPendingSelfEchoIndex,
 } from './chatTerminal.ts';
+import { spliceAuthoritativeDiskTail } from './sessionProjection.ts';
 
 test('legacy done and stopped are natural completions that preserve queued messages', () => {
   assert.deepEqual(classifyChatDone({}), {
@@ -128,6 +131,71 @@ test('mergeDiskWithUnpersistedTail：磁盘停在上一轮时不得抹掉画布�
   // 磁盘还停在上一轮（daemon 收尾/重启）：steer 与最终回答是唯一副本，必须整段接回。
   const kept = mergeDiskWithUnpersistedTail(disk, canvas, { diskCoversTail: false });
   assert.deepEqual(kept.map((m) => m.id), ['q0', 'a0', 'steer-1', 'live-1']);
+});
+
+test('diskCoversCanvasTail：磁盘只有当前提问、还没有当前回答时不算覆盖尾部', () => {
+  const disk = [
+    { role: 'user', id: 'q0', parts: [{ kind: 'text' as const, text: '上一问' }] },
+    { role: 'assistant', id: 'a0', parts: [{ kind: 'text' as const, text: '上一答' }] },
+    { role: 'user', id: 'q1', parts: [{ kind: 'text' as const, text: '当前提问' }] },
+  ];
+  const canvas = [
+    ...disk,
+    { role: 'assistant', id: 'a1', parts: [{ kind: 'text' as const, text: '当前已结算回答' }] },
+  ];
+  assert.equal(diskCoversCanvasTail(disk, canvas), false);
+
+  const full = [...disk, { role: 'assistant', id: 'a1', parts: [{ kind: 'text' as const, text: '当前已结算回答' }] }];
+  assert.equal(diskCoversCanvasTail(full, canvas), true);
+
+  // 画布比磁盘更长 = 还有未落盘正文，绝不能被旧磁盘覆盖。
+  const longer = [
+    ...disk,
+    { role: 'assistant', parts: [{ kind: 'text' as const, text: '当前已结算回答，还有一段刚流出但尚未落盘' }] },
+  ];
+  assert.equal(diskCoversCanvasTail(full, longer), false);
+});
+
+test('before/after：旧 adopt 路径会丢当前提问并留下错位回答，新 helper 保留完整当前轮', () => {
+  const disk = [
+    { role: 'user', id: 'q0', parts: [{ kind: 'text' as const, text: '上一问' }] },
+    { role: 'assistant', id: 'a0', parts: [{ kind: 'text' as const, text: '上一答' }] },
+  ];
+  const canvas = [
+    ...disk,
+    { role: 'user', id: 'q1', sourceIndex: 2, parts: [{ kind: 'text' as const, text: '当前提问' }] },
+    { role: 'assistant', id: 'a1', parts: [{ kind: 'text' as const, text: '当前已结算回答' }] },
+  ];
+  // 旧实现：splice 丢掉窗口外的 q1 后，merge 默认 diskCoversTail=true，直接采用旧磁盘。
+  const oldMerged = mergeDiskWithUnpersistedTail(
+    spliceAuthoritativeDiskTail(canvas, disk, 2),
+    canvas,
+  );
+  // 复现旧路径：q1 被窗口判断丢弃，a1 被当作 overlay 留在尾部，
+  // 于是上一轮内容和一条失去提问的回答混在尾部。
+  assert.deepEqual(oldMerged.map((m) => m.id), ['q0', 'a0', 'a1']);
+
+  const fixed = mergeAuthoritativeTail(disk, canvas, 2);
+  assert.deepEqual(fixed.map((m) => m.id), ['q0', 'a0', 'q1', 'a1']);
+});
+
+test('mergeDiskWithUnpersistedTail：停止对账磁盘停在上一轮时必须保留已结算的当前轮', () => {
+  const disk = [
+    { role: 'user', id: 'q0', parts: [{ kind: 'text' as const, text: '上一问' }] },
+    { role: 'assistant', id: 'a0', parts: [{ kind: 'text' as const, text: '上一答' }] },
+  ];
+  const canvas = [
+    ...disk,
+    { role: 'user', id: 'q1', parts: [{ kind: 'text' as const, text: '当前提问' }] },
+    { role: 'assistant', id: 'a1', parts: [{ kind: 'text' as const, text: '当前已结算回答' }] },
+  ];
+  // 默认 true 会让画布被旧磁盘整表替换；停止/断网对账必须显式传 false，
+  // 否则当前轮消失，看起来就像是上一轮内容又“复活”到了尾部。
+  assert.deepEqual(mergeDiskWithUnpersistedTail(disk, canvas).map((m) => m.id), ['q0', 'a0']);
+  assert.deepEqual(
+    mergeDiskWithUnpersistedTail(disk, canvas, { diskCoversTail: false }).map((m) => m.id),
+    ['q0', 'a0', 'q1', 'a1'],
+  );
 });
 
 test('mergeDiskWithUnpersistedTail：多条未落盘 steer 按身份整段接回', () => {

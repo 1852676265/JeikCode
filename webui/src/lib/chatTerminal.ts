@@ -53,6 +53,8 @@ export function shouldAdoptDiskTranscript(input: {
   return input.diskHasUser && input.diskText > input.canvasText;
 }
 
+import { spliceAuthoritativeDiskTail } from './sessionProjection.ts';
+
 type TailPart = { kind: string; text?: string };
 type TailMessage = { role: string; parts: TailPart[]; images?: unknown[]; id?: string };
 
@@ -79,6 +81,40 @@ function lastTailUser(messages: TailMessage[]): string {
     if (messages[i]?.role === 'user') return tailPlain(messages[i]);
   }
   return '';
+}
+
+/**
+ * Does the authoritative disk slice actually cover the canvas's LAST row?
+ *
+ * `diskHasCanvasUser` only checks the latest user prompt. After Stop the daemon
+ * may have persisted that prompt but not its answer yet: the last user matches,
+ * while the disk tail still ends at the previous answer. Treating that as
+ * "covers tail" makes `mergeDiskWithUnpersistedTail` adopt the old answer and
+ * drop the stopped turn. This check also compares the tail row itself.
+ */
+export function diskCoversCanvasTail(disk: TailMessage[], canvas: TailMessage[]): boolean {
+  if (canvas.length === 0) return true;
+  const last = canvas[canvas.length - 1];
+  if (!last) return true;
+  if (last.id && disk.some((message) => message.id === last.id)) return true;
+  const diskLast = disk[disk.length - 1];
+  if (!diskLast || diskLast.role !== last.role) return false;
+  const canvasText = tailPlain(last).trim();
+  const diskText = tailPlain(diskLast).trim();
+  if (last.role === 'user') {
+    if (!canvasText) return false;
+    // Disk text may carry an injected prefix; canvas text must be its suffix.
+    // Do NOT treat a longer canvas as covered: that is an unpersisted tail.
+    return diskText === canvasText || diskText.endsWith(canvasText);
+  }
+  if (last.role === 'assistant') {
+    if (!canvasText) return false;
+    // Disk may hold the complete answer while the stopped canvas has only a
+    // prefix. Only "disk extends canvas" (or equal) counts as covered; a
+    // different previous answer or a longer live canvas must be preserved.
+    return diskText === canvasText || diskText.startsWith(canvasText);
+  }
+  return false;
 }
 
 /**
@@ -165,6 +201,29 @@ export function mergeDiskWithUnpersistedTail<T extends TailMessage>(
   }
 
   return [...disk, ...canvas.slice(lastUser)];
+}
+
+/**
+ * The exact authoritative-tail composition used by Chat.tsx.
+ *
+ * Kept pure so the stop/reconnect race can be tested without mounting the UI:
+ * a stale disk tail (previous turn, or current prompt without its answer) must
+ * preserve the current canvas tail instead of replacing it wholesale.
+ */
+export function mergeAuthoritativeTail<
+  T extends TailMessage & { sourceIndex?: number; isSteer?: boolean },
+>(diskTail: T[], canvas: T[], diskOffset: number): T[] {
+  if (diskTail.length === 0) return canvas;
+  const diskCoversTail = diskCoversCanvasTail(diskTail, canvas);
+  if (!diskCoversTail) {
+    // Do NOT splice first in this branch: splice can append an orphan current
+    // answer (a1) as overlay, making identity matching think the current turn
+    // is already on disk and dropping its user question. Merge from the
+    // ORIGINAL stale tail so the last shared id is the previous answer.
+    return mergeDiskWithUnpersistedTail(diskTail, canvas, { diskCoversTail: false });
+  }
+  const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, diskOffset);
+  return mergeDiskWithUnpersistedTail(spliced, canvas, { diskCoversTail: true });
 }
 
 /** Keep the existing `/live` SSE when returning to the execution session.
@@ -696,8 +755,9 @@ function continuationNotOnTranscript<T extends ReconcileMessage>(base: T[], extr
   return kept;
 }
 
-/** Session detail caps a field at 24KB and appends this marker. The live replay
- *  still carries the original text, so a raw prefix compare misses. */
+/** Legacy session detail capped a field at 24KB and appended this marker. New
+ *  daemon builds return full fields; keep the marker handling so old caches and
+ *  old display logs still reconcile without duplicating blocks. */
 export const DISPLAY_TRUNCATION_MARK = '\n… [truncated for display]';
 
 export function withoutDisplayTruncation(value: string): string {

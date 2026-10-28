@@ -441,6 +441,10 @@ mod tests {
             updated_at_ms: 2,
             message_count: 3,
             turn_count: 1,
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
             presence: CatalogPresence::NativeOnly,
         };
 

@@ -13,7 +13,6 @@
 import {
   turnNavId,
   compactTurnNavText,
-  truncateTurnNavLabel,
   type TurnNavItem,
 } from './turnNav.ts';
 import {
@@ -345,7 +344,7 @@ export function deriveTurnNavItems(messages: MessageEntity[]): TurnNavItem[] {
     const cleaned = compactTurnNavText(
       stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(rawText)),
     );
-    const label = truncateTurnNavLabel(cleaned);
+    const label = cleaned;
     if (!label) continue;
 
     const ordinal = typeof msg.turn_ordinal === 'number' ? msg.turn_ordinal : items.length;

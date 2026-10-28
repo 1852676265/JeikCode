@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use super::manager::SessionManager;
 use super::{SessionResult, SessionStoreError};
 
-pub const DISPLAY_VERSION: u32 = 2;
+pub const DISPLAY_VERSION: u32 = 3;
 pub const MAX_DISPLAY_BYTES: usize = 512 * 1024 * 1024;
 /// The reader loads the whole log (records + inline images). Keep a bounded
 /// read but align it with realistic image-heavy sessions; beyond this the

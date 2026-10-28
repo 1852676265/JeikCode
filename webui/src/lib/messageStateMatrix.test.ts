@@ -366,7 +366,7 @@ test('after a compacted disk snapshot, a new steer keeps the full display histor
   assert.ok(toolIndex > steerIndex);
 });
 
-test('cache schema version is 4, so pre-fix canvases are not trusted', async () => {
+test('cache schema version is 6, so pre-fix canvases are not trusted', async () => {
   const { CACHE_DISPLAY_VERSION } = await import('./sessionCache.ts');
-  assert.equal(CACHE_DISPLAY_VERSION, 5);
+  assert.equal(CACHE_DISPLAY_VERSION, 6);
 });

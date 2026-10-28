@@ -74,7 +74,10 @@ use axum::{
         ws::{Message, WebSocketUpgrade},
         DefaultBodyLimit, Path, Query, State,
     },
-    http::{header, request::Parts as RequestParts, HeaderName, HeaderValue, Method, StatusCode},
+    http::{
+        header, request::Parts as RequestParts, HeaderMap, HeaderName, HeaderValue, Method,
+        StatusCode,
+    },
     response::{sse::Sse, IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -709,13 +712,135 @@ mod session_window_tests {
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].ordinal, 0);
         assert_eq!(turns[0].index, 0);
-        assert_eq!(turns[0].text, "第一问");
+        assert_eq!(turns[0].label, "第一问");
         assert_eq!(turns[1].ordinal, 1);
         assert_eq!(turns[1].index, 2);
-        assert_eq!(turns[1].text, "第二问");
+        assert_eq!(turns[1].label, "第二问");
         assert_eq!(turns[2].ordinal, 2);
         assert_eq!(turns[2].index, 4);
-        assert_eq!(turns[2].text, "服务恢复后继续");
+        assert_eq!(turns[2].label, "服务恢复后继续");
+    }
+
+    #[test]
+    fn session_detail_response_emits_etag_and_honors_if_none_match() {
+        let detail = SessionDetail {
+            id: "s".into(),
+            name: "n".into(),
+            working_dir: PathBuf::from("."),
+            created_at: 0,
+            updated_at: 0,
+            message_count: 0,
+            offset: 0,
+            pinned_user_index: None,
+            turns: Vec::new(),
+            messages: Vec::new(),
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
+            token_usage: None,
+            origin: jeikcode_capabilities::session::SessionOrigin::Manual,
+            todos: Vec::new(),
+        };
+        let first = session_detail_response(&HeaderMap::new(), detail.clone());
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            HeaderValue::from_str(&etag).unwrap(),
+        );
+        let second = session_detail_response(&request_headers, detail);
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            second
+                .headers()
+                .get(axum::http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag
+        );
+    }
+
+    #[test]
+    fn catalog_summary_uses_entry_config_without_meta_read() {
+        let entry = jeikcode_capabilities::session::CatalogEntry {
+            id: "s".into(),
+            name: "n".into(),
+            fork_root_id: None,
+            project_bucket: "p".into(),
+            // Deliberately nonexistent: the summary must not read a meta file.
+            working_dir: PathBuf::from("/does/not/exist"),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            message_count: 0,
+            turn_count: 0,
+            preferred_model: Some("model-a".into()),
+            approval_mode: None,
+            reasoning_effort: Some("high".into()),
+            thinking_budget: Some(4096),
+            presence: jeikcode_capabilities::session::CatalogPresence::NativeOnly,
+        };
+        let summary = catalog_entry_to_session_summary(&entry);
+        assert_eq!(summary.preferred_model.as_deref(), Some("model-a"));
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(summary.thinking_budget, Some(4096));
+    }
+
+    #[test]
+    fn outline_label_is_short_but_canvas_content_is_full() {
+        let long = "长".repeat(1000);
+
+        let msgs = vec![MessageInfo {
+            role: "user".into(),
+            content: long.clone(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms: None,
+            id: None,
+        }];
+        let turns = session_user_outline(&msgs);
+        assert_eq!(turns[0].label.chars().count(), 120);
+        assert!(turns[0].label.ends_with('…'));
+
+        let record = jeikcode_capabilities::session::DisplayRecord {
+            v: jeikcode_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id: 1,
+            index: 0,
+            role: "user".into(),
+            id: None,
+            content: long.clone(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: None,
+            elapsed_ms: None,
+        };
+        let turns = session_records_user_outline(&[record], 0);
+        assert_eq!(turns[0].label.chars().count(), 120);
+        assert!(turns[0].label.ends_with('…'));
+
+        let msg = jeikcode_kernel::message::Message::user(long.clone());
+        let info = MessageInfo::from_kernel(&msg);
+        assert_eq!(info.content, long);
     }
 }
 
@@ -1277,8 +1402,6 @@ mod global_events_tests {
     }
 }
 
-const DISPLAY_FIELD_CAP: usize = 24 * 1024;
-
 /// Compact user-question row for the session outline (right-rail). Not the
 /// model context — just labels.
 #[derive(Debug, Clone, Serialize)]
@@ -1286,11 +1409,31 @@ pub struct SessionTurnOutline {
     /// Stable ordinal among real user questions. Unlike `index`, this is not
     /// affected by assistant/tool/diagnostic rows inserted by failed turns.
     pub ordinal: usize,
+    /// Stable persisted message id when available. The primary dedupe identity;
+    /// older rows without an id fall back to `index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub index: usize,
-    pub text: String,
+    /// Short rail label. The full question lives in `messages`; keeping the
+    /// outline compact avoids duplicating the whole transcript in every page.
+    pub label: String,
 }
 
-const OUTLINE_TEXT_CAP: usize = 240;
+const OUTLINE_LABEL_CAP: usize = 120;
+
+fn outline_label(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= OUTLINE_LABEL_CAP {
+        return compact;
+    }
+    format!(
+        "{}…",
+        compact
+            .chars()
+            .take(OUTLINE_LABEL_CAP.saturating_sub(1))
+            .collect::<String>()
+    )
+}
 
 fn session_user_outline(messages: &[MessageInfo]) -> Vec<SessionTurnOutline> {
     messages
@@ -1300,27 +1443,18 @@ fn session_user_outline(messages: &[MessageInfo]) -> Vec<SessionTurnOutline> {
             if !msg.role.eq_ignore_ascii_case("user") || msg.synthetic {
                 return None;
             }
-            let text = msg.content.split_whitespace().collect::<Vec<_>>().join(" ");
-            if text.is_empty() {
+            let label = outline_label(&msg.content);
+            if label.is_empty() {
                 return None;
             }
-            let text = if text.chars().count() > OUTLINE_TEXT_CAP {
-                format!(
-                    "{}…",
-                    text.chars()
-                        .take(OUTLINE_TEXT_CAP.saturating_sub(1))
-                        .collect::<String>()
-                )
-            } else {
-                text
-            };
-            Some((index, text))
+            Some((index, msg.id.clone(), label))
         })
         .enumerate()
-        .map(|(ordinal, (index, text))| SessionTurnOutline {
+        .map(|(ordinal, (index, id, label))| SessionTurnOutline {
             ordinal,
+            id,
             index,
-            text,
+            label,
         })
         .collect()
 }
@@ -1336,50 +1470,24 @@ fn session_records_user_outline(
             if !record.role.eq_ignore_ascii_case("user") || record.synthetic {
                 return None;
             }
-            let text = record
-                .content
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            if text.is_empty() {
+            let label = outline_label(&record.content);
+            if label.is_empty() {
                 return None;
             }
-            let text = if text.chars().count() > OUTLINE_TEXT_CAP {
-                format!(
-                    "{}…",
-                    text.chars()
-                        .take(OUTLINE_TEXT_CAP.saturating_sub(1))
-                        .collect::<String>()
-                )
-            } else {
-                text
-            };
-            Some((index_offset + idx, text))
+            Some((index_offset + idx, record.id.clone(), label))
         })
         .enumerate()
-        .map(|(ordinal, (index, text))| SessionTurnOutline {
+        .map(|(ordinal, (index, id, label))| SessionTurnOutline {
             ordinal,
+            id,
             index,
-            text,
+            label,
         })
         .collect()
 }
 
-fn cap_display_field(s: String) -> String {
-    if s.len() <= DISPLAY_FIELD_CAP {
-        return s;
-    }
-    let mut end = DISPLAY_FIELD_CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = s[..end].to_string();
-    out.push_str("\n… [truncated for display]");
-    out
-}
-
 /// Session detail response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionDetail {
     pub id: String,
     pub name: String,
@@ -3793,7 +3901,7 @@ impl MessageInfo {
                 .map(|call| ToolCallInfo {
                     id: call.id.clone(),
                     name: call.name.clone(),
-                    arguments: cap_display_field(call.arguments.clone()),
+                    arguments: call.arguments.clone(),
                     display: format_tool_args(&call.name, &call.arguments),
                 })
                 .collect()
@@ -3813,7 +3921,7 @@ impl MessageInfo {
                 .iter()
                 .map(|call| (call.name.as_str(), call.arguments.as_str())),
         );
-        let mut content = cap_display_field(msg.text.clone());
+        let mut content = msg.text.clone();
         let mut images = (!msg.images.is_empty()).then(|| {
             msg.images
                 .iter()
@@ -3839,7 +3947,7 @@ impl MessageInfo {
             role: role.into(),
             id: msg.id.clone(),
             content,
-            reasoning: msg.reasoning.clone().map(cap_display_field),
+            reasoning: msg.reasoning.clone(),
             synthetic: msg.synthetic,
             internal_origin: msg.internal_origin.clone(),
             tool_calls,
@@ -4203,10 +4311,74 @@ fn dangerous_tools_enabled() -> bool {
 }
 
 fn compression_layer() -> CompressionLayer<impl Predicate + Clone> {
-    CompressionLayer::new()
-        .gzip(true)
-        .br(true)
-        .compress_when(DefaultPredicate::new().and(NotForContentType::new("text/event-stream")))
+    CompressionLayer::new().gzip(true).br(true).compress_when(
+        DefaultPredicate::new()
+            .and(NotForContentType::new("text/event-stream"))
+            .and(CompressibleContentType),
+    )
+}
+
+/// Binary payloads are already compressed (or incompressible): gzip/brotli only
+/// burns CPU and can enlarge them. SSE is excluded separately above.
+#[derive(Clone, Copy, Default)]
+struct CompressibleContentType;
+
+fn is_binary_content_type(content_type: &str) -> bool {
+    let value = content_type.trim().to_ascii_lowercase();
+    value.starts_with("image/")
+        || value.starts_with("video/")
+        || value.starts_with("audio/")
+        || value.starts_with("font/")
+        || value.starts_with("application/zip")
+        || value.starts_with("application/gzip")
+        || value.starts_with("application/x-gzip")
+        || value.starts_with("application/octet-stream")
+        || value.starts_with("application/pdf")
+        || value.starts_with("application/wasm")
+}
+
+impl Predicate for CompressibleContentType {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: axum::body::HttpBody,
+    {
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        !is_binary_content_type(content_type)
+    }
+}
+
+#[cfg(test)]
+mod compression_predicate_tests {
+    use super::is_binary_content_type;
+
+    #[test]
+    fn binary_content_types_are_excluded_from_compression() {
+        for content_type in [
+            "image/png",
+            "video/mp4",
+            "audio/mpeg",
+            "font/woff2",
+            "application/zip",
+            "application/gzip",
+            "application/octet-stream",
+            "application/pdf",
+            "application/wasm",
+        ] {
+            assert!(is_binary_content_type(content_type), "{content_type}");
+        }
+        for content_type in [
+            "application/json",
+            "text/html; charset=utf-8",
+            "text/event-stream",
+            "application/javascript",
+        ] {
+            assert!(!is_binary_content_type(content_type), "{content_type}");
+        }
+    }
 }
 
 fn cors_layer() -> CorsLayer {
@@ -4222,8 +4394,10 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
+            header::IF_NONE_MATCH,
             HeaderName::from_static("x-jeikcode-client"),
         ])
+        .expose_headers([header::ETAG])
         .allow_credentials(true)
 }
 
@@ -4678,15 +4852,12 @@ fn catalog_scan_in_root(
 fn catalog_entry_to_session_summary(
     entry: &jeikcode_capabilities::session::CatalogEntry,
 ) -> SessionSummary {
-    let meta = jeikcode_capabilities::session::SessionManager::for_project(&entry.working_dir)
-        .read_meta(&entry.id)
-        .ok();
-    let preferred_model = meta.as_ref().and_then(|m| m.preferred_model.clone());
+    // Catalog entries already carry the four session-scoped config fields, so
+    // the list path does not re-open `<id>.meta` for every row.
+    let preferred_model = entry.preferred_model.clone();
     // 全局开关优先，其余情况磁盘元数据 > 内存热态（不再回扫会话目录）。
-    let approval_mode = live_api::live_display_approval_mode_wire(
-        &entry.id,
-        meta.as_ref().and_then(|m| m.approval_mode.as_deref()),
-    );
+    let approval_mode =
+        live_api::live_display_approval_mode_wire(&entry.id, entry.approval_mode.as_deref());
     SessionSummary {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -4697,8 +4868,8 @@ fn catalog_entry_to_session_summary(
         file_size: 0,
         approval_mode: Some(approval_mode),
         preferred_model,
-        reasoning_effort: meta.as_ref().and_then(|m| m.reasoning_effort.clone()),
-        thinking_budget: meta.as_ref().and_then(|m| m.thinking_budget),
+        reasoning_effort: entry.reasoning_effort.clone(),
+        thinking_budget: entry.thinking_budget,
     }
 }
 
@@ -5332,11 +5503,72 @@ async fn get_session_freshness(
     Json(freshness)
 }
 
+const SESSION_DETAIL_WARN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Stable, dependency-free ETag for a JSON response body.
+fn response_etag(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("\"{hash:016x}\"")
+}
+
+fn log_response_size(route: &str, bytes: usize) {
+    tracing::debug!(target: "jeikcode::http", route, bytes, "response_size");
+    if bytes > SESSION_DETAIL_WARN_BYTES {
+        tracing::warn!(target: "jeikcode::http", route, bytes, "large_response_body");
+    }
+}
+
+fn session_detail_response(headers: &HeaderMap, detail: SessionDetail) -> axum::response::Response {
+    let body = match serde_json::to_vec(&detail) {
+        Ok(body) => body,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let etag = response_etag(&body);
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || candidate == etag
+                    || candidate
+                        .strip_prefix("W/")
+                        .is_some_and(|weak| weak == etag)
+            })
+        });
+    if not_modified {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        return response;
+    }
+
+    log_response_size("session_detail", body.len());
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(
     State(state): State<AppState>,
     Path((hash, id)): Path<(String, String)>,
     Query(query): Query<SessionDetailQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
@@ -5597,7 +5829,7 @@ async fn get_session_detail(
                 origin: session.meta.origin,
                 todos,
             };
-            Json(detail).into_response()
+            session_detail_response(&headers, detail)
         }
         Ok(None) if crate::native_live::is_session_draft(&id) => {
             // OpenCode draft: allocated via POST /sessions but not catalog-persisted yet.
@@ -5626,7 +5858,7 @@ async fn get_session_detail(
                 origin: jeikcode_capabilities::session::SessionOrigin::Manual,
                 todos: Vec::new(),
             };
-            Json(detail).into_response()
+            session_detail_response(&headers, detail)
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
         Err(e) => {
@@ -5850,11 +6082,12 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     }
 }
 
-/// The display log is also read on every history page. A single-entry cache is
-/// enough for the common scroll pattern (consecutive pages of one session) and
-/// avoids re-reading + re-parsing a multi-megabyte JSONL per page. The cache is
-/// bounded so a pathological log cannot pin hundreds of MB in memory.
+/// The display log is also read on every history page. Keep a small LRU across
+/// sessions so warm-switching does not re-read + re-parse a multi-megabyte JSONL
+/// per page. Both the per-entry and total budgets are bounded.
 const MAX_CACHED_DISPLAY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CACHED_DISPLAY_ENTRIES: usize = 8;
+const MAX_CACHED_DISPLAY_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 
 struct DisplayLogCacheEntry {
     key: String,
@@ -5866,10 +6099,71 @@ struct DisplayLogCacheEntry {
     records: Arc<Vec<jeikcode_capabilities::session::DisplayRecord>>,
 }
 
-fn display_log_cache() -> &'static std::sync::Mutex<Option<DisplayLogCacheEntry>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<DisplayLogCacheEntry>>> =
+#[derive(Default)]
+struct DisplayLogCache {
+    entries: HashMap<String, DisplayLogCacheEntry>,
+    order: std::collections::VecDeque<String>,
+    total_bytes: u64,
+}
+
+impl DisplayLogCache {
+    fn get(
+        &mut self,
+        key: &str,
+        log_mtime: Option<std::time::SystemTime>,
+        log_len: u64,
+        meta_mtime: Option<std::time::SystemTime>,
+        meta_len: u64,
+    ) -> Option<(
+        jeikcode_capabilities::session::DisplayMeta,
+        Arc<Vec<jeikcode_capabilities::session::DisplayRecord>>,
+    )> {
+        let entry = self.entries.get(key)?;
+        if entry.log_mtime != log_mtime
+            || entry.log_len != log_len
+            || entry.meta_mtime != meta_mtime
+            || entry.meta_len != meta_len
+        {
+            return None;
+        }
+        let meta = entry.meta.clone();
+        let records = entry.records.clone();
+        self.order.retain(|item| item != key);
+        self.order.push_back(key.to_string());
+        Some((meta, records))
+    }
+
+    fn insert(&mut self, entry: DisplayLogCacheEntry) {
+        let key = entry.key.clone();
+        let bytes = entry.log_len.saturating_add(entry.meta_len);
+        if let Some(previous) = self.entries.remove(&key) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(previous.log_len.saturating_add(previous.meta_len));
+        }
+        self.order.retain(|item| item != &key);
+        self.order.push_back(key.clone());
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.entries.insert(key, entry);
+        while self.entries.len() > MAX_CACHED_DISPLAY_ENTRIES
+            || self.total_bytes > MAX_CACHED_DISPLAY_TOTAL_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(evicted.log_len.saturating_add(evicted.meta_len));
+            }
+        }
+    }
+}
+
+fn display_log_cache() -> &'static std::sync::Mutex<DisplayLogCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DisplayLogCache>> =
         std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+    CACHE.get_or_init(|| std::sync::Mutex::new(DisplayLogCache::default()))
 }
 
 /// Read a complete display log with an mtime+length guarded cache. The log is
@@ -5888,7 +6182,7 @@ fn read_display_cached(
 fn read_display_with_cache(
     manager: &NativeSessionManager,
     id: &str,
-    cache: &std::sync::Mutex<Option<DisplayLogCacheEntry>>,
+    cache: &std::sync::Mutex<DisplayLogCache>,
 ) -> Option<(
     jeikcode_capabilities::session::DisplayMeta,
     Arc<Vec<jeikcode_capabilities::session::DisplayRecord>>,
@@ -5912,24 +6206,16 @@ fn read_display_with_cache(
             .map(|(meta, records)| (meta, Arc::new(records)));
     }
 
-    {
-        let guard = cache.lock().ok()?;
-        if let Some(cache) = guard.as_ref() {
-            if cache.key == key
-                && cache.log_mtime == log_mtime
-                && cache.log_len == log_len
-                && cache.meta_mtime == meta_mtime
-                && cache.meta_len == meta_len
-            {
-                return Some((cache.meta.clone(), cache.records.clone()));
-            }
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key, log_mtime, log_len, meta_mtime, meta_len) {
+            return Some(hit);
         }
     }
 
     let (meta, records) = manager.read_display(id).ok().flatten()?;
     let records = Arc::new(records);
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some(DisplayLogCacheEntry {
+        guard.insert(DisplayLogCacheEntry {
             key,
             log_mtime,
             log_len,
@@ -6028,7 +6314,7 @@ fn display_prefix_from_transcript(
             rows.push(MessageInfo {
                 role: "user".into(),
                 id: Some(format!("{ID_PREFIX}-{}-user", turn.turn_id)),
-                content: cap_display_field(turn.user.clone()),
+                content: turn.user.clone(),
                 reasoning: None,
                 synthetic: false,
                 internal_origin: Some(DISPLAY_ORIGIN.into()),
@@ -6047,7 +6333,7 @@ fn display_prefix_from_transcript(
             .map(|(index, tool)| ToolCallInfo {
                 id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
                 name: tool.name.clone(),
-                arguments: cap_display_field(tool.args.clone()),
+                arguments: tool.args.clone(),
                 display: format_tool_args(&tool.name, &tool.args),
             })
             .collect();
@@ -6063,7 +6349,7 @@ fn display_prefix_from_transcript(
                 role: "assistant".into(),
                 id: Some(format!("{ID_PREFIX}-{}-assistant-tools", turn.turn_id)),
                 content: String::new(),
-                reasoning: has_reasoning.then(|| cap_display_field(turn.reasoning.clone())),
+                reasoning: has_reasoning.then(|| turn.reasoning.clone()),
                 synthetic: false,
                 internal_origin: Some(DISPLAY_ORIGIN.into()),
                 tool_calls: Some(calls),
@@ -6077,7 +6363,7 @@ fn display_prefix_from_transcript(
                 rows.push(MessageInfo {
                     role: "tool".into(),
                     id: Some(format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id)),
-                    content: cap_display_field(tool.result.clone()),
+                    content: tool.result.clone(),
                     reasoning: None,
                     synthetic: false,
                     internal_origin: Some(DISPLAY_ORIGIN.into()),
@@ -6099,7 +6385,7 @@ fn display_prefix_from_transcript(
                 rows.push(MessageInfo {
                     role: "assistant".into(),
                     id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
-                    content: cap_display_field(turn.assistant.clone()),
+                    content: turn.assistant.clone(),
                     reasoning: None,
                     synthetic: false,
                     internal_origin: Some(DISPLAY_ORIGIN.into()),
@@ -6115,8 +6401,8 @@ fn display_prefix_from_transcript(
             rows.push(MessageInfo {
                 role: "assistant".into(),
                 id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
-                content: cap_display_field(turn.assistant.clone()),
-                reasoning: has_reasoning.then(|| cap_display_field(turn.reasoning.clone())),
+                content: turn.assistant.clone(),
+                reasoning: has_reasoning.then(|| turn.reasoning.clone()),
                 synthetic: false,
                 internal_origin: Some(DISPLAY_ORIGIN.into()),
                 tool_calls: None,
@@ -6246,7 +6532,7 @@ fn display_prefix_messages(
 fn display_record_to_message_info(
     record: &jeikcode_capabilities::session::DisplayRecord,
 ) -> MessageInfo {
-    let mut content = cap_display_field(record.content.clone());
+    let mut content = record.content.clone();
     let mut images = (!record.images.is_empty()).then(|| {
         record
             .images
@@ -6274,7 +6560,7 @@ fn display_record_to_message_info(
             .map(|call| ToolCallInfo {
                 id: call.id.clone(),
                 name: call.name.clone(),
-                arguments: cap_display_field(call.arguments.clone()),
+                arguments: call.arguments.clone(),
                 display: format_tool_args(&call.name, &call.arguments),
             })
             .collect::<Vec<_>>()
@@ -6298,7 +6584,7 @@ fn display_record_to_message_info(
         role: record.role.clone(),
         id: record.id.clone(),
         content,
-        reasoning: record.reasoning.clone().map(cap_display_field),
+        reasoning: record.reasoning.clone(),
         synthetic: record.synthetic,
         internal_origin: record.internal_origin.clone(),
         tool_calls,
@@ -19064,6 +19350,10 @@ mod tests {
             updated_at_ms: 1,
             message_count: 0,
             turn_count: 0,
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -19733,7 +20023,7 @@ mod tests {
         let mgr = NativeSessionManager::with_root(dir.path());
         mgr.write_display_backfill("s-cache", &[archive_record(1, "m-a")], 1)
             .unwrap();
-        let cache = std::sync::Mutex::new(None);
+        let cache = std::sync::Mutex::new(DisplayLogCache::default());
 
         let (_, first) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
         let (_, second) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
@@ -19756,6 +20046,24 @@ mod tests {
             "changed log must bypass the cache"
         );
         assert_eq!(third.len(), 2);
+    }
+
+    #[test]
+    fn display_log_cache_keeps_multiple_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = NativeSessionManager::with_root(dir.path());
+        mgr.write_display_backfill("s-a", &[archive_record(1, "m-a")], 1)
+            .unwrap();
+        mgr.write_display_backfill("s-b", &[archive_record(1, "m-b")], 1)
+            .unwrap();
+        let cache = std::sync::Mutex::new(DisplayLogCache::default());
+
+        let (_, a1) = read_display_with_cache(&mgr, "s-a", &cache).unwrap();
+        let (_, b1) = read_display_with_cache(&mgr, "s-b", &cache).unwrap();
+        let (_, a2) = read_display_with_cache(&mgr, "s-a", &cache).unwrap();
+        let (_, b2) = read_display_with_cache(&mgr, "s-b", &cache).unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2), "session A must stay cached");
+        assert!(Arc::ptr_eq(&b1, &b2), "session B must stay cached");
     }
 
     #[test]
@@ -20501,6 +20809,7 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
                         offset,
                         limit,
                     }),
+                    HeaderMap::new(),
                 )
                 .await
                 .into_response();
@@ -20697,6 +21006,7 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
                     tail: Some(48),
                     ..Default::default()
                 }),
+                HeaderMap::new(),
             )
             .await
             .into_response();

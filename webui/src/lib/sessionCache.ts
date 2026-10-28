@@ -13,7 +13,9 @@
 /// v4: also drop canvases saved around the natural-steer race (a stale todo
 /// host / a dropped steer bubble). The server display log is authoritative;
 /// one cold refetch is cheaper than showing an old polluted canvas.
-export const CACHE_DISPLAY_VERSION = 5;
+/// v6: the daemon no longer truncates display fields at 24 KiB; drop canvases
+/// that still carry the old `… [truncated for display]` tail.
+export const CACHE_DISPLAY_VERSION = 6;
 
 export interface CachedSessionData {
   sessionId: string;
@@ -26,6 +28,10 @@ export interface CachedSessionData {
   historyOffset?: number;
   historyTotal?: number;
   timestamp: number;
+  /** Last read/write time; LRU eviction uses this instead of write time. */
+  lastAccess?: number;
+  /** Approximate stored bytes (UTF-8 JSON payload). */
+  size?: number;
   mtime_ms?: number;
   approvalMode?: string | null;
   preferredModel?: string | null;
@@ -39,6 +45,11 @@ const STORE_SESSIONS = 'sessions';
 const STORE_FILES = 'files';
 const STORE_TREES = 'trees';
 const MAX_MEMORY_ENTRIES = 30;
+/** L2 IndexedDB budget. Keep it well below typical browser quotas. */
+const MAX_DB_BYTES = 64 * 1024 * 1024;
+const MAX_DB_ENTRIES = 200;
+const DB_TARGET_RATIO = 0.8;
+let evictionScheduled = false;
 
 // L1 内存 LRU 缓存 (0.00ms 极速响应)
 const memoryCache = new Map<string, CachedSessionData>();
@@ -47,6 +58,96 @@ const treeMemoryCache = new Map<string, any>();
 
 function makeKey(projectHash: string, sessionId: string): string {
   return `${projectHash}:${sessionId}`;
+}
+
+function estimateCachedBytes(data: CachedSessionData): number {
+  try {
+    const json = JSON.stringify(data);
+    if (typeof Blob !== 'undefined') return new Blob([json]).size;
+    return json.length * 2;
+  } catch {
+    return 0;
+  }
+}
+
+function persistSessionCacheAccess(projectHash: string, sessionId: string, data: CachedSessionData): void {
+  void (async () => {
+    const db = await getDB();
+    if (!db) return;
+    try {
+      const key = makeKey(projectHash, sessionId);
+      const tx = db.transaction(STORE_SESSIONS, 'readwrite');
+      const store = tx.objectStore(STORE_SESSIONS);
+      const req = store.get(key);
+      req.onsuccess = () => {
+        const latest = req.result as CachedSessionData | undefined;
+        // Only touch the access time; never overwrite a newer save with the
+        // stale snapshot that was read a moment ago.
+        if (latest && latest.timestamp === data.timestamp) {
+          store.put({ ...latest, lastAccess: data.lastAccess ?? Date.now() });
+        }
+      };
+    } catch {
+      // best effort: LRU accuracy does not justify surfacing a cache error
+    }
+  })();
+}
+
+function scheduleSessionCacheEviction(): void {
+  if (evictionScheduled) return;
+  evictionScheduled = true;
+  const timer = typeof window !== 'undefined' ? window.setTimeout : globalThis.setTimeout;
+  timer(() => {
+    evictionScheduled = false;
+    void evictSessionCacheBudget();
+  }, 1000);
+}
+
+async function evictSessionCacheBudget(): Promise<void> {
+  const db = await getDB();
+  if (!db) return;
+  const entries: Array<{ key: string; size: number; lastAccess: number }> = [];
+  try {
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(STORE_SESSIONS, 'readonly');
+      const req = tx.objectStore(STORE_SESSIONS).openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+        const value = cursor.value as CachedSessionData & { key?: string };
+        const size = typeof value.size === 'number' ? value.size : estimateCachedBytes(value);
+        entries.push({
+          key: value.key ?? cursor.primaryKey as string,
+          size,
+          lastAccess: value.lastAccess ?? value.timestamp ?? 0,
+        });
+        cursor.continue();
+      };
+      req.onerror = () => resolve();
+    });
+  } catch {
+    return;
+  }
+
+  let total = entries.reduce((sum, entry) => sum + entry.size, 0);
+  if (total <= MAX_DB_BYTES && entries.length <= MAX_DB_ENTRIES) return;
+
+  entries.sort((a, b) => a.lastAccess - b.lastAccess);
+  const targetBytes = Math.floor(MAX_DB_BYTES * DB_TARGET_RATIO);
+  const targetEntries = Math.floor(MAX_DB_ENTRIES * DB_TARGET_RATIO);
+  const deleted: string[] = [];
+  const tx = db.transaction(STORE_SESSIONS, 'readwrite');
+  const store = tx.objectStore(STORE_SESSIONS);
+  for (const entry of entries) {
+    if (total <= targetBytes && entries.length - deleted.length <= targetEntries) break;
+    store.delete(entry.key);
+    deleted.push(entry.key);
+    total -= entry.size;
+  }
+  for (const key of deleted) memoryCache.delete(key);
 }
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
@@ -142,7 +243,10 @@ export async function getSessionCache(
             result.displayVersion === CACHE_DISPLAY_VERSION &&
             Array.isArray(result.messages)
           ) {
+            result.lastAccess = Date.now();
+            if (typeof result.size !== 'number') result.size = estimateCachedBytes(result);
             setMemorySession(projectHash, sessionId, result);
+            persistSessionCacheAccess(projectHash, sessionId, result);
             resolve(result);
           } else {
             resolve(null);
@@ -161,7 +265,10 @@ export async function getSessionCache(
               result.displayVersion === CACHE_DISPLAY_VERSION &&
               Array.isArray(result.messages)
             ) {
+              result.lastAccess = Date.now();
+              if (typeof result.size !== 'number') result.size = estimateCachedBytes(result);
               setMemorySession(result.projectHash, sessionId, result);
+              persistSessionCacheAccess(result.projectHash, sessionId, result);
               resolve(result);
               return;
             }
@@ -211,6 +318,7 @@ export async function saveSessionCache(
   // 保留上一次写入的会话级配置：调用方大多只更新消息，不能因未传而抹掉
   // approvalMode / preferredModel / reasoningEffort 等持久字段。
   const previous = memoryCache.get(makeKey(projectHash, sessionId));
+  const now = Date.now();
   const data: CachedSessionData = {
     sessionId,
     projectHash,
@@ -221,13 +329,15 @@ export async function saveSessionCache(
     tokenUsage: tokenUsage ?? undefined,
     historyOffset: historyOffset ?? previous?.historyOffset,
     historyTotal: historyTotal ?? previous?.historyTotal,
-    timestamp: Date.now(),
+    timestamp: now,
+    lastAccess: now,
     mtime_ms,
     approvalMode: approvalMode ?? previous?.approvalMode,
     preferredModel: preferredModel ?? previous?.preferredModel,
     reasoningEffort: reasoningEffort ?? previous?.reasoningEffort,
     thinkingBudget: thinkingBudget ?? previous?.thinkingBudget,
   };
+  data.size = estimateCachedBytes(data);
 
   // 1. 同步更新 L1 内存
   setMemorySession(projectHash, sessionId, data);
@@ -243,6 +353,7 @@ export async function saveSessionCache(
       key: makeKey(projectHash, sessionId),
       ...data,
     });
+    scheduleSessionCacheEviction();
   } catch (err) {
     console.warn('[SessionCache] Failed to write to IndexedDB:', err);
   }
@@ -284,6 +395,7 @@ export function updateSessionCacheMeta(
         ? (patch.thinkingBudget ?? undefined)
         : current.thinkingBudget,
     timestamp: Date.now(),
+    lastAccess: Date.now(),
   };
   setMemorySession(projectHash, sessionId, next);
 }
@@ -326,6 +438,7 @@ export function appendMessageToSessionCache(
     if (turns) current.turns = turns;
     if (tokenUsage) current.tokenUsage = tokenUsage;
     current.timestamp = Date.now();
+    current.lastAccess = current.timestamp;
     // 异步排队更新 IndexedDB
     void saveSessionCache(projectHash, sessionId, current.messages, current.todos, current.mtime_ms, current.turns, current.tokenUsage);
   }

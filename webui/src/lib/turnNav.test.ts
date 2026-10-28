@@ -8,8 +8,6 @@ import {
   hasOlderVisibleMessages,
   remainingUnloadedTurns,
   resolveActiveTurnId,
-  TURN_NAV_LABEL_SAFETY_MAX,
-  truncateTurnNavLabel,
   turnNavId,
   turnNavScrollTop,
   visibleOlderRemainingCount,
@@ -17,13 +15,6 @@ import {
 
 test('turnNavId is stable per user-turn ordinal', () => {
   assert.equal(turnNavId(3), 'turn-nav-3');
-});
-
-test('truncateTurnNavLabel collapses whitespace and ellipsizes', () => {
-  assert.equal(truncateTurnNavLabel('  hello   world  '), 'hello world');
-  assert.equal(truncateTurnNavLabel('abcdefghij', 6), 'abcde…');
-  assert.equal(truncateTurnNavLabel('short', 28), 'short');
-  assert.equal(truncateTurnNavLabel('   '), '');
 });
 
 // The rail is user-resizable: the visual ellipsis belongs to CSS at the real
@@ -34,16 +25,31 @@ test('outline labels are not hard-truncated at the old fixed width', () => {
   assert.equal(fromMessages[0].label, long);
   assert.equal(fromMessages[0].text, long);
 
-  const fromOutline = buildTurnNavItemsFromOutline([{ index: 0, text: long }]);
+  const fromOutline = buildTurnNavItemsFromOutline([{ index: 0, label: long }]);
   assert.equal(fromOutline[0].label, long);
 });
 
-test('outline labels keep a safety ceiling for pathological prompts', () => {
-  const huge = 'z'.repeat(TURN_NAV_LABEL_SAFETY_MAX + 40);
+test('outline labels keep pathological prompts intact', () => {
+  const huge = 'z'.repeat(540);
   const items = buildTurnNavItems([{ role: 'user', text: huge }]);
-  assert.equal(items[0].label.length, TURN_NAV_LABEL_SAFETY_MAX);
-  assert.ok(items[0].label.endsWith('…'));
+  assert.equal(items[0].label, huge);
   assert.equal(items[0].text, huge);
+});
+
+test('capped outline labels keep distinct long questions', () => {
+  const capped = 'x'.repeat(119) + '…';
+  const out = dedupeTurnOutline([
+    { index: 0, text: capped },
+    { index: 1, text: capped },
+  ]);
+  assert.equal(out.length, 2);
+
+  // Full (uncapped) duplicates still fold as before.
+  const full = dedupeTurnOutline([
+    { index: 0, text: 'same question' },
+    { index: 1, text: 'same question' },
+  ]);
+  assert.equal(full.length, 1);
 });
 
 test('buildTurnNavItems keeps user questions in order and skips empty/system', () => {
@@ -55,10 +61,10 @@ test('buildTurnNavItems keeps user questions in order and skips empty/system', (
     { role: 'user', text: '第二问' },
   ]);
   assert.deepEqual(
-    items.map((i) => ({ id: i.id, ordinal: i.ordinal, index: i.index, label: i.label, text: i.text })),
+    items.map((i) => ({ id: i.id, ordinal: i.ordinal, index: i.index, label: i.label, text: i.text, fullText: i.fullText })),
     [
-      { id: 'turn-nav-0', ordinal: 0, index: 0, label: '你好 今天天气', text: '你好 今天天气' },
-      { id: 'turn-nav-4', ordinal: 1, index: 4, label: '第二问', text: '第二问' },
+      { id: 'turn-nav-0', ordinal: 0, index: 0, label: '你好 今天天气', text: '你好 今天天气', fullText: '你好 今天天气' },
+      { id: 'turn-nav-4', ordinal: 1, index: 4, label: '第二问', text: '第二问', fullText: '第二问' },
     ],
   );
 });
@@ -89,9 +95,9 @@ test('turnNavScrollTop targets the chat container and clamps above its start', (
 
 test('buildTurnNavItemsFromOutline uses absolute transcript indexes', () => {
   const items = buildTurnNavItemsFromOutline([
-    { ordinal: 0, index: 0, text: '第一问' },
-    { ordinal: 1, index: 25, text: '<system-reminder>internal</system-reminder>' },
-    { ordinal: 2, index: 80, text: '很后面的提问' },
+    { ordinal: 0, index: 0, label: '第一问' },
+    { ordinal: 1, index: 25, label: '<system-reminder>internal</system-reminder>' },
+    { ordinal: 2, index: 80, label: '很后面的提问' },
   ]);
   assert.deepEqual(
     items.map((i) => ({ id: i.id, index: i.index, label: i.label })),
@@ -107,12 +113,12 @@ test('buildTurnNavItemsFromOutline strips steer envelope and keeps clean query',
     {
       ordinal: 0,
       index: 0,
-      text: '<user-query>\n跨平台都只需要声音通知就可以\n</user-query>\n\n[jeikcode-steer]\nYou are currently in the middle of executing a task...',
+      label: '<user-query>\n跨平台都只需要声音通知就可以\n</user-query>\n\n[jeikcode-steer]\nYou are currently in the middle of executing a task...',
     },
     {
       ordinal: 1,
       index: 1,
-      text: '<user-query>不用引入播放器 直接调用系统原生的就可以了</user-query>\n\n[jeikcode-steer]\nnotes',
+      label: '<user-query>不用引入播放器 直接调用系统原生的就可以了</user-query>\n\n[jeikcode-steer]\nnotes',
     },
   ]);
   assert.equal(items.length, 2);
@@ -136,9 +142,9 @@ test('buildTurnNavItems strips steer envelope from user messages', () => {
 
 test('outline ids do not shift when failed turns insert diagnostic rows', () => {
   const items = buildTurnNavItemsFromOutline([
-    { ordinal: 4, index: 10, text: '第一次继续' },
-    { ordinal: 5, index: 12, text: '第二次继续' },
-    { ordinal: 6, index: 15, text: '服务恢复后继续' },
+    { ordinal: 4, index: 10, label: '第一次继续' },
+    { ordinal: 5, index: 12, label: '第二次继续' },
+    { ordinal: 6, index: 15, label: '服务恢复后继续' },
   ]);
   assert.deepEqual(
     items.map((i) => ({ id: i.id, ordinal: i.ordinal, index: i.index })),
@@ -153,7 +159,7 @@ test('outline ids do not shift when failed turns insert diagnostic rows', () => 
 test('outline and message fallback agree on the anchor id for the same absolute index', () => {
   // 右栏大纲与画布必须用同一套身份：绝对转录下标。否则分页加载后同一个
   // “窗口内序号”会指向不同提问（或产生重复 DOM id），跳转/高亮就会错位。
-  const fromOutline = buildTurnNavItemsFromOutline([{ ordinal: 7, index: 42, text: '同一问' }]);
+  const fromOutline = buildTurnNavItemsFromOutline([{ ordinal: 7, index: 42, label: '同一问' }]);
   const fromMessages = buildTurnNavItems([
     { role: 'user', text: '同一问', sourceIndex: 42, turnNavOrdinal: 0 },
   ]);
@@ -179,7 +185,7 @@ test('paged windows never collide: same window ordinal, different absolute index
   assert.equal(new Set(ids).size, ids.length, 'anchor ids must stay unique across pages');
 });
 
-test('filterTurnNavItems matches full question text, not only the truncated label', () => {
+test('filterTurnNavItems matches the full question text', () => {
   const items = buildTurnNavItems([
     { role: 'user', text: '请根据用户需求配置 MCP 服务器' },
     { role: 'user', text: '现在搜索试一下' },

@@ -1749,12 +1749,60 @@ use serde::Serialize;
 // Wire DTO: LiveWireEvent + to_wire
 // ============================================================================
 
+/// `/live` snapshots carry only a bounded presentation window. Older history is
+/// fetched from the gzip/brotli-compressed session-detail endpoint.
+const LIVE_SNAPSHOT_TAIL: usize = 48;
+
+fn snapshot_tail(
+    messages: &[jeikcode_kernel::message::Message],
+) -> (usize, &[jeikcode_kernel::message::Message]) {
+    let start = messages.len().saturating_sub(LIVE_SNAPSHOT_TAIL);
+    (start, &messages[start..])
+}
+
+const LIVE_SNAPSHOT_WARN_BYTES: usize = 1 * 1024 * 1024;
+
+/// Metrics only: never buffers or alters the SSE frame.
+fn log_live_frame_size(wire: &LiveWireEvent, bytes: usize) {
+    if let LiveWireEvent::Snapshot {
+        message_count,
+        offset,
+        ..
+    } = wire
+    {
+        tracing::debug!(
+            target: "jeikcode::http",
+            route = "live_snapshot",
+            bytes,
+            message_count,
+            offset,
+            "response_size"
+        );
+        if bytes > LIVE_SNAPSHOT_WARN_BYTES {
+            tracing::warn!(
+                target: "jeikcode::http",
+                route = "live_snapshot",
+                bytes,
+                message_count,
+                offset,
+                "large_response_body"
+            );
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "snapshot")]
     Snapshot {
         messages: Vec<crate::MessageInfo>,
+        /// Total messages in the full session snapshot.
+        #[serde(default)]
+        message_count: usize,
+        /// Absolute index of `messages[0]` in the full snapshot.
+        #[serde(default)]
+        offset: usize,
         session_id: String,
         /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
         /// 已有会话名,不必等 SessionRenamed 事件(切项目场景才有 loadSession 拉名)。
@@ -2561,8 +2609,9 @@ fn live_stream_from_registry(
     // Snapshot + replay head is emitted ahead of the live bus and tagged
     // `replay: true`; only those frames may be de-duplicated client-side.
     let mut head: Vec<LiveWireEvent> = Vec::new();
-    let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot
-        .messages
+    let snapshot_count = snapshot.messages.len();
+    let (snapshot_offset, snapshot_tail) = snapshot_tail(&snapshot.messages);
+    let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot_tail
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
@@ -2570,6 +2619,8 @@ fn live_stream_from_registry(
     crate::attach_display_images(&mut snapshot_messages, &working_dir, &session_id);
     head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
+        message_count: snapshot_count,
+        offset: snapshot_offset,
         session_id: session_id.clone(),
         session_name,
         project_hash,
@@ -2624,7 +2675,9 @@ fn live_stream_from_registry(
     });
 
     let head_stream = futures::stream::iter(head).map(|wire| {
-        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
+        let frame = live_wire_frame_json(&wire, true);
+        log_live_frame_size(&wire, frame.len());
+        Ok::<_, std::convert::Infallible>(Event::default().data(frame))
     });
     let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
         Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
@@ -2672,9 +2725,9 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     // Snapshot + replay head is emitted ahead of the live bus and tagged
     // `replay: true`; only those frames may be de-duplicated client-side.
     let mut head: Vec<LiveWireEvent> = Vec::new();
-    let mut snapshot_messages: Vec<crate::MessageInfo> = join
-        .snapshot
-        .messages
+    let snapshot_count = join.snapshot.messages.len();
+    let (snapshot_offset, snapshot_tail) = snapshot_tail(&join.snapshot.messages);
+    let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot_tail
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
@@ -2689,6 +2742,8 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     );
     head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
+        message_count: snapshot_count,
+        offset: snapshot_offset,
         session_id: join.binding.session_id.clone(),
         session_name,
         project_hash,
@@ -2739,7 +2794,9 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     });
 
     let head_stream = futures::stream::iter(head).map(|wire| {
-        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
+        let frame = live_wire_frame_json(&wire, true);
+        log_live_frame_size(&wire, frame.len());
+        Ok::<_, std::convert::Infallible>(Event::default().data(frame))
     });
     let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
         Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
@@ -4185,6 +4242,18 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 mod tests {
     use super::*;
     use jeikcode_kernel::message::Message;
+
+    #[test]
+    fn live_snapshot_tail_is_bounded_to_48_messages() {
+        let messages: Vec<Message> = (0..100)
+            .map(|index| Message::user(format!("question {index}")))
+            .collect();
+        let (offset, tail) = snapshot_tail(&messages);
+        assert_eq!(offset, 52);
+        assert_eq!(tail.len(), 48);
+        assert_eq!(tail[0].text, "question 52");
+        assert_eq!(tail[47].text, "question 99");
+    }
 
     #[test]
     fn in_turn_and_approval_block_a_new_submit_until_preempted() {

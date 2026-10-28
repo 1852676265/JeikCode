@@ -227,6 +227,12 @@ pub struct CatalogEntry {
     pub updated_at_ms: i64,
     pub message_count: usize,
     pub turn_count: usize,
+    /// Session-scoped model / approval / effort, copied from the native meta so
+    /// the list endpoint does not re-open every `<id>.meta` file per row.
+    pub preferred_model: Option<String>,
+    pub approval_mode: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<u32>,
     pub presence: CatalogPresence,
 }
 
@@ -3874,6 +3880,10 @@ fn catalog_entry(
             updated_at_ms: native.updated_at,
             message_count: native.message_count as usize,
             turn_count: native.turn_count as usize,
+            preferred_model: native.preferred_model.clone(),
+            approval_mode: native.approval_mode.clone(),
+            reasoning_effort: native.reasoning_effort.clone(),
+            thinking_budget: native.thinking_budget,
             presence: if legacy.is_some() {
                 CatalogPresence::Both
             } else {
@@ -3890,6 +3900,10 @@ fn catalog_entry(
             updated_at_ms: checked_legacy_millis(legacy.updated_at).ok()?,
             message_count: legacy.messages.len(),
             turn_count: legacy.turn_stats.len(),
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
             presence: CatalogPresence::LegacyOnly,
         }),
         (None, None) => None,

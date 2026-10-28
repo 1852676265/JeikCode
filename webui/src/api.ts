@@ -1011,7 +1011,10 @@ export interface SessionTurnOutline {
   ordinal?: number;
   /** Absolute index in the full transcript (not the returned window). */
   index: number;
-  text: string;
+  /** Stable persisted message id; primary dedupe identity when available. */
+  id?: string;
+  /** Short rail label. Full question text comes from the loaded messages. */
+  label: string;
 }
 
 export interface SessionDetail {
@@ -2081,6 +2084,12 @@ export async function getSessionFreshness(
   return resp.json();
 }
 
+const SESSION_DETAIL_CACHE_MAX = 8;
+const sessionDetailEtagCache = new Map<
+  string,
+  { etag: string; detail: SessionDetail }
+>();
+
 export async function getSession(
   projectHash: string,
   sessionId: string,
@@ -2092,14 +2101,38 @@ export async function getSession(
   if (opts?.limit != null) q.set('limit', String(opts.limit));
   const qs = q.toString();
   const path = `/projects/${projectHash}/sessions/${sessionId}`;
-  const resp = await apiFetch(qs ? `${path}?${qs}` : path, {
-    headers: authHeaders(),
+  const requestPath = qs ? `${path}?${qs}` : path;
+  const cached = sessionDetailEtagCache.get(requestPath);
+  const headers = authHeaders();
+  if (cached?.etag) headers['If-None-Match'] = cached.etag;
+  const resp = await apiFetch(requestPath, {
+    headers,
     signal: opts?.signal,
   });
+  // Conditional hit: reuse the exact previous body without re-parsing or
+  // transferring it. The cache is tiny and keyed by the full window query.
+  if (resp.status === 304 && cached) {
+    sessionDetailEtagCache.delete(requestPath);
+    sessionDetailEtagCache.set(requestPath, cached);
+    return cached.detail;
+  }
   if (!resp.ok) {
     throw new Error(`getSession failed with status ${resp.status}`);
   }
-  return resp.json();
+  const detail = (await resp.json()) as SessionDetail;
+  const etag = resp.headers.get('ETag');
+  if (etag) {
+    sessionDetailEtagCache.delete(requestPath);
+    sessionDetailEtagCache.set(requestPath, { etag, detail });
+    while (sessionDetailEtagCache.size > SESSION_DETAIL_CACHE_MAX) {
+      const oldest = sessionDetailEtagCache.keys().next().value;
+      if (!oldest) break;
+      sessionDetailEtagCache.delete(oldest);
+    }
+  } else {
+    sessionDetailEtagCache.delete(requestPath);
+  }
+  return detail;
 }
 
 // --- Live session (multi-tab real-time sync) ---
@@ -2275,7 +2308,7 @@ export async function streamGlobalEvents(
 }
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; session_name?: string; project_hash: string; provider: string; mode: ApprovalMode; working_dir?: string }
+  | { type: 'snapshot'; messages: SessionMessage[]; message_count?: number; offset?: number; session_id: string; session_name?: string; project_hash: string; provider: string; mode: ApprovalMode; working_dir?: string }
   | { type: 'provider'; provider: string }
   | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string; message_id?: string }

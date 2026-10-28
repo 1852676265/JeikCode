@@ -209,7 +209,6 @@ import {
   toolResultClearsUserInput,
   transcriptLatestUserInputIsResolved,
   transcriptToolCallIsResolved,
-  mergeDiskWithUnpersistedTail,
   stayOnNewSessionLanding,
   shouldReuseLiveStream,
   resumeTurnStartedAt,
@@ -237,6 +236,7 @@ import {
   userTextsMatch,
   findPendingSelfEchoIndex,
   dropSnapshotDuplicates,
+  mergeAuthoritativeTail,
   type ChatRecoveryEvent,
   type ChatRecoveryState,
 } from '../lib/chatTerminal';
@@ -280,7 +280,6 @@ import {
   mergeOlderMessages,
   cachedHeadIsContiguous,
   resolveHistoryOffset,
-  spliceAuthoritativeDiskTail,
   sanitizeCanvasMessages,
   stampUserClientInputId,
   stampUserSourceIndex,
@@ -1105,19 +1104,10 @@ function formatArgs(args: unknown): string {
   }
 }
 
-// The VISIBLE truncation is done by CSS ellipsis at the real row width
-// (.tool-name-secondary flexes to fill the row), so the preview length
-// follows the screen/window width. This cap is only a DOM-size guard for
-// pathological args (e.g. a tool fed a whole file); 1000 is far beyond any
-// realistic single-row character count, so it never truncates before the
-// screen edge — full args remain available by expanding the row.
-function abbreviateArgs(args: string, maxLen = 1000): string {
-  if (args.length <= maxLen) return args;
-  return args.slice(0, maxLen) + '…';
-}
-
 function ToolArgPreview({ text }: { text: string }) {
-  const spans = colorizeInlineJson(text);
+  // The text is never shortened; only skip JSON span coloring for pathological
+  // payloads so a huge write/edit argument cannot explode the header DOM.
+  const spans = text.length <= 20_000 ? colorizeInlineJson(text) : null;
   if (!spans) {
     return <span class="tool-name-secondary notranslate" translate={false} title={text}>{text}</span>;
   }
@@ -2572,6 +2562,17 @@ export function Chat({
     if (!sid) return false;
     return ownsRunningLocalSend(localActiveStreamsBySessionRef.current.get(sid));
   }
+  /** The outline carries only a short label; match a replay's full prompt by
+   *  exact text or by the label's prefix (minus the trailing ellipsis). */
+  function outlineMatchesPrompt(
+    turn: SessionTurnOutline,
+    content: string,
+  ): boolean {
+    const raw = turn.label ?? (turn as { text?: string }).text ?? '';
+    const label = raw.replace(/…$/, '');
+    return userTextsMatch(raw, content) || (!!label && content.startsWith(label));
+  }
+
   /** 回放帧的提问是否落在折叠线以上（右栏大纲里它的绝对下标早于当前窗口起点）。 */
   function replayQueryAboveFold(sessionId: string, event: SSEEvent): boolean {
     if (event.type !== 'user' || typeof event.content !== 'string') return false;
@@ -2580,7 +2581,7 @@ export function Chat({
         ? turnOutlineRef.current
         : (turnOutlineBySessionRef.current.get(sessionId) ?? []);
     if (outline.length === 0) return false;
-    const hit = [...outline].reverse().find((turn) => userTextsMatch(turn.text, event.content!));
+    const hit = [...outline].reverse().find((turn) => outlineMatchesPrompt(turn, event.content!));
     return !!hit && hit.index < watchReplayOffset(sessionId);
   }
 
@@ -2602,7 +2603,7 @@ export function Chat({
       if (event.type !== 'user' || typeof event.content !== 'string') return event;
       const hit = [...outline]
         .reverse()
-        .find((turn) => userTextsMatch(turn.text, event.content!));
+        .find((turn) => outlineMatchesPrompt(turn, event.content!));
       return hit ? { ...event, source_index: hit.index } : event;
     });
     const placed = placeRecoveredTurnUsers(base, withIndex, accepted.before);
@@ -2955,8 +2956,11 @@ export function Chat({
     const canvas = activeIdRef.current === sid
       ? messagesRef.current
       : (messageCacheRef.current.get(sid) ?? []);
-    const spliced = spliceAuthoritativeDiskTail(canvas, diskTail, diskOffset);
-    const merged = mergeDiskWithUnpersistedTail(spliced, canvas);
+    // A stop/reconnect reconcile can race the daemon's disk write: the tail may
+    // still end at the PREVIOUS question while the canvas already holds the
+    // current (even settled) turn. `mergeAuthoritativeTail` passes
+    // diskCoversTail=false in that case, preserving the unpersisted current turn.
+    const merged = mergeAuthoritativeTail(diskTail, canvas, diskOffset);
     // 拼接与尾部合并后统一自愈一次：pinned 提问、相邻重复 user、空占位都可能在
     // 历史缓存里留下重复节点。落缓存与上屏必须用同一份清洗后的数组，否则下一个
     // 回合终态会拿脏画布再拼一次，重复会逐轮累积。
@@ -4554,17 +4558,11 @@ export function Chat({
               // landed afterwards. Only checking `lastAssistantHasAnswer` left the
               // canvas stuck on the old 48-row window after a refresh.
               if (serverActive === false) {
-                const spliced = spliceAuthoritativeDiskTail(currentCached!, loaded, diskOffset);
                 // 磁盘尾部是结算后的权威，但「磁盘还没落盘的最后一问」只存在于画布缓存里：
                 // 刚发出的提问、刚被内核 fold 的中途转向（它要等回合终态才写进 display 日志）、
-                // 以及新一轮 loop 已流出的正文。短会话的尾部切片 offset=0 时 splice 会整张
-                // 采用磁盘，直接拿它上屏就会把用户气泡抹掉、新一轮正文贴到上一条回答下面。
-                // 与回合终态对账（`syncSessionCacheFromDisk`）用同一套补尾规则。
-                const rescued = mergeDiskWithUnpersistedTail(spliced, currentCached!, {
-                  // 磁盘还停在上一轮（daemon 正在收尾 / 重启丢了快照）：画布上的 steer 与
-                  // 后续工具行是唯一副本，必须整段接回；否则刷新后 steer 气泡凭空消失。
-                  diskCoversTail: diskHasCanvasUser(loaded, currentCached!),
-                });
+                // 以及新一轮 loop 已流出的正文。`mergeAuthoritativeTail` 在磁盘未覆盖尾部时
+                // 不会先 splice，避免当前提问被窗口判断丢掉、只剩上一轮和孤立回答。
+                const rescued = mergeAuthoritativeTail(loaded, currentCached!, diskOffset);
                 displayMessages = sanitizeCanvasMessages(rescued);
                 messagesRef.current = displayMessages;
                 messageCacheRef.current.set(loadId, displayMessages);
@@ -4872,6 +4870,9 @@ export function Chat({
 
   // 页面进入隐藏（切后台/挂起）的时刻；仅用于判定失焦重进是否需要重连 watch。
   const pageHiddenSinceRef = useRef<number | null>(null);
+  // 断网期间服务端可能已经追加了新消息；恢复联网后即使本地会话是空闲态，
+  // 也必须做一次磁盘权威尾部对账，不能只依赖 active/watch 分支。
+  const networkOfflineRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -4989,6 +4990,12 @@ export function Chat({
         pageHiddenSinceRef.current != null &&
         Date.now() - pageHiddenSinceRef.current >= WATCH_REATTACH_AFTER_HIDDEN_MS;
       pageHiddenSinceRef.current = null;
+      // `online` may fire without a matching `offline` in some mobile webviews.
+      // Keep the flag until a visible, actually-online wakeup consumes it.
+      const recoveredFromOffline =
+        networkOfflineRef.current &&
+        (typeof navigator === 'undefined' || navigator.onLine !== false);
+      if (recoveredFromOffline) networkOfflineRef.current = false;
       {
         getApprovalModeState(activeIdRef.current ?? undefined)
           .then((current) => {
@@ -5044,16 +5051,35 @@ export function Chat({
                   settleDiskCatchUp(projectHash, sid);
                 } else if (hiddenForLong) {
                   void catchUpFromDisk(projectHash, sid).catch(() => {});
+                } else if (recoveredFromOffline) {
+                  // The server is idle and the page was neither hidden long nor
+                  // carrying stale live state. This is the common "phone lost
+                  // network, another device appended, then network returned"
+                  // case: pull the authoritative disk tail even for an idle
+                  // session. `adoptAuthoritativeDiskTail` updates canvas, outline,
+                  // tokens and the persisted display cache together.
+                  void syncSessionCacheFromDisk(projectHash, sid);
                 }
                 if (staleLiveState || hiddenForLong) {
                   // 挂起/断网后待机 watch 多半已被系统戒断：强制重挂，
                   // 否则对端新回合永远推不过来（不拉新量）。
                   stopIdleWatch();
                   startIdleWatch(projectHash, sid, sessionGenerationRef.current, { replayIfLive: true });
+                } else if (recoveredFromOffline) {
+                  // Same recovery must also re-arm the standby watch if the
+                  // offline period silently killed it; startIdleWatch no-ops
+                  // when a live/idle watcher is already healthy.
+                  startIdleWatch(projectHash, sid, sessionGenerationRef.current, { replayIfLive: true });
                 }
               }
             })
-            .catch(() => {});
+            .catch(() => {
+              // The active-session probe can fail on a flaky reconnect; the
+              // offline catch-up must still run so an idle tab gets its tail.
+              if (recoveredFromOffline) {
+                void syncSessionCacheFromDisk(projectHash, sid);
+              }
+            });
         }
       }
     };
@@ -5062,10 +5088,18 @@ export function Chat({
     document.addEventListener('visibilitychange', refreshOnFocus);
     // 手机网络恢复不一定伴随 focus/visibility（熄屏直起、地铁出隧道）：
     // 必须在 online 时走同一条唤醒自愈，否则断网期间的半开连接会让会话永远停在运行中。
+    const onOffline = () => {
+      networkOfflineRef.current = true;
+    };
     const onOnline = () => {
+      // Set explicitly too: some embedded webviews restore the network without
+      // emitting `offline`, and an idle session still needs one disk catch-up.
+      // Keep it pending when hidden; visibilitychange will consume it later.
+      networkOfflineRef.current = true;
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       refreshOnFocus();
     };
+    window.addEventListener('offline', onOffline);
     window.addEventListener('online', onOnline);
 
     return () => {
@@ -5075,6 +5109,7 @@ export function Chat({
       window.removeEventListener('jeikcode:mode_global_changed', handleGlobalModeSwitch);
       window.removeEventListener('focus', refreshOnFocus);
       document.removeEventListener('visibilitychange', refreshOnFocus);
+      window.removeEventListener('offline', onOffline);
       window.removeEventListener('online', onOnline);
       try {
         bc?.close();
@@ -5427,7 +5462,20 @@ export function Chat({
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
   const turnNavItems = useMemo(
     () => {
-      if (turnOutline.length > 0) return buildTurnNavItemsFromOutline(turnOutline);
+      if (turnOutline.length > 0) {
+        // The outline only carries a short label. Resolve the full question from
+        // the loaded canvas messages so hover/search still see the whole text;
+        // unloaded turns fall back to the label until their page is fetched.
+        const fullByIndex = new Map<number, string>();
+        for (const m of messages) {
+          if (m.role !== 'user' || m.sourceIndex == null) continue;
+          fullByIndex.set(m.sourceIndex, messageText(m));
+        }
+        return buildTurnNavItemsFromOutline(turnOutline).map((item) => {
+          const fullText = fullByIndex.get(item.index);
+          return fullText ? { ...item, fullText } : item;
+        });
+      }
       return buildTurnNavItems(
         messages.map((m) => ({
           role: m.role,
@@ -5990,7 +6038,7 @@ export function Chat({
       // 只按绝对下标去重/排序：它是唯一跨窗口稳定的身份。ordinal 是“当前窗口内的
       // 顺序号”，拿它去重会把不同提问误并掉（回放/分页后尤其明显）。
       if (prev.some((item) => item.index === index)) return prev;
-      return [...prev, { ordinal, index, text: compact }].sort((a, b) => a.index - b.index);
+      return [...prev, { ordinal, index, label: compact }].sort((a, b) => a.index - b.index);
     });
   }
 
@@ -7681,7 +7729,7 @@ export function Chat({
             if (rowText) {
               outlineIndex = [...turnOutlineRef.current]
                 .reverse()
-                .find((turn) => userTextsMatch(turn.text, rowText))?.index;
+                .find((turn) => outlineMatchesPrompt(turn, rowText))?.index;
             }
           }
           next = stampUserSourceIndex(
@@ -8696,7 +8744,7 @@ export function Chat({
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
     if (!optimisticFiredRef.current && messages.length === 0) {
       optimisticFiredRef.current = true;
-      const title = (text.split('\n')[0]?.trim() ?? '').slice(0, 10);
+      const title = text.split('\n')[0]?.trim() ?? '';
       if (title) onOptimisticSession?.(title);
     }
 
@@ -11324,7 +11372,7 @@ export function Chat({
                           key={item.id}
                           type="button"
                           class={'turn-nav-item' + (item.id === activeTurnId ? ' active' : '')}
-                          title={item.text}
+                          title={item.fullText ?? item.text}
                           onClick={() => jumpToTurn(item.id)}
                         >
                           {item.label}
@@ -13235,7 +13283,7 @@ function ToolRowView({
         pending: String(counts.pending),
         failed: String(counts.failed),
       })
-    : abbreviateArgs(formatToolDetail(tool.name, tool.args));
+    : formatToolDetail(tool.name, tool.args);
 
   return (
     <div class={'tool-body kind-' + category + ' notranslate'} translate={false}>

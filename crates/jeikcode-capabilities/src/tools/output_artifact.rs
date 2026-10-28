@@ -3,7 +3,11 @@
 //! full outputs live on disk, deduplicated by content.
 
 use crate::tools::artifact_watchdog::{ArtifactWatchdog, GLOBAL_MAX_CAPACITY};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,12 +61,14 @@ impl ArtifactStore {
         let path = self.dir.join(&id);
         if !path.exists() {
             std::fs::create_dir_all(&self.dir)?;
+            let stored = encode_for_storage(bytes);
             // Write to a temp sibling then rename → readers never see a partial file.
             let tmp = self.dir.join(format!("{id}.tmp"));
-            std::fs::write(&tmp, bytes)?;
+            std::fs::write(&tmp, stored.as_ref())?;
             std::fs::rename(&tmp, &path)?;
             if let Some(wd) = &self.watchdog {
-                wd.record_addition(bytes.len() as u64);
+                // Capacity is disk capacity: count the compressed bytes actually stored.
+                wd.record_addition(stored.len() as u64);
             }
         }
         Ok(id)
@@ -86,11 +92,31 @@ impl ArtifactStore {
             return Ok(None);
         }
         let path = self.dir.join(id);
-        let bytes = match std::fs::read(&path) {
+        let mut bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+        // Large UTF-8 artifacts use a private header + gzip payload. The header
+        // (not the gzip magic alone) is what makes detection unambiguous: a
+        // binary artifact may legitimately start with `1f 8b`, but it cannot
+        // start with the full JEIKCODE marker by accident in practice.
+        if bytes.len() >= ARTIFACT_GZIP_HEADER_LEN && bytes.starts_with(ARTIFACT_GZIP_MAGIC) {
+            let expected = u64::from_le_bytes(
+                bytes[ARTIFACT_GZIP_MAGIC.len()..ARTIFACT_GZIP_HEADER_LEN]
+                    .try_into()
+                    .expect("fixed 8-byte length"),
+            ) as usize;
+            let mut decoded = Vec::new();
+            GzDecoder::new(&bytes[ARTIFACT_GZIP_HEADER_LEN..]).read_to_end(&mut decoded)?;
+            if decoded.len() != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "artifact gzip length mismatch",
+                ));
+            }
+            bytes = decoded;
+        }
         // Touch mtime on access so this artifact is marked recently used (true cross-platform LRU).
         touch_mtime(&path);
 
@@ -99,19 +125,61 @@ impl ArtifactStore {
         Ok(Some(bytes[start..end].to_vec()))
     }
 
-    /// Byte length of a stored artifact — an O(1) `metadata` stat, so the fetch
-    /// pagination hint doesn't re-read the whole (≤4 MiB) blob just for its size.
-    /// `Ok(None)` for a missing file or an id that isn't `[0-9a-f]{16}`.
+    /// Logical byte length of the stored artifact (the original bytes, before
+    /// any on-disk gzip compression). `Ok(None)` for a missing file or an id
+    /// that isn't `[0-9a-f]{16}`.
     pub fn size(&self, id: &str) -> std::io::Result<Option<u64>> {
         if !is_valid_id(id) {
             return Ok(None);
         }
-        match std::fs::metadata(self.dir.join(id)) {
-            Ok(m) => Ok(Some(m.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let path = self.dir.join(id);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if metadata.len() < ARTIFACT_GZIP_HEADER_LEN as u64 {
+            return Ok(Some(metadata.len()));
         }
+        let mut header = [0u8; ARTIFACT_GZIP_HEADER_LEN];
+        let mut file = std::fs::File::open(&path)?;
+        if file.read_exact(&mut header).is_err() || !header.starts_with(ARTIFACT_GZIP_MAGIC) {
+            return Ok(Some(metadata.len()));
+        }
+        Ok(Some(u64::from_le_bytes(
+            header[ARTIFACT_GZIP_MAGIC.len()..ARTIFACT_GZIP_HEADER_LEN]
+                .try_into()
+                .expect("fixed 8-byte length"),
+        )))
     }
+}
+
+/// Text artifacts at or above 64 KiB are gzip-compressed on disk. The artifact
+/// id still hashes the original bytes, so ids and dedup stay stable; `get`
+/// transparently restores the original bytes. Binary data is never compressed.
+const ARTIFACT_GZIP_THRESHOLD: usize = 64 * 1024;
+const ARTIFACT_GZIP_MAGIC: &[u8] = b"JEIKCODE-GZIP-V1\0";
+const ARTIFACT_GZIP_HEADER_LEN: usize = ARTIFACT_GZIP_MAGIC.len() + 8;
+
+fn encode_for_storage(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if bytes.len() < ARTIFACT_GZIP_THRESHOLD || std::str::from_utf8(bytes).is_err() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    if encoder.write_all(bytes).is_err() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let Ok(compressed) = encoder.finish() else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    if compressed.len() + ARTIFACT_GZIP_HEADER_LEN >= bytes.len() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut stored = Vec::with_capacity(ARTIFACT_GZIP_HEADER_LEN + compressed.len());
+    stored.extend_from_slice(ARTIFACT_GZIP_MAGIC);
+    stored.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    stored.extend_from_slice(&compressed);
+    std::borrow::Cow::Owned(stored)
 }
 
 /// Touch mtime to current timestamp on access (best effort, zero fail impact).
@@ -390,6 +458,57 @@ mod tests {
         assert_eq!(store.get(&id, 100, 4).unwrap().unwrap(), b"");
         // limit past end → clamped
         assert_eq!(store.get(&id, 14, 999).unwrap().unwrap(), b"ef");
+    }
+
+    #[test]
+    fn large_text_artifact_is_gzip_compressed_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new_standalone(dir.path());
+        let original = "hello world\n".repeat(20_000);
+        let id = store.put(original.as_bytes()).unwrap();
+
+        let raw = std::fs::read(dir.path().join(&id)).unwrap();
+        assert!(
+            raw.starts_with(super::ARTIFACT_GZIP_MAGIC),
+            "large UTF-8 text must be gzip-compressed on disk"
+        );
+        assert!(
+            raw.len() < original.len(),
+            "compression must reduce disk size"
+        );
+
+        assert_eq!(
+            store.get(&id, 0, usize::MAX).unwrap().unwrap(),
+            original.as_bytes()
+        );
+        assert_eq!(
+            store.get(&id, 10, 5).unwrap().unwrap(),
+            original.as_bytes()[10..15].to_vec()
+        );
+        assert_eq!(store.size(&id).unwrap().unwrap(), original.len() as u64);
+    }
+
+    #[test]
+    fn small_text_and_binary_artifacts_are_stored_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new_standalone(dir.path());
+
+        let small = b"small text".to_vec();
+        let small_id = store.put(&small).unwrap();
+        assert!(!std::fs::read(dir.path().join(&small_id))
+            .unwrap()
+            .starts_with(super::ARTIFACT_GZIP_MAGIC));
+        assert_eq!(store.get(&small_id, 0, usize::MAX).unwrap().unwrap(), small);
+
+        let binary = vec![0xFFu8; 128 * 1024];
+        let binary_id = store.put(&binary).unwrap();
+        assert!(!std::fs::read(dir.path().join(&binary_id))
+            .unwrap()
+            .starts_with(super::ARTIFACT_GZIP_MAGIC));
+        assert_eq!(
+            store.get(&binary_id, 0, usize::MAX).unwrap().unwrap(),
+            binary
+        );
     }
 
     #[test]

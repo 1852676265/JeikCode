@@ -15,25 +15,18 @@ export interface TurnNavItem {
   /** Absolute index in the raw persisted transcript, used for history loading
    *  and as the canonical anchor identity (unique across pages). */
   index: number;
-  /** Outline label. Kept (near-)intact on purpose: the rail is resizable, so the
-   *  visual ellipsis must be decided by CSS at the real available width instead
-   *  of a fixed character count. */
+  /** Outline label. Kept intact on purpose: the rail is resizable, so the
+   *  visual ellipsis is decided by CSS at the real available width instead of a
+   *  fixed character count. */
   label: string;
-  /** Full compacted question text for search. */
+  /** Short compacted display/search text (the server's outline label). */
   text: string;
+  /** Stable persisted message id; primary dedupe identity when available. */
+  messageId?: string;
+  /** Full question text resolved from the loaded message window, when available.
+   *  The outline itself only carries a short label; the canvas owns the full text. */
+  fullText?: string;
 }
-
-const DEFAULT_MAX_LABEL = 28;
-
-/**
- * Safety ceiling for the outline label (characters).
- *
- * The rail is user-resizable, so truncation belongs to CSS
- * (`text-overflow: ellipsis` on the real width). This cap only exists to keep a
- * pathological multi-KB prompt from becoming a huge layout box; normal
- * questions never reach it.
- */
-export const TURN_NAV_LABEL_SAFETY_MAX = 500;
 
 /**
  * Anchor DOM id for one user turn.
@@ -51,14 +44,6 @@ export function compactTurnNavText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-/** Collapse whitespace and truncate for the outline label. */
-export function truncateTurnNavLabel(text: string, max = DEFAULT_MAX_LABEL): string {
-  const compact = compactTurnNavText(text);
-  if (!compact) return '';
-  if (compact.length <= max) return compact;
-  return compact.slice(0, Math.max(1, max - 1)) + '…';
-}
-
 /**
  * 提问大纲去重与规范化（彻底解决乐观发送/回放对账导致的尾部 2~3 条提问重复问题）。
  *
@@ -68,23 +53,33 @@ export function truncateTurnNavLabel(text: string, max = DEFAULT_MAX_LABEL): str
  *    合并为单一真实条目，保留更早的权威 index 与更完整的内容；
  * 3. 严格按 index 升序排列。
  */
-export function dedupeTurnOutline<T extends { index: number; text: string; ordinal?: number }>(
-  turns: T[],
-): T[] {
+type OutlineLike = { index: number; id?: string; label?: string; text?: string; ordinal?: number };
+
+function outlineText(t: OutlineLike): string {
+  return t.label ?? t.text ?? '';
+}
+
+export function dedupeTurnOutline<T extends OutlineLike>(turns: T[]): T[] {
   if (!turns || turns.length <= 1) return turns || [];
   const result: T[] = [];
   for (const t of turns) {
     const c = compactTurnNavText(
-      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(t.text)),
+      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(outlineText(t))),
     );
     if (!c) continue;
 
-    // 检查是否已有完全匹配、相似、或包含关系的提问
+    // 检查是否已有完全匹配、相似、或包含关系的提问。
+    // 服务端大纲只带短 label（以 … 结尾）；不同 index 的截断 label 不能按
+    // 文本相似度合并，否则前缀相同的两个真实长提问会被误删。
+    const capped = c.endsWith('…');
     const matchIdx = result.findIndex((prev) => {
+      if (t.id && prev.id && t.id === prev.id) return true;
       if (prev.index === t.index) return true;
       const prevC = compactTurnNavText(
-        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(prev.text)),
+        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(outlineText(prev))),
       );
+      const prevCapped = prevC.endsWith('…');
+      if (capped || prevCapped) return false;
       if (prevC === c) return true;
       // 允许前缀包含匹配（至少 8 个字符，避免单字误伤）
       if (
@@ -100,12 +95,13 @@ export function dedupeTurnOutline<T extends { index: number; text: string; ordin
     if (matchIdx >= 0) {
       const existing = result[matchIdx]!;
       const existingC = compactTurnNavText(
-        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(existing.text)),
+        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(outlineText(existing))),
       );
       // 如果当前项文本更完整，升级文本内容；下标保留更小（更靠前）的权威下标
       if (c.length > existingC.length) {
         result[matchIdx] = {
           ...t,
+          id: t.id ?? existing.id,
           index: Math.min(existing.index, t.index),
           ordinal: existing.ordinal ?? t.ordinal,
         };
@@ -118,27 +114,37 @@ export function dedupeTurnOutline<T extends { index: number; text: string; ordin
 }
 
 export function buildTurnNavItemsFromOutline(
-  turns: { ordinal?: number; index: number; text: string }[],
+  turns: { ordinal?: number; index: number; id?: string; label: string }[],
 ): TurnNavItem[] {
   const items: TurnNavItem[] = [];
   const cleanTurns = dedupeTurnOutline(turns);
   for (const turn of cleanTurns) {
+    // Older daemons sent `text`; the current wire uses `label`. Accept both for
+    // one compatibility window (the cache schema bump clears stale canvases).
+    const raw = turn.label ?? (turn as { text?: string }).text ?? '';
     // Older sessions may not mark injected user rows as synthetic. Keep the
     // server outline aligned with the same rows history rendering suppresses.
-    if (isInternalHistoryUserMessage(turn.text)) continue;
+    if (isInternalHistoryUserMessage(raw)) continue;
     const text = compactTurnNavText(
-      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(turn.text)),
+      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(raw)),
     );
-    const label = truncateTurnNavLabel(text, TURN_NAV_LABEL_SAFETY_MAX);
+    const label = text;
     if (!label) continue;
     const ordinal = turn.ordinal ?? items.length;
-    items.push({ id: turnNavId(turn.index), ordinal, index: turn.index, label, text });
+    items.push({
+      id: turnNavId(turn.index),
+      messageId: turn.id,
+      ordinal,
+      index: turn.index,
+      label,
+      text,
+    });
   }
   return items;
 }
 
 export function buildTurnNavItems(
-  messages: { role: string; text: string; sourceIndex?: number; turnNavOrdinal?: number }[],
+  messages: { role: string; text: string; id?: string; sourceIndex?: number; turnNavOrdinal?: number }[],
   windowOffset = 0,
 ): TurnNavItem[] {
   const items: TurnNavItem[] = [];
@@ -148,7 +154,7 @@ export function buildTurnNavItems(
     const text = compactTurnNavText(
       stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(msg.text)),
     );
-    const label = truncateTurnNavLabel(text, TURN_NAV_LABEL_SAFETY_MAX);
+    const label = text;
     if (!label) continue;
     // History rendering filters synthetic messages and folds tool-result rows
     // into their assistant. Prefer the raw transcript index carried through
@@ -157,7 +163,7 @@ export function buildTurnNavItems(
     const ordinal = typeof msg.turnNavOrdinal === 'number' ? msg.turnNavOrdinal : items.length;
     // Same contract as the outline path: the id is the absolute index, `ordinal`
     // is only carried along for display/back-compat.
-    items.push({ id: turnNavId(index), ordinal, index, label, text });
+    items.push({ id: turnNavId(index), messageId: msg.id, ordinal, index, label, text, fullText: text });
   }
   return items;
 }
@@ -175,7 +181,7 @@ export function turnNavScrollTop(
 export function filterTurnNavItems(items: TurnNavItem[], query: string): TurnNavItem[] {
   const q = query.trim().toLowerCase();
   if (!q) return items;
-  return items.filter((it) => it.text.toLowerCase().includes(q));
+  return items.filter((it) => (it.fullText ?? it.text).toLowerCase().includes(q));
 }
 
 /**

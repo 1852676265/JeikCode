@@ -426,7 +426,7 @@ test('formatToolCompactJson formats multi-param read_file as single-line JSON', 
   );
 });
 
-test('formatToolCompactJson abbreviates long content / code strings with ellipsis', () => {
+test('formatToolCompactJson keeps long content / code strings intact', () => {
   const args = JSON.stringify({
     file_path: 'src/auth.rs',
     old_string: 'pub fn verify() {\n    let token = get_token();\n    println!("debug: {}", token);\n    return check(token);\n}',
@@ -435,8 +435,10 @@ test('formatToolCompactJson abbreviates long content / code strings with ellipsi
   const detail = formatToolDetail('edit_file', args);
   // Must be a single line without raw newlines
   assert.ok(!detail.includes('\n'), 'must not contain literal newlines');
-  // Must abbreviate long payload with ellipsis
-  assert.ok(detail.includes('…'), 'must abbreviate with ellipsis');
+  // No character truncation: the full payload survives.
+  assert.ok(!detail.includes('…'), 'must not truncate with ellipsis');
+  assert.ok(detail.includes('println!'));
+  assert.ok(detail.includes('return check(get_token())'));
   // Must preserve key identifier file_path
   assert.ok(detail.includes('"file_path": "src/auth.rs"'));
 });
@@ -457,17 +459,17 @@ test('formatToolCompactJson handles arrays, empty args, and non-JSON fallbacks',
   assert.equal(formatToolDetail('read_file', '{}'), '');
   assert.equal(formatToolDetail('read_file', ''), '');
 
-  // Truncating arrays with > 3 items
+  // Arrays keep every element; no "+N more" truncation.
   const arrayArgs = JSON.stringify({
     files: ['a.rs', 'b.rs', 'c.rs', 'd.rs', 'e.rs'],
   });
   const arrayDetail = formatToolCompactJson(arrayArgs);
   assert.equal(
     arrayDetail,
-    '{"files": ["a.rs", "b.rs", "c.rs", "+2 more"]}',
+    '{"files": ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]}',
   );
 
-  // Non-JSON fallback
+  // Non-JSON fallback stays complete.
   assert.equal(formatToolDetail('custom', 'plain text string'), 'plain text string');
 });
 

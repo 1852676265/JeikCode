@@ -304,9 +304,9 @@ impl Tool for BashTool {
                     }
                     let advisory = if !resolved.starts_with(&ctx.working_dir) {
                         Some(format!(
-                            "[advisory] Command executed in external directory outside workspace: {}\n",
-                            resolved.display()
-                        ))
+                        "[advisory] Command executed in external directory outside workspace: {}\n",
+                        resolved.display()
+                    ))
                     } else {
                         None
                     };
@@ -347,6 +347,13 @@ impl Tool for BashTool {
             };
 
         if a.background {
+            // A turn-level cancel that arrived before spawn must not create a
+            // process after the user already stopped the turn.
+            if ctx.cancel.is_cancelled() {
+                return annotate(err(
+                    "bash: cancelled before background process started.".to_string()
+                ));
+            }
             let running = runtime.active_background_tasks();
             if let Some(existing) = running
                 .iter()
@@ -547,20 +554,19 @@ impl Tool for BashTool {
         if a.background {
             let settle_secs = a.settle_secs.unwrap_or(3).max(1);
             let settle_deadline = Instant::now() + Duration::from_secs(settle_secs);
+            // A steer/stop can arrive after the detached child is already alive.
+            // Killing it or dropping the future here is what produced
+            // `(cancelled — side effects unknown)` plus a zombie service. Once the
+            // process exists, turn cancellation only stops the startup observation;
+            // the background reader below still detaches and drains its pipes.
+            let mut startup_observation_cancelled = false;
 
             while Instant::now() < settle_deadline {
                 tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => {
-                        #[cfg(windows)]
-                        crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-                        #[cfg(not(target_os = "windows"))]
-                        if let Some(pgid) = child_pid {
-                            unsafe { killpg(pgid as i32, SIGKILL) };
-                        }
-                        runtime.unregister_live_bash(child_pid_val);
-                        let (out, errb) = snapshot();
-                        return annotate(err(with_note(&out, &errb, "bash: cancelled before completion.")));
+                        startup_observation_cancelled = true;
+                        break;
                     }
                     _ = live.kill.cancelled() => {
                         #[cfg(windows)]
@@ -636,9 +642,20 @@ impl Tool for BashTool {
             let initial_output = format_streams(&init_out, &init_err, None, false);
 
             let pid_num = child_pid.unwrap_or(0);
-            let mut bg_writer = BackgroundLogWriter::create(&session_id, pid_num, &initial_output)
+            // Diagnostic setup is best-effort and time-boxed: a slow temp/log scan,
+            // PID probe, or port check must never delay a successfully spawned
+            // background service (or let a turn cancel turn it into a zombie).
+            let mut bg_writer = if startup_observation_cancelled {
+                None
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    BackgroundLogWriter::create(&session_id, pid_num, &initial_output),
+                )
                 .await
-                .ok();
+                .ok()
+                .and_then(|r| r.ok())
+            };
             let bg_log_path_display = bg_writer
                 .as_ref()
                 .map(|w| w.path_display())
@@ -735,14 +752,20 @@ impl Tool for BashTool {
             // its Git-Bash pid (`kill`) — see `render_background_pid_block` for why the
             // wrapper shell's number alone is not enough.
             #[cfg(target_os = "windows")]
-            let workloads = {
+            let workloads = if startup_observation_cancelled {
+                Vec::new()
+            } else {
                 let rows = match child_pid {
                     Some(pid) => windows_descendant_rows(pid),
                     None => Vec::new(),
                 };
                 let leaves = workload_leaves(&rows);
                 let winpids: Vec<u32> = leaves.iter().map(|(pid, _)| *pid).collect();
-                let mut msys = msys_pids_for(&winpids).await;
+                let mut msys =
+                    tokio::time::timeout(Duration::from_secs(1), msys_pids_for(&winpids))
+                        .await
+                        .ok()
+                        .unwrap_or_default();
                 leaves
                     .into_iter()
                     .map(|(pid, name)| (pid, msys.remove(&pid), name))
@@ -755,7 +778,11 @@ impl Tool for BashTool {
                 Some(pid) => render_background_pid_block(pid, &workloads),
                 None => "PID: unknown".to_string(),
             };
-            let detected_ports = detect_listening_ports_from_output(&initial_output);
+            let detected_ports = if startup_observation_cancelled {
+                Vec::new()
+            } else {
+                detect_listening_ports_from_output(&initial_output)
+            };
             // Health-check every port the startup output declared: a listener that ACCEPTS
             // on 127.0.0.1 is real evidence the service is up. "Not reachable yet" stays an
             // observation (bind addresses vary), never a failure claim.
@@ -789,8 +816,15 @@ impl Tool for BashTool {
                  - To search keywords or error context: call `read` with `keyword` and adjust `upward`/`downward` (e.g. `read(path=\"{bg_log_path_display}\", keyword=\"<keyword>\", upward=10, downward=20)`).]"
             );
 
+            let cancelled_note = if startup_observation_cancelled {
+                "\n\n[Note: the turn was cancelled while observing startup. The process was already \
+                 spawned and remains detached; use the PID above to stop it. The startup log/PID \
+                 diagnostics were intentionally skipped to return immediately.]"
+            } else {
+                ""
+            };
             return annotate(ok(format!(
-                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}{unverified_note}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{guidance_note}"
+                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}{unverified_note}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{cancelled_note}{guidance_note}"
             )));
         }
 
@@ -6859,6 +6893,65 @@ mod tests {
             "log file must be preserved for diagnostics after process exit"
         );
         let _ = tokio::fs::remove_file(&log_path).await;
+    }
+
+    #[tokio::test]
+    async fn run_command_background_turn_cancel_after_spawn_returns_success() {
+        use crate::tools::bash_runtime::BashRuntimeState;
+        let runtime = Arc::new(BashRuntimeState::new());
+        let tool = BashTool::with_runtime_state(Arc::clone(&runtime));
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: cancel.clone(),
+            progress: jeikcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let cmd = if cfg!(target_os = "windows") {
+            "powershell -Command Start-Sleep -Seconds 10"
+        } else {
+            "sleep 10"
+        };
+        let args = serde_json::json!({
+            "command": cmd,
+            "background": true,
+            "settle_secs": 5
+        })
+        .to_string();
+
+        // Simulate a steer/stop arriving during the startup observation window,
+        // after the detached child already exists.
+        let cancel_after_spawn = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            cancel_after_spawn.cancel();
+        });
+
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(3), tool.execute(&args, &ctx))
+                .await
+                .expect("cancel must end the startup observation, not hang the tool");
+        assert!(
+            !res.is_error,
+            "a process that already spawned must not become side-effects-unknown: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("Background process started")
+                && res.content.contains("remains detached"),
+            "content: {}",
+            res.content
+        );
+
+        let active = runtime.active_background_tasks();
+        let matched = active.iter().find(|t| t.command == cmd);
+        assert!(
+            matched.is_some(),
+            "cancelled observation must keep the background task registered"
+        );
+        assert!(runtime.kill_by_pid(matched.unwrap().pid));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     #[test]
