@@ -10314,6 +10314,15 @@ export function Chat({
     const skipCatchUp = Boolean(options && typeof options === 'object' && 'skipDiskCatchUp' in options && (options as { skipDiskCatchUp?: boolean }).skipDiskCatchUp);
     const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
     const requestAlias = requestIdRef.current;
+    // 停止前先判断“这是不是本端自己的回合”：本端持有发送流时，停下去后时间线
+    // 立刻收尾、按钮复位，再追加一条“已请求停止”只会变成尾部噪音（而且对账会
+    // 把它留成历史行）。只有停的是 TUI/其他标签页拥有的回合才需要文字回执。
+    const localStreamEntry = currentSid
+      ? localActiveStreamsBySessionRef.current.get(currentSid)
+      : undefined;
+    const ownStream =
+      abortRef.current !== null ||
+      (!!localStreamEntry && localStreamEntry.watchOnly !== true);
     // 用户主动停止：无论此前是否发生过程序化停止，都复位抑制标记，保证排队内容照常回吐输入框。
     programmaticStopMarkRef.current = null;
     if (currentSid) {
@@ -10348,7 +10357,9 @@ export function Chat({
     busyRef.current = false;
     transitionChatRecovery({ type: 'stop_succeeded' });
     onPermissionResolved?.(null);
-    pushCommandNotice(t('chat.detachedStopped'));
+    if (!ownStream && (currentSid || requestAlias)) {
+      pushCommandNotice(t('chat.detachedStopped'));
+    }
 
     try {
       await stopRunningTurn(currentSid, requestAlias);

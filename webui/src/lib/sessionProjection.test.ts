@@ -1139,6 +1139,27 @@ test('带锚点的本地通知行（压缩标记）对账后仍留在所属回�
   assert.equal(twice.filter((m) => m.role === 'system').length, 1);
 });
 
+test('spliceAuthoritativeDiskTail 丢弃无锚点的旧缓存通知行，不再逐轮钉到会话末尾', () => {
+  // 升级前写入 IndexedDB 的临时提示（如“已请求停止当前回合”）没有锚点，也不属于任何一轮。
+  const legacyNotice = () => ({ role: 'system', parts: [{ kind: 'notice' as const, text: '已请求停止当前回合' }] });
+  const canvas = [
+    { role: 'user', id: 'u-2', sourceIndex: 50, parts: [{ kind: 'text' as const, text: '第二问' }] },
+    { role: 'assistant', id: 'a-2', sourceIndex: 51, parts: [{ kind: 'text' as const, text: '第二答' }] },
+    legacyNotice(),
+    { role: 'user', id: 'u-3', sourceIndex: 52, parts: [{ kind: 'text' as const, text: '第三问' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 53, parts: [{ kind: 'text' as const, text: '第三答' }] },
+  ];
+  const diskTail = [
+    { role: 'user', id: 'u-2', sourceIndex: 50, parts: [{ kind: 'text' as const, text: '第二问' }] },
+    { role: 'assistant', id: 'a-2', sourceIndex: 51, parts: [{ kind: 'text' as const, text: '第二答' }] },
+    { role: 'user', id: 'u-3', sourceIndex: 52, parts: [{ kind: 'text' as const, text: '第三问' }] },
+    { role: 'assistant', id: 'a-3', sourceIndex: 53, parts: [{ kind: 'text' as const, text: '第三答' }] },
+  ];
+
+  const spliced = spliceAuthoritativeDiskTail(canvas as any, diskTail as any, 40) as any[];
+  assert.deepEqual(spliced.map((m) => m.id ?? 'notice'), ['u-2', 'a-2', 'u-3', 'a-3']);
+});
+
 test('spliceAuthoritativeDiskTail 用权威行替换同一身份时保留本地 notice 部件', () => {
   // 压缩发生在第 2 轮之后：标记作为 notice 部件挂在 a-2 上。
   const canvas = [
@@ -1169,6 +1190,28 @@ test('spliceAuthoritativeDiskTail 用权威行替换同一身份时保留本地 
   // 其他行不受影响，也不会把 notice 复制到最新一条。
   assert.deepEqual(spliced.find((m) => m.id === 'a-3').parts.map((p: any) => p.kind), ['text']);
   assert.equal(spliced.filter((m) => m.parts.some((p: any) => p.kind === 'notice')).length, 1);
+});
+
+test('sanitizeCanvasMessages 丢弃无锚点的旧缓存通知行，保留带锚点的通知行', () => {
+  const messages: any[] = [
+    { role: 'user', id: 'u-1', sourceIndex: 0, parts: [{ kind: 'text' as const, text: '问' }] },
+    { role: 'assistant', id: 'a-1', sourceIndex: 1, parts: [{ kind: 'text' as const, text: '答' }] },
+    // 升级前写入的瞬态提示：无锚点，不属于任何一轮。
+    { role: 'system', parts: [{ kind: 'notice' as const, text: '已请求停止当前回合' }] },
+    // 新代码写入的提示：带锚点，必须保留。
+    {
+      role: 'system',
+      parts: [{ kind: 'notice' as const, text: '已压缩 · 摘要 12 条' }],
+      anchorId: 'a-1',
+      anchorSourceIndex: 1,
+    },
+  ];
+  const cleaned = sanitizeCanvasMessages(messages);
+  assert.deepEqual(
+    cleaned.map((m) => m.role),
+    ['user', 'assistant', 'system'],
+  );
+  assert.equal((cleaned[2] as any).anchorId, 'a-1');
 });
 
 test('sanitizeCanvasMessages 自动自愈连续重复的用户提问气泡和夹杂的空占位', () => {

@@ -1276,8 +1276,13 @@ export function spliceAuthoritativeDiskTail<
   }
   // 本地通知行按创建时的锚点归位（压缩标记冻结在发生压缩的那一轮尾部）。
   // 同一锚点有多条时保持它们在画布上的先后顺序。
+  //
+  // 没有锚点的旧缓存通知行（升级前写入 IndexedDB 的“已请求停止…”等临时提示）
+  // 不属于任何一轮：以前它们被当成“未落盘尾巴”逐轮拖到会话末尾。这类行是
+  // 瞬态提示而非历史，直接丢弃，避免旧噪声永久贴在底部。
   const byInsertIndex = new Map<number, T[]>();
   for (const notice of anchoredNotices) {
+    if (notice.anchorId === undefined && notice.anchorSourceIndex === undefined) continue;
     if (notice.id && seenIds.has(notice.id)) continue;
     if (notice.id) seenIds.add(notice.id);
     const at = localNoticeInsertIndex(result, notice);
@@ -1299,12 +1304,28 @@ export function spliceAuthoritativeDiskTail<
  * 4. 确保从 IndexedDB 或历史缓存加载出来的画布是纯净无污染的。
  */
 export function sanitizeCanvasMessages<
-  T extends { role: string; parts?: MsgPart[]; sourceIndex?: number },
+  T extends {
+    role: string;
+    parts?: MsgPart[];
+    sourceIndex?: number;
+    anchorId?: string;
+    anchorSourceIndex?: number;
+  },
 >(messages: T[]): T[] {
   if (!messages || messages.length <= 1) return messages;
   const result: T[] = [];
   for (let i = 0; i < messages.length; i++) {
     const cur = messages[i]!;
+    // 无锚点的本地通知行是升级前缓存的瞬态提示（如“已请求停止当前回合”），
+    // 不属于任何一轮；新代码创建时都会盖锚点，这类残留直接丢弃，
+    // 否则旧实现会把它逐轮拖到会话末尾，永不消失。
+    if (
+      cur.role === 'system' &&
+      cur.anchorId === undefined &&
+      cur.anchorSourceIndex === undefined
+    ) {
+      continue;
+    }
     // 1. 如果当前是空助手气泡，且前一个已经是助手气泡，丢弃多余的空助手
     if (cur.role === 'assistant' && (!cur.parts || cur.parts.length === 0)) {
       const prev = result[result.length - 1];
