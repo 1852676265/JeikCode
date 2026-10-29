@@ -32,6 +32,23 @@ function getAppVersion(): string {
   return '0.0.0';
 }
 
+function getDaemonPort(): number | null {
+  try {
+    const listenFile = path.resolve(
+      process.env.USERPROFILE || process.env.HOME || '',
+      '.jeikcode',
+      'webui-listen.json'
+    );
+    if (fs.existsSync(listenFile)) {
+      const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
+      if (data && data.port) {
+        return Number(data.port);
+      }
+    }
+  } catch {}
+  return null;
+}
+
 export default defineConfig({
   plugins: [preact(), mockApiPlugin()],
   base: './',
@@ -46,5 +63,26 @@ export default defineConfig({
     __APP_VERSION__: JSON.stringify(getAppVersion()),
   },
   build: { outDir: 'dist', emptyOutDir: true },
-  server: { host: '0.0.0.0', port: 5173 },
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    proxy: {
+      '^/(api|events|health|config|models|skills|sessions|project|projects|cd|chat|fs|terminal|git|provider-accounts|providers|shutdown|auth|telemetry)': {
+        target: 'http://127.0.0.1:13457',
+        router: () => {
+          const port = getDaemonPort();
+          return port ? `http://127.0.0.1:${port}` : undefined;
+        },
+        changeOrigin: true,
+        ws: true,
+        bypass: (req) => {
+          const port = getDaemonPort();
+          if (!port) {
+            return req.url;
+          }
+          return null;
+        },
+      },
+    },
+  },
 });

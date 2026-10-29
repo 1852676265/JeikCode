@@ -406,6 +406,8 @@ export function mockApiPlugin(): Plugin {
           pathname.startsWith('/terminal/') ||
           pathname.startsWith('/git/') ||
           pathname.startsWith('/chat/') ||
+          pathname.startsWith('/provider-accounts') ||
+          pathname.startsWith('/providers') ||
           pathname === '/events' ||
           pathname === '/health' ||
           pathname === '/config' ||
@@ -550,6 +552,42 @@ export function mockApiPlugin(): Plugin {
             ],
             language: 'zh',
           });
+        }
+
+        // Provider accounts
+        if (pathname.startsWith('/provider-accounts')) {
+          const parts = pathname.split('/').filter(Boolean);
+          const accountId = parts[1] ? decodeURIComponent(parts[1]) : '';
+          if (req.method === 'GET') {
+            return sendJson([
+              { id: 'antigravity', type: 'anthropic', base_url: 'http://127.0.0.1:8045', has_api_key: true },
+              { id: 'google-default', type: 'gemini', base_url: 'https://generativelanguage.googleapis.com', has_api_key: true },
+              { id: 'openai-default', type: 'openai', base_url: 'https://api.openai.com/v1', has_api_key: true },
+            ]);
+          }
+          if (req.method === 'PUT' || req.method === 'POST') {
+            const body = await readJsonBody(req);
+            return sendJson({
+              id: body.id || accountId,
+              type: body.type || 'openai',
+              base_url: body.base_url || '',
+              has_api_key: Boolean(body.api_key),
+              skip_tls_verify: Boolean(body.skip_tls_verify),
+            });
+          }
+          if (req.method === 'DELETE') {
+            return sendJson({ status: 'ok' });
+          }
+        }
+
+        // Upstream models fetch
+        if (pathname === '/providers/upstream-models') {
+          return sendJson([
+            'claude-opus-5-5-high',
+            'claude-sonnet-5-5-high',
+            'gemini-3.8-flash-high',
+            'gpt-oss-120b',
+          ]);
         }
 
         // Models

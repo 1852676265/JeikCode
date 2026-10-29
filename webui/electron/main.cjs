@@ -1,5 +1,8 @@
 const { app, BrowserWindow, Menu, globalShortcut } = require('electron');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 Menu.setApplicationMenu(null);
 
@@ -32,6 +35,19 @@ async function findActiveViteUrl(maxWaitMs = 15000) {
   return 'http://localhost:5173';
 }
 
+function getDaemonAuth() {
+  try {
+    const listenFile = path.join(os.homedir(), '.jeikcode', 'webui-listen.json');
+    if (fs.existsSync(listenFile)) {
+      const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
+      if (data && data.token) {
+        return data;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -49,7 +65,11 @@ async function createWindow() {
   });
 
   const targetUrl = await findActiveViteUrl();
-  await mainWindow.loadURL(targetUrl).catch(() => {});
+  const daemonAuth = getDaemonAuth();
+  const finalUrl = daemonAuth && daemonAuth.token
+    ? `${targetUrl}/?token=${encodeURIComponent(daemonAuth.token)}`
+    : targetUrl;
+  await mainWindow.loadURL(finalUrl).catch(() => {});
   mainWindow.show();
 
   // 支持 F12 或 Ctrl+Shift+I 呼出控制台方便二开调试
