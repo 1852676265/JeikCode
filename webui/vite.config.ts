@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import preact from '@preact/preset-vite';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -32,7 +32,7 @@ function getAppVersion(): string {
   return '0.0.0';
 }
 
-function getDaemonPort(): number | null {
+function getDaemonAuth(): { port: number; token?: string } | null {
   try {
     const listenFile = path.resolve(
       process.env.USERPROFILE || process.env.HOME || '',
@@ -42,47 +42,90 @@ function getDaemonPort(): number | null {
     if (fs.existsSync(listenFile)) {
       const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
       if (data && data.port) {
-        return Number(data.port);
+        return { port: Number(data.port), token: data.token };
       }
     }
   } catch {}
   return null;
 }
 
-export default defineConfig({
-  plugins: [preact(), mockApiPlugin()],
-  base: './',
-  resolve: {
-    alias: {
-      react: 'preact/compat',
-      'react-dom': 'preact/compat',
-      'react/jsx-runtime': 'preact/jsx-runtime',
+function autoAuthPlugin(): Plugin {
+  return {
+    name: 'vite-plugin-auto-auth',
+    transformIndexHtml(html) {
+      const auth = getDaemonAuth();
+      if (auth?.token) {
+        return html.replace(
+          '<head>',
+          `<head><script>try{sessionStorage.setItem('jeikcode_webui_token',${JSON.stringify(auth.token)});}catch(e){}</script>`
+        );
+      }
+      return html;
     },
-  },
-  define: {
-    __APP_VERSION__: JSON.stringify(getAppVersion()),
-  },
-  build: { outDir: 'dist', emptyOutDir: true },
-  server: {
-    host: '0.0.0.0',
-    port: 5173,
-    proxy: {
-      '^/(api|events|health|config|models|skills|sessions|project|projects|cd|chat|fs|terminal|git|provider-accounts|providers|shutdown|auth|telemetry)': {
-        target: 'http://127.0.0.1:13457',
-        router: () => {
-          const port = getDaemonPort();
-          return port ? `http://127.0.0.1:${port}` : undefined;
-        },
-        changeOrigin: true,
-        ws: true,
-        bypass: (req) => {
-          const port = getDaemonPort();
-          if (!port) {
-            return req.url;
+  };
+}
+
+export default defineConfig(() => {
+  const proxyConfig = {
+    '^/(api|events|health|config|models|skills|sessions|project|projects|cd|chat|fs|terminal|git|provider-accounts|providers|shutdown|auth|telemetry)': {
+      target: 'http://127.0.0.1:13458',
+      router: () => {
+        const auth = getDaemonAuth();
+        return auth ? `http://127.0.0.1:${auth.port}` : undefined;
+      },
+      changeOrigin: true,
+      ws: true,
+      configure: (proxy: any) => {
+        proxy.on('proxyReq', (proxyReq: any) => {
+          const auth = getDaemonAuth();
+          if (auth?.token) {
+            if (!proxyReq.getHeader('authorization')) {
+              proxyReq.setHeader('authorization', `Bearer ${auth.token}`);
+            }
+            const cookieName = `jeikcode_webui_${auth.port}`;
+            const existingCookie = proxyReq.getHeader('cookie');
+            if (!existingCookie || !String(existingCookie).includes(cookieName)) {
+              proxyReq.setHeader(
+                'cookie',
+                existingCookie ? `${existingCookie}; ${cookieName}=${auth.token}` : `${cookieName}=${auth.token}`
+              );
+            }
           }
-          return null;
-        },
+        });
+      },
+      bypass: (req: any) => {
+        const auth = getDaemonAuth();
+        if (!auth) {
+          return req.url;
+        }
+        return null;
       },
     },
-  },
+  };
+
+  return {
+    plugins: [preact(), autoAuthPlugin(), mockApiPlugin()],
+    base: './',
+    resolve: {
+      alias: {
+        react: 'preact/compat',
+        'react-dom': 'preact/compat',
+        'react/jsx-runtime': 'preact/jsx-runtime',
+      },
+    },
+    define: {
+      __APP_VERSION__: JSON.stringify(getAppVersion()),
+    },
+    build: { outDir: 'dist', emptyOutDir: true },
+    server: {
+      host: '0.0.0.0',
+      port: 5173,
+      proxy: proxyConfig,
+    },
+    preview: {
+      host: '0.0.0.0',
+      port: 5173,
+      proxy: proxyConfig,
+    },
+  };
 });

@@ -926,6 +926,9 @@ pub struct SessionDetail {
     /// The session's single live checklist. Empty after a completed board is closed on stop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<jeikcode_capabilities::tools::TodoItem>,
+    /// Per-turn telemetry stats (token usage, duration, tool call count, errors) for turn analysis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_stats: Vec<jeikcode_capabilities::session::TurnStat>,
 }
 
 fn is_manual_session_origin(origin: &jeikcode_capabilities::session::SessionOrigin) -> bool {
@@ -3523,7 +3526,9 @@ fn is_private_network_authority(authority: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => {
-                v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified()
+                let octets = v4.octets();
+                let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64; // RFC 6598 100.64.0.0/10 (Tailscale)
+                v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified() || is_cgnat
             }
             std::net::IpAddr::V6(v6) => {
                 let seg0 = v6.segments()[0];
@@ -3720,6 +3725,16 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     list_projects_in_root(&sessions_root, active.as_ref())
 }
 
+/// Global default workspace for standalone sessions (not bound to any specific project).
+pub(crate) fn global_standalone_workspace() -> PathBuf {
+    let home = jeikcode_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let ws = home.join(".jeikcode").join("workspace");
+    if !ws.exists() {
+        let _ = std::fs::create_dir_all(&ws);
+    }
+    ws
+}
+
 fn list_projects_in_root(
     sessions_root: &std::path::Path,
     active: Option<&jeikcode_capabilities::session::CatalogLocation>,
@@ -3729,8 +3744,9 @@ fn list_projects_in_root(
         String,
         Vec<jeikcode_capabilities::session::CatalogEntry>,
     >::new();
+    let global_ws = global_standalone_workspace();
     for entry in scan.entries {
-        if is_system_temp_dir(&entry.working_dir) {
+        if is_system_temp_dir(&entry.working_dir) || entry.working_dir == global_ws {
             continue;
         }
         if !catalog_entry_is_visible(sessions_root, &entry, active) {
@@ -4530,6 +4546,7 @@ async fn get_session_detail(
                 token_usage,
                 origin: session.meta.origin,
                 todos,
+                turn_stats: session.meta.turn_stats.clone(),
             };
             Json(detail).into_response()
         }
@@ -4551,6 +4568,7 @@ async fn get_session_detail(
                 token_usage: None,
                 origin: jeikcode_capabilities::session::SessionOrigin::Manual,
                 todos: Vec::new(),
+                turn_stats: Vec::new(),
             };
             Json(detail).into_response()
         }
@@ -4862,11 +4880,12 @@ async fn create_session(
 ) -> impl IntoResponse {
     // Determine working directory
     let mut working_dir = match req.working_dir {
-        Some(dir) => {
+        Some(dir) if !dir.as_os_str().is_empty() && dir.to_string_lossy() != "__global__" => {
             let mut proj = state.project.write().await;
             update_project_state(&mut proj, &dir);
             dir
         }
+        Some(_) => global_standalone_workspace(),
         None => {
             // Use current project's working directory
             let project = state.project.read().await;
@@ -8397,7 +8416,11 @@ async fn chat_stream(
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     // Use current project working directory if not specified
-    if req.working_dir.is_none() {
+    if let Some(ref dir) = req.working_dir {
+        if dir.as_os_str().is_empty() || dir.to_string_lossy() == "__global__" {
+            req.working_dir = Some(global_standalone_workspace());
+        }
+    } else {
         let project = state.project.read().await;
         req.working_dir = Some(project.working_dir.clone());
     }
@@ -8696,9 +8719,10 @@ pub(crate) async fn process_chat_request(
     });
 
     // Get working directory
-    let mut working_dir = req
-        .working_dir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut working_dir = match req.working_dir {
+        Some(dir) if !dir.as_os_str().is_empty() && dir.to_string_lossy() != "__global__" => dir,
+        _ => global_standalone_workspace(),
+    };
 
     let (session_id, initial_messages, is_new_session) =
         if let Some(ref session_id_str) = req.session_id {

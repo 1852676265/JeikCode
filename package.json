@@ -4,6 +4,9 @@
   "private": true,
   "description": "JeikCode AI Coding Agent",
   "scripts": {
+    "dev": "npm --prefix webui run dev",
+    "dev:desktop": "npm --prefix webui run dev:desktop",
+    "build:webui": "npm --prefix webui run build",
     "bump": "node scripts/bump-version.js",
     "bump:beta": "node scripts/bump-version.js beta",
     "bump:patch": "node scripts/bump-version.js patch",

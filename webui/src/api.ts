@@ -1,6 +1,7 @@
 // Task 12 — API client for jeikcode webui
 
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
+import { getActiveServerProfile, normalizeServerUrl } from './lib/serverProfiles.ts';
 
 // Serve / webui bootstrap: `/?token=<uuid>` is handed off via HttpOnly cookie
 // AND left visible on first paint so we can stash it for Authorization.
@@ -79,6 +80,15 @@ function currentWebuiToken(): string {
     persistWebuiToken(fromUrl);
     return fromUrl;
   }
+
+  // 优先从当前激活的主机配置读取专用 Token
+  try {
+    const activeProfile = getActiveServerProfile();
+    if (activeProfile && activeProfile.token && activeProfile.token.trim()) {
+      return activeProfile.token.trim();
+    }
+  } catch {}
+
   const stored = storedWebuiToken();
   if (stored) return stored;
 
@@ -111,19 +121,46 @@ function authHeaders(): Record<string, string> {
 }
 
 /**
+ * 获取当前目标主机的绝对 BaseURL (若为空字符串则代表同源当前主机)
+ */
+export function getActiveServerBaseUrl(): string {
+  try {
+    const activeProfile = getActiveServerProfile();
+    return activeProfile && activeProfile.url ? normalizeServerUrl(activeProfile.url) : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Same-origin fetch that always includes cookies (HttpOnly token handoff)
  * and merges auth headers. Remote LAN clients need both cookie + Bearer.
  */
 async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  let targetInput = input;
+  const baseUrl = getActiveServerBaseUrl();
+
+  if (baseUrl) {
+    if (typeof input === 'string') {
+      if (input.startsWith('/')) {
+        targetInput = `${baseUrl}${input}`;
+      }
+    } else if (input instanceof URL) {
+      if (typeof window !== 'undefined' && input.origin === window.location.origin) {
+        targetInput = new URL(`${baseUrl}${input.pathname}${input.search}${input.hash}`);
+      }
+    }
+  }
+
   const headers = new Headers(init.headers);
   const auth = authHeaders();
   for (const [k, v] of Object.entries(auth)) {
     if (!headers.has(k)) headers.set(k, v);
   }
   try {
-    const resp = await fetch(input, { ...init, credentials: 'include', headers });
+    const resp = await fetch(targetInput, { ...init, credentials: 'include', headers });
     if (resp.status === 401) {
-      console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', input);
+      console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', targetInput);
     }
     return resp;
   } catch (err: any) {
@@ -878,6 +915,26 @@ export interface SessionTurnOutline {
   text: string;
 }
 
+export interface ModelUsageStat {
+  model_name: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  total_tokens: number;
+}
+
+export interface TurnStat {
+  turn_id: number;
+  round_count: number;
+  tool_call_count: number;
+  duration_ms: number;
+  total_tokens: number;
+  errored?: boolean;
+  used_tokens?: number;
+  ctx_window?: number;
+  model_usage?: ModelUsageStat[];
+}
+
 export interface SessionDetail {
   id: string;
   name: string;
@@ -899,6 +956,8 @@ export interface SessionDetail {
   origin?: 'manual' | 'scheduled' | 'protocol';
   /** Authoritative active todo list from backend transcript. */
   todos?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+  /** Per-turn execution telemetry (tokens, duration, tool call count, errors) for turn analysis. */
+  turn_stats?: TurnStat[];
 }
 
 /** Token footer snapshot from session turn_stats (GET /projects/:hash/sessions/:id).

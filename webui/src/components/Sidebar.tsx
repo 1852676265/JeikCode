@@ -21,11 +21,12 @@ import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, stripExtendedPathPrefix } from '../lib/displayPath';
 import { FileExplorer } from './FileExplorer';
 import { getPageZoom } from '../lib/pageZoom';
+import { buildSessionAnalysisPrompt } from '../lib/sessionAnalysis';
 
 interface SidebarProps {
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
-  onNew: (targetDir?: string) => void;
+  onNew: (targetDir?: string, initialPrompt?: string) => void;
   /** Open a specific settings dialog (theme / language / model). */
   onOpenSettings: (section: SettingsSection) => void;
   /** Mobile drawer open state */
@@ -566,8 +567,13 @@ export function Sidebar({
   // opens it upward above the kebab (used when there isn't room below, so the
   // 2-row menu isn't clipped by the viewport edge).
   const [menuPos, setMenuPos] = useState<
-    { top?: number; bottom?: number; right: number } | null
+    { top?: number; bottom?: number; left?: number; right?: number } | null
   >(null);
+  const [projectMenuTarget, setProjectMenuTarget] = useState<ProjectInfo | null>(null);
+  const [projectMenuPos, setProjectMenuPos] = useState<
+    { top?: number; bottom?: number; left?: number; right?: number } | null
+  >(null);
+  const projectMenuRef = useRef<HTMLDivElement | null>(null);
   // Session search: a centered modal dialog (same .modal-overlay/.modal-card
   // family as the rename/delete dialogs), closes on backdrop click / Escape.
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1038,27 +1044,116 @@ export function Sidebar({
     };
   }, [menuFor]);
 
+  useEffect(() => {
+    if (!projectMenuTarget) return;
+    const close = () => setProjectMenuTarget(null);
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+      if (projectMenuRef.current?.contains(el)) return;
+      if (el.closest?.('.project-group-action-btn')) return;
+      close();
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [projectMenuTarget]);
+
+  function openProjectMenu(e: MouseEvent, p: ProjectInfo) {
+    e.preventDefault();
+    e.stopPropagation();
+    const zoom = getPageZoom() || 1.0;
+    const MENU_EST_HEIGHT = 210;
+    const MENU_EST_WIDTH = 220;
+    const isRightClick = e.type === 'contextmenu';
+
+    if (isRightClick) {
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+      const spaceBelow = (window.innerHeight - clientY) / zoom;
+      const spaceRight = (window.innerWidth - clientX) / zoom;
+      const top = spaceBelow < MENU_EST_HEIGHT + 8 ? undefined : clientY / zoom;
+      const bottom = spaceBelow < MENU_EST_HEIGHT + 8 ? (window.innerHeight - clientY) / zoom : undefined;
+      const left = spaceRight < MENU_EST_WIDTH + 8 ? undefined : clientX / zoom;
+      const right = spaceRight < MENU_EST_WIDTH + 8 ? (window.innerWidth - clientX) / zoom : undefined;
+      setProjectMenuPos({ top, bottom, left, right });
+    } else {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const right = (window.innerWidth - rect.right) / zoom;
+      const spaceBelow = (window.innerHeight - rect.bottom) / zoom;
+      if (spaceBelow < MENU_EST_HEIGHT + 8) {
+        setProjectMenuPos({ bottom: (window.innerHeight - rect.top + 4) / zoom, right });
+      } else {
+        setProjectMenuPos({ top: (rect.bottom + 4) / zoom, right });
+      }
+    }
+    setProjectMenuTarget(p);
+  }
+
   function openItemMenu(e: MouseEvent, id: string) {
     e.preventDefault();
     e.stopPropagation();
     const zoom = getPageZoom() || 1.0;
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    if (menuFor === id) {
+    const isRightClick = e.type === 'contextmenu';
+    if (!isRightClick && menuFor === id) {
       setMenuFor(null);
       return;
     }
-    const right = (window.innerWidth - rect.right) / zoom;
-    // 3 rows (rename + export + delete); estimate generously so we flip up a touch
-    // early rather than let the last item clip off the bottom edge.
-    const MENU_EST_HEIGHT = 144;
-    const spaceBelow = (window.innerHeight - rect.bottom) / zoom;
-    if (spaceBelow < MENU_EST_HEIGHT + 8) {
-      // Not enough room below → open upward, anchored above the kebab.
-      setMenuPos({ bottom: (window.innerHeight - rect.top + 4) / zoom, right });
+    const MENU_EST_HEIGHT = 180;
+    const MENU_EST_WIDTH = 190;
+
+    if (isRightClick) {
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+      const spaceBelow = (window.innerHeight - clientY) / zoom;
+      const spaceRight = (window.innerWidth - clientX) / zoom;
+      const top = spaceBelow < MENU_EST_HEIGHT + 8 ? undefined : clientY / zoom;
+      const bottom = spaceBelow < MENU_EST_HEIGHT + 8 ? (window.innerHeight - clientY) / zoom : undefined;
+      const left = spaceRight < MENU_EST_WIDTH + 8 ? undefined : clientX / zoom;
+      const right = spaceRight < MENU_EST_WIDTH + 8 ? (window.innerWidth - clientX) / zoom : undefined;
+      setMenuPos({ top, bottom, left, right });
     } else {
-      setMenuPos({ top: (rect.bottom + 4) / zoom, right });
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const right = (window.innerWidth - rect.right) / zoom;
+      const spaceBelow = (window.innerHeight - rect.bottom) / zoom;
+      if (spaceBelow < MENU_EST_HEIGHT + 8) {
+        setMenuPos({ bottom: (window.innerHeight - rect.top + 4) / zoom, right });
+      } else {
+        setMenuPos({ top: (rect.bottom + 4) / zoom, right });
+      }
     }
     setMenuFor(id);
+  }
+
+  async function handleAnalyzeSession(targetSession: SessionMetaWithProject) {
+    try {
+      showToast(t('sidebar.analyzingSession'), 'info');
+      const pHash = targetSession.project_hash || projectHash || '';
+      const detail = await getSession(pHash, targetSession.id, { offset: 0, limit: 1000 });
+      const prompt = buildSessionAnalysisPrompt(detail);
+      exitSelectMode();
+      onNew(targetSession.working_dir, prompt);
+    } catch {
+      showToast(t('sidebar.analyzeSessionFailed'), 'error');
+    }
+  }
+
+  async function handleAnalyzeSessionForProject(p: ProjectInfo) {
+    try {
+      const pSessions = projectSessionsMap[p.hash] || sessions.filter((s) => s.project_hash === p.hash || s.working_dir === p.working_dir);
+      if (!pSessions || pSessions.length === 0) {
+        showToast(t('sidebar.noSessionsToAnalyze'), 'warning');
+        return;
+      }
+      const target = pSessions.find((s) => s.id === activeSessionId) || pSessions[0];
+      await handleAnalyzeSession(target);
+    } catch {
+      showToast(t('sidebar.analyzeSessionFailed'), 'error');
+    }
   }
 
   function handleRenamed(id: string, name: string) {
@@ -1820,11 +1915,68 @@ export function Sidebar({
     : [];
 
   const knownHashes = new Set(allProjects.map((p) => p.hash));
+  const knownDirs = new Set(
+    allProjects
+      .filter((p) => Boolean(p.working_dir))
+      .map((p) => p.working_dir.replace(/\\/g, '/').toLowerCase())
+  );
+
+  // 过滤掉尚未发出第一条消息的空白会话（新建但未发送消息者不建会话、不入列表；首发即入列并持续展示）
+  const isNonEmptySession = (s: SessionMetaWithProject) => {
+    if (allOptimistic.some((opt) => opt.id === s.id)) return true;
+    if (s.id === activeSessionId) return true;
+    if (activeIds.includes(s.id) || extraRunningIds?.includes(s.id)) return true;
+    return (s.message_count ?? 0) > 0;
+  };
+
+  // 判断一个会话是否归属于某个具体项目
+  const isProjectSession = (s: SessionMetaWithProject) => {
+    const normDir = (s.working_dir || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    if (normDir === '__global__' || normDir.includes('.jeikcode/workspace')) {
+      return false;
+    }
+    if (s.project_hash && knownHashes.has(s.project_hash)) {
+      return true;
+    }
+    if (normDir && knownDirs.has(normDir)) {
+      return true;
+    }
+    if (s.project_hash && s.project_hash.trim().length > 0) {
+      return true;
+    }
+    return false;
+  };
+
+  // 下方列表只展示没有项目的会话（有项目的已在上方各项目树内展示，不用在下面显示）
   const recentsList = sortSessions(
-    merged.filter((s) => !s.project_hash || !knownHashes.has(s.project_hash))
+    merged.filter((s) => isNonEmptySession(s) && !isProjectSession(s)),
   );
 
   const filtered = q ? searchFiltered : merged;
+
+  const handleSelectSessionItem = (s: SessionMetaWithProject) => {
+    if (selectMode) {
+      toggleSelected(s.id);
+      return;
+    }
+    // 联动展开：若点击的会话属于某个已知项目，自动将该项目展开并加载列表，保持空间树同步
+    if (s.project_hash && knownHashes.has(s.project_hash)) {
+      setExpandedProjects((prev) => {
+        if (prev.has(s.project_hash!)) return prev;
+        const next = new Set(prev);
+        next.add(s.project_hash!);
+        return next;
+      });
+      if (!projectSessionsMap[s.project_hash]) {
+        listProjectSessions(s.project_hash)
+          .then((list) => {
+            setProjectSessionsMap((m) => ({ ...m, [s.project_hash!]: list }));
+          })
+          .catch(() => {});
+      }
+    }
+    onSelect(s);
+  };
 
   const renderItem = (s: SessionMetaWithProject) => {
     const active = s.id === activeSessionId;
@@ -1832,6 +1984,12 @@ export function Sidebar({
     const selected = selectedIds.has(s.id);
     const label = s.name || s.id.slice(0, 8);
     const dir = shortDir(s.working_dir);
+    const proj = allProjects.find(
+      (p) =>
+        p.hash === s.project_hash ||
+        (p.working_dir && s.working_dir && sameProjectDir(p.working_dir, s.working_dir)),
+    );
+    const itemTitle = proj?.name ? `${label} (${proj.name})` : (s.working_dir || dir);
     return (
       <div
         key={s.id}
@@ -1844,6 +2002,11 @@ export function Sidebar({
           (selectMode && selected ? ' selected' : '') +
           (selectMode ? ' selecting' : '')
         }
+        onContextMenu={(e) => {
+          if (!selectMode) {
+            openItemMenu(e as unknown as MouseEvent, s.id);
+          }
+        }}
       >
         {selectMode && (
           <button
@@ -1860,8 +2023,8 @@ export function Sidebar({
         )}
         <button
           class="session-item-main"
-          onClick={() => (selectMode ? toggleSelected(s.id) : onSelect(s))}
-          title={dir}
+          onClick={() => handleSelectSessionItem(s)}
+          title={itemTitle}
         >
           <div class="session-item-header">
             <span class="session-item-icon" aria-hidden="true"><ChatBubbleIcon /></span>
@@ -2207,14 +2370,6 @@ export function Sidebar({
               const isExpanded = expandedProjects.has(p.hash);
               const isShowAll = showAllProjects.has(p.hash);
 
-              // 过滤掉尚未发出第一条消息的空白会话（新建但未发送消息者不建会话、不入列表；首发即入列并持续展示）
-              const isNonEmptySession = (s: SessionMetaWithProject) => {
-                if (allOptimistic.some((opt) => opt.id === s.id)) return true;
-                if (s.id === activeSessionId) return true;
-                if (activeIds.includes(s.id) || extraRunningIds?.includes(s.id)) return true;
-                return (s.message_count ?? 0) > 0;
-              };
-
               const rawBase = projectSessionsMap[p.hash] ?? sessions.filter((s) => s.project_hash === p.hash);
               const baseSessions = rawBase.filter(isNonEmptySession);
               const projectOptimistics = allOptimistic.filter(
@@ -2247,65 +2402,23 @@ export function Sidebar({
                   <div
                     class={'project-group-header' + (p.hash === projectHash ? ' active-project' : '')}
                     onClick={() => toggleProjectExpand(p.hash)}
+                    onContextMenu={(e) => openProjectMenu(e, p)}
                   >
                     <span class="project-group-icon"><FolderIcon /></span>
                     <span class="project-group-name" title={p.working_dir}>
                       {p.name || shortDir(p.working_dir)}
                     </span>
 
+                    {/* 项目操作快捷按钮（悬停时显示），同时支持整行右键唤出完整菜单 */}
                     <div class="project-group-actions-cluster" onClick={(e) => e.stopPropagation()}>
-                      {/* 在文件资源管理器打开项目目录 */}
-                      {p.working_dir && (
-                        <button
-                          type="button"
-                          class="project-group-action-btn"
-                          onClick={() => void revealInFileExplorer(p.working_dir)}
-                          title={t('sidebar.revealInExplorer')}
-                          aria-label={t('sidebar.revealInExplorer')}
-                        >
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                          </svg>
-                        </button>
-                      )}
-
-                      {/* GitHub 联动与自动审查配置 */}
                       <button
                         type="button"
                         class="project-group-action-btn"
-                        onClick={() => setGitWebhookProject(p)}
-                        title={t('gitWebhook.btnTitle')}
-                        aria-label={t('gitWebhook.btnTitle')}
+                        onClick={(e) => openProjectMenu(e, p)}
+                        title={t('sidebar.projectActions')}
+                        aria-label={t('sidebar.projectActions')}
                       >
-                        <GithubLogo />
-                      </button>
-
-                      {/* 在当前项目发起新会话 */}
-                      <button
-                        type="button"
-                        class="project-group-action-btn"
-                        onClick={() => {
-                          exitSelectMode();
-                          onNew(p.working_dir);
-                        }}
-                        title={t('sidebar.newChat')}
-                        aria-label={t('sidebar.newChat')}
-                      >
-                        +
-                      </button>
-
-                      {/* 从左侧列表清除该项目显示（保留磁盘物理文件与会话记录，再次添加时可还原） */}
-                      <button
-                        type="button"
-                        class="project-group-action-btn danger"
-                        onClick={() => setRemoveProjectTarget(p)}
-                        title={t('sidebar.removeProjectFromList')}
-                        aria-label={t('sidebar.removeProjectFromList')}
-                      >
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <polyline points="3 6 5 6 21 6" />
-                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                        </svg>
+                        <KebabIcon />
                       </button>
                     </div>
 
@@ -2342,7 +2455,7 @@ export function Sidebar({
                   <span class="sidebar-section-title">{t('sidebar.recents')}</span>
                 </div>
                 <div class="project-sessions-list" style={{ paddingLeft: 0 }}>
-                  {recentsList.slice(0, 10).map(renderItem)}
+                  {recentsList.slice(0, 30).map(renderItem)}
                 </div>
               </div>
             )}
@@ -2366,6 +2479,21 @@ export function Sidebar({
           </a>
         )}
         <span class="sidebar-bottom-spacer" />
+        <button
+          class="sidebar-icon-btn"
+          onClick={() => {
+            onCloseDrawer?.();
+            window.dispatchEvent(new CustomEvent('jeikcode:open_server_switcher'));
+          }}
+          title="多主机管理与快速切换 (公司 / 家里 / 云端)"
+          aria-label="切换主机"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+            <line x1="8" y1="21" x2="16" y2="21" />
+            <line x1="12" y1="17" x2="12" y2="21" />
+          </svg>
+        </button>
         <button
           class="sidebar-icon-btn sidebar-settings-btn"
           onClick={() => {
@@ -2456,9 +2584,20 @@ export function Sidebar({
           style={{
             top: menuPos.top != null ? `${menuPos.top}px` : undefined,
             bottom: menuPos.bottom != null ? `${menuPos.bottom}px` : undefined,
-            right: `${menuPos.right}px`,
+            left: menuPos.left != null ? `${menuPos.left}px` : undefined,
+            right: menuPos.right != null ? `${menuPos.right}px` : undefined,
           }}
         >
+          <button
+            class="item-menu-row"
+            onClick={() => {
+              void handleAnalyzeSession(menuSession);
+              setMenuFor(null);
+            }}
+          >
+            <SparklesIcon />
+            <span>{t('sidebar.analyzeSession')}</span>
+          </button>
           <button
             class="item-menu-row"
             onClick={() => {
@@ -2476,6 +2615,7 @@ export function Sidebar({
             <DownloadIcon />
             <span>{t('sidebar.exportMarkdown')}</span>
           </button>
+          <div class="settings-menu-divider" />
           <button
             class="item-menu-row danger"
             onClick={() => {
@@ -2485,6 +2625,86 @@ export function Sidebar({
           >
             <TrashIcon />
             <span>{t('sidebar.delete')}</span>
+          </button>
+        </div>,
+        document.body,
+      )}
+
+      {/* Project actions context menu (收纳图二各项操作与一键分析) */}
+      {projectMenuTarget && projectMenuPos && createPortal(
+        <div
+          class="item-menu"
+          ref={projectMenuRef}
+          style={{
+            top: projectMenuPos.top != null ? `${projectMenuPos.top}px` : undefined,
+            bottom: projectMenuPos.bottom != null ? `${projectMenuPos.bottom}px` : undefined,
+            left: projectMenuPos.left != null ? `${projectMenuPos.left}px` : undefined,
+            right: projectMenuPos.right != null ? `${projectMenuPos.right}px` : undefined,
+          }}
+        >
+          {/* 在当前项目发起新会话 */}
+          <button
+            class="item-menu-row"
+            onClick={() => {
+              exitSelectMode();
+              onNew(projectMenuTarget.working_dir);
+              setProjectMenuTarget(null);
+            }}
+          >
+            <PlusIcon />
+            <span>{t('sidebar.newChat')}</span>
+          </button>
+
+          {/* 一键分析会话 */}
+          <button
+            class="item-menu-row"
+            onClick={() => {
+              void handleAnalyzeSessionForProject(projectMenuTarget);
+              setProjectMenuTarget(null);
+            }}
+          >
+            <SparklesIcon />
+            <span>{t('sidebar.analyzeSession')}</span>
+          </button>
+
+          {/* 在文件资源管理器打开项目目录 */}
+          {projectMenuTarget.working_dir && (
+            <button
+              class="item-menu-row"
+              onClick={() => {
+                void revealInFileExplorer(projectMenuTarget.working_dir);
+                setProjectMenuTarget(null);
+              }}
+            >
+              <FolderOpenIcon />
+              <span>{t('sidebar.revealInExplorer')}</span>
+            </button>
+          )}
+
+          {/* GitHub 联动与自动审查配置 */}
+          <button
+            class="item-menu-row"
+            onClick={() => {
+              setGitWebhookProject(projectMenuTarget);
+              setProjectMenuTarget(null);
+            }}
+          >
+            <GithubLogo />
+            <span>{t('gitWebhook.btnTitle')}</span>
+          </button>
+
+          <div class="settings-menu-divider" />
+
+          {/* 从列表中移除项目 */}
+          <button
+            class="item-menu-row danger"
+            onClick={() => {
+              setRemoveProjectTarget(projectMenuTarget);
+              setProjectMenuTarget(null);
+            }}
+          >
+            <TrashIcon />
+            <span>{t('sidebar.removeProjectFromList')}</span>
           </button>
         </div>,
         document.body,

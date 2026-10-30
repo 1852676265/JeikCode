@@ -7,7 +7,8 @@ const os = require('os');
 Menu.setApplicationMenu(null);
 
 let mainWindow = null;
-const CANDIDATE_PORTS = [5173, 5174, 5175];
+// 默认仅连接 JeikCode Vite 服务端口 5173，避免误连本地其他前端项目（如 5174 等）
+const CANDIDATE_PORTS = [5173];
 
 function pingPort(port) {
   return new Promise((resolve) => {

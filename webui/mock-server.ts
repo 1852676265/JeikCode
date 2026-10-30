@@ -85,6 +85,23 @@ function resolveGitBashPath(): string {
   return 'bash.exe';
 }
 
+function getDaemonAuth(): { port: number; token?: string } | null {
+  try {
+    const listenFile = pathMod.resolve(
+      process.env.USERPROFILE || process.env.HOME || '',
+      '.jeikcode',
+      'webui-listen.json'
+    );
+    if (fs.existsSync(listenFile)) {
+      const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
+      if (data && data.port) {
+        return { port: Number(data.port), token: data.token };
+      }
+    }
+  } catch {}
+  return null;
+}
+
 export function mockApiPlugin(): Plugin {
   const mockTerminalStore = new Map<string, any>();
 
@@ -328,6 +345,10 @@ export function mockApiPlugin(): Plugin {
       import('ws').then(({ WebSocketServer }) => {
         const wss = new WebSocketServer({ noServer: true });
         server.httpServer?.on('upgrade', (req, socket, head) => {
+          if (getDaemonAuth()) {
+            // 真实后端在线时，让 Vite proxy 的 ws: true 代理终端，不走 Mock WebSocket
+            return;
+          }
           const url = new URL(req.url || '', 'http://localhost');
           if (url.pathname === '/terminal/ws') {
             wss.handleUpgrade(req, socket, head, (ws: any) => {
@@ -391,6 +412,11 @@ export function mockApiPlugin(): Plugin {
       });
 
       server.middlewares.use(async (req, res, next) => {
+        // 若本地检测到真实 Daemon 正在运行，跳过所有 Mock 拦截，让 Vite Proxy 转发给真实后端
+        if (getDaemonAuth()) {
+          return next();
+        }
+
         const url = req.url || '';
         const parsedUrl = new URL(url, 'http://localhost');
         let pathname = parsedUrl.pathname;

@@ -1,2 +1,7 @@
 node_modules/
 .npm-cache/
+dist/
+ios/App/build/
+ios/App/DerivedData/
+ios/App/Pods/
+ios/App/.build/

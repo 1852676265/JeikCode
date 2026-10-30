@@ -11,6 +11,8 @@ import { onboardingDone } from './lib/onboarding';
 import { LiveReviewState, NotificationDock } from './components/NotificationDock';
 import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
+import { ServerSwitcherModal } from './components/ServerSwitcherModal';
+import { getActiveServerProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
 import { ConfirmModalHost } from './components/ConfirmDialog';
@@ -60,6 +62,7 @@ export function App() {
   const { theme, setTheme, lang, setLang } = useSettings();
   // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 乐观会话集合：让新创建/首条消息发出的会话即时出现在侧栏（即使切到其他会话也不丢失）。
   // 当后端列表出现同 id 的真实会话后，Sidebar 的 mergeOptimisticSessions 会自动以落盘条目为准去重。
@@ -121,6 +124,21 @@ export function App() {
   const [sessionListVersion, setSessionListVersion] = useState(0);
   const [liveRunningIds, setLiveRunningIds] = useState<Set<string>>(() => new Set());
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [serverSwitcherOpen, setServerSwitcherOpen] = useState(false);
+  const [activeServerName, setActiveServerName] = useState(() => getActiveServerProfile().name);
+
+  useEffect(() => {
+    const onProfilesChange = () => {
+      setActiveServerName(getActiveServerProfile().name);
+    };
+    const onOpenSwitcher = () => setServerSwitcherOpen(true);
+    window.addEventListener(PROFILES_CHANGE_EVENT, onProfilesChange);
+    window.addEventListener('jeikcode:open_server_switcher', onOpenSwitcher);
+    return () => {
+      window.removeEventListener(PROFILES_CHANGE_EVENT, onProfilesChange);
+      window.removeEventListener('jeikcode:open_server_switcher', onOpenSwitcher);
+    };
+  }, []);
   // 表头会话菜单改用 fixed 定位，避免被祖先 overflow/层叠裁剪；记录锚点坐标。
   const [headerMenuPos, setHeaderMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [headerDialog, setHeaderDialog] = useState<'rename' | 'delete' | null>(null);
@@ -773,16 +791,22 @@ export function App() {
     navSeqRef.current++;
     setSessionId(null);
     setActiveSession(null);
-    if (targetCwd && targetCwd !== '~') {
+    if (targetCwd === '' || targetCwd === '__global__') {
+      setCwd('');
+      setProjectHash('');
+    } else if (targetCwd && targetCwd !== '~') {
       setCwd(targetCwd);
     }
   }
 
-  function handleNewSession(targetDir?: string) {
+  function handleNewSession(targetDir?: string, initialPrompt?: string) {
     setSidebarOpen(false);
     setActiveMainTabId('chat');
-    // Top-level 「新建对话」 stays in the current/serve workspace.
-    openNewSession(targetDir || cwd || undefined);
+    if (initialPrompt) {
+      setPendingPrompt(initialPrompt);
+    }
+    // Top-level「新建对话」继承当前项目的上下文（若无项目则保持当前）；项目卡片「+」或落地页可显式传入目录
+    openNewSession(targetDir !== undefined ? targetDir : (cwd || undefined));
   }
 
   function applySessionSelection(session: SessionMetaWithProject) {
@@ -790,10 +814,12 @@ export function App() {
     setSessionId(session.id);
     setActiveSession(session);
     setActiveMainTabId('chat');
-    if (session.working_dir) {
+    if (session.working_dir && session.working_dir !== '__global__') {
       setCwd(session.working_dir);
+    } else {
+      setCwd('');
     }
-    if (session.project_hash) setProjectHash(session.project_hash);
+    setProjectHash(session.project_hash || '');
     setSidebarOpen(false);
   }
 
@@ -1280,6 +1306,17 @@ export function App() {
               </svg>
             </button>
 
+            {/* 顶栏多主机快速切换入口 (手机/桌面均可秒级切换) */}
+            <button
+              type="button"
+              class="top-nav-server-switcher-btn"
+              onClick={() => setServerSwitcherOpen(true)}
+              title="切换连接主机 (公司工位 / 家里台式机 / 云端)"
+            >
+              <span class="top-nav-server-switcher-dot" />
+              <span>{activeServerName || '主机切换'}</span>
+            </button>
+
             {/* 桌面端外显：远程访问控制 */}
             <div class="top-nav-desktop-action top-nav-remote-desktop">
               <RemoteAccessControl />
@@ -1444,6 +1481,22 @@ export function App() {
                     class="top-nav-more-item"
                     onClick={() => {
                       setTopNavMoreOpen(false);
+                      setServerSwitcherOpen(true);
+                    }}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                      <line x1="8" y1="21" x2="16" y2="21" />
+                      <line x1="12" y1="17" x2="12" y2="21" />
+                    </svg>
+                    <span>切换主机 ({activeServerName || '当前'})</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    class="top-nav-more-item"
+                    onClick={() => {
+                      setTopNavMoreOpen(false);
                       openUpdateDialogWithFreshCheck();
                     }}
                   >
@@ -1535,6 +1588,8 @@ export function App() {
             sessionId={sessionId}
             onSessionId={handleSessionAssigned}
             cwd={cwd}
+            pendingPrompt={pendingPrompt}
+            onConsumedPendingPrompt={() => setPendingPrompt(null)}
             onPermission={setPending}
             onPermissionResolved={(callId) =>
               setPending((cur: any) =>
@@ -1667,6 +1722,10 @@ export function App() {
       </Suspense>
       <ConfirmModalHost />
       <ToastHost />
+      <ServerSwitcherModal
+        open={serverSwitcherOpen}
+        onClose={() => setServerSwitcherOpen(false)}
+      />
       <NotificationDock
         liveReview={liveReview}
         chatPermission={pending}
