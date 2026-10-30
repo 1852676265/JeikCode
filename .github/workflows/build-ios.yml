@@ -1,0 +1,71 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_build:
+        description: 'Whether to create a draft release with the IPA'
+        type: boolean
+        default: false
+  push:
+    paths:
+      - 'webui/**'
+      - '.github/workflows/build-ios.yml'
+    branches:
+      - custom
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build-ipa:
+    name: Build JeikCode iOS App (.ipa)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install WebUI Dependencies
+        run: |
+          cd webui
+          npm install
+
+      - name: Build Web Assets & Sync Capacitor
+        run: |
+          cd webui
+          npm run cap:sync
+
+      - name: Build Xcode Project (Unsigned / Sideload-Ready)
+        run: |
+          cd webui/ios/App
+          xcodebuild build \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ./build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package Payload into IPA
+        run: |
+          cd webui/ios/App
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/App.app Payload/
+          zip -r -q JeikCode.ipa Payload
+          ls -lh JeikCode.ipa
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JeikCode-iOS-IPA
+          path: webui/ios/App/JeikCode.ipa
+          retention-days: 14
