@@ -1,8 +1,13 @@
+export type ServerProfileType = 'host' | 'direct_llm';
+
 export interface ServerProfile {
   id: string;
   name: string;
-  url: string; // e.g. "http://192.168.1.100:13458" or "" for current origin
-  token: string;
+  type?: ServerProfileType;
+  url: string; // host mode: daemon url (e.g. "http://192.168.1.100:13458"); direct_llm mode: OpenAI-compatible API base (e.g. "https://api.deepseek.com/v1")
+  token: string; // host mode: daemon token; direct_llm mode: API Key (sk-...)
+  model?: string; // direct_llm mode: model identifier (e.g. "deepseek-chat", "gpt-4o")
+  systemPrompt?: string; // direct_llm mode: optional custom system prompt
   isDefault?: boolean;
   notes?: string;
   lastConnectedAt?: number;
@@ -66,10 +71,15 @@ export function getDefaultProfile(): ServerProfile {
   return {
     id: 'default',
     name: hostLabel,
+    type: 'host',
     url: '',
     token: initialToken,
     isDefault: true,
   };
+}
+
+export function isDirectLlmProfile(profile?: ServerProfile | null): boolean {
+  return profile?.type === 'direct_llm';
 }
 
 /**
@@ -155,7 +165,10 @@ export function upsertServerProfile(profile: Omit<ServerProfile, 'id'> & { id?: 
       profiles[index] = {
         ...profiles[index],
         ...profile,
+        type: profile.type || profiles[index].type || 'host',
         url: normUrl,
+        model: profile.model?.trim(),
+        systemPrompt: profile.systemPrompt?.trim(),
       };
       saveServerProfiles(profiles);
       return profiles[index];
@@ -165,9 +178,12 @@ export function upsertServerProfile(profile: Omit<ServerProfile, 'id'> & { id?: 
   // 新增
   const newProfile: ServerProfile = {
     id: `srv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-    name: profile.name.trim() || normUrl || '未命名主机',
+    name: profile.name.trim() || normUrl || (profile.type === 'direct_llm' ? '直连大模型 API' : '未命名主机'),
+    type: profile.type || 'host',
     url: normUrl,
     token: profile.token.trim(),
+    model: profile.model?.trim(),
+    systemPrompt: profile.systemPrompt?.trim(),
     notes: profile.notes?.trim(),
   };
 
@@ -193,15 +209,56 @@ export function deleteServerProfile(id: string): void {
 /**
  * 测试远程主机连通性与健康状态
  */
-export async function pingServer(rawUrl: string, token: string): Promise<PingResult> {
+export async function pingServer(
+  rawUrl: string,
+  token: string,
+  type: ServerProfileType = 'host',
+  model?: string,
+): Promise<PingResult> {
   const baseUrl = normalizeServerUrl(rawUrl);
-  const targetUrl = baseUrl ? `${baseUrl}/health` : '/health';
   const startTime = Date.now();
-
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6000);
+  const timer = setTimeout(() => controller.abort(), 7000);
 
   try {
+    if (type === 'direct_llm') {
+      // 针对 OpenAI 兼容接口：先探测 /models 端点
+      const targetUrl = baseUrl ? `${baseUrl}/models` : '/models';
+      const headers: Record<string, string> = {};
+      if (token.trim()) {
+        headers.Authorization = `Bearer ${token.trim()}`;
+      }
+
+      const res = await fetch(targetUrl, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+        mode: 'cors',
+        credentials: 'omit',
+      });
+
+      clearTimeout(timer);
+      const latencyMs = Date.now() - startTime;
+
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const modelCount = Array.isArray(data?.data) ? data.data.length : undefined;
+        return {
+          ok: true,
+          latencyMs,
+          service: 'OpenAI 兼容模型 API',
+          version: model ? `指定: ${model}` : (modelCount ? `${modelCount} 个可用模型` : '活跃'),
+        };
+      }
+
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, latencyMs, error: 'API Key 认证失败 (401/403)' };
+      }
+      return { ok: false, latencyMs, error: `HTTP ${res.status}: ${res.statusText}` };
+    }
+
+    // host 模式逻辑 (原有逻辑完全保持)
+    const targetUrl = baseUrl ? `${baseUrl}/health` : '/health';
     const headers: Record<string, string> = {
       'X-JeikCode-Client': 'webui-ping',
     };
@@ -238,7 +295,7 @@ export async function pingServer(rawUrl: string, token: string): Promise<PingRes
     clearTimeout(timer);
     const latencyMs = Date.now() - startTime;
     if (err.name === 'AbortError') {
-      return { ok: false, latencyMs, error: '连接超时 (超过 6 秒未响应)' };
+      return { ok: false, latencyMs, error: '连接超时 (超过 7 秒未响应)' };
     }
     return { ok: false, latencyMs, error: err.message || '网络连接失败 (无法访问目标地址或已被防火墙拦截)' };
   }
@@ -270,11 +327,15 @@ export function importServerProfiles(jsonStr: string): { count: number; error?: 
     for (const item of parsed) {
       if (item && typeof item === 'object' && item.name) {
         const id = item.id || `srv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const type: ServerProfileType = item.type === 'direct_llm' ? 'direct_llm' : 'host';
         map.set(id, {
           id,
           name: String(item.name || ''),
+          type,
           url: normalizeServerUrl(String(item.url || '')),
           token: String(item.token || ''),
+          model: item.model ? String(item.model) : undefined,
+          systemPrompt: item.systemPrompt ? String(item.systemPrompt) : undefined,
           notes: item.notes ? String(item.notes) : undefined,
           isDefault: item.id === 'default',
         });

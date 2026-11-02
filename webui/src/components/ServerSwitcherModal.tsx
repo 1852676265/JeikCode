@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'preact/hooks';
 import {
   ServerProfile,
+  ServerProfileType,
   getServerProfiles,
   getActiveServerProfileId,
   setActiveServerProfileId,
@@ -18,15 +19,26 @@ interface ServerSwitcherModalProps {
   onClose: () => void;
 }
 
+const DIRECT_PRESETS = [
+  { label: 'DeepSeek (V3)', name: 'DeepSeek-V3 随身直连', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { label: 'DeepSeek (R1 思考)', name: 'DeepSeek-R1 深度思考', url: 'https://api.deepseek.com/v1', model: 'deepseek-reasoner' },
+  { label: 'OpenAI (GPT-4o)', name: 'OpenAI GPT-4o 随身直连', url: 'https://api.openai.com/v1', model: 'gpt-4o' },
+  { label: '硅基流动', name: '硅基流动 DeepSeek', url: 'https://api.siliconflow.cn/v1', model: 'deepseek-ai/DeepSeek-V3' },
+  { label: '月之暗面 (Kimi)', name: 'Kimi 随身直连', url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+];
+
 export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps) {
   const [profiles, setProfiles] = useState<ServerProfile[]>([]);
   const [activeId, setActiveId] = useState<string>('default');
   const [editingId, setEditingId] = useState<string | null>(null);
 
   // 编辑表单
+  const [formType, setFormType] = useState<ServerProfileType>('host');
   const [formName, setFormName] = useState('');
   const [formUrl, setFormUrl] = useState('');
   const [formToken, setFormToken] = useState('');
+  const [formModel, setFormModel] = useState('');
+  const [formSystemPrompt, setFormSystemPrompt] = useState('');
   const [isAddingNew, setIsAddingNew] = useState(false);
 
   // Ping 状态映射: profileId -> PingResult | 'testing'
@@ -58,23 +70,32 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
 
   if (!open) return null;
 
-  const handleTestConnection = async (id: string, url: string, token: string) => {
+  const handleTestConnection = async (
+    id: string,
+    url: string,
+    token: string,
+    type: ServerProfileType = 'host',
+    model?: string,
+  ) => {
     setPingStatus((prev) => ({ ...prev, [id]: 'testing' }));
-    const res = await pingServer(url, token);
+    const res = await pingServer(url, token, type, model);
     setPingStatus((prev) => ({ ...prev, [id]: res }));
   };
 
   const handleSaveForm = (andSwitch: boolean = false) => {
     const norm = normalizeServerUrl(formUrl);
     if (!formName.trim() && !norm) {
-      triggerToast('请输入主机名称或主机网络地址');
+      triggerToast('请输入节点名称或网络地址');
       return;
     }
     const saved = upsertServerProfile({
       id: editingId || undefined,
-      name: formName.trim() || norm || '未命名主机',
+      name: formName.trim() || norm || (formType === 'direct_llm' ? '直连大模型 API' : '未命名主机'),
+      type: formType,
       url: norm,
       token: formToken.trim(),
+      model: formModel.trim() || undefined,
+      systemPrompt: formSystemPrompt.trim() || undefined,
     });
 
     reloadData();
@@ -84,24 +105,30 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
     if (andSwitch) {
       setActiveServerProfileId(saved.id, true);
     } else {
-      triggerToast('主机配置已保存');
+      triggerToast('节点配置已保存');
     }
   };
 
   const handleStartEdit = (p: ServerProfile) => {
     setEditingId(p.id);
     setIsAddingNew(false);
+    setFormType(p.type || 'host');
     setFormName(p.name);
     setFormUrl(p.url);
     setFormToken(p.token);
+    setFormModel(p.model || '');
+    setFormSystemPrompt(p.systemPrompt || '');
   };
 
-  const handleStartAdd = () => {
+  const handleStartAdd = (initialType: ServerProfileType = 'host') => {
     setIsAddingNew(true);
     setEditingId(null);
+    setFormType(initialType);
     setFormName('');
     setFormUrl('');
     setFormToken('');
+    setFormModel('');
+    setFormSystemPrompt('');
   };
 
   const handleSwitch = (id: string) => {
@@ -170,49 +197,138 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
 
         <div class="modal-body server-switcher-body">
           <div class="server-switcher-intro">
-            📱 随时在手机上切换连接工位电脑、家里台式机或云端沙箱。点击对应主机即可秒级直连。
+            📱 随时在手机上切换连接工位电脑、家里台式机，或直接调用云端大模型 API（无需电脑）。点击对应节点即可秒级切换。
           </div>
 
           {/* 添加 / 编辑 面板 */}
           {(isAddingNew || editingId) ? (
             <div class="server-profile-edit-box">
               <div class="server-profile-edit-title">
-                {editingId ? '编辑主机配置' : '➕ 添加新主机节点'}
+                {editingId ? '编辑节点配置' : '➕ 添加新节点'}
               </div>
+
+              {/* 模式选择 */}
               <div class="server-profile-form-row">
-                <label>主机标签 / 备注名</label>
-                <input
-                  type="text"
-                  placeholder="如：公司工位电脑 / 家里台式机"
-                  value={formName}
-                  onInput={(e) => setFormName((e.target as HTMLInputElement).value)}
-                />
+                <label>节点模式类型</label>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                  <button
+                    type="button"
+                    class={`btn btn-xs ${formType === 'host' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ flex: 1, padding: '6px 10px', fontSize: '13px' }}
+                    onClick={() => setFormType('host')}
+                  >
+                    💻 电脑工作站 (Host)
+                  </button>
+                  <button
+                    type="button"
+                    class={`btn btn-xs ${formType === 'direct_llm' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ flex: 1, padding: '6px 10px', fontSize: '13px' }}
+                    onClick={() => setFormType('direct_llm')}
+                  >
+                    ⚡ 大模型 API 直连 (无需电脑)
+                  </button>
+                </div>
               </div>
-              <div class="server-profile-form-row">
-                <label>网络地址 (局域网 IP / Tailscale / 域名)</label>
-                <input
-                  type="text"
-                  placeholder="如：http://192.168.1.100:13458 或 http://my-pc:13458"
-                  value={formUrl}
-                  onInput={(e) => setFormUrl((e.target as HTMLInputElement).value)}
-                />
-                <span class="server-form-hint">留空则代表使用当前网页所在的默认同源宿主。</span>
-              </div>
-              <div class="server-profile-form-row">
-                <label>访问 Token (凭据)</label>
-                <input
-                  type="text"
-                  placeholder="从目标电脑的终端启动日志或远程设置中获取"
-                  value={formToken}
-                  onInput={(e) => setFormToken((e.target as HTMLInputElement).value)}
-                />
-              </div>
+
+              {formType === 'direct_llm' ? (
+                <>
+                  <div style={{ marginTop: '8px', marginBottom: '8px', padding: '8px 10px', background: 'var(--bg-subtle, rgba(255,255,255,0.04))', borderRadius: '6px', fontSize: '12px', border: '1px solid var(--border-subtle, rgba(255,255,255,0.08))' }}>
+                    <div style={{ fontWeight: 600, marginBottom: '6px', color: 'var(--text-accent, #58a6ff)' }}>✨ 快速填充常用服务预设：</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                      {DIRECT_PRESETS.map((p) => (
+                        <button
+                          key={p.label}
+                          type="button"
+                          class="btn btn-xs btn-secondary"
+                          style={{ fontSize: '11px', padding: '3px 8px' }}
+                          onClick={() => {
+                            setFormName(p.name);
+                            setFormUrl(p.url);
+                            setFormModel(p.model);
+                          }}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div class="server-profile-form-row">
+                    <label>节点名称 / 备注标签</label>
+                    <input
+                      type="text"
+                      placeholder="如：DeepSeek-V3 随身直连"
+                      value={formName}
+                      onInput={(e) => setFormName((e.target as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="server-profile-form-row">
+                    <label>API 基础地址 (Base URL)</label>
+                    <input
+                      type="text"
+                      placeholder="如：https://api.deepseek.com/v1"
+                      value={formUrl}
+                      onInput={(e) => setFormUrl((e.target as HTMLInputElement).value)}
+                    />
+                    <span class="server-form-hint">支持 OpenAI、DeepSeek、硅基流动、Kimi 或企业中台 API。</span>
+                  </div>
+                  <div class="server-profile-form-row">
+                    <label>API Key (密钥)</label>
+                    <input
+                      type="password"
+                      placeholder="sk-..."
+                      value={formToken}
+                      onInput={(e) => setFormToken((e.target as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="server-profile-form-row">
+                    <label>模型名称 (Model Identifier)</label>
+                    <input
+                      type="text"
+                      placeholder="如：deepseek-chat / gpt-4o / deepseek-reasoner"
+                      value={formModel}
+                      onInput={(e) => setFormModel((e.target as HTMLInputElement).value)}
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div class="server-profile-form-row">
+                    <label>主机标签 / 备注名</label>
+                    <input
+                      type="text"
+                      placeholder="如：公司工位电脑 / 家里台式机"
+                      value={formName}
+                      onInput={(e) => setFormName((e.target as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="server-profile-form-row">
+                    <label>网络地址 (局域网 IP / Tailscale / 域名)</label>
+                    <input
+                      type="text"
+                      placeholder="如：http://192.168.1.100:13458 或 http://my-pc:13458"
+                      value={formUrl}
+                      onInput={(e) => setFormUrl((e.target as HTMLInputElement).value)}
+                    />
+                    <span class="server-form-hint">留空则代表使用当前网页所在的默认同源宿主。</span>
+                  </div>
+                  <div class="server-profile-form-row">
+                    <label>访问 Token (凭据)</label>
+                    <input
+                      type="text"
+                      placeholder="从目标电脑的终端启动日志或远程设置中获取"
+                      value={formToken}
+                      onInput={(e) => setFormToken((e.target as HTMLInputElement).value)}
+                    />
+                  </div>
+                </>
+              )}
 
               <div class="server-profile-edit-actions">
                 <button
                   type="button"
                   class="btn btn-sm btn-secondary"
-                  onClick={() => handleTestConnection('form-test', formUrl, formToken)}
+                  onClick={() => handleTestConnection('form-test', formUrl, formToken, formType, formModel)}
                 >
                   🔍 测试连通性
                 </button>
@@ -248,9 +364,9 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
               {pingStatus['form-test'] && (
                 <div class={'server-ping-res ' + (pingStatus['form-test'] === 'testing' ? 'testing' : pingStatus['form-test'].ok ? 'ok' : 'err')}>
                   {pingStatus['form-test'] === 'testing' ? (
-                    '⏳ 正在探测目标主机连通性与服务响应...'
+                    '⏳ 正在探测目标节点连通性与服务响应...'
                   ) : pingStatus['form-test'].ok ? (
-                    `🟢 连通正常！耗时: ${pingStatus['form-test'].latencyMs}ms | 守护版本: ${pingStatus['form-test'].version}`
+                    `🟢 连通正常！耗时: ${pingStatus['form-test'].latencyMs}ms | 服务: ${pingStatus['form-test'].service || '就绪'} (${pingStatus['form-test'].version || 'OK'})`
                   ) : (
                     `🔴 无法连通: ${pingStatus['form-test'].error}`
                   )}
@@ -262,25 +378,40 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
           {/* 已配置的主机列表 */}
           <div class="server-profiles-list">
             <div class="server-list-header">
-              <span>已保存主机 ({profiles.length})</span>
+              <span>已保存节点 ({profiles.length})</span>
               {!isAddingNew && !editingId && (
-                <button type="button" class="btn btn-xs btn-primary" onClick={handleStartAdd}>
-                  ➕ 添加主机
-                </button>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <button type="button" class="btn btn-xs btn-secondary" onClick={() => handleStartAdd('host')}>
+                    💻 加电脑
+                  </button>
+                  <button type="button" class="btn btn-xs btn-primary" onClick={() => handleStartAdd('direct_llm')}>
+                    ⚡ 加直连 API
+                  </button>
+                </div>
               )}
             </div>
 
             {profiles.map((p) => {
               const isActive = p.id === activeId;
               const pStatus = pingStatus[p.id];
+              const isDirect = p.type === 'direct_llm';
 
               return (
                 <div key={p.id} class={'server-profile-card' + (isActive ? ' is-active' : '')}>
                   <div class="server-profile-info">
-                    <div class="server-profile-header">
+                    <div class="server-profile-header" style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                       <span class="server-profile-name">{p.name}</span>
                       {isActive && <span class="server-badge-active">当前使用中</span>}
                       {p.isDefault && <span class="server-badge-default">默认宿主</span>}
+                      {isDirect ? (
+                        <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '4px', background: 'rgba(210, 153, 34, 0.2)', color: '#d29922', border: '1px solid rgba(210, 153, 34, 0.4)' }}>
+                          ⚡ 直连 API {p.model ? `(${p.model})` : ''}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '4px', background: 'rgba(56, 139, 253, 0.15)', color: '#58a6ff', border: '1px solid rgba(56, 139, 253, 0.3)' }}>
+                          💻 电脑主机
+                        </span>
+                      )}
                     </div>
 
                     <div class="server-profile-url">
@@ -293,7 +424,7 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
                         {pStatus === 'testing' ? (
                           '⏳ 测速中...'
                         ) : pStatus.ok ? (
-                          `🟢 在线 (${pStatus.latencyMs}ms, v${pStatus.version})`
+                          `🟢 在线 (${pStatus.latencyMs}ms, ${pStatus.version || '正常'})`
                         ) : (
                           `🔴 离线: ${pStatus.error}`
                         )}
@@ -306,7 +437,7 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
                       type="button"
                       class="btn btn-xs btn-secondary"
                       title="测试连通性与延迟"
-                      onClick={() => handleTestConnection(p.id, p.url, p.token)}
+                      onClick={() => handleTestConnection(p.id, p.url, p.token, p.type || 'host', p.model)}
                     >
                       📡 测速
                     </button>

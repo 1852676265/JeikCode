@@ -1,7 +1,19 @@
 // Task 12 — API client for jeikcode webui
 
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
-import { getActiveServerProfile, normalizeServerUrl } from './lib/serverProfiles.ts';
+import { getActiveServerProfile, isDirectLlmProfile, normalizeServerUrl } from './lib/serverProfiles.ts';
+import {
+  DIRECT_LLM_PROJECT_HASH,
+  DIRECT_LLM_PROJECT_NAME,
+  getDirectSessionList,
+  getDirectSessionDetail,
+  createDirectSession,
+  deleteDirectSession,
+  renameDirectSession,
+  enqueueDirectPrompt,
+  runDirectWatch,
+  abortDirectStream,
+} from './lib/directLlmClient.ts';
 
 // Serve / webui bootstrap: `/?token=<uuid>` is handed off via HttpOnly cookie
 // AND left visible on first paint so we can stash it for Authorization.
@@ -295,6 +307,20 @@ export interface ModelInfo {
 }
 
 export async function getModels(): Promise<ModelInfo[]> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    const profile = getActiveServerProfile();
+    const model = profile.model || 'deepseek-chat';
+    return [
+      {
+        provider: profile.name,
+        model,
+        provider_type: 'direct_llm',
+        is_default: true,
+        effort_applicable: false,
+        reasoning_effort: null,
+      },
+    ];
+  }
   const r = await apiFetch('/models', { headers: authHeaders() });
   if (!r.ok) throw new Error(`list models failed: ${r.status}`);
   const body: unknown = await r.json();
@@ -350,6 +376,16 @@ export async function postChatPrompt(
   body: StreamChatBody,
   signal?: AbortSignal,
 ): Promise<PromptAck> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    const targetSessionId = body.session_id || createDirectSession().id;
+    enqueueDirectPrompt(targetSessionId, body.message, body.images, signal);
+    return {
+      status: 'admitted',
+      operation_id: targetSessionId,
+      session_id: targetSessionId,
+    };
+  }
+
   const resp = await apiFetch('/chat', {
     method: 'POST',
     headers: {
@@ -401,6 +437,10 @@ export interface StopChatResult {
  * delivers after `released`, which is what removes the 409-then-requeue flash.
  */
 export async function stopChat(requestId: string): Promise<StopChatResult> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    abortDirectStream(requestId);
+    return { success: true, released: true };
+  }
   const resp = await apiFetch('/chat/stop', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -578,6 +618,9 @@ export async function postSystemNotify(input: {
 }
 
 export async function getActiveChatSessions(): Promise<string[]> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return [];
+  }
   const resp = await apiFetch('/chat/active', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`active chats failed: ${resp.status}`);
   const body: unknown = await resp.json();
@@ -605,6 +648,13 @@ export interface ChatPendingInteractive {
 }
 
 export async function getChatPending(sessionId: string): Promise<ChatPendingInteractive> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return {
+      active: false,
+      permission: null,
+      user_input: null,
+    };
+  }
   const resp = await apiFetch(
     `/chat/pending?session_id=${encodeURIComponent(sessionId)}`,
     { headers: authHeaders() },
@@ -634,6 +684,9 @@ export async function watchChatSession(
   signal?: AbortSignal,
   opts?: { standbyOnly?: boolean; afterSeq?: number },
 ): Promise<void> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return runDirectWatch(sessionId, onEvent, signal);
+  }
   const params = new URLSearchParams({ session_id: sessionId });
   if (opts?.standbyOnly) params.set('standby', 'true');
   if (opts?.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
@@ -976,6 +1029,9 @@ export interface SessionTokenUsage {
 // anywhere use searchSessions. This capped list is only for cross-project
 // lookups where 50 is enough (e.g. URL-restore of a recent session).
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return getDirectSessionList();
+  }
   const resp = await apiFetch('/sessions', { headers: authHeaders() });
   return resp.json();
 }
@@ -986,6 +1042,9 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
 // The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
 // stamp it back on for the client's project-scoped dedup/filter.
 export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return getDirectSessionList();
+  }
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
     headers: authHeaders(),
   });
@@ -997,6 +1056,11 @@ export async function listProjectSessions(projectHash: string): Promise<SessionM
 // Cross-project session search by name, UNCAPPED. Backs the search modal so it
 // can find a session in ANY project (the sidebar list itself is per-project).
 export async function searchSessions(q: string): Promise<SessionMetaWithProject[]> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    const list = getDirectSessionList();
+    const lower = q.toLowerCase();
+    return list.filter((s) => (s.name || '').toLowerCase().includes(lower));
+  }
   const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}`, {
     headers: authHeaders(),
   });
@@ -1008,6 +1072,10 @@ export async function searchSessions(q: string): Promise<SessionMetaWithProject[
 // URL-restore only has a short id from the address bar; the capped `/sessions`
 // can't locate an older session. Returns null when nothing matches.
 export async function resolveSession(id: string): Promise<SessionMetaWithProject | null> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    const list = getDirectSessionList();
+    return list.find((s) => s.id === id || s.id.startsWith(id)) || null;
+  }
   const resp = await apiFetch(`/sessions/resolve/${encodeURIComponent(id)}`, {
     headers: authHeaders(),
   });
@@ -1028,6 +1096,16 @@ export async function createSession(
   workingDir?: string,
   title?: string,
 ): Promise<CreateSessionResponse> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    const meta = createDirectSession(title);
+    return {
+      id: meta.id,
+      name: meta.name || '新对话',
+      working_dir: '',
+      project_hash: DIRECT_LLM_PROJECT_HASH,
+      created_at: meta.created_at,
+    };
+  }
   const body: Record<string, string> = {};
   if (workingDir) body.working_dir = workingDir;
   if (title) body.title = title;
@@ -1045,6 +1123,10 @@ export async function renameSession(
   sessionId: string,
   name: string,
 ): Promise<void> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    renameDirectSession(sessionId, name);
+    return;
+  }
   const resp = await apiFetch(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/rename`,
     {
@@ -1070,6 +1152,10 @@ export async function deleteSession(
   projectHash: string,
   sessionId: string,
 ): Promise<void> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    deleteDirectSession(sessionId);
+    return;
+  }
   const resp = await apiFetch(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}`,
     { method: 'DELETE', headers: authHeaders() },
@@ -1306,6 +1392,19 @@ export interface ProjectInfo {
 }
 
 export async function getProjects(): Promise<ProjectInfo[]> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return [
+      {
+        hash: DIRECT_LLM_PROJECT_HASH,
+        name: DIRECT_LLM_PROJECT_NAME,
+        working_dir: 'local://direct_llm',
+        description: 'Direct LLM Client',
+        session_count: getDirectSessionList().length,
+        created_at: Date.now(),
+        last_updated: Date.now(),
+      },
+    ];
+  }
   const resp = await apiFetch('/projects', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`list projects failed: ${resp.status}`);
   const body: unknown = await resp.json();
@@ -1412,6 +1511,12 @@ export interface ProjectState {
 }
 
 export async function getProject(): Promise<ProjectState> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return {
+      working_dir: '',
+      project_hash: DIRECT_LLM_PROJECT_HASH,
+    };
+  }
   const resp = await apiFetch('/project', { headers: authHeaders() });
   return resp.json();
 }
@@ -1874,6 +1979,19 @@ export async function getSession(
   sessionId: string,
   opts?: { tail?: number; offset?: number; limit?: number; signal?: AbortSignal },
 ): Promise<SessionDetail> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    const detail = getDirectSessionDetail(sessionId);
+    if (detail) return detail;
+    return {
+      id: sessionId,
+      name: '随身问答',
+      working_dir: '',
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      message_count: 0,
+      messages: [],
+    };
+  }
   const q = new URLSearchParams();
   if (opts?.tail != null) q.set('tail', String(opts.tail));
   if (opts?.offset != null) q.set('offset', String(opts.offset));
@@ -2674,6 +2792,15 @@ export interface UpgradeDiffsResponse {
 }
 
 export async function checkUpdate(channel?: string): Promise<UpdateCheckResponse> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return {
+      has_update: false,
+      latest_version: '',
+      current_version: '',
+      is_desktop: false,
+      channel: (channel as any) || 'stable',
+    };
+  }
   const url = channel ? `/api/update/check?channel=${encodeURIComponent(channel)}` : '/api/update/check';
   const resp = await apiFetch(url, {
     headers: authHeaders(),
@@ -2686,6 +2813,9 @@ export async function checkUpdate(channel?: string): Promise<UpdateCheckResponse
 }
 
 export async function getUpdateStatus(): Promise<UpdateStatus> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    return { status: 'idle', progress: 0, bytes: 0, total: 0 };
+  }
   const resp = await apiFetch('/api/update/status', {
     headers: authHeaders(),
   });

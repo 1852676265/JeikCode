@@ -1601,6 +1601,7 @@ export function Chat({
   const [bubbleEditDraft, setBubbleEditDraft] = useState<BubbleEditDraft | null>(() => initialBubbleDraft);
   const isFirstMountRef = useRef(true);
   const nativeFileInputRef = useRef<HTMLInputElement>(null);
+  const nativeCameraInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
@@ -8416,6 +8417,42 @@ export function Chat({
               aria-hidden="true"
             >
               <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+          </button>
+          <input
+            ref={nativeCameraInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const input = e.target as HTMLInputElement;
+              if (input.files && input.files.length > 0) {
+                void addLocalFiles(input.files);
+              }
+              input.value = '';
+            }}
+          />
+          <button
+            type="button"
+            class="btn-native-upload"
+            onClick={() => nativeCameraInputRef.current?.click()}
+            title="拍照识物 / 随手拍照提问"
+            aria-label="拍照提问"
+          >
+            <svg
+              width="17"
+              height="17"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
+              <circle cx="12" cy="13" r="3" />
             </svg>
           </button>
         </div>

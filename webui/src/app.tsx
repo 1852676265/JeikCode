@@ -12,7 +12,7 @@ import { LiveReviewState, NotificationDock } from './components/NotificationDock
 import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { ServerSwitcherModal } from './components/ServerSwitcherModal';
-import { getActiveServerProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
+import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
 import { ConfirmModalHost } from './components/ConfirmDialog';
@@ -125,11 +125,13 @@ export function App() {
   const [liveRunningIds, setLiveRunningIds] = useState<Set<string>>(() => new Set());
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [serverSwitcherOpen, setServerSwitcherOpen] = useState(false);
-  const [activeServerName, setActiveServerName] = useState(() => getActiveServerProfile().name);
+  const [activeServer, setActiveServer] = useState(() => getActiveServerProfile());
+  const activeServerName = activeServer.name;
+  const isDirectMode = isDirectLlmProfile(activeServer);
 
   useEffect(() => {
     const onProfilesChange = () => {
-      setActiveServerName(getActiveServerProfile().name);
+      setActiveServer(getActiveServerProfile());
     };
     const onOpenSwitcher = () => setServerSwitcherOpen(true);
     window.addEventListener(PROFILES_CHANGE_EVENT, onProfilesChange);
@@ -1311,10 +1313,13 @@ export function App() {
               type="button"
               class="top-nav-server-switcher-btn"
               onClick={() => setServerSwitcherOpen(true)}
-              title="切换连接主机 (公司工位 / 家里台式机 / 云端)"
+              title="切换连接模式 (工位电脑 / 家里主机 / 随身大模型直连)"
             >
-              <span class="top-nav-server-switcher-dot" />
-              <span>{activeServerName || '主机切换'}</span>
+              <span
+                class="top-nav-server-switcher-dot"
+                style={isDirectMode ? { background: '#d29922', boxShadow: '0 0 6px rgba(210, 153, 34, 0.6)' } : undefined}
+              />
+              <span>{isDirectMode ? `⚡ ${activeServerName}` : (activeServerName || '主机切换')}</span>
             </button>
 
             {/* 桌面端外显：远程访问控制 */}
@@ -1489,7 +1494,7 @@ export function App() {
                       <line x1="8" y1="21" x2="16" y2="21" />
                       <line x1="12" y1="17" x2="12" y2="21" />
                     </svg>
-                    <span>切换主机 ({activeServerName || '当前'})</span>
+                    <span>切换节点 ({isDirectMode ? `⚡ ${activeServerName}` : (activeServerName || '当前')})</span>
                   </button>
 
                   <button
