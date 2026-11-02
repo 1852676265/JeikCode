@@ -1,6 +1,6 @@
 import type { SSEEvent, SessionDetail, SessionMessage, SessionMetaWithProject, ImageData } from '../api.ts';
 import type { ServerProfile } from './serverProfiles.ts';
-import { normalizeServerUrl, getActiveServerProfile } from './serverProfiles.ts';
+import { normalizeServerUrl, normalizeDirectApiBase, getActiveServerProfile } from './serverProfiles.ts';
 
 export const DIRECT_LLM_PROJECT_HASH = 'direct_llm';
 export const DIRECT_LLM_PROJECT_NAME = '⚡ 随身 AI 助理';
@@ -242,13 +242,15 @@ export async function runDirectWatch(
 
 
 /**
- * 解析并构建 OpenAI 兼容请求地址
+ * 解析并构建 OpenAI 兼容请求地址（对齐桌面端，域名自动补全 /v1）
  */
 export function resolveDirectChatUrl(baseUrl: string): string {
-  const norm = normalizeServerUrl(baseUrl);
-  if (!norm) return 'https://api.deepseek.com/v1/chat/completions';
+  const trimmed = (baseUrl || '').trim();
+  if (!trimmed) return 'https://api.deepseek.com/v1/chat/completions';
+  const norm = normalizeServerUrl(trimmed);
   if (norm.endsWith('/chat/completions')) return norm;
-  return `${norm}/chat/completions`;
+  const base = normalizeDirectApiBase(norm);
+  return `${base}/chat/completions`;
 }
 
 export interface StreamDirectPromptParams {

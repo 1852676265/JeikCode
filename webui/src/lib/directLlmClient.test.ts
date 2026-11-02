@@ -12,6 +12,7 @@ import {
 import type { ServerProfile } from './serverProfiles.ts';
 import {
   isDirectLlmProfile,
+  normalizeDirectApiBase,
   upsertServerProfile,
 } from './serverProfiles.ts';
 
@@ -24,7 +25,7 @@ const storage = new Map<string, string>();
   clear: () => storage.clear(),
 };
 
-test('resolveDirectChatUrl formats base URLs correctly', () => {
+test('resolveDirectChatUrl formats base URLs correctly and auto-appends /v1', () => {
   assert.equal(
     resolveDirectChatUrl('https://api.deepseek.com/v1'),
     'https://api.deepseek.com/v1/chat/completions',
@@ -33,10 +34,28 @@ test('resolveDirectChatUrl formats base URLs correctly', () => {
     resolveDirectChatUrl('https://api.openai.com/v1/chat/completions'),
     'https://api.openai.com/v1/chat/completions',
   );
+  // 纯域名自动补齐 /v1（对齐桌面端体验，如用户的 cpa.beauli.chat）
   assert.equal(
-    resolveDirectChatUrl('https://my-gateway.internal.net'),
-    'https://my-gateway.internal.net/chat/completions',
+    resolveDirectChatUrl('https://cpa.beauli.chat'),
+    'https://cpa.beauli.chat/v1/chat/completions',
   );
+  assert.equal(
+    resolveDirectChatUrl('https://cpa.beauli.chat/'),
+    'https://cpa.beauli.chat/v1/chat/completions',
+  );
+  // 已有自定义子路径保留原样
+  assert.equal(
+    resolveDirectChatUrl('https://dashscope.aliyuncs.com/compatible-mode/v1'),
+    'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+  );
+});
+
+test('normalizeDirectApiBase handles various url formats', () => {
+  assert.equal(normalizeDirectApiBase('https://cpa.beauli.chat'), 'https://cpa.beauli.chat/v1');
+  assert.equal(normalizeDirectApiBase('https://cpa.beauli.chat/'), 'https://cpa.beauli.chat/v1');
+  assert.equal(normalizeDirectApiBase('https://cpa.beauli.chat/v1'), 'https://cpa.beauli.chat/v1');
+  assert.equal(normalizeDirectApiBase('https://cpa.beauli.chat/v1/chat/completions'), 'https://cpa.beauli.chat/v1');
+  assert.equal(normalizeDirectApiBase('https://cpa.beauli.chat/v1/models'), 'https://cpa.beauli.chat/v1');
 });
 
 test('isDirectLlmProfile detects node modes properly', () => {

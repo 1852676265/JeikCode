@@ -266,11 +266,11 @@ export function ServerSwitcherModal({ open, onClose }: ServerSwitcherModalProps)
                     <label>API 基础地址 (Base URL)</label>
                     <input
                       type="text"
-                      placeholder="如：https://api.deepseek.com/v1"
+                      placeholder="如：https://api.deepseek.com（域名自动补全 /v1）"
                       value={formUrl}
                       onInput={(e) => setFormUrl((e.target as HTMLInputElement).value)}
                     />
-                    <span class="server-form-hint">支持 OpenAI、DeepSeek、硅基流动、Kimi 或企业中台 API。</span>
+                    <span class="server-form-hint">支持纯域名自动补全 /v1，对齐桌面端体验。兼容 OpenAI、DeepSeek、中转站等。</span>
                   </div>
                   <div class="server-profile-form-row">
                     <label>API Key (密钥)</label>

@@ -55,6 +55,31 @@ export function normalizeServerUrl(rawUrl: string): string {
 }
 
 /**
+ * 规范化大模型直连 API 基础地址（对齐桌面端与 CLI 体验）：
+ * 1. 自动去除尾部斜杠以及冗余的 /chat/completions、/models
+ * 2. 若用户仅输入了纯域名（如 https://cpa.beauli.chat 或 https://api.deepseek.com），自动补全 /v1
+ */
+export function normalizeDirectApiBase(rawUrl: string): string {
+  let norm = normalizeServerUrl(rawUrl);
+  if (!norm) return 'https://api.deepseek.com/v1';
+  // 去除尾部 /chat/completions 或 /models
+  norm = norm.replace(/\/(chat\/completions|models)\/?$/i, '');
+  norm = norm.replace(/\/+$/, '');
+
+  try {
+    const parsed = new URL(norm);
+    if (!parsed.pathname || parsed.pathname === '/') {
+      return `${parsed.origin}/v1`;
+    }
+  } catch {
+    if (!norm.includes('/')) {
+      return `${norm}/v1`;
+    }
+  }
+  return norm;
+}
+
+/**
  * 获取默认主机（当前网页宿主自身）
  */
 export function getDefaultProfile(): ServerProfile {
@@ -222,20 +247,74 @@ export async function pingServer(
 
   try {
     if (type === 'direct_llm') {
-      // 针对 OpenAI 兼容接口：先探测 /models 端点
-      const targetUrl = baseUrl ? `${baseUrl}/models` : '/models';
-      const headers: Record<string, string> = {};
-      if (token.trim()) {
-        headers.Authorization = `Bearer ${token.trim()}`;
+      const cleanBase = normalizeDirectApiBase(baseUrl);
+      if (!token.trim()) {
+        clearTimeout(timer);
+        return { ok: false, latencyMs: 0, error: '请先填写 API Key (密钥)' };
       }
 
-      const res = await fetch(targetUrl, {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token.trim()}`,
+      };
+
+      // 1. 先尝试标准的 GET /models 端点
+      const modelsUrl = `${cleanBase}/models`;
+      const res = await fetch(modelsUrl, {
         method: 'GET',
         headers,
         signal: controller.signal,
         mode: 'cors',
         credentials: 'omit',
       });
+
+      // 如果 /models 返回 404 或 405（如硅基流动、Kimi 等服务不开放 /models 端点），降级探测 /chat/completions
+      if (res.status === 404 || res.status === 405) {
+        const chatUrl = `${cleanBase}/chat/completions`;
+        const probeRes = await fetch(chatUrl, {
+          method: 'POST',
+          headers: {
+            ...headers,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: model?.trim() || 'test',
+            messages: [{ role: 'user', content: 'ping' }],
+            max_tokens: 1,
+          }),
+          signal: controller.signal,
+          mode: 'cors',
+          credentials: 'omit',
+        });
+
+        clearTimeout(timer);
+        const latencyMs = Date.now() - startTime;
+
+        if (probeRes.ok) {
+          return {
+            ok: true,
+            latencyMs,
+            service: 'OpenAI 兼容模型 API',
+            version: model ? `指定: ${model}` : '活跃',
+          };
+        }
+
+        if (probeRes.status === 401 || probeRes.status === 403) {
+          return { ok: false, latencyMs, error: 'API Key 认证失败 (401/403)' };
+        }
+
+        if (probeRes.status === 400) {
+          const errData = await probeRes.json().catch(() => ({}));
+          const errMsg = (errData as any)?.error?.message;
+          return {
+            ok: true,
+            latencyMs,
+            service: 'OpenAI 兼容模型 API',
+            version: errMsg ? `连通但提示: ${errMsg.slice(0, 30)}` : '连通成功',
+          };
+        }
+
+        return { ok: false, latencyMs, error: `HTTP ${probeRes.status}: ${probeRes.statusText}` };
+      }
 
       clearTimeout(timer);
       const latencyMs = Date.now() - startTime;
