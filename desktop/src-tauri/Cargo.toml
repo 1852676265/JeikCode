@@ -2,7 +2,7 @@
 
 [package]
 name = "jeikcode-desktop"
-version = "7.3.6"
+version = "1.0.0"
 edition = "2021"
 description = "JeikCode desktop shell"
 publish = false

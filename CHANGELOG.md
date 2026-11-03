@@ -21,6 +21,23 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.0 (2026-11-03)
+
+- **[Release & Architecture] Official v1.0.0 milestone release for PipiRunner**:
+  - Streamlined Git repository architecture by converging custom modifications into the main branch.
+  - Reset application milestone version baseline officially to v1.0.0 across all packages and configuration manifests.
+  - Fixed Windows desktop installer UTF-8 encoding behavior to ensure correct shortcut and directory naming.
+  - Synchronized WebUI brand titles, window metadata, and desktop vector assets cleanly under the PipiRunner identity.
+
+---
+
+- **[正式发布与架构精简] 皮皮跑腿 (PipiRunner) v1.0.0 里程碑正式发布**:
+  - 精简仓库架构体系，将定制功能完全合入主分支。
+  - 正式将全仓版本基线重置为 v1.0.0，包含全套核心模块、桌面端与 Web 依赖清单。
+  - 修复 Windows 安装包在构建时的 UTF-8 字符集支持，彻底解决桌面快捷方式与安装路径乱码问题。
+  - 全面统一 WebUI 侧栏、落地页、窗口标题与矢量图标，确立皮皮跑腿专属品牌体系。
+
+
 ## v7.3.6 (2026-11-03)
 
 - **[Branding & Desktop Shell] Complete application name, multi-scale icon assets, and updater priority fix**:
