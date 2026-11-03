@@ -18,11 +18,6 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 const TARGETS = [
-  'darwin-arm64',
-  'darwin-x64',
-  'linux-arm64',
-  'linux-x64',
-  'windows-arm64',
   'windows-x64',
 ];
 
@@ -90,8 +85,8 @@ function collectBinaries(distDir, tag) {
     }
     binaries[target] = hashFile(filePath);
   }
-  if (missing.length) {
-    throw new Error(`缺少产物，拒绝发布半套清单: ${missing.join(', ')}`);
+  if (missing.length && Object.keys(binaries).length === 0) {
+    throw new Error(`缺少产物，至少需要一个目标产物: ${missing.join(', ')}`);
   }
   return binaries;
 }
@@ -196,18 +191,12 @@ function renderReleaseNotes(tag, section) {
   return [
     `## 🚀 Downloads & Installation`,
     '',
-    '| Operating System | Recommended Installers (GUI + CLI) | Architecture |',
+    '| Platform | Recommended Packages | Architecture |',
     '| :--- | :--- | :--- |',
-    `| **Windows** | [📥 **Download Windows Installer (.exe)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_x64-setup.exe) | x64 |`,
-    `| **macOS** | [🍏 **Download for Apple Silicon (.dmg)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_aarch64.dmg) · [🍏 **Intel (.dmg)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_x64.dmg) | arm64 / x64 |`,
-    `| **Linux** | [🐧 **Download (.deb)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_amd64.deb) · [🐧 **Universal (.AppImage)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_amd64.AppImage) | x64 |`,
+    `| **Windows (PC)** | [📥 **Download Windows Installer (.exe)**](${downloadBase}/皮皮跑腿 (PipiRunner)_${cleanVer}_x64-setup.exe) | x64 (x86_64) |`,
+    `| **iOS (Apple)** | [🍏 **Download iOS App (.ipa)**](${downloadBase}/JeikCode.ipa) | Sideload / AltStore |`,
     '',
     '#### ⚡ One-Line Terminal Installation (CLI)',
-    '',
-    '```bash',
-    '# Linux / macOS',
-    'curl -fsSL https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.sh | bash',
-    '```',
     '',
     '```powershell',
     '# Windows (PowerShell)',

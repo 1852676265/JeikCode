@@ -12,10 +12,12 @@ on:
       - 'webui/**'
       - '.github/workflows/build-ios.yml'
     branches:
-      - custom
       - main
     tags:
       - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   build-ipa:
@@ -69,3 +71,13 @@ jobs:
           name: JeikCode-iOS-IPA
           path: webui/ios/App/JeikCode.ipa
           retention-days: 14
+
+      - name: Upload IPA to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: webui/ios/App/JeikCode.ipa
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
