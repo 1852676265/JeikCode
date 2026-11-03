@@ -1,6 +1,6 @@
 # JeikCode installer for Windows — PowerShell
 #
-#   irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.ps1 | iex
 #
 # Env overrides:
 #   $env:JEIKCODE_VERSION    release tag (default: latest release asset latest.json)
@@ -10,7 +10,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$RepoBase   = if ($env:JEIKCODE_DOWNLOAD_BASE) { $env:JEIKCODE_DOWNLOAD_BASE.TrimEnd('/') } else { "https://github.com/jeikl/JeikCode/releases/download" }
+$RepoBase   = if ($env:JEIKCODE_DOWNLOAD_BASE) { $env:JEIKCODE_DOWNLOAD_BASE.TrimEnd('/') } else { "https://github.com/1852676265/JeikCode/releases/download" }
 function Normalize-ReleaseTag([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
     $Value = $Value.Trim()
@@ -23,9 +23,9 @@ $ManifestUrl = if ($env:JEIKCODE_MANIFEST_URL) {
     $custom = $env:JEIKCODE_MANIFEST_URL.TrimEnd('/')
     if ($custom.EndsWith('.json')) { $custom } else { "$custom/latest.json" }
 } elseif ($RequestedTag) {
-    "https://github.com/jeikl/JeikCode/releases/download/$RequestedTag/latest.json"
+    "https://github.com/1852676265/JeikCode/releases/download/$RequestedTag/latest.json"
 } else {
-    "https://github.com/jeikl/JeikCode/releases/latest/download/latest.json"
+    "https://github.com/1852676265/JeikCode/releases/latest/download/latest.json"
 }
 
 # --- detect platform ---

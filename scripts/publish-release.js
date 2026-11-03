@@ -191,7 +191,7 @@ function upsertChangelog(existing, section, tag) {
 function renderReleaseNotes(tag, section) {
   const body = section.replace(/^## .+\n+/, '').trimEnd();
   const cleanVer = tag.replace(/^v/, '');
-  const downloadBase = `https://github.com/jeikl/JeikCode/releases/download/${tag}`;
+  const downloadBase = `https://github.com/1852676265/JeikCode/releases/download/${tag}`;
 
   return [
     `## 🚀 Downloads & Installation`,
@@ -206,12 +206,12 @@ function renderReleaseNotes(tag, section) {
     '',
     '```bash',
     '# Linux / macOS',
-    'curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | bash',
+    'curl -fsSL https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.sh | bash',
     '```',
     '',
     '```powershell',
     '# Windows (PowerShell)',
-    'irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | iex',
+    'irm https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.ps1 | iex',
     '```',
     '',
     '---',

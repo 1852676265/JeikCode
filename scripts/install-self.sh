@@ -18,9 +18,9 @@ esac
 TMP_INSTALLER=$(mktemp)
 trap 'rm -f "$TMP_INSTALLER"' EXIT
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh -o "$TMP_INSTALLER"
+    curl -fsSL https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.sh -o "$TMP_INSTALLER"
 elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMP_INSTALLER" https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh
+    wget -qO "$TMP_INSTALLER" https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.sh
 else
     echo "Error: need curl or wget to load the official JeikCode installer." >&2
     exit 1

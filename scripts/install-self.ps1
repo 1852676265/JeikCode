@@ -14,7 +14,7 @@ if ($InvocationPath) {
 
 $TempInstaller = Join-Path ([System.IO.Path]::GetTempPath()) ("jeikcode-install-" + [guid]::NewGuid().ToString("N") + ".ps1")
 try {
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1" -OutFile $TempInstaller -UseBasicParsing -TimeoutSec 15
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.ps1" -OutFile $TempInstaller -UseBasicParsing -TimeoutSec 15
     & $TempInstaller
     exit $LASTEXITCODE
 } finally {

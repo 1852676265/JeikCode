@@ -1,7 +1,7 @@
 #!/bin/sh
 # JeikCode installer — curl | sh
 #
-#   curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.sh | sh
 #
 # Env overrides:
 #   JEIKCODE_VERSION   release tag to install (default: latest release asset latest.json)
@@ -14,7 +14,7 @@
 # crates/jeikcode-cli/src/uninstall/paths.rs.
 set -eu
 
-REPO_BASE="${JEIKCODE_DOWNLOAD_BASE:-https://github.com/jeikl/JeikCode/releases/download}"
+REPO_BASE="${JEIKCODE_DOWNLOAD_BASE:-https://github.com/1852676265/JeikCode/releases/download}"
 REQUESTED_TAG=""
 if [ -n "${JEIKCODE_VERSION:-}" ]; then
     case "$JEIKCODE_VERSION" in
@@ -29,9 +29,9 @@ if [ -n "${JEIKCODE_MANIFEST_URL:-}" ]; then
         *) MANIFEST_URL="${MANIFEST_URL%/}/latest.json" ;;
     esac
 elif [ -n "$REQUESTED_TAG" ]; then
-    MANIFEST_URL="https://github.com/jeikl/JeikCode/releases/download/${REQUESTED_TAG}/latest.json"
+    MANIFEST_URL="https://github.com/1852676265/JeikCode/releases/download/${REQUESTED_TAG}/latest.json"
 else
-    MANIFEST_URL="https://github.com/jeikl/JeikCode/releases/latest/download/latest.json"
+    MANIFEST_URL="https://github.com/1852676265/JeikCode/releases/latest/download/latest.json"
 fi
 
 # --- detect platform ---
@@ -242,7 +242,7 @@ if [ "$os" = "windows" ]; then
     echo ""
     echo "Note: installed for this Unix shell (MSYS/MinGW/Git-Bash/Cygwin)."
     echo "      For a system-wide Windows install (cmd / PowerShell PATH), use instead:"
-    echo "      powershell -c \"irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | iex\""
+    echo "      powershell -c \"irm https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.ps1 | iex\""
 fi
 
 if [ "${JEIKCODE_NO_PATH_UPDATE:-0}" != "1" ]; then
