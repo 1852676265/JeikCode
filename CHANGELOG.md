@@ -21,6 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.4 (2026-11-03)
+
+- **[UI & Interaction] In-app software update enhancements and version badge interactions**:
+  - Replaced bottom-left external GitHub links with a quick software update action button in both expanded and collapsed sidebars.
+  - Upgraded the top navigation update button to a standardized update icon with status labeling.
+  - Transformed the top-left version indicator badge (e.g. `v7.3.4`) into an interactive clickable capsule to immediately check and open the update dialog.
+- **[WebUI & Proxy Stability] Decoupled project-independent sessions and enhanced local proxy handling**:
+  - Decoupled project-independent chat sessions and added user home directory filtering to prevent home paths from appearing as projects.
+  - Enhanced Vite development proxy error interception with clear 502 diagnostics when the local backend daemon is unreachable.
+  - Dynamically resolved update repository names in updater test suites to ensure clean CI release gate passage.
+
+---
+
+- **[界面与交互优化] 软件版本交互强化与全方位更新快捷入口**:
+  - 移除侧边栏底部 GitHub 外部链接，升级为直观便捷的软件更新快捷动作按钮。
+  - 顶部导航栏更新按钮升级为标准更新图标并增加状态文字标签，清晰呈现版本更新动态。
+  - 左上角版本号（如 `v7.3.4`）升级为可点击胶囊组件，点击可直接检查更新并呼出更新对话框。
+- **[WebUI 与代理稳定性] 无项目独立会话解耦与本地代理异常防护**:
+  - 增强无工程绑定模式下的独立会话支持，精准过滤系统用户主目录，避免伪工程污染。
+  - 完善 Vite 开发代理错误捕获机制，在本地守护进程未就绪时返回结构化 502 提示。
+  - 升级升级器单元测试中的仓库匹配逻辑，保证跨仓库与分支的发布门禁稳定通过。
+
 ## v7.3.3 (2026-11-03)
 
 - **[Updater & Release Distribution] Smart multi-source auto-updater and seamless one-click in-app upgrade**:
