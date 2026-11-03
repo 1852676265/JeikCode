@@ -52,7 +52,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const [updating, setUpdating] = useState(false);
   const [status, setStatus] = useState<UpdateStatus | null>(null);
 
-  const isDesktop = false;
+  const isDesktop = info?.is_desktop ?? false;
   const isMounted = useRef(true);
   const reloadStarted = useRef(false);
   const sawInstallProgress = useRef(false);

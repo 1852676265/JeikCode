@@ -258,7 +258,11 @@ fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option
     #[cfg(target_os = "windows")]
     let predicate = |name: &str| -> bool {
         let lower = name.to_lowercase();
-        lower.ends_with(".exe") && (lower.contains("setup") || lower.contains("desktop"))
+        lower.ends_with(".exe")
+            && (lower.contains("setup")
+                || lower.contains("desktop")
+                || lower.contains("pipirunner")
+                || lower.contains("皮皮跑腿"))
     };
     #[cfg(target_os = "macos")]
     let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
@@ -348,7 +352,10 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
                     let predicate = |name: &str| -> bool {
                         let lower = name.to_lowercase();
                         lower.ends_with(".exe")
-                            && (lower.contains("setup") || lower.contains("desktop"))
+                            && (lower.contains("setup")
+                                || lower.contains("desktop")
+                                || lower.contains("pipirunner")
+                                || lower.contains("皮皮跑腿"))
                     };
                     #[cfg(target_os = "macos")]
                     let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
@@ -572,6 +579,7 @@ pub async fn execute_update(
     let req = payload.map(|Json(p)| p).unwrap_or_default();
     let listen_port = state.bind_port;
     let restart_token = state.webui_tokens.display();
+    let is_desktop = is_desktop_environment();
 
     tokio::spawn(async move {
         set_update_status(UpdateStatus {
@@ -582,27 +590,39 @@ pub async fn execute_update(
             error: None,
         });
 
-        // WebUI is embedded in this binary. Remote browsers and the desktop
-        // shell all hit this process — never open a host-side installer wizard.
-        // Swap the running jeikcode in place, then restart so the new UI is served.
-        if let Err(e) = run_cli_update(
-            req.version,
-            req.channel,
-            req.download_url,
-            req.force.unwrap_or(false),
-            listen_port,
-            restart_token,
-        )
-        .await
-        {
-            set_update_status(UpdateStatus {
-                status: "error".to_string(),
-                progress: 0,
-                bytes: 0,
-                total: 0,
-                error: Some(format!("更新二进制失败: {e}")),
-            });
-            IS_UPDATING.store(false, Ordering::SeqCst);
+        if is_desktop {
+            // 桌面端环境：直接下载全量安装包并自动拉起安装向导完成升级安装
+            if let Err(e) = run_desktop_update(req.download_url, req.version).await {
+                set_update_status(UpdateStatus {
+                    status: "error".to_string(),
+                    progress: 0,
+                    bytes: 0,
+                    total: 0,
+                    error: Some(format!("下载或安装更新失败: {e}")),
+                });
+                IS_UPDATING.store(false, Ordering::SeqCst);
+            }
+        } else {
+            // CLI / 无头环境：就地升级后台二进制并重启
+            if let Err(e) = run_cli_update(
+                req.version,
+                req.channel,
+                req.download_url,
+                req.force.unwrap_or(false),
+                listen_port,
+                restart_token,
+            )
+            .await
+            {
+                set_update_status(UpdateStatus {
+                    status: "error".to_string(),
+                    progress: 0,
+                    bytes: 0,
+                    total: 0,
+                    error: Some(format!("更新二进制失败: {e}")),
+                });
+                IS_UPDATING.store(false, Ordering::SeqCst);
+            }
         }
     });
 
@@ -612,7 +632,6 @@ pub async fn execute_update(
     }))
 }
 
-#[allow(dead_code)]
 async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<String>) -> Result<()> {
     let manifest_opt = if direct_url.is_none() {
         jeikcode_updater::fetch_manifest().await.ok()
@@ -622,6 +641,10 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
 
     let download_url = if let Some(u) = direct_url {
         u
+    } else if let Some(ref ver) = version_opt {
+        resolve_desktop_installer_url(ver)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("未找到版本 {ver} 匹配当前系统的桌面安装包"))?
     } else if let Some(ref m) = manifest_opt {
         resolve_desktop_installer_url(&m.version)
             .await
@@ -698,7 +721,6 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
     set_update_status(UpdateStatus {
         status: "installing".to_string(),
@@ -710,16 +732,24 @@ async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // 1. 启动下载好的 setup.exe 安装包
-        let _ = std::process::Command::new(&installer_path).spawn();
+        // 1. 通过 cmd /c start "" 拉起下载好的安装包，触发 Windows UAC 提权并正常显示安装向导
+        let status = std::process::Command::new("cmd")
+            .args(&["/c", "start", "", &installer_path.to_string_lossy()])
+            .status();
+        if status.is_err() {
+            let _ = std::process::Command::new(&installer_path).spawn();
+        }
 
-        // 2. 终止桌面端前端进程 JeikCode Desktop.exe，防止覆盖安装时被文件锁定
+        // 2. 终止桌面端前端进程，防止覆盖安装时被文件锁定
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "皮皮跑腿 (PipiRunner).exe"])
+            .spawn();
         let _ = std::process::Command::new("taskkill")
             .args(&["/F", "/IM", "JeikCode Desktop.exe"])
             .spawn();
 
-        // 3. 延时片刻退出当前后台子进程
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // 3. 延时片刻退出当前后台子进程，交由安装程序接管
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         std::process::exit(0);
     }
 
