@@ -5975,6 +5975,8 @@ body {
   font-size: 16px;
   letter-spacing: -0.01em;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--app-brand-text);
 }
 .sidebar-brand-version {
@@ -5991,6 +5993,7 @@ body {
 .sidebar-brand-version-btn {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 4px;
   font-size: 11px;
   font-weight: 500;
