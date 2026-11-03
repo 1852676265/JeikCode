@@ -183,7 +183,10 @@ pub fn is_desktop_environment() -> bool {
     std::env::var("JEIKCODE_DESKTOP").is_ok()
 }
 
-const GITHUB_LATEST_API_URL: &str = "https://api.github.com/repos/jeikl/JeikCode/releases/latest";
+fn github_latest_api_url() -> String {
+    let repo = jeikcode_config::endpoints::update_repo();
+    format!("https://api.github.com/repos/{repo}/releases/latest")
+}
 
 #[derive(Debug, Deserialize, Clone)]
 struct GitHubRelease {
@@ -468,12 +471,15 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                 download_url = Some(jeikcode_updater::binary_url(&latest_version, target));
             }
         } else if let Some(ref c) = client {
-            if let Ok(resp) = c.get(GITHUB_LATEST_API_URL).send().await {
+            let latest_api = github_latest_api_url();
+            let mut got_rel = false;
+            if let Ok(resp) = c.get(&latest_api).send().await {
                 if resp.status().is_success() {
                     if let Ok(rel) = resp.json::<GitHubRelease>().await {
                         latest_version = rel.tag_name.clone();
                         release_notes = rel.body;
                         released_at = rel.published_at;
+                        got_rel = true;
                         if is_desktop {
                             download_url = find_desktop_installer_url_in_assets(&rel.assets)
                                 .or_else(|| {
@@ -486,6 +492,30 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                                         jeikcode_updater::binary_url(&latest_version, target)
                                     })
                                 });
+                        }
+                    }
+                }
+            }
+            if !got_rel && jeikcode_config::endpoints::update_repo() != "jeikl/JeikCode" {
+                if let Ok(resp) = c.get("https://api.github.com/repos/jeikl/JeikCode/releases/latest").send().await {
+                    if resp.status().is_success() {
+                        if let Ok(rel) = resp.json::<GitHubRelease>().await {
+                            latest_version = rel.tag_name.clone();
+                            release_notes = rel.body;
+                            released_at = rel.published_at;
+                            if is_desktop {
+                                download_url = find_desktop_installer_url_in_assets(&rel.assets)
+                                    .or_else(|| {
+                                        resolve_desktop_installer_url_fallback(&latest_version)
+                                    });
+                            } else {
+                                download_url = find_cli_asset_url(&rel.assets, &latest_version)
+                                    .or_else(|| {
+                                        jeikcode_updater::detect_target().map(|target| {
+                                            jeikcode_updater::binary_url(&latest_version, target)
+                                        })
+                                    });
+                            }
                         }
                     }
                 }
@@ -737,8 +767,8 @@ async fn run_cli_update(
         } else {
             format!("v{ver}")
         };
-        let manifest_url =
-            format!("https://github.com/jeikl/JeikCode/releases/download/{tag}/latest.json");
+        let download_base = jeikcode_updater::download_base().trim_end_matches('/');
+        let manifest_url = format!("{download_base}/{tag}/latest.json");
         match jeikcode_updater::fetch_manifest_from_url(&manifest_url).await {
             Ok(manifest) => tokio::spawn(jeikcode_updater::run_upgrade_with_manifest(
                 manifest,

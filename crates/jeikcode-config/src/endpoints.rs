@@ -37,6 +37,9 @@ pub const CODINGPLAN_LLM_BASE_URL_ENV: &str = "JEIKCODE_CODINGPLAN_LLM_BASE_URL"
 pub const UPDATE_MANIFEST_URL_ENV: &str = "JEIKCODE_UPDATE_MANIFEST_URL";
 pub const UPDATE_DOWNLOAD_BASE_ENV: &str = "JEIKCODE_UPDATE_DOWNLOAD_BASE";
 pub const DESKTOP_DOWNLOAD_URL_ENV: &str = "JEIKCODE_DESKTOP_DOWNLOAD_URL";
+pub const UPDATE_REPO_ENV: &str = "JEIKCODE_UPDATE_REPO";
+pub const DEFAULT_UPDATE_REPO: &str = "1852676265/JeikCode";
+pub const UPSTREAM_UPDATE_REPO: &str = "jeikl/JeikCode";
 pub const RELAY_URL_ENV: &str = "JEIKCODE_APP_RELAY";
 
 /// Marketplace git URLs, comma-separated. Replaces the default list; an
@@ -185,22 +188,45 @@ pub fn codingplan_llm_base_url() -> &'static str {
     URL.get_or_init(|| resolve(CODINGPLAN_LLM_BASE_URL_ENV, HOSTED_CODINGPLAN_LLM_BASE_URL))
 }
 
+/// GitHub repository (`owner/repo`) for updates and release assets.
+pub fn update_repo() -> &'static str {
+    static REPO: OnceLock<String> = OnceLock::new();
+    REPO.get_or_init(|| {
+        if let Some(env) = env_var_dual(UPDATE_REPO_ENV) {
+            return env.trim().to_string();
+        }
+        DEFAULT_UPDATE_REPO.to_string()
+    })
+}
+
 /// Version manifest (`latest.json`) for self-update.
 pub fn update_manifest_url() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| resolve(UPDATE_MANIFEST_URL_ENV, HOSTED_UPDATE_MANIFEST_URL))
+    URL.get_or_init(|| {
+        let repo = update_repo();
+        let fallback = format!("https://github.com/{repo}/releases/latest/download/latest.json");
+        resolve(UPDATE_MANIFEST_URL_ENV, &fallback)
+    })
 }
 
 /// Base for release binary downloads; the updater appends `/<version>/<asset>`.
 pub fn update_download_base() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| resolve(UPDATE_DOWNLOAD_BASE_ENV, HOSTED_UPDATE_DOWNLOAD_BASE))
+    URL.get_or_init(|| {
+        let repo = update_repo();
+        let fallback = format!("https://github.com/{repo}/releases/download");
+        resolve(UPDATE_DOWNLOAD_BASE_ENV, &fallback)
+    })
 }
 
 /// Landing page the `/desktop` command points users at.
 pub fn desktop_download_url() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| resolve(DESKTOP_DOWNLOAD_URL_ENV, HOSTED_DESKTOP_DOWNLOAD_URL))
+    URL.get_or_init(|| {
+        let repo = update_repo();
+        let fallback = format!("https://github.com/{repo}/releases");
+        resolve(DESKTOP_DOWNLOAD_URL_ENV, &fallback)
+    })
 }
 
 /// Relay base URL. Only meaningful when [`relay_enabled`] is true.

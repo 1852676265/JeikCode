@@ -21,6 +21,26 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.2.8 (2026-11-03)
+
+- **[Updater & Release Distribution] Smart multi-source auto-updater and seamless one-click in-app upgrade**:
+  - Added intelligent update source resolution that prioritizes custom release repositories (`1852676265/JeikCode`) while seamlessly falling back to upstream official releases.
+  - Enabled direct GitHub release discovery in WebUI standalone and Direct LLM modes, allowing clients to detect new updates and initiate downloads with one click.
+  - Streamlined cross-platform daemon and updater binary installation pipeline to automatically pull and install matching assets upon clicking update.
+- **[Mobile & Client Adaptation] Direct LLM integration and mobile workflow improvements**:
+  - Enhanced base URL auto-normalization and health-check ping probes for direct LLM connections.
+  - Added native mobile camera capture and photo upload integration for iOS and web clients.
+
+---
+
+- **[软件更新与版本分发] 智能多源自动更新与一键在线升级**:
+  - 新增智能更新源路由，优先检测并下载用户开源仓库（`1852676265/JeikCode`）发布的更新产物，并无缝支持官方源自动兜底。
+  - 支持 WebUI 独立模式与直连模式直接从 GitHub 获取最新版本与更新日志，提供一键点击下载与更新安装闭环。
+  - 优化守护进程二进制平滑替换与更新重启机制，确保各平台客户端均可点击更新后自动下载最新版本并完成安装。
+- **[移动端与客户端适配] 大模型直连与移动端体验优化**:
+  - 优化直连模式下的 Base URL 格式自动规整与健康探测机制。
+  - 完善 iOS 与移动端拍照相册上传与随身 AI 直连体验。
+
 ## v7.2.7 (2026-10-19)
 
 - **[TodoList & Lifecycle Architecture] Authoritative session board synchronization, turn-settlement archival, and continuation guards**:

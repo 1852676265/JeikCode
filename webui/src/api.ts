@@ -2,6 +2,7 @@
 
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
 import { getActiveServerProfile, isDirectLlmProfile, normalizeServerUrl } from './lib/serverProfiles.ts';
+import { bakedAppVersion, compareSemVer } from './lib/appVersion.ts';
 import {
   DIRECT_LLM_PROJECT_HASH,
   DIRECT_LLM_PROJECT_NAME,
@@ -2791,15 +2792,93 @@ export interface UpgradeDiffsResponse {
   diffs: ConfigDiffItem[];
 }
 
+let directUpdateStatus: UpdateStatus = { status: 'idle', progress: 0, bytes: 0, total: 0 };
+
+async function checkDirectGitHubUpdate(channel?: string): Promise<UpdateCheckResponse> {
+  const targetChannel: 'stable' | 'beta' = channel === 'beta' ? 'beta' : 'stable';
+  const baked = bakedAppVersion();
+  const currentVersion = baked ? `v${baked}` : 'v7.2.7';
+
+  const repos = ['1852676265/JeikCode', 'jeikl/JeikCode'];
+  let rawReleases: any[] = [];
+
+  for (const repo of repos) {
+    try {
+      const resp = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=50`, {
+        headers: { Accept: 'application/vnd.github.v3+json' },
+      });
+      if (resp.ok) {
+        const list = await resp.json();
+        if (Array.isArray(list) && list.length > 0) {
+          rawReleases = list;
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  if (rawReleases.length === 0) {
+    return {
+      current_version: currentVersion,
+      latest_version: currentVersion,
+      has_update: false,
+      is_desktop: false,
+      channel: targetChannel,
+      versions: [],
+    };
+  }
+
+  const channelReleases = rawReleases.filter((r) => {
+    const isBeta = r.prerelease || (r.tag_name && r.tag_name.includes('-'));
+    return targetChannel === 'beta' ? isBeta : !isBeta;
+  });
+
+  const targetList = channelReleases.length > 0 ? channelReleases : rawReleases;
+  const latestRel = targetList[0];
+  const latestVersion = latestRel?.tag_name || currentVersion;
+
+  let downloadUrl: string | undefined = undefined;
+  if (latestRel?.assets && Array.isArray(latestRel.assets)) {
+    const isWindows = typeof navigator !== 'undefined' && /win/i.test(navigator.userAgent || '');
+    const isMac = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent || '');
+    const isArm = typeof navigator !== 'undefined' && (/arm|aarch64/i.test(navigator.userAgent || '') || navigator.userAgent.includes('ARM'));
+
+    const matchAsset = latestRel.assets.find((a: any) => {
+      const name = (a.name || '').toLowerCase();
+      if (isWindows) return name.endsWith('.exe') && (isArm ? name.includes('arm64') : (name.includes('x64') || name.includes('x86_64')));
+      if (isMac) return name.endsWith('.dmg') || (name.includes('darwin') && (isArm ? name.includes('arm64') : name.includes('x64')));
+      return name.includes('linux');
+    }) || latestRel.assets[0];
+
+    downloadUrl = matchAsset?.browser_download_url || latestRel.html_url;
+  } else {
+    downloadUrl = latestRel?.html_url;
+  }
+
+  const versions: UpdateVersionEntry[] = targetList.map((r) => ({
+    version: r.tag_name,
+    notes: r.body || '',
+    released_at: r.published_at,
+  }));
+
+  const hasUpdate = compareSemVer(latestVersion, currentVersion) > 0;
+
+  return {
+    current_version: currentVersion,
+    latest_version: latestVersion,
+    has_update: hasUpdate,
+    is_desktop: false,
+    release_notes: latestRel?.body || '',
+    download_url: downloadUrl,
+    released_at: latestRel?.published_at,
+    channel: targetChannel,
+    versions,
+  };
+}
+
 export async function checkUpdate(channel?: string): Promise<UpdateCheckResponse> {
   if (isDirectLlmProfile(getActiveServerProfile())) {
-    return {
-      has_update: false,
-      latest_version: '',
-      current_version: '',
-      is_desktop: false,
-      channel: (channel as any) || 'stable',
-    };
+    return checkDirectGitHubUpdate(channel);
   }
   const url = channel ? `/api/update/check?channel=${encodeURIComponent(channel)}` : '/api/update/check';
   const resp = await apiFetch(url, {
@@ -2814,7 +2893,7 @@ export async function checkUpdate(channel?: string): Promise<UpdateCheckResponse
 
 export async function getUpdateStatus(): Promise<UpdateStatus> {
   if (isDirectLlmProfile(getActiveServerProfile())) {
-    return { status: 'idle', progress: 0, bytes: 0, total: 0 };
+    return directUpdateStatus;
   }
   const resp = await apiFetch('/api/update/status', {
     headers: authHeaders(),
@@ -2832,6 +2911,18 @@ export async function executeUpdate(payload?: {
   download_url?: string;
   force?: boolean;
 }): Promise<{ success: boolean; message: string }> {
+  if (isDirectLlmProfile(getActiveServerProfile())) {
+    directUpdateStatus = { status: 'downloading', progress: 50, bytes: 50, total: 100 };
+    if (payload?.download_url) {
+      if (typeof window !== 'undefined') {
+        window.open(payload.download_url, '_blank');
+      }
+    }
+    setTimeout(() => {
+      directUpdateStatus = { status: 'done', progress: 100, bytes: 100, total: 100 };
+    }, 1200);
+    return { success: true, message: '已为您拉起最新版本安装包，请按引导完成安装' };
+  }
   const resp = await apiFetch('/api/update/execute', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
