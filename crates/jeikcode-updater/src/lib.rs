@@ -416,18 +416,7 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
 /// fast at startup); here the user explicitly asked for an upgrade, so
 /// waiting 30s for a slow mirror is acceptable.
 pub async fn fetch_manifest() -> Result<Manifest> {
-    match fetch_manifest_from_url(manifest_url()).await {
-        Ok(m) => Ok(m),
-        Err(e) => {
-            let upstream_url = "https://github.com/jeikl/JeikCode/releases/latest/download/latest.json";
-            if manifest_url() != upstream_url {
-                if let Ok(m) = fetch_manifest_from_url(upstream_url).await {
-                    return Ok(m);
-                }
-            }
-            Err(e)
-        }
-    }
+    fetch_manifest_from_url(manifest_url()).await
 }
 
 /// Release channel for in-place upgrades. `Stable` is GitHub `releases/latest`
@@ -652,12 +641,6 @@ pub async fn list_releases() -> Result<Vec<ListedRelease>> {
             let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
             if let Ok(pages) = fetch_release_pages(&client, &gh).await {
                 merge_listed_releases(&mut all, pages);
-            }
-            if all.is_empty() && repo != "jeikl/JeikCode" {
-                let upstream_gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100";
-                if let Ok(pages) = fetch_release_pages(&client, upstream_gh).await {
-                    merge_listed_releases(&mut all, pages);
-                }
             }
         }
     }
