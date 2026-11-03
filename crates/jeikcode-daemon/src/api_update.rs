@@ -506,6 +506,7 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                 }
             }
             if !got_rel {
+                let repo = jeikcode_config::endpoints::update_repo();
                 let latest_endpoint = format!("https://api.github.com/repos/{repo}/releases/latest");
                 if let Ok(resp) = c.get(&latest_endpoint).send().await {
                     if resp.status().is_success() {
