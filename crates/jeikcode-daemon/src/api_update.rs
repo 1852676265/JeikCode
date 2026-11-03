@@ -297,23 +297,24 @@ fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
         format!("v{version}")
     };
     let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
+    let repo = jeikcode_config::endpoints::update_repo();
 
     #[cfg(target_os = "windows")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
+            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
         ))
     }
     #[cfg(target_os = "macos")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
+            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
         ))
     }
     #[cfg(target_os = "linux")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
+            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
         ))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -332,7 +333,8 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
 
     // 优先尝试通过 GitHub API 查找 release assets 列表中的安装包
-    let api_url = format!("https://api.github.com/repos/jeikl/JeikCode/releases/tags/{tag}");
+    let repo = jeikcode_config::endpoints::update_repo();
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
     let client = reqwest::Client::builder()
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -381,19 +383,19 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
+            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
         ))
     }
     #[cfg(target_os = "macos")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
+            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
         ))
     }
     #[cfg(target_os = "linux")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
+            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
         ))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -496,8 +498,9 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                     }
                 }
             }
-            if !got_rel && jeikcode_config::endpoints::update_repo() != "jeikl/JeikCode" {
-                if let Ok(resp) = c.get("https://api.github.com/repos/jeikl/JeikCode/releases/latest").send().await {
+            if !got_rel {
+                let latest_endpoint = format!("https://api.github.com/repos/{repo}/releases/latest");
+                if let Ok(resp) = c.get(&latest_endpoint).send().await {
                     if resp.status().is_success() {
                         if let Ok(rel) = resp.json::<GitHubRelease>().await {
                             latest_version = rel.tag_name.clone();

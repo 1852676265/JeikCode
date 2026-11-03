@@ -42,7 +42,7 @@ codegen-units = 16
 version = "1.0.0"
 edition = "2021"
 license = "CC-BY-NC-4.0"
-repository = "https://github.com/jeikl/JeikCode"
+repository = "https://github.com/1852676265/JeikCode"
 description = "Open-source terminal AI coding agent"
 
 [workspace.dependencies]

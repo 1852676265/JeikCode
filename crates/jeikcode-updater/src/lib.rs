@@ -629,6 +629,10 @@ pub async fn list_releases() -> Result<Vec<ListedRelease>> {
         if let Ok(pages) = fetch_release_pages(&client, &gh).await {
             merge_listed_releases(&mut all, pages);
         }
+        if all.is_empty() {
+            return Err(anyhow!("no releases found for custom repository {repo}"));
+        }
+        return Ok(all);
     }
 
     if all.is_empty() {

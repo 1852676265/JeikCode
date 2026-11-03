@@ -2799,7 +2799,7 @@ async function checkDirectGitHubUpdate(channel?: string): Promise<UpdateCheckRes
   const baked = bakedAppVersion();
   const currentVersion = baked ? `v${baked}` : 'v7.2.7';
 
-  const repos = ['1852676265/JeikCode', 'jeikl/JeikCode'];
+  const repos = ['1852676265/JeikCode'];
   let rawReleases: any[] = [];
 
   for (const repo of repos) {
