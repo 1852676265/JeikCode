@@ -164,6 +164,14 @@ async function run() {
   console.log(`   Current highest baseline version: ${highestBaseline}`);
   console.log(`   Target release version:          ${tag}`);
 
+  // 当重置版本至全新 1.0.0 基线时，若基线是历史遗留版本 (>= 6.0.0)，则允许放行
+  const targetParsed = parseSemVer(tag);
+  const baselineParsed = parseSemVer(highestBaseline);
+  if (targetParsed.parts[0] === 1 && baselineParsed.parts[0] >= 6) {
+    console.log(`✅ Release version gate passed: reset baseline to ${tag} from legacy ${highestBaseline}\n`);
+    process.exit(0);
+  }
+
   const cmp = compareSemVer(tag, highestBaseline);
   if (cmp <= 0) {
     console.error('\n================================================================================');
