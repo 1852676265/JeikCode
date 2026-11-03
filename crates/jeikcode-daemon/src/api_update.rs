@@ -307,7 +307,7 @@ fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"
         ))
     }
     #[cfg(target_os = "macos")]
@@ -392,7 +392,7 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"
         ))
     }
     #[cfg(target_os = "macos")]
@@ -664,16 +664,42 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    let response = client.get(&download_url).send().await?;
+    let mut response = client.get(&download_url).send().await?;
     if !response.status().is_success() {
-        anyhow::bail!("下载安装包失败，HTTP 状态码: {}", response.status());
+        let repo = jeikcode_config::endpoints::update_repo();
+        let tag = if version_str.starts_with('v') || version_str.starts_with('V') {
+            version_str.clone()
+        } else {
+            format!("v{version_str}")
+        };
+        let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
+        let fallback_candidates = vec![
+            format!("https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"),
+            format!("https://github.com/{repo}/releases/download/{tag}/皮皮跑腿 (PipiRunner)_{clean_ver}_x64-setup.exe"),
+            format!("https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"),
+        ];
+        let mut recovered = false;
+        for candidate in fallback_candidates {
+            if candidate != download_url {
+                if let Ok(alt_resp) = client.get(&candidate).send().await {
+                    if alt_resp.status().is_success() {
+                        response = alt_resp;
+                        recovered = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !recovered {
+            anyhow::bail!("下载安装包失败，HTTP 状态码: {}", response.status());
+        }
     }
 
     let total_bytes = response.content_length().unwrap_or(0);
     let temp_dir = std::env::temp_dir();
 
     #[cfg(target_os = "windows")]
-    let installer_filename = format!("JeikCode-Desktop-Setup-{}.exe", version_str);
+    let installer_filename = format!("Zap-Setup-{}.exe", version_str);
     #[cfg(target_os = "macos")]
     let installer_filename = format!("JeikCode-Desktop-{}.dmg", version_str);
     #[cfg(target_os = "linux")]
