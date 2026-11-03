@@ -2029,13 +2029,14 @@ mod tests {
 
     #[test]
     fn binary_url_shape() {
+        let repo = jeikcode_config::endpoints::update_repo();
         assert_eq!(
             binary_url("6.0.0", "windows-x64"),
-            "https://github.com/jeikl/JeikCode/releases/download/v6.0.0/jeikcode-v6.0.0-windows-x64.exe"
+            format!("https://github.com/{repo}/releases/download/v6.0.0/jeikcode-v6.0.0-windows-x64.exe")
         );
         assert_eq!(
             binary_url("v7.0.0", "windows-x64"),
-            "https://github.com/jeikl/JeikCode/releases/download/v7.0.0/jeikcode-v7.0.0-windows-x64.exe"
+            format!("https://github.com/{repo}/releases/download/v7.0.0/jeikcode-v7.0.0-windows-x64.exe")
         );
     }
 
