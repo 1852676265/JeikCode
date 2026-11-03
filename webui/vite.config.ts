@@ -66,13 +66,13 @@ function autoAuthPlugin(): Plugin {
 }
 
 export default defineConfig(() => {
+  const initialAuth = getDaemonAuth();
+  const daemonPort = initialAuth?.port || 13460;
+  const targetUrl = `http://127.0.0.1:${daemonPort}`;
+
   const proxyConfig = {
     '^/(api|events|health|config|models|skills|sessions|project|projects|cd|chat|fs|terminal|git|provider-accounts|providers|shutdown|auth|telemetry)': {
-      target: 'http://127.0.0.1:13458',
-      router: () => {
-        const auth = getDaemonAuth();
-        return auth ? `http://127.0.0.1:${auth.port}` : undefined;
-      },
+      target: targetUrl,
       changeOrigin: true,
       ws: true,
       configure: (proxy: any) => {
@@ -92,13 +92,13 @@ export default defineConfig(() => {
             }
           }
         });
-      },
-      bypass: (req: any) => {
-        const auth = getDaemonAuth();
-        if (!auth) {
-          return req.url;
-        }
-        return null;
+        proxy.on('error', (err: any, req: any, res: any) => {
+          console.warn(`[Vite Proxy Error] ${req?.url || ''} -> ${err?.message || err}`);
+          if (res && typeof res.writeHead === 'function' && !res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `无法连接到本地后端守护进程 (${err?.message || err})`, code: 'daemon_unreachable' }));
+          }
+        });
       },
     },
   };

@@ -164,7 +164,7 @@ import {
   type LiveTodoDocument,
   type TodoItem,
 } from '../lib/todos';
-import { displayPath, pathBasename, getRelativePathToProject } from '../lib/displayPath';
+import { displayPath, pathBasename, getRelativePathToProject, isUserHomeDir } from '../lib/displayPath';
 import { toolTouchesWorktree } from '../lib/gitRefresh';
 import {
   getSessionCache,
@@ -1034,11 +1034,16 @@ export function Chat({
   }
 
   // 当前会话的权威工作目录：优先使用当前会话自身的 working_dir，回退到传入的全局 cwd。
-  // 防止多项目切换或新建会话时由于外层 cwd 暂时漂移导致把当前会话的消息发往错误目录。
-  const effectiveWorkingDir =
+  // 若工作目录为主目录（如 C:\Users\LiSB）或未显式绑定工程，则视为纯粹未绑定的独立会话（空目录），
+  // 杜绝将系统根目录或用户主目录当作普通工程绑定。
+  const rawWorkingDir =
     (activeSession && activeSession.id === sessionId && activeSession.working_dir)
       ? activeSession.working_dir
       : cwd;
+  const effectiveWorkingDir =
+    rawWorkingDir && !isUserHomeDir(rawWorkingDir) && rawWorkingDir !== '__global__'
+      ? rawWorkingDir
+      : '';
 
   // 落地页项目选择器状态（类似 Codex 体验，支持无项目自由会话）
   const [landingProjects, setLandingProjects] = useState<ProjectInfo[]>([]);

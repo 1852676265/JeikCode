@@ -18,7 +18,7 @@ import { CwdPicker } from './CwdPicker';
 import { mergeOptimisticSession, mergeOptimisticSessions } from '../lib/sessionList';
 import { mcpAutoTrustSignature, mcpEnableNeedsTrust } from '../lib/mcpTrust';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
-import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, stripExtendedPathPrefix } from '../lib/displayPath';
+import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, isUserHomeDir, stripExtendedPathPrefix } from '../lib/displayPath';
 import { FileExplorer } from './FileExplorer';
 import { getPageZoom } from '../lib/pageZoom';
 import { buildSessionAnalysisPrompt } from '../lib/sessionAnalysis';
@@ -1839,15 +1839,23 @@ export function Sidebar({
   // 避免出现两条相同会话（刷新才消失）。
   const merged = mergeOptimisticSessions(allOptimistic, sessions);
 
-  const allProjects = projects.slice();
+  const allProjects = projects.filter((p) => !isUserHomeDir(p.working_dir));
   for (const pinned of pinnedProjects) {
-    if (!allProjects.some((p) => p.hash === pinned.hash)) allProjects.push(pinned);
+    if (!isUserHomeDir(pinned.working_dir) && !allProjects.some((p) => p.hash === pinned.hash)) {
+      allProjects.push(pinned);
+    }
   }
-  if (projectHash && !allProjects.some((p) => p.hash === projectHash) && !hiddenProjectHashes.has(projectHash)) {
+  if (
+    projectHash &&
+    cwd &&
+    !isUserHomeDir(cwd) &&
+    !allProjects.some((p) => p.hash === projectHash) &&
+    !hiddenProjectHashes.has(projectHash)
+  ) {
     allProjects.unshift({
       hash: projectHash,
-      name: shortDir(cwd || ''),
-      working_dir: cwd || '',
+      name: shortDir(cwd),
+      working_dir: cwd,
       session_count: 0,
       created_at: Date.now(),
       last_updated: Date.now(),
@@ -1932,16 +1940,13 @@ export function Sidebar({
   // 判断一个会话是否归属于某个具体项目
   const isProjectSession = (s: SessionMetaWithProject) => {
     const normDir = (s.working_dir || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-    if (normDir === '__global__' || normDir.includes('.jeikcode/workspace')) {
+    if (!normDir || normDir === '__global__' || normDir.includes('.jeikcode/workspace') || isUserHomeDir(normDir)) {
       return false;
     }
     if (s.project_hash && knownHashes.has(s.project_hash)) {
       return true;
     }
     if (normDir && knownDirs.has(normDir)) {
-      return true;
-    }
-    if (s.project_hash && s.project_hash.trim().length > 0) {
       return true;
     }
     return false;
@@ -2338,6 +2343,16 @@ export function Sidebar({
           </div>
         ) : (
           <>
+            {/* 1. 独立会话列表（类似 DeepSeek，普通无项目会话直接平铺展示在最近区域顶部） */}
+            {recentsList.length > 0 && (
+              <div class="sidebar-recents-section" style={{ marginBottom: visibleProjects.length > 0 ? '12px' : 0 }}>
+                <div class="project-sessions-list" style={{ paddingLeft: 0 }}>
+                  {recentsList.slice(0, 50).map(renderItem)}
+                </div>
+              </div>
+            )}
+
+            {/* 2. 项目工作区分组 */}
             <div class="sidebar-section-header">
               <span class="sidebar-section-title">{t('sidebar.projects')}</span>
               <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
@@ -2449,14 +2464,9 @@ export function Sidebar({
               );
             })}
 
-            {recentsList.length > 0 && (
-              <div class="sidebar-recents-section">
-                <div class="sidebar-section-header">
-                  <span class="sidebar-section-title">{t('sidebar.recents')}</span>
-                </div>
-                <div class="project-sessions-list" style={{ paddingLeft: 0 }}>
-                  {recentsList.slice(0, 30).map(renderItem)}
-                </div>
+            {visibleProjects.length === 0 && recentsList.length === 0 && (
+              <div class="session-empty" style={{ padding: '12px', fontSize: '12px' }}>
+                {t('sidebar.empty')}
               </div>
             )}
           </>

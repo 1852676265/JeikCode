@@ -205,3 +205,19 @@ export function parseFilePathAndLines(raw: string): ParsedFilePathWithLine {
     endLine: Number.isFinite(endLine) && endLine! > 0 ? endLine : undefined,
   };
 }
+
+/**
+ * 检查路径是否为操作系统用户的主目录（例如 `C:\Users\username`, `/home/username`, `/Users/username`, `~`）
+ * 或全局空白/无项目占位符。主目录是系统的用户根目录，绝非代码工程的工作区。
+ */
+export function isUserHomeDir(path?: string | null): boolean {
+  if (!path) return true;
+  const clean = stripExtendedPathPrefix(path).replace(/\\/g, '/').replace(/\/+$/, '').trim();
+  if (!clean || clean === '~' || clean.toLowerCase() === '__global__') return true;
+  // Windows: C:/Users/username (驱动器盘符 + Users/用户名)
+  if (/^[a-zA-Z]:\/Users\/[^/]+$/i.test(clean)) return true;
+  // Linux: /home/username
+  // macOS: /Users/username
+  if (/^\/(home|Users)\/[^/]+$/i.test(clean)) return true;
+  return false;
+}

@@ -16,7 +16,7 @@ import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } fro
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
 import { ConfirmModalHost } from './components/ConfirmDialog';
-import { parseFilePathAndLines } from './lib/displayPath';
+import { isUserHomeDir, parseFilePathAndLines } from './lib/displayPath';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销
 const ThemeDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ThemeDialog })));
@@ -624,8 +624,11 @@ export function App() {
     getProject()
       .then((p) => {
         if (cancelled) return;
-        if (p.working_dir) setCwd((c) => c || p.working_dir);
-        if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+        // 只有当服务端返回的不是操作系统用户主目录时，才作为工程项目 seed
+        if (p.working_dir && !isUserHomeDir(p.working_dir)) {
+          setCwd((c) => c || p.working_dir);
+          if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+        }
       })
       .catch(() => {
         // Ignore; cwd stays empty
@@ -793,7 +796,7 @@ export function App() {
     navSeqRef.current++;
     setSessionId(null);
     setActiveSession(null);
-    if (targetCwd === '' || targetCwd === '__global__') {
+    if (!targetCwd || targetCwd === '__global__' || isUserHomeDir(targetCwd)) {
       setCwd('');
       setProjectHash('');
     } else if (targetCwd && targetCwd !== '~') {
@@ -807,8 +810,11 @@ export function App() {
     if (initialPrompt) {
       setPendingPrompt(initialPrompt);
     }
-    // Top-level「新建对话」继承当前项目的上下文（若无项目则保持当前）；项目卡片「+」或落地页可显式传入目录
-    openNewSession(targetDir !== undefined ? targetDir : (cwd || undefined));
+    // 采用类似 DeepSeek 的解耦设计：
+    // 若显式传入 targetDir（如在项目卡片或右键中点击「+」），则绑定指定工程；
+    // 若未传入 targetDir（即用户点击顶栏或侧栏全局「+ 新建对话」）：
+    // 默认创建纯净独立的全局新对话（空工作区），绝不强行绑定操作系统主目录或非明确工程！
+    openNewSession(targetDir !== undefined ? targetDir : '');
   }
 
   function applySessionSelection(session: SessionMetaWithProject) {
@@ -816,7 +822,7 @@ export function App() {
     setSessionId(session.id);
     setActiveSession(session);
     setActiveMainTabId('chat');
-    if (session.working_dir && session.working_dir !== '__global__') {
+    if (session.working_dir && session.working_dir !== '__global__' && !isUserHomeDir(session.working_dir)) {
       setCwd(session.working_dir);
     } else {
       setCwd('');
