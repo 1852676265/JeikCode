@@ -271,7 +271,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     !isChecking &&
     !checkError &&
     !!targetVersion &&
-    (!isLatestPick || hasUpdate || forceReinstall);
+    (!isLatestPick || hasUpdate);
 
   return (
     <>
@@ -377,11 +377,6 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                 <div class="update-status-row has-update">
                   <span class="update-status-sparkle">✨</span>
                   <span>{t('update.dialogDesc', { version: info?.latest_version || '' })}</span>
-                </div>
-              ) : forceReinstall ? (
-                <div class="update-status-row has-update">
-                  <span class="update-status-sparkle">🔁</span>
-                  <span>{t('update.dialogDescForce', { version: info?.latest_version || '' })}</span>
                 </div>
               ) : (
                 <div class="update-status-row latest">
