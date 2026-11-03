@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="./assets/jeikcode-logo.svg" alt="JeikCode Logo" width="120" />
-  <h1>JeikCode: Native Code Graph · Extreme KV-Cache · Cross-Platform All-in-One Agent (TUI / WebUI / Desktop)</h1>
-  <p><strong>Native Code Graph · 98–99% KV-Cache · Cross-Platform All-in-One Agent (TUI, WebUI, Desktop) · Self-Healing</strong></p>
+  <img src="./assets/pipi-logo.svg" alt="PipiRunner Logo" width="120" />
+  <h1>PipiRunner (皮皮跑腿): Native Code Graph · Extreme KV-Cache · Cross-Platform All-in-One Agent (TUI / WebUI / Desktop)</h1>
+  <p><strong>Code Chores, Handled by Pipi & Paotui! · Native Code Graph · 98–99% KV-Cache · Cross-Platform All-in-One Agent (TUI, WebUI, Desktop)</strong></p>
   <p>
     <em>Next-generation autonomous AI coding agent purpose-built for complex production engineering — eliminating context bloat, broken tool loops, and cache thrashing.</em>
   </p>
