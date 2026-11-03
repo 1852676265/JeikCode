@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo, SidebarProjects } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getCapabilities, toggleCapability, getMcpStatus, postMcpReload, postLiveMcpTrust, getSession, getProjects, getSidebarProjects, hideSidebarProject, showSidebarProject, revealSidebarProject, resolveSession, getActiveChatSessions, getHealth, pickNativeDirectory, revealInFileExplorer, CapabilityItem, CapScope, McpStatusInfo, SessionMetaWithProject, ProjectInfo, SidebarProjects, UpdateCheckResponse } from '../api';
 import { mergeSessionRow, onGlobalEvent, removeSessionRows } from '../lib/globalEvents';
 import { deleteSessionCache } from '../lib/sessionCache';
 import { bakedAppVersion, formatAppVersionLabel, normalizeAppVersion } from '../lib/appVersion';
@@ -68,6 +68,10 @@ interface SidebarProps {
   /** 从资源管理器打开文件 */
   onOpenFile?: (filePath: string) => void;
   activeFilePath?: string | null;
+  /** 检查更新/打开更新弹窗 */
+  onOpenUpdate?: () => void;
+  /** 更新状态信息 */
+  updateInfo?: UpdateCheckResponse | null;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -425,6 +429,8 @@ export function Sidebar({
   extraRunningIds,
   onOpenFile,
   activeFilePath,
+  onOpenUpdate,
+  updateInfo,
 }: SidebarProps) {
   const [isMobile, setIsMobile] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
@@ -2113,18 +2119,23 @@ export function Sidebar({
           </button>
         </nav>
         <div class="sidebar-rail-bottom">
-          {githubLogo !== false && (
-            <a
-              class="sidebar-rail-btn sidebar-rail-github-btn"
-              href="https://github.com/jeikl/JeikCode"
-              target="_blank"
-              rel="noopener noreferrer"
-              title="GitHub: JeikCode"
-              aria-label="GitHub Repository"
-            >
-              <GithubLogo />
-            </a>
-          )}
+          <button
+            class={`sidebar-rail-btn sidebar-update-btn ${updateInfo?.has_update ? 'has-update' : ''}`}
+            onClick={() => {
+              onCloseDrawer?.();
+              onOpenUpdate?.();
+            }}
+            title={updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : t('update.modalTitle')}
+            aria-label={t('update.modalTitle')}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+              <path d="M3 3v5h5" />
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+              <path d="M16 16h5v5" />
+            </svg>
+            {updateInfo?.has_update && <span class="sidebar-update-dot" />}
+          </button>
           <button
             class="sidebar-rail-btn"
             onClick={() => {
@@ -2157,8 +2168,17 @@ export function Sidebar({
       />
       <div class="sidebar-brand-row">
         <span class="sidebar-brand">
-<span class="sidebar-brand-name">JeikCode</span>
-          <span class="sidebar-brand-version">{formatAppVersionLabel(appVersion) || 'v?'}</span>
+          <span class="sidebar-brand-name">JeikCode</span>
+          <button
+            type="button"
+            class={`sidebar-brand-version-btn ${updateInfo?.has_update ? 'has-update' : ''}`}
+            onClick={onOpenUpdate}
+            title={updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : `${t('update.modalTitle')} (${formatAppVersionLabel(appVersion)})`}
+            aria-label={t('update.modalTitle')}
+          >
+            <span>{formatAppVersionLabel(appVersion) || 'v?'}</span>
+            {updateInfo?.has_update && <span class="sidebar-version-badge">NEW</span>}
+          </button>
         </span>
         <span class="sidebar-brand-btns">
           <button
@@ -2476,18 +2496,6 @@ export function Sidebar({
   )}
 
       <div class="sidebar-bottom">
-        {githubLogo !== false && (
-          <a
-            class="sidebar-bottom-github-btn"
-            href="https://github.com/jeikl/JeikCode"
-            target="_blank"
-            rel="noopener noreferrer"
-            title="GitHub: JeikCode"
-            aria-label="GitHub Repository"
-          >
-            <GithubLogo />
-          </a>
-        )}
         <span class="sidebar-bottom-spacer" />
         <button
           class="sidebar-icon-btn"
@@ -2503,6 +2511,23 @@ export function Sidebar({
             <line x1="8" y1="21" x2="16" y2="21" />
             <line x1="12" y1="17" x2="12" y2="21" />
           </svg>
+        </button>
+        <button
+          class={`sidebar-icon-btn sidebar-update-btn ${updateInfo?.has_update ? 'has-update' : ''}`}
+          onClick={() => {
+            onCloseDrawer?.();
+            onOpenUpdate?.();
+          }}
+          title={updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : t('update.modalTitle')}
+          aria-label={t('update.modalTitle')}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+            <path d="M16 16h5v5" />
+          </svg>
+          {updateInfo?.has_update && <span class="sidebar-update-dot" />}
         </button>
         <button
           class="sidebar-icon-btn sidebar-settings-btn"
