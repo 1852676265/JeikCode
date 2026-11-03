@@ -261,8 +261,8 @@ fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option
         lower.ends_with(".exe")
             && (lower.contains("setup")
                 || lower.contains("desktop")
-                || lower.contains("pipirunner")
                 || lower.contains("zap")
+                || lower.contains("pipirunner")
                 || lower.contains("皮皮跑腿"))
     };
     #[cfg(target_os = "macos")]
@@ -355,8 +355,8 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
                         lower.ends_with(".exe")
                             && (lower.contains("setup")
                                 || lower.contains("desktop")
-                                || lower.contains("pipirunner")
                                 || lower.contains("zap")
+                                || lower.contains("pipirunner")
                                 || lower.contains("皮皮跑腿"))
                     };
                     #[cfg(target_os = "macos")]

@@ -193,7 +193,7 @@ function renderReleaseNotes(tag, section) {
     '',
     '| Platform | Recommended Packages | Architecture |',
     '| :--- | :--- | :--- |',
-    `| **Windows (PC)** | [📥 **Download Windows Installer (.exe)**](${downloadBase}/皮皮跑腿 (PipiRunner)_${cleanVer}_x64-setup.exe) | x64 (x86_64) |`,
+    `| **Windows (PC)** | [📥 **Download Windows Installer (.exe)**](${downloadBase}/Zap_${cleanVer}_x64-setup.exe) | x64 (x86_64) |`,
     `| **iOS (Apple)** | [🍏 **Download iOS App (.ipa)**](${downloadBase}/JeikCode.ipa) | Sideload / AltStore |`,
     '',
     '#### ⚡ One-Line Terminal Installation (CLI)',
