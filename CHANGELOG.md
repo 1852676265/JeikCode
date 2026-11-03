@@ -21,7 +21,7 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
-## v7.2.8 (2026-11-03)
+## v7.3.3 (2026-11-03)
 
 - **[Updater & Release Distribution] Smart multi-source auto-updater and seamless one-click in-app upgrade**:
   - Added intelligent update source resolution that prioritizes custom release repositories (`1852676265/JeikCode`) while seamlessly falling back to upstream official releases.
