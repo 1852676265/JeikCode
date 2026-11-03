@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.6 (2026-11-03)
+
+- **[Branding & Desktop Shell] Complete application name, multi-scale icon assets, and updater priority fix**:
+  - Upgraded desktop application productName and window titles to "皮皮跑腿 (PipiRunner)".
+  - Replaced full desktop and web application icon suites across `.ico` (16 to 256px multi-resolution Windows icon), high-res `.png` bundles, and `favicon.png`.
+  - Updated WebUI landing brand title and metadata to reflect the new PipiRunner identity.
+  - Enhanced self-updater repository resolution: prioritized custom downstream GitHub releases to bypass upstream edge cache shadowing.
+
+---
+
+- **[品牌与桌面应用] 深度换新应用名称、全套原生应用图标体系并修复自动更新优先级**:
+  - 全面更新桌面端 `productName` 与窗口标题为“皮皮跑腿 (PipiRunner)”。
+  - 彻底替换桌面客户端与 Web 端的全套原生图标，包含 Windows `.ico`（16~256px 多分辨率合并）、全尺寸 `.png` 桌面图标、以及网页 `favicon.png`。
+  - 同步更新 WebUI 落地页主品牌名与浏览器标题，全面融入“皮皮跑腿”品牌视觉。
+  - 优化更新检测逻辑：当使用自定义仓库发版时，优先请求目标仓库 GitHub Releases，避免被上游官方边缘缓存劫持。
+
 ## v7.3.5 (2026-11-03)
 
 - **[Branding & Mascot] Official brand refresh to PipiRunner (皮皮跑腿) with dual-cat vector identity**:

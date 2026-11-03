@@ -610,39 +610,50 @@ async fn fetch_release_pages(
     Ok(all)
 }
 
-/// Releases from the edge cache at `jeikcode.top/api/releases`.
-///
-/// GitHub's REST API is used when the edge returns nothing, or when it
-/// returns tags whose announcement `body` is still empty. A payload that
-/// already includes notes does not call GitHub.
+/// Releases list discovery:
+/// 1. If configured with a custom repository (not "jeikl/JeikCode"), prefer
+///    fetching GitHub Releases directly so downstream releases take precedence.
+/// 2. Otherwise try edge cache at `jeikcode.top/api/releases` with fallbacks.
 pub async fn list_releases() -> Result<Vec<ListedRelease>> {
     let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(JEIKCODE_USER_AGENT)
         .build()?;
     let mut all = Vec::new();
-    let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
-    if let Ok(resp) = client.get(&primary).send().await {
-        if resp.status().is_success() {
-            if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
-                merge_listed_releases(&mut all, list);
-            }
-        }
-    }
-    let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
-    if all.is_empty() || !edge_has_notes {
-        let repo = jeikcode_config::endpoints::update_repo();
+    let repo = jeikcode_config::endpoints::update_repo();
+    let is_custom_repo = repo != "jeikl/JeikCode";
+
+    // Downstream custom repository: fetch directly from GitHub releases first
+    if is_custom_repo {
         let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
         if let Ok(pages) = fetch_release_pages(&client, &gh).await {
             merge_listed_releases(&mut all, pages);
         }
-        if all.is_empty() && repo != "jeikl/JeikCode" {
-            let upstream_gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100";
-            if let Ok(pages) = fetch_release_pages(&client, upstream_gh).await {
+    }
+
+    if all.is_empty() {
+        let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
+        if let Ok(resp) = client.get(&primary).send().await {
+            if resp.status().is_success() {
+                if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
+                    merge_listed_releases(&mut all, list);
+                }
+            }
+        }
+        let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
+        if all.is_empty() || !edge_has_notes {
+            let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
+            if let Ok(pages) = fetch_release_pages(&client, &gh).await {
                 merge_listed_releases(&mut all, pages);
+            }
+            if all.is_empty() && repo != "jeikl/JeikCode" {
+                let upstream_gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100";
+                if let Ok(pages) = fetch_release_pages(&client, upstream_gh).await {
+                    merge_listed_releases(&mut all, pages);
+                }
             }
         }
     }
