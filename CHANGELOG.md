@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v7.3.5 (2026-11-03)
+
+- **[Branding & Mascot] Official brand refresh to PipiRunner (皮皮跑腿) with dual-cat vector identity**:
+  - Introduced the brand new "PipiRunner" identity featuring the iconic dual-cat duo: Pipi the planner and Paotui the runner.
+  - Added ultra high-fidelity SVG mascot logos across `assets/` and official `docs-site/` with high-contrast ambient glow and squircle framing.
+  - Provided a standalone interactive multi-scale browser preview page (`assets/pipi-preview.html`) to audit icon clarity from 512px down to 18px.
+  - Updated English and Chinese project documentation banners and slogans to reflect the new friendly brand identity.
+
+---
+
+- **[品牌与吉祥物升级] 正式确立“皮皮跑腿 (PipiRunner)”双猫形象与矢量图标体系**:
+  - 正式发布全新“皮皮跑腿”品牌形象，确立“皮皮（思考规划）+ 跑腿（极客执行）”双猫搭档角色设定。
+  - 在 `assets/` 与官方文档站 `docs-site/` 全面引入高保真纯矢量双猫 SVG 图标，支持全尺寸无损自适应缩放与氛围微光渲染。
+  - 增加本地交互式多尺寸浏览器预览页（`assets/pipi-preview.html`），可一键实时比对 512px 原图、52px 桌面 Dock、32px 托盘与 18px 网页图标效果。
+  - 同步更新中英文主 README 文档的主标题、徽章与品牌标语（“代码杂活，皮皮跑腿！”）。
+
 ## v7.3.4 (2026-11-03)
 
 - **[UI & Interaction] In-app software update enhancements and version badge interactions**:
