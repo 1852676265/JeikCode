@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zap (闪击) - 全新品牌 Logo 视效预览与设计指南</title>
+  <style>
+    :root {
+      --bg: #070a13;
+      --card-bg: #0f172a;
+      --border: #1e293b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --cyan: #00f5ff;
+      --purple: #8b5cf6;
+      --amber: #f59e0b;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 48px 24px;
+    }
+
+    .header {
+      text-align: center;
+      max-width: 800px;
+      margin-bottom: 36px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 14px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      border-radius: 9999px;
+      background: rgba(0, 245, 255, 0.12);
+      color: var(--cyan);
+      border: 1px solid rgba(0, 245, 255, 0.3);
+      margin-bottom: 14px;
+    }
+    .header h1 {
+      font-size: 42px;
+      font-weight: 900;
+      letter-spacing: -1px;
+      background: linear-gradient(135deg, #00f5ff 0%, #a855f7 50%, #f59e0b 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 12px;
+    }
+    .header p {
+      font-size: 16px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+
+    .manifesto {
+      max-width: 760px;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid rgba(139, 92, 246, 0.25);
+      border-radius: 16px;
+      padding: 18px 24px;
+      margin-bottom: 36px;
+      font-size: 14px;
+      line-height: 1.7;
+      color: #cbd5e1;
+      backdrop-filter: blur(12px);
+    }
+    .manifesto strong { color: var(--cyan); }
+    .manifesto span.highlight { color: #facc15; font-weight: 600; }
+
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+      max-width: 1100px;
+      width: 100%;
+    }
+
+    @media (max-width: 900px) {
+      .main-grid { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 32px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.45);
+      position: relative;
+      overflow: hidden;
+    }
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(0, 245, 255, 0.4), rgba(168, 85, 247, 0.4), transparent);
+    }
+
+    .card-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 24px;
+      align-self: flex-start;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-title::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 8px var(--cyan);
+    }
+
+    .hero-logo-box {
+      width: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 24px 0;
+    }
+    .hero-logo {
+      width: 300px;
+      height: 300px;
+      filter: drop-shadow(0 20px 40px rgba(0, 245, 255, 0.25));
+      transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .hero-logo:hover {
+      transform: scale(1.05) rotate(1deg);
+    }
+
+    .palette-row {
+      display: flex;
+      gap: 12px;
+      width: 100%;
+      margin-top: 24px;
+    }
+    .swatch {
+      flex: 1;
+      height: 48px;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      font-size: 10px;
+      font-weight: 700;
+      color: #fff;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+
+    .scale-list {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      width: 100%;
+    }
+    .scale-item {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      background: #141e33;
+      padding: 14px 18px;
+      border-radius: 14px;
+      border: 1px solid #1e2c4a;
+    }
+    .scale-desc {
+      flex: 1;
+    }
+    .scale-desc h4 {
+      font-size: 15px;
+      color: #f1f5f9;
+      margin-bottom: 2px;
+    }
+    .scale-desc p {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .scale-tag {
+      font-size: 11px;
+      font-family: monospace;
+      color: #38bdf8;
+      background: rgba(56, 189, 248, 0.1);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .icon-container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.25);
+      border-radius: 10px;
+      padding: 6px;
+    }
+
+    .tab-bar-mock {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #0b0f19;
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid #1e293b;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+
+    .footer {
+      margin-top: 48px;
+      text-align: center;
+      font-size: 13px;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="badge">Official Brand Refresh</div>
+    <h1>Zap: 瞬息击发 · 码无遁形</h1>
+    <p>专为新一代高性能 Rust AI Coding Agent 打造的品牌视觉识别体系</p>
+  </div>
+
+  <div class="manifesto">
+    <strong>⚡ 设计灵魂解构</strong>：<br>
+    - <strong>极速 Z 几何</strong>：兼具字符 <code>Z</code> 与高能闪电姿态，象征纯 Rust 原生带来的毫秒冷启动与极速自愈执行；<br>
+    - <strong>3D 折面棱镜 (Faceted Bevel)</strong>：超导青光（向阳高光）与极客深紫（背光深核）相互折叠，展现类 Git 状态机的坚实结构感；<br>
+    - <strong>星轨图谱连线 (CodeGraph Constellation)</strong>：背景淡入微型的 AST 节点与语义网络，直击 Tree-Sitter 穿透庞大代码库的底气；<br>
+    - <strong>微光能量火花 (Energy Spark)</strong>：折角处迸发的白热与 Rust 橙火花，代表代码杂活被瞬间清除的痛快与干脆。
+  </div>
+
+  <div class="main-grid">
+    <!-- Card 1: 512px Hero Showcase -->
+    <div class="card">
+      <div class="card-title">主视觉高保真呈现 (512 × 512 px)</div>
+      <div class="hero-logo-box">
+        <img src="./zap-logo.svg" alt="Zap Logo" class="hero-logo" />
+      </div>
+      <div class="palette-row">
+        <div class="swatch" style="background: #00f5ff; color: #000;">#00F5FF<br>超导电青</div>
+        <div class="swatch" style="background: #8b5cf6;">#8B5CF6<br>极客电紫</div>
+        <div class="swatch" style="background: #f59e0b;">#F59E0B<br>Rust 炽火</div>
+        <div class="swatch" style="background: #0a0f1d; border-color: #334155;">#0A0F1D<br>黑曜深空</div>
+      </div>
+    </div>
+
+    <!-- Card 2: Multi-Scale Practical Verification -->
+    <div class="card">
+      <div class="card-title">全场景多尺度实机验证</div>
+      <div class="scale-list">
+        
+        <!-- 128px -->
+        <div class="scale-item">
+          <div class="icon-container">
+            <img src="./zap-logo.svg" style="width: 72px; height: 72px;" alt="128px" />
+          </div>
+          <div class="scale-desc">
+            <h4>macOS Dock / Windows 开始菜单</h4>
+            <p>128px ~ 72px: 3D 折角与双色光晕层次饱满，高辨识度突显。</p>
+          </div>
+          <span class="scale-tag">128px</span>
+        </div>
+
+        <!-- 48px -->
+        <div class="scale-item">
+          <div class="icon-container">
+            <img src="./zap-logo.svg" style="width: 44px; height: 44px;" alt="48px" />
+          </div>
+          <div class="scale-desc">
+            <h4>桌面端启动器 / WebUI 导航栏大图</h4>
+            <p>48px ~ 44px: Z 形闪电主体轮廓极为锐利，无模糊粘连。</p>
+          </div>
+          <span class="scale-tag">48px</span>
+        </div>
+
+        <!-- 32px -->
+        <div class="scale-item">
+          <div class="icon-container">
+            <img src="./zap-logo.svg" style="width: 32px; height: 32px;" alt="32px" />
+          </div>
+          <div class="scale-desc">
+            <h4>系统托盘 / 侧边栏折叠图标</h4>
+            <p>32px: 即使在小图标下，中心高能闪电依然一目了然。</p>
+          </div>
+          <span class="scale-tag">32px</span>
+        </div>
+
+        <!-- 18px -->
+        <div class="scale-item">
+          <div class="icon-container">
+            <div class="tab-bar-mock">
+              <img src="./zap-logo.svg" style="width: 18px; height: 18px;" alt="18px" />
+              <span>Zap WebUI - Terminal</span>
+            </div>
+          </div>
+          <div class="scale-desc">
+            <h4>浏览器 Favicon / 标签页极小尺寸</h4>
+            <p>16px ~ 18px: 极高对比度电光保证小尺寸不丢形。</p>
+          </div>
+          <span class="scale-tag">16/18px</span>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Zap AI Coding Agent · Assets ready for Desktop (Tauri) and WebUI integration.
+  </div>
+
+</body>
+</html>

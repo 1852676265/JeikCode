@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="./assets/pipi-logo.svg" alt="PipiRunner Logo" width="120" />
-  <h1>PipiRunner (皮皮跑腿): Native Code Graph · Extreme KV-Cache · Cross-Platform All-in-One Agent (TUI / WebUI / Desktop)</h1>
-  <p><strong>Code Chores, Handled by Pipi & Paotui! · Native Code Graph · 98–99% KV-Cache · Cross-Platform All-in-One Agent (TUI, WebUI, Desktop)</strong></p>
+  <img src="./assets/zap-logo.svg" alt="Zap Logo" width="120" />
+  <h1>Zap: Native Code Graph · Extreme KV-Cache · Cross-Platform All-in-One Agent (TUI / WebUI / Desktop)</h1>
+  <p><strong>Instant Strike, Chores Gone! · Native Code Graph · 98–99% KV-Cache · Cross-Platform All-in-One Agent (TUI, WebUI, Desktop)</strong></p>
   <p>
     <em>Next-generation autonomous AI coding agent purpose-built for complex production engineering — eliminating context bloat, broken tool loops, and cache thrashing.</em>
   </p>

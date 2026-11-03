@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "皮皮跑腿 (PipiRunner)",
+  "productName": "Zap",
   "version": "1.0.0",
   "identifier": "com.jeikcode.desktop",
   "build": {

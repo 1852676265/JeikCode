@@ -8772,7 +8772,7 @@ export function Chat({
             <div class="chat-landing">
               <div class="landing-inner">
                 <div class="landing-brand">
-                  <span class="landing-brand-name">皮皮跑腿 (PipiRunner)</span>
+                  <span class="landing-brand-name">Zap</span>
                 </div>
                 <div class="landing-tagline">
                   {effectiveWorkingDir ? (

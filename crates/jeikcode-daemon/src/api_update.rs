@@ -262,6 +262,7 @@ fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option
             && (lower.contains("setup")
                 || lower.contains("desktop")
                 || lower.contains("pipirunner")
+                || lower.contains("zap")
                 || lower.contains("皮皮跑腿"))
     };
     #[cfg(target_os = "macos")]
@@ -355,6 +356,7 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
                             && (lower.contains("setup")
                                 || lower.contains("desktop")
                                 || lower.contains("pipirunner")
+                                || lower.contains("zap")
                                 || lower.contains("皮皮跑腿"))
                     };
                     #[cfg(target_os = "macos")]
@@ -742,6 +744,9 @@ async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
         }
 
         // 2. 终止桌面端前端进程，防止覆盖安装时被文件锁定
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "Zap.exe"])
+            .spawn();
         let _ = std::process::Command::new("taskkill")
             .args(&["/F", "/IM", "皮皮跑腿 (PipiRunner).exe"])
             .spawn();

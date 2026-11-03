@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="./assets/pipi-logo.svg" alt="PipiRunner Logo" width="120" />
-  <h1>皮皮跑腿 (PipiRunner): 原生代码图谱 · 极致缓存 · 跨平台全能型 Agent（TUI / WebUI / 桌面）</h1>
-  <p><strong>代码杂活，皮皮跑腿！· 原生代码图谱 · 98–99% 极致缓存 · 跨平台全能型 Agent (TUI / WebUI / Desktop) · 自主开源 · 极速自愈</strong></p>
+  <img src="./assets/zap-logo.svg" alt="Zap Logo" width="120" />
+  <h1>Zap (闪击): 原生代码图谱 · 极致缓存 · 跨平台全能型 Agent（TUI / WebUI / 桌面）</h1>
+  <p><strong>瞬息击发，码无遁形！· 原生代码图谱 · 98–99% 极致缓存 · 跨平台全能型 Agent (TUI / WebUI / Desktop) · 自主开源 · 极速自愈</strong></p>
   <p>
     <em>专为大型复杂工程打造的新一代自主编程智能体，告别可配置性差、上下文臃肿、工具报错与缓存雪崩。</em>
   </p>

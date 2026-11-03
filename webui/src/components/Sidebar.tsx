@@ -2168,7 +2168,7 @@ export function Sidebar({
       />
       <div class="sidebar-brand-row">
         <span class="sidebar-brand">
-          <span class="sidebar-brand-name">皮皮跑腿 (PipiRunner)</span>
+          <span class="sidebar-brand-name">Zap</span>
           <button
             type="button"
             class={`sidebar-brand-version-btn ${updateInfo?.has_update ? 'has-update' : ''}`}

@@ -4,9 +4,9 @@ import sys
 from PIL import Image
 
 WORKSPACE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SVG_PATH = os.path.join(WORKSPACE, "assets", "pipi-logo.svg")
+SVG_PATH = os.path.join(WORKSPACE, "assets", "zap-logo.svg")
 HTML_PATH = os.path.join(WORKSPACE, "scripts", "render-icon.html")
-MASTER_PNG = os.path.join(WORKSPACE, "assets", "pipi-1024.png")
+MASTER_PNG = os.path.join(WORKSPACE, "assets", "zap-1024.png")
 
 with open(SVG_PATH, "r", encoding="utf-8") as f:
     svg_content = f.read()

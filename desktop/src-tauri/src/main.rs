@@ -240,7 +240,7 @@ fn main() {
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
-            .title("皮皮跑腿 (PipiRunner)")
+            .title("Zap")
             .inner_size(1280.0, 800.0)
             .resizable(true)
             .on_navigation(move |url| {
@@ -316,7 +316,7 @@ fn main() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("启动皮皮跑腿 (PipiRunner) 失败")
+        .expect("启动 Zap 失败")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 DESKTOP_SHUTTING_DOWN.store(true, Ordering::SeqCst);
