@@ -378,7 +378,7 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         let matched = jeikcode_updater::filter_channel_releases(&releases, updater_channel);
         if is_desktop {
             // 桌面端环境：严格筛选出包含当前平台有效桌面安装包的 Release 列表
-            let desktop_releases: Vec<&GitHubRelease> = matched
+            let desktop_releases: Vec<&jeikcode_updater::ListedRelease> = matched
                 .iter()
                 .filter(|r| {
                     let assets: Vec<GitHubReleaseAsset> = r
@@ -638,7 +638,7 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    let mut response = client.get(&download_url).send().await?;
+    let response = client.get(&download_url).send().await?;
     if !response.status().is_success() {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("下载安装包失败 (404 Not Found)：下载地址不可用或资源不存在，请前往 GitHub Releases 确认");

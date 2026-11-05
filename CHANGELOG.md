@@ -21,6 +21,18 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.3 (2026-11-06)
+
+- **[Daemon & Updater] Fix Rust compilation type mismatch in updater API**:
+  - Corrected release struct reference type in desktop update release filter (`ListedRelease`), fixing build failure in GitHub Actions Windows runner.
+  - Cleaned up redundant mutable bindings in updater download stream.
+
+---
+
+- **[后台服务与更新器] 修复更新 API 的 Rust 类型匹配错误**:
+  - 修正桌面端版本筛选逻辑中的引用类型，统一为 `ListedRelease`，彻底解决 GitHub Actions Windows runner 上的编译报错。
+  - 清理更新器下载流中未使用的可变绑定警告。
+
 ## v1.0.2 (2026-11-06)
 
 - **[Updater & CI/CD] Fix desktop installer upload race condition and harden update check logic**:
