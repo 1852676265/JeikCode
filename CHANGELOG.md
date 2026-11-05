@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.1 (2026-11-05)
+
+- **[Plugins & Customization] Decouple boot animation and introduce 1:1 DSH startup settings panel**:
+  - Decoupled hardcoded startup animation assets and slash commands from core webui runtime, delegating boot effects entirely to external plugin packages to keep the repository ultralight.
+  - Introduced a 1:1 pixel-perfect Startup Screen settings panel aligned with DeepSeek Harness v2.16.10, featuring play timing controls (per session, always, daily), playback speed slider (0.35x - 3.00x), custom video/image import, and user-provided background music.
+  - Resolved repetitive animation popups upon session refresh by defaulting playback strategy to once per browser session.
+  - Enhanced plugin kernel with complete lifecycle hooks, settings section injection, and clean uninstallation cleanup.
+
+---
+
+- **[插件体系与个性化] 开机动效解耦与 1:1 原生启动动画配置中心上线**:
+  - 彻底拔除主程序中硬编码的开机动画媒体素材与专属斜杠命令，转由外部独立扩展包接管，保持主仓库极致轻量。
+  - 1:1 像素级还原 DeepSeek Harness (DSH) v2.16.10 原生启动动画控制台，支持播放时机设定、速度倍率微调 (0.35x~3.00x)、自定义视频与动画导入、自备背景音乐与循环播放。
+  - 将启动动画默认策略优化为“每个浏览器会话一次 (session)”，彻底解决每次刷新会话反复弹出的问题。
+  - 增强插件微内核插槽机制与干净卸载逻辑，支持实时重播预览与本地持久化。
+
 ## v1.0.0 (2026-11-03)
 
 - **[Release & Architecture] Official v1.0.0 milestone release for PipiRunner**:

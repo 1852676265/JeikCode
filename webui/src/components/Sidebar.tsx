@@ -22,6 +22,7 @@ import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost
 import { FileExplorer } from './FileExplorer';
 import { getPageZoom } from '../lib/pageZoom';
 import { buildSessionAnalysisPrompt } from '../lib/sessionAnalysis';
+import { openDeepSeekSettingsCenter } from '../custom/custom-registry';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -334,6 +335,15 @@ function McpIcon() {
       <path d="M6.5 1.5v5a2.5 2.5 0 0 0 5 0v-5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
       <line x1="4" y1="9" x2="9" y2="9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
       <path d="M4 9v4.5a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/** Plugin / puzzle piece glyph for Plugin Center. */
+function PluginIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1 1.705-.707c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>
     </svg>
   );
 }
@@ -2257,6 +2267,15 @@ export function Sidebar({
               <span class="sidebar-action-label">{t('sidebar.mcp')}</span>
               {mcpCount > 0 && <span class="sidebar-action-badge">{mcpCount}</span>}
               <span class="sidebar-action-caret"><ChevronDownIcon /></span>
+            </button>
+            <button
+              type="button"
+              class="sidebar-action zap-sidebar-plugins-btn"
+              onClick={() => openDeepSeekSettingsCenter('plugins')}
+              title={t('sidebar.plugins') || '插件中心'}
+            >
+              <span class="sidebar-action-icon"><PluginIcon /></span>
+              <span class="sidebar-action-label">{t('sidebar.plugins') || '插件中心'}</span>
             </button>
           </div>
 

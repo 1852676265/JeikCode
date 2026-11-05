@@ -23,6 +23,7 @@ export const vi: Record<keyof typeof en, string> = {
   'sidebar.skillsEmpty': 'Chưa có kỹ năng nào',
   'sidebar.skillsLoading': 'Đang tải…',
   'sidebar.mcp': 'MCP',
+  'sidebar.plugins': 'Trung tâm Plugin',
   'sidebar.mcpEmpty': 'Chưa có máy chủ MCP',
   'sidebar.mcpLoading': 'Đang tải…',
   'sidebar.mcpConnected': 'Đã kết nối',

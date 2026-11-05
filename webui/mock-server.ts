@@ -412,11 +412,6 @@ export function mockApiPlugin(): Plugin {
       });
 
       server.middlewares.use(async (req, res, next) => {
-        // 若本地检测到真实 Daemon 正在运行，跳过所有 Mock 拦截，让 Vite Proxy 转发给真实后端
-        if (getDaemonAuth()) {
-          return next();
-        }
-
         const url = req.url || '';
         const parsedUrl = new URL(url, 'http://localhost');
         let pathname = parsedUrl.pathname;
@@ -427,11 +422,67 @@ export function mockApiPlugin(): Plugin {
           pathname = '/' + pathname;
         }
 
+        // 插件生态本地资产静态服务拦截器（即使后端 Daemon 尚未热重载，也可直接由本地插件目录分发）
+        if (pathname.startsWith('/plugins/assets/')) {
+          const subPath = decodeURIComponent(pathname.replace(/^\/plugins\/assets\//, ''));
+          const pluginsRoot = pathMod.resolve(
+            process.env.USERPROFILE || process.env.HOME || '',
+            '.jeikcode',
+            'plugins',
+            'installed'
+          );
+          const directFile = pathMod.resolve(pluginsRoot, subPath);
+          const communityFile = pathMod.resolve(pluginsRoot, 'community', subPath);
+          const targetFile = fs.existsSync(directFile) && fs.statSync(directFile).isFile()
+            ? directFile
+            : fs.existsSync(communityFile) && fs.statSync(communityFile).isFile()
+              ? communityFile
+              : null;
+
+          if (targetFile) {
+            const ext = pathMod.extname(targetFile).toLowerCase();
+            const mimeMap: Record<string, string> = {
+              '.js': 'application/javascript; charset=utf-8',
+              '.mjs': 'application/javascript; charset=utf-8',
+              '.css': 'text/css; charset=utf-8',
+              '.json': 'application/json; charset=utf-8',
+              '.mp4': 'video/mp4',
+              '.webm': 'video/webm',
+              '.mp3': 'audio/mpeg',
+              '.wav': 'audio/wav',
+              '.ogg': 'audio/ogg',
+              '.png': 'image/png',
+              '.jpg': 'image/jpeg',
+              '.jpeg': 'image/jpeg',
+              '.gif': 'image/gif',
+              '.webp': 'image/webp',
+              '.svg': 'image/svg+xml',
+              '.wasm': 'application/wasm',
+              '.html': 'text/html; charset=utf-8',
+            };
+            res.statusCode = 200;
+            res.setHeader('Content-Type', mimeMap[ext] || 'application/octet-stream');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Accept-Ranges', 'bytes');
+            return fs.createReadStream(targetFile).pipe(res);
+          } else {
+            res.statusCode = 404;
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            return res.end(`Plugin asset not found: ${subPath}`);
+          }
+        }
+
+        // 若本地检测到真实 Daemon 正在运行，跳过所有 Mock 拦截，让 Vite Proxy 转发给真实后端
+        if (getDaemonAuth()) {
+          return next();
+        }
+
         const isApi =
           pathname.startsWith('/fs/') ||
           pathname.startsWith('/terminal/') ||
           pathname.startsWith('/git/') ||
           pathname.startsWith('/chat/') ||
+          pathname.startsWith('/plugins/') ||
           pathname.startsWith('/provider-accounts') ||
           pathname.startsWith('/providers') ||
           pathname === '/events' ||
