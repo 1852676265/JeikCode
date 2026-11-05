@@ -320,4 +320,14 @@ jobs:
               Write-Error "Failed to upload $($file.Name) after 3 attempts"
               exit 1
             }
+
+            # 兼容老版本客户端：如果当前安装包名为 Zap_...，额外上传一份 JeikCode.Desktop_... 别名包
+            # 确保未升级到 v1.0.2+ 的老版本客户端在点击更新时也能命中下载，永远不会遭遇 404
+            if ($file.Name -like "Zap_*") {
+              $legacyName = $file.Name -replace '^Zap_', 'JeikCode.Desktop_'
+              $legacyPath = Join-Path $file.DirectoryName $legacyName
+              Copy-Item -Path $file.FullName -Destination $legacyPath -Force
+              Write-Host "Uploading legacy compatible alias: $legacyName to release ${{ github.ref_name }}..."
+              gh release upload "${{ github.ref_name }}" "$legacyPath" --clobber
+            }
           }
