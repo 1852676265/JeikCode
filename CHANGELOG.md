@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.2 (2026-11-06)
+
+- **[Updater & CI/CD] Fix desktop installer upload race condition and harden update check logic**:
+  - Replaced third-party GitHub Release action in desktop/iOS jobs with official `gh release upload` CLI, eliminating `updateRelease HttpError` caused by API write concurrency.
+  - Hardened update check mechanism: desktop clients now strictly require the existence of valid platform-specific installers (e.g. Windows `.exe`) before flagging updates as available, preventing false update notifications.
+  - Completely purged hardcoded installer filenames and fallback candidate guessing, dynamically resolving real download URLs directly from GitHub Release asset manifests.
+
+---
+
+- **[软件更新与构建流水线] 修复桌面安装包上传并发冲突与更新检测逻辑重构**:
+  - 在桌面端与 iOS 构建流水线中改用 GitHub 原生 `gh release upload` 命令行工具，彻底根除因并发写 Release 导致的 `updateRelease HttpError` 报错与安装包丢失问题。
+  - 重构更新检测机制：桌面端仅在远程真实存在当前平台有效安装包（如 Windows `.exe`）时才提示有更新，彻底消除无对应包时误报更新导致的下载异常。
+  - 彻底铲除代码中硬编码的安装包文件名与后备猜测逻辑，改为直接从 GitHub Release 资产清单动态提取真实下载链接。
+
 ## v1.0.1 (2026-11-05)
 
 - **[Plugins & Customization] Decouple boot animation and introduce 1:1 DSH startup settings panel**:

@@ -254,30 +254,45 @@ fn find_highest_release(
     highest.cloned()
 }
 
-fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option<String> {
+fn is_desktop_installer_asset(name: &str) -> bool {
+    let lower = name.to_lowercase();
     #[cfg(target_os = "windows")]
-    let predicate = |name: &str| -> bool {
-        let lower = name.to_lowercase();
-        lower.ends_with(".exe")
-            && (lower.contains("setup")
-                || lower.contains("desktop")
-                || lower.contains("zap")
-                || lower.contains("pipirunner")
-                || lower.contains("皮皮跑腿"))
-    };
+    {
+        if !lower.ends_with(".exe") {
+            return false;
+        }
+        // 明确排除 CLI 纯命令行独立二进制（如 jeikcode-v1.0.1-windows-x64.exe 或 jeikcode.exe）
+        if (lower.starts_with("jeikcode-") || lower == "jeikcode.exe")
+            && !lower.contains("desktop")
+            && !lower.contains("setup")
+        {
+            return false;
+        }
+        lower.contains("setup")
+            || lower.contains("installer")
+            || lower.contains("desktop")
+            || lower.contains("zap")
+            || lower.contains("pipirunner")
+            || lower.contains("皮皮跑腿")
+    }
     #[cfg(target_os = "macos")]
-    let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
+    {
+        lower.ends_with(".dmg") || lower.ends_with(".pkg")
+    }
     #[cfg(target_os = "linux")]
-    let predicate = |name: &str| -> bool {
-        let lower = name.to_lowercase();
-        lower.ends_with(".appimage") || lower.ends_with(".deb")
-    };
+    {
+        lower.ends_with(".appimage") || lower.ends_with(".deb") || lower.ends_with(".rpm")
+    }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let predicate = |_: &str| false;
+    {
+        false
+    }
+}
 
+fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option<String> {
     assets
         .iter()
-        .find(|a| predicate(&a.name))
+        .find(|a| is_desktop_installer_asset(&a.name))
         .map(|a| a.browser_download_url.clone())
 }
 
@@ -295,49 +310,14 @@ fn find_cli_asset_url(assets: &[GitHubReleaseAsset], tag: &str) -> Option<String
     None
 }
 
-fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
-    let tag = if version.starts_with('v') || version.starts_with('V') {
-        version.to_string()
-    } else {
-        format!("v{version}")
-    };
-    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
-    let repo = jeikcode_config::endpoints::update_repo();
-
-    #[cfg(target_os = "windows")]
-    {
-        Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
-        ))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
-}
-
-/// 解析桌面安装包候选下载地址
+/// 解析桌面安装包候选下载地址（完全动态从 GitHub Release Assets 提取真实链接，绝不硬编码文件名猜测）
 async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     let tag = if version.starts_with('v') || version.starts_with('V') {
         version.to_string()
     } else {
         format!("v{version}")
     };
-    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
 
-    // 优先尝试通过 GitHub API 查找 release assets 列表中的安装包
     let repo = jeikcode_config::endpoints::update_repo();
     let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
     let client = reqwest::Client::builder()
@@ -349,68 +329,25 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
         if resp.status().is_success() {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
-                    #[cfg(target_os = "windows")]
-                    let predicate = |name: &str| -> bool {
-                        let lower = name.to_lowercase();
-                        lower.ends_with(".exe")
-                            && (lower.contains("setup")
-                                || lower.contains("desktop")
-                                || lower.contains("zap")
-                                || lower.contains("pipirunner")
-                                || lower.contains("皮皮跑腿"))
-                    };
-                    #[cfg(target_os = "macos")]
-                    let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
-                    #[cfg(target_os = "linux")]
-                    let predicate = |name: &str| -> bool {
-                        let lower = name.to_lowercase();
-                        lower.ends_with(".appimage") || lower.ends_with(".deb")
-                    };
-                    #[cfg(not(any(
-                        target_os = "windows",
-                        target_os = "macos",
-                        target_os = "linux"
-                    )))]
-                    let predicate = |_: &str| false;
+                    let release_assets: Vec<GitHubReleaseAsset> = assets
+                        .iter()
+                        .filter_map(|item| {
+                            let name = item.get("name")?.as_str()?.to_string();
+                            let url = item.get("browser_download_url")?.as_str()?.to_string();
+                            Some(GitHubReleaseAsset {
+                                name,
+                                browser_download_url: url,
+                            })
+                        })
+                        .collect();
 
-                    for asset in assets {
-                        if let (Some(name), Some(url)) = (
-                            asset.get("name").and_then(|n| n.as_str()),
-                            asset.get("browser_download_url").and_then(|u| u.as_str()),
-                        ) {
-                            if predicate(name) {
-                                return Some(url.to_string());
-                            }
-                        }
-                    }
+                    return find_desktop_installer_url_in_assets(&release_assets);
                 }
             }
         }
     }
 
-    // 后备方案：使用标准发布产物命名约定
-    #[cfg(target_os = "windows")]
-    {
-        Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
-        ))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    None
 }
 
 /// GET /api/update/check
@@ -439,30 +376,72 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     // 边缘缓存与 GitHub 分页合并后，按通道倒序给出全部历史版本。
     if let Ok(releases) = jeikcode_updater::list_releases().await {
         let matched = jeikcode_updater::filter_channel_releases(&releases, updater_channel);
-        versions = matched
-            .iter()
-            .map(|r| UpdateVersionEntry {
-                version: r.tag_name.clone(),
-                notes: r.body.clone().filter(|s| !s.trim().is_empty()),
-                released_at: r.published_at.clone(),
-            })
-            .collect();
-        if let Some(rel) = matched.first() {
-            latest_version = rel.tag_name.clone();
-            release_notes = rel.body.clone();
-            released_at = rel.published_at.clone();
-            let assets: Vec<GitHubReleaseAsset> = rel
-                .assets
+        if is_desktop {
+            // 桌面端环境：严格筛选出包含当前平台有效桌面安装包的 Release 列表
+            let desktop_releases: Vec<&GitHubRelease> = matched
                 .iter()
-                .map(|a| GitHubReleaseAsset {
-                    name: a.name.clone(),
-                    browser_download_url: a.browser_download_url.clone(),
+                .filter(|r| {
+                    let assets: Vec<GitHubReleaseAsset> = r
+                        .assets
+                        .iter()
+                        .map(|a| GitHubReleaseAsset {
+                            name: a.name.clone(),
+                            browser_download_url: a.browser_download_url.clone(),
+                        })
+                        .collect();
+                    find_desktop_installer_url_in_assets(&assets).is_some()
                 })
                 .collect();
-            if is_desktop {
-                download_url = find_desktop_installer_url_in_assets(&assets)
-                    .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
+
+            versions = desktop_releases
+                .iter()
+                .map(|r| UpdateVersionEntry {
+                    version: r.tag_name.clone(),
+                    notes: r.body.clone().filter(|s| !s.trim().is_empty()),
+                    released_at: r.published_at.clone(),
+                })
+                .collect();
+
+            if let Some(rel) = desktop_releases.first() {
+                latest_version = rel.tag_name.clone();
+                release_notes = rel.body.clone();
+                released_at = rel.published_at.clone();
+                let assets: Vec<GitHubReleaseAsset> = rel
+                    .assets
+                    .iter()
+                    .map(|a| GitHubReleaseAsset {
+                        name: a.name.clone(),
+                        browser_download_url: a.browser_download_url.clone(),
+                    })
+                    .collect();
+                download_url = find_desktop_installer_url_in_assets(&assets);
             } else {
+                // 如果远端所有 Release 均无当前操作系统的桌面安装包，则当前桌面版本已是最新，绝不误报有更新
+                latest_version = current_version.clone();
+                download_url = None;
+            }
+        } else {
+            versions = matched
+                .iter()
+                .map(|r| UpdateVersionEntry {
+                    version: r.tag_name.clone(),
+                    notes: r.body.clone().filter(|s| !s.trim().is_empty()),
+                    released_at: r.published_at.clone(),
+                })
+                .collect();
+
+            if let Some(rel) = matched.first() {
+                latest_version = rel.tag_name.clone();
+                release_notes = rel.body.clone();
+                released_at = rel.published_at.clone();
+                let assets: Vec<GitHubReleaseAsset> = rel
+                    .assets
+                    .iter()
+                    .map(|a| GitHubReleaseAsset {
+                        name: a.name.clone(),
+                        browser_download_url: a.browser_download_url.clone(),
+                    })
+                    .collect();
                 download_url = find_cli_asset_url(&assets, &latest_version).or_else(|| {
                     jeikcode_updater::detect_target()
                         .map(|target| jeikcode_updater::binary_url(&latest_version, target))
@@ -492,10 +471,7 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                         released_at = rel.published_at;
                         got_rel = true;
                         if is_desktop {
-                            download_url = find_desktop_installer_url_in_assets(&rel.assets)
-                                .or_else(|| {
-                                    resolve_desktop_installer_url_fallback(&latest_version)
-                                });
+                            download_url = find_desktop_installer_url_in_assets(&rel.assets);
                         } else {
                             download_url = find_cli_asset_url(&rel.assets, &latest_version)
                                 .or_else(|| {
@@ -517,10 +493,7 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                             release_notes = rel.body;
                             released_at = rel.published_at;
                             if is_desktop {
-                                download_url = find_desktop_installer_url_in_assets(&rel.assets)
-                                    .or_else(|| {
-                                        resolve_desktop_installer_url_fallback(&latest_version)
-                                    });
+                                download_url = find_desktop_installer_url_in_assets(&rel.assets);
                             } else {
                                 download_url = find_cli_asset_url(&rel.assets, &latest_version)
                                     .or_else(|| {
@@ -543,8 +516,9 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         }
     }
 
-    let has_update =
-        !latest_version.is_empty() && compare_versions(&latest_version, &current_version);
+    let has_update = !latest_version.is_empty()
+        && compare_versions(&latest_version, &current_version)
+        && (!is_desktop || download_url.is_some());
 
     Json(UpdateCheckResponse {
         current_version,
@@ -666,31 +640,9 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
 
     let mut response = client.get(&download_url).send().await?;
     if !response.status().is_success() {
-        let repo = jeikcode_config::endpoints::update_repo();
-        let tag = if version_str.starts_with('v') || version_str.starts_with('V') {
-            version_str.clone()
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("下载安装包失败 (404 Not Found)：下载地址不可用或资源不存在，请前往 GitHub Releases 确认");
         } else {
-            format!("v{version_str}")
-        };
-        let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
-        let fallback_candidates = vec![
-            format!("https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"),
-            format!("https://github.com/{repo}/releases/download/{tag}/皮皮跑腿 (PipiRunner)_{clean_ver}_x64-setup.exe"),
-            format!("https://github.com/{repo}/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"),
-        ];
-        let mut recovered = false;
-        for candidate in fallback_candidates {
-            if candidate != download_url {
-                if let Ok(alt_resp) = client.get(&candidate).send().await {
-                    if alt_resp.status().is_success() {
-                        response = alt_resp;
-                        recovered = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !recovered {
             anyhow::bail!("下载安装包失败，HTTP 状态码: {}", response.status());
         }
     }
@@ -698,14 +650,22 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
     let total_bytes = response.content_length().unwrap_or(0);
     let temp_dir = std::env::temp_dir();
 
-    #[cfg(target_os = "windows")]
-    let installer_filename = format!("Zap-Setup-{}.exe", version_str);
-    #[cfg(target_os = "macos")]
-    let installer_filename = format!("JeikCode-Desktop-{}.dmg", version_str);
-    #[cfg(target_os = "linux")]
-    let installer_filename = format!("JeikCode-Desktop-{}.AppImage", version_str);
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let installer_filename = format!("JeikCode-Desktop-{}", version_str);
+    let installer_filename = download_url
+        .split('?')
+        .next()
+        .and_then(|u| u.split('/').last())
+        .filter(|s| !s.is_empty() && s.contains('.'))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            #[cfg(target_os = "windows")]
+            { format!("installer-{version_str}.exe") }
+            #[cfg(target_os = "macos")]
+            { format!("installer-{version_str}.dmg") }
+            #[cfg(target_os = "linux")]
+            { format!("installer-{version_str}.AppImage") }
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            { format!("installer-{version_str}") }
+        });
 
     let installer_path = temp_dir.join(installer_filename);
 

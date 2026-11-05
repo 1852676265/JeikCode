@@ -72,12 +72,12 @@ jobs:
           path: webui/ios/App/JeikCode.ipa
           retention-days: 14
 
-      - name: Upload IPA to GitHub Release
+      - name: Upload IPA to GitHub Release via GitHub CLI
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: webui/ios/App/JeikCode.ipa
-          fail_on_unmatched_files: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Uploading JeikCode.ipa via GitHub CLI..."
+          for i in 1 2 3; do
+            gh release upload "${{ github.ref_name }}" webui/ios/App/JeikCode.ipa --clobber && break || sleep 5
+          done
