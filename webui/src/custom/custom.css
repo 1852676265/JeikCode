@@ -359,6 +359,24 @@
   gap: 18px;
 }
 
+.dsh-general-card-elevated {
+  position: relative;
+  z-index: 30;
+}
+
+.dsh-settings-model-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.dsh-settings-server-pill {
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
 .dsh-general-meta {
   display: flex;
   flex-direction: column;
@@ -1245,124 +1263,6 @@
 
 .dsh-boot-anim-overlay:hover .dsh-boot-anim-skip-hint {
   color: #38bdf8;
-}
-
-/* ─── dsh-pet 桌面伴侣挂件样式 ─── */
-.dsh-pet-widget {
-  position: fixed;
-  z-index: 99998;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  user-select: none;
-  cursor: grab;
-  transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-.dsh-pet-widget:active {
-  cursor: grabbing;
-}
-
-.dsh-pet-bubble {
-  position: absolute;
-  bottom: calc(100% + 10px);
-  background: rgba(15, 23, 42, 0.92);
-  border: 1px solid rgba(56, 189, 248, 0.45);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.4), 0 0 12px rgba(56, 189, 248, 0.25);
-  backdrop-filter: blur(8px);
-  color: #f8fafc;
-  font-size: 11px;
-  line-height: 1.4;
-  padding: 6px 12px;
-  border-radius: 8px;
-  white-space: nowrap;
-  pointer-events: none;
-  animation: dshPetBubbleFade 0.25s ease-out;
-}
-
-.dsh-pet-bubble::after {
-  content: '';
-  position: absolute;
-  top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  border-width: 5px;
-  border-style: solid;
-  border-color: rgba(15, 23, 42, 0.92) transparent transparent transparent;
-}
-
-@keyframes dshPetBubbleFade {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.dsh-pet-body {
-  position: relative;
-  width: 130px;
-  height: 130px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  filter: drop-shadow(0 8px 24px rgba(14, 165, 233, 0.45));
-  animation: dshPetFloat 3.6s ease-in-out infinite alternate;
-}
-
-.dsh-pet-video {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  pointer-events: auto;
-  user-select: none;
-  -webkit-user-drag: none;
-}
-
-@keyframes dshPetFloat {
-  0% { transform: translateY(0px) rotate(0deg); }
-  50% { transform: translateY(-6px) rotate(1.5deg); }
-  100% { transform: translateY(-2px) rotate(-1.5deg); }
-}
-
-.dsh-pet-body.is-patting {
-  animation: dshPetBounce 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-@keyframes dshPetBounce {
-  0% { transform: scale(1); }
-  40% { transform: scale(1.22, 0.82); }
-  75% { transform: scale(0.92, 1.15); }
-  100% { transform: scale(1); }
-}
-
-.dsh-pet-controls {
-  position: absolute;
-  top: calc(100% + 4px);
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.18s ease;
-}
-
-.dsh-pet-widget:hover .dsh-pet-controls {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.dsh-pet-btn {
-  background: rgba(15, 23, 42, 0.85);
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  color: #94a3b8;
-  font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: all 0.12s ease;
-}
-
-.dsh-pet-btn:hover {
-  color: #38bdf8;
-  border-color: #38bdf8;
-  background: rgba(14, 165, 233, 0.2);
 }
 
 /* ─── DSH Startup Screen 1:1 配置面板样式 (__ss_*) ─── */

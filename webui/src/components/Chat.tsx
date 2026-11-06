@@ -8740,23 +8740,21 @@ export function Chat({
     });
   }
 
-  const topModelChrome = (() => {
-    const slot = topModelSlot || (typeof document !== 'undefined' ? document.getElementById('top-nav-model-slot') : null);
-    if (!slot) return null;
-    return createPortal(
-      <div class="top-model-row">
-        <ModelSelector
-          value={provider}
-          onChange={(p) => switchProvider(p)}
-          onDefaultChange={followDefaultProvider}
-          sessionId={sessionId ?? activeIdRef.current}
-          direction="down"
-          onOpenModelConfig={onOpenModelConfig}
-        />
-      </div>,
-      slot,
-    );
-  })();
+  const currentSessionIdForModel = sessionId ?? activeIdRef.current;
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    (window as any).__jeikcodeChatModelBridge = {
+      provider,
+      sessionId: currentSessionIdForModel,
+      switchProvider: (p: string) => switchProvider(p),
+      followDefaultProvider: (p: string) => followDefaultProvider(p),
+      onOpenModelConfig,
+    };
+    window.dispatchEvent(new CustomEvent('jeikcode:chat-model-bridge-update'));
+  }, [provider, currentSessionIdForModel, onOpenModelConfig]);
+
+  const topModelChrome = null;
 
   if (landing) {
     return (

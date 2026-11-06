@@ -74,6 +74,18 @@ export interface ShellOverlayContribution {
   render: () => ComponentChildren;
 }
 
+export interface SidebarNavContribution {
+  id: string;
+  order: number;
+  label: string;
+  icon?: ComponentChildren;
+  badge?: string | number;
+  active?: boolean;
+  pluginPackage?: string;
+  onClick?: () => void;
+  render?: () => ComponentChildren;
+}
+
 export interface SlotMap {
   'settings.section': SettingsSectionContribution;
   'settings.action': SettingsActionContribution;
@@ -81,6 +93,7 @@ export interface SlotMap {
   'settings.plugins.tab': SettingsPluginsTabContribution;
   'plugins.tab': PluginsManagerTabContribution;
   'shell.overlay': ShellOverlayContribution;
+  'sidebar.nav': SidebarNavContribution;
 }
 
 export type SlotKey = keyof SlotMap;
@@ -169,6 +182,14 @@ export interface ExternalPluginPackage {
     type: 'boolean' | 'string' | 'number' | 'select';
     options?: { label: string; value: string }[];
   }[];
+  contributesSidebarNav?: {
+    id?: string;
+    label: string;
+    badge?: string | number;
+    order?: number;
+    eventName?: string;
+    sectionId?: string;
+  };
 }
 
 export interface MarketListingVersion {
@@ -421,6 +442,17 @@ const DEFAULT_BUILTIN_PLUGINS: BuiltinPluginEntry[] = [
     scope: 'global',
     enabled: false,
     runtimePhase: 'unobserved',
+  },
+  {
+    id: 'glass-theme',
+    name: '@zap/glass-theme',
+    title: '苹果毛玻璃与透明度定制 (Apple Glass & Opacity)',
+    description: '提供全景苹果液态毛玻璃视觉、工作台侧边栏/卡片透明度无级调节、高斯模糊度与壁纸光晕控制。',
+    moduleName: '@zap/glass-theme/suite',
+    scope: 'global',
+    enabled: true,
+    runtimePhase: 'active',
+    configTabId: 'glass-theme-config',
   },
 ];
 
@@ -806,6 +838,7 @@ export class ZapPluginKernel {
     'settings.plugins.tab': new Map(),
     'plugins.tab': new Map(),
     'shell.overlay': new Map(),
+    'sidebar.nav': new Map(),
   };
 
   private builtinPlugins: BuiltinPluginEntry[] = [];
@@ -1427,20 +1460,29 @@ export class ZapPluginKernel {
       }
     }
 
-    // Apply desktop pet overlay if `dsh-pet` or any pet extension package is enabled
-    if (
-      pkg.name === 'dsh-pet' ||
-      pkg.name === '@user-plugin/dsh-pet' ||
-      pkg.name.includes('pet')
-    ) {
-      const overlayId = `pet-widget-${pkg.name}`;
-      const unreg = this.registerSlot('shell.overlay', {
-        id: overlayId,
-        order: 20,
+    // If plugin declares a sidebar navigation entry (e.g. future DevOrbit plugin), mount into `sidebar.nav`
+    if (pkg.contributesSidebarNav && pkg.contributesSidebarNav.label) {
+      const navCfg = pkg.contributesSidebarNav;
+      const navId = navCfg.id || `sidebar-nav-${pkg.name}`;
+      const unregNav = this.registerSlot('sidebar.nav', {
+        id: navId,
+        order: navCfg.order ?? 50,
+        label: navCfg.label,
+        badge: navCfg.badge,
         pluginPackage: pkg.name,
-        render: () => h(PetCompanionOverlay, { pkg }),
+        onClick: () => {
+          if (navCfg.eventName) {
+            window.dispatchEvent(new CustomEvent(navCfg.eventName, { detail: { pkg } }));
+          } else if (navCfg.sectionId) {
+            window.dispatchEvent(
+              new CustomEvent('zap:open-deepseek-settings-center', {
+                detail: { section: navCfg.sectionId },
+              }),
+            );
+          }
+        },
       });
-      cleanups.push(unreg);
+      cleanups.push(unregNav);
     }
 
     // Attempt to dynamically load plugin bundle script if present
@@ -1595,229 +1637,6 @@ function BootAnimationOverlay({
         ),
         h('span', { class: 'dsh-boot-anim-skip-hint' }, '点击任意区域或按 [Esc] 跳过'),
       ),
-    ),
-  );
-}
-
-// =============================================================================
-// 6. dsh-pet 客户端桌面伴侣与桌宠挂件组件（支持官方透明 WebM 视频动效）
-// =============================================================================
-
-const PET_QUOTES = [
-  '小鲸鱼一直在陪你写代码哦~ 🐳',
-  '代码写得真棒！今天也是高效的一天！✨',
-  '遇到 Bug 别慌，深呼吸一下再看看日志~ 💡',
-  'DeepSeek 模型正在施展魔法推理中...',
-  '累了的话记得喝口水休息一下哦 (oﾟ▽ﾟ)o',
-];
-
-const PET_IDLE_ACTIONS = [
-  '东张西望.webm',
-  '原地小憩沉眠.webm',
-  '原地漂浮踏步.webm',
-];
-
-const PET_PAT_ACTIONS = [
-  '原地敲击桌面互动.webm',
-  '原地专心玩魔方.webm',
-  '可爱宅舞.webm',
-  '吃Token.webm',
-  '三球抛接.webm',
-];
-
-function PetCompanionOverlay({ pkg }: { pkg: ExternalPluginPackage }) {
-  const [pos, setPos] = useState(() => {
-    try {
-      const saved = localStorage.getItem('dsh-pet:position');
-      if (saved) return JSON.parse(saved);
-    } catch {
-      /* ignore */
-    }
-    const defX = typeof window !== 'undefined' ? Math.max(20, window.innerWidth - 150) : 900;
-    const defY = typeof window !== 'undefined' ? Math.max(20, window.innerHeight - 170) : 600;
-    return { x: defX, y: defY };
-  });
-
-  const [affinity, setAffinity] = useState(() => {
-    try {
-      return Number(localStorage.getItem('dsh-pet:affinity')) || 99;
-    } catch {
-      return 99;
-    }
-  });
-
-  const [patting, setPatting] = useState(false);
-  const [hidden, setHidden] = useState(false);
-  const [quote, setQuote] = useState('小鲸鱼一直在陪你写代码哦~ 🐳');
-  const [showBubble, setShowBubble] = useState(true);
-
-  // 官方 WebM 动效支持
-  const [currentAction, setCurrentAction] = useState('东张西望.webm');
-  const [isPlayingCustomAction, setIsPlayingCustomAction] = useState(false);
-  const [videoFailed, setVideoFailed] = useState(false);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-
-  const draggingRef = useRef(false);
-  const offsetRef = useRef({ x: 0, y: 0 });
-
-  useEffect(() => {
-    const bubbleTimer = setInterval(() => {
-      const randomQuote = PET_QUOTES[Math.floor(Math.random() * PET_QUOTES.length)];
-      setQuote(randomQuote);
-      setShowBubble(true);
-      setTimeout(() => setShowBubble(false), 5000);
-    }, 16000);
-
-    return () => clearInterval(bubbleTimer);
-  }, []);
-
-  const handleMouseDown = (e: MouseEvent) => {
-    if ((e.target as HTMLElement).closest('.dsh-pet-btn')) return;
-    draggingRef.current = true;
-    offsetRef.current = {
-      x: e.clientX - pos.x,
-      y: e.clientY - pos.y,
-    };
-
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      if (!draggingRef.current) return;
-      const newX = Math.max(10, Math.min(window.innerWidth - 120, moveEvent.clientX - offsetRef.current.x));
-      const newY = Math.max(10, Math.min(window.innerHeight - 120, moveEvent.clientY - offsetRef.current.y));
-      setPos({ x: newX, y: newY });
-    };
-
-    const handleMouseUp = () => {
-      if (draggingRef.current) {
-        draggingRef.current = false;
-        try {
-          localStorage.setItem('dsh-pet:position', JSON.stringify(pos));
-        } catch {
-          /* ignore */
-        }
-      }
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-  };
-
-  const handlePat = () => {
-    setPatting(true);
-    const newAffinity = affinity + 1;
-    setAffinity(newAffinity);
-    try {
-      localStorage.setItem('dsh-pet:affinity', String(newAffinity));
-    } catch {
-      /* ignore */
-    }
-
-    // 随机播放互动动效（魔方、宅舞、吃Token、三球抛接等）
-    const nextAction = PET_PAT_ACTIONS[Math.floor(Math.random() * PET_PAT_ACTIONS.length)];
-    setCurrentAction(nextAction);
-    setIsPlayingCustomAction(true);
-    if (videoRef.current) {
-      videoRef.current.currentTime = 0;
-      videoRef.current.play().catch(() => {});
-    }
-
-    setQuote(`摸摸头！好感度 +1（当前: ${newAffinity}）(oﾟ▽ﾟ)o`);
-    setShowBubble(true);
-    setTimeout(() => setPatting(false), 450);
-  };
-
-  const handleVideoEnded = () => {
-    if (isPlayingCustomAction) {
-      setIsPlayingCustomAction(false);
-      // 动作结束恢复待机状态
-      const idleAction = PET_IDLE_ACTIONS[Math.floor(Math.random() * PET_IDLE_ACTIONS.length)];
-      setCurrentAction(idleAction);
-    }
-  };
-
-  const handleResetPos = () => {
-    const defX = window.innerWidth - 150;
-    const defY = window.innerHeight - 170;
-    const newPos = { x: defX, y: defY };
-    setPos(newPos);
-    try {
-      localStorage.setItem('dsh-pet:position', JSON.stringify(newPos));
-    } catch {
-      /* ignore */
-    }
-  };
-
-  if (hidden) return null;
-
-  const videoUrl = `/api/plugins/assets/dsh-pet/assets/webm/${encodeURIComponent(currentAction)}`;
-
-  return h(
-    'div',
-    {
-      class: 'dsh-pet-widget',
-      style: {
-        left: `${pos.x}px`,
-        top: `${pos.y}px`,
-      },
-      onMouseDown: handleMouseDown,
-    },
-    showBubble ? h('div', { class: 'dsh-pet-bubble' }, quote) : null,
-    h(
-      'div',
-      {
-        class: `dsh-pet-body ${patting ? 'is-patting' : ''}`,
-        onClick: handlePat,
-        title: `DeepSeek 官方开源桌面伴侣 (dsh-pet) · 好感度 ${affinity}（点击互动 / 按住拖拽）`,
-      },
-      !videoFailed
-        ? h('video', {
-            ref: videoRef,
-            class: 'dsh-pet-video',
-            src: videoUrl,
-            autoPlay: true,
-            loop: !isPlayingCustomAction,
-            muted: true,
-            playsInline: true,
-            onEnded: handleVideoEnded,
-            onError: () => setVideoFailed(true),
-          })
-        : h(
-            'svg',
-            { width: 84, height: 84, viewBox: '0 0 100 100', fill: 'none' },
-            h('circle', { cx: 50, cy: 50, r: 42, fill: 'rgba(14, 165, 233, 0.12)' }),
-            h('path', {
-              d: 'M25 58 C25 40, 42 28, 65 30 C78 31, 88 40, 88 52 C88 66, 74 74, 52 74 C36 74, 25 68, 25 58 Z',
-              fill: '#0284c7',
-            }),
-            h('path', {
-              d: 'M32 60 C32 48, 45 42, 60 44 C72 45, 80 52, 80 58 C80 66, 70 70, 52 70 C40 70, 32 66, 32 60 Z',
-              fill: '#38bdf8',
-              opacity: 0.85,
-            }),
-            h('path', {
-              d: 'M26 56 C20 50, 12 46, 10 52 C12 56, 18 58, 22 60 C18 64, 12 66, 10 70 C14 74, 20 68, 26 62 Z',
-              fill: '#0284c7',
-            }),
-            h('path', {
-              d: 'M48 64 C52 70, 60 72, 62 66 C58 64, 52 63, 48 64 Z',
-              fill: '#0369a1',
-            }),
-            h('circle', { cx: 72, cy: 46, r: 4, fill: '#0f172a' }),
-            h('circle', { cx: 73.5, cy: 44.5, r: 1.5, fill: '#ffffff' }),
-            h('ellipse', { cx: 68, cy: 52, rx: 3, ry: 1.8, fill: '#f43f5e', opacity: 0.65 }),
-            h('path', { d: 'M76 50 Q78 52 80 50', stroke: '#0f172a', strokeWidth: 1.4, fill: 'none' }),
-            h('circle', { cx: 54, cy: 22, r: 2.5, fill: '#38bdf8' }),
-            h('circle', { cx: 58, cy: 16, r: 3.5, fill: '#38bdf8' }),
-            h('circle', { cx: 63, cy: 23, r: 2, fill: '#38bdf8' }),
-          ),
-    ),
-    h(
-      'div',
-      { class: 'dsh-pet-controls' },
-      h('button', { class: 'dsh-pet-btn', onClick: handlePat }, '互动'),
-      h('button', { class: 'dsh-pet-btn', onClick: handleResetPos }, '复位'),
-      h('button', { class: 'dsh-pet-btn', onClick: () => setHidden(true) }, '隐藏'),
     ),
   );
 }

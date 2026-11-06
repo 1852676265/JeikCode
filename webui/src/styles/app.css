@@ -28,7 +28,8 @@ body {
   font-family: var(--app-sans-font-family);
   font-size: 14px;
   color: var(--app-primary-foreground);
-  background: var(--app-primary-background);
+  background: var(--zap-wallpaper, var(--app-primary-background));
+  background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -50,9 +51,13 @@ body {
   height: 100%;
   width: 100%;
   overflow: hidden;
+  padding: 16px;
+  gap: 16px;
+  box-sizing: border-box;
+  background: transparent;
 }
 
-/* Right-hand column: sticky session-title header above the chat body (no top bar). */
+/* Right-hand column: floating Apple Liquid Glass panel */
 .main-column {
   display: flex;
   flex-direction: column;
@@ -61,7 +66,12 @@ body {
   min-height: 0;
   overflow: hidden;
   position: relative;
-  background: var(--app-primary-background);
+  background: var(--zap-glass-panel-bg, rgba(255, 255, 255, 0.48));
+  backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  -webkit-backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  border: 1px solid var(--zap-glass-border, rgba(255, 255, 255, 0.85));
+  border-radius: 26px;
+  box-shadow: var(--zap-glass-shadow);
 }
 
 /* 当左侧边栏折叠收起时，主列内容区与输入框自适应充分利用屏幕横向空间 */
@@ -89,14 +99,15 @@ body {
 .session-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 16px 0 18px;
-  height: 42px;
-  min-height: 42px;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 22px 8px 22px;
+  height: 56px;
+  min-height: 56px;
   flex-shrink: 0;
-  background: var(--app-primary-background);
-  border-bottom: 1px solid var(--app-primary-border-color, rgba(128, 128, 128, 0.15));
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+  background: transparent;
+  border-bottom: none;
+  box-shadow: none;
   z-index: 35;
   overflow: visible !important;
   position: relative;
@@ -106,9 +117,9 @@ body {
   container-name: session-header;
 }
 :root[data-theme='light'] .session-header {
-  background: #ffffff;
-  border-bottom-color: #cbd5e1;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+  background: transparent;
+  border-bottom: none;
+  box-shadow: none;
 }
 
 .header-spacer {
@@ -1553,7 +1564,7 @@ body {
 }
 
 .app-sidebar {
-  background: var(--app-primary-background);
+  background: transparent;
 }
 
 .session-body {
@@ -1564,6 +1575,7 @@ body {
   min-height: 0;
   overflow: hidden;
   position: relative;
+  background: transparent;
 }
 
 .session-row {
@@ -5945,11 +5957,15 @@ body {
 /* === Sidebar / session list === */
 .session-list {
   /* 侧栏支持用户拖拽拉宽，默认自适应 clamp */
-  width: var(--sidebar-width, clamp(260px, 15vw, 320px));
-  min-width: 220px;
-  max-width: 600px;
-  background: var(--app-secondary-background);
-  border-right: 1px solid var(--app-primary-border-color);
+  width: var(--sidebar-width, clamp(248px, 16vw, 272px));
+  min-width: 236px;
+  max-width: 480px;
+  background: var(--zap-glass-bg, rgba(255, 255, 255, 0.56));
+  backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  -webkit-backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  border: 1px solid var(--zap-glass-border, rgba(255, 255, 255, 0.85));
+  border-radius: 24px;
+  box-shadow: var(--zap-glass-shadow);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -6694,6 +6710,115 @@ body {
 }
 @keyframes session-item-spin {
   to { transform: rotate(360deg); }
+}
+
+/* ==============================================================================
+   Zap Apple Glassmorphism Sidebar Styles (保留完整真实功能，适配毛玻璃胶囊与卡片质感)
+   ============================================================================== */
+.sidebar-brand-row {
+  padding: 16px 14px 10px;
+}
+
+.sidebar-segment-tabs {
+  margin: 4px 12px 10px;
+  padding: 4px;
+  border-radius: var(--zap-pill-radius, 9999px);
+  background: var(--zap-glass-panel-bg);
+  border: 1px solid var(--zap-glass-border);
+  box-shadow: var(--zap-glass-shadow);
+}
+
+.sidebar-segment-tab {
+  border-radius: var(--zap-pill-radius, 9999px);
+  font-weight: 600;
+  transition: all 0.16s ease;
+}
+
+.sidebar-segment-tab.active {
+  background: var(--zap-glass-card-bg);
+  color: var(--app-primary-foreground);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+
+.sidebar-new-chat-btn {
+  border-radius: var(--zap-pill-radius, 9999px);
+  background: var(--zap-glass-card-bg);
+  border: 1px solid var(--zap-glass-border);
+  box-shadow: var(--zap-glass-shadow);
+  color: var(--app-primary-foreground);
+  font-weight: 600;
+  transition: all 0.16s ease;
+}
+
+.sidebar-new-chat-btn:hover {
+  background: var(--zap-glass-card-hover-bg);
+  transform: translateY(-0.5px);
+}
+
+.sidebar-action-item {
+  border-radius: 12px;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.sidebar-action-item:hover,
+.sidebar-action-item.active {
+  background: var(--app-list-hover-background);
+}
+
+.project-group-header {
+  border-radius: 12px;
+}
+
+.session-list-body {
+  padding: 4px 10px 14px;
+}
+
+.session-item {
+  border-radius: 14px;
+  padding: 4px 8px;
+  color: var(--app-secondary-foreground);
+  background: transparent;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+
+.session-item:hover {
+  background: var(--app-list-hover-background);
+  color: var(--app-primary-foreground);
+}
+
+.session-item.active {
+  background: var(--zap-glass-card-bg);
+  border-color: var(--zap-glass-border);
+  border-radius: 14px;
+  box-shadow: var(--zap-glass-shadow);
+  color: var(--app-primary-foreground);
+}
+
+.session-item.active .session-item-name {
+  color: var(--app-primary-foreground);
+  font-weight: 600;
+}
+
+.sidebar-plugin-nav-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-plugin-nav-slot:empty {
+  display: none;
+}
+
+.sidebar-bottom {
+  border-top: 1px solid var(--zap-glass-border-subtle);
+  background: transparent;
+  padding: 8px 10px;
+}
+
+.sidebar-bottom-settings-btn {
+  width: 100%;
+  position: relative;
 }
 
 /* Kebab (⋮) button — appears on hover or while its menu is open. */
@@ -16700,6 +16825,122 @@ body {
   .server-profile-actions {
     justify-content: flex-end;
   }
+}
+
+/* ==============================================================================
+   Zap Apple Glassmorphism Header, Chat Canvas & Composer (保留全部真实控件与深浅主题令牌)
+   ============================================================================== */
+.session-title-btn,
+.top-nav-btn {
+  border-radius: var(--zap-pill-radius, 9999px);
+  background: var(--zap-glass-card-bg);
+  border: 1px solid var(--zap-glass-border);
+  box-shadow: var(--zap-glass-shadow);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.session-title-btn:hover,
+.top-nav-btn:hover {
+  background: var(--zap-glass-card-hover-bg);
+}
+
+/* 顶栏右侧操作与选择器（本地宿主、Effort、模型选择器、语言、主题等）已统一收拢至左下角设置中心，保持会话顶栏清爽 */
+.session-header > .top-nav-actions,
+.top-nav-lang-btn,
+.top-nav-theme-btn,
+.top-nav-desktop-action,
+.top-nav-more-lang-item,
+.top-nav-more-theme-item,
+.top-nav-actions > button[title="刷新"],
+.top-nav-actions > button[aria-label="刷新"],
+.top-nav-actions > button[aria-label="Refresh"] {
+  display: none !important;
+}
+
+.header-editor-tab {
+  border-radius: var(--zap-pill-radius, 9999px);
+}
+
+.header-editor-tab.active {
+  background: var(--zap-glass-card-bg);
+  border-color: var(--zap-glass-border);
+  box-shadow: var(--zap-glass-shadow);
+}
+
+.chat-stage,
+.chat-main-column,
+.chat-landing {
+  background: transparent;
+}
+
+.landing-project-btn,
+.landing-chip {
+  background: var(--zap-glass-card-bg);
+  border: 1px solid var(--zap-glass-border);
+  box-shadow: var(--zap-glass-shadow);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.landing-project-btn:hover,
+.landing-chip:hover {
+  background: var(--zap-glass-card-hover-bg);
+}
+
+/* 用户提问卡片：靠右毛玻璃圆角卡片 */
+.user-message-bubble {
+  background: var(--zap-glass-card-hover-bg);
+  border: 1px solid var(--zap-glass-border);
+  border-radius: 18px;
+  box-shadow: var(--zap-glass-shadow);
+  color: var(--app-primary-foreground);
+  backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  -webkit-backdrop-filter: blur(var(--zap-glass-blur, 28px));
+}
+
+/* 助手回复卡片：高斯模糊苹果毛玻璃卡片 */
+.timeline-message {
+  background: var(--zap-glass-card-bg);
+  backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  -webkit-backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  border: 1px solid var(--zap-glass-border);
+  border-radius: var(--zap-chat-card-radius, 22px);
+  box-shadow: var(--zap-glass-shadow);
+  padding: 20px 24px;
+  margin-bottom: 14px;
+  color: var(--app-primary-foreground);
+}
+
+/* 底部悬浮毛玻璃输入框（完整保留多行输入与底部工具栏控件） */
+.input-container {
+  background: transparent;
+}
+
+.input-box {
+  border-radius: 22px;
+  background: var(--zap-glass-card-bg);
+  backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  -webkit-backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  border: 1px solid var(--zap-glass-border);
+  box-shadow: var(--zap-glass-shadow-floating);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.input-box:focus-within {
+  border-color: color-mix(in srgb, var(--app-brand) 45%, var(--zap-glass-border));
+  box-shadow: var(--zap-glass-shadow-floating), 0 0 0 2px color-mix(in srgb, var(--app-brand) 16%, transparent);
+}
+
+.btn-send {
+  border-radius: 50%;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--app-brand) 38%, transparent);
+  transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+
+.btn-send:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--app-brand) 48%, transparent);
 }
 
 

@@ -23,6 +23,7 @@ import { FileExplorer } from './FileExplorer';
 import { getPageZoom } from '../lib/pageZoom';
 import { buildSessionAnalysisPrompt } from '../lib/sessionAnalysis';
 import { openDeepSeekSettingsCenter } from '../custom/custom-registry';
+import { zapPluginKernel } from '../custom/plugin-kernel';
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -525,6 +526,15 @@ export function Sidebar({
   // MCP menu: the rows come from `capabilities`; `/mcp/status` is consumed only to
   // auto-confirm an untrusted project (no prompt is rendered).
   const [mcpReloading, setMcpReloading] = useState(false);
+
+  // 订阅插件内核侧边栏预留插槽 (`sidebar.nav`)，如未来挂载 DevOrbit 等外部扩展时自动渲染
+  const [, setPluginNavTick] = useState(0);
+  useEffect(() => {
+    return zapPluginKernel.subscribe(() => {
+      setPluginNavTick((v) => v + 1);
+    });
+  }, []);
+  const sidebarPluginNavItems = zapPluginKernel.getSlotEntries('sidebar.nav');
 
   // 侧栏可拖拽宽度状态与本地持久化
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -2130,32 +2140,16 @@ export function Sidebar({
         </nav>
         <div class="sidebar-rail-bottom">
           <button
-            class={`sidebar-rail-btn sidebar-update-btn ${updateInfo?.has_update ? 'has-update' : ''}`}
-            onClick={() => {
-              onCloseDrawer?.();
-              onOpenUpdate?.();
-            }}
-            title={updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : t('update.modalTitle')}
-            aria-label={t('update.modalTitle')}
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-              <path d="M3 3v5h5" />
-              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-              <path d="M16 16h5v5" />
-            </svg>
-            {updateInfo?.has_update && <span class="sidebar-update-dot" />}
-          </button>
-          <button
             class="sidebar-rail-btn"
             onClick={() => {
               onCloseDrawer?.();
-              onOpenSettings('model');
+              openDeepSeekSettingsCenter('general');
             }}
-            title={t('settings.menuModel')}
-            aria-label={t('settings.menuModel')}
+            title={t('sidebar.settings')}
+            aria-label={t('sidebar.settings')}
           >
-            <ModelGlyph />
+            <GearIcon />
+            {updateInfo?.has_update && <span class="sidebar-update-dot" />}
           </button>
         </div>
       </aside>
@@ -2244,39 +2238,30 @@ export function Sidebar({
               <span class="sidebar-action-icon"><PlusIcon /></span>
               <span class="sidebar-action-label">{t('sidebar.newChat')}</span>
             </button>
-            <button
-              ref={skillsBtnRef}
-              class={'sidebar-action' + (skillsMenuOpen ? ' open' : '')}
-              onClick={(e) => toggleSkillsMenu(e as unknown as MouseEvent)}
-              aria-haspopup="menu"
-              aria-expanded={skillsMenuOpen}
-            >
-              <span class="sidebar-action-icon"><SparklesIcon /></span>
-              <span class="sidebar-action-label">{t('sidebar.skills')}</span>
-              {skillCount > 0 && <span class="sidebar-action-badge">{skillCount}</span>}
-              <span class="sidebar-action-caret"><ChevronDownIcon /></span>
-            </button>
-            <button
-              ref={mcpBtnRef}
-              class={'sidebar-action' + (mcpMenuOpen ? ' open' : '')}
-              onClick={(e) => toggleMcpMenu(e as unknown as MouseEvent)}
-              aria-haspopup="menu"
-              aria-expanded={mcpMenuOpen}
-            >
-              <span class="sidebar-action-icon"><McpIcon /></span>
-              <span class="sidebar-action-label">{t('sidebar.mcp')}</span>
-              {mcpCount > 0 && <span class="sidebar-action-badge">{mcpCount}</span>}
-              <span class="sidebar-action-caret"><ChevronDownIcon /></span>
-            </button>
-            <button
-              type="button"
-              class="sidebar-action zap-sidebar-plugins-btn"
-              onClick={() => openDeepSeekSettingsCenter('plugins')}
-              title={t('sidebar.plugins') || '插件中心'}
-            >
-              <span class="sidebar-action-icon"><PluginIcon /></span>
-              <span class="sidebar-action-label">{t('sidebar.plugins') || '插件中心'}</span>
-            </button>
+            {/* 侧边栏插件扩展预留区 (`sidebar.nav`)：后续如 DevOrbit 等插件挂载后在此区域显示 */}
+            <div class="sidebar-plugin-nav-slot" data-plugin-slot="sidebar.nav">
+              {sidebarPluginNavItems.map((item) =>
+                item.render ? (
+                  <div key={item.id} class="sidebar-plugin-nav-custom">
+                    {item.render()}
+                  </div>
+                ) : (
+                  <button
+                    key={item.id}
+                    type="button"
+                    class={'sidebar-action sidebar-plugin-nav-btn' + (item.active ? ' open' : '')}
+                    onClick={() => item.onClick?.()}
+                    title={item.label}
+                  >
+                    <span class="sidebar-action-icon">{item.icon || <PluginIcon />}</span>
+                    <span class="sidebar-action-label">{item.label}</span>
+                    {item.badge !== undefined && item.badge !== '' && (
+                      <span class="sidebar-action-badge">{item.badge}</span>
+                    )}
+                  </button>
+                ),
+              )}
+            </div>
           </div>
 
           <div class="session-group-header">
@@ -2515,49 +2500,21 @@ export function Sidebar({
   )}
 
       <div class="sidebar-bottom">
-        <span class="sidebar-bottom-spacer" />
         <button
-          class="sidebar-icon-btn"
+          type="button"
+          class="sidebar-action sidebar-bottom-settings-btn"
           onClick={() => {
             onCloseDrawer?.();
-            window.dispatchEvent(new CustomEvent('jeikcode:open_server_switcher'));
+            openDeepSeekSettingsCenter('general');
           }}
-          title="多主机管理与快速切换 (公司 / 家里 / 云端)"
-          aria-label="切换主机"
+          title={t('sidebar.settings')}
+          aria-label={t('sidebar.settings')}
         >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-            <line x1="8" y1="21" x2="16" y2="21" />
-            <line x1="12" y1="17" x2="12" y2="21" />
-          </svg>
-        </button>
-        <button
-          class={`sidebar-icon-btn sidebar-update-btn ${updateInfo?.has_update ? 'has-update' : ''}`}
-          onClick={() => {
-            onCloseDrawer?.();
-            onOpenUpdate?.();
-          }}
-          title={updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : t('update.modalTitle')}
-          aria-label={t('update.modalTitle')}
-        >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-            <path d="M16 16h5v5" />
-          </svg>
+          <span class="sidebar-action-icon">
+            <GearIcon />
+          </span>
+          <span class="sidebar-action-label">{t('sidebar.settings')}</span>
           {updateInfo?.has_update && <span class="sidebar-update-dot" />}
-        </button>
-        <button
-          class="sidebar-icon-btn sidebar-settings-btn"
-          onClick={() => {
-            onCloseDrawer?.();
-            onOpenSettings('model');
-          }}
-          title={t('settings.menuModel')}
-          aria-label={t('settings.menuModel')}
-        >
-          <ModelGlyph />
         </button>
       </div>
       {renderSkillsMenu()}

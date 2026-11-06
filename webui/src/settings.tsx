@@ -26,17 +26,23 @@ interface SettingsCtx {
 const Ctx = createContext<SettingsCtx | null>(null);
 
 const THEME_KEY = 'jeikcode.theme';
+const THEME_GLASS_MIGRATED_KEY = 'jeikcode.theme.glass_v2';
 const LANG_KEY = 'jeikcode.lang';
 
 function readTheme(): Theme {
   try {
+    if (localStorage.getItem(THEME_GLASS_MIGRATED_KEY) !== '1') {
+      localStorage.setItem(THEME_KEY, 'light');
+      localStorage.setItem(THEME_GLASS_MIGRATED_KEY, '1');
+      return 'light';
+    }
     const v = localStorage.getItem(THEME_KEY);
     if (v === 'light' || v === 'dark' || v === 'system') return v;
   } catch {
     /* ignore */
   }
-  // Default to clean Gemini-style dark mode
-  return 'dark';
+  // Default to Apple Glassmorphism light mode
+  return 'light';
 }
 
 export function detectBrowserPreferredLang(): Lang | null {
@@ -173,8 +179,41 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
 
 export function useSettings(): SettingsCtx {
   const c = useContext(Ctx);
-  if (!c) throw new Error('useSettings must be used within <SettingsProvider>');
-  return c;
+  if (c) return c;
+  const fallbackLang = readLang();
+  const fallbackTheme = readTheme();
+  return {
+    theme: fallbackTheme,
+    setTheme: (next: Theme) => {
+      document.documentElement.setAttribute('data-theme', next);
+      try {
+        localStorage.setItem(THEME_KEY, next);
+      } catch {
+        /* ignore */
+      }
+    },
+    lang: fallbackLang,
+    setLang: async (next: Lang) => {
+      document.documentElement.setAttribute('lang', next === 'zh' ? 'zh-CN' : next);
+      try {
+        localStorage.setItem(LANG_KEY, next);
+      } catch {
+        /* ignore */
+      }
+      await postLanguage(next).catch(() => {});
+    },
+    t: (key: MsgKey, params?: TParams) => {
+      const table = messages[fallbackLang] ?? messages.en;
+      let s = table[key] ?? messages.en[key] ?? key;
+      if (params) {
+        for (const k of Object.keys(params)) {
+          s = s.split(`{${k}}`).join(String(params[k]));
+        }
+      }
+      return s;
+    },
+    githubLogo: true,
+  };
 }
 
 /** Convenience hook when a component only needs the translator. */

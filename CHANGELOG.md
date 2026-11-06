@@ -21,6 +21,28 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.4 (2026-11-06)
+
+- **[UI & Settings] Consolidate top header controls into Settings Center and fix sidebar settings modal**:
+  - Fixed unclickable settings button on the bottom left sidebar by mounting the settings center directly within the application context.
+  - Consolidated top navigation controls (connected host status, reasoning effort, and model selector) into the Settings Center to maintain a clean, distraction-free chat header.
+
+- **[Plugins & Customization] Introduce Apple Glassmorphism and Opacity customization suite**:
+  - Introduced the `@zap/glass-theme` plugin suite enabling seamless real-time customization of sidebar, panel, and message card opacity, gaussian blur radius, and border highlight.
+  - Added 4 instant design presets (Apple Default, Ultra Transparent, Deep Frosted, and Solid Focus) alongside ambient aurora mesh wallpaper controls and saturation slider.
+  - Built-in live responsive CSS variable synchronization with real-time interactive preview card and local storage persistence.
+
+---
+
+- **[界面与设置] 修复侧边栏设置弹窗并统一收拢顶部栏控件至设置中心**:
+  - 修复左下角侧边栏「设置」按钮点击无响应问题，将设置中心直接挂载于应用主上下文，完整打通多语言与主题状态。
+  - 会话顶部栏操作全面收拢，将连接宿主状态、思考强度 (Effort) 胶囊与模型选择器迁移归纳至设置中心，保持会话视窗沉浸清爽。
+
+- **[插件与个性化] 推出全景苹果毛玻璃与透明度定制套件插件**:
+  - 正式发布 `@zap/glass-theme` 视觉定制插件，支持工作台侧边栏、对话消息卡片透明度、高斯模糊半径与高光边框的无级动态微调。
+  - 内置 4 套一键风格预设（苹果原汁、空灵极透、雾面厚磨砂、纯净低透），并支持流动极光壁纸开关与色彩浓度控制。
+  - 全局 CSS 变量实时联动渲染，内置交互式卡片透光预览，配置自动持久化保存且刷新无感恢复。
+
 ## v1.0.3 (2026-11-06)
 
 - **[Daemon & Updater] Fix Rust compilation type mismatch in updater API**:

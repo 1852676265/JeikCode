@@ -12,6 +12,7 @@ import { LiveReviewState, NotificationDock } from './components/NotificationDock
 import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { ServerSwitcherModal } from './components/ServerSwitcherModal';
+import { PluginCenterHostApp } from './custom/custom-registry';
 import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
@@ -490,6 +491,17 @@ export function App() {
   const [isLanding, setIsLanding] = useState(true);
 
   useEffect(() => {
+    const onOpenModelConfig = () => setSettingsSection('model');
+    const onOpenUpdateModal = () => setShowUpdateDialog(true);
+    window.addEventListener('jeikcode:open-model-config', onOpenModelConfig);
+    window.addEventListener('jeikcode:open-update-modal', onOpenUpdateModal);
+    return () => {
+      window.removeEventListener('jeikcode:open-model-config', onOpenModelConfig);
+      window.removeEventListener('jeikcode:open-update-modal', onOpenUpdateModal);
+    };
+  }, []);
+
+  useEffect(() => {
     let desktop = false;
     try {
       desktop = new URLSearchParams(window.location.search).get('desktop') === '1';
@@ -601,7 +613,11 @@ export function App() {
   // 用真实标题覆盖顶部标题头的临时标题（前 10 字）。仅在仍是同一会话且标题有变时更新。
   function handleActiveSessionMeta(s: SessionMetaWithProject) {
     setActiveSession((prev) =>
-      prev && prev.id === s.id && prev.name !== s.name ? { ...prev, name: s.name } : prev,
+      !prev ||
+      (prev.id === s.id &&
+        (prev.name !== s.name || prev.message_count !== s.message_count))
+        ? { ...(prev || s), ...s }
+        : prev,
     );
     // 当真实会话已经从后端拉出且已拥有消息时，才从乐观池移除对应的临时记录，杜绝首轮执行中断档消失
     setOptimisticSessions((prev) => {
@@ -1108,8 +1124,11 @@ export function App() {
                 </div>
               )}
             </div>
-          ) : activeSession?.name && (activeSession.message_count ?? 0) > 0 ? (
-            /* 桌面端会话标题：只有当该会话真实拥有消息时才展示其标题 */
+          ) : activeSession?.name &&
+            (!activeSession.id.startsWith('optimistic-') ||
+              !isLanding ||
+              (activeSession.message_count ?? 0) > 0) ? (
+            /* 桌面端会话标题：选中真实会话或会话已有消息时直接展示会话名称 */
             <button
               type="button"
               class={
@@ -1745,6 +1764,7 @@ export function App() {
         open={serverSwitcherOpen}
         onClose={() => setServerSwitcherOpen(false)}
       />
+      <PluginCenterHostApp />
       <NotificationDock
         liveReview={liveReview}
         chatPermission={pending}

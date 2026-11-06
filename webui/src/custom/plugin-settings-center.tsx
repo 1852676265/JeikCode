@@ -21,6 +21,8 @@ import {
   zapPluginKernel,
 } from './plugin-kernel';
 import { DshBootAnimationSettingsPanel } from './boot-animation-settings-panel';
+import { GlassThemeSettingsPanel } from './glass-theme-settings-panel';
+import { loadGlassThemeSettings } from './glass-theme-plugin';
 import {
   CapabilityItem,
   getCapabilities,
@@ -29,6 +31,10 @@ import {
   postLanguage,
   toggleCapability,
 } from '../api';
+import { useSettings, Theme } from '../settings';
+import { Lang } from '../i18n';
+import { ModelSelector } from '../components/ModelSelector';
+import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from '../lib/serverProfiles';
 
 // =============================================================================
 // 1. Icons (Matching @deepseek-ai/dsh-client-ui-primitives outline icons)
@@ -66,6 +72,16 @@ const IconCube = ({ size = 18 }: { size?: number }) => (
     <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
     <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
     <line x1="12" y1="22.08" x2="12" y2="12" />
+  </svg>
+);
+
+const IconPalette = ({ size = 18 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="13.5" cy="6.5" r=".5" fill="currentColor" />
+    <circle cx="17.5" cy="10.5" r=".5" fill="currentColor" />
+    <circle cx="8.5" cy="7.5" r=".5" fill="currentColor" />
+    <circle cx="6.5" cy="12.5" r=".5" fill="currentColor" />
+    <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.563-2.512 5.563-5.563C22 6.5 17.5 2 12 2z" />
   </svg>
 );
 
@@ -212,36 +228,68 @@ function PluginArtwork({ name, size = 24 }: { name: string; size?: number }) {
 // 3. Section 1: General Settings (`ui-settings-general`)
 // =============================================================================
 
-function GeneralSettingsSection() {
-  const [theme, setTheme] = useState<'light' | 'dark' | 'system'>(() => {
-    const v = localStorage.getItem('jeikcode.theme');
-    return v === 'light' || v === 'dark' || v === 'system' ? v : 'dark';
-  });
-  const [lang, setLang] = useState<'zh' | 'en' | 'vi'>(() => {
-    const v = localStorage.getItem('jeikcode.lang');
-    return v === 'en' || v === 'vi' || v === 'zh' ? v : 'zh';
-  });
+interface ChatModelBridgeState {
+  provider: string;
+  sessionId: string | null;
+  switchProvider: (p: string) => void;
+  followDefaultProvider: (p: string) => void;
+  onOpenModelConfig?: () => void;
+}
+
+function useChatModelBridge() {
+  const [, setTick] = useState(0);
+  const [fallbackProvider, setFallbackProvider] = useState('');
+
+  useEffect(() => {
+    const onUpdate = () => setTick((v) => v + 1);
+    window.addEventListener('jeikcode:chat-model-bridge-update', onUpdate);
+    return () => window.removeEventListener('jeikcode:chat-model-bridge-update', onUpdate);
+  }, []);
+
+  const raw = (typeof window !== 'undefined' ? (window as any).__jeikcodeChatModelBridge : null) as ChatModelBridgeState | null;
+  return {
+    provider: raw?.provider ?? fallbackProvider,
+    sessionId: raw?.sessionId ?? null,
+    switchProvider: (p: string) => {
+      setFallbackProvider(p);
+      raw?.switchProvider?.(p);
+    },
+    followDefaultProvider: (p: string) => {
+      if (!fallbackProvider) setFallbackProvider(p);
+      raw?.followDefaultProvider?.(p);
+    },
+  };
+}
+
+function useActiveServerProfile() {
+  const [activeProfile, setActiveProfile] = useState(() => getActiveServerProfile());
+  useEffect(() => {
+    const sync = () => setActiveProfile(getActiveServerProfile());
+    window.addEventListener(PROFILES_CHANGE_EVENT, sync);
+    return () => window.removeEventListener(PROFILES_CHANGE_EVENT, sync);
+  }, []);
+  return activeProfile;
+}
+
+function GeneralSettingsSection({
+  close,
+  navigate,
+}: {
+  close: () => void;
+  navigate?: (sectionId: string) => void;
+}) {
+  const { theme, setTheme, lang, setLang } = useSettings();
   const [devTools, setDevTools] = useState(() => zapPluginKernel.getDeveloperToolsEnabled());
   const generalSlotItems = zapPluginKernel.getSlotEntries('settings.general.item');
+  const modelBridge = useChatModelBridge();
+  const activeProfile = useActiveServerProfile();
 
-  const applyTheme = (next: 'light' | 'dark' | 'system') => {
+  const applyTheme = (next: Theme) => {
     setTheme(next);
-    document.documentElement.setAttribute('data-theme', next);
-    try {
-      localStorage.setItem('jeikcode.theme', next);
-    } catch {
-      /* ignore */
-    }
   };
 
-  const applyLang = (next: 'zh' | 'en' | 'vi') => {
+  const applyLang = (next: Lang) => {
     setLang(next);
-    document.documentElement.setAttribute('lang', next === 'zh' ? 'zh-CN' : next);
-    try {
-      localStorage.setItem('jeikcode.lang', next);
-    } catch {
-      /* ignore */
-    }
     void postLanguage(next).catch(() => {});
   };
 
@@ -252,6 +300,47 @@ function GeneralSettingsSection() {
 
   return (
     <div class="dsh-general-list">
+      <div class="dsh-general-card dsh-general-card-elevated">
+        <div class="dsh-general-row">
+          <div class="dsh-general-meta">
+            <div class="dsh-general-label">当前对话模型与思考强度 (Model & Reasoning Effort)</div>
+            <div class="dsh-general-desc">切换当前会话使用的推理模型、供应商账号及思考强度档位（Effort）</div>
+          </div>
+          <div class="dsh-settings-model-controls">
+            <ModelSelector
+              value={modelBridge.provider}
+              onChange={(p) => modelBridge.switchProvider(p)}
+              onDefaultChange={(p) => modelBridge.followDefaultProvider(p)}
+              sessionId={modelBridge.sessionId}
+              direction="down"
+              onOpenModelConfig={() => {
+                close();
+                window.dispatchEvent(new CustomEvent('jeikcode:open-model-config'));
+              }}
+            />
+          </div>
+        </div>
+
+        <div class="dsh-general-divider" />
+
+        <div class="dsh-general-row">
+          <div class="dsh-general-meta">
+            <div class="dsh-general-label">当前连接宿主与多机切换 (Host & Server Switcher)</div>
+            <div class="dsh-general-desc">查看当前连接宿主状态，管理并快速切换本地、公司或云端远程主机节点</div>
+          </div>
+          <button
+            type="button"
+            class="top-nav-server-switcher-btn dsh-settings-server-pill"
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent('jeikcode:open-server-switcher'));
+            }}
+          >
+            <span class="server-dot">{isDirectLlmProfile(activeProfile) ? '⚡' : '🟢'}</span>
+            <span class="server-name">{activeProfile.name}</span>
+          </button>
+        </div>
+      </div>
+
       <div class="dsh-general-card">
         <div class="dsh-general-row">
           <div class="dsh-general-meta">
@@ -276,6 +365,26 @@ function GeneralSettingsSection() {
               </button>
             ))}
           </div>
+        </div>
+
+        <div class="dsh-general-divider" />
+
+        <div class="dsh-general-row">
+          <div class="dsh-general-meta">
+            <div class="dsh-general-label">毛玻璃与透明度定制 (Glass & Opacity)</div>
+            <div class="dsh-general-desc">
+              自由调节侧边栏、对话消息卡片透明度、高斯模糊散射与极光渐变壁纸
+            </div>
+          </div>
+          <button
+            type="button"
+            class="dsh-btn"
+            onClick={() => {
+              if (navigate) navigate('ui-glass');
+            }}
+          >
+            🎨 调节透明度
+          </button>
         </div>
 
         <div class="dsh-general-divider" />
@@ -307,6 +416,25 @@ function GeneralSettingsSection() {
           </div>
           <DshSwitch checked={devTools} onChange={toggleDevTools} />
         </div>
+
+        <div class="dsh-general-divider" />
+
+        <div class="dsh-general-row">
+          <div class="dsh-general-meta">
+            <div class="dsh-general-label">版本与软件更新 (Software Update)</div>
+            <div class="dsh-general-desc">查看当前版本信息、发行说明并检查客户端更新</div>
+          </div>
+          <button
+            type="button"
+            class="dsh-btn"
+            onClick={() => {
+              close();
+              window.dispatchEvent(new CustomEvent('jeikcode:open-update-modal'));
+            }}
+          >
+            检查更新
+          </button>
+        </div>
       </div>
 
       {generalSlotItems.map((item) => (
@@ -325,6 +453,7 @@ function GeneralSettingsSection() {
 function ModelsSettingsSection({ close }: { close: () => void }) {
   const [modelsList, setModelsList] = useState<ModelInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const modelBridge = useChatModelBridge();
 
   useEffect(() => {
     let active = true;
@@ -345,26 +474,35 @@ function ModelsSettingsSection({ close }: { close: () => void }) {
 
   const openNativeModelSettings = () => {
     close();
-    const btn = document.querySelector('.sidebar-settings-btn') as HTMLButtonElement | null;
-    if (btn) btn.click();
+    window.dispatchEvent(new CustomEvent('jeikcode:open-model-config'));
   };
 
   const defaultModel = modelsList.find((m) => m.is_default);
 
   return (
     <div class="dsh-section-stack">
-      <div class="dsh-banner-card">
+      <div class="dsh-banner-card dsh-general-card-elevated">
         <div class="dsh-banner-main">
           <div class="dsh-banner-title">
             当前默认模型：{defaultModel ? `${defaultModel.provider} (${defaultModel.model})` : '未设定'}
           </div>
           <div class="dsh-banner-sub">
-            已加载 {modelsList.length} 个可用模型配置
+            已加载 {modelsList.length} 个可用模型配置 · 可在此直接切换当前对话模型与思考强度（Effort）
           </div>
         </div>
-        <button type="button" class="dsh-btn dsh-btn-primary" onClick={openNativeModelSettings}>
-          打开完整供应商与密钥配置
-        </button>
+        <div class="dsh-settings-model-controls">
+          <ModelSelector
+            value={modelBridge.provider}
+            onChange={(p) => modelBridge.switchProvider(p)}
+            onDefaultChange={(p) => modelBridge.followDefaultProvider(p)}
+            sessionId={modelBridge.sessionId}
+            direction="down"
+            onOpenModelConfig={openNativeModelSettings}
+          />
+          <button type="button" class="dsh-btn dsh-btn-primary" onClick={openNativeModelSettings}>
+            打开完整供应商与密钥配置
+          </button>
+        </div>
       </div>
 
       {loading ? (
@@ -373,27 +511,36 @@ function ModelsSettingsSection({ close }: { close: () => void }) {
         <div class="dsh-group-stack">
           <h3 class="dsh-group-heading">已注册供应商与模型列表</h3>
           <ul class="dsh-card-list">
-            {modelsList.slice(0, 30).map((m: ModelInfo) => (
-              <li key={`${m.provider}-${m.model}`} class="dsh-item-card">
-                <div class="dsh-item-card-head">
-                  <span class="dsh-item-icon">
-                    <IconCube size={20} />
-                  </span>
-                  <div class="dsh-item-main">
-                    <div class="dsh-item-title-row">
-                      <span class="dsh-item-title">{m.provider}</span>
-                      {m.is_default && <DshTag tone="info">默认模型</DshTag>}
-                      {m.provider_type && <DshTag tone="neutral">{m.provider_type}</DshTag>}
-                      {m.context_window && <DshTag tone="success">{Math.round(m.context_window / 1024)}k 上下文</DshTag>}
-                    </div>
-                    <span class="dsh-item-desc">
-                      上游标识：<code>{m.model}</code>
-                      {m.account ? ` · 账号：${m.account}` : ''}
+            {modelsList.slice(0, 30).map((m: ModelInfo) => {
+              const isCurrent = modelBridge.provider === m.provider;
+              return (
+                <li
+                  key={`${m.provider}-${m.model}`}
+                  class={`dsh-item-card ${isCurrent ? 'is-active' : ''}`}
+                  onClick={() => modelBridge.switchProvider(m.provider)}
+                  style={{ cursor: 'pointer' }}
+                >
+                  <div class="dsh-item-card-head">
+                    <span class="dsh-item-icon">
+                      <IconCube size={20} />
                     </span>
+                    <div class="dsh-item-main">
+                      <div class="dsh-item-title-row">
+                        <span class="dsh-item-title">{m.provider}</span>
+                        {isCurrent && <DshTag tone="success">当前使用</DshTag>}
+                        {m.is_default && <DshTag tone="info">默认模型</DshTag>}
+                        {m.provider_type && <DshTag tone="neutral">{m.provider_type}</DshTag>}
+                        {m.context_window && <DshTag tone="success">{Math.round(m.context_window / 1024)}k 上下文</DshTag>}
+                      </div>
+                      <span class="dsh-item-desc">
+                        上游标识：<code>{m.model}</code>
+                        {m.account ? ` · 账号：${m.account}` : ''}
+                      </span>
+                    </div>
                   </div>
-                </div>
-              </li>
-            ))}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}
@@ -2262,7 +2409,16 @@ export function DeepSeekSettingsCenterModal({
         label: '通用',
         title: '通用设置',
         description: '管理界面主题、多语言偏好与编码开发者工具选项',
-        render: () => <GeneralSettingsSection />,
+        render: ({ close, navigate }) => <GeneralSettingsSection close={close} navigate={navigate} />,
+      },
+      {
+        id: 'ui-glass',
+        order: 15,
+        icon: <IconPalette size={18} />,
+        label: '界面与透明度',
+        title: '界面毛玻璃与透明度定制 (UI Appearance)',
+        description: '无级调节侧边栏与卡片透明度、高斯磨砂模糊半径及极光渐变壁纸',
+        render: () => <GlassThemeSettingsPanel />,
       },
       {
         id: 'models',

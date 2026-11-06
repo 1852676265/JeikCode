@@ -11,6 +11,7 @@ import './styles/app.css';
 import './index.css';
 import './custom/custom.css';
 import './custom/custom-registry';
+import './custom/glass-theme-plugin';
 import 'katex/dist/katex.min.css';
 
 // 禁用浏览器默认的历史滚动恢复，避免刷新时与聊天时间线底部粘性定位冲突产生跳变
