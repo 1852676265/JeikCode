@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from 'vite';
 import preact from '@preact/preset-vite';
 import fs from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import { mockApiPlugin } from './mock-server';
 
 function stripVersionPrefix(raw: string): string {
@@ -65,9 +66,36 @@ function autoAuthPlugin(): Plugin {
   };
 }
 
-export default defineConfig(() => {
+async function checkPortHealth(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/health`, { timeout: 400 }, (res) => {
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function findActiveDaemonPort(preferredPort?: number): Promise<number> {
+  if (preferredPort && (await checkPortHealth(preferredPort))) {
+    return preferredPort;
+  }
+  const candidatePorts = [13457, 13458, 13459, 13460, 13461, 13462];
+  for (const port of candidatePorts) {
+    if (port === preferredPort) continue;
+    if (await checkPortHealth(port)) {
+      return port;
+    }
+  }
+  return preferredPort || 13459;
+}
+
+export default defineConfig(async () => {
   const initialAuth = getDaemonAuth();
-  const daemonPort = initialAuth?.port || 13460;
+  const daemonPort = await findActiveDaemonPort(initialAuth?.port);
   const targetUrl = `http://127.0.0.1:${daemonPort}`;
 
   const proxyConfig = {

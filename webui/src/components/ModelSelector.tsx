@@ -86,6 +86,7 @@ export function ModelSelector({
   sessionId,
   direction = 'down',
   onOpenModelConfig,
+  hideEffort = false,
 }: {
   value: string | null;
   onChange: (p: string) => void;
@@ -93,6 +94,7 @@ export function ModelSelector({
   sessionId?: string | null;
   direction?: 'up' | 'down';
   onOpenModelConfig?: () => void;
+  hideEffort?: boolean;
 }) {
   const t = useT();
   const narrow = useNarrowScreen();
@@ -499,7 +501,7 @@ export function ModelSelector({
   return (
     <div class="model-controls">
       {/* 思考强度选择器 */}
-      {current?.effort_applicable && (
+      {!hideEffort && current?.effort_applicable && (
         <div class={`model-selector effort-selector ${direction === 'down' ? 'model-selector-down' : 'model-selector-up'}`} ref={effortRef}>
           <button
             class={'model-selector-trigger effort-capsule-trigger' + (effortOpen ? ' is-active' : '')}
@@ -523,7 +525,7 @@ export function ModelSelector({
         </div>
       )}
 
-      {effortOpen && (narrow || open) && typeof document !== 'undefined' && createPortal(
+      {!hideEffort && effortOpen && (narrow || open) && typeof document !== 'undefined' && createPortal(
         <div
           class="modal-overlay effort-selector-modal-overlay"
           onMouseDown={(e) => e.stopPropagation()}

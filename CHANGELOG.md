@@ -21,6 +21,38 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.5 (2026-11-08)
+
+- **[Chat & Navigation] Introduce DeepSeek-style Turn Navigation rail and metrics**:
+  - Introduced the `TurnNavigator` right-rail component providing smooth turn navigation, hover previews, instant jumping, and real-time per-turn token usage and cumulative session token metrics.
+  - Added full test coverage for turn extraction, label truncation, steer envelope cleanup, and token metric calculations.
+
+- **[Sidebar & Workspace] Add collapsible sections and session grouping**:
+  - Implemented collapsible accordion controls for the Recent sessions and Projects workspace sections with localStorage state persistence.
+  - Added "Show more / Show less" pagination toggle for recent sessions, pinning the active conversation into view.
+
+- **[Preview & Developer Experience] Enhance preview tabs and terminal stability**:
+  - Replaced preview tab emojis with clean, professional filetype badges (TS, RS, MD, etc.) and added a one-click tab clear action.
+  - Added a top-right header toggle button to easily collapse and expand the right preview panel.
+  - Hardened terminal execution by reusing open active sessions and adding a startup buffer for Windows PowerShell / ConPTY cold start.
+  - Added dynamic daemon port detection in Vite development configuration.
+
+---
+
+- **[会话与导航] 引入深度对齐的轮次导航侧轨与 Token 指标洞察**:
+  - 引入全新的 `TurnNavigator` 右侧悬浮轮次导航轨，支持平滑滚动定位、提问与回答卡片悬浮预览、单轮消耗与累计 Token 消耗实时计算。
+  - 补齐轮次解析、标题收拢、引导词清洗与 Token 计算的完整单元测试。
+
+- **[侧边栏与工作区] 新增折叠分组与会话聚合管理**:
+  - 为侧边栏「最近会话」与「项目工作区」增加平滑折叠/展开功能，状态自动记忆持久化至本地存储。
+  - 新增最近会话「展开更多 / 收起」切换，并在大量历史中自动将当前活跃会话保持于置顶可视区域。
+
+- **[文件预览与开发体验] 优化对照区徽标与终端并发稳定性**:
+  - 优化右侧文件对照预览区标签，采用纯净文件类型标识（TS、RS、MD、JSON 等）替代彩色 Emoji，支持多标签一键清空。
+  - 顶部导航栏右上角新增常驻面板折叠/展开快捷按钮。
+  - 终端面板支持智能复用已有活跃标签执行命令，并优化 Windows PowerShell / ConPTY 冷启动缓冲，杜绝首字符丢失。
+  - Vite 配置支持守护进程端口自动嗅探探测，避免多实例端口冲突。
+
 ## v1.0.4 (2026-11-06)
 
 - **[UI & Settings] Consolidate top header controls into Settings Center and fix sidebar settings modal**:

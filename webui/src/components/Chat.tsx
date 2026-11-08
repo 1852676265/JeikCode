@@ -40,7 +40,7 @@ const PROGRAMMATIC_STOP_MARK_TTL_MS = 15000;
  * （subscribe_live_with_replay），把已画完的正文/思考再落一遍。
  */
 const WATCH_REATTACH_AFTER_HIDDEN_MS = 60000;
-import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, getProjects, type ProjectInfo, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
+import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, TurnStat, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, getProjects, getSidebarProjects, type ProjectInfo, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueue, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
 import { showToast } from './Toast';
@@ -63,6 +63,7 @@ import {
   type SlashHandlers,
 } from '../lib/slashCommands';
 import { buildTurnNavItems, buildTurnNavItemsFromOutline, compactTurnNavText, filterTurnNavItems, resolveActiveTurnId, turnNavId, turnNavScrollTop } from '../lib/turnNav';
+import { TurnNavigator } from './TurnNavigator';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForSessionOrigin } from '../lib/modeSwitch';
 import { randomUUID } from '../lib/randomId';
@@ -359,6 +360,15 @@ function messageText(m: Message): string {
   }, '');
 }
 
+/** 提取助手消息中的实际正文文本（排除 reasoning 深度思考推导与工具调用） */
+function assistantAnswerText(m: Message): string {
+  const parts = m.parts.filter((p) => p.kind === 'text');
+  if (parts.length > 0) {
+    return parts.map((p) => p.text).join(' ').trim();
+  }
+  return '';
+}
+
 /** 图片集合相等（纯图片 / 空文本卡片无法用文本判定身份时使用）。 */
 function sameImageSet(a?: ImageData[], b?: ImageData[]): boolean {
   const left = a ?? [];
@@ -501,17 +511,66 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   return typeof document !== 'undefined' ? createPortal(content, document.body) : content;
 }
 
-function MsgImage({ img }: { img: ImageData }) {
+/**
+ * lone image 尺寸计算（严格对齐 DeepSeek singleFit 规范）：
+ * 长边限制 240px，长宽比限制在 [0.25, 4]，超出通过 object-fit: cover 裁切，且绝不超过原图固有尺寸。
+ */
+function singleFit(dimensions: { readonly width: number; readonly height: number }): {
+  width: number;
+  height: number;
+  objectPosition: string;
+} {
+  const natural = dimensions.width / dimensions.height;
+  const ratio = Math.min(4, Math.max(0.25, natural));
+  const box = ratio >= 1 ? { width: 240, height: 240 / ratio } : { width: 240 * ratio, height: 240 };
+  const scale = Math.min(1, dimensions.width / box.width, dimensions.height / box.height);
+  return {
+    width: Math.max(1, Math.round(box.width * scale)),
+    height: Math.max(1, Math.round(box.height * scale)),
+    objectPosition: natural < 0.25 ? 'center top' : natural > 4 ? 'left center' : 'center',
+  };
+}
+
+function MsgImage({
+  img,
+  variant = 'single',
+}: {
+  img: ImageData;
+  variant?: 'single' | 'tile' | 'thumbnail';
+}) {
   const [open, setOpen] = useState(false);
+  const [dimensions, setDimensions] = useState<{ width: number; height: number } | null>(null);
   const src = imageDataUrl(img);
+
+  const handleLoad = useCallback((e: Event) => {
+    const el = e.target as HTMLImageElement;
+    if (el && el.naturalWidth && el.naturalHeight) {
+      setDimensions({ width: el.naturalWidth, height: el.naturalHeight });
+    }
+  }, []);
+
+  const fit = useMemo(() => {
+    if (variant !== 'single') return undefined;
+    if (!dimensions) return { width: 240, height: 160, objectPosition: 'center' };
+    return singleFit(dimensions);
+  }, [variant, dimensions]);
+
   return (
     <>
-      <img
-        class="msg-image"
-        src={src}
-        alt=""
+      <button
+        type="button"
+        class={'msg-image-frame' + (variant === 'tile' ? ' is-tile' : variant === 'thumbnail' ? ' is-thumbnail' : ' is-single')}
+        style={fit ? { width: `${fit.width}px`, height: `${fit.height}px` } : undefined}
         onClick={() => setOpen(true)}
-      />
+      >
+        <img
+          class="msg-image"
+          src={src}
+          alt=""
+          onLoad={handleLoad}
+          style={fit ? { objectPosition: fit.objectPosition } : undefined}
+        />
+      </button>
       {open && <ImageLightbox src={src} onClose={() => setOpen(false)} />}
     </>
   );
@@ -1606,7 +1665,6 @@ export function Chat({
   const [bubbleEditDraft, setBubbleEditDraft] = useState<BubbleEditDraft | null>(() => initialBubbleDraft);
   const isFirstMountRef = useRef(true);
   const nativeFileInputRef = useRef<HTMLInputElement>(null);
-  const nativeCameraInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
@@ -1766,6 +1824,8 @@ export function Chat({
   const turnOutlineRef = useRef(turnOutline);
   turnOutlineRef.current = turnOutline;
   const turnOutlineBySessionRef = useRef<Map<string, SessionTurnOutline[]>>(new Map());
+  const [turnStats, setTurnStats] = useState<TurnStat[]>([]);
+  const turnStatsBySessionRef = useRef<Map<string, TurnStat[]>>(new Map());
   /** Stable turn-nav id pending a scroll-jump after older history loads. */
   const pendingJumpIdRef = useRef<string | null>(null);
   // While another client (OpenAI API) owns `/chat/active`:
@@ -2229,6 +2289,10 @@ export function Chat({
         if (detail.turns && detail.turns.length > 0) {
           turnOutlineBySessionRef.current.set(sid, detail.turns);
           setTurnOutline(detail.turns);
+        }
+        if (detail.turn_stats && detail.turn_stats.length > 0) {
+          turnStatsBySessionRef.current.set(sid, detail.turn_stats);
+          setTurnStats(detail.turn_stats);
         }
         if (detail.token_usage) {
           applySessionTokens(sid, merged, detail.token_usage);
@@ -2945,6 +3009,8 @@ export function Chat({
       pendingJumpIdRef.current = null;
       const cachedOutline = sessionId ? turnOutlineBySessionRef.current.get(sessionId) : undefined;
       setTurnOutline(cachedOutline ?? []);
+      const cachedStats = sessionId ? turnStatsBySessionRef.current.get(sessionId) : undefined;
+      setTurnStats(cachedStats ?? []);
 
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
@@ -3080,6 +3146,10 @@ export function Chat({
                 if (res.turns && res.turns.length > 0) {
                   turnOutlineBySessionRef.current.set(sessionId, res.turns);
                   setTurnOutline(res.turns);
+                }
+                if (res.turn_stats && res.turn_stats.length > 0) {
+                  turnStatsBySessionRef.current.set(sessionId, res.turn_stats);
+                  setTurnStats(res.turn_stats);
                 }
                 if (res.token_usage) {
                   applySessionTokens(sessionId, loaded, res.token_usage);
@@ -3237,6 +3307,10 @@ export function Chat({
             if (sessionResult.value.turns && sessionResult.value.turns.length > 0) {
               setTurnOutline(sessionResult.value.turns);
               turnOutlineBySessionRef.current.set(loadId, sessionResult.value.turns);
+            }
+            if (sessionResult.value.turn_stats && sessionResult.value.turn_stats.length > 0) {
+              turnStatsBySessionRef.current.set(loadId, sessionResult.value.turn_stats);
+              setTurnStats(sessionResult.value.turn_stats);
             }
             // 运行中的会话磁盘尚未落盘本轮未结消息，绝不能用落后磁盘历史覆盖缓存！
             if (serverActive === false) {
@@ -3991,19 +4065,26 @@ export function Chat({
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
   const turnNavItems = useMemo(
     () => {
-      if (turnOutline.length > 0) return buildTurnNavItemsFromOutline(turnOutline);
-      return buildTurnNavItems(
-        messages.map((m) => ({
-          role: m.role,
-          text: messageText(m),
-          sourceIndex: m.sourceIndex,
-          turnNavOrdinal: m.turnNavOrdinal,
-        })),
+      const loaded = buildTurnNavItems(
+        messages.map((m) => {
+          const est = estimateMessageTokens(m);
+          return {
+            role: m.role,
+            text: m.role === 'assistant' ? assistantAnswerText(m) : messageText(m),
+            sourceIndex: m.sourceIndex,
+            turnNavOrdinal: m.turnNavOrdinal,
+            hasImages: Boolean(m.images && m.images.length > 0),
+            tokens: est.prompt + est.completion + est.reasoning,
+          };
+        }),
         historyOffsetRef.current,
       );
+      if (turnOutline.length > 0) return buildTurnNavItemsFromOutline(turnOutline, loaded, turnStats);
+      return loaded;
     },
-    [turnOutline, messages],
+    [turnOutline, messages, turnStats],
   );
+  const [busyTurnId, setBusyTurnId] = useState<string | null>(null);
   const [turnNavQuery, setTurnNavQuery] = useState('');
   const filteredTurnNavItems = useMemo(
     () => filterTurnNavItems(turnNavItems, turnNavQuery),
@@ -4053,15 +4134,15 @@ export function Chat({
     };
   }, [effectiveWorkingDir]);
 
-  // Right Inspector Panel: Multi-tab ('questions' | 'git' | 'terminal' | 'preview'), resizable, collapsible
-  const [rightPanelTab, setRightPanelTabState] = useState<'questions' | 'git' | 'terminal' | 'preview'>(() => {
+  // Right Inspector Panel: Multi-tab ('git' | 'terminal' | 'preview'), resizable, collapsible
+  const [rightPanelTab, setRightPanelTabState] = useState<'git' | 'terminal' | 'preview'>(() => {
     try {
       const saved = localStorage.getItem('jeikcode:right-panel-tab');
-      if (saved === 'git' || saved === 'questions' || saved === 'terminal' || saved === 'preview') return saved;
+      if (saved === 'git' || saved === 'terminal' || saved === 'preview') return saved;
     } catch {}
-    return 'questions';
+    return 'git';
   });
-  const setRightPanelTab = (tab: 'questions' | 'git' | 'terminal' | 'preview') => {
+  const setRightPanelTab = (tab: 'git' | 'terminal' | 'preview') => {
     setRightPanelTabState(tab);
     try {
       localStorage.setItem('jeikcode:right-panel-tab', tab);
@@ -4169,7 +4250,7 @@ export function Chat({
   useEffect(() => {
     const handleSwitchRightTab = (e: CustomEvent<string>) => {
       const tab = e.detail;
-      if (tab === 'preview' || tab === 'terminal' || tab === 'git' || tab === 'questions') {
+      if (tab === 'preview' || tab === 'terminal' || tab === 'git') {
         setRightPanelTab(tab as any);
         setRightPanelCollapsed(false);
       }
@@ -4317,6 +4398,7 @@ export function Chat({
   }, [loading]);
 
   const stageRef = useRef<HTMLDivElement>(null);
+  const rightPanelRef = useRef<HTMLElement>(null);
   const isResizingRef = useRef(false);
 
   const handleResizerMouseDown = (e: MouseEvent) => {
@@ -4326,8 +4408,10 @@ export function Chat({
     document.body.style.userSelect = 'none';
 
     const handleMouseMove = (moveEvent: MouseEvent) => {
-      if (!isResizingRef.current || !stageRef.current) return;
-      const rect = stageRef.current.getBoundingClientRect();
+      if (!isResizingRef.current) return;
+      const targetEl = rightPanelRef.current || stageRef.current;
+      if (!targetEl) return;
+      const rect = targetEl.getBoundingClientRect();
       const newWidth = rect.right - moveEvent.clientX;
       setRightPanelWidth(newWidth);
     };
@@ -4348,6 +4432,144 @@ export function Chat({
   };
 
   const isRightPanelVisible = !rightPanelCollapsed;
+
+  const renderRightInspector = (isLanding = false) => {
+    const content = (
+      <>
+        {isRightPanelVisible && (
+          <div
+            class="right-inspector-backdrop"
+            onClick={() => setRightPanelCollapsed(true)}
+            aria-hidden="true"
+          />
+        )}
+        <aside
+          ref={rightPanelRef}
+          class={'right-inspector-panel' + (rightPanelCollapsed ? ' is-collapsed-hidden' : '')}
+          style={{
+            display: rightPanelCollapsed ? 'none' : 'flex',
+            '--right-panel-width': `${rightPanelWidth}px`,
+            width: `${rightPanelWidth}px`,
+          } as any}
+          aria-label={rightPanelTab === 'git' ? t('panel.git') : rightPanelTab === 'terminal' ? (t('panel.terminal') || '终端') : (t('panel.preview') || '预览')}
+        >
+          {/* Draggable Resizer on left edge */}
+          <div
+            class="right-panel-resizer"
+            onMouseDown={handleResizerMouseDown as any}
+            title="Drag to resize panel"
+          />
+
+          {/* Header Tab Bar */}
+          <div class="right-panel-header">
+            <div class="right-panel-tabs">
+              <button
+                type="button"
+                class={'right-panel-tab-btn' + (rightPanelTab === 'git' ? ' active' : '')}
+                onClick={() => setRightPanelTab('git')}
+                title={t('panel.git')}
+                aria-label={t('panel.git')}
+              >
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
+                </svg>
+              </button>
+
+              <button
+                type="button"
+                class={'right-panel-tab-btn' + (rightPanelTab === 'terminal' ? ' active' : '')}
+                onClick={() => setRightPanelTab('terminal')}
+                title={t('panel.terminal') || '终端'}
+                aria-label={t('panel.terminal') || '终端'}
+              >
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 5l4 3-4 3m6 0h4" />
+                </svg>
+              </button>
+
+              <button
+                type="button"
+                class={'right-panel-tab-btn' + (rightPanelTab === 'preview' ? ' active' : '') + (eyeDragOver ? ' is-drag-over-eye' : '')}
+                onClick={() => setRightPanelTab('preview')}
+                onDragEnter={handleEyeDragOver as any}
+                onDragOver={handleEyeDragOver as any}
+                onDragLeave={handleEyeDragLeave as any}
+                onDrop={handleEyeDrop as any}
+                title={t('panel.preview') || '预览'}
+                aria-label={t('panel.preview') || '预览'}
+              >
+                <svg width="15" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                  <circle cx="12" cy="12" r="3" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="right-panel-title-wrap">
+              <span class="right-panel-title">
+                {rightPanelTab === 'git' ? t('git.title') : rightPanelTab === 'terminal' ? (t('panel.terminal') || '终端') : (t('panel.preview') || '预览')}
+              </span>
+            </div>
+
+            <div class="right-panel-actions">
+              <button
+                type="button"
+                class="right-panel-collapse-btn"
+                onClick={() => setRightPanelCollapsed(true)}
+                title={t('panel.collapse')}
+                aria-label={t('panel.collapse')}
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="6 12 10 8 6 4" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          {/* Panel Content (All tabs keep-alive) */}
+          <div class="right-panel-body right-panel-content">
+            <div style={{ display: rightPanelTab === 'git' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+              <Suspense
+                fallback={
+                  <div class="git-empty-state">
+                    <div class="git-spinner" />
+                    <span>{t('git.loading')}</span>
+                  </div>
+                }
+              >
+                <GitPanel
+                  cwd={effectiveWorkingDir}
+                  refreshTrigger={gitRefreshTrigger}
+                  onBranchChanged={(newB) => {
+                    setGitRefreshTrigger((n) => n + 1);
+                    onCwdChanged?.(effectiveWorkingDir || '');
+                  }}
+                  onOpenFileDiff={handleOpenFileDiff}
+                  onOpenWorkingDiff={handleOpenWorkingDiff}
+                />
+              </Suspense>
+            </div>
+
+            <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+              <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
+            </div>
+
+            <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
+              <PreviewPanel
+                cwd={effectiveWorkingDir || cwd}
+                onOpenInMainEditor={(filePath) => {
+                  window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
+                }}
+              />
+            </div>
+          </div>
+        </aside>
+      </>
+    );
+
+    const appRoot = typeof document !== 'undefined' ? (document.getElementById('app-root') || document.querySelector('.app')) : null;
+    return appRoot ? createPortal(content, appRoot) : content;
+  };
 
   // Open Diff Tabs (VSCode style tabs for inspecting commit file diffs)
   interface OpenDiffTab {
@@ -4771,6 +4993,7 @@ export function Chat({
       historyTotalBySessionRef.current.set(sid, newTotal);
       hasOlderBySessionRef.current.set(sid, olderExists);
       if (detail.turns && detail.turns.length > 0) setTurnOutline(detail.turns);
+      if (detail.turn_stats && detail.turn_stats.length > 0) setTurnStats(detail.turn_stats);
       setMessages((prev) => {
         const next = [...older, ...prev];
         messagesRef.current = next;
@@ -4798,35 +5021,40 @@ export function Chat({
     const sid = activeIdRef.current;
     const generation = sessionGenerationRef.current;
     pendingJumpIdRef.current = id;
+    setBusyTurnId(id);
     setActiveTurnId(id);
     turnNavPinUntilRef.current = Date.now() + 1800;
-    if (index < historyOffsetRef.current) {
-      await ensureHistoryIncludes(index);
-    }
-    if (
-      activeIdRef.current !== sid ||
-      sessionGenerationRef.current !== generation
-    ) {
-      if (pendingJumpIdRef.current === id) pendingJumpIdRef.current = null;
-      return;
-    }
-    // The messages effect may already have completed the pending jump after a
-    // history prepend. Otherwise try the current DOM and then bounded retries.
-    if (pendingJumpIdRef.current === id && scrollToTurnId(id)) {
-      pendingJumpIdRef.current = null;
-      return;
-    }
-    for (const ms of [50, 150, 300]) {
-      await new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+    try {
+      if (index < historyOffsetRef.current) {
+        await ensureHistoryIncludes(index);
+      }
       if (
         activeIdRef.current !== sid ||
-        sessionGenerationRef.current !== generation ||
-        pendingJumpIdRef.current !== id
-      ) return;
-      if (scrollToTurnId(id)) {
+        sessionGenerationRef.current !== generation
+      ) {
+        if (pendingJumpIdRef.current === id) pendingJumpIdRef.current = null;
+        return;
+      }
+      // The messages effect may already have completed the pending jump after a
+      // history prepend. Otherwise try the current DOM and then bounded retries.
+      if (pendingJumpIdRef.current === id && scrollToTurnId(id)) {
         pendingJumpIdRef.current = null;
         return;
       }
+      for (const ms of [50, 150, 300]) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+        if (
+          activeIdRef.current !== sid ||
+          sessionGenerationRef.current !== generation ||
+          pendingJumpIdRef.current !== id
+        ) return;
+        if (scrollToTurnId(id)) {
+          pendingJumpIdRef.current = null;
+          return;
+        }
+      }
+    } finally {
+      setBusyTurnId((curr) => (curr === id ? null : curr));
     }
   }
   // 提问导航取消与滚动同步由主 session-switch effect 维护大纲生命周期。
@@ -4876,6 +5104,7 @@ export function Chat({
       historyTotalBySessionRef.current.set(id, newTotal);
       hasOlderBySessionRef.current.set(id, olderExists);
       if (detail.turns && detail.turns.length > 0) setTurnOutline(detail.turns);
+      if (detail.turn_stats && detail.turn_stats.length > 0) setTurnStats(detail.turn_stats);
       setMessages((prev) => {
         const next = [...older, ...prev];
         messagesRef.current = next;
@@ -6560,23 +6789,17 @@ export function Chat({
     timelineFollow.jump();
 
     // 发送聊天后自动判定右侧栏展示模式：
-    // 如果是非 Git 仓库或非多 Git 仓库（repos.length === 0），则默认选择提问历史模式 ('questions')；否则才为 'git'
     if (effectiveWorkingDir) {
-      setRightPanelTab(hasGitReposRef.current ? 'git' : 'questions');
       fetchGitRepos(effectiveWorkingDir)
         .then((res) => {
           const hasGit = Array.isArray(res.repos) && res.repos.length > 0;
           hasGitReposRef.current = hasGit;
           setHasGitRepos(hasGit);
-          setRightPanelTab(hasGit ? 'git' : 'questions');
         })
         .catch(() => {
           hasGitReposRef.current = false;
           setHasGitRepos(false);
-          setRightPanelTab('questions');
         });
-    } else {
-      setRightPanelTab('questions');
     }
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
     // 让会话「一发送就出现在左侧」。回合 done 后列表刷新会换成后端自动命名。
@@ -8206,15 +8429,49 @@ export function Chat({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [landing]);
 
+  const refreshLandingProjects = useCallback(() => {
+    Promise.all([
+      getProjects().catch(() => [] as ProjectInfo[]),
+      getSidebarProjects().catch(() => ({ hidden: [], pinned: [] })),
+    ])
+      .then(([list, sidebar]) => {
+        const hidden = new Set(sidebar.hidden || []);
+        const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+        const all: ProjectInfo[] = [];
+
+        if (Array.isArray(list)) {
+          for (const p of list) {
+            if (!p.working_dir || isUserHomeDir(p.working_dir) || hidden.has(p.hash)) continue;
+            all.push(p);
+          }
+        }
+
+        if (Array.isArray(sidebar.pinned)) {
+          for (const pinned of sidebar.pinned) {
+            if (!pinned.working_dir || isUserHomeDir(pinned.working_dir) || hidden.has(pinned.hash)) continue;
+            const pinnedNorm = norm(pinned.working_dir);
+            if (!all.some((p) => p.hash === pinned.hash || norm(p.working_dir) === pinnedNorm)) {
+              all.push(pinned);
+            }
+          }
+        }
+
+        setLandingProjects(all);
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     if (landing || projectMenuOpen) {
-      getProjects()
-        .then((list) => {
-          if (Array.isArray(list)) setLandingProjects(list);
-        })
-        .catch(() => {});
+      refreshLandingProjects();
     }
-  }, [landing, projectMenuOpen]);
+  }, [landing, projectMenuOpen, refreshLandingProjects]);
+
+  useEffect(() => {
+    const handleSidebarChange = () => refreshLandingProjects();
+    window.addEventListener('jeikcode:sidebar_projects', handleSidebarChange);
+    return () => window.removeEventListener('jeikcode:sidebar_projects', handleSidebarChange);
+  }, [refreshLandingProjects]);
 
   // 侧栏「技能」菜单选中 → 把 `/name ` 插入输入框（按 seq 去重，避免重复插入）。
   // replaceSkill=true 会先清除已有的技能前缀，避免反复选择时累加。
@@ -8251,6 +8508,21 @@ export function Chat({
     window.addEventListener('jeikcode:send_prompt', handleSendPromptEvent);
     return () => window.removeEventListener('jeikcode:send_prompt', handleSendPromptEvent);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 监听右上角或全局切换右侧检视面板事件
+  useEffect(() => {
+    const handleToggleRightPanel = () => {
+      setRightPanelCollapsedState((prev) => {
+        const next = !prev;
+        try {
+          localStorage.setItem('jeikcode:right-panel-collapsed', String(next));
+        } catch {}
+        return next;
+      });
+    };
+    window.addEventListener('jeikcode:toggle_right_panel', handleToggleRightPanel);
+    return () => window.removeEventListener('jeikcode:toggle_right_panel', handleToggleRightPanel);
   }, []);
 
   // 落地页副标题：项目名 + 缩写路径（剥掉 Windows `\\?\` 扩展前缀）。
@@ -8304,7 +8576,7 @@ export function Chat({
           {pendingAttach.map((item) => (
             <div key={item.id} class={'input-thumb' + (item.kind === 'file' ? ' input-thumb-file' : '')}>
               {item.kind === 'image' ? (
-                <MsgImage img={item.image} />
+                <MsgImage img={item.image} variant="thumbnail" />
               ) : (
                 <>
                   <span class="input-thumb-file-icon" aria-hidden="true">📄</span>
@@ -8422,42 +8694,6 @@ export function Chat({
               aria-hidden="true"
             >
               <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-            </svg>
-          </button>
-          <input
-            ref={nativeCameraInputRef}
-            type="file"
-            accept="image/*"
-            capture="environment"
-            style={{ display: 'none' }}
-            onChange={(e) => {
-              const input = e.target as HTMLInputElement;
-              if (input.files && input.files.length > 0) {
-                void addLocalFiles(input.files);
-              }
-              input.value = '';
-            }}
-          />
-          <button
-            type="button"
-            class="btn-native-upload"
-            onClick={() => nativeCameraInputRef.current?.click()}
-            title="拍照识物 / 随手拍照提问"
-            aria-label="拍照提问"
-          >
-            <svg
-              width="17"
-              height="17"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
-              <circle cx="12" cy="13" r="3" />
             </svg>
           </button>
         </div>
@@ -8681,6 +8917,14 @@ export function Chat({
             </div>
           )}
 
+          <ModelSelector
+            value={provider}
+            onChange={(p) => switchProvider(p)}
+            onDefaultChange={followDefaultProvider}
+            sessionId={sessionId ?? activeIdRef.current}
+            direction="up"
+            onOpenModelConfig={onOpenModelConfig}
+          />
           <ModeSelector
             value={modeState.displayMode}
             disabled={Boolean(modeState.pendingMode)}
@@ -8985,175 +9229,8 @@ export function Chat({
             </div>
           </div>
 
-          {/* Right Inspector Multi-Tab Panel (Landing 页保活常驻) */}
-          {isRightPanelVisible && (
-            <div
-              class="right-inspector-backdrop"
-              onClick={() => setRightPanelCollapsed(true)}
-              aria-hidden="true"
-            />
-          )}
-          <aside
-            class={'right-inspector-panel' + (rightPanelCollapsed ? ' is-collapsed-hidden' : '')}
-            style={{ display: rightPanelCollapsed ? 'none' : 'flex' }}
-            aria-label={rightPanelTab === 'questions' ? t('panel.questions') : t('panel.git')}
-          >
-            {/* Draggable Resizer on left edge */}
-            <div
-              class="right-panel-resizer"
-              onMouseDown={handleResizerMouseDown as any}
-              title="Drag to resize panel"
-            />
-
-            {/* Header Tab Bar */}
-            <div class="right-panel-header">
-              <div class="right-panel-tabs">
-                <button
-                  type="button"
-                  class={'right-panel-tab-btn' + (rightPanelTab === 'git' ? ' active' : '')}
-                  onClick={() => setRightPanelTab('git')}
-                  title={t('panel.git')}
-                  aria-label={t('panel.git')}
-                >
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                    <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
-                  </svg>
-                </button>
-
-                <button
-                  type="button"
-                  class={'right-panel-tab-btn' + (rightPanelTab === 'terminal' ? ' active' : '')}
-                  onClick={() => setRightPanelTab('terminal')}
-                  title={t('panel.terminal') || '终端'}
-                  aria-label={t('panel.terminal') || '终端'}
-                >
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M3 5l4 3-4 3m6 0h4" />
-                  </svg>
-                </button>
-
-                <button
-                  type="button"
-                  class={'right-panel-tab-btn' + (rightPanelTab === 'preview' ? ' active' : '') + (eyeDragOver ? ' is-drag-over-eye' : '')}
-                  onClick={() => setRightPanelTab('preview')}
-                  onDragEnter={handleEyeDragOver as any}
-                  onDragOver={handleEyeDragOver as any}
-                  onDragLeave={handleEyeDragLeave as any}
-                  onDrop={handleEyeDrop as any}
-                  title={t('panel.preview') || '预览'}
-                  aria-label={t('panel.preview') || '预览'}
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                    <circle cx="12" cy="12" r="3" />
-                  </svg>
-                </button>
-
-                <button
-                  type="button"
-                  class={'right-panel-tab-btn' + (rightPanelTab === 'questions' ? ' active' : '')}
-                  onClick={() => setRightPanelTab('questions')}
-                  title={t('panel.questions')}
-                  aria-label={t('panel.questions')}
-                >
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                    <circle cx="8" cy="8" r="6.2" />
-                    <path d="M6 6.5a2 2 0 0 1 3.8.8c0 1.2-1.8 1.5-1.8 2.5" />
-                    <circle cx="8" cy="12.2" r="0.7" fill="currentColor" />
-                  </svg>
-                  {turnNavItems.length > 0 && <span class="tab-badge">{turnNavItems.length}</span>}
-                </button>
-              </div>
-
-              <span class="right-panel-title">
-                {rightPanelTab === 'questions' ? t('turnNav.title') : rightPanelTab === 'git' ? t('git.title') : rightPanelTab === 'terminal' ? (t('panel.terminal') || '终端') : (t('panel.preview') || '预览')}
-              </span>
-
-              <button
-                type="button"
-                class="right-panel-collapse-btn"
-                onClick={() => setRightPanelCollapsed(true)}
-                title={t('panel.collapse')}
-                aria-label={t('panel.collapse')}
-              >
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                  <path d="M6 4l4 4-4 4" />
-                </svg>
-              </button>
-            </div>
-
-            {/* Body */}
-            <div class="right-panel-body">
-              <div style={{ display: rightPanelTab === 'questions' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-                <nav class="turn-nav" aria-label={t('turnNav.title')}>
-                  <div class="turn-nav-header">
-                    <input
-                      class="turn-nav-search"
-                      type="text"
-                      value={turnNavQuery}
-                      placeholder={t('turnNav.searchPlaceholder')}
-                      aria-label={t('turnNav.searchPlaceholder')}
-                      onInput={(e) => setTurnNavQuery((e.target as HTMLInputElement).value)}
-                    />
-                  </div>
-                  <div class="turn-nav-list">
-                    {filteredTurnNavItems.length === 0 ? (
-                      <div class="turn-nav-empty">
-                        {turnNavItems.length === 0 ? t('turnNav.empty') : t('turnNav.noMatch')}
-                      </div>
-                    ) : (
-                      filteredTurnNavItems.map((item) => (
-                        <button
-                          key={item.id}
-                          type="button"
-                          class={'turn-nav-item' + (item.id === activeTurnId ? ' active' : '')}
-                          title={item.text}
-                          onClick={() => jumpToTurn(item.id)}
-                        >
-                          {item.label}
-                        </button>
-                      ))
-                    )}
-                  </div>
-                </nav>
-              </div>
-
-              <div style={{ display: rightPanelTab === 'git' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-                <Suspense
-                  fallback={
-                    <div class="git-empty-state">
-                      <div class="git-spinner" />
-                      <span>{t('git.loading')}</span>
-                    </div>
-                  }
-                >
-                  <GitPanel
-                    cwd={effectiveWorkingDir}
-                    refreshTrigger={gitRefreshTrigger}
-                    onBranchChanged={(newB) => {
-                      setGitRefreshTrigger((n) => n + 1);
-                      onCwdChanged?.(effectiveWorkingDir || '');
-                    }}
-                    onOpenFileDiff={handleOpenFileDiff}
-                    onOpenWorkingDiff={handleOpenWorkingDiff}
-                  />
-                </Suspense>
-              </div>
-
-              <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-                <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
-              </div>
-
-              <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-                <PreviewPanel
-                  cwd={effectiveWorkingDir || cwd}
-                  onOpenInMainEditor={(filePath) => {
-                    window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
-                  }}
-                />
-              </div>
-            </div>
-          </aside>
+          {/* Right Inspector Multi-Tab Panel (Landing 页独立悬浮毛玻璃卡片，平级挂载至 .app 顶层容器) */}
+          {renderRightInspector(true)}
         </div>
 
         {/* 落地页常驻折叠悬浮游标（已隐藏展示，保留完整功能与代码） */}
@@ -9230,24 +9307,6 @@ export function Chat({
               </svg>
               <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
             </button>
-            <button
-              type="button"
-              class="right-panel-tab-btn"
-              onClick={() => {
-                setRightPanelTab('questions');
-                setRightPanelCollapsed(false);
-              }}
-              title={t('panel.questions')}
-              aria-label={t('panel.questions')}
-            >
-              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                <circle cx="8" cy="8" r="6.2" />
-                <path d="M6 6.5a2 2 0 0 1 3.8.8c0 1.2-1.8 1.5-1.8 2.5" />
-                <circle cx="8" cy="12.2" r="0.7" fill="currentColor" />
-              </svg>
-              <span class="rail-tab-text">{t('turnNav.title')}</span>
-              {turnNavItems.length > 0 && <span class="tab-badge">{turnNavItems.length}</span>}
-            </button>
           </div>
         )}
         {topModelChrome}
@@ -9281,13 +9340,16 @@ export function Chat({
       >
       {/* Main chat / editor stage column */}
       <div class="chat-main-column">
-        {/* Message timeline */}
+        {/* Message timeline viewport with floating turn navigator */}
         <div
-          class="messages-container"
-          ref={attachTimeline}
+          class="messages-viewport-wrapper"
           style={activeMainTabId !== 'chat' ? { display: 'none' } : undefined}
-          onScroll={syncTurnNavFromScroll}
         >
+          <div
+            class="messages-container"
+            ref={attachTimeline}
+            onScroll={syncTurnNavFromScroll}
+          >
         <div class="timeline-inner">
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
@@ -9513,9 +9575,9 @@ export function Chat({
           <div key={`q-${q.id}`} class="user-message-wrapper queued">
             <div class="user-message-bubble queued-bubble">
               {q.images && q.images.length > 0 && (
-                <div class="msg-images">
+                <div class="msg-images" data-align="end">
                   {q.images.map((img, i) => (
-                    <MsgImage key={i} img={img} />
+                    <MsgImage key={i} img={img} variant={q.images!.length > 1 ? 'tile' : 'single'} />
                   ))}
                 </div>
               )}
@@ -9594,6 +9656,16 @@ export function Chat({
         </div>
       </div>
 
+      {/* Turn Navigator (DeepSeek-Harness style middle-right rail) */}
+      <TurnNavigator
+        items={turnNavItems}
+        activeId={activeTurnId}
+        busyId={busyTurnId}
+        sessionTotalTokens={tokens?.total}
+        onNavigate={(item) => jumpToTurn(item.id)}
+      />
+    </div>
+
       {/* VSCode Diff Viewer or Code Editor Stage */}
       {activeMainTabId !== 'chat' && (() => {
         const currentDiffTab = diffTabs.find((t) => t.id === activeMainTabId);
@@ -9641,175 +9713,8 @@ export function Chat({
       })()}
       </div>
 
-      {/* Right Inspector Multi-Tab Panel (Keep-Alive 保活：常驻 DOM，CSS 显隐切换，杜绝卸载重载与蹦图) */}
-      {isRightPanelVisible && (
-        <div
-          class="right-inspector-backdrop"
-          onClick={() => setRightPanelCollapsed(true)}
-          aria-hidden="true"
-        />
-      )}
-      <aside
-        class={'right-inspector-panel' + (rightPanelCollapsed ? ' is-collapsed-hidden' : '')}
-        style={{ display: rightPanelCollapsed ? 'none' : 'flex' }}
-        aria-label={rightPanelTab === 'questions' ? t('panel.questions') : t('panel.git')}
-      >
-        {/* Draggable Resizer on left edge */}
-        <div
-          class="right-panel-resizer"
-          onMouseDown={handleResizerMouseDown as any}
-          title="Drag to resize panel"
-        />
-
-        {/* Header Tab Bar */}
-        <div class="right-panel-header">
-          <div class="right-panel-tabs">
-            <button
-              type="button"
-              class={'right-panel-tab-btn' + (rightPanelTab === 'questions' ? ' active' : '')}
-              onClick={() => setRightPanelTab('questions')}
-              title={t('panel.questions')}
-              aria-label={t('panel.questions')}
-            >
-              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                <circle cx="8" cy="8" r="6.2" />
-                <path d="M6 6.5a2 2 0 0 1 3.8.8c0 1.2-1.8 1.5-1.8 2.5" />
-                <circle cx="8" cy="12.2" r="0.7" fill="currentColor" />
-              </svg>
-              {turnNavItems.length > 0 && <span class="tab-badge">{turnNavItems.length}</span>}
-            </button>
-
-            <button
-              type="button"
-              class={'right-panel-tab-btn' + (rightPanelTab === 'git' ? ' active' : '')}
-              onClick={() => setRightPanelTab('git')}
-              title={t('panel.git')}
-              aria-label={t('panel.git')}
-            >
-              <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                <path fill-rule="evenodd" clip-rule="evenodd" d="M11.75 3a1.75 1.75 0 1 0-1.07 3.13 4.25 4.25 0 0 1-2.93 2.12v-1.5a1.75 1.75 0 1 0-1.5 0v4.5a1.75 1.75 0 1 0 1.5 0V9.8a5.75 5.75 0 0 0 3.75-2.67A1.75 1.75 0 0 0 11.75 3zm-6.25 10a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm0-7a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm6.25-2a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z" />
-              </svg>
-            </button>
-
-            <button
-              type="button"
-              class={'right-panel-tab-btn' + (rightPanelTab === 'terminal' ? ' active' : '')}
-              onClick={() => setRightPanelTab('terminal')}
-              title={t('panel.terminal') || '终端'}
-              aria-label={t('panel.terminal') || '终端'}
-            >
-              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 5l4 3-4 3m6 0h4" />
-              </svg>
-            </button>
-
-            <button
-              type="button"
-              class={'right-panel-tab-btn' + (rightPanelTab === 'preview' ? ' active' : '') + (eyeDragOver ? ' is-drag-over-eye' : '')}
-              onClick={() => setRightPanelTab('preview')}
-              onDragEnter={handleEyeDragOver as any}
-              onDragOver={handleEyeDragOver as any}
-              onDragLeave={handleEyeDragLeave as any}
-              onDrop={handleEyeDrop as any}
-              title={t('panel.preview') || '预览'}
-              aria-label={t('panel.preview') || '预览'}
-            >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            </button>
-          </div>
-
-          <span class="right-panel-title">
-            {rightPanelTab === 'questions' ? t('turnNav.title') : rightPanelTab === 'git' ? t('git.title') : rightPanelTab === 'terminal' ? (t('panel.terminal') || '终端') : (t('panel.preview') || '预览')}
-          </span>
-
-          <button
-            type="button"
-            class="right-panel-collapse-btn"
-            onClick={() => setRightPanelCollapsed(true)}
-            title={t('panel.collapse')}
-            aria-label={t('panel.collapse')}
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-              <path d="M6 4l4 4-4 4" />
-            </svg>
-          </button>
-        </div>
-
-        {/* Body */}
-        <div class="right-panel-body">
-          <div style={{ display: rightPanelTab === 'questions' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-            <nav class="turn-nav" aria-label={t('turnNav.title')}>
-              <div class="turn-nav-header">
-                <input
-                  class="turn-nav-search"
-                  type="text"
-                  value={turnNavQuery}
-                  placeholder={t('turnNav.searchPlaceholder')}
-                  aria-label={t('turnNav.searchPlaceholder')}
-                  onInput={(e) => setTurnNavQuery((e.target as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="turn-nav-list">
-                {filteredTurnNavItems.length === 0 ? (
-                  <div class="turn-nav-empty">
-                    {turnNavItems.length === 0 ? t('turnNav.empty') : t('turnNav.noMatch')}
-                  </div>
-                ) : (
-                  filteredTurnNavItems.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      class={'turn-nav-item' + (item.id === activeTurnId ? ' active' : '')}
-                      title={item.text}
-                      onClick={() => jumpToTurn(item.id)}
-                    >
-                      {item.label}
-                    </button>
-                  ))
-                )}
-              </div>
-            </nav>
-          </div>
-
-          <div style={{ display: rightPanelTab === 'git' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-            <Suspense
-              fallback={
-                <div class="git-empty-state">
-                  <div class="git-spinner" />
-                  <span>{t('git.loading')}</span>
-                </div>
-              }
-            >
-              <GitPanel
-                cwd={effectiveWorkingDir}
-                refreshTrigger={gitRefreshTrigger}
-                onBranchChanged={(newB) => {
-                  setGitRefreshTrigger((n) => n + 1);
-                  onCwdChanged?.(effectiveWorkingDir || '');
-                }}
-                onOpenFileDiff={handleOpenFileDiff}
-                onOpenWorkingDiff={handleOpenWorkingDiff}
-              />
-            </Suspense>
-          </div>
-
-          <div style={{ display: rightPanelTab === 'terminal' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-            <TerminalPanel cwd={effectiveWorkingDir || cwd} active={rightPanelTab === 'terminal' && !rightPanelCollapsed} />
-          </div>
-
-          <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
-            <PreviewPanel
-              cwd={effectiveWorkingDir || cwd}
-              onOpenInMainEditor={(filePath) => {
-                window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
-              }}
-            />
-          </div>
-        </div>
-      </aside>
+      {/* Right Inspector Multi-Tab Panel (解耦为顶层独立悬浮毛玻璃卡片，平级挂载至 .app 顶层容器) */}
+      {renderRightInspector(false)}
 
       {/* 折叠收起悬浮条（已隐藏展示，保留完整功能与代码） */}
       {false && rightPanelCollapsed && (
@@ -9884,24 +9789,6 @@ export function Chat({
               <circle cx="12" cy="12" r="3" />
             </svg>
             <span class="rail-tab-text">{t('panel.preview') || '预览'}</span>
-          </button>
-          <button
-            type="button"
-            class="right-panel-tab-btn"
-            onClick={() => {
-              setRightPanelTab('questions');
-              setRightPanelCollapsed(false);
-            }}
-            title={t('panel.questions')}
-            aria-label={t('panel.questions')}
-          >
-            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-              <circle cx="8" cy="8" r="6.2" />
-              <path d="M6 6.5a2 2 0 0 1 3.8.8c0 1.2-1.8 1.5-1.8 2.5" />
-              <circle cx="8" cy="12.2" r="0.7" fill="currentColor" />
-            </svg>
-            <span class="rail-tab-text">{t('turnNav.title')}</span>
-            {turnNavItems.length > 0 && <span class="tab-badge">{turnNavItems.length}</span>}
           </button>
         </div>
       )}
@@ -10577,10 +10464,12 @@ function UserMessageView({
     }
   }
 
-  const images = msg.images && msg.images.length > 0 && (
-    <div class="msg-images">
-      {msg.images.map((img, i) => (
-        <MsgImage key={i} img={img} />
+  const hasImages = msg.images && msg.images.length > 0;
+  const isMultiple = hasImages && msg.images!.length > 1;
+  const images = hasImages && (
+    <div class="msg-images" data-align="end">
+      {msg.images!.map((img, i) => (
+        <MsgImage key={i} img={img} variant={isMultiple ? 'tile' : 'single'} />
       ))}
     </div>
   );
@@ -10643,21 +10532,27 @@ function UserMessageView({
     );
   }
 
+  const hasText = text.trim() !== '' || Boolean(skillTitle);
+
   return (
     <div class={wrapperClass} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={searchRef}>
-      <div
-        class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}
-        onCopy={handleBubbleCopy}
-      >
+      <div class="user-message-stack">
         {images}
-        {skillTitle && (
-          <button class="skill-collapse" onClick={() => setExpanded(false)}>
-            {t('chat.skillCollapse')}
-          </button>
+        {hasText && (
+          <div
+            class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}
+            onCopy={handleBubbleCopy}
+          >
+            {skillTitle && (
+              <button class="skill-collapse" onClick={() => setExpanded(false)}>
+                {t('chat.skillCollapse')}
+              </button>
+            )}
+            {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
+                普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
+            {skillTitle ? <Markdown content={text} search={search} cwd={cwd} targetContext="chat" /> : highlightText(text, search)}
+          </div>
         )}
-        {/* 技能/文档型内容本就是 markdown（注入的 SKILL.md），渲染它；
-            普通用户消息保持逐字纯文本（不把用户输入当 markdown 解析）。 */}
-        {skillTitle ? <Markdown content={text} search={search} cwd={cwd} targetContext="chat" /> : highlightText(text, search)}
       </div>
       <div class="msg-footer-row user-footer-row">
         {timeLabel && <span class="msg-time msg-time-user" title={timeFull}>{timeLabel}</span>}

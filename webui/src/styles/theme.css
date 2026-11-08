@@ -41,7 +41,7 @@
   --app-button-foreground:#ffffff; --app-button-background:#2563eb; --app-button-hover-background:#1d4ed8; --app-ghost-button-hover-background:rgba(15, 23, 42, 0.05);
   --app-tool-background:rgba(255, 255, 255, 0.78); --app-header-background:transparent; --app-primary-border-color:rgba(15, 23, 42, 0.08); --app-accent-color:#2563eb;
   --app-table-border:rgba(15, 23, 42, 0.08);
-  --app-content-max-width:min(1440px, 94%);
+  --app-content-max-width:min(960px, 92%);
   --app-list-hover-background:rgba(255, 255, 255, 0.58); --app-list-active-background:rgba(255, 255, 255, 0.94); --app-list-active-foreground:#0f172a;
   --app-menu-background:rgba(255, 255, 255, 0.94); --app-menu-border:rgba(255, 255, 255, 0.88); --app-menu-foreground:#0f172a; --app-menu-selection-background:rgba(37, 99, 235, 0.08);
   --app-command-menu-hover-background:rgba(0, 0, 0, 0.05); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 10%,transparent); --app-command-menu-active-accent:#2563eb;

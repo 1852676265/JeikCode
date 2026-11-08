@@ -551,18 +551,26 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
             const initialCmd = pendingCommandsRef.current.get(tab.id);
             if (initialCmd) {
               pendingCommandsRef.current.delete(tab.id);
+              // Windows PowerShell / ConPTY 冷启动需要加载环境与控制台句柄。
+              // 裸发过快会导致控制台初始化 flush 时首个字符（如 'j'）丢失变成 'eikcode'。
+              // 采用防御式缓冲：1000ms 缓冲后先发一个无害回车，再发送完整命令。
               setTimeout(() => {
                 if (record.ws && record.ws.readyState === WebSocket.OPEN) {
-                  const trimmed = initialCmd.trimEnd();
-                  const normalized = trimmed.replace(/\r?\n/g, '\r') + '\r';
-                  record.ws.send(normalized);
+                  record.ws.send('\r');
                   setTimeout(() => {
-                    try {
-                      record.term.focus();
-                    } catch {}
-                  }, 50);
+                    if (record.ws && record.ws.readyState === WebSocket.OPEN) {
+                      const trimmed = initialCmd.trimEnd();
+                      const normalized = trimmed.replace(/\r?\n/g, '\r') + '\r';
+                      record.ws.send(normalized);
+                      setTimeout(() => {
+                        try {
+                          record.term.focus();
+                        } catch {}
+                      }, 50);
+                    }
+                  }, 150);
                 }
-              }, 400);
+              }, 1000);
             }
           }
         };
@@ -931,6 +939,20 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
       const customEvent = e as CustomEvent<{ command: string; shell?: string }>;
       const { command, shell } = customEvent.detail || {};
       if (!command) return;
+      // 若当前活跃标签页已建立连接且存活，优先直接复用当前标签执行，避免重复冷启动并杜绝启动时丢字符
+      const curTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
+      const curRecord = curTab ? termMap.current.get(curTab.id) : undefined;
+      if (curTab && curRecord && curRecord.ws && curRecord.ws.readyState === WebSocket.OPEN) {
+        const trimmed = command.trimEnd();
+        const normalized = trimmed.replace(/\r?\n/g, '\r') + '\r';
+        curRecord.ws.send(normalized);
+        setTimeout(() => {
+          try {
+            curRecord.term?.focus();
+          } catch {}
+        }, 50);
+        return;
+      }
       const targetShell = shell || getMainstreamShell();
       void createNewTab(targetShell, command);
     };
@@ -938,7 +960,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
     return () => {
       window.removeEventListener('jeikcode:terminal:run_command', handleRunCommand);
     };
-  }, [createNewTab]);
+  }, [createNewTab, tabs, activeTabId]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
 

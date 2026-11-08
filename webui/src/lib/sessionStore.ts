@@ -355,6 +355,10 @@ export function deriveTurnNavItems(messages: MessageEntity[]): TurnNavItem[] {
       index: msg.order ?? i,
       label,
       text: cleaned,
+      turn: ordinal + 1,
+      prompt: label,
+      response: '',
+      unloaded: false,
     });
   }
   return items;

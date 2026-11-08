@@ -406,16 +406,15 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
     } catch {}
   };
 
-  // 获取文件图标或徽章
-  const getTabIcon = (filePath: string) => {
-    const ext = (filePath.split('.').pop() || '').toLowerCase();
-    if (IMAGE_EXTS.has(ext)) return '🖼️';
-    if (ext === 'md' || ext === 'markdown') return '📖';
-    if (ext === 'rs') return '🦀';
-    if (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') return '⚡';
-    if (ext === 'json' || ext === 'toml' || ext === 'yaml' || ext === 'yml') return '⚙️';
-    if (ext === 'sh' || ext === 'bash' || ext === 'ps1') return '🐚';
-    return '📄';
+  // 获取文件类型徽章（对齐主编辑器标签，采用专业的类型徽标替代彩色 Emoji）
+  const renderTabBadge = (filePath: string) => {
+    const ext = (filePath.split('.').pop() || 'file').toLowerCase();
+    const label = ext.toUpperCase().slice(0, 4);
+    return (
+      <span class={`preview-tab-type-badge type-${ext}`}>
+        {label}
+      </span>
+    );
   };
 
   return (
@@ -491,7 +490,7 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
                 }}
                 title={tab.filePath}
               >
-                <span class="preview-tab-icon">{getTabIcon(tab.filePath)}</span>
+                <span class="preview-tab-icon">{renderTabBadge(tab.filePath)}</span>
                 <span class="preview-tab-name">{tab.fileName}</span>
                 <button
                   type="button"
@@ -513,58 +512,22 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
           )}
         </div>
 
-        {/* 顶部右侧快捷工具按钮 */}
-        <div class="preview-bar-actions">
-          {activeTab && (
+        {/* 顶部右侧快捷工具按钮（多标签时提供轻量一键清空） */}
+        {tabs.length > 1 && (
+          <div class="preview-bar-actions">
             <button
               type="button"
               class="preview-action-btn"
-              onClick={() => {
-                setRefreshTrigger((n) => n + 1);
-                showToast(t('preview.refresh') || '已刷新预览', 'info');
-              }}
-              title={t('preview.refresh') || '刷新预览'}
-              aria-label="Refresh"
-            >
-              🔄
-            </button>
-          )}
-
-          {activeTab && (
-            <button
-              type="button"
-              class={'preview-action-btn' + (activeViewMode === 'edit' ? ' active' : '')}
-              onClick={() => {
-                window.dispatchEvent(new CustomEvent(`jeikcode:editor:toggle_mode:${activeTab.filePath}`));
-              }}
-              title={
-                activeViewMode === 'edit'
-                  ? `${t('editor.switchToPreview')} (Ctrl+Shift+V)`
-                  : `${t('editor.switchToEdit')} (Ctrl+Shift+V)`
-              }
-              aria-label="Toggle editor/preview mode"
-            >
-              {activeViewMode === 'edit' ? '📖' : '✏️'}
-            </button>
-          )}
-
-          {tabs.length > 0 && (
-            <button
-              type="button"
-              class="preview-action-btn preview-clear-btn"
               onClick={handleClearAll}
-              title={t('preview.clearAll') || '清空全部预览'}
-              aria-label="Clear all"
+              title={t('preview.clearAll') || '关闭全部标签'}
+              aria-label="Clear all tabs"
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                <line x1="10" y1="11" x2="10" y2="17" />
-                <line x1="14" y1="11" x2="14" y2="17" />
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 4.5h10M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M12.5 4.5v8a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5v-8" />
               </svg>
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       {/* 主体预览/编辑舞台 (由 CodeEditorTab 驱动，满血具备撤销、黄色搜索高亮与替换功能) */}
@@ -600,12 +563,20 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
         {tabs.length === 0 || !activeTab ? (
           <div class="preview-empty-stage">
             <div class="preview-empty-box">
-              <div class="preview-empty-icon">👁️</div>
+              <div class="preview-empty-icon">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <line x1="16" y1="13" x2="8" y2="13" />
+                  <line x1="16" y1="17" x2="8" y2="17" />
+                  <polyline points="10 9 9 9 8 9" />
+                </svg>
+              </div>
               <div class="preview-empty-title">
-                {t('preview.emptyTitle') || '右侧预览面板已就绪'}
+                {t('preview.emptyTitle') || '文件对照区'}
               </div>
               <div class="preview-empty-desc">
-                {t('preview.emptyDesc') || '按住顶部文件标签拖拽至此处或眼睛图标，边与 AI 交流边对照查阅文档与代码'}
+                {t('preview.emptyDesc') || '按住顶部文件标签拖拽至此处，边与 AI 交流边对照查阅文档与代码'}
               </div>
             </div>
           </div>

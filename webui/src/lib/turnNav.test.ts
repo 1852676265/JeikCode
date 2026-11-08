@@ -4,6 +4,7 @@ import {
   buildTurnNavItems,
   buildTurnNavItemsFromOutline,
   filterTurnNavItems,
+  formatTokenMetric,
   resolveActiveTurnId,
   truncateTurnNavLabel,
   turnNavId,
@@ -163,4 +164,85 @@ test('resolveActiveTurnId does not skip a short question just below the marker',
     resolveActiveTurnId(items, topOf, { scrollTop: 0, clientHeight: 600, scrollHeight: 2000 }),
     'a',
   );
+});
+
+test('buildTurnNavItems extracts prompt and response preview for turn navigation rail', () => {
+  const items = buildTurnNavItems([
+    { role: 'user', text: '你好' },
+    { role: 'assistant', text: '你好！我是你的编码助手。' },
+    { role: 'user', text: '你在干什么' },
+    { role: 'assistant', text: '我没在做什么——刚才只是打了声招呼。' },
+  ]);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].turn, 1);
+  assert.equal(items[0].prompt, '你好');
+  assert.equal(items[0].response, '你好！我是你的编码助手。');
+  assert.equal(items[0].unloaded, false);
+
+  assert.equal(items[1].turn, 2);
+  assert.equal(items[1].prompt, '你在干什么');
+  assert.equal(items[1].response, '我没在做什么——刚才只是打了声招呼。');
+  assert.equal(items[1].unloaded, false);
+});
+
+test('buildTurnNavItemsFromOutline merges loaded responses and flags unloaded turns', () => {
+  const loaded = buildTurnNavItems([
+    { role: 'user', text: '第二问', sourceIndex: 10, turnNavOrdinal: 1 },
+    { role: 'assistant', text: '第二问的回答', sourceIndex: 11 },
+  ]);
+  const outline = [
+    { ordinal: 0, index: 0, text: '第一问（未加载）' },
+    { ordinal: 1, index: 10, text: '第二问' },
+  ];
+  const items = buildTurnNavItemsFromOutline(outline, loaded);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].turn, 1);
+  assert.equal(items[0].prompt, '第一问（未加载）');
+  assert.equal(items[0].response, '');
+  assert.equal(items[0].unloaded, true);
+
+  assert.equal(items[1].turn, 2);
+  assert.equal(items[1].prompt, '第二问');
+  assert.equal(items[1].response, '第二问的回答');
+  assert.equal(items[1].unloaded, false);
+});
+
+test('formatTokenMetric formats tokens into human readable metric', () => {
+  assert.equal(formatTokenMetric(0), '0');
+  assert.equal(formatTokenMetric(undefined), '0');
+  assert.equal(formatTokenMetric(500), '500');
+  assert.equal(formatTokenMetric(1500), '1.5k');
+  assert.equal(formatTokenMetric(18500), '19k');
+  assert.equal(formatTokenMetric(1200000), '1.2M');
+});
+
+test('buildTurnNavItems computes per-turn and cumulative tokens', () => {
+  const items = buildTurnNavItems([
+    { role: 'user', text: '第一问', tokens: 100 },
+    { role: 'assistant', text: '第一问回答', tokens: 400 },
+    { role: 'user', text: '第二问', tokens: 200 },
+    { role: 'assistant', text: '第二问回答', tokens: 800 },
+  ]);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].tokens, 500);
+  assert.equal(items[0].cumulativeTokens, 500);
+  assert.equal(items[1].tokens, 1000);
+  assert.equal(items[1].cumulativeTokens, 1500);
+});
+
+test('buildTurnNavItemsFromOutline incorporates turnStats per turn accurately', () => {
+  const outline = [
+    { ordinal: 0, index: 0, text: '第一问' },
+    { ordinal: 1, index: 10, text: '第二问' },
+  ];
+  const turnStats = [
+    { turn_id: 1, total_tokens: 85000, model_usage: [{ prompt_tokens: 80000, completion_tokens: 5000 }] },
+    { turn_id: 2, total_tokens: 120000, model_usage: [{ prompt_tokens: 30000, completion_tokens: 5000 }] },
+  ];
+  const items = buildTurnNavItemsFromOutline(outline, undefined, turnStats);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].tokens, 85000);
+  assert.equal(items[0].cumulativeTokens, 85000);
+  assert.equal(items[1].tokens, 35000);
+  assert.equal(items[1].cumulativeTokens, 120000);
 });

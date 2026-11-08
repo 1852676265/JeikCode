@@ -949,7 +949,7 @@ export function App() {
   }
 
   return (
-    <div class="app">
+    <div class="app" id="app-root">
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
       <Sidebar
         activeSessionId={sessionId}
@@ -1598,6 +1598,25 @@ export function App() {
                 </div>
               )}
             </div>
+          </div>
+
+          {/* 右上角展开/收起右侧面板按钮 */}
+          <div class="header-right-actions">
+            <button
+              type="button"
+              class={'top-nav-btn right-panel-toggle-btn' + (!rightPanelLayout.collapsed ? ' active' : '')}
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('jeikcode:toggle_right_panel'));
+              }}
+              title={rightPanelLayout.collapsed ? (t('panel.expand') || '展开面板') : (t('panel.collapse') || '收起面板')}
+              aria-label={rightPanelLayout.collapsed ? (t('panel.expand') || '展开面板') : (t('panel.collapse') || '收起面板')}
+              aria-pressed={!rightPanelLayout.collapsed}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2" y="2" width="12" height="12" rx="2" />
+                <path d="M10.5 2v12" />
+              </svg>
+            </button>
           </div>
         </header>
 
