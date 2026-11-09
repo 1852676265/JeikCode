@@ -165,15 +165,7 @@ fn resolve_prompts_dir() -> Option<PathBuf> {
     #[cfg(not(test))]
     {
         let home = dirs::home_dir()?;
-        let zap_prompts = home.join(".zap").join("prompts");
-        if zap_prompts.exists() {
-            return Some(zap_prompts);
-        }
-        let legacy = home.join(".jeikcode").join("prompts");
-        if legacy.exists() {
-            return Some(legacy);
-        }
-        Some(zap_prompts)
+        Some(home.join(".zap").join("prompts"))
     }
 }
 
@@ -181,7 +173,7 @@ fn strip_utf8_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
-/// Bundled first-run templates for `~/.jeikcode/prompts/`. Existing files are never
+/// Bundled first-run templates for `~/.zap/prompts/`. Existing files are never
 /// overwritten — the user owns their copies after the first write.
 const PROMPT_SEEDS: &[(&str, &str)] = &[
     ("init.yaml", include_str!("../assets/prompts/init.yaml")),

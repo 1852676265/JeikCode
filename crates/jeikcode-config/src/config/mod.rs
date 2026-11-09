@@ -1989,14 +1989,7 @@ impl Config {
             return PathBuf::from(p);
         }
         let home_dir = home.unwrap_or_else(|| PathBuf::from("."));
-        let zap_dir = home_dir.join(".zap");
-        if !zap_dir.exists() {
-            let legacy_dir = home_dir.join(".jeikcode");
-            if legacy_dir.exists() {
-                return legacy_dir;
-            }
-        }
-        zap_dir
+        home_dir.join(".zap")
     }
 
     pub fn config_dir() -> PathBuf {
@@ -2487,13 +2480,13 @@ model = "missing-type"
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
         let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
-        assert_eq!(result, PathBuf::from("/Users/foo/.jeikcode"));
+        assert_eq!(result, PathBuf::from("/Users/foo/.zap"));
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_dot_when_no_home() {
         let result = Config::resolve_config_dir(None, None);
-        assert_eq!(result, PathBuf::from("./.jeikcode"));
+        assert_eq!(result, PathBuf::from("./.zap"));
     }
 
     #[test]

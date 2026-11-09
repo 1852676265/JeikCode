@@ -6,7 +6,7 @@
 
 ### 1.1 配置文件定位与优先级
 1. **工作区项目级**：`<workspace>/.mcp.json`（仅对当前项目生效，版本控制友好）。
-2. **用户全局级**：`~/.jeikcode/mcp.json`（全局共享，所有项目均可访问）。
+2. **用户全局级**：`~/.zap/mcp.json`（全局共享，所有项目均可访问）。
 3. **优先级**：同名配置下，项目级覆盖全局级。
 
 ### 1.2 CLI 快速添加 MCP 工具
@@ -16,7 +16,7 @@
 # 写入当前项目 .mcp.json
 jeikcode mcp add playwright npx @playwright/mcp@latest
 
-# 写入全局 ~/.jeikcode/mcp.json
+# 写入全局 ~/.zap/mcp.json
 jeikcode mcp add playwright npx -y @playwright/mcp@latest --global
 
 # 指定工作区目录
@@ -86,9 +86,9 @@ Skills 允许以 Markdown + YAML 方式为 Agent 注入特定工程工作流。
 
 ### 2.1 目录定位与优先级
 按以下优先级由高到低搜索（高优先级同名覆盖）：
-1. **项目专属**：`<workspace>/.jeikcode/skills/<name>/SKILL.md` 或 `<workspace>/.skills/<name>/SKILL.md`
-2. **全局用户**：`~/.jeikcode/skills/<name>/SKILL.md`
-3. **插件市场**：`~/.jeikcode/plugins/marketplaces/...`
+1. **项目专属**：`<workspace>/.zap/skills/<name>/SKILL.md` 或 `<workspace>/.skills/<name>/SKILL.md`
+2. **全局用户**：`~/.zap/skills/<name>/SKILL.md`
+3. **插件市场**：`~/.zap/plugins/marketplaces/...`
 
 ### 2.2 `SKILL.md` 标准格式
 
@@ -123,6 +123,6 @@ description: 专精于代码审查与架构规范检查。当用户要求 review
 
 ## 3. Plugins 插件管理
 
-- 插件主目录：`~/.jeikcode/plugins/`。
+- 插件主目录：`~/.zap/plugins/`。
 - 在 TUI 输入 `/plugin` 交互式浏览、安装与卸载插件。
 - 安装或更新插件后调用工具 `jeikcode_config(action="reload")` 立即生效，无需重启。

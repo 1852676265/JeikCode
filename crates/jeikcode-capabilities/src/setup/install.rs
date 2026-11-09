@@ -8,7 +8,7 @@ use crate::setup::types::*;
 use std::path::PathBuf;
 
 const GITIGNORE_BLOCK: &str =
-    "\n# JeikCode local-scope configs (machine-specific)\n.jeikcode/local/\n";
+    "\n# Zap local-scope configs (machine-specific)\n.zap/local/\n";
 
 #[derive(Debug)]
 pub enum FileWrite {
@@ -30,7 +30,7 @@ impl InstalledTxn {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let base_dir = project_root.join(".jeikcode");
+        let base_dir = project_root.join(".zap");
         let backup_dir = base_dir.join(format!(".setup-backup-{ts}"));
         std::fs::create_dir_all(&backup_dir)?;
         Ok(Self {
@@ -57,10 +57,10 @@ impl InstalledTxn {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         let already = existing.lines().any(|l| {
             let l = l.trim();
-            l == ".jeikcode/local"
-                || l == ".jeikcode/local/"
-                || l == "**/.jeikcode/local"
-                || l == "**/.jeikcode/local/"
+            l == ".zap/local"
+                || l == ".zap/local/"
+                || l == "**/.zap/local"
+                || l == "**/.zap/local/"
         });
         if already {
             return Ok(());
@@ -176,7 +176,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let txn = InstalledTxn::new(dir.path().to_path_buf()).unwrap();
         assert!(txn.backup_dir.exists());
-        assert!(txn.backup_dir.starts_with(dir.path().join(".jeikcode")));
+        assert!(txn.backup_dir.starts_with(dir.path().join(".zap")));
         std::mem::forget(txn);
     }
 
@@ -186,7 +186,7 @@ mod tests {
         let mut txn = InstalledTxn::new(dir.path().to_path_buf()).unwrap();
         txn.append_gitignore(dir.path()).unwrap();
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert!(content.contains(".jeikcode/local/"));
+        assert!(content.contains(".zap/local/"));
         std::mem::forget(txn);
     }
 
@@ -195,7 +195,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".gitignore"),
-            "node_modules/\n.jeikcode/local/\n",
+            "node_modules/\n.zap/local/\n",
         )
         .unwrap();
         let mut txn = InstalledTxn::new(dir.path().to_path_buf()).unwrap();
@@ -213,12 +213,12 @@ mod tests {
         txn.append_gitignore(dir.path()).unwrap();
         assert!(std::fs::read_to_string(&gi)
             .unwrap()
-            .contains(".jeikcode/local/"));
+            .contains(".zap/local/"));
 
         let outcome = txn.rollback();
         assert!(matches!(outcome, RollbackOutcome::Clean));
         let restored = std::fs::read_to_string(&gi).unwrap();
-        assert!(!restored.contains(".jeikcode/local/"));
+        assert!(!restored.contains(".zap/local/"));
         assert!(restored.contains("node_modules/"));
     }
 
@@ -233,7 +233,7 @@ mod tests {
         } // Drop runs here; should NOT restore .gitignore.
         assert!(std::fs::read_to_string(&gi)
             .unwrap()
-            .contains(".jeikcode/local/"));
+            .contains(".zap/local/"));
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
         } // Drop without commit — rollback should fire.
         let content = std::fs::read_to_string(&gi).unwrap();
         assert!(
-            !content.contains(".jeikcode/local/"),
+            !content.contains(".zap/local/"),
             "drop should have rolled back, .gitignore still has marker"
         );
     }

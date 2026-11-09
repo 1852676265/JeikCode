@@ -13,8 +13,8 @@ import {
 
 test('formatUserMessageWithAttachments appends numbered absolute paths', () => {
   assert.equal(
-    formatUserMessageWithAttachments('请看这个', ['E:/proj/.jeikcode_store/a.pdf', 'E:/proj/.jeikcode_store/b.txt']),
-    '请看这个\n\n附件1：E:/proj/.jeikcode_store/a.pdf\n附件2：E:/proj/.jeikcode_store/b.txt',
+    formatUserMessageWithAttachments('请看这个', ['E:/proj/.zap_store/a.pdf', 'E:/proj/.zap_store/b.txt']),
+    '请看这个\n\n附件1：E:/proj/.zap_store/a.pdf\n附件2：E:/proj/.zap_store/b.txt',
   );
 });
 

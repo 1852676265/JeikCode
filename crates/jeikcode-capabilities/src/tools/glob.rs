@@ -226,7 +226,7 @@ fn run_glob_walk(
     let mut timed_out = false;
     let mut hits: Vec<(String, std::time::SystemTime)> = Vec::new();
     // hidden=false: glob historically searches hidden files unless gitignored.
-    // `.jeikcode_store` is still visited even after it is gitignored.
+    // `.zap_store` is still visited even after it is gitignored.
     for_each_project_entry(base, false, |entry| {
         if Instant::now() >= deadline {
             timed_out = true;
@@ -849,12 +849,12 @@ mod tests {
         std::fs::create_dir(d.path().join(".git")).unwrap();
         std::fs::write(
             d.path().join(".gitignore"),
-            ".jeikcode_store/\nsecret.txt\n",
+            ".zap_store/\nsecret.txt\n",
         )
         .unwrap();
         std::fs::write(d.path().join("secret.txt"), "").unwrap();
-        std::fs::create_dir_all(d.path().join(".jeikcode_store")).unwrap();
-        std::fs::write(d.path().join(".jeikcode_store/notes.md"), "hello").unwrap();
+        std::fs::create_dir_all(d.path().join(".zap_store")).unwrap();
+        std::fs::write(d.path().join(".zap_store/notes.md"), "hello").unwrap();
         std::fs::write(d.path().join("keep.rs"), "").unwrap();
         let r = GlobTool.execute(r#"{"pattern":"*"}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);

@@ -4,7 +4,14 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+app.name = 'Zap';
+
 Menu.setApplicationMenu(null);
+
+// 在 Windows 下设置应用标识符（AUMID），让系统通知顶部显示 "Zap" 而不是默认的 "electron.app.Electron"
+if (process.platform === 'win32') {
+  app.setAppUserModelId('Zap');
+}
 
 let mainWindow = null;
 // 默认仅连接 JeikCode Vite 服务端口 5173，避免误连本地其他前端项目（如 5174 等）
@@ -38,7 +45,10 @@ async function findActiveViteUrl(maxWaitMs = 15000) {
 
 function getDaemonAuth() {
   try {
-    const listenFile = path.join(os.homedir(), '.jeikcode', 'webui-listen.json');
+    let listenFile = path.join(os.homedir(), '.zap', 'webui-listen.json');
+    if (!fs.existsSync(listenFile)) {
+      listenFile = path.join(os.homedir(), '.jeikcode', 'webui-listen.json');
+    }
     if (fs.existsSync(listenFile)) {
       const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
       if (data && data.token) {
@@ -55,7 +65,7 @@ async function createWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 640,
-    title: 'JeikCode Developer Studio',
+    title: 'Zap Developer Studio',
     backgroundColor: '#131314',
     show: false,
     webPreferences: {

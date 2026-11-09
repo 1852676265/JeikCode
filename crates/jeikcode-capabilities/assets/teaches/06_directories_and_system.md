@@ -1,6 +1,6 @@
 # 06 - 系统目录与全局文件配置指南 (Directories & System)
 
-全局根目录路径：`~/.jeikcode/`（或 `$JEIKCODE_HOME`）。
+全局根目录路径：`~/.zap/`（或 `$ZAP_HOME`）。
 
 ---
 

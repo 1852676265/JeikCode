@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   dispatchSystemNotification,
+  flashDocumentTitle,
   permissionInstanceKey,
+  playCompletionAudio,
   samePermissionInstance,
   sessionNoticeLabel,
   shouldEmitNotice,
@@ -10,6 +12,7 @@ import {
   shouldOsNotifyTerminal,
   shouldToastTerminal,
   showPermissionNotice,
+  triggerBrowserNotification,
   windowAwayFrom,
   takeTerminalEdges,
   terminalKindFromDone,
@@ -221,4 +224,11 @@ test('dispatchSystemNotification calls backend post function with expected paylo
     tag: 'sess-123:done',
     sessionId: 'sess-123',
   });
+});
+
+test('playCompletionAudio and triggerBrowserNotification degrade gracefully without DOM / AudioContext', () => {
+  // Safe execution in headless / Node environment
+  playCompletionAudio();
+  triggerBrowserNotification('Title', 'Body');
+  flashDocumentTitle('Title');
 });

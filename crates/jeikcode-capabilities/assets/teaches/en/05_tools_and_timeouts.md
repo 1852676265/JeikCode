@@ -1,6 +1,6 @@
 # 05 - Tools and Timeouts Configuration Guide (Tools & Timeouts)
 
-Configuration file path: `~/.jeikcode/config.toml`.
+Configuration file path: `~/.zap/config.toml`.
 
 ---
 
@@ -142,7 +142,7 @@ ai_session_naming = true        # Asynchronously generate session titles using A
 
 ## 9. Reload Semantics & Triggering
 
-- **No automatic reload**: Saving edits to `~/.jeikcode/config.toml` does not trigger automatic reload.
+- **No automatic reload**: Saving edits to `~/.zap/config.toml` does not trigger automatic reload.
 - **Reload Triggers**:
   1. **Agent Side**: Invoke the built-in tool `jeikcode_config(action="reload")`; takes effect on the next turn immediately after the current turn completes.
   2. **User Side**: Enter `/reload` in WebUI or TUI terminal to reread configuration immediately.

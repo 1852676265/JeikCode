@@ -1,6 +1,6 @@
 # 02 - 模型与提供商配置指南 (Models & Providers)
 
-配置文件路径：`~/.jeikcode/config.toml`（或 `$JEIKCODE_HOME/config.toml`）。
+配置文件路径：`~/.zap/config.toml`（或 `$ZAP_HOME/config.toml`）。
 
 ---
 

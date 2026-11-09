@@ -8,7 +8,7 @@
 
 ## 一、两类文件
 
-所有文件均位于全局配置目录（`~/.jeikcode/prompts/` 或 `$JEIKCODE_HOME/prompts/`）。
+所有文件均位于全局配置目录（`~/.zap/prompts/` 或 `$ZAP_HOME/prompts/`）。
 
 ### 进模型（live）
 
@@ -29,7 +29,7 @@
 
 ## 二、加载优先级与热重载
 
-1. **优先级**：`~/.jeikcode/prompts/init.yaml` 与 `rules.yaml` 只要存在且能解析，就作为 live 来源。解析失败则回退编译期默认。`root_docs_*` 永不参与组装。
+1. **优先级**：`~/.zap/prompts/init.yaml` 与 `rules.yaml` 只要存在且能解析，就作为 live 来源。解析失败则回退编译期默认。`root_docs_*` 永不参与组装。
 2. **热重载**：对 live YAML 检查 mtime；保存后下一轮对话生效。`root_docs_*` 改了也不会进模型。
 3. **首次 seed**：上述五份文件写入 `prompts/`，已有文件永不覆盖。
 

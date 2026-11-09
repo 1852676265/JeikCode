@@ -181,10 +181,10 @@ fn load_hooks_file(path: &Path) -> Vec<HookConfig> {
         .collect()
 }
 
-/// Resolve `$JEIKCODE_HOME` (fallback `~/.jeikcode`).
+/// Resolve `$ZAP_HOME` (fallback `~/.zap`).
 ///
 /// NOTE: deliberately NOT `Config::config_dir()` — this module needs the *raw*
-/// env/home rule so `sudo`-without-`$JEIKCODE_HOME` keeps its documented behaviour.
+/// env/home rule so `sudo`-without-`$ZAP_HOME` keeps its documented behaviour.
 /// The one exception is the test seam: when a thread installed a private home
 /// (`jeikcode_config::test_util::isolated_home`, used by integration tests that
 /// assert hooks land in the same private home as config/sessions), honour it.
@@ -192,17 +192,17 @@ fn jeikcode_home() -> Option<PathBuf> {
     if let Some(home) = jeikcode_config::test_util::overridden_home() {
         return Some(home);
     }
-    if let Ok(h) = std::env::var("JEIKCODE_HOME") {
+    if let Ok(h) = std::env::var("ZAP_HOME").or_else(|_| std::env::var("JEIKCODE_HOME")) {
         if !h.is_empty() {
             return Some(PathBuf::from(h));
         }
     }
     let home = dirs::home_dir()?;
-    Some(home.join(".jeikcode"))
+    Some(home.join(".zap"))
 }
 
 /// The GLOBAL hooks file `load_hooks_config` reads
-/// (`$JEIKCODE_HOME`/`~/.jeikcode` + `/hooks.json`), or `None` when no home resolves.
+/// (`$ZAP_HOME`/`~/.zap` + `/hooks.json`), or `None` when no home resolves.
 /// Exposed so diagnostics (`jeikcode hooks paths`/`list`) show EXACTLY the file that is
 /// loaded — which under `sudo` is NOT the sudo-aware `Config::config_dir()` this module
 /// deliberately does not use.

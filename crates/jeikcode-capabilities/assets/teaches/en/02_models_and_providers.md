@@ -1,6 +1,6 @@
 # 02 - Models and Providers Configuration Guide (Models & Providers)
 
-Configuration file path: `~/.jeikcode/config.toml` (or `$JEIKCODE_HOME/config.toml`).
+Configuration file path: `~/.zap/config.toml` (or `$ZAP_HOME/config.toml`).
 
 ---
 

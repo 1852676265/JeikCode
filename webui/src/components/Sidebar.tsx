@@ -1985,7 +1985,7 @@ export function Sidebar({
   // 判断一个会话是否归属于某个具体项目
   const isProjectSession = (s: SessionMetaWithProject) => {
     const normDir = (s.working_dir || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-    if (!normDir || normDir === '__global__' || normDir.includes('.jeikcode/workspace') || isUserHomeDir(normDir)) {
+    if (!normDir || normDir === '__global__' || normDir.includes('.zap/workspace') || normDir.includes('.jeikcode/workspace') || isUserHomeDir(normDir)) {
       return false;
     }
     if (s.project_hash && knownHashes.has(s.project_hash)) {

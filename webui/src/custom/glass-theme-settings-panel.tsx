@@ -17,6 +17,32 @@ import {
   GLASS_THEME_CHANGE_EVENT,
 } from './glass-theme-plugin';
 
+function DshSwitch({
+  checked,
+  disabled,
+  onChange,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      class={`dsh-switch ${checked ? 'is-checked' : ''} ${disabled ? 'is-disabled' : ''}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!disabled) onChange(!checked);
+      }}
+    >
+      <span class="dsh-switch-thumb" />
+    </button>
+  );
+}
+
 export function GlassThemeSettingsPanel() {
   const [settings, setSettings] = useState<GlassThemeSettings>(() => loadGlassThemeSettings());
   const [activePresetId, setActivePresetId] = useState<string>('apple-default');
@@ -53,36 +79,31 @@ export function GlassThemeSettingsPanel() {
       {/* 顶部状态与开关卡片 */}
       <div class="dsh-banner-card dsh-general-card-elevated">
         <div class="dsh-banner-main">
-          <div class="dsh-banner-title">🎨 苹果全景毛玻璃与透明度定制套件</div>
+          <div class="dsh-banner-title">全景毛玻璃与透明度定制</div>
           <div class="dsh-banner-sub">
-            支持无级调节侧边栏、对话消息卡片透明度、高斯模糊强度以及光晕壁纸饱和度，打造独一无二的通透质感。
+            支持无级调节侧边栏、对话消息卡片透明度、高斯模糊度以及光晕壁纸饱和度
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div class="dsh-banner-actions">
           <button
             type="button"
-            class="dsh-btn"
+            class="dsh-btn dsh-btn-outline dsh-btn-sm"
             onClick={handleReset}
             title="恢复默认毛玻璃设置"
           >
             重置默认
           </button>
-          <label class="dsh-switch-wrap" style={{ cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              class="dsh-switch-checkbox"
-              checked={settings.enabled}
-              onChange={(e) => update({ enabled: (e.currentTarget as HTMLInputElement).checked })}
-            />
-            <span class="dsh-switch-slider" />
-          </label>
+          <DshSwitch
+            checked={settings.enabled}
+            onChange={(next) => update({ enabled: next })}
+          />
         </div>
       </div>
 
       {/* 预设方案一键套用 */}
       <div class="dsh-group-stack">
-        <h3 class="dsh-group-heading">风格预设一键套用 (Style Presets)</h3>
-        <div class="dsh-presets-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' }}>
+        <h4 class="dsh-group-heading">风格预设一键套用</h4>
+        <div class="dsh-presets-grid">
           {GLASS_PRESETS.map((preset) => {
             const isCurrent = activePresetId === preset.id;
             return (
@@ -90,23 +111,10 @@ export function GlassThemeSettingsPanel() {
                 key={preset.id}
                 type="button"
                 class={`dsh-preset-card ${isCurrent ? 'is-active' : ''}`}
-                style={{
-                  textAlign: 'left',
-                  cursor: 'pointer',
-                  border: isCurrent ? '1px solid #38bdf8' : '1px solid rgba(148, 163, 184, 0.14)',
-                  background: isCurrent ? 'rgba(56, 189, 248, 0.12)' : 'rgba(30, 41, 59, 0.45)',
-                  padding: '14px',
-                  borderRadius: '12px',
-                  transition: 'all 0.18s ease',
-                }}
                 onClick={() => applyPreset(preset.id)}
               >
-                <div style={{ fontWeight: 600, fontSize: '13px', color: '#f1f5f9', marginBottom: '4px' }}>
-                  {preset.name}
-                </div>
-                <div style={{ fontSize: '11px', color: '#94a3b8', lineHeight: 1.4 }}>
-                  {preset.desc}
-                </div>
+                <div class="dsh-preset-name">{preset.name}</div>
+                <div class="dsh-preset-desc">{preset.desc}</div>
               </button>
             );
           })}
@@ -115,25 +123,20 @@ export function GlassThemeSettingsPanel() {
 
       {/* 核心透明度与模糊度滑块调节 */}
       <div class="dsh-group-stack">
-        <h3 class="dsh-group-heading">视觉参数精细调节 (Fine-tuning Controls)</h3>
+        <h4 class="dsh-group-heading">视觉参数精细调节</h4>
         <div class="dsh-general-card">
           {/* 面板与侧边栏透明度 */}
-          <div class="dsh-slider-row" style={{ padding: '8px 0' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-              <div>
-                <span style={{ fontWeight: 600, fontSize: '13px', color: '#f1f5f9' }}>
-                  工作台与侧边栏透明度 (Panel Opacity)
-                </span>
-                <div style={{ fontSize: '11px', color: '#94a3b8' }}>
-                  控制左侧导航栏、应用外壳与侧面板背景的不透明度（越低越透出壁纸）
-                </div>
+          <div class="dsh-slider-row">
+            <div class="dsh-slider-header">
+              <div class="dsh-slider-meta">
+                <span class="dsh-slider-title">工作台与侧边栏透明度</span>
+                <span class="dsh-slider-desc">控制左侧导航栏、应用外壳与侧面板背景的不透明度</span>
               </div>
-              <span class="dsh-slider-value" style={{ fontWeight: 'bold', color: '#38bdf8', fontSize: '13px' }}>
-                {Math.round(settings.panelOpacity * 100)}%
-              </span>
+              <span class="dsh-slider-value">{Math.round(settings.panelOpacity * 100)}%</span>
             </div>
             <input
               type="range"
+              class="dsh-slider"
               min="0.10"
               max="1.00"
               step="0.02"
@@ -142,29 +145,23 @@ export function GlassThemeSettingsPanel() {
                 setActivePresetId('custom');
                 update({ panelOpacity: parseFloat((e.currentTarget as HTMLInputElement).value) });
               }}
-              style={{ width: '100%', accentColor: '#38bdf8' }}
             />
           </div>
 
           <div class="dsh-general-divider" />
 
           {/* 消息与输入框卡片透明度 */}
-          <div class="dsh-slider-row" style={{ padding: '8px 0' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-              <div>
-                <span style={{ fontWeight: 600, fontSize: '13px', color: '#f1f5f9' }}>
-                  对话卡片与输入框透明度 (Card Opacity)
-                </span>
-                <div style={{ fontSize: '11px', color: '#94a3b8' }}>
-                  控制问答消息卡片、输入框胶囊与弹窗内容区域的不透明度
-                </div>
+          <div class="dsh-slider-row">
+            <div class="dsh-slider-header">
+              <div class="dsh-slider-meta">
+                <span class="dsh-slider-title">对话卡片与输入框透明度</span>
+                <span class="dsh-slider-desc">控制问答消息卡片、输入框胶囊与弹窗内容区域的不透明度</span>
               </div>
-              <span class="dsh-slider-value" style={{ fontWeight: 'bold', color: '#38bdf8', fontSize: '13px' }}>
-                {Math.round(settings.cardOpacity * 100)}%
-              </span>
+              <span class="dsh-slider-value">{Math.round(settings.cardOpacity * 100)}%</span>
             </div>
             <input
               type="range"
+              class="dsh-slider"
               min="0.20"
               max="1.00"
               step="0.02"
@@ -173,29 +170,23 @@ export function GlassThemeSettingsPanel() {
                 setActivePresetId('custom');
                 update({ cardOpacity: parseFloat((e.currentTarget as HTMLInputElement).value) });
               }}
-              style={{ width: '100%', accentColor: '#38bdf8' }}
             />
           </div>
 
           <div class="dsh-general-divider" />
 
           {/* 高斯模糊度 */}
-          <div class="dsh-slider-row" style={{ padding: '8px 0' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-              <div>
-                <span style={{ fontWeight: 600, fontSize: '13px', color: '#f1f5f9' }}>
-                  高斯磨砂模糊半径 (Backdrop Blur)
-                </span>
-                <div style={{ fontSize: '11px', color: '#94a3b8' }}>
-                  背景毛玻璃散射程度（0px 为纯透明玻璃，48px 为深厚雾面霜化）
-                </div>
+          <div class="dsh-slider-row">
+            <div class="dsh-slider-header">
+              <div class="dsh-slider-meta">
+                <span class="dsh-slider-title">高斯磨砂模糊半径</span>
+                <span class="dsh-slider-desc">背景毛玻璃散射程度（0px 为纯透，48px 为浓厚雾面）</span>
               </div>
-              <span class="dsh-slider-value" style={{ fontWeight: 'bold', color: '#38bdf8', fontSize: '13px' }}>
-                {settings.blur} px
-              </span>
+              <span class="dsh-slider-value">{settings.blur} px</span>
             </div>
             <input
               type="range"
+              class="dsh-slider"
               min="0"
               max="48"
               step="1"
@@ -204,29 +195,23 @@ export function GlassThemeSettingsPanel() {
                 setActivePresetId('custom');
                 update({ blur: parseInt((e.currentTarget as HTMLInputElement).value, 10) });
               }}
-              style={{ width: '100%', accentColor: '#38bdf8' }}
             />
           </div>
 
           <div class="dsh-general-divider" />
 
           {/* 高光细边框透明度 */}
-          <div class="dsh-slider-row" style={{ padding: '8px 0' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-              <div>
-                <span style={{ fontWeight: 600, fontSize: '13px', color: '#f1f5f9' }}>
-                  毛玻璃高光边框强度 (Border Highlight)
-                </span>
-                <div style={{ fontSize: '11px', color: '#94a3b8' }}>
-                  卡片与分界线边缘的微光反光强度，强化卡片立体悬浮层级感
-                </div>
+          <div class="dsh-slider-row">
+            <div class="dsh-slider-header">
+              <div class="dsh-slider-meta">
+                <span class="dsh-slider-title">毛玻璃微光边框强度</span>
+                <span class="dsh-slider-desc">卡片与分界线边缘的反光强度，强化卡片立体悬浮层级感</span>
               </div>
-              <span class="dsh-slider-value" style={{ fontWeight: 'bold', color: '#38bdf8', fontSize: '13px' }}>
-                {Math.round(settings.borderOpacity * 100)}%
-              </span>
+              <span class="dsh-slider-value">{Math.round(settings.borderOpacity * 100)}%</span>
             </div>
             <input
               type="range"
+              class="dsh-slider"
               min="0.00"
               max="1.00"
               step="0.05"
@@ -235,7 +220,6 @@ export function GlassThemeSettingsPanel() {
                 setActivePresetId('custom');
                 update({ borderOpacity: parseFloat((e.currentTarget as HTMLInputElement).value) });
               }}
-              style={{ width: '100%', accentColor: '#38bdf8' }}
             />
           </div>
 
@@ -244,34 +228,29 @@ export function GlassThemeSettingsPanel() {
           {/* 极光壁纸开关与光晕饱和度 */}
           <div class="dsh-general-row">
             <div class="dsh-general-meta">
-              <div class="dsh-general-label">流动极光渐变壁纸 (Aurora Mesh Wallpaper)</div>
-              <div class="dsh-general-desc">
-                开启苹果风格暖阳橙/水波青/极光蓝流动网格壁纸；关闭后呈现极简纯色背景
-              </div>
+              <div class="dsh-general-label">流动极光渐变壁纸</div>
+              <div class="dsh-general-desc">开启苹果风格暖阳橙/水波青/极光蓝流动网格壁纸；关闭后呈现极简底色</div>
             </div>
-            <input
-              type="checkbox"
+            <DshSwitch
               checked={settings.wallpaperMesh}
-              onChange={(e) => {
+              onChange={(next) => {
                 setActivePresetId('custom');
-                update({ wallpaperMesh: (e.currentTarget as HTMLInputElement).checked });
+                update({ wallpaperMesh: next });
               }}
-              style={{ width: '18px', height: '18px', accentColor: '#38bdf8', cursor: 'pointer' }}
             />
           </div>
 
           {settings.wallpaperMesh && (
-            <div class="dsh-slider-row" style={{ padding: '12px 0 4px 0' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-                <span style={{ fontSize: '12px', color: '#cbd5e1' }}>
-                  壁纸光晕饱和度 (Wallpaper Intensity)
-                </span>
-                <span class="dsh-slider-value" style={{ fontWeight: 'bold', color: '#38bdf8', fontSize: '12px' }}>
-                  {Math.round(settings.wallpaperIntensity * 100)}%
-                </span>
+            <div class="dsh-slider-row" style={{ marginTop: '12px' }}>
+              <div class="dsh-slider-header">
+                <div class="dsh-slider-meta">
+                  <span class="dsh-slider-title" style={{ fontSize: '13px' }}>壁纸光晕饱和度</span>
+                </div>
+                <span class="dsh-slider-value">{Math.round(settings.wallpaperIntensity * 100)}%</span>
               </div>
               <input
                 type="range"
+                class="dsh-slider"
                 min="0.10"
                 max="1.00"
                 step="0.05"
@@ -280,7 +259,6 @@ export function GlassThemeSettingsPanel() {
                   setActivePresetId('custom');
                   update({ wallpaperIntensity: parseFloat((e.currentTarget as HTMLInputElement).value) });
                 }}
-                style={{ width: '100%', accentColor: '#38bdf8' }}
               />
             </div>
           )}
@@ -289,47 +267,15 @@ export function GlassThemeSettingsPanel() {
 
       {/* 实时交互预览卡片 */}
       <div class="dsh-group-stack">
-        <h3 class="dsh-group-heading">实时渲染预览效果 (Live Glass Preview)</h3>
-        <div
-          style={{
-            position: 'relative',
-            padding: '24px',
-            borderRadius: '16px',
-            background: 'var(--zap-wallpaper)',
-            overflow: 'hidden',
-            boxShadow: 'inset 0 0 0 1px rgba(255, 255, 255, 0.1)',
-          }}
-        >
-          <div
-            style={{
-              padding: '16px 20px',
-              borderRadius: 'var(--zap-chat-card-radius, 22px)',
-              background: 'var(--zap-glass-card-bg)',
-              backdropFilter: 'blur(var(--zap-glass-blur, 28px))',
-              WebkitBackdropFilter: 'blur(var(--zap-glass-blur, 28px))',
-              border: '1px solid var(--zap-glass-border)',
-              boxShadow: 'var(--zap-glass-shadow)',
-              color: 'var(--app-primary-foreground, #0f172a)',
-              maxWidth: '460px',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-              <span style={{ fontSize: '15px' }}>✨</span>
-              <span style={{ fontWeight: 600, fontSize: '13px' }}>Apple Glassmorphism UI</span>
-              <span
-                style={{
-                  fontSize: '10px',
-                  background: 'rgba(56, 189, 248, 0.2)',
-                  color: '#38bdf8',
-                  padding: '2px 6px',
-                  borderRadius: '999px',
-                  marginLeft: 'auto',
-                }}
-              >
-                实时透光
-              </span>
+        <h4 class="dsh-group-heading">实时渲染预览效果</h4>
+        <div class="dsh-glass-preview-stage">
+          <div class="dsh-glass-preview-card">
+            <div class="dsh-glass-preview-head">
+              <span class="dsh-glass-preview-icon">✨</span>
+              <span class="dsh-glass-preview-title">Glassmorphism UI</span>
+              <span class="dsh-glass-preview-badge">实时透光</span>
             </div>
-            <div style={{ fontSize: '12px', lineHeight: 1.5, opacity: 0.85 }}>
+            <div class="dsh-glass-preview-body">
               拖动上方滑块即可实时预览毛玻璃透光、磨砂散射与背景流光的呼吸感，整站界面已同步即时渲染。
             </div>
           </div>

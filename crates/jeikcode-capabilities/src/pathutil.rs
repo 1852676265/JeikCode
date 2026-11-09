@@ -319,8 +319,8 @@ mod tests {
     fn backslash_expands_on_windows() {
         let home = Path::new(r"C:\Users\csdn");
         assert_eq!(
-            expand_tilde_with_home(r"~\.jeikcode\x", Some(home)),
-            Some(PathBuf::from(r"C:\Users\csdn\.jeikcode\x"))
+            expand_tilde_with_home(r"~\.zap\x", Some(home)),
+            Some(PathBuf::from(r"C:\Users\csdn\.zap\x"))
         );
         // Doubled separator must not escape to the drive root.
         assert_eq!(

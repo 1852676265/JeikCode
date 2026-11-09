@@ -24,14 +24,7 @@ fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathB
     if let Some(d) = override_dir.filter(|s| !s.is_empty()) {
         return project_root.join(d).join("memory.md");
     }
-    let zap_path = project_root.join(".zap").join("memory.md");
-    if !zap_path.exists() {
-        let legacy_path = project_root.join(".jeikcode").join("memory.md");
-        if legacy_path.exists() {
-            return legacy_path;
-        }
-    }
-    zap_path
+    project_root.join(".zap").join("memory.md")
 }
 
 impl MemoryStore {
@@ -282,11 +275,11 @@ mod tests {
         // Default (unset/empty) is byte-identical to today's hardcoded path.
         assert_eq!(
             super::project_memory_path(root, None),
-            Path::new("/proj/.jeikcode/memory.md")
+            Path::new("/proj/.zap/memory.md")
         );
         assert_eq!(
             super::project_memory_path(root, Some("")),
-            Path::new("/proj/.jeikcode/memory.md")
+            Path::new("/proj/.zap/memory.md")
         );
         // Relative override nests under project_root.
         assert_eq!(

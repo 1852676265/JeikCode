@@ -432,6 +432,7 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "datalog",
     "logs",
     "log",
+    ".zap",
     ".jeikcode",
     ".claude",
     "runs",
@@ -446,14 +447,12 @@ pub(crate) fn is_skip_dir(name: &str) -> bool {
 /// `read` / `grep` / `glob` must still see it — these files
 /// are attachments the model is expected to open, not project source.
 pub const USER_UPLOAD_STORE_DIR: &str = ".zap_store";
-pub const LEGACY_USER_UPLOAD_STORE_DIR: &str = ".jeikcode_store";
 
 pub(crate) fn is_upload_store_dir(name: &str) -> bool {
     name.eq_ignore_ascii_case(USER_UPLOAD_STORE_DIR)
-        || name.eq_ignore_ascii_case(LEGACY_USER_UPLOAD_STORE_DIR)
 }
 
-/// True when `path` is `.jeikcode_store` itself or lives under one.
+/// True when `path` is `.zap_store` itself or lives under one.
 pub(crate) fn path_in_upload_store(path: &Path) -> bool {
     path.components().any(|c| {
         c.as_os_str()

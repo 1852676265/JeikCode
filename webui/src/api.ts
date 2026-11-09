@@ -1856,7 +1856,7 @@ export type UploadProgress = {
   percent: number;
 };
 
-/** POST /fs/upload — save non-image attachments under `{cwd}/.jeikcode_store`.
+/** POST /fs/upload — save non-image attachments under `{cwd}/.zap_store`.
  *  Called only when the user sends, so removed pending files never hit disk.
  *  Large files are streamed one-by-one with upload progress. */
 export async function uploadSessionFiles(

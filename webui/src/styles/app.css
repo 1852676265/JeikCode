@@ -5472,108 +5472,322 @@ body {
   cursor: default;
 }
 
-/* === Session todo panel (sticky above composer — TUI active_todos parity) ===
-   Width matches .input-wrap / .timeline-inner (--app-content-max-width). */
+/* === Session todo panel (Apple Liquid Glassmorphism · Floating HUD & Embedded) ===
+   Prototype 1: Apple Liquid Glass Floating HUD on Top-Right / Timeline Card */
 .session-todo-panel {
-  flex-shrink: 0;
-  width: 100%;
-  margin: 0 0 8px;
-  border: 1px solid var(--app-border, rgba(127, 127, 127, 0.22));
-  border-radius: var(--corner-radius-small, 8px);
-  background: color-mix(in srgb, var(--app-secondary-background) 85%, transparent);
-  overflow: hidden;
-  max-height: 180px;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  box-sizing: border-box;
-  transition: all 0.2s ease;
+  background: var(--zap-glass-card-bg, rgba(255, 255, 255, 0.88));
+  backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  -webkit-backdrop-filter: blur(var(--zap-glass-blur, 28px));
+  border: 1px solid var(--zap-glass-border, rgba(255, 255, 255, 0.85));
+  border-radius: 18px;
+  box-shadow: var(--zap-glass-shadow-floating, 0 14px 40px rgba(31, 38, 135, 0.09), 0 2px 6px rgba(0, 0, 0, 0.03));
+  overflow: hidden;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.session-todo-panel.is-collapsed {
-  max-height: 38px;
-  margin-bottom: 6px;
+
+/* Floating HUD on top-right (active turns) */
+.session-todo-panel.is-floating {
+  position: absolute;
+  top: 14px;
+  right: 22px;
+  z-index: 20;
+  width: min(320px, calc(100% - 36px));
+  max-height: min(360px, calc(100% - 28px));
+  animation: sessionTodoFloatIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-/* Frozen under an assistant reply (timeline column already max-width constrained). */
+
+.session-todo-panel.is-floating.is-collapsed {
+  max-height: 46px;
+  width: min(290px, calc(100% - 36px));
+}
+
+/* Free dragging state */
+.session-todo-panel.is-dragging {
+  transition: none !important;
+  cursor: grabbing !important;
+  user-select: none !important;
+  box-shadow: 0 20px 52px rgba(31, 38, 135, 0.16), 0 4px 12px rgba(0, 0, 0, 0.08) !important;
+}
+
+.session-todo-panel.is-dragging * {
+  cursor: grabbing !important;
+}
+
+/* Embedded at the bottom of an assistant message bubble (frozen turns) */
 .session-todo-panel.is-embedded {
-  margin: 10px 0 0;
-  max-height: 220px;
+  flex-shrink: 0;
+  width: 100%;
+  margin: 12px 0 4px;
+  border-radius: 16px;
+  max-height: 280px;
 }
+
+.session-todo-panel.is-embedded.is-collapsed {
+  max-height: 44px;
+}
+
+/* Header */
 .session-todo-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--app-border-color, rgba(127, 127, 127, 0.15));
-  font-size: 12px;
+  justify-content: space-between;
+  padding: 10px 14px 9px;
   cursor: pointer;
   user-select: none;
-  min-height: 32px;
+  min-height: 38px;
+  box-sizing: border-box;
 }
-.session-todo-panel.is-collapsed .session-todo-header {
-  border-bottom: none;
+
+.session-todo-panel.is-floating .session-todo-header {
+  cursor: grab;
 }
-.session-todo-collapse-icon {
-  font-size: 11px;
+
+.session-todo-panel.is-floating.is-dragging .session-todo-header {
+  cursor: grabbing;
+}
+
+.session-todo-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-todo-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--app-secondary-foreground);
+  opacity: 0.45;
+  cursor: grab;
+  padding: 2px 2px 2px 0;
   flex-shrink: 0;
-  width: 12px;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.session-todo-header:hover .session-todo-drag-handle {
+  opacity: 0.85;
+  color: var(--app-brand, #2563eb);
+}
+
+.session-todo-sparkle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--app-brand, #2563eb) 12%, transparent);
+  color: var(--app-brand, #2563eb);
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.session-todo-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-primary-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-todo-header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.session-todo-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-brand, #2563eb) 10%, transparent);
+  color: var(--app-brand, #2563eb);
+}
+
+.session-todo-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s, color 0.15s;
+}
+
+.session-todo-header:hover .session-todo-toggle-btn {
+  background: color-mix(in srgb, var(--app-secondary-foreground) 12%, transparent);
+  color: var(--app-primary-foreground);
+}
+
+/* Gradient progress bar right under the header */
+.session-todo-progress-track {
+  height: 3px;
+  width: 100%;
+  background: color-mix(in srgb, var(--app-border, #e2e8f0) 40%, transparent);
+  position: relative;
+  overflow: hidden;
+}
+
+.session-todo-progress-bar {
+  height: 100%;
+  border-radius: 0 999px 999px 0;
+  background: linear-gradient(90deg, #10b981 0%, var(--app-brand, #3b82f6) 100%);
+  transition: width 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Collapsed active task snippet bar */
+.session-todo-active-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px 8px;
+  font-size: 11.5px;
+  color: var(--app-secondary-foreground);
+  min-width: 0;
+}
+
+.session-todo-active-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+/* Item list */
+.session-todo-list {
+  padding: 6px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.session-todo-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--app-secondary-foreground);
+  transition: all 0.18s ease;
+  min-width: 0;
+}
+
+.session-todo-status-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.session-todo-check {
+  display: block;
+}
+
+.session-todo-spin-ring {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1.8px solid var(--app-brand, #2563eb);
+  background: color-mix(in srgb, var(--app-brand, #2563eb) 14%, transparent);
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
-.session-todo-active-snippet {
-  font-size: 11px;
-  color: var(--app-info-foreground, #3b82f6);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+
+.session-todo-spin-dot,
+.session-todo-pulse-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--app-brand, #2563eb);
+  box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.5);
+  animation: sessionTodoPulse 1.8s infinite;
+}
+
+.session-todo-pending-ring {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--app-border, #cbd5e1);
+  background: transparent;
+  display: block;
+  box-sizing: border-box;
+}
+
+.session-todo-content {
   flex: 1;
   min-width: 0;
-  padding: 0 4px;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
-.session-todo-title {
-  font-weight: 600;
-  color: var(--app-primary-foreground);
-  flex-shrink: 0;
-}
-.session-todo-summary {
-  margin-left: auto;
-  color: var(--app-secondary-foreground);
-  font-size: 11px;
-  flex-shrink: 0;
-}
-.session-todo-list {
-  overflow: auto;
-  padding: 4px 0;
-}
-.session-todo-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 4px 12px;
-  font-size: 12.5px;
-  line-height: 1.4;
-  min-width: 0;
-}
-.session-todo-glyph {
-  flex-shrink: 0;
-  width: 1.1em;
-  text-align: center;
-  margin-top: 1px;
-}
-.session-todo-row.status-completed .session-todo-glyph {
-  color: var(--app-success-foreground, #16a34a);
-}
-.session-todo-row.status-in_progress .session-todo-glyph {
-  color: var(--app-info-foreground, #3b82f6);
-}
-.session-todo-row.status-pending .session-todo-glyph {
-  color: var(--app-secondary-foreground);
-  opacity: 0.65;
-}
+
 .session-todo-row.status-completed .session-todo-content {
-  color: var(--app-secondary-foreground);
   text-decoration: line-through;
-  opacity: 0.85;
+  opacity: 0.72;
+}
+
+.session-todo-row.status-in_progress {
+  background: color-mix(in srgb, var(--app-brand, #2563eb) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--app-brand, #2563eb) 18%, transparent);
+  color: var(--app-primary-foreground);
+  font-weight: 500;
+}
+
+.session-todo-pill-active {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--app-brand, #2563eb);
+  color: #ffffff;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+@keyframes sessionTodoFloatIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes sessionTodoPulse {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.5);
+  }
+  70% {
+    transform: scale(1.05);
+    box-shadow: 0 0 0 5px rgba(37, 99, 235, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+  }
 }
 
 .input-wrap {
@@ -11060,27 +11274,28 @@ body {
   }
 
   /* 移动端 Todolist 深度空间压缩 */
-  .session-todo-panel {
-    margin-bottom: 4px !important;
+  .session-todo-panel.is-floating {
+    top: 8px;
+    right: 8px;
+    width: calc(100% - 16px);
+    max-height: min(240px, 40vh);
+    border-radius: 14px;
   }
-  .session-todo-panel.is-collapsed {
-    max-height: 28px !important;
+  .session-todo-panel.is-floating.is-collapsed {
+    max-height: 40px;
+    width: min(260px, calc(100% - 16px));
   }
-  .session-todo-panel.is-collapsed .session-todo-header {
-    min-height: 28px !important;
-    padding: 2px 8px !important;
-    font-size: 11px !important;
+  .session-todo-panel.is-embedded {
+    margin-top: 8px;
+    border-radius: 12px;
   }
-  .session-todo-panel:not(.is-collapsed) {
-    max-height: 95px !important; /* 展开也严格封顶在 95px，滚动浏览，绝不占半屏 */
-  }
-  .session-todo-list {
-    max-height: 65px !important;
-    padding: 2px 0 !important;
+  .session-todo-header {
+    padding: 6px 10px;
+    min-height: 32px;
   }
   .session-todo-row {
-    padding: 2px 8px !important;
-    font-size: 11.5px !important;
+    padding: 4px 6px;
+    font-size: 11.5px;
   }
 
   /* 移动端排队消息卡片：紧凑排版，避免挤占垂直空间 */
@@ -11587,9 +11802,6 @@ body {
   }
   .messages-container {
     padding: 14px 16px 8px;
-  }
-  .session-todo-panel {
-    max-height: min(160px, 20vh);
   }
 }
 

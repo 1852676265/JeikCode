@@ -11,7 +11,7 @@
 | **03** | `mcp` / `skills` | `teaches/03_mcp_and_skills.md` | `jeikcode mcp add` CLI、`mcp.json`、WebUI/TUI `/mcp` 与刷新、`SKILL.md` 编写与 `/skills`、插件管理 |
 | **04** | `thesaurus` / `cilin` | `teaches/04_thesaurus_and_retrieval.md` | 词林 `thesaurus/*.txt` 映射格式、双语代码检索、领域专有词库配置 |
 | **05** | `tools` / `timeouts` | `teaches/05_tools_and_timeouts.md` | `[tools.bash]` 命令硬寿命、`[tools.timeouts]` 短超时、`[tools.tool_output]` 64KB/24KB 压缩、后台任务、代理设置 |
-| **06** | `directories` / `files` | `teaches/06_directories_and_system.md` | `~/.zap/`（或 `~/.jeikcode/`）目录结构与配置文件清单、清理与维护建议 |
+| **06** | `directories` / `files` | `teaches/06_directories_and_system.md` | `~/.zap/` 目录结构与配置文件清单、清理与维护建议 |
 | **07** | `project` / `rules` | `teaches/07_project_constraints_and_rules.md` | 三层项目指令（AGENTS.md、ZAP.md、.zap.user.md 等）、业务知识包（rules.md、glossary.md、dbwords.md） |
 | **08** | `updates` / `upgrade` | `teaches/08_updates_and_releases.md` | 更新源配置（github.com/jeikl/JeikCode / latest.json）、自升级命令（/upgrade）、环境变量覆盖 |
 

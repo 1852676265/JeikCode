@@ -512,7 +512,7 @@ pub(crate) async fn get_or_spawn_terminal_process(
     let killer = spawned.child.clone_killer();
     let (broadcast, _) = tokio::sync::broadcast::channel::<String>(512);
     let greeting = format!(
-        "\x1b[32m[JeikCode Terminal: {term_id} ({shell_name})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
+        "\x1b[32m[Zap Terminal: {term_id} ({shell_name})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
     );
     let buffer = Arc::new(Mutex::new(greeting));
     start_reader(spawned.reader, buffer.clone(), broadcast.clone());

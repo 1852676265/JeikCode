@@ -832,7 +832,7 @@ fn ensure_shell_path(dir: &Path) {
         if !next.is_empty() && !next.ends_with('\n') {
             next.push('\n');
         }
-        next.push_str("\n# Added by JeikCode Desktop\n");
+        next.push_str("\n# Added by Zap Desktop\n");
         next.push_str(&line);
         next.push('\n');
         let _ = std::fs::write(path, next);

@@ -55,11 +55,11 @@ pub fn codeintel_tool_names() -> &'static [&'static str] {
 }
 
 /// Returned by `code_explore` when the workspace has no
-/// `.jeikcode/codegraph` index. Steers the model to inspect workspace
+/// `.zap/codegraph` index. Steers the model to inspect workspace
 /// layout, distinguishes single vs multi-repo scenarios, and guides
 /// direct or separated `jeikcode init --force` indexing.
 pub fn no_codegraph_tool_guidance() -> &'static str {
-    "当前目录下尚未建立代码图谱索引（`.jeikcode/codegraph` 不存在或为空）。\n\
+    "当前目录下尚未建立代码图谱索引（`.zap/codegraph` 不存在或为空）。\n\
      \n\
      【路由诊断与行动指引】：\n\
      1. 请先用 `read` 查看当前工作目录结构；\n\
@@ -107,7 +107,7 @@ pub fn notify_code_index_file_changed(path: &Path, content: Option<&str>) {
 /// Completely non-blocking to startup, LLM streaming, and TUI events, ensuring cold-start
 /// queries execute in milliseconds.
 ///
-/// Only runs when `{root}/.jeikcode/codegraph` already has a non-empty index.
+/// Only runs when `{root}/.zap/codegraph` already has a non-empty index.
 /// Missing or empty graphs are never auto-created — the user must run
 /// `jeikcode init .` for a first index. Incremental refresh of an existing
 /// index stays in the background.

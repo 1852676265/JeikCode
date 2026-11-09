@@ -431,9 +431,9 @@ mod tests {
     #[tokio::test]
     async fn turn_start_hot_reloads_agents_and_glossary() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join(".jeikcode")).unwrap();
+        std::fs::create_dir_all(d.path().join(".zap")).unwrap();
         std::fs::write(d.path().join("AGENTS.md"), "rule-v1").unwrap();
-        std::fs::write(d.path().join(".jeikcode/glossary.md"), "term-v1").unwrap();
+        std::fs::write(d.path().join(".zap/glossary.md"), "term-v1").unwrap();
         let hook = SessionContextHook::with_home(d.path(), d.path().join("nohome"));
 
         let mut convo = Conversation::new();
@@ -447,7 +447,7 @@ mod tests {
 
         // Mid-session edits on disk.
         std::fs::write(d.path().join("AGENTS.md"), "rule-v2-hot").unwrap();
-        std::fs::write(d.path().join(".jeikcode/glossary.md"), "term-v2-hot").unwrap();
+        std::fs::write(d.path().join(".zap/glossary.md"), "term-v2-hot").unwrap();
         convo.push(Message::user("next turn"));
         hook.turn_start(&mut convo).await;
 

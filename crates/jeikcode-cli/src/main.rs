@@ -188,7 +188,7 @@ fn format_serve_banner(
 
     let mut out = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(out, "JeikCode serve");
+    let _ = writeln!(out, "Zap serve");
     // canonicalize() on Windows yields `\\?\E:\...` — strip for human banner.
     let project_raw = workdir.display().to_string();
     let project_display = project_raw
@@ -387,7 +387,7 @@ async fn attach_to_server(url: &str, token_arg: Option<&str>, no_open: bool) -> 
         None => format!("{base}/"),
     };
 
-    eprintln!("Connected to JeikCode server at {base}");
+    eprintln!("Connected to Zap server at {base}");
     eprintln!("  UI: {client_url}");
     if token.is_none() {
         eprintln!("  (no token; if the server requires auth, pass --token or a full ?token= URL)");
@@ -2232,7 +2232,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 return Ok(0);
             }
             Commands::SyncConfig { auto } => {
-                if let Some(home) = dirs::home_dir().map(|h| h.join(".jeikcode")) {
+                if let Some(home) = dirs::home_dir().map(|h| h.join(".zap")) {
                     let diffs = jeikcode::config_sync::scan_jeikcode_config_diffs(&home);
                     if auto {
                         let _ = jeikcode::config_sync::apply_selected_diffs(diffs);
@@ -3531,8 +3531,8 @@ fn is_git_repository(dir: &Path) -> bool {
     }
 }
 
-/// 判断 .gitignore 文件内容中是否已经包含了忽略 .jeikcode/codegraph/ 的规则
-/// （包括显式忽略 codegraph，或父级 .jeikcode/、.* 等整体忽略规则）
+/// 判断 .gitignore 文件内容中是否已经包含了忽略 .zap/codegraph/ 的规则
+/// （包括显式忽略 codegraph，或父级 .zap/、.* 等整体忽略规则）
 fn gitignore_contains_codegraph(content: &str) -> bool {
     content.lines().any(|raw_line| {
         let line = raw_line.trim();
@@ -3549,16 +3549,16 @@ fn gitignore_contains_codegraph(content: &str) -> bool {
         let rule = rule.strip_suffix('/').unwrap_or(rule);
         let rule = rule.strip_suffix("/*").unwrap_or(rule);
 
-        // 如果规则直接忽略了 .jeikcode/codegraph、整个 .jeikcode 目录或全局 codegraph 目录
-        rule == ".jeikcode/codegraph" || rule == ".jeikcode" || rule == "codegraph"
+        // 如果规则直接忽略了 .zap/codegraph、整个 .zap 目录或全局 codegraph 目录
+        rule == ".zap/codegraph" || rule == ".zap" || rule == "codegraph"
     })
 }
 
-/// 在 jeikcode init / jeikcode init --force 结束时确保 .gitignore 包含 .jeikcode/codegraph/：
+/// 在 zap init / zap init --force 结束时确保 .gitignore 包含 .zap/codegraph/：
 /// 1. 自动判断当前是否为 git 仓库，若不是则直接退出
 /// 2. 找当前目录下是否存在 .gitignore 文件
-///    - 如果没有，就创建并写入 .jeikcode/codegraph/
-///    - 如果有，就判断 .jeikcode/codegraph/ 是否在忽略列表：如果不在就加入，如果在就忽略
+///    - 如果没有，就创建并写入 .zap/codegraph/
+///    - 如果有，就判断 .zap/codegraph/ 是否在忽略列表：如果不在就加入，如果在就忽略
 fn ensure_gitignore_codegraph_entry(root: &Path) {
     if !is_git_repository(root) {
         return;
@@ -3566,7 +3566,7 @@ fn ensure_gitignore_codegraph_entry(root: &Path) {
 
     let gitignore_path = root.join(".gitignore");
     if !gitignore_path.exists() {
-        if let Err(e) = std::fs::write(&gitignore_path, ".jeikcode/codegraph/\n") {
+        if let Err(e) = std::fs::write(&gitignore_path, ".zap/codegraph/\n") {
             eprintln!("warning: failed to create .gitignore: {e}");
         }
         return;
@@ -3581,7 +3581,7 @@ fn ensure_gitignore_codegraph_entry(root: &Path) {
             if !next.is_empty() && !next.ends_with('\n') {
                 next.push('\n');
             }
-            next.push_str(".jeikcode/codegraph/\n");
+            next.push_str(".zap/codegraph/\n");
             if let Err(e) = std::fs::write(&gitignore_path, next) {
                 eprintln!("warning: failed to update .gitignore: {e}");
             }
@@ -4635,7 +4635,7 @@ async fn run_upgrade_cli(
 
                 if spawned.is_err() {
                     // Fallback to in-process sync if spawning new binary fails
-                    if let Some(home) = dirs::home_dir().map(|h| h.join(".jeikcode")) {
+                    if let Some(home) = dirs::home_dir().map(|h| h.join(".zap")) {
                         let diffs = jeikcode::config_sync::scan_jeikcode_config_diffs(&home);
                         if yes {
                             let _ = jeikcode::config_sync::apply_selected_diffs(diffs);
@@ -5747,39 +5747,39 @@ mod tests {
 
     #[test]
     fn test_gitignore_contains_codegraph_patterns() {
-        // 直接忽略 .jeikcode/codegraph
-        assert!(gitignore_contains_codegraph(".jeikcode/codegraph/"));
-        assert!(gitignore_contains_codegraph(".jeikcode/codegraph"));
-        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph/"));
-        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph"));
-        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph/"));
-        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph"));
-        assert!(gitignore_contains_codegraph(".jeikcode/codegraph/*"));
-        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph/*"));
-        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph/*"));
+        // 直接忽略 .zap/codegraph
+        assert!(gitignore_contains_codegraph(".zap/codegraph/"));
+        assert!(gitignore_contains_codegraph(".zap/codegraph"));
+        assert!(gitignore_contains_codegraph("/.zap/codegraph/"));
+        assert!(gitignore_contains_codegraph("/.zap/codegraph"));
+        assert!(gitignore_contains_codegraph("**/.zap/codegraph/"));
+        assert!(gitignore_contains_codegraph("**/.zap/codegraph"));
+        assert!(gitignore_contains_codegraph(".zap/codegraph/*"));
+        assert!(gitignore_contains_codegraph("/.zap/codegraph/*"));
+        assert!(gitignore_contains_codegraph("**/.zap/codegraph/*"));
         assert!(gitignore_contains_codegraph("codegraph/"));
         assert!(gitignore_contains_codegraph("**/codegraph/"));
 
-        // 已经整目录忽略 .jeikcode/ 或 .*，无需重复追加
-        assert!(gitignore_contains_codegraph(".jeikcode/"));
-        assert!(gitignore_contains_codegraph(".jeikcode"));
-        assert!(gitignore_contains_codegraph("/.jeikcode/"));
-        assert!(gitignore_contains_codegraph("**/.jeikcode/"));
+        // 已经整目录忽略 .zap/ 或 .*，无需重复追加
+        assert!(gitignore_contains_codegraph(".zap/"));
+        assert!(gitignore_contains_codegraph(".zap"));
+        assert!(gitignore_contains_codegraph("/.zap/"));
+        assert!(gitignore_contains_codegraph("**/.zap/"));
         assert!(gitignore_contains_codegraph(".*"));
         assert!(gitignore_contains_codegraph(".*/"));
 
         // 前后有空白或换行
-        assert!(gitignore_contains_codegraph("  .jeikcode/codegraph/  \n"));
+        assert!(gitignore_contains_codegraph("  .zap/codegraph/  \n"));
 
         // 不匹配的情况（确保 rules.md, mcp.json, glossary.md 等项目配置不会被当成 codegraph 已忽略）
         assert!(!gitignore_contains_codegraph(""));
-        assert!(!gitignore_contains_codegraph("# .jeikcode/codegraph/"));
-        assert!(!gitignore_contains_codegraph("!.jeikcode/codegraph/"));
-        assert!(!gitignore_contains_codegraph(".jeikcode/rules.md"));
-        assert!(!gitignore_contains_codegraph(".jeikcode/glossary.md"));
-        assert!(!gitignore_contains_codegraph(".jeikcode/local/"));
+        assert!(!gitignore_contains_codegraph("# .zap/codegraph/"));
+        assert!(!gitignore_contains_codegraph("!.zap/codegraph/"));
+        assert!(!gitignore_contains_codegraph(".zap/rules.md"));
+        assert!(!gitignore_contains_codegraph(".zap/glossary.md"));
+        assert!(!gitignore_contains_codegraph(".zap/local/"));
         assert!(!gitignore_contains_codegraph("node_modules/"));
-        assert!(!gitignore_contains_codegraph(".jeikcode_store/"));
+        assert!(!gitignore_contains_codegraph(".zap_store/"));
     }
 
     #[test]
@@ -5789,7 +5789,7 @@ mod tests {
         ensure_gitignore_codegraph_entry(non_git.path());
         assert!(!non_git.path().join(".gitignore").exists());
 
-        // 场景 2：是 Git 仓库，但无 .gitignore 文件 -> 自动创建并写入 .jeikcode/codegraph/\n
+        // 场景 2：是 Git 仓库，但无 .gitignore 文件 -> 自动创建并写入 .zap/codegraph/\n
         let git_repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(git_repo.path().join(".git")).unwrap();
         ensure_gitignore_codegraph_entry(git_repo.path());
@@ -5797,14 +5797,14 @@ mod tests {
         assert!(gitignore.exists());
         assert_eq!(
             std::fs::read_to_string(&gitignore).unwrap(),
-            ".jeikcode/codegraph/\n"
+            ".zap/codegraph/\n"
         );
 
-        // 场景 3：已包含 .jeikcode/codegraph/，不重复添加
+        // 场景 3：已包含 .zap/codegraph/，不重复添加
         ensure_gitignore_codegraph_entry(git_repo.path());
         assert_eq!(
             std::fs::read_to_string(&gitignore).unwrap(),
-            ".jeikcode/codegraph/\n"
+            ".zap/codegraph/\n"
         );
 
         // 场景 4：已有 .gitignore 包含其它项目配置（如 rules.md 或 target），且不以换行符结尾，正确补齐换行并追加
@@ -5815,10 +5815,10 @@ mod tests {
         ensure_gitignore_codegraph_entry(git_repo2.path());
         assert_eq!(
             std::fs::read_to_string(&gi2).unwrap(),
-            "target\n.jeikcode/codegraph/\n"
+            "target\n.zap/codegraph/\n"
         );
 
-        // 场景 5：已有以换行符结尾的 .gitignore，追加 .jeikcode/codegraph/\n
+        // 场景 5：已有以换行符结尾的 .gitignore，追加 .zap/codegraph/\n
         let git_repo3 = tempfile::tempdir().unwrap();
         std::fs::create_dir(git_repo3.path().join(".git")).unwrap();
         let gi3 = git_repo3.path().join(".gitignore");
@@ -5826,15 +5826,15 @@ mod tests {
         ensure_gitignore_codegraph_entry(git_repo3.path());
         assert_eq!(
             std::fs::read_to_string(&gi3).unwrap(),
-            "node_modules/\n.jeikcode/codegraph/\n"
+            "node_modules/\n.zap/codegraph/\n"
         );
 
-        // 场景 6：已有 .jeikcode/ 整体忽略时，判定已忽略，不重复追加
+        // 场景 6：已有 .zap/ 整体忽略时，判定已忽略，不重复追加
         let git_repo4 = tempfile::tempdir().unwrap();
         std::fs::create_dir(git_repo4.path().join(".git")).unwrap();
         let gi4 = git_repo4.path().join(".gitignore");
-        std::fs::write(&gi4, ".jeikcode/\n").unwrap();
+        std::fs::write(&gi4, ".zap/\n").unwrap();
         ensure_gitignore_codegraph_entry(git_repo4.path());
-        assert_eq!(std::fs::read_to_string(&gi4).unwrap(), ".jeikcode/\n");
+        assert_eq!(std::fs::read_to_string(&gi4).unwrap(), ".zap/\n");
     }
 }

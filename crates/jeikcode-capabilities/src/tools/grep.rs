@@ -1066,7 +1066,7 @@ fn search(
         .heap_limit(Some(MAX_LINE_BUF_BYTES))
         .build();
 
-    // hidden=true: grep historically skips dotfiles. `.jeikcode_store` is still
+    // hidden=true: grep historically skips dotfiles. `.zap_store` is still
     // visited even when hidden and gitignored, so uploaded attachments stay searchable.
     for_each_project_entry(root, true, |entry| {
         if Instant::now() >= deadline {
@@ -1534,14 +1534,14 @@ mod tests {
         std::fs::create_dir(d.path().join(".git")).unwrap();
         std::fs::write(
             d.path().join(".gitignore"),
-            ".jeikcode_store/\nhidden.txt\n",
+            ".zap_store/\nhidden.txt\n",
         )
         .unwrap();
         std::fs::write(d.path().join("hidden.txt"), "NEEDLE hidden\n").unwrap();
         std::fs::write(d.path().join("keep.rs"), "NEEDLE keep\n").unwrap();
-        std::fs::create_dir_all(d.path().join(".jeikcode_store")).unwrap();
+        std::fs::create_dir_all(d.path().join(".zap_store")).unwrap();
         std::fs::write(
-            d.path().join(".jeikcode_store/upload.txt"),
+            d.path().join(".zap_store/upload.txt"),
             "NEEDLE upload\n",
         )
         .unwrap();

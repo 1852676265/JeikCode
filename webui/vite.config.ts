@@ -35,11 +35,11 @@ function getAppVersion(): string {
 
 function getDaemonAuth(): { port: number; token?: string } | null {
   try {
-    const listenFile = path.resolve(
-      process.env.USERPROFILE || process.env.HOME || '',
-      '.jeikcode',
-      'webui-listen.json'
-    );
+    const home = process.env.USERPROFILE || process.env.HOME || '';
+    let listenFile = path.resolve(home, '.zap', 'webui-listen.json');
+    if (!fs.existsSync(listenFile)) {
+      listenFile = path.resolve(home, '.jeikcode', 'webui-listen.json');
+    }
     if (fs.existsSync(listenFile)) {
       const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
       if (data && data.port) {

@@ -22,6 +22,8 @@ export interface CodeEditorTabProps {
   hideHeaderToolbar?: boolean;
   startLine?: number;
   endLine?: number;
+  silentError?: boolean;
+  onLoadError?: (err: any) => void;
 }
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif']);
@@ -42,6 +44,8 @@ export function CodeEditorTab({
   hideHeaderToolbar = false,
   startLine,
   endLine,
+  silentError = false,
+  onLoadError,
 }: CodeEditorTabProps) {
   const t = useT();
   const ext = useMemo(() => (filePath.split('.').pop() || '').toLowerCase(), [filePath]);
@@ -52,6 +56,8 @@ export function CodeEditorTab({
 
   const [content, setContent] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(!isImage && !isBinary);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadTrigger, setReloadTrigger] = useState<number>(0);
   const [saving, setSaving] = useState<boolean>(false);
   const [isDirty, setIsDirty] = useState<boolean>(false);
 
@@ -488,11 +494,13 @@ export function CodeEditorTab({
     });
 
     setLoading(true);
+    setLoadError(null);
     fetchFsRead(filePath, cwd)
       .then((res) => {
         if (!cancelled) {
           const loaded = res.content || '';
           setContent(loaded);
+          setLoadError(null);
           historyRef.current = [{ text: loaded, cursor: 0 }];
           historyIndexRef.current = 0;
           setIsDirty(false);
@@ -501,7 +509,13 @@ export function CodeEditorTab({
       })
       .catch((err) => {
         if (!cancelled) {
-          showToast(t('editor.readFailed', { error: err?.message || String(err) }), 'error');
+          const errMsg = err?.message || String(err);
+          setLoadError(errMsg);
+          onLoadError?.(err);
+          // 在静默错误模式或只读预览模式下不弹全局阻塞式 Toast 弹窗骚扰主界面
+          if (!silentError && defaultViewMode !== 'preview') {
+            showToast(t('editor.readFailed', { error: errMsg }), 'error');
+          }
         }
       })
       .finally(() => {
@@ -510,7 +524,7 @@ export function CodeEditorTab({
     return () => {
       cancelled = true;
     };
-  }, [filePath, isImage, isSvg, isBinary]);
+  }, [filePath, cwd, isImage, isSvg, isBinary, reloadTrigger, silentError, defaultViewMode, onLoadError]);
 
   // 保存文件
   const handleSave = useCallback(async () => {
@@ -1092,6 +1106,44 @@ export function CodeEditorTab({
           <div class="diff-loading-wrap">
             <div class="git-spinner" />
             <span>{t('editor.loading')}</span>
+          </div>
+        ) : loadError ? (
+          <div class="editor-binary-stage">
+            <div class="editor-binary-card">
+              <div class="editor-binary-icon">📑</div>
+              <div class="editor-binary-title">
+                {loadError.includes('File not found') || loadError.includes('not found')
+                  ? (t('editor.fileNotFound') || '文件不存在或已被移除')
+                  : (t('common.loadError') || '读取文件失败')}
+              </div>
+              <div class="editor-binary-desc">
+                {loadError.includes('File not found') || loadError.includes('not found')
+                  ? '该文件可能已被重命名、删除，或在当前工作目录下不存在。'
+                  : loadError}
+              </div>
+              <div class="editor-binary-path">{filePath}</div>
+              <div class="editor-binary-actions">
+                <button
+                  type="button"
+                  class="binary-action-primary-btn"
+                  onClick={() => {
+                    setLoadError(null);
+                    setReloadTrigger((v) => v + 1);
+                  }}
+                >
+                  <span>🔄 {t('common.retry') || '重试'}</span>
+                </button>
+                {onClose && (
+                  <button
+                    type="button"
+                    class="binary-action-secondary-btn"
+                    onClick={onClose}
+                  >
+                    <span>✕ {t('preview.closeTab') || '关闭标签'}</span>
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         ) : viewMode === 'image' ? (
           <div class="editor-image-stage" onWheel={handleImageWheel}>

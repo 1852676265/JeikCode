@@ -43,6 +43,8 @@ const SENSITIVE_MARKERS: &[&str] = &[
     ".git-credentials",
     "/.jeikcode/auth.toml",
     "/.jeikcode/auth/",
+    "/.zap/auth.toml",
+    "/.zap/auth/",
     "/.docker/config",
     ".npmrc",
     ".pypirc",
@@ -563,10 +565,19 @@ mod tests {
             "real secret variant"
         );
         assert!(references_sensitive_path(
+            r#"{"file_path":"/home/u/.zap/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
             r#"{"file_path":"/home/u/.jeikcode/auth.toml"}"#
         ));
         assert!(references_sensitive_path(
+            r#"{"command":"cat ~/.zap/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
             r#"{"command":"cat ~/.jeikcode/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"file_path":"C:\\Users\\u\\.zap\\auth.toml"}"#
         ));
         assert!(references_sensitive_path(
             r#"{"file_path":"C:\\Users\\u\\.jeikcode\\auth.toml"}"#
@@ -838,7 +849,13 @@ mod tests {
     #[test]
     fn the_default_credential_markers_survive_relocation() {
         assert!(references_sensitive_path(
+            r#"{"file_path":"/home/u/.zap/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
             r#"{"file_path":"/home/u/.jeikcode/auth.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"command":"cat ~/.zap/auth/token.json"}"#
         ));
         assert!(references_sensitive_path(
             r#"{"command":"cat ~/.jeikcode/auth/token.json"}"#

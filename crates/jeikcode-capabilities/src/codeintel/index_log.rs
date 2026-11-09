@@ -1,4 +1,4 @@
-//! Diagnostic JSONL under `.jeikcode/codegraph/logs/`.
+//! Diagnostic JSONL under `.zap/codegraph/logs/`.
 //!
 //! One line per index rebuild / cache-miss / graph-tool call so a Windows
 //! "why did code_explore take 9s?" session can be replayed without a debugger.
@@ -74,7 +74,7 @@ fn civil_from_unix(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 
 pub fn log_dir(root: &Path) -> PathBuf {
     super::canonical(root)
-        .join(".jeikcode")
+        .join(".zap")
         .join("codegraph")
         .join("logs")
 }

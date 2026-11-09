@@ -12112,8 +12112,8 @@ fn handle_idle_key(
                         // `/skills ` so backspace still recovers.
                         renderer.render(UiLine::CommandOutput(
                             "  \u{24d8} No user-invocable skills installed yet.\n    \
-                            \u{2022} Drop SKILL.md into ~/.jeikcode/skills/<name>/ \n      \
-                              (Windows: %USERPROFILE%\\.jeikcode\\skills\\<name>\\)\n    \
+                            \u{2022} Drop SKILL.md into ~/.zap/skills/<name>/ \n      \
+                              (Windows: %USERPROFILE%\\.zap\\skills\\<name>\\)\n    \
                             \u{2022} Or install a plugin that ships skills via /plugin install <git-url>\n\n"
                                 .into(),
                         ));

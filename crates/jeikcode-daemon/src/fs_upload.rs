@@ -1,7 +1,7 @@
-//! POST `/fs/upload` — persist WebUI attachments under `{cwd}/.jeikcode_store`.
+//! POST `/fs/upload` — persist WebUI attachments under `{cwd}/.zap_store`.
 //!
 //! Images stay on the chat `images` field (base64). Non-image files are streamed
-//! to disk and referenced in the user message as absolute paths. `.jeikcode_store/`
+//! to disk and referenced in the user message as absolute paths. `.zap_store/`
 //! is added to `.gitignore` when that file exists, or created when the cwd is a
 //! git repo; `read`/`grep`/`glob` still see the directory.
 //!
@@ -19,7 +19,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-const GITIGNORE_BLOCK: &str = "\n# Zap user uploads (not project source)\n.zap_store/\n.jeikcode_store/\n";
+const GITIGNORE_BLOCK: &str = "\n# Zap user uploads (not project source)\n.zap_store/\n";
 const MAX_NAME_CHARS: usize = 180;
 
 #[derive(Debug, Serialize)]
@@ -276,10 +276,10 @@ pub fn ensure_gitignore_store_entry(cwd: &Path) -> std::io::Result<()> {
 fn gitignore_has_store_entry(content: &str) -> bool {
     content.lines().any(|l| {
         let l = l.trim();
-        l == ".jeikcode_store"
-            || l == ".jeikcode_store/"
-            || l == "**/.jeikcode_store"
-            || l == "**/.jeikcode_store/"
+        l == ".zap_store"
+            || l == ".zap_store/"
+            || l == "**/.zap_store"
+            || l == "**/.zap_store/"
     })
 }
 
@@ -316,11 +316,11 @@ mod tests {
         std::fs::write(d.path().join(".gitignore"), "node_modules/\n").unwrap();
         ensure_gitignore_store_entry(d.path()).unwrap();
         let once = std::fs::read_to_string(d.path().join(".gitignore")).unwrap();
-        assert!(once.contains(".jeikcode_store/"));
+        assert!(once.contains(".zap_store/"));
         ensure_gitignore_store_entry(d.path()).unwrap();
         let twice = std::fs::read_to_string(d.path().join(".gitignore")).unwrap();
         assert_eq!(
-            twice.matches(".jeikcode_store/").count(),
+            twice.matches(".zap_store/").count(),
             1,
             "append must be idempotent: {twice}"
         );
@@ -332,7 +332,7 @@ mod tests {
         std::fs::create_dir(d.path().join(".git")).unwrap();
         ensure_gitignore_store_entry(d.path()).unwrap();
         let gi = std::fs::read_to_string(d.path().join(".gitignore")).unwrap();
-        assert!(gi.contains(".jeikcode_store/"));
+        assert!(gi.contains(".zap_store/"));
     }
 
     #[test]
@@ -349,12 +349,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(paths.len(), 2);
-        assert!(paths[0].contains(".jeikcode_store"));
+        assert!(paths[0].contains(".zap_store"));
         assert!(paths[0].ends_with("notes.md") || paths[0].contains("notes.md"));
         assert!(paths[1].contains("notes_1.md"), "{}", paths[1]);
         let gi = std::fs::read_to_string(d.path().join(".gitignore")).unwrap();
-        assert!(gi.contains(".jeikcode_store/"));
-        let body = std::fs::read_to_string(d.path().join(".jeikcode_store/notes.md")).unwrap();
+        assert!(gi.contains(".zap_store/"));
+        let body = std::fs::read_to_string(d.path().join(".zap_store/notes.md")).unwrap();
         assert_eq!(body, "# hello");
     }
 

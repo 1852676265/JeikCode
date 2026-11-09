@@ -54,10 +54,10 @@ pub struct CatalogEntry {
 
 /// Source-priority tier from a skill's `source_path`. Curated, product-native
 /// dirs survive a budget squeeze over community bulk. Kept as approved:
-/// `.jeikcode` > `.claude` > `.agents` > everything else.
+/// `.zap` > `.claude` > `.agents` > everything else.
 pub fn source_rank(path: &Path) -> u8 {
     let s = path.to_string_lossy();
-    if s.contains(".jeikcode") {
+    if s.contains(".zap") {
         0
     } else if s.contains(".claude") {
         1
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn source_rank_tiers() {
         assert_eq!(
-            source_rank(&PathBuf::from("/home/u/.jeikcode/skills/x/SKILL.md")),
+            source_rank(&PathBuf::from("/home/u/.zap/skills/x/SKILL.md")),
             0
         );
         assert_eq!(
@@ -292,7 +292,7 @@ mod tests {
         let out = render_skill_catalog(&[entry_with_loc(
             "multi-db-executor",
             "连接数据库",
-            "/root/.jeikcode/skills/multi-db-executor",
+            "/root/.zap/skills/multi-db-executor",
             0,
         )])
         .unwrap();
@@ -306,11 +306,11 @@ mod tests {
     #[test]
     fn short_location_keeps_last_two_segments() {
         assert_eq!(
-            short_location("/root/.jeikcode/skills/multi-db-executor"),
+            short_location("/root/.zap/skills/multi-db-executor"),
             "skills/multi-db-executor"
         );
         assert_eq!(
-            short_location("C:\\Users\\a\\.jeikcode\\skills\\x"),
+            short_location("C:\\Users\\a\\.zap\\skills\\x"),
             "skills/x"
         );
     }

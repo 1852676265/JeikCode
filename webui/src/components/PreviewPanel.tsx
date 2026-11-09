@@ -1,9 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'preact/hooks';
 import { useT, useSettings } from '../settings';
-import { fetchFsRead } from '../api';
-import { Markdown } from './Markdown';
 import { CodeEditorTab } from './CodeEditorTab';
-import { showToast } from './Toast';
 import { parseFilePathAndLines } from '../lib/displayPath';
 
 export interface PreviewTab {
@@ -18,6 +15,7 @@ export interface PreviewTab {
 export interface PreviewPanelProps {
   cwd?: string;
   onOpenInMainEditor?: (filePath: string) => void;
+  visible?: boolean;
 }
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp']);
@@ -31,7 +29,7 @@ function normalizeToAbsolute(filePath: string, cwd?: string): string {
   return base ? `${base}/${p.replace(/^\.?\/+/, '')}` : p;
 }
 
-export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
+export function PreviewPanel({ cwd, onOpenInMainEditor, visible = true }: PreviewPanelProps) {
   const t = useT();
   const { theme } = useSettings();
   const isDark =
@@ -111,58 +109,33 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
   }, [tabs, activeTabId]);
 
   const activeTab = useMemo(() => tabs.find((t) => t.id === activeTabId), [tabs, activeTabId]);
-
-  // 预览文件内容状态
-  const [content, setContent] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshTrigger, setRefreshTrigger] = useState<number>(0);
 
-  const activeExt = useMemo(() => {
-    if (!activeTab) return '';
-    return (activeTab.filePath.split('.').pop() || '').toLowerCase();
-  }, [activeTab]);
-
-  const isImage = useMemo(() => IMAGE_EXTS.has(activeExt), [activeExt]);
-  const isMarkdown = useMemo(
-    () => activeExt === 'md' || activeExt === 'markdown' || activeExt === 'mdx',
-    [activeExt],
-  );
-
-  // 加载当前文件内容
-  useEffect(() => {
-    if (!activeTab || isImage) {
-      setContent('');
-      setLoading(false);
-      setLoadError(null);
-      return;
-    }
-
-    let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
-
-    fetchFsRead(activeTab.filePath, cwd)
-      .then((res) => {
-        if (cancelled) return;
-        if (res.success) {
-          setContent(res.content || '');
+  // 关闭标签
+  const handleCloseTab = useCallback((tabId: string, e?: MouseEvent) => {
+    e?.stopPropagation();
+    setTabs((prev) => {
+      const next = prev.filter((t) => t.id !== tabId);
+      if (activeTabId === tabId) {
+        if (next.length > 0) {
+          setActiveTabId(next[next.length - 1]!.id);
         } else {
-          setLoadError(t('common.loadError') || '读取文件失败');
+          setActiveTabId('');
         }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setLoadError(err?.message || String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      }
+      return next;
+    });
+  }, [activeTabId]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab?.filePath, refreshTrigger, isImage]);
+  // 当标签读取失败时（例如磁盘文件已被删除/404）：
+  // 若面板折叠或不可见，自动清除该失效 tab，实现 localStorage 静默自愈，杜绝跨会话无限报错！
+  const handleTabLoadError = useCallback((tabId: string, err: any) => {
+    const msg = err?.message || String(err);
+    const isNotFound = msg.includes('File not found') || msg.includes('not found') || msg.includes('404');
+    if (isNotFound && !visible) {
+      handleCloseTab(tabId);
+    }
+  }, [visible, handleCloseTab]);
 
   // 打开或追加一个标签页
   const openTab = useCallback(
@@ -244,22 +217,6 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
       window.removeEventListener('jeikcode:preview:open_file', handleOpenFileEvent as EventListener);
     };
   }, [openTab]);
-
-  // 关闭标签
-  const handleCloseTab = (tabId: string, e?: MouseEvent) => {
-    e?.stopPropagation();
-    setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== tabId);
-      if (activeTabId === tabId) {
-        if (next.length > 0) {
-          setActiveTabId(next[next.length - 1]!.id);
-        } else {
-          setActiveTabId('');
-        }
-      }
-      return next;
-    });
-  };
 
   // 清空所有标签
   const handleClearAll = () => {
@@ -590,6 +547,9 @@ export function PreviewPanel({ cwd, onOpenInMainEditor }: PreviewPanelProps) {
             defaultViewMode="preview"
             onViewModeChange={(m) => setActiveViewMode(m)}
             hideHeaderToolbar={true}
+            silentError={true}
+            onClose={() => handleCloseTab(activeTab.id)}
+            onLoadError={(err) => handleTabLoadError(activeTab.id, err)}
           />
         )}
       </div>

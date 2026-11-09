@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 /// AGENTS.md takes first precedence.
 const PROJECT_NAMES: [&str; 5] = [
     "AGENTS.md",
-    ".jeikcode.md",
-    "JEIKCODE.md",
+    ".zap.md",
+    "ZAP.md",
     "CLAUDE.md",
     "claude.md",
 ];
@@ -50,8 +50,8 @@ Use this glossary when the user speaks in business terms: expand each term into 
 listed code aliases, then search those aliases (and the original term) in parallel. \
 Prefer code_explore once you have an exact type/method name from the glossary.",
         candidates: &[
-            ".jeikcode/glossary.md",
-            ".jeikcode/domain-glossary.md",
+            ".zap/glossary.md",
+            ".zap/domain-glossary.md",
             "docs/domain-glossary.md",
             "docs/glossary.md",
             "domain-glossary.md",
@@ -65,8 +65,8 @@ Domain / org / process rules for this product (organization structure, approval 
 business constraints). Treat as authoritative project knowledge when implementing or \
 explaining features. Prefer these over guessing product policy.",
         candidates: &[
-            ".jeikcode/rules.md",
-            ".jeikcode/business-rules.md",
+            ".zap/rules.md",
+            ".zap/business-rules.md",
             "docs/rules.md",
             "docs/business-rules.md",
             "rules.md",
@@ -79,9 +79,9 @@ Common database tables, columns, and nicknames. Use when the user mentions data 
 or when writing SQL / ORM / migrations: map spoken names to real table/column identifiers \
 before searching code or inventing schema.",
         candidates: &[
-            ".jeikcode/dbwords.md",
-            ".jeikcode/db-words.md",
-            ".jeikcode/schema.md",
+            ".zap/dbwords.md",
+            ".zap/db-words.md",
+            ".zap/schema.md",
             "docs/dbwords.md",
             "docs/db-words.md",
             "dbwords.md",
@@ -118,12 +118,12 @@ pub fn render_instructions(home: &Path, project: &Path) -> String {
             out.push(format!("# PROJECT INSTRUCTIONS ({filename})\n{body}"));
         }
     }
-    let user = project.join(".jeikcode.user.md");
+    let user = project.join(".zap.user.md");
     if let Some(body) = read_tier(&user) {
         let filename = user
             .file_name()
             .and_then(|f| f.to_str())
-            .unwrap_or(".jeikcode.user.md");
+            .unwrap_or(".zap.user.md");
         out.push(format!("# USER INSTRUCTIONS ({filename})\n{body}"));
     }
     for pack in KNOWLEDGE_PACKS {
@@ -198,7 +198,7 @@ mod tests {
         fs::write(home.join("JEIKCODE.md"), "global rules").unwrap();
         let proj = d.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
-        fs::write(proj.join(".jeikcode.user.md"), "user rules").unwrap();
+        fs::write(proj.join(".zap.user.md"), "user rules").unwrap();
         let out = render_instructions(&home, &proj);
         assert!(out.contains("GLOBAL INSTRUCTIONS") && out.contains("global rules"));
         assert!(out.contains("USER INSTRUCTIONS") && out.contains("user rules"));
@@ -250,10 +250,10 @@ mod tests {
     fn domain_glossary_is_additive_with_agents_md() {
         let d = tempfile::tempdir().unwrap();
         let proj = d.path().join("proj");
-        fs::create_dir_all(proj.join(".jeikcode")).unwrap();
+        fs::create_dir_all(proj.join(".zap")).unwrap();
         fs::write(proj.join("AGENTS.md"), "build with cargo").unwrap();
         fs::write(
-            proj.join(".jeikcode/glossary.md"),
+            proj.join(".zap/glossary.md"),
             "- 优惠券 → Coupon, PromoCode, Voucher\n- 结算 → Checkout, Settlement\n",
         )
         .unwrap();
@@ -285,15 +285,15 @@ mod tests {
     fn rules_and_dbwords_are_additive() {
         let d = tempfile::tempdir().unwrap();
         let proj = d.path().join("proj");
-        fs::create_dir_all(proj.join(".jeikcode")).unwrap();
+        fs::create_dir_all(proj.join(".zap")).unwrap();
         fs::write(proj.join("AGENTS.md"), "use cargo").unwrap();
         fs::write(
-            proj.join(".jeikcode/rules.md"),
+            proj.join(".zap/rules.md"),
             "## 组织架构\n- 中台 / 交易中心 / 营销中心\n",
         )
         .unwrap();
         fs::write(
-            proj.join(".jeikcode/dbwords.md"),
+            proj.join(".zap/dbwords.md"),
             "| 业务 | 表名 |\n| 优惠券 | t_coupon |\n",
         )
         .unwrap();
@@ -312,11 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn rules_prefers_jeikcode_dir_over_root() {
+    fn rules_prefers_zap_dir_over_root() {
         let d = tempfile::tempdir().unwrap();
         let proj = d.path().join("proj");
-        fs::create_dir_all(proj.join(".jeikcode")).unwrap();
-        fs::write(proj.join(".jeikcode/rules.md"), "nested-rules").unwrap();
+        fs::create_dir_all(proj.join(".zap")).unwrap();
+        fs::write(proj.join(".zap/rules.md"), "nested-rules").unwrap();
         fs::write(proj.join("rules.md"), "root-rules-should-lose").unwrap();
         let out = render_instructions(&d.path().join("nohome"), &proj);
         assert!(out.contains("nested-rules"));
@@ -324,14 +324,14 @@ mod tests {
     }
 
     #[test]
-    fn agents_md_wins_over_jeikcode_md() {
+    fn agents_md_wins_over_zap_md() {
         let d = tempfile::tempdir().unwrap();
         let proj = d.path();
         fs::write(proj.join("AGENTS.md"), "agents first").unwrap();
-        fs::write(proj.join(".jeikcode.md"), "jeikcode second").unwrap();
+        fs::write(proj.join(".zap.md"), "zap second").unwrap();
         let out = render_instructions(&d.path().join("nohome"), proj);
         assert!(out.contains("agents first"));
-        assert!(!out.contains("jeikcode second"));
+        assert!(!out.contains("zap second"));
         assert!(out.starts_with(INSTRUCTIONS_HEADER));
     }
 

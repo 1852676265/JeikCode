@@ -51,16 +51,20 @@ pub fn real_home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// Return the JeikCode data directory, respecting the `JEIKCODE_HOME`
-/// environment variable. When `JEIKCODE_HOME` is set, it IS the data root
-/// (no `.jeikcode` suffix is appended). Otherwise `$HOME/.jeikcode`, or
-/// `./.jeikcode` when `$HOME` cannot be resolved.
+/// Return the Zap data directory, respecting the `ZAP_HOME` (or `JEIKCODE_HOME`)
+/// environment variable. When `ZAP_HOME` is set, it IS the data root
+/// (no `.zap` suffix is appended). Otherwise `$HOME/.zap`, or
+/// `./.zap` when `$HOME` cannot be resolved.
 pub fn default_jeikcode_dir() -> PathBuf {
-    if let Some(p) = env::var("JEIKCODE_HOME").ok().filter(|s| !s.is_empty()) {
+    if let Some(p) = env::var("ZAP_HOME")
+        .or_else(|_| env::var("JEIKCODE_HOME"))
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         PathBuf::from(p)
     } else {
         let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".jeikcode")
+        home.join(".zap")
     }
 }
 

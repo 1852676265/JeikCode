@@ -1322,7 +1322,7 @@ where
         match rename(from, to) {
             Ok(()) => return Ok(()),
             // Cross-device: the staged binary lives under the user profile
-            // (e.g. C:\Users\…\.jeikcode\staged\) while the running exe may be
+            // (e.g. C:\Users\…\.zap\staged\) while the running exe may be
             // on another drive (H:\…). `rename` across volumes can NEVER
             // succeed (ERROR_NOT_SAME_DEVICE / EXDEV), so don't waste the retry
             // budget — copy the bytes across and drop the source instead.
@@ -2487,7 +2487,7 @@ mod tests {
 
     #[test]
     fn robust_rename_falls_back_to_copy_on_cross_device() {
-        // The reported bug: staged binary under the user profile (C:\…\.jeikcode
+        // The reported bug: staged binary under the user profile (C:\…\.zap
         // \staged\) vs a running exe on another drive (H:\). `rename` fails with
         // ERROR_NOT_SAME_DEVICE; robust_rename must transparently copy instead of
         // burning its retry budget on a deterministic failure.

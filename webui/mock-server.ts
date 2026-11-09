@@ -87,11 +87,11 @@ function resolveGitBashPath(): string {
 
 function getDaemonAuth(): { port: number; token?: string } | null {
   try {
-    const listenFile = pathMod.resolve(
-      process.env.USERPROFILE || process.env.HOME || '',
-      '.jeikcode',
-      'webui-listen.json'
-    );
+    const home = process.env.USERPROFILE || process.env.HOME || '';
+    let listenFile = pathMod.resolve(home, '.zap', 'webui-listen.json');
+    if (!fs.existsSync(listenFile)) {
+      listenFile = pathMod.resolve(home, '.jeikcode', 'webui-listen.json');
+    }
     if (fs.existsSync(listenFile)) {
       const data = JSON.parse(fs.readFileSync(listenFile, 'utf8'));
       if (data && data.port) {
@@ -425,12 +425,11 @@ export function mockApiPlugin(): Plugin {
         // 插件生态本地资产静态服务拦截器（即使后端 Daemon 尚未热重载，也可直接由本地插件目录分发）
         if (pathname.startsWith('/plugins/assets/')) {
           const subPath = decodeURIComponent(pathname.replace(/^\/plugins\/assets\//, ''));
-          const pluginsRoot = pathMod.resolve(
-            process.env.USERPROFILE || process.env.HOME || '',
-            '.jeikcode',
-            'plugins',
-            'installed'
-          );
+          const home = process.env.USERPROFILE || process.env.HOME || '';
+          let pluginsRoot = pathMod.resolve(home, '.zap', 'plugins', 'installed');
+          if (!fs.existsSync(pluginsRoot)) {
+            pluginsRoot = pathMod.resolve(home, '.jeikcode', 'plugins', 'installed');
+          }
           const directFile = pathMod.resolve(pluginsRoot, subPath);
           const communityFile = pathMod.resolve(pluginsRoot, 'community', subPath);
           const targetFile = fs.existsSync(directFile) && fs.statSync(directFile).isFile()

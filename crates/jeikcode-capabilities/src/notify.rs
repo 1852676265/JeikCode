@@ -816,8 +816,121 @@ fn play_system_alert_sound() {
 
 fn spawn_system_notification(title: String, body: String, launch: Option<String>) {
     std::thread::spawn(move || {
-        let _ = (&title, &body, &launch);
         play_system_alert_sound();
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        let _ = (&title, &body, &launch);
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = install_focus_shell();
+            if let Some(bin) = find_executable_on_path("terminal-notifier") {
+                let mut cmd = Command::new(bin);
+                cmd.arg("-title")
+                    .arg(&title)
+                    .arg("-message")
+                    .arg(&body)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if let (Some(uri), Some(script)) = (launch.as_deref(), focus_shell_path()) {
+                    cmd.arg("-execute")
+                        .arg(macos_execute_line(&script.to_string_lossy(), uri));
+                } else if let Some(bundle_id) = macos_terminal_bundle_id(detect_terminal_app()) {
+                    cmd.arg("-activate").arg(bundle_id);
+                }
+                if cmd.spawn().is_ok() {
+                    return;
+                }
+            }
+
+            ensure_macos_focus_helper();
+            if let (Some(uri), Some(helper)) = (launch.as_deref(), macos_focus_helper_bin()) {
+                if Command::new(helper)
+                    .arg(&title)
+                    .arg(&body)
+                    .arg(uri)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+
+            let script = format!(
+                "display notification {} with title {}",
+                apple_script_string(&body),
+                apple_script_string(&title)
+            );
+            let _ = Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = install_focus_shell();
+            if let Some(script) = focus_shell_path() {
+                if Command::new(script)
+                    .arg("linux-notify")
+                    .arg(&title)
+                    .arg(&body)
+                    .arg(launch.as_deref().unwrap_or(""))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            let _ = Command::new("notify-send")
+                .arg(&title)
+                .arg(&body)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let xml = windows_toast_xml(&title, &body, launch.as_deref());
+            let app_ids = windows_toast_app_ids()
+                .iter()
+                .map(|id| format!("'{}'", powershell_string_literal(id)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let script = format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+                 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; \
+                 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument; \
+                 $xml.LoadXml('{}'); \
+                 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
+                 $shown = $false; \
+                 foreach ($appId in @({app_ids})) {{ \
+                   try {{ [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast); $shown = $true; break }} catch {{ }} \
+                 }};",
+                powershell_string_literal(&xml),
+            );
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let _ = Command::new("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-WindowStyle")
+                .arg("Hidden")
+                .arg("-Command")
+                .arg(script)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
     });
 }
 

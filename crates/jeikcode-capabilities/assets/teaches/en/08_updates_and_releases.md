@@ -16,7 +16,7 @@ JeikCode pulls updates and version manifests from the official GitHub repository
 
 ## 2. Persisting Update Sources in `config.toml`
 
-Configure at the **very top of `~/.jeikcode/config.toml` (before any `[table]`)**:
+Configure at the **very top of `~/.zap/config.toml` (before any `[table]`)**:
 
 ```toml
 # ==============================================================================
@@ -78,7 +78,7 @@ jeikcode --host 0.0.0.0 --port 13457
 - **Linux**: Generates and registers as a systemd service.
 - **macOS**: Registers as a launchd service.
 - **Windows**: Writes to registry under current user Run keys.
-- Port and token configurations persist in `~/.jeikcode/webui-listen.json`.
+- Port and token configurations persist in `~/.zap/webui-listen.json`.
 
 ---
 

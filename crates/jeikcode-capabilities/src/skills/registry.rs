@@ -221,42 +221,42 @@ pub fn standard_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".claude/commands"),
         home.join(".agents/commands"),
-        home.join(".jeikcode/commands"),
+        home.join(".zap/commands"),
         home.join(".claude/skills"),
         // Cross-agent shared conventions (`.agents/skills`, opencode et al.).
-        // Placed before `.jeikcode` so jeikcode-native skills win a same-name collision.
+        // Placed before `.zap` so zap-native skills win a same-name collision.
         home.join(".agents/skills"),
         home.join(".skills"),
-        home.join(".jeikcode/skills"),
+        home.join(".zap/skills"),
         project.join(".claude/commands"),
         project.join(".agents/commands"),
-        project.join(".jeikcode/commands"),
+        project.join(".zap/commands"),
         project.join(".claude/skills"),
         project.join(".agents/skills"),
         project.join(".skills"),
         project.join("skills"),
-        project.join(".jeikcode/skills"),
+        project.join(".zap/skills"),
     ]
 }
 
-/// The standard skill directories with the user-level `.jeikcode` root resolved
-/// from `JEIKCODE_HOME` when it is set. `JEIKCODE_HOME` is the config root (the
-/// equivalent of `~/.jeikcode`), so EVERY user-level `~/.jeikcode/*` entry
+/// The standard skill directories with the user-level `.zap` root resolved
+/// from `ZAP_HOME` when it is set. `ZAP_HOME` is the config root (the
+/// equivalent of `~/.zap`), so EVERY user-level `~/.zap/*` entry
 /// (`skills` AND `commands`) is rebased onto it; other products' dirs (`.claude`,
-/// `.agents`) and all project-relative dirs stay put. An empty `JEIKCODE_HOME` is
+/// `.agents`) and all project-relative dirs stay put. An empty `ZAP_HOME` is
 /// treated as unset — mirroring [`jeikcode_config`]'s `Config::config_dir` — so a
-/// stray `JEIKCODE_HOME=` never rebases skills onto a bogus relative `skills` path.
+/// stray `ZAP_HOME=` never rebases skills onto a bogus relative `skills` path.
 pub fn runtime_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
     let dirs = standard_skill_dirs(home, project);
     // Unified derivation (env → legacy → real home, resolved once, plus the
     // thread-local test override). Reading `JEIKCODE_HOME` here used to be a
     // second rule that could rebase skills onto a different root than
     // `Config::config_dir()` — the exact "two homes" drift.
-    let jeikcode_home = jeikcode_config::Config::config_dir();
-    let user_jeikcode = home.join(".jeikcode");
+    let zap_home = jeikcode_config::Config::config_dir();
+    let user_zap = home.join(".zap");
     dirs.into_iter()
-        .map(|dir| match dir.strip_prefix(&user_jeikcode) {
-            Ok(rest) => jeikcode_home.join(rest),
+        .map(|dir| match dir.strip_prefix(&user_zap) {
+            Ok(rest) => zap_home.join(rest),
             Err(_) => dir,
         })
         .collect()
@@ -276,16 +276,16 @@ mod tests {
         let _home = jeikcode_config::test_util::IsolatedHome::at(config_root.path());
         let dirs = runtime_skill_dirs(home.path(), project.path());
 
-        // BOTH user-level `.jeikcode/*` dirs (skills AND commands) move under JEIKCODE_HOME.
+        // BOTH user-level `.zap/*` dirs (skills AND commands) move under ZAP_HOME.
         assert!(dirs.contains(&config_root.path().join("skills")));
         assert!(dirs.contains(&config_root.path().join("commands")));
-        // The stale real-home `.jeikcode/*` entries are gone.
-        assert!(!dirs.contains(&home.path().join(".jeikcode/skills")));
-        assert!(!dirs.contains(&home.path().join(".jeikcode/commands")));
+        // The stale real-home `.zap/*` entries are gone.
+        assert!(!dirs.contains(&home.path().join(".zap/skills")));
+        assert!(!dirs.contains(&home.path().join(".zap/commands")));
         // Other products' dirs (`.claude`, `.agents`) stay at real home; project dirs unchanged.
         assert!(dirs.contains(&home.path().join(".claude/skills")));
         assert!(dirs.contains(&home.path().join(".agents/skills")));
-        assert!(dirs.contains(&project.path().join(".jeikcode/skills")));
+        assert!(dirs.contains(&project.path().join(".zap/skills")));
     }
 
     #[test]
@@ -293,15 +293,15 @@ mod tests {
     fn runtime_dirs_treat_empty_jeikcode_home_as_unset() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        // “空 JEIKCODE_HOME = 未设置”现在等价于“本线程用默认临时 home”：重点断言
+        // “空 ZAP_HOME = 未设置”现在等价于“本线程用默认临时 home”：重点断言
         // 不产生 bogus 的相对 `skills` 目录（历史回归：`PathBuf::from("").join("skills")`）。
-        // 把 seam 钉在**本测试 home 的 .jeikcode 根**上：`runtime_skill_dirs` 会把
-        // `home/.jeikcode/*` 重基到 `Config::config_dir()`（也就是 seam 根本身），
-        // 所以 seam 必须等于 `home/.jeikcode`，两侧才会一致。
-        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path().join(".jeikcode"));
+        // 把 seam 钉在**本测试 home 的 .zap 根**上：`runtime_skill_dirs` 会把
+        // `home/.zap/*` 重基到 `Config::config_dir()`（也就是 seam 根本身），
+        // 所以 seam 必须等于 `home/.zap`，两侧才会一致。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path().join(".zap"));
         let dirs = runtime_skill_dirs(home.path(), project.path());
 
-        // Empty JEIKCODE_HOME must be treated as unset — NOT redirected to a bogus
+        // Empty ZAP_HOME must be treated as unset — NOT redirected to a bogus
         // relative `skills` path (regression: `PathBuf::from("").join("skills")`).
         assert!(!dirs.iter().any(|d| d == std::path::Path::new("skills")));
         assert_eq!(dirs, standard_skill_dirs(home.path(), project.path()));
@@ -479,13 +479,13 @@ mod tests {
             dirs.contains(&project.join(".skills")),
             "project-level .skills"
         );
-        // Precedence (last-wins): .claude < .agents < .jeikcode at each level, so a
-        // user's jeikcode-native skill still overrides a same-named shared one.
+        // Precedence (last-wins): .claude < .agents < .zap at each level, so a
+        // user's zap-native skill still overrides a same-named shared one.
         let pos = |p: PathBuf| dirs.iter().position(|d| *d == p).expect("dir present");
         assert!(pos(home.join(".claude/skills")) < pos(home.join(".agents/skills")));
-        assert!(pos(home.join(".agents/skills")) < pos(home.join(".jeikcode/skills")));
+        assert!(pos(home.join(".agents/skills")) < pos(home.join(".zap/skills")));
         assert!(pos(project.join(".claude/skills")) < pos(project.join(".agents/skills")));
-        assert!(pos(project.join(".agents/skills")) < pos(project.join(".jeikcode/skills")));
+        assert!(pos(project.join(".agents/skills")) < pos(project.join(".zap/skills")));
     }
 
     #[test]

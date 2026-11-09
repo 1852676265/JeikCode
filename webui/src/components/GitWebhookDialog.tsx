@@ -438,7 +438,7 @@ export async function saveProjectGitConfig(projectHash: string, config: GitAdapt
   } catch {
     // ignore
   }
-  // 异步同步到后端持久化文件 (~/.jeikcode/git-bindings.json)
+  // 异步同步到后端持久化文件 (~/.zap/git-bindings.json)
   return saveGitBinding(clean);
 }
 

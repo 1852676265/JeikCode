@@ -514,7 +514,7 @@ test('fetchUpgradeDiffs passes first_launch and force query parameters', async (
           {
             relative_path: 'prompts/init.yaml',
             description: '提示词',
-            target_path: '/home/.jeikcode/prompts/init.yaml',
+            target_path: '/home/.zap/prompts/init.yaml',
             kind: 'modified',
             selected: true,
           },
@@ -606,7 +606,7 @@ test('getConfig parses a successful config payload', async () => {
     assert.equal(String(url), '/config');
     return new Response(
       JSON.stringify({
-        path: '/home/.jeikcode/config.toml',
+        path: '/home/.zap/config.toml',
         default_provider: 'claude-opus-4-6',
         providers: [],
         accounts: [],

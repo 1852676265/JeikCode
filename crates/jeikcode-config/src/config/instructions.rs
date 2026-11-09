@@ -50,23 +50,21 @@ pub struct LayeredInstructions {
 impl LayeredInstructions {
     /// Load all three instruction tiers from disk.
     ///
-    /// - Global:  `~/.zap/ZAP.md` (or `~/.jeikcode/JEIKCODE.md`)
-    /// - Project: `<project_root>/.zap.md`, `ZAP.md`, `.jeikcode.md`, `JEIKCODE.md`, `AGENTS.md`,
+    /// - Global:  `~/.zap/ZAP.md`
+    /// - Project: `<project_root>/.zap.md`, `ZAP.md`, `AGENTS.md`,
     ///   `CLAUDE.md`, or `claude.md` (first match wins)
-    /// - User:    `<project_root>/.zap.user.md` (or `.jeikcode.user.md`)
+    /// - User:    `<project_root>/.zap.user.md`
     pub fn load(project_root: &Path) -> Self {
         let config_dir = crate::config::Config::config_dir();
         let global = Self::try_load(&config_dir.join("AGENTS.md"), InstructionLevel::Global)
             .or_else(|| Self::try_load(&config_dir.join("ZAP.md"), InstructionLevel::Global))
             .or_else(|| Self::try_load(&config_dir.join("JEIKCODE.md"), InstructionLevel::Global));
 
-        // Lookup order: native Zap names first, then legacy JeikCode names, then AGENTS.md (open standard),
+        // Lookup order: native Zap names first, then AGENTS.md (open standard),
         // then Claude Code names.
         let project = [
             ".zap.md",
             "ZAP.md",
-            ".jeikcode.md",
-            "JEIKCODE.md",
             "AGENTS.md",
             "CLAUDE.md",
             "claude.md",
@@ -77,13 +75,7 @@ impl LayeredInstructions {
         let user = Self::try_load(
             &project_root.join(".zap.user.md"),
             InstructionLevel::User,
-        )
-        .or_else(|| {
-            Self::try_load(
-                &project_root.join(".jeikcode.user.md"),
-                InstructionLevel::User,
-            )
-        });
+        );
 
         Self {
             global,
@@ -197,11 +189,11 @@ mod tests {
         let instructions = LayeredInstructions {
             global: None,
             project: LayeredInstructions::try_load(
-                &tmp.path().join(".jeikcode.md"),
+                &tmp.path().join(".zap.md"),
                 InstructionLevel::Project,
             ),
             user: LayeredInstructions::try_load(
-                &tmp.path().join(".jeikcode.user.md"),
+                &tmp.path().join(".zap.user.md"),
                 InstructionLevel::User,
             ),
         };
@@ -210,11 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn project_jeikcode_md_is_found() {
+    fn project_zap_md_is_found() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".jeikcode.md"), "Use tabs.").unwrap();
+        fs::write(tmp.path().join(".zap.md"), "Use tabs.").unwrap();
         let instructions = LayeredInstructions::try_load(
-            &tmp.path().join(".jeikcode.md"),
+            &tmp.path().join(".zap.md"),
             InstructionLevel::Project,
         );
         assert!(instructions.is_some());
@@ -261,23 +253,23 @@ mod tests {
     }
 
     #[test]
-    fn jeikcode_md_preferred_over_agents_md() {
+    fn zap_md_preferred_over_agents_md() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".jeikcode.md"), "jeikcode wins").unwrap();
+        fs::write(tmp.path().join(".zap.md"), "zap wins").unwrap();
         fs::write(tmp.path().join("AGENTS.md"), "agents loses").unwrap();
         let instructions = LayeredInstructions::load(tmp.path());
         let project = instructions.project.expect("project tier should load");
-        assert!(project.content.contains("jeikcode wins"));
+        assert!(project.content.contains("zap wins"));
     }
 
     #[test]
-    fn jeikcode_md_preferred_over_claude_md() {
+    fn zap_md_preferred_over_claude_md() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".jeikcode.md"), "jeikcode wins").unwrap();
+        fs::write(tmp.path().join(".zap.md"), "zap wins").unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "claude loses").unwrap();
         let instructions = LayeredInstructions::load(tmp.path());
         let project = instructions.project.expect("project tier should load");
-        assert!(project.content.contains("jeikcode wins"));
+        assert!(project.content.contains("zap wins"));
     }
 
     #[test]
@@ -291,32 +283,32 @@ mod tests {
     }
 
     #[test]
-    fn jeikcode_uppercase_preferred_over_claude_md() {
+    fn zap_uppercase_preferred_over_claude_md() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("JEIKCODE.md"), "JEIKCODE wins").unwrap();
+        fs::write(tmp.path().join("ZAP.md"), "ZAP wins").unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "claude loses").unwrap();
         let instructions = LayeredInstructions::load(tmp.path());
         let project = instructions.project.expect("project tier should load");
-        assert!(project.content.contains("JEIKCODE wins"));
+        assert!(project.content.contains("ZAP wins"));
     }
 
     #[test]
     fn lowercase_preferred_over_uppercase() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".jeikcode.md"), "lowercase wins").unwrap();
-        fs::write(tmp.path().join("JEIKCODE.md"), "uppercase loses").unwrap();
+        fs::write(tmp.path().join(".zap.md"), "lowercase wins").unwrap();
+        fs::write(tmp.path().join("ZAP.md"), "uppercase loses").unwrap();
         let instructions = LayeredInstructions::load(tmp.path());
         let project = instructions.project.expect("project tier should load");
         assert!(project.content.contains("lowercase wins"));
-        assert!(project.path.ends_with(".jeikcode.md"));
+        assert!(project.path.ends_with(".zap.md"));
     }
 
     #[test]
     fn user_instructions_loaded() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".jeikcode.user.md"), "my prefs").unwrap();
+        fs::write(tmp.path().join(".zap.user.md"), "my prefs").unwrap();
         let user = LayeredInstructions::try_load(
-            &tmp.path().join(".jeikcode.user.md"),
+            &tmp.path().join(".zap.user.md"),
             InstructionLevel::User,
         );
         assert!(user.is_some());
@@ -328,9 +320,9 @@ mod tests {
     #[test]
     fn empty_file_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".jeikcode.md"), "   \n  \n").unwrap();
+        fs::write(tmp.path().join(".zap.md"), "   \n  \n").unwrap();
         let project = LayeredInstructions::try_load(
-            &tmp.path().join(".jeikcode.md"),
+            &tmp.path().join(".zap.md"),
             InstructionLevel::Project,
         );
         assert!(project.is_none());
@@ -387,7 +379,7 @@ mod tests {
         assert!(lines[0].path.ends_with("g.md"));
         assert_eq!(lines[1].level, InstructionLevel::Project);
         assert!(!lines[1].found);
-        assert_eq!(lines[1].path, tmp.path().join(".jeikcode.md"));
+        assert_eq!(lines[1].path, tmp.path().join(".zap.md"));
         assert_eq!(lines[2].level, InstructionLevel::User);
         assert!(lines[2].found);
         assert!(lines[2].path.ends_with("u.md"));
@@ -443,7 +435,7 @@ mod tests {
         let instructions = LayeredInstructions {
             global: None,
             project: Some(InstructionFile {
-                path: PathBuf::from("/project/.jeikcode.md"),
+                path: PathBuf::from("/project/.zap.md"),
                 content: "Only project rules".to_string(),
                 level: InstructionLevel::Project,
             }),

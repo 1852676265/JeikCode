@@ -1,6 +1,6 @@
 //! SQLite-backed incremental index storage for `CodeGraph` & `FileUnit` cache.
 //!
-//! On-disk layout is `.jeikcode/codegraph/index.v1.db` with row-level upserts.
+//! On-disk layout is `.zap/codegraph/index.v1.db` with row-level upserts.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use super::graph::CodeGraph;
 use super::index::FileUnit;
 
-pub const DISK_CACHE_REL_DB: &str = ".jeikcode/codegraph/index.v1.db";
+pub const DISK_CACHE_REL_DB: &str = ".zap/codegraph/index.v1.db";
 
 pub fn disk_cache_path_db(root: &Path) -> PathBuf {
     let canonical_root = super::canonical(root);

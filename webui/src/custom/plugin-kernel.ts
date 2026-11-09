@@ -470,7 +470,7 @@ const DEFAULT_EXTERNAL_PACKAGES: ExternalPluginPackage[] = [
     removable: false,
     updatable: true,
     source: 'builtin:@deepseek-ai/plugin-mermaid-enhanced',
-    installDir: '~/.jeikcode/plugins/mermaid-enhanced',
+    installDir: '~/.zap/plugins/mermaid-enhanced',
     readmeMarkdown: `### Mermaid 架构图增强渲染器\n\n提供对话内 Mermaid 图表的无级缩放、拖拽平移、亮暗主题自适应以及一键复制 SVG/PNG 能力。\n\n- **视图切换**：支持「图表预览」与「原始代码」一键切换\n- **自适应视口**：自动根据节点密度计算最佳初始缩放比例`,
     versions: ['1.4.2', '1.4.0', '1.3.5'],
     rows: [
@@ -497,7 +497,7 @@ const DEFAULT_EXTERNAL_PACKAGES: ExternalPluginPackage[] = [
     removable: false,
     updatable: true,
     source: 'builtin:@deepseek-ai/plugin-code-canvas',
-    installDir: '~/.jeikcode/plugins/code-canvas',
+    installDir: '~/.zap/plugins/code-canvas',
     readmeMarkdown: `### Canvas 交互式分析画布\n\n当智能体产出定量分析、架构矩阵或交互式工具时，在聊天流旁侧展开实时可交互预览画布。`,
     versions: ['2.1.0', '2.0.4'],
     rows: [
@@ -524,7 +524,7 @@ const DEFAULT_EXTERNAL_PACKAGES: ExternalPluginPackage[] = [
     removable: false,
     updatable: true,
     source: 'builtin:@deepseek-ai/plugin-git-worktree-guard',
-    installDir: '~/.jeikcode/plugins/git-worktree-guard',
+    installDir: '~/.zap/plugins/git-worktree-guard',
     readmeMarkdown: `### Git 多工作树并发隔离器\n\n防止多个并发 Agent 会话在同一工作区发生文件覆盖冲突。`,
     versions: ['1.2.0', '1.1.0'],
     rows: [
@@ -1229,7 +1229,7 @@ export class ZapPluginKernel {
       removable: true,
       updatable: true,
       source: `registry:${entry.name}@${version}`,
-      installDir: `~/.jeikcode/plugins/${entry.name.replace(/^@/, '').replace(/\//g, '-')}`,
+      installDir: `~/.zap/plugins/${entry.name.replace(/^@/, '').replace(/\//g, '-')}`,
       readmeMarkdown: entry.readmeMarkdown,
       versions: entry.versions.map((v) => v.version),
       configSchema: entry.configSchema,
@@ -1292,7 +1292,7 @@ export class ZapPluginKernel {
       removable: true,
       updatable: false,
       source: trimmed.startsWith('http') || trimmed.startsWith('git+') ? `git:${trimmed}` : `local:${trimmed}`,
-      installDir: `~/.jeikcode/plugins/${shortId}`,
+      installDir: `~/.zap/plugins/${shortId}`,
       readmeMarkdown: `### ${customTitle || shortId}\n\n来源规格：\`${trimmed}\`\n\n该插件已通过 Zap Cordis 插件运行时挂载，并在设置中心左侧导航栏注册了专属设置页。`,
       versions: ['1.0.0'],
       configSchema: [

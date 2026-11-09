@@ -1,6 +1,6 @@
 # 01 - Prompts and Context Configuration Guide (Prompts & Context)
 
-Configuration directory path: `~/.jeikcode/prompts/` (or `$JEIKCODE_HOME/prompts/`).
+Configuration directory path: `~/.zap/prompts/` (or `$ZAP_HOME/prompts/`).
 
 ---
 
@@ -99,9 +99,9 @@ Please answer in English, strictly following software engineering best practices
 
 ### 4.2 File Priority
 Loaded by nearest scope (first hit takes effect):
-1. Project-specific: `<workspace>/.jeikcode/user-wrap.md`
+1. Project-specific: `<workspace>/.zap/user-wrap.md`
 2. Project root: `<workspace>/user-wrap.md`
-3. Global default: `~/.jeikcode/user-wrap.md`
+3. Global default: `~/.zap/user-wrap.md`
 
 ---
 

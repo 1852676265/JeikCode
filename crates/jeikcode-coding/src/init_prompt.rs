@@ -16,7 +16,7 @@ focused on non-obvious, project-specific information — do NOT include generic 
 \"follow existing patterns\" or \"write tests\".
 
 IMPORTANT — pick the RIGHT file: check for an existing project instruction file in this \
-precedence order — `.jeikcode.md`, `AGENTS.md`, `CLAUDE.md`. If ONE already EXISTS, read it \
+precedence order — `.zap.md`, `AGENTS.md`, `CLAUDE.md`. If ONE already EXISTS, read it \
 and improve THAT SAME file in place (it is the file the agent actually loads — writing a \
 different filename would be shadowed and never take effect): preserve the useful content, \
 fill gaps, and fix anything stale; do NOT wipe and rewrite it from scratch. Only if NONE of \

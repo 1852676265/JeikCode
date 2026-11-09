@@ -1112,7 +1112,10 @@ const SKIP_DIR_NAMES: &[&str] = &[
     ".cache",
     "publish",
     "out",
-    // WebUI user uploads: gitignored attachments, not project source.
+    // Zap internal data & store
+    ".zap",
+    ".jeikcode",
+    ".zap_store",
     ".jeikcode_store",
 ];
 
@@ -1146,8 +1149,8 @@ fn load_codegraph_ignore(root: &Path) -> ignore::gitignore::Gitignore {
         root.join(".codegraignore"),
         root.join(".codegraphignore.graph"),
         root.join(".codegraignore.graph"),
-        root.join(".jeikcode").join(".codegraphignore"),
-        root.join(".jeikcode").join(".codegraphignore.graph"),
+        root.join(".zap").join(".codegraphignore"),
+        root.join(".zap").join(".codegraphignore.graph"),
         cfg.join(".codegraphignore"),
         cfg.join(".codegraignore"),
         cfg.join(".codegraphignore.graph"),
@@ -1488,10 +1491,10 @@ fn collect_files_fallback(root: &Path) -> Vec<Walked> {
         builder.add_ignore(global_ignore2);
     }
 
-    // Also check .jeikcode/.codegraphignore inside project root
-    let project_jeikcode_ignore = root.join(".jeikcode").join(".codegraphignore");
-    if project_jeikcode_ignore.is_file() {
-        builder.add_ignore(project_jeikcode_ignore);
+    // Also check .zap/.codegraphignore inside project root
+    let project_zap_ignore = root.join(".zap").join(".codegraphignore");
+    if project_zap_ignore.is_file() {
+        builder.add_ignore(project_zap_ignore);
     }
 
     for entry in builder
@@ -1582,9 +1585,9 @@ pub fn disk_cache_path(root: &Path) -> PathBuf {
     super::index_db::disk_cache_path_db(root)
 }
 
-/// True when `{root}/.jeikcode/codegraph/index.v1.db` exists and contains at
+/// True when `{root}/.zap/codegraph/index.v1.db` exists and contains at
 /// least one file unit. Empty or missing graphs must not be auto-created —
-/// the user runs `jeikcode init` for a first index.
+/// the user runs `zap init` for a first index.
 pub fn has_nonempty_codegraph(root: &Path) -> bool {
     load_disk_cache(&super::canonical(root)).is_some()
 }
@@ -1885,12 +1888,12 @@ fn load_idf_stats_sqlite(root: &Path) -> Option<super::retrieval::IdfStats> {
 fn cleanup_legacy_sidecars(root: &Path) {
     let root = super::canonical(root);
     for rel in [
-        ".jeikcode/codegraph/units.v3.json",
-        ".jeikcode/codegraph/units.v4.bin",
-        ".jeikcode/codegraph/dirindex.v1.json",
-        ".jeikcode/codegraph/stats.v1.json",
-        ".jeikcode/codegraph/units.v3.json.tmp",
-        ".jeikcode/codegraph/units.v4.bin.tmp",
+        ".zap/codegraph/units.v3.json",
+        ".zap/codegraph/units.v4.bin",
+        ".zap/codegraph/dirindex.v1.json",
+        ".zap/codegraph/stats.v1.json",
+        ".zap/codegraph/units.v3.json.tmp",
+        ".zap/codegraph/units.v4.bin.tmp",
     ] {
         let _ = std::fs::remove_file(root.join(rel));
     }
@@ -4211,13 +4214,13 @@ export function CouponPanel() {
             "query-time get() must not invent a first index"
         );
         assert!(
-            !d.path().join(".jeikcode").join("codegraph").exists(),
-            "missing codegraph must not be auto-created; user runs `jeikcode init`"
+            !d.path().join(".zap").join("codegraph").exists(),
+            "missing codegraph must not be auto-created; user runs `zap init`"
         );
         assert!(!has_nonempty_codegraph(d.path()));
         crate::codeintel::prewarm_code_index(d.path());
         assert!(
-            !d.path().join(".jeikcode").exists(),
+            !d.path().join(".zap").exists(),
             "prewarm must be a no-op when codegraph is missing"
         );
     }
@@ -4344,7 +4347,7 @@ export function CouponPanel() {
             calls: vec![],
         };
         let units = HashMap::from([(file.clone(), unit.clone())]);
-        let graph_dir = d.path().join(".jeikcode").join("codegraph");
+        let graph_dir = d.path().join(".zap").join("codegraph");
         std::fs::create_dir_all(&graph_dir).unwrap();
         let leftover_json = graph_dir.join("units.v3.json");
         let leftover_bin = graph_dir.join("units.v4.bin");
@@ -5094,9 +5097,9 @@ public class OrderController
         assert_eq!(g.node_count(), 0);
         assert!(
             idx.inner.lock().unwrap().units.is_empty(),
-            "query-time must not create a first index; run `jeikcode init`"
+            "query-time must not create a first index; run `zap init`"
         );
-        assert!(!d.path().join(".jeikcode").join("codegraph").exists());
+        assert!(!d.path().join(".zap").join("codegraph").exists());
     }
 
     #[test]

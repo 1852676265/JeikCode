@@ -59,7 +59,8 @@ site/index-new.html
 # Config with secrets
 config.toml
 
-# Personal project instructions (loaded by JeikCode, never committed)
+# Personal project instructions (loaded by Zap, never committed)
+.zap.user.md
 .jeikcode.user.md
 
 # Logs
@@ -72,7 +73,8 @@ config.toml
 backend.log
 .venv-swebench/
 
-# JeikCode & JeikCode local data (graph cache, etc.)
+# Zap local data (graph cache, etc.)
+.zap/
 .jeikcode/
 .atomcode/
 .*.rolling
@@ -130,7 +132,9 @@ docs/plan*/
 .plan_docs
 extensions/vscode/resources/bin/
 .kiro
-# JeikCode local-scope configs (machine-specific)
+# Zap local-scope configs (machine-specific)
+.zap/local/
+.zap_store/
 .jeikcode/local/
 crates/jeikcode-codingplan-crypto/
 scripts/build-official.sh

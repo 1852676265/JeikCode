@@ -1,6 +1,6 @@
 # 01 - 提示词与上下文配置指南 (Prompts & Context)
 
-配置目录路径：`~/.jeikcode/prompts/`（或 `$JEIKCODE_HOME/prompts/`）。
+配置目录路径：`~/.zap/prompts/`（或 `$ZAP_HOME/prompts/`）。
 
 ---
 
@@ -99,9 +99,9 @@ prohibitions:
 
 ### 4.2 配置文件优先级
 按以下就近原则加载（命中首个生效）：
-1. 项目级专属：`<workspace>/.jeikcode/user-wrap.md`
+1. 项目级专属：`<workspace>/.zap/user-wrap.md`
 2. 项目级根目录：`<workspace>/user-wrap.md`
-3. 全局默认：`~/.jeikcode/user-wrap.md`
+3. 全局默认：`~/.zap/user-wrap.md`
 
 ---
 

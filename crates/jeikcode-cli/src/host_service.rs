@@ -688,7 +688,7 @@ fn render_windows_launcher(executable: &Path, workdir: &Path, args: &[String]) -
 fn windows_service_dir() -> std::path::PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".jeikcode")
+        .join(".zap")
         .join("services")
 }
 

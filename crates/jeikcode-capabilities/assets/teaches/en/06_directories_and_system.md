@@ -1,6 +1,6 @@
 # 06 - Directories and System Files Configuration Guide (Directories & System)
 
-Global root directory path: `~/.jeikcode/` (or `$JEIKCODE_HOME`).
+Global root directory path: `~/.zap/` (or `$ZAP_HOME`).
 
 ---
 

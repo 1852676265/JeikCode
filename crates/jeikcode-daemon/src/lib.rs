@@ -3728,7 +3728,7 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
 /// Global default workspace for standalone sessions (not bound to any specific project).
 pub(crate) fn global_standalone_workspace() -> PathBuf {
     let home = jeikcode_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let ws = home.join(".jeikcode").join("workspace");
+    let ws = home.join(".zap").join("workspace");
     if !ws.exists() {
         let _ = std::fs::create_dir_all(&ws);
     }
@@ -9659,7 +9659,7 @@ fn session_queue_file_path(session_id: &str) -> Option<PathBuf> {
         return None;
     }
     let home = jeikcode_config::util::real_home_dir()?;
-    let dir = home.join(".jeikcode").join("state").join("queues");
+    let dir = home.join(".zap").join("state").join("queues");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join(format!("{clean}.json")))
 }

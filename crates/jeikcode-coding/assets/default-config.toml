@@ -98,7 +98,7 @@ provider = "exa"
 
 [datalog]
 enabled = false
-dir = "~/.jeikcode/datalog"
+dir = "~/.zap/datalog"
 max_total_mb = 512
 max_days = 7
 

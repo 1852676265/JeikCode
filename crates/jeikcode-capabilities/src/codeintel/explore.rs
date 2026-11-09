@@ -271,7 +271,7 @@ fn seed_fork_defaults() {
     }
     // .codegraphignore — bundled ignore rules. First run writes the file.
     // A later change to the asset is not written over an existing copy here.
-    // Config sync compares the bundled file with ~/.jeikcode/.codegraphignore
+    // Config sync compares the bundled file with ~/.zap/.codegraphignore
     // and offers it as a checked file diff (scan_jeikcode_config_diffs).
     let ignore_dest = dir.join(".codegraphignore");
     if !ignore_dest.exists() {
@@ -340,7 +340,7 @@ static BUILTIN_TOOLS_ASSET: &str = include_str!("../../assets/builtin-tools.txt"
 static MCP_JSON_ASSET: &str = include_str!("../../assets/mcp.json");
 
 /// Bundled default code-graph ignore rules (generated/minified artifacts,
-/// vendored deps), seeded as `~/.jeikcode/.codegraphignore` on first run.
+/// vendored deps), seeded as `~/.zap/.codegraphignore` on first run.
 static CODEGRAPH_IGNORE_ASSET: &str = include_str!("../../assets/.codegraphignore");
 /// GRAPH-ONLY sensitive-credential rules (`assets/.codegraphignore.graph`): applied by
 /// `codeintel::index::load_codegraph_ignore` only — never by the glob/grep search walker.
@@ -488,9 +488,9 @@ impl Tool for CodeExploreTool {
             }),
         );
 
-        // Load project-specific thesaurus from `.jeikcode/thesaurus`
+        // Load project-specific thesaurus from `.zap/thesaurus`
         {
-            let project_thesaurus_dir = root.join(".jeikcode").join("thesaurus");
+            let project_thesaurus_dir = root.join(".zap").join("thesaurus");
             if project_thesaurus_dir.is_dir() {
                 if let Ok(mut th) = self.thesaurus.write() {
                     th.load_from_dir(&project_thesaurus_dir);

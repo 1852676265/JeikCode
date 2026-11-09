@@ -4557,6 +4557,7 @@ export function Chat({
             <div style={{ display: rightPanelTab === 'preview' ? 'flex' : 'none', flex: 1, flexDirection: 'column', minHeight: 0, height: '100%', width: '100%' }}>
               <PreviewPanel
                 cwd={effectiveWorkingDir || cwd}
+                visible={!rightPanelCollapsed && rightPanelTab === 'preview'}
                 onOpenInMainEditor={(filePath) => {
                   window.dispatchEvent(new CustomEvent('jeikcode:open_file', { detail: { path: filePath } }));
                 }}
@@ -8237,7 +8238,7 @@ export function Chat({
   }
 
   // 追加本地附件（粘贴 / 拖拽 / 文件选择）：图片立刻转成预览用 base64，
-  // 其它文件只挂在输入框里，等用户点发送才写入 .jeikcode_store。
+  // 其它文件只挂在输入框里，等用户点发送才写入 .zap_store。
   async function addLocalFiles(files: File[] | FileList) {
     const arr = Array.from(files);
     if (arr.length === 0) return;
@@ -9654,6 +9655,9 @@ export function Chat({
         sessionTotalTokens={tokens?.total}
         onNavigate={(item) => jumpToTurn(item.id)}
       />
+
+      {/* Floating Realtime Todo Panel (HUD on top-right) */}
+      {stickyTodoPanel}
     </div>
 
       {/* VSCode Diff Viewer or Code Editor Stage */}
@@ -9907,7 +9911,6 @@ export function Chat({
       {activeMainTabId === 'chat' && (
         <div class="input-container">
           <div class="input-wrap">
-            {stickyTodoPanel}
             {inputBox}
           </div>
         </div>
@@ -10279,9 +10282,12 @@ function ReasoningBlock({ text, search }: { text: string; search: string }) {
   );
 }
 
+const TODO_POS_STORAGE_KEY = 'zap:todo-panel-pos';
+
 /**
- * Todo panel — sticky above the composer (live turn) or embedded at the
+ * Todo panel — floating HUD at top-right of the viewport (live turn) or embedded at the
  * bottom of a frozen assistant reply (after the user advanced).
+ * Supports free dragging and position memory when floating.
  */
 function SessionTodoPanel({
   items,
@@ -10292,47 +10298,271 @@ function SessionTodoPanel({
 }) {
   const t = useT();
   const { completed, inProgress, total } = todoCounts(items);
-  // 默认展开以展示完整的多步骤任务树，不再因移动端窄屏默认收起导致误判为「只有单张卡片」
+  // 默认展开以展示完整的多步骤任务树
   const [collapsed, setCollapsed] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  // 悬浮状态下的自定义坐标（未设置时为 null，走 CSS 默认 top: 14px; right: 22px;）
+  const [floatingPos, setFloatingPos] = useState<{ left: number; top: number } | null>(() => {
+    if (embedded) return null;
+    try {
+      const saved = localStorage.getItem(TODO_POS_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed?.left === 'number' && typeof parsed?.top === 'number') {
+          return { left: parsed.left, top: parsed.top };
+        }
+      }
+    } catch {}
+    return null;
+  });
+
+  const posRef = useRef(floatingPos);
+  posRef.current = floatingPos;
+  const hasMovedRef = useRef(false);
+
+  // 视口 resize 时校验边界，防止窗口缩小时卡片掉到可视区外部
+  useEffect(() => {
+    if (embedded) return;
+    const clampPos = () => {
+      const panel = panelRef.current;
+      const parent = panel?.parentElement;
+      if (!panel || !parent) return;
+      const cur = posRef.current;
+      if (!cur) return;
+      const parentRect = parent.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const zoom = getPageZoom() || 1.0;
+      const maxLeft = Math.max(8, (parentRect.width / zoom) - (panelRect.width / zoom) - 8);
+      const maxTop = Math.max(8, (parentRect.height / zoom) - (panelRect.height / zoom) - 8);
+      const left = Math.max(8, Math.min(maxLeft, cur.left));
+      const top = Math.max(8, Math.min(maxTop, cur.top));
+      if (left !== cur.left || top !== cur.top) {
+        setFloatingPos({ left, top });
+      }
+    };
+    window.addEventListener('resize', clampPos);
+    window.addEventListener('jeikcode:zoom_change', clampPos);
+    return () => {
+      window.removeEventListener('resize', clampPos);
+      window.removeEventListener('jeikcode:zoom_change', clampPos);
+    };
+  }, [embedded]);
+
+  const handleHeaderMouseDown = (e: MouseEvent | TouchEvent) => {
+    if (embedded) return;
+    // 如果点击的是按钮（如折叠按钮），不触发拖拽
+    if ((e.target as HTMLElement).closest('.session-todo-toggle-btn')) {
+      return;
+    }
+    const point = 'touches' in e ? (e as TouchEvent).touches[0] : (e as MouseEvent);
+    if (!point) return;
+
+    const panel = panelRef.current;
+    const parent = panel?.parentElement;
+    if (!panel || !parent) return;
+
+    const startClientX = point.clientX;
+    const startClientY = point.clientY;
+    const zoom = getPageZoom() || 1.0;
+
+    // 初始计算卡片相对于父容器的逻辑坐标
+    const parentRect = parent.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    const initialLeft = (panelRect.left - parentRect.left) / zoom;
+    const initialTop = (panelRect.top - parentRect.top) / zoom;
+
+    hasMovedRef.current = false;
+    let latestLeft = initialLeft;
+    let latestTop = initialTop;
+
+    const onMove = (moveEv: MouseEvent | TouchEvent) => {
+      const cur = 'touches' in moveEv ? (moveEv as TouchEvent).touches[0] : (moveEv as MouseEvent);
+      if (!cur) return;
+
+      const deltaX = (cur.clientX - startClientX) / zoom;
+      const deltaY = (cur.clientY - startClientY) / zoom;
+
+      if (!hasMovedRef.current && Math.hypot(deltaX, deltaY) > 4) {
+        hasMovedRef.current = true;
+        setIsDragging(true);
+        document.body.style.userSelect = 'none';
+      }
+
+      if (hasMovedRef.current) {
+        const curParentRect = parent.getBoundingClientRect();
+        const curPanelRect = panel.getBoundingClientRect();
+        const maxLeft = Math.max(8, (curParentRect.width / zoom) - (curPanelRect.width / zoom) - 8);
+        const maxTop = Math.max(8, (curParentRect.height / zoom) - (curPanelRect.height / zoom) - 8);
+
+        latestLeft = Math.max(8, Math.min(maxLeft, initialLeft + deltaX));
+        latestTop = Math.max(8, Math.min(maxTop, initialTop + deltaY));
+
+        setFloatingPos({ left: latestLeft, top: latestTop });
+      }
+    };
+
+    const onEnd = () => {
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove as any);
+      window.removeEventListener('mouseup', onEnd);
+      window.removeEventListener('touchmove', onMove as any);
+      window.removeEventListener('touchend', onEnd);
+
+      if (hasMovedRef.current) {
+        setIsDragging(false);
+        try {
+          localStorage.setItem(
+            TODO_POS_STORAGE_KEY,
+            JSON.stringify({ left: Math.round(latestLeft), top: Math.round(latestTop) })
+          );
+        } catch {}
+      }
+    };
+
+    window.addEventListener('mousemove', onMove as any);
+    window.addEventListener('mouseup', onEnd);
+    window.addEventListener('touchmove', onMove as any, { passive: false });
+    window.addEventListener('touchend', onEnd);
+  };
+
+  const handleHeaderClick = () => {
+    // 若刚刚发生了拖动位移，忽略点击切换，防止拖完面板松开手时卡片折叠
+    if (hasMovedRef.current) return;
+    setCollapsed(!collapsed);
+  };
+
+  const handleHeaderDblClick = () => {
+    if (embedded) return;
+    // 双击头部复位到默认右上角位置
+    setFloatingPos(null);
+    try {
+      localStorage.removeItem(TODO_POS_STORAGE_KEY);
+    } catch {}
+  };
 
   const activeTask = items.find((i) => i.status === 'in_progress');
+  const progressPercent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+
+  const floatingStyle =
+    !embedded && floatingPos
+      ? {
+          left: `${floatingPos.left}px`,
+          top: `${floatingPos.top}px`,
+          right: 'auto',
+          bottom: 'auto',
+        }
+      : undefined;
 
   return (
     <div
-      class={'session-todo-panel' + (embedded ? ' is-embedded' : '') + (collapsed ? ' is-collapsed' : '')}
+      ref={panelRef}
+      class={
+        'session-todo-panel' +
+        (embedded ? ' is-embedded' : ' is-floating') +
+        (collapsed ? ' is-collapsed' : '') +
+        (isDragging ? ' is-dragging' : '')
+      }
+      style={floatingStyle}
       role="region"
       aria-label={t('todo.panelTitle')}
     >
       <div
         class="session-todo-header"
-        onClick={() => setCollapsed(!collapsed)}
+        onClick={handleHeaderClick}
+        onDblClick={handleHeaderDblClick}
+        onMouseDown={handleHeaderMouseDown as any}
+        onTouchStart={handleHeaderMouseDown as any}
         title={t(collapsed ? 'panel.expand' : 'panel.collapse')}
       >
-        <span class="session-todo-collapse-icon" aria-hidden="true">
-          {collapsed ? '▸' : '▾'}
-        </span>
-        <span class="session-todo-title">{t('todo.panelTitle')}</span>
-        {collapsed && activeTask && (
-          <span class="session-todo-active-snippet" title={activeTask.content}>
-            • {activeTask.content}
+        <div class="session-todo-header-left">
+          {!embedded && (
+            <span
+              class="session-todo-drag-handle"
+              title={t('common.drag') || '拖拽移动（双击复位）'}
+              aria-hidden="true"
+            >
+              <svg width="10" height="12" viewBox="0 0 10 14" fill="currentColor">
+                <circle cx="2.5" cy="2.5" r="1.3" />
+                <circle cx="7.5" cy="2.5" r="1.3" />
+                <circle cx="2.5" cy="7" r="1.3" />
+                <circle cx="7.5" cy="7" r="1.3" />
+                <circle cx="2.5" cy="11.5" r="1.3" />
+                <circle cx="7.5" cy="11.5" r="1.3" />
+              </svg>
+            </span>
+          )}
+          <span class="session-todo-sparkle" aria-hidden="true">✦</span>
+          <span class="session-todo-title">{t('todo.panelTitle')}</span>
+        </div>
+        <div class="session-todo-header-right">
+          <span
+            class="session-todo-badge"
+            title={t('todo.summary', {
+              done: String(completed),
+              active: String(inProgress),
+              total: String(total),
+            })}
+          >
+            {completed} / {total}
           </span>
-        )}
-        <span class="session-todo-summary">
-          {t('todo.summary', {
-            done: String(completed),
-            active: String(inProgress),
-            total: String(total),
-          })}
-        </span>
+          <button
+            type="button"
+            class="session-todo-toggle-btn"
+            aria-label={t(collapsed ? 'panel.expand' : 'panel.collapse')}
+            onClick={(e) => {
+              e.stopPropagation();
+              setCollapsed(!collapsed);
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              {collapsed ? (
+                <path d="M6 3.5l5 4.5-5 4.5V3.5z" />
+              ) : (
+                <path d="M3.5 6l4.5 5 4.5-5h-9z" />
+              )}
+            </svg>
+          </button>
+        </div>
       </div>
+
+      <div class="session-todo-progress-track" aria-hidden="true">
+        <div
+          class="session-todo-progress-bar"
+          style={{ width: `${progressPercent}%` }}
+        />
+      </div>
+
+      {collapsed && activeTask && (
+        <div class="session-todo-active-bar" title={activeTask.content}>
+          <span class="session-todo-pulse-dot" aria-hidden="true" />
+          <span class="session-todo-active-text">{activeTask.content}</span>
+        </div>
+      )}
+
       {!collapsed && (
         <div class="session-todo-list">
           {items.map((item, i) => (
             <div class={'session-todo-row status-' + item.status} key={i}>
-              <span class="session-todo-glyph" aria-hidden="true">
-                {item.status === 'completed' ? '√' : item.status === 'in_progress' ? '•' : '○'}
+              <span class="session-todo-status-icon" aria-hidden="true">
+                {item.status === 'completed' ? (
+                  <svg class="session-todo-check" width="16" height="16" viewBox="0 0 16 16" fill="none">
+                    <circle cx="8" cy="8" r="7.2" fill="var(--app-success-foreground, #10b981)" />
+                    <path d="M4.8 8.2l2.2 2.3 4.2-4.5" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                ) : item.status === 'in_progress' ? (
+                  <span class="session-todo-spin-ring">
+                    <span class="session-todo-spin-dot" />
+                  </span>
+                ) : (
+                  <span class="session-todo-pending-ring" />
+                )}
               </span>
               <span class="session-todo-content">{item.content}</span>
+              {item.status === 'in_progress' && (
+                <span class="session-todo-pill-active">{t('todo.inProgress')}</span>
+              )}
             </div>
           ))}
         </div>

@@ -21,6 +21,26 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.7 (2026-11-09)
+
+- **[Settings & UI Refactoring] Modern glassmorphism redesign and redundant item cleanup**:
+  - Streamlined settings center into four core functional sections: General, Appearance & Glass, Models & Providers, and MCP & Skills, eliminating all mock and unsupported legacy modules.
+  - Introduced design tokens for dark and light modes, delivering refined contrast, subtle borders, responsive sliders, custom selects, and modern segmented controls.
+  - Enhanced desktop user experience with Apple-style glassmorphism materials and seamless dual-theme adaptability.
+
+- **[Brand & System Alignment] Unified naming and configuration paths for Zap**:
+  - Aligned project configuration paths to `.zap/` and unified desktop notifications and application identity.
+
+---
+
+- **[设置中心与视觉重构] 现代全景毛玻璃重构与冗余功能精简**:
+  - 全面精简统一设置中心，收敛为通用设置、界面与透明度、模型与供应商、MCP 与技能四大核心模块，剔除所有 Mock 模拟生态与无后端支持的冗余项。
+  - 建立深浅双主题 CSS 设计令牌体系，优化卡片微阴影、原生美化下拉框、分段控制器、纤细滑块与平滑开关控件。
+  - 优化苹果全景毛玻璃材质与磨砂通透质感，确保双主题下文字清晰度与层次感。
+
+- **[品牌与系统对齐] Zap 统一命名与配置规范**:
+  - 全面规范系统配置路径为 `.zap/`，统一桌面端通知机制与应用品牌标识。
+
 ## v1.0.6 (2026-11-09)
 
 - **[Updater & Daemon] Rate-limit-free updates, multi-mirror download fallback, and silent NSIS desktop installer**:

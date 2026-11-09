@@ -37,4 +37,4 @@ skills:
     description: "Interactively scaffold and author a new Agent skill (SKILL.md + helper scripts)."
     trigger_scenarios:
       - "User wants to create a new skill or runs /create-skill" # 【中文触发】：用户希望新建技能或运行 /create-skill
-    path: "~/.jeikcode/skills/create-skill/SKILL.md"
+    path: "~/.zap/skills/create-skill/SKILL.md"
