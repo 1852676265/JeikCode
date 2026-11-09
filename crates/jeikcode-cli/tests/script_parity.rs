@@ -2,7 +2,7 @@
 //! match crates/jeikcode-cli/src/uninstall/paths.rs::uninstall_manifest().
 //! Any drift breaks symmetry between the subcommand and fallback scripts.
 
-use zap::uninstall::paths::uninstall_manifest;
+use jeikcode::uninstall::paths::uninstall_manifest;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 

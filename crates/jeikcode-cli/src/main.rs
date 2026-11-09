@@ -18,7 +18,7 @@ mod schedule_os;
 mod server_cmd;
 mod telemetry_cmd;
 mod vision;
-use zap::uninstall;
+use jeikcode::uninstall;
 
 // Redirect JEIKCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so unit tests never persist into the developer's real `~/.jeikcode`.
