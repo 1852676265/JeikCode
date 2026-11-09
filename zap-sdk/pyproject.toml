@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jeikcode-sdk"
+name = "zap-sdk"
 version = "0.1.0"
-description = "Python SDK for JeikCode serve OpenAI/Anthropic-compatible streaming APIs"
+description = "Python SDK for Zap serve OpenAI/Anthropic-compatible streaming APIs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "JeikCode" }]
+authors = [{ name = "Zap" }]
 dependencies = [
   "httpx>=0.27",
 ]
@@ -19,7 +19,7 @@ dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["jeikcode_sdk*"]
+include = ["zap_sdk*", "jeikcode_sdk*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

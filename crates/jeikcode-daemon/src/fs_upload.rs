@@ -19,7 +19,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-const GITIGNORE_BLOCK: &str = "\n# JeikCode user uploads (not project source)\n.jeikcode_store/\n";
+const GITIGNORE_BLOCK: &str = "\n# Zap user uploads (not project source)\n.zap_store/\n.jeikcode_store/\n";
 const MAX_NAME_CHARS: usize = 180;
 
 #[derive(Debug, Serialize)]

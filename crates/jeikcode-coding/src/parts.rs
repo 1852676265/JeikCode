@@ -1695,6 +1695,8 @@ pub fn assemble(
     Ok(agent)
 }
 
+const ZAP_PERSONA_PREFIX: &str =
+    "You are Zap, an AI coding agent by Zap running the ";
 const JEIKCODE_PERSONA_PREFIX: &str =
     "You are JeikCode, an AI coding agent by JeikCode running the ";
 const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
@@ -1710,7 +1712,7 @@ fn persona_model(text: &str) -> Option<&str> {
         }
     }
     // Legacy snapshots / custom persona templates that still name the model in the prose.
-    if let Some(rest) = text.strip_prefix(JEIKCODE_PERSONA_PREFIX) {
+    if let Some(rest) = text.strip_prefix(ZAP_PERSONA_PREFIX).or_else(|| text.strip_prefix(JEIKCODE_PERSONA_PREFIX)) {
         return rest.split_once(" model.").map(|(model, _)| model);
     }
     if let Some(pos) = text.find(" running the ") {
@@ -1725,7 +1727,9 @@ fn is_persona_block_1(message: &Message) -> bool {
         return false;
     }
     message.text.starts_with("<environment>")
+        || message.text.starts_with(ZAP_PERSONA_PREFIX)
         || message.text.starts_with(JEIKCODE_PERSONA_PREFIX)
+        || message.text.starts_with("You are Zap")
         || message.text.starts_with("You are JeikCode")
         || (message.text.contains(" running the ")
             && message.text.contains(" model.")

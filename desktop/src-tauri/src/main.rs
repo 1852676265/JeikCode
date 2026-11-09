@@ -362,7 +362,7 @@ fn start_webui(
         .unwrap_or(launch.port);
     if probe_port != launch.port {
         launch.port = probe_port;
-        let dir = jeikcode_dir();
+        let dir = zap_dir();
         let _ = std::fs::create_dir_all(&dir);
         let body = format!(
             "{{\n  \"port\": {probe_port},\n  \"token\": \"{}\"\n}}\n",
@@ -387,13 +387,17 @@ fn spawn_desktop_server(
         .arg("--no-open")
         .arg("--token")
         .arg(&launch.token);
+    cmd.env("ZAP_DESKTOP", "1");
     cmd.env("JEIKCODE_DESKTOP", "1");
     if exact_port {
-        // 与 jeikcode-updater 的同名变量一致：只绑定这个端口，不顺延，也不关闭别的进程。
+        // 与 updater 的同名变量一致：只绑定这个端口，不顺延，也不关闭别的进程。
+        cmd.env("ZAP_RESTART_EXACT_PORT", "1");
+        cmd.env("ZAP_RESTART_LISTEN_PORT", launch.port.to_string());
         cmd.env("JEIKCODE_RESTART_EXACT_PORT", "1");
         cmd.env("JEIKCODE_RESTART_LISTEN_PORT", launch.port.to_string());
     }
     if let Some(ref bundled) = launch.bundled {
+        cmd.env("ZAP_DESKTOP_CLI_BIN", bundled);
         cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
     }
     cmd.current_dir(&launch.home)
@@ -638,7 +642,7 @@ fn mint_desktop_token(port: u16) -> String {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let token = format!("sk-{:x}-{:x}", std::process::id(), nanos);
-    let dir = jeikcode_dir();
+    let dir = zap_dir();
     let _ = std::fs::create_dir_all(&dir);
     let body = format!("{{\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
     let _ = std::fs::write(dir.join("webui-listen.json"), body);
@@ -696,18 +700,18 @@ fn cli_dest_dir() -> PathBuf {
 
 fn cli_file_name() -> &'static str {
     if cfg!(windows) {
-        "jeikcode.exe"
+        "zap.exe"
     } else {
-        "jeikcode"
+        "zap"
     }
 }
 
 const WEBUI_DEFAULT_PORT: u16 = 13457;
 
-/// `~/.jeikcode/webui-listen.json` written by the remote-access panel.
+/// `~/.zap/webui-listen.json` written by the remote-access panel.
 /// Missing file, a bad file, or no token means: port 13457 and a random token.
 fn saved_webui_listen() -> (u16, Option<String>) {
-    let path = jeikcode_dir().join("webui-listen.json");
+    let path = zap_dir().join("webui-listen.json");
     let Ok(text) = std::fs::read_to_string(path) else {
         return (WEBUI_DEFAULT_PORT, None);
     };
@@ -733,13 +737,21 @@ fn parse_webui_listen(text: &str) -> (u16, Option<String>) {
     (port, token)
 }
 
-fn jeikcode_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("JEIKCODE_HOME") {
+fn zap_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("ZAP_HOME").or_else(|| std::env::var_os("JEIKCODE_HOME")) {
         if !home.is_empty() {
             return PathBuf::from(home);
         }
     }
-    home_dir().join(".jeikcode")
+    let h = home_dir();
+    let zap_path = h.join(".zap");
+    if !zap_path.exists() {
+        let legacy_path = h.join(".jeikcode");
+        if legacy_path.exists() {
+            return legacy_path;
+        }
+    }
+    zap_path
 }
 
 fn home_dir() -> PathBuf {

@@ -1529,16 +1529,19 @@ fn ai_session_naming_from_parts(env_val: Option<&str>, config_val: bool) -> bool
     }
 }
 
-/// True when AI session naming should run. Env `JEIKCODE_AI_SESSION_NAMING`
+/// True when AI session naming should run. Env `ZAP_AI_SESSION_NAMING` / `JEIKCODE_AI_SESSION_NAMING`
 /// ("0"/"false"/"off" ⇒ disabled) overrides the config value.
 pub fn ai_session_naming_enabled(cfg: &Config) -> bool {
+    let env_val = std::env::var("ZAP_AI_SESSION_NAMING")
+        .or_else(|_| std::env::var("JEIKCODE_AI_SESSION_NAMING"))
+        .ok();
     ai_session_naming_from_parts(
-        std::env::var("JEIKCODE_AI_SESSION_NAMING").ok().as_deref(),
+        env_val.as_deref(),
         cfg.ui.ai_session_naming,
     )
 }
 
-/// Resolve the effective todo switch: env `JEIKCODE_TODO` (0/false/off vs 1/true/on)
+/// Resolve the effective todo switch: env `ZAP_TODO` / `JEIKCODE_TODO` (0/false/off vs 1/true/on)
 /// overrides the config value; absent/empty env → config value.
 pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
     match env.map(|s| s.trim().to_ascii_lowercase()) {
@@ -1552,7 +1555,7 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
 /// Returns `false` only when `env` is `Some("")`/`"0"`/`"false"`/`"off"` (case-insensitive,
 /// trimmed).  `None` (unset) or any other value → `true`.
 ///
-/// Opt-out: set `JEIKCODE_REQUEST_USER_INPUT=0` (or `false`/`off`) to disable.
+/// Opt-out: set `ZAP_REQUEST_USER_INPUT=0` / `JEIKCODE_REQUEST_USER_INPUT=0` (or `false`/`off`) to disable.
 ///
 /// Called by `jeikcode-coding`'s persona gate (`request_user_input_switch_enabled`).
 ///
@@ -1575,9 +1578,9 @@ impl Default for DatalogConfig {
             enabled: false,
             // Pre-fill the default root so it round-trips into config.toml on
             // first save — users see exactly where logs go without having to
-            // discover that "unset == ~/.jeikcode/datalog". Resolver still
+            // discover that "unset == ~/.zap/datalog". Resolver still
             // treats this string the same as `None` (project slug appended).
-            dir: Some("~/.jeikcode/datalog".to_string()),
+            dir: Some("~/.zap/datalog".to_string()),
             max_total_mb: default_datalog_max_mb(),
             max_days: default_datalog_max_days(),
         }
@@ -1600,7 +1603,7 @@ impl Default for NotificationConfig {
 /// Serialize the `[datalog]` section with help comments so users editing
 /// config.toml by hand can discover the options without reading the source.
 /// `enabled` and `dir` are always emitted as real values — the default `dir`
-/// (`~/.jeikcode/datalog`) is shown explicitly so users see exactly where
+/// (`~/.zap/datalog`) is shown explicitly so users see exactly where
 /// logs go without having to discover that "unset == default".
 fn render_datalog_section(cfg: &DatalogConfig) -> String {
     let mut out = String::new();
@@ -1610,19 +1613,19 @@ fn render_datalog_section(cfg: &DatalogConfig) -> String {
         "# Logs contain raw prompts, responses, tool inputs and tool outputs; protect them\n",
     );
     out.push_str(
-        "# as sensitive data. JeikCode creates project directories/files as 0700/0600 on Unix.\n",
+        "# as sensitive data. Zap creates project directories/files as 0700/0600 on Unix.\n",
     );
     out.push_str("# A per-project subdirectory is always appended under `dir` so multiple\n");
     out.push_str("# projects never share a bucket.\n");
     out.push_str("# - enabled = false        -> disable logging entirely (default: false)\n");
     out.push_str(
-        "# - dir = \"~/.jeikcode/datalog\" -> default (follows $JEIKCODE_HOME, ignores /cd)\n",
+        "# - dir = \"~/.zap/datalog\"    -> default (follows $ZAP_HOME / $JEIKCODE_HOME, ignores /cd)\n",
     );
     out.push_str("# - dir = \"/abs/path\"      -> absolute, fixed (unaffected by /cd)\n");
     out.push_str("# - dir = \"rel/path\"       -> joined with current working_dir, follows /cd\n");
     out.push_str("[datalog]\n");
     out.push_str(&format!("enabled = {}\n", cfg.enabled));
-    let dir_value = cfg.dir.as_deref().unwrap_or("~/.jeikcode/datalog");
+    let dir_value = cfg.dir.as_deref().unwrap_or("~/.zap/datalog");
     let escaped = dir_value.replace('\\', "\\\\").replace('"', "\\\"");
     out.push_str(&format!("dir = \"{}\"\n", escaped));
     out.push_str(&format!("max_total_mb = {}\n", cfg.max_total_mb));
@@ -1748,17 +1751,17 @@ fn escape_toml(value: &str) -> String {
 fn render_instructions_section() -> String {
     let mut out = String::new();
     out.push_str("\n# Project instructions — customize AI behavior via Markdown files.\n");
-    out.push_str("# JeikCode loads instructions from three levels (low → high priority):\n");
+    out.push_str("# Zap loads instructions from three levels (low → high priority):\n");
     out.push_str("#\n");
-    out.push_str("#   1. ~/.jeikcode/JEIKCODE.md           (global — your personal defaults)\n");
+    out.push_str("#   1. ~/.zap/ZAP.md (or ~/.jeikcode/JEIKCODE.md) (global — your personal defaults)\n");
     out.push_str(
-        "#   2. <project>/.jeikcode.md            (project — team-shared, commit to git)\n",
+        "#   2. <project>/.zap.md (or .jeikcode.md) (project — team-shared, commit to git)\n",
     );
-    out.push_str("#      or <project>/JEIKCODE.md\n");
+    out.push_str("#      or <project>/ZAP.md / JEIKCODE.md\n");
     out.push_str("#      or <project>/AGENTS.md           (AGENTS.md open standard)\n");
     out.push_str("#      or <project>/CLAUDE.md / claude.md (Claude Code compat)\n");
     out.push_str(
-        "#   3. <project>/.jeikcode.user.md       (user — personal per-project, .gitignore)\n",
+        "#   3. <project>/.zap.user.md (or .jeikcode.user.md) (user — personal per-project, .gitignore)\n",
     );
     out.push_str("#\n");
     out.push_str("# Higher priority files appear later in the prompt (recency effect).\n");
@@ -1766,12 +1769,12 @@ fn render_instructions_section() -> String {
         "# Use /status to see which files are loaded. Use /init to generate a template.\n",
     );
     out.push_str("#\n");
-    out.push_str("# Example ~/.jeikcode/JEIKCODE.md:\n");
+    out.push_str("# Example ~/.zap/ZAP.md:\n");
     out.push_str("#   ## Global Preferences\n");
     out.push_str("#   - Reply in Chinese\n");
     out.push_str("#   - Don't add AI co-author tags to commits\n");
     out.push_str("#\n");
-    out.push_str("# Example <project>/.jeikcode.md:\n");
+    out.push_str("# Example <project>/.zap.md:\n");
     out.push_str("#   ## Project Rules\n");
     out.push_str("#   - This is a Rust workspace with 5 crates\n");
     out.push_str("#   - Use anyhow::Result for error handling\n");
@@ -1782,7 +1785,7 @@ fn render_instructions_section() -> String {
 fn render_hooks_json_section() -> String {
     let mut out = String::new();
     out.push_str("\n# Lifecycle hooks — configure in separate JSON files:\n");
-    out.push_str("#   ~/.jeikcode/hooks.json       (global hooks)\n");
+    out.push_str("#   ~/.zap/hooks.json (or ~/.jeikcode/hooks.json) (global hooks)\n");
     out.push_str("#   <project>/.hooks.json         (project hooks, override global by name)\n");
     out.push_str("#\n");
     out.push_str("# Example hooks.json:\n");
@@ -1790,7 +1793,7 @@ fn render_hooks_json_section() -> String {
     out.push_str("#     \"hooks\": {\n");
     out.push_str("#       \"audit-all\": {\n");
     out.push_str("#         \"event\": \"pre_tool_use\",\n");
-    out.push_str("#         \"command\": \"echo \\\"$(date) $JEIKCODE_TOOL_NAME\\\" >> ~/.jeikcode/audit.log\"\n");
+    out.push_str("#         \"command\": \"echo \\\"$(date) $ZAP_TOOL_NAME\\\" >> ~/.zap/audit.log\"\n");
     out.push_str("#       },\n");
     out.push_str("#       \"block-rm\": {\n");
     out.push_str("#         \"event\": \"pre_tool_use\",\n");
@@ -1802,7 +1805,7 @@ fn render_hooks_json_section() -> String {
     out.push_str("#   }\n");
     out.push_str("#\n");
     out.push_str("# Events: pre_tool_use, post_tool_use, session_start, session_end\n");
-    out.push_str("# Env vars: JEIKCODE_HOOK_EVENT, JEIKCODE_TOOL_NAME, JEIKCODE_HOOK_CONTEXT\n");
+    out.push_str("# Env vars: ZAP_HOOK_EVENT, ZAP_TOOL_NAME, ZAP_HOOK_CONTEXT (also supports JEIKCODE_*)\n");
     out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"}\n");
     out
 }
@@ -1981,12 +1984,19 @@ impl Config {
 
     /// Resolve the config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(env_jeikcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
-        if let Some(p) = env_jeikcode_home.filter(|s| !s.is_empty()) {
+    fn resolve_config_dir(env_zap_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
+        if let Some(p) = env_zap_home.filter(|s| !s.is_empty()) {
             return PathBuf::from(p);
         }
         let home_dir = home.unwrap_or_else(|| PathBuf::from("."));
-        home_dir.join(".jeikcode")
+        let zap_dir = home_dir.join(".zap");
+        if !zap_dir.exists() {
+            let legacy_dir = home_dir.join(".jeikcode");
+            if legacy_dir.exists() {
+                return legacy_dir;
+            }
+        }
+        zap_dir
     }
 
     pub fn config_dir() -> PathBuf {
@@ -2005,10 +2015,12 @@ impl Config {
         static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         RESOLVED
             .get_or_init(|| {
+                let env_home = std::env::var("ZAP_HOME")
+                    .or_else(|_| std::env::var("JEIKCODE_HOME"))
+                    .ok()
+                    .filter(|s| !s.is_empty());
                 Self::resolve_config_dir(
-                    std::env::var("JEIKCODE_HOME")
-                        .ok()
-                        .filter(|s| !s.is_empty()),
+                    env_home,
                     crate::util::real_home_dir(),
                 )
             })

@@ -31,35 +31,35 @@
 use std::sync::OnceLock;
 
 /// Address overrides. Each takes a complete URL.
-pub const PLATFORM_SERVER_ENV: &str = "JEIKCODE_PLATFORM_SERVER";
-pub const CODINGPLAN_API_BASE_ENV: &str = "JEIKCODE_CODINGPLAN_API_BASE";
-pub const CODINGPLAN_LLM_BASE_URL_ENV: &str = "JEIKCODE_CODINGPLAN_LLM_BASE_URL";
-pub const UPDATE_MANIFEST_URL_ENV: &str = "JEIKCODE_UPDATE_MANIFEST_URL";
-pub const UPDATE_DOWNLOAD_BASE_ENV: &str = "JEIKCODE_UPDATE_DOWNLOAD_BASE";
-pub const DESKTOP_DOWNLOAD_URL_ENV: &str = "JEIKCODE_DESKTOP_DOWNLOAD_URL";
-pub const UPDATE_REPO_ENV: &str = "JEIKCODE_UPDATE_REPO";
+pub const PLATFORM_SERVER_ENV: &str = "ZAP_PLATFORM_SERVER";
+pub const CODINGPLAN_API_BASE_ENV: &str = "ZAP_CODINGPLAN_API_BASE";
+pub const CODINGPLAN_LLM_BASE_URL_ENV: &str = "ZAP_CODINGPLAN_LLM_BASE_URL";
+pub const UPDATE_MANIFEST_URL_ENV: &str = "ZAP_UPDATE_MANIFEST_URL";
+pub const UPDATE_DOWNLOAD_BASE_ENV: &str = "ZAP_UPDATE_DOWNLOAD_BASE";
+pub const DESKTOP_DOWNLOAD_URL_ENV: &str = "ZAP_DESKTOP_DOWNLOAD_URL";
+pub const UPDATE_REPO_ENV: &str = "ZAP_UPDATE_REPO";
 pub const DEFAULT_UPDATE_REPO: &str = "1852676265/JeikCode";
 pub const UPSTREAM_UPDATE_REPO: &str = "jeikl/JeikCode";
-pub const RELAY_URL_ENV: &str = "JEIKCODE_APP_RELAY";
+pub const RELAY_URL_ENV: &str = "ZAP_APP_RELAY";
 
 /// Marketplace git URLs, comma-separated. Replaces the default list; an
 /// explicitly empty value registers none.
-pub const PLUGIN_MARKETPLACES_ENV: &str = "JEIKCODE_PLUGIN_MARKETPLACES";
+pub const PLUGIN_MARKETPLACES_ENV: &str = "ZAP_PLUGIN_MARKETPLACES";
 
 /// Which of [`PLUGIN_MARKETPLACES_ENV`] are force-installed, comma-separated.
 /// Replaces the default; an explicitly empty value installs none.
-pub const PLUGIN_AUTO_INSTALL_ENV: &str = "JEIKCODE_PLUGIN_AUTO_INSTALL";
+pub const PLUGIN_AUTO_INSTALL_ENV: &str = "ZAP_PLUGIN_AUTO_INSTALL";
 
 /// Whether `/app` remote access is offered. Defaults to on.
-pub const ENABLE_RELAY_ENV: &str = "JEIKCODE_ENABLE_RELAY";
+pub const ENABLE_RELAY_ENV: &str = "ZAP_ENABLE_RELAY";
 
 /// Overrides the prefix CodingPlan provider keys are written with.
-pub const CODINGPLAN_PROVIDER_PREFIX_ENV: &str = "JEIKCODE_CODINGPLAN_PROVIDER_PREFIX";
+pub const CODINGPLAN_PROVIDER_PREFIX_ENV: &str = "ZAP_CODINGPLAN_PROVIDER_PREFIX";
 
 /// Hosts to treat as first-party, comma-separated. **Replaces** the default
 /// set rather than adding to it: a deployment that has moved off the hosted
 /// service should stop trusting it, not accumulate both.
-pub const TRUSTED_HOSTS_ENV: &str = "JEIKCODE_TRUSTED_HOSTS";
+pub const TRUSTED_HOSTS_ENV: &str = "ZAP_TRUSTED_HOSTS";
 
 // ---------------------------------------------------------------------------
 // Hosted-service addresses
@@ -96,9 +96,26 @@ const HOSTED_TLS_FALLBACK_DOMAINS: &[&str] = &[];
 // ---------------------------------------------------------------------------
 
 fn env_var_dual(key: &str) -> Option<String> {
-    if let Some(rest) = key.strip_prefix("JEIKCODE_") {
-        let jeik_key = format!("JEIKCODE_{rest}");
-        if let Ok(v) = std::env::var(&jeik_key) {
+    if let Some(rest) = key.strip_prefix("ZAP_") {
+        if let Ok(v) = std::env::var(key) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+        let legacy_key = format!("JEIKCODE_{rest}");
+        if let Ok(v) = std::env::var(&legacy_key) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    } else if let Some(rest) = key.strip_prefix("JEIKCODE_") {
+        let zap_key = format!("ZAP_{rest}");
+        if let Ok(v) = std::env::var(&zap_key) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var(key) {
             if !v.trim().is_empty() {
                 return Some(v);
             }

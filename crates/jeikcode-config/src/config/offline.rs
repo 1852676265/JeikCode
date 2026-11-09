@@ -29,6 +29,7 @@ static VERDICT: AtomicU8 = AtomicU8::new(V_UNSEEDED);
 static NOTE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Env var that overrides the config `offline_mode` (highest priority).
+pub const ZAP_OFFLINE_ENV: &str = "ZAP_OFFLINE";
 pub const JEIKCODE_OFFLINE_ENV: &str = "JEIKCODE_OFFLINE";
 
 /// Resolve whether offline is FORCED active from a config mode + env, WITHOUT touching
@@ -41,12 +42,15 @@ pub fn offline_resolved(mode: OfflineMode, env_raw: Option<&str>) -> bool {
 }
 
 /// Seed the process verdict + note from an optional loaded `Config`, reading the
-/// `JEIKCODE_OFFLINE` env override internally. Missing config → defaults (Off / no note).
+/// `ZAP_OFFLINE` / `JEIKCODE_OFFLINE` env override internally. Missing config → defaults (Off / no note).
 /// Call once at startup, before any consumer of `is_offline_active()`.
 pub fn seed_offline_from_config(cfg: Option<&super::Config>) {
     let mode = cfg.map(|c| c.offline_mode).unwrap_or_default();
     let note = cfg.and_then(|c| c.offline_note.clone());
-    seed_offline_verdict(mode, std::env::var(JEIKCODE_OFFLINE_ENV).ok().as_deref());
+    let env_val = std::env::var(ZAP_OFFLINE_ENV)
+        .or_else(|_| std::env::var(JEIKCODE_OFFLINE_ENV))
+        .ok();
+    seed_offline_verdict(mode, env_val.as_deref());
     set_offline_note(note);
 }
 

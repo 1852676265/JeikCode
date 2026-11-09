@@ -126,6 +126,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
         "grep",
         "glob",
         "todo_write",
+        "zap_config",
         "jeikcode_config",
         "fetch_output",
         "request_user_input",
@@ -445,10 +446,12 @@ pub(crate) fn is_skip_dir(name: &str) -> bool {
 /// WebUI user-upload store. Gitignored so it stays out of project VCS, but
 /// `read` / `grep` / `glob` must still see it — these files
 /// are attachments the model is expected to open, not project source.
-pub const USER_UPLOAD_STORE_DIR: &str = ".jeikcode_store";
+pub const USER_UPLOAD_STORE_DIR: &str = ".zap_store";
+pub const LEGACY_USER_UPLOAD_STORE_DIR: &str = ".jeikcode_store";
 
 pub(crate) fn is_upload_store_dir(name: &str) -> bool {
     name.eq_ignore_ascii_case(USER_UPLOAD_STORE_DIR)
+        || name.eq_ignore_ascii_case(LEGACY_USER_UPLOAD_STORE_DIR)
 }
 
 /// True when `path` is `.jeikcode_store` itself or lives under one.
@@ -877,7 +880,7 @@ mod tests {
         "grep",
         "glob",
         "todo_write",
-        "jeikcode_config",
+        "zap_config",
     ];
 
     #[test]

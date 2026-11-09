@@ -12,10 +12,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Env override: `JEIKCODE_TLS_MAX=1.2` caps outbound TLS at 1.2 from process start.
+/// Env override: `ZAP_TLS_MAX=1.2` (or `JEIKCODE_TLS_MAX=1.2`) caps outbound TLS at 1.2 from process start.
 /// An escape hatch for users on a TLS-1.3-hostile network (works before any request)
 /// and a way to skip the first-request reset+retry the auto-fallback would otherwise do.
-pub const MAX_ENV: &str = "JEIKCODE_TLS_MAX";
+pub const MAX_ENV: &str = "ZAP_TLS_MAX";
+pub const LEGACY_MAX_ENV: &str = "JEIKCODE_TLS_MAX";
 
 /// Latched once [`latch_managed_tls12`] fires; never cleared for the process lifetime
 /// (a TLS-1.3-hostile path does not heal mid-session, and re-probing 1.3 on every
@@ -31,6 +32,7 @@ pub fn latch_managed_tls12() {
 /// Whether the user explicitly requested a process-wide TLS 1.2 ceiling.
 pub fn env_forces_tls12() -> bool {
     std::env::var(MAX_ENV)
+        .or_else(|_| std::env::var(LEGACY_MAX_ENV))
         .ok()
         .as_deref()
         .map(value_requests_tls12)

@@ -24,7 +24,8 @@ import {
 // (CWE-598). If storage is unavailable, keep ?token= so later fetches still
 // authenticate.
 /** Shared sessionStorage key for the webui access token (api + LoginButton). */
-export const WEBUI_TOKEN_STORAGE_KEY = 'jeikcode_webui_token';
+export const WEBUI_TOKEN_STORAGE_KEY = 'zap_webui_token';
+export const LEGACY_WEBUI_TOKEN_STORAGE_KEY = 'jeikcode_webui_token';
 
 function persistWebuiToken(value: string) {
   try {
@@ -41,13 +42,13 @@ function persistWebuiToken(value: string) {
 
 function storedWebuiToken(): string {
   try {
-    const session = sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY);
+    const session = sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) || sessionStorage.getItem(LEGACY_WEBUI_TOKEN_STORAGE_KEY);
     if (session) return session;
   } catch {
     /* ignore */
   }
   try {
-    return localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '';
+    return localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) || localStorage.getItem(LEGACY_WEBUI_TOKEN_STORAGE_KEY) || '';
   } catch {
     return '';
   }
@@ -125,9 +126,12 @@ function currentWebuiToken(): string {
 }
 
 function authHeaders(): Record<string, string> {
-  // X-JeikCode-Client lets the daemon tag telemetry as webui-originated
+  // X-Zap-Client & X-JeikCode-Client let the daemon tag telemetry as webui-originated
   // (resolve_client_mode → SessionMode::Webui); sent regardless of token.
-  const h: Record<string, string> = { 'X-JeikCode-Client': 'webui' };
+  const h: Record<string, string> = {
+    'X-Zap-Client': 'webui',
+    'X-JeikCode-Client': 'webui',
+  };
   const token = currentWebuiToken();
   if (token) h.Authorization = 'Bearer ' + token;
   return h;

@@ -1,4 +1,4 @@
-"""Shared helpers for JeikCode SDK examples (not part of the installable package)."""
+"""Shared helpers for Zap SDK examples (not part of the installable package)."""
 
 from __future__ import annotations
 
@@ -10,42 +10,46 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from jeikcode_sdk import ReasoningEffort, StreamEvent, StreamEventType, TurnResult, parse_reasoning_effort
+from zap_sdk import ReasoningEffort, StreamEvent, StreamEventType, TurnResult, parse_reasoning_effort
 
 
-def env(name: str, default: Optional[str] = None) -> Optional[str]:
+def env(name: str, fallback_name: Optional[str] = None, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(name)
-    if v is None or v.strip() == "":
-        return default
-    return v.strip()
+    if v is not None and v.strip() != "":
+        return v.strip()
+    if fallback_name:
+        v = os.environ.get(fallback_name)
+        if v is not None and v.strip() != "":
+            return v.strip()
+    return default
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--base",
-        default=env("JEIKCODE_BASE", "http://127.0.0.1:4096"),
-        help="JeikCode serve base URL (env JEIKCODE_BASE)",
+        default=env("ZAP_BASE", "JEIKCODE_BASE", "http://127.0.0.1:4096"),
+        help="Zap serve base URL (env ZAP_BASE / JEIKCODE_BASE)",
     )
     p.add_argument(
         "--token",
-        default=env("JEIKCODE_TOKEN"),
-        help="Bearer token (env JEIKCODE_TOKEN); omit for --no-token servers",
+        default=env("ZAP_TOKEN", "JEIKCODE_TOKEN"),
+        help="Bearer token (env ZAP_TOKEN / JEIKCODE_TOKEN); omit for --no-token servers",
     )
     p.add_argument(
         "--user",
-        default=env("JEIKCODE_USER"),
-        help="Session key / OpenAI user field (env JEIKCODE_USER)",
+        default=env("ZAP_USER", "JEIKCODE_USER"),
+        help="Session key / OpenAI user field (env ZAP_USER / JEIKCODE_USER)",
     )
     p.add_argument(
         "--model",
-        default=env("JEIKCODE_MODEL"),
-        help="Model selection id from GET /v1/models (env JEIKCODE_MODEL)",
+        default=env("ZAP_MODEL", "JEIKCODE_MODEL"),
+        help="Model selection id from GET /v1/models (env ZAP_MODEL / JEIKCODE_MODEL)",
     )
     p.add_argument(
         "--system",
         "-s",
-        default=env("JEIKCODE_SYSTEM"),
-        help="System / instructions text (env JEIKCODE_SYSTEM)",
+        default=env("ZAP_SYSTEM", "JEIKCODE_SYSTEM"),
+        help="System / instructions text (env ZAP_SYSTEM / JEIKCODE_SYSTEM)",
     )
     p.add_argument(
         "--system-file",
@@ -80,10 +84,10 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         "--reasoning-effort",
         "--effort",
         dest="reasoning_effort",
-        default=env("JEIKCODE_REASONING_EFFORT", "medium"),
+        default=env("ZAP_REASONING_EFFORT", "JEIKCODE_REASONING_EFFORT", "medium"),
         choices=["low", "medium", "max", "min", "med", "high", "full", "default"],
         help=(
-            "Display intensity for the reasoning pane (env JEIKCODE_REASONING_EFFORT). "
+            "Display intensity for the reasoning pane (env ZAP_REASONING_EFFORT / JEIKCODE_REASONING_EFFORT). "
             "low=content only; medium=tools+subagents no thinking detail (default); "
             "max=full thinking+tools+subagents"
         ),

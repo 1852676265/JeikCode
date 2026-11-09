@@ -30,7 +30,8 @@ const APP_USER_ID_HEADER: &str = "x-jeikcode-user-id";
 /// cookie name anywhere — the real per-instance name is [`webui_cookie_name`]
 /// (port-scoped). Reading/writing the bare base name would 401 against a
 /// port-scoped instance, so it's kept crate-private to prevent that footgun.
-pub(crate) const WEBUI_COOKIE: &str = "jeikcode_webui";
+pub(crate) const WEBUI_COOKIE: &str = "zap_webui";
+pub(crate) const LEGACY_WEBUI_COOKIE: &str = "jeikcode_webui";
 
 /// Per-instance webui cookie name: `jeikcode_webui_<port>`.
 ///
@@ -148,7 +149,7 @@ pub fn standalone_daemon_tokens(
         Ok(None)
     } else {
         Err(format!(
-            "non-loopback daemon bind '{host}' requires --token or JEIKCODE_SERVER_TOKEN"
+            "non-loopback daemon bind '{host}' requires --token, ZAP_SERVER_TOKEN, or JEIKCODE_SERVER_TOKEN"
         ))
     }
 }

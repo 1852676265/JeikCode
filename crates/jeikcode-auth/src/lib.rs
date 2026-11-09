@@ -20,7 +20,8 @@ pub use oauth::*;
 /// `CARGO_PKG_VERSION`, so the string matches): lowercase `jeikcode/<version>` is
 /// deliberate — the gateway UA filter hijacks capital-A `JeikCode`. Held locally so this
 /// leaf crate needs no `jeikcode-core` dependency.
-pub const JEIKCODE_USER_AGENT: &str = concat!("jeikcode/", env!("CARGO_PKG_VERSION"));
+pub const ZAP_USER_AGENT: &str = concat!("zap/", env!("CARGO_PKG_VERSION"));
+pub const JEIKCODE_USER_AGENT: &str = ZAP_USER_AGENT;
 
 pub fn write_auth_file_secure(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {

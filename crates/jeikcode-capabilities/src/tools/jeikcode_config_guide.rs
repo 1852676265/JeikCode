@@ -176,15 +176,21 @@ struct Args {
 #[async_trait]
 impl Tool for JeikcodeConfigTool {
     fn name(&self) -> &str {
-        "jeikcode_config"
+        "zap_config"
     }
 
     fn aliases(&self) -> &'static [&'static str] {
-        &["jeikcode_config_guide", "jeikcode_config_reload"]
+        &[
+            "jeikcode_config",
+            "zap_config_guide",
+            "zap_config_reload",
+            "jeikcode_config_guide",
+            "jeikcode_config_reload",
+        ]
     }
 
     fn description(&self) -> &str {
-        "Manage JeikCode configuration: query guide documents or hot-reload all configurations in the active session. Querying currently mounted MCP servers or skills is not supported as they are already available in the context."
+        "Manage Zap configuration: query guide documents or hot-reload all configurations in the active session. Querying currently mounted MCP servers or skills is not supported as they are already available in the context."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -242,8 +248,11 @@ impl Tool for JeikcodeConfigTool {
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let args = if args.trim().is_empty() { "{}" } else { args };
-        let parsed: Args = match parse_tool_args("jeikcode_config", args, r#"{"action":"guide"}"#)
+        let parsed: Args = match parse_tool_args("zap_config", args, r#"{"action":"guide"}"#)
+            .or_else(|_| parse_tool_args("jeikcode_config", args, r#"{"action":"guide"}"#))
+            .or_else(|_| parse_tool_args("zap_config_guide", args, r#"{"topic":"overview"}"#))
             .or_else(|_| parse_tool_args("jeikcode_config_guide", args, r#"{"topic":"overview"}"#))
+            .or_else(|_| parse_tool_args("zap_config_reload", args, r#"{}"#))
             .or_else(|_| parse_tool_args("jeikcode_config_reload", args, r#"{}"#))
         {
             Ok(a) => a,

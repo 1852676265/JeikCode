@@ -1,9 +1,9 @@
-"""Unit tests for JeikCode stream parser + reasoning composer (no network)."""
+"""Unit tests for Zap stream parser + reasoning composer (no network)."""
 
 from __future__ import annotations
 
-from jeikcode_sdk.events import StreamEventType
-from jeikcode_sdk.stream import Protocol, StreamParser
+from zap_sdk.events import StreamEventType
+from zap_sdk.stream import Protocol, StreamParser
 
 
 def _sse_chat_chunk(delta: dict) -> str:
@@ -265,7 +265,7 @@ def test_reasoning_effort_medium_hides_thinking():
 
 
 def test_parse_reasoning_effort_aliases():
-    from jeikcode_sdk import ReasoningEffort, parse_reasoning_effort
+    from zap_sdk import ReasoningEffort, parse_reasoning_effort
 
     assert parse_reasoning_effort("low") is ReasoningEffort.LOW
     assert parse_reasoning_effort("min") is ReasoningEffort.LOW
@@ -275,7 +275,7 @@ def test_parse_reasoning_effort_aliases():
 
 
 def test_collect_events_turn_result():
-    from jeikcode_sdk import collect_events
+    from zap_sdk import collect_events
 
     raw = "".join(
         [
@@ -335,3 +335,16 @@ def test_anthropic_thinking_and_tool_progress():
     assert "正在调用 bash" in reasoning
     assert "子代理 explore#1" in reasoning
     assert "跑测试" in reasoning
+
+
+def test_legacy_jeikcode_sdk_backward_compatibility():
+    import jeikcode_sdk
+    from zap_sdk import ZapClient, JeikCodeClient, AsyncZapClient, AsyncJeikCodeClient
+
+    assert JeikCodeClient is ZapClient
+    assert AsyncJeikCodeClient is AsyncZapClient
+    assert jeikcode_sdk.ZapClient is ZapClient
+    assert jeikcode_sdk.JeikCodeClient is ZapClient
+    assert jeikcode_sdk.StreamParser is StreamParser
+    assert hasattr(jeikcode_sdk, "collect_events")
+

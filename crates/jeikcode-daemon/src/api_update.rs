@@ -180,7 +180,9 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
 
 /// 探测当前是否在桌面端环境
 pub fn is_desktop_environment() -> bool {
-    std::env::var("JEIKCODE_DESKTOP").is_ok()
+    std::env::var("ZAP_DESKTOP")
+        .or_else(|_| std::env::var("JEIKCODE_DESKTOP"))
+        .is_ok()
 }
 
 fn github_latest_api_url() -> String {

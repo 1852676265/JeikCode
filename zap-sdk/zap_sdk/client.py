@@ -1,4 +1,4 @@
-"""HTTP client for JeikCode serve compatible APIs."""
+"""HTTP client for Zap serve compatible APIs."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _chat_body(
 
 
 class _ChatAPI:
-    def __init__(self, client: "JeikCodeClient") -> None:
+    def __init__(self, client: "ZapClient") -> None:
         self._c = client
 
     def stream(
@@ -54,7 +54,7 @@ class _ChatAPI:
         """``POST /v1/chat/completions`` with ``stream=true``.
 
         ``reasoning_effort``: ``low`` | ``medium`` (default) | ``max``.
-        See :class:`~jeikcode_sdk.events.ReasoningEffort`.
+        See :class:`~zap_sdk.events.ReasoningEffort`.
         """
         body = _chat_body(
             messages=messages,
@@ -131,7 +131,7 @@ class _ChatAPI:
 
 
 class _ResponsesAPI:
-    def __init__(self, client: "JeikCodeClient") -> None:
+    def __init__(self, client: "ZapClient") -> None:
         self._c = client
 
     def stream(
@@ -195,7 +195,7 @@ class _ResponsesAPI:
 
 
 class _MessagesAPI:
-    def __init__(self, client: "JeikCodeClient") -> None:
+    def __init__(self, client: "ZapClient") -> None:
         self._c = client
 
     def stream(
@@ -251,8 +251,8 @@ class _MessagesAPI:
         )
 
 
-class JeikCodeClient:
-    """Sync client for JeikCode ``serve`` compatible endpoints.
+class ZapClient:
+    """Sync client for Zap ``serve`` compatible endpoints.
 
     Parameters
     ----------
@@ -292,7 +292,7 @@ class JeikCodeClient:
         if self._owns_client:
             self._http.close()
 
-    def __enter__(self) -> "JeikCodeClient":
+    def __enter__(self) -> "ZapClient":
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -339,8 +339,8 @@ class JeikCodeClient:
                 yield ev
 
 
-class AsyncJeikCodeClient:
-    """Async variant of :class:`JeikCodeClient` (``httpx.AsyncClient``)."""
+class AsyncZapClient:
+    """Async variant of :class:`ZapClient` (``httpx.AsyncClient``)."""
 
     def __init__(
         self,
@@ -369,7 +369,7 @@ class AsyncJeikCodeClient:
         if self._owns_client:
             await self._http.aclose()
 
-    async def __aenter__(self) -> "AsyncJeikCodeClient":
+    async def __aenter__(self) -> "AsyncZapClient":
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -412,7 +412,7 @@ class AsyncJeikCodeClient:
 
 
 class _AsyncChatAPI:
-    def __init__(self, client: AsyncJeikCodeClient) -> None:
+    def __init__(self, client: AsyncZapClient) -> None:
         self._c = client
 
     async def stream(
@@ -470,7 +470,7 @@ class _AsyncChatAPI:
 
 
 class _AsyncResponsesAPI:
-    def __init__(self, client: AsyncJeikCodeClient) -> None:
+    def __init__(self, client: AsyncZapClient) -> None:
         self._c = client
 
     async def stream(
@@ -516,7 +516,7 @@ class _AsyncResponsesAPI:
 
 
 class _AsyncMessagesAPI:
-    def __init__(self, client: AsyncJeikCodeClient) -> None:
+    def __init__(self, client: AsyncZapClient) -> None:
         self._c = client
 
     async def stream(
@@ -554,3 +554,9 @@ class _AsyncMessagesAPI:
         async for ev in self.stream(**kwargs):
             events.append(ev)
         return collect_events(events)
+
+
+# Backward compatibility aliases
+JeikCodeClient = ZapClient
+AsyncJeikCodeClient = AsyncZapClient
+

@@ -1,10 +1,10 @@
-"""JeikCode Python SDK — stream OpenAI/Anthropic-compatible serve endpoints.
+"""Zap Python SDK — stream OpenAI/Anthropic-compatible serve endpoints.
 
 Typical usage (reasoning pane merges thinking + tools + subagents)::
 
-    from jeikcode_sdk import JeikCodeClient
+    from zap_sdk import ZapClient
 
-    client = JeikCodeClient("http://127.0.0.1:4096", token="...")
+    client = ZapClient("http://127.0.0.1:4096", token="...")
     for ev in client.chat.stream(
         messages=[{"role": "user", "content": "看一下 README"}],
         user="alice_proj1",
@@ -22,7 +22,12 @@ Or collect the whole turn::
     print(result.content)    # 正式回答
 """
 
-from .client import AsyncJeikCodeClient, JeikCodeClient
+from .client import (
+    AsyncJeikCodeClient,
+    AsyncZapClient,
+    JeikCodeClient,
+    ZapClient,
+)
 from .events import (
     ReasoningEffort,
     StreamEvent,
@@ -37,6 +42,8 @@ from .reasoning import ReasoningComposer
 from .stream import Protocol, StreamParser
 
 __all__ = [
+    "ZapClient",
+    "AsyncZapClient",
     "JeikCodeClient",
     "AsyncJeikCodeClient",
     "StreamEvent",
@@ -53,3 +60,4 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
+

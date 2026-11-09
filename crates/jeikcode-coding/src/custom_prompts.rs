@@ -143,7 +143,7 @@ pub fn invalidate_cache_for_test() {
 
 /// Resolve the user prompts dir.
 ///
-/// Env (`JEIKCODE_HOME`) first, then `~/.jeikcode/prompts`. Not routed through
+/// Env (`ZAP_HOME` / `JEIKCODE_HOME`) first, then `~/.zap/prompts` (fallback `~/.jeikcode/prompts`). Not routed through
 /// `Config::config_dir()` so sudo-without-home keeps the documented raw rule.
 /// `cc_hooks` keeps the same shape for the same reason.
 fn resolve_prompts_dir() -> Option<PathBuf> {
@@ -151,12 +151,12 @@ fn resolve_prompts_dir() -> Option<PathBuf> {
     if let Some(home) = jeikcode_config::test_util::overridden_home() {
         return Some(home.join("prompts"));
     }
-    if let Ok(p) = std::env::var("JEIKCODE_HOME") {
+    if let Ok(p) = std::env::var("ZAP_HOME").or_else(|_| std::env::var("JEIKCODE_HOME")) {
         if !p.is_empty() {
             return Some(PathBuf::from(p).join("prompts"));
         }
     }
-    // Unit tests must not leak the developer's `~/.jeikcode/prompts` into persona
+    // Unit tests must not leak the developer's `~/.zap/prompts` into persona
     // snapshots. Production still loads the user home.
     #[cfg(test)]
     {
@@ -165,7 +165,15 @@ fn resolve_prompts_dir() -> Option<PathBuf> {
     #[cfg(not(test))]
     {
         let home = dirs::home_dir()?;
-        Some(home.join(".jeikcode").join("prompts"))
+        let zap_prompts = home.join(".zap").join("prompts");
+        if zap_prompts.exists() {
+            return Some(zap_prompts);
+        }
+        let legacy = home.join(".jeikcode").join("prompts");
+        if legacy.exists() {
+            return Some(legacy);
+        }
+        Some(zap_prompts)
     }
 }
 
@@ -308,7 +316,7 @@ pub fn render_identity_and_precedence(model: &str) -> (String, Option<String>) {
         render_identity_and_precedence_from(&cfg, model)
     } else {
         (
-            format!("You are JeikCode, an AI coding agent by JeikCode running the {model} model. You help users with software engineering tasks within the current project."),
+            format!("You are Zap, an AI coding agent by Zap running the {model} model. You help users with software engineering tasks within the current project."),
             None,
         )
     }
@@ -320,12 +328,24 @@ pub(crate) fn render_identity_and_precedence_from(
 ) -> (String, Option<String>) {
     let identity = if let Some(id) = &cfg.identity {
         if let Some(template) = &id.template {
-            let agent_name = id.agent_name.as_deref().unwrap_or("JeikCode");
-            let provider = id.provider.as_deref().unwrap_or("Jeik");
-            let desc = id
+            let mut agent_name = id.agent_name.as_deref().unwrap_or("Zap");
+            let mut provider = id.provider.as_deref().unwrap_or("Zap");
+            // Auto-upgrade legacy default names if unchanged by user
+            if agent_name == "JeikCode" {
+                agent_name = "Zap";
+            }
+            if provider == "Jeik" || provider == "JeikCode" {
+                provider = "Zap";
+            }
+            let mut desc = id
                 .description
                 .as_deref()
-                .unwrap_or("an AI coding agent by JeikCode running the {model} model");
+                .unwrap_or("an AI coding agent by Zap running the {model} model");
+            let desc_buf;
+            if desc.contains("by JeikCode") || desc.contains("by Jeik") {
+                desc_buf = desc.replace("by JeikCode", "by Zap").replace("by Jeik", "by Zap");
+                desc = &desc_buf;
+            }
             let role = id.role_summary.as_deref().unwrap_or(
                 "You help users with software engineering tasks within the current project.",
             );
@@ -337,10 +357,10 @@ pub(crate) fn render_identity_and_precedence_from(
                 .replace("{role_summary}", role)
                 .replace("{model}", model)
         } else {
-            format!("You are JeikCode, an AI coding agent by JeikCode running the {model} model. You help users with software engineering tasks within the current project.")
+            format!("You are Zap, an AI coding agent by Zap running the {model} model. You help users with software engineering tasks within the current project.")
         }
     } else {
-        format!("You are JeikCode, an AI coding agent by JeikCode running the {model} model. You help users with software engineering tasks within the current project.")
+        format!("You are Zap, an AI coding agent by Zap running the {model} model. You help users with software engineering tasks within the current project.")
     };
 
     let precedence = cfg.precedence.as_ref().and_then(|p| p.rule.clone());

@@ -10,7 +10,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-pub const MODE_ENV: &str = "JEIKCODE_PROXY_MODE";
+pub const MODE_ENV: &str = "ZAP_PROXY_MODE";
+pub const LEGACY_MODE_ENV: &str = "JEIKCODE_PROXY_MODE";
 
 const ENV_HTTP_PROXY: &[&str] = &["HTTP_PROXY", "http_proxy"];
 const ENV_HTTPS_PROXY: &[&str] = &["HTTPS_PROXY", "https_proxy"];
@@ -184,7 +185,7 @@ pub fn install_from_default_path_or_default() {
 /// Ensure the process proxy env has been initialized from disk once. Public so the
 /// HTTP-owning crates can call it before building clients.
 pub fn ensure_runtime_initialized() {
-    if env::var_os(MODE_ENV).is_none() {
+    if env::var_os(MODE_ENV).is_none() && env::var_os(LEGACY_MODE_ENV).is_none() {
         install_from_default_path_or_default();
     }
 }
@@ -219,6 +220,7 @@ fn follow_system_env(
 pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
     let _ = startup_env();
     env::set_var(MODE_ENV, cfg.mode.as_str());
+    env::set_var(LEGACY_MODE_ENV, cfg.mode.as_str());
     match cfg.mode {
         ProxyMode::FollowSystem => {
             let snapshot = startup_env();

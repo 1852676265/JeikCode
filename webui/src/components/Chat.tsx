@@ -5494,7 +5494,7 @@ export function Chat({
               window.dispatchEvent(
                 new CustomEvent('jeikcode:terminal:run_command', {
                   detail: {
-                    command: 'jeikcode init --force',
+                    command: 'zap init --force',
                   },
                 })
               );
@@ -5899,7 +5899,7 @@ export function Chat({
           void syncSessionCacheFromDisk(ph, targetSid);
         }
         const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((p) => p.length > 0).pop() ?? '';
-        const sessionName = activeSession?.name || folder || 'JeikCode';
+        const sessionName = activeSession?.name || folder || 'Zap';
         const previewText = event.type === 'error' ? (event.message || 'Error occurred') : 'Task completed';
         dispatchSystemNotification({
           title: sessionName,
@@ -6341,7 +6341,7 @@ export function Chat({
         }
         {
           const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((part) => part.length > 0).pop() ?? '';
-          const sessionName = activeSession?.name || folder || 'JeikCode';
+          const sessionName = activeSession?.name || folder || 'Zap';
           const sid = (event as any).session_id || activeIdRef.current;
           dispatchSystemNotification({
             title: t('notify.review.title'),
@@ -6359,7 +6359,7 @@ export function Chat({
         setUserInputReq(event);
         {
           const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((part) => part.length > 0).pop() ?? '';
-          const sessionName = activeSession?.name || folder || 'JeikCode';
+          const sessionName = activeSession?.name || folder || 'Zap';
           const sid = (event as any).session_id || activeIdRef.current;
           const detail = (event as any).question || (event as any).header || 'Input requested';
           dispatchSystemNotification({
@@ -6465,7 +6465,7 @@ export function Chat({
           windowAway: isWindowAway(),
         })) {
           const folder = (effectiveWorkingDir ?? '').split(/[\\/]/).filter((part) => part.length > 0).pop() ?? '';
-          const sessionName = activeSession?.name || folder || 'JeikCode';
+          const sessionName = activeSession?.name || folder || 'Zap';
           const title = t('notify.done.title');
           const body = t('notify.done.body', { session: sessionName });
           dispatchSystemNotification({

@@ -1,8 +1,12 @@
 [package]
-name = "jeikcode"
+name = "zap"
 version.workspace = true
 edition.workspace = true
-default-run = "jeikcode"
+default-run = "zap"
+
+[[bin]]
+name = "zap"
+path = "src/main.rs"
 
 [[bin]]
 name = "jeikcode"
@@ -13,7 +17,7 @@ path = "src/main.rs"
 # exposes no API to `tests/`, which is why the uninstall manifest used to
 # live in core just to be reachable from script_parity.rs.
 [lib]
-name = "jeikcode"
+name = "zap"
 path = "src/lib.rs"
 
 [features]

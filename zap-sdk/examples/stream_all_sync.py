@@ -28,7 +28,7 @@ Examples
   # Run all three formats in sequence (same prompt)
   python examples/stream_all_sync.py all -s "用中文" -p "一句话介绍自己"
 
-Env: JEIKCODE_BASE, JEIKCODE_TOKEN, JEIKCODE_MODEL, JEIKCODE_USER, JEIKCODE_SYSTEM
+Env: ZAP_BASE, ZAP_TOKEN, ZAP_MODEL, ZAP_USER, ZAP_SYSTEM
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ for _p in (_ROOT, _EXAMPLES):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from jeikcode_sdk import JeikCodeClient  # noqa: E402
+from zap_sdk import ZapClient  # noqa: E402
 
 from _common import (  # noqa: E402
     DualPanePrinter,
@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_one(
-    client: JeikCodeClient,
+    client: ZapClient,
     fmt: str,
     *,
     model: str | None,
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     code = 0
-    with JeikCodeClient(args.base, token=args.token) as client:
+    with ZapClient(args.base, token=args.token) as client:
         # Optional: list models when model not set (helps first-time users)
         if not args.model and not args.quiet_meta:
             try:

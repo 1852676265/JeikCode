@@ -291,7 +291,9 @@ impl CodingPersonaHook {
             .enumerate()
             .take_while(|(_, m)| m.role == Role::System)
             .find(|(_, m)| {
-                m.text.starts_with("<environment>") || m.text.starts_with("You are JeikCode")
+                m.text.starts_with("<environment>")
+                    || m.text.starts_with("You are Zap")
+                    || m.text.starts_with("You are JeikCode")
             })
             .map(|(i, _)| i);
 

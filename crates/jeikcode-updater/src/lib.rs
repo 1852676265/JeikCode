@@ -75,7 +75,7 @@ pub fn download_base() -> &'static str {
 /// deliberate (the gateway UA filter hijacks capital-A `JeikCode`). Vendored here so
 /// this leaf crate doesn't depend on `jeikcode-core` (mirrors its `JEIKCODE_USER_AGENT`;
 /// same value since the whole workspace shares one version).
-const JEIKCODE_USER_AGENT: &str = concat!("jeikcode/", env!("CARGO_PKG_VERSION"));
+const JEIKCODE_USER_AGENT: &str = concat!("zap/", env!("CARGO_PKG_VERSION"));
 
 /// 显式检测系统环境变量中配置的代理（与 Antigravity-Manager 完全对齐）
 pub fn detect_system_proxy() -> Option<String> {

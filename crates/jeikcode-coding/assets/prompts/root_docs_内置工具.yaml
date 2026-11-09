@@ -2,8 +2,8 @@
 # 本文档不加载进模型。仅供人类阅读。
 # 运行时工具 schema 来自 Rust `Tool::description()` / `parameters_schema()`。
 # ==============================================================================
-# JeikCode 内置工具说明（种子文档）
-# 已按用户需求裁剪：移除了未启用的细粒度 CodeIntel 衍生工具与 JeikCode 平台工具，
+# Zap 内置工具说明（种子文档）
+# 已按用户需求裁剪：移除了未启用的细粒度 CodeIntel 衍生工具与平台工具，
 # 仅保留真实挂载且高频的核心工具。修改本文件不会改变线上 tools 列表。
 # 【提示】：每个参数均包含精准的【中文翻译】与【作用说明】注释。
 # ==============================================================================
@@ -406,11 +406,11 @@ tools:
         required: true
         description: "Artifact ID."
 
-  - name: "jeikcode_config"
-    category: "utility"
-    aliases: ["jeikcode_config_guide", "jeikcode_config_reload"]
-    # 【中文】：JeikCode 全局与工作区配置管理工具。支持查阅各模块配置指南（action="guide"），或在当前会话中主动热重载配置（action="reload"），无需重启进程。
-    description: "Manage JeikCode configuration: query guide documents or hot-reload all configurations in the active session. Querying currently mounted MCP servers or skills is not supported as they are already available in the context."
+  - name: "zap_config"
+    category: "configuration"
+    aliases: ["jeikcode_config", "zap_config_guide", "zap_config_reload", "jeikcode_config_guide", "jeikcode_config_reload"]
+    # 【中文】：Zap 全局与工作区配置管理工具。支持查阅各模块配置指南（action="guide"），或在当前会话中主动热重载配置（action="reload"），无需重启进程。
+    description: "Manage Zap configuration: query guide documents or hot-reload all configurations in the active session. Querying currently mounted MCP servers or skills is not supported as they are already available in the context."
     parameters:
       action:
         type: "string"

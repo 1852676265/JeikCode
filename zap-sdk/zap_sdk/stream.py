@@ -170,9 +170,9 @@ def _merge_tool(
 
 
 class StreamParser:
-    """Parse JeikCode SSE into unified :class:`StreamEvent` frames.
+    """Parse Zap SSE into unified :class:`StreamEvent` frames.
 
-    ``reasoning_delta`` is filtered by :class:`~jeikcode_sdk.events.ReasoningEffort`:
+    ``reasoning_delta`` is filtered by :class:`~zap_sdk.events.ReasoningEffort`:
 
     - ``low``: empty reasoning pane (content only)
     - ``medium``: tools + subagents, no model thinking detail
@@ -307,8 +307,8 @@ class StreamParser:
         rc = msg.get("reasoning_content") or ""
         if rc:
             yield self.composer.on_thinking(str(rc))
-        # tools summary may be in jeikcode_tools text — leave as content side channel
-        tools_txt = msg.get("jeikcode_tools")
+        # tools summary may be in zap_tools/jeikcode_tools text — leave as content side channel
+        tools_txt = msg.get("zap_tools") or msg.get("jeikcode_tools")
         if tools_txt:
             yield self.composer.on_thinking(str(tools_txt) if str(tools_txt).endswith("\n") else str(tools_txt) + "\n")
         content = msg.get("content") or ""
@@ -499,7 +499,7 @@ class StreamParser:
                 for c in item.get("content") or []:
                     if isinstance(c, dict) and c.get("text"):
                         yield self.composer.on_thinking(str(c["text"]))
-            elif t in ("jeikcode_tools",):
+            elif t in ("zap_tools", "jeikcode_tools"):
                 for c in item.get("content") or []:
                     if isinstance(c, dict) and c.get("text"):
                         yield self.composer.on_thinking(str(c["text"]) + "\n")

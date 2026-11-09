@@ -533,7 +533,9 @@ impl ProviderConfig {
             }
         }
 
-        if let Ok(val) = std::env::var("JEIKCODE_API_KEY") {
+        if let Ok(val) = std::env::var("ZAP_API_KEY")
+            .or_else(|_| std::env::var("JEIKCODE_API_KEY"))
+        {
             if !val.trim().is_empty() {
                 return Some(val);
             }

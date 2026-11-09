@@ -523,13 +523,15 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         let token = '';
         try {
           token =
+            sessionStorage.getItem('zap_webui_token') ||
+            localStorage.getItem('zap_webui_token') ||
             sessionStorage.getItem('jeikcode_webui_token') ||
             localStorage.getItem('jeikcode_webui_token') ||
             '';
         } catch {}
         if (!token) {
           try {
-            const m = document.cookie.match(/jeikcode_webui(?:_\d+)?=([^;]+)/);
+            const m = document.cookie.match(/(?:zap_webui|jeikcode_webui)(?:_\d+)?=([^;]+)/);
             if (m && m[1]) token = m[1].trim();
           } catch {}
         }
@@ -590,7 +592,7 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
             if (!receivedAnyData && (!record.ws || record.ws.readyState !== WebSocket.OPEN)) {
               const promptChar = tabShell.includes('powershell') ? 'PS ' : tabShell.includes('cmd') ? '' : '$ ';
               const cwdDisplay = (cwd || '.').replace(/\\/g, '/');
-              record.term.write(`\r\n\x1b[32m[JeikCode Terminal - ${tabShell}]\x1b[0m\r\n${promptChar}${cwdDisplay}> `);
+              record.term.write(`\r\n\x1b[32m[Zap Terminal - ${tabShell}]\x1b[0m\r\n${promptChar}${cwdDisplay}> `);
             }
           }, 800);
         };

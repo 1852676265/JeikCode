@@ -1,6 +1,6 @@
 """Compose a display-oriented *reasoning* timeline.
 
-Controlled by :class:`~jeikcode_sdk.events.ReasoningEffort`:
+Controlled by :class:`~zap_sdk.events.ReasoningEffort`:
 
 - **low**: no reasoning pane (content only)
 - **medium**: tools + subagents, hide model thinking detail

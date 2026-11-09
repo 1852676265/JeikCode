@@ -39,8 +39,8 @@ function tauriCargoVersion(path) {
 
 function cargoLockVersion(path) {
   const text = fs.readFileSync(path, 'utf8');
-  const match = text.match(/\[\[package\]\]\r?\nname = "jeikcode"\r?\nversion = "([^"]+)"/m);
-  if (!match) throw new Error('jeikcode package version not found in ' + path);
+  const match = text.match(/\[\[package\]\]\r?\nname = "(?:zap|jeikcode)"\r?\nversion = "([^"]+)"/m);
+  if (!match) throw new Error('zap or jeikcode package version not found in ' + path);
   return match[1];
 }
 

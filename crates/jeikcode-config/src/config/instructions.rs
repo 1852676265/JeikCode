@@ -50,18 +50,21 @@ pub struct LayeredInstructions {
 impl LayeredInstructions {
     /// Load all three instruction tiers from disk.
     ///
-    /// - Global:  `~/.jeikcode/JEIKCODE.md`
-    /// - Project: `<project_root>/.jeikcode.md`, `JEIKCODE.md`, `AGENTS.md`,
+    /// - Global:  `~/.zap/ZAP.md` (or `~/.jeikcode/JEIKCODE.md`)
+    /// - Project: `<project_root>/.zap.md`, `ZAP.md`, `.jeikcode.md`, `JEIKCODE.md`, `AGENTS.md`,
     ///   `CLAUDE.md`, or `claude.md` (first match wins)
-    /// - User:    `<project_root>/.jeikcode.user.md`
+    /// - User:    `<project_root>/.zap.user.md` (or `.jeikcode.user.md`)
     pub fn load(project_root: &Path) -> Self {
         let config_dir = crate::config::Config::config_dir();
         let global = Self::try_load(&config_dir.join("AGENTS.md"), InstructionLevel::Global)
+            .or_else(|| Self::try_load(&config_dir.join("ZAP.md"), InstructionLevel::Global))
             .or_else(|| Self::try_load(&config_dir.join("JEIKCODE.md"), InstructionLevel::Global));
 
-        // Lookup order: native JeikCode names first, then AGENTS.md (open standard),
+        // Lookup order: native Zap names first, then legacy JeikCode names, then AGENTS.md (open standard),
         // then Claude Code names.
         let project = [
+            ".zap.md",
+            "ZAP.md",
             ".jeikcode.md",
             "JEIKCODE.md",
             "AGENTS.md",
@@ -72,9 +75,15 @@ impl LayeredInstructions {
         .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
 
         let user = Self::try_load(
-            &project_root.join(".jeikcode.user.md"),
+            &project_root.join(".zap.user.md"),
             InstructionLevel::User,
-        );
+        )
+        .or_else(|| {
+            Self::try_load(
+                &project_root.join(".jeikcode.user.md"),
+                InstructionLevel::User,
+            )
+        });
 
         Self {
             global,
@@ -134,17 +143,17 @@ impl LayeredInstructions {
             InstructionStatusLine::new(
                 InstructionLevel::Global,
                 self.global.as_ref(),
-                crate::config::Config::config_dir().join("JEIKCODE.md"),
+                crate::config::Config::config_dir().join("ZAP.md"),
             ),
             InstructionStatusLine::new(
                 InstructionLevel::Project,
                 self.project.as_ref(),
-                project_root.join(".jeikcode.md"),
+                project_root.join(".zap.md"),
             ),
             InstructionStatusLine::new(
                 InstructionLevel::User,
                 self.user.as_ref(),
-                project_root.join(".jeikcode.user.md"),
+                project_root.join(".zap.user.md"),
             ),
         ]
     }

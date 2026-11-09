@@ -18,7 +18,7 @@ mod schedule_os;
 mod server_cmd;
 mod telemetry_cmd;
 mod vision;
-use jeikcode::uninstall;
+use zap::uninstall;
 
 // Redirect JEIKCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so unit tests never persist into the developer's real `~/.jeikcode`.
@@ -276,11 +276,11 @@ fn format_serve_banner(
         );
         let _ = writeln!(
             out,
-            "  # jeikcode-sdk: JeikCodeClient(\"{base_local}\", token=\"{t}\")"
+            "  # zap-sdk: ZapClient(\"{base_local}\", token=\"{t}\")"
         );
         let _ = writeln!(
             out,
-            "  # OpenAI `user` field = JeikCode session key (e.g. alice_1 / chat-2)"
+            "  # OpenAI `user` field = Zap session key (e.g. alice_1 / chat-2)"
         );
     } else if no_token {
         let _ = writeln!(out, "Auth: disabled (--no-token)");
