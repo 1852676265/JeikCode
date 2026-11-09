@@ -176,12 +176,12 @@ struct Args {
 #[async_trait]
 impl Tool for JeikcodeConfigTool {
     fn name(&self) -> &str {
-        "zap_config"
+        "jeikcode_config"
     }
 
     fn aliases(&self) -> &'static [&'static str] {
         &[
-            "jeikcode_config",
+            "zap_config",
             "zap_config_guide",
             "zap_config_reload",
             "jeikcode_config_guide",

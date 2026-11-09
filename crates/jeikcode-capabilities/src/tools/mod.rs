@@ -126,7 +126,6 @@ pub fn coding_tool_names() -> &'static [&'static str] {
         "grep",
         "glob",
         "todo_write",
-        "zap_config",
         "jeikcode_config",
         "fetch_output",
         "request_user_input",
@@ -880,7 +879,7 @@ mod tests {
         "grep",
         "glob",
         "todo_write",
-        "zap_config",
+        "jeikcode_config",
     ];
 
     #[test]
