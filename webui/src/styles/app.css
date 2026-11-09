@@ -5812,11 +5812,13 @@ body {
 }
 .input-footer-actions .model-controls > .model-selector:not(.effort-selector) {
   min-width: 60px;
-  max-width: 220px;
+  max-width: 260px;
   flex: 0 1 auto;
 }
-.input-footer-actions .model-controls > .model-selector:not(.effort-selector) .model-selector-trigger {
-  max-width: 100%;
+.input-footer-actions .model-controls > .model-selector:not(.effort-selector) .model-selector-trigger,
+.input-footer-actions .model-controls > .model-selector:not(.effort-selector) .model-capsule-trigger {
+  max-width: 100% !important;
+  box-sizing: border-box;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

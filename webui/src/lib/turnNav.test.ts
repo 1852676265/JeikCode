@@ -166,6 +166,18 @@ test('resolveActiveTurnId does not skip a short question just below the marker',
   );
 });
 
+test('resolveActiveTurnId pins the last turn when visible near the bottom of short threads', () => {
+  const items = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  // 最后一轮 c 位于 750px，视口高度 600，整个容器高度 1100（最大 scrollTop 为 500）
+  // 滚动到底时，c 处于 750 - 500 = 250px（视口中央），虽然未到达顶部 24px marker，但由于已展示在视口中且接近底端，应可靠激活 c
+  const tops: Record<string, number> = { a: 0, b: 350, c: 750 };
+  const topOf = (id: string) => tops[id];
+  assert.equal(
+    resolveActiveTurnId(items, topOf, { scrollTop: 450, clientHeight: 600, scrollHeight: 1100 }),
+    'c',
+  );
+});
+
 test('buildTurnNavItems extracts prompt and response preview for turn navigation rail', () => {
   const items = buildTurnNavItems([
     { role: 'user', text: '你好' },
@@ -245,4 +257,41 @@ test('buildTurnNavItemsFromOutline incorporates turnStats per turn accurately', 
   assert.equal(items[0].cumulativeTokens, 85000);
   assert.equal(items[1].tokens, 35000);
   assert.equal(items[1].cumulativeTokens, 120000);
+});
+
+test('buildTurnNavItemsFromOutline ensures cumulativeTokens is monotonically increasing and never smaller than turn tokens', () => {
+  const outline = [
+    { ordinal: 0, index: 0, text: '最新版本都到1.0.5了' },
+    { ordinal: 1, index: 5, text: '那别人的是怎么做到的' },
+    { ordinal: 2, index: 12, text: '具体怎么做' },
+    { ordinal: 3, index: 20, text: '给我一个最好的方案' },
+  ];
+  // 模拟真实生产场景：单轮消耗 83k，但 stat.total_tokens 仅记录最终请求（62k）
+  const turnStats = [
+    { turn_id: 1, total_tokens: 31000, model_usage: [{ prompt_tokens: 28000, completion_tokens: 3000 }] },
+    { turn_id: 2, total_tokens: 62000, model_usage: [{ prompt_tokens: 75000, completion_tokens: 8000 }] },
+    { turn_id: 3, total_tokens: 31000, model_usage: [{ prompt_tokens: 28000, completion_tokens: 3000 }] },
+    { turn_id: 4, total_tokens: 62000, model_usage: [{ prompt_tokens: 75000, completion_tokens: 8000 }] },
+  ];
+  const items = buildTurnNavItemsFromOutline(outline, undefined, turnStats);
+  assert.equal(items.length, 4);
+
+  // 第 1 轮：31k，累计 31k
+  assert.equal(items[0].tokens, 31000);
+  assert.equal(items[0].cumulativeTokens, 31000);
+
+  // 第 2 轮：本轮 83k，累计必须为 31k + 83k = 114k，绝不能倒挂成 62k！
+  assert.equal(items[1].tokens, 83000);
+  assert.equal(items[1].cumulativeTokens, 114000);
+  assert.ok(items[1].cumulativeTokens! >= items[1].tokens!);
+
+  // 第 3 轮：本轮 31k，累计必须单调递增为 114k + 31k = 145k
+  assert.equal(items[2].tokens, 31000);
+  assert.equal(items[2].cumulativeTokens, 145000);
+  assert.ok(items[2].cumulativeTokens! > items[1].cumulativeTokens!);
+
+  // 第 4 轮：本轮 83k，累计必须为 145k + 83k = 228k
+  assert.equal(items[3].tokens, 83000);
+  assert.equal(items[3].cumulativeTokens, 228000);
+  assert.ok(items[3].cumulativeTokens! > items[2].cumulativeTokens!);
 });

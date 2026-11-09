@@ -209,19 +209,21 @@ struct GitHubReleaseAsset {
 }
 
 fn create_update_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::ACCEPT,
-                reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
-            );
-            headers
-        })
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .ok()
+    jeikcode_updater::apply_proxy_policy(
+        reqwest::Client::builder()
+            .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
+            .default_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::ACCEPT,
+                    reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+                );
+                headers
+            })
+            .timeout(std::time::Duration::from_secs(12)),
+    )
+    .build()
+    .ok()
 }
 
 /// 根据指定的更新通道，在 Release 列表中寻找语义化版本号最大的目标 Release，支持跨版本直升最高版
@@ -310,7 +312,7 @@ fn find_cli_asset_url(assets: &[GitHubReleaseAsset], tag: &str) -> Option<String
     None
 }
 
-/// 解析桌面安装包候选下载地址（完全动态从 GitHub Release Assets 提取真实链接，绝不硬编码文件名猜测）
+/// 解析桌面安装包候选下载地址（优先从 GitHub Release Assets 动态提取，频控或断网时按标准安装包规范构造直连地址兜底）
 async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     let tag = if version.starts_with('v') || version.starts_with('V') {
         version.to_string()
@@ -320,34 +322,58 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
 
     let repo = jeikcode_config::endpoints::update_repo();
     let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
+    let client = create_update_client();
 
-    if let Ok(resp) = client.get(&api_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
-                    let release_assets: Vec<GitHubReleaseAsset> = assets
-                        .iter()
-                        .filter_map(|item| {
-                            let name = item.get("name")?.as_str()?.to_string();
-                            let url = item.get("browser_download_url")?.as_str()?.to_string();
-                            Some(GitHubReleaseAsset {
-                                name,
-                                browser_download_url: url,
+    if let Some(client) = client {
+        if let Ok(resp) = client.get(&api_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
+                        let release_assets: Vec<GitHubReleaseAsset> = assets
+                            .iter()
+                            .filter_map(|item| {
+                                let name = item.get("name")?.as_str()?.to_string();
+                                let url = item.get("browser_download_url")?.as_str()?.to_string();
+                                Some(GitHubReleaseAsset {
+                                    name,
+                                    browser_download_url: url,
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    return find_desktop_installer_url_in_assets(&release_assets);
+                        if let Some(found) = find_desktop_installer_url_in_assets(&release_assets) {
+                            return Some(found);
+                        }
+                    }
                 }
             }
         }
     }
 
-    None
+    // 兜底回退：当 GitHub API 触发 403 频控或网络受限时，按构建产物规范构造直连下载地址
+    let ver_clean = version.trim_start_matches(|c| c == 'v' || c == 'V');
+    #[cfg(target_os = "windows")]
+    {
+        Some(format!(
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{ver_clean}_x64-setup.exe"
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(format!(
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{ver_clean}_x64.dmg"
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(format!(
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{ver_clean}_amd64.AppImage"
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// GET /api/update/check
@@ -377,35 +403,9 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     if let Ok(releases) = jeikcode_updater::list_releases().await {
         let matched = jeikcode_updater::filter_channel_releases(&releases, updater_channel);
         if is_desktop {
-            // 桌面端环境：严格筛选出包含当前平台有效桌面安装包的 Release 列表
-            let desktop_releases: Vec<&jeikcode_updater::ListedRelease> = matched
-                .iter()
-                .filter(|r| {
-                    let assets: Vec<GitHubReleaseAsset> = r
-                        .assets
-                        .iter()
-                        .map(|a| GitHubReleaseAsset {
-                            name: a.name.clone(),
-                            browser_download_url: a.browser_download_url.clone(),
-                        })
-                        .collect();
-                    find_desktop_installer_url_in_assets(&assets).is_some()
-                })
-                .collect();
-
-            versions = desktop_releases
-                .iter()
-                .map(|r| UpdateVersionEntry {
-                    version: r.tag_name.clone(),
-                    notes: r.body.clone().filter(|s| !s.trim().is_empty()),
-                    released_at: r.published_at.clone(),
-                })
-                .collect();
-
-            if let Some(rel) = desktop_releases.first() {
-                latest_version = rel.tag_name.clone();
-                release_notes = rel.body.clone();
-                released_at = rel.published_at.clone();
+            // 桌面端环境：解析包含有效桌面安装包的 Release 列表（支持回退解析）
+            let mut resolved_first_url = None;
+            for rel in &matched {
                 let assets: Vec<GitHubReleaseAsset> = rel
                     .assets
                     .iter()
@@ -414,8 +414,27 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                         browser_download_url: a.browser_download_url.clone(),
                     })
                     .collect();
-                download_url = find_desktop_installer_url_in_assets(&assets);
-            } else {
+                let url = find_desktop_installer_url_in_assets(&assets);
+                let url = match url {
+                    Some(u) => Some(u),
+                    None => resolve_desktop_installer_url(&rel.tag_name).await,
+                };
+                if let Some(u) = url {
+                    if resolved_first_url.is_none() {
+                        resolved_first_url = Some(u);
+                        latest_version = rel.tag_name.clone();
+                        release_notes = rel.body.clone();
+                        released_at = rel.published_at.clone();
+                    }
+                    versions.push(UpdateVersionEntry {
+                        version: rel.tag_name.clone(),
+                        notes: rel.body.clone().filter(|s| !s.trim().is_empty()),
+                        released_at: rel.published_at.clone(),
+                    });
+                }
+            }
+            download_url = resolved_first_url;
+            if latest_version.is_empty() {
                 // 如果远端所有 Release 均无当前操作系统的桌面安装包，则当前桌面版本已是最新，绝不误报有更新
                 latest_version = current_version.clone();
                 download_url = None;
@@ -634,18 +653,39 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
         .or_else(|| manifest_opt.map(|m| m.version))
         .unwrap_or_else(|| "latest".to_string());
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = jeikcode_updater::apply_proxy_policy(
+        reqwest::Client::builder()
+            .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(600)),
+    )
+    .build()?;
 
-    let response = client.get(&download_url).send().await?;
-    if !response.status().is_success() {
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            anyhow::bail!("下载安装包失败 (404 Not Found)：下载地址不可用或资源不存在，请前往 GitHub Releases 确认");
-        } else {
-            anyhow::bail!("下载安装包失败，HTTP 状态码: {}", response.status());
+    let candidate_urls = jeikcode_updater::get_mirror_urls(&download_url);
+    let mut last_err = None;
+    let mut response_opt = None;
+
+    for candidate in &candidate_urls {
+        match client.get(candidate).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                response_opt = Some(resp);
+                break;
+            }
+            Ok(resp) => {
+                last_err = Some(anyhow::anyhow!(
+                    "下载源 {} 响应 HTTP 状态码: {}",
+                    candidate,
+                    resp.status()
+                ));
+            }
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("连接下载源 {} 失败: {}", candidate, e));
+            }
         }
     }
+
+    let response = response_opt.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow::anyhow!("所有镜像与直连源均无法下载安装包"))
+    })?;
 
     let total_bytes = response.content_length().unwrap_or(0);
     let temp_dir = std::env::temp_dir();
@@ -668,6 +708,9 @@ async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<Stri
         });
 
     let installer_path = temp_dir.join(installer_filename);
+    if installer_path.exists() {
+        let _ = tokio::fs::remove_file(&installer_path).await;
+    }
 
     let mut file = tokio::fs::File::create(&installer_path).await?;
     let mut downloaded_bytes: u64 = 0;
@@ -721,15 +764,18 @@ async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // 1. 通过 cmd /c start "" 拉起下载好的安装包，触发 Windows UAC 提权并正常显示安装向导
+        // 1. 通过 cmd /c start "" 拉起下载好的安装包，传入 /S 参数以进行静默安装（NSIS 标准无感安装）
         let status = std::process::Command::new("cmd")
-            .args(&["/c", "start", "", &installer_path.to_string_lossy()])
+            .args(&["/c", "start", "", &installer_path.to_string_lossy(), "/S"])
             .status();
         if status.is_err() {
-            let _ = std::process::Command::new(&installer_path).spawn();
+            let _ = std::process::Command::new(&installer_path).arg("/S").spawn();
         }
 
-        // 2. 终止桌面端前端进程，防止覆盖安装时被文件锁定
+        // 2. 终止桌面端前端进程与后台旧进程，防止覆盖安装时被文件锁定
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "jeikcode-desktop.exe"])
+            .spawn();
         let _ = std::process::Command::new("taskkill")
             .args(&["/F", "/IM", "Zap.exe"])
             .spawn();

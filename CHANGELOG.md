@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.6 (2026-11-09)
+
+- **[Updater & Daemon] Rate-limit-free updates, multi-mirror download fallback, and silent NSIS desktop installer**:
+  - Eliminated GitHub REST API 403 Rate Limit (60 req/hour) bottlenecks by prioritizing static `latest.json` manifests via release CDN assets, with automatic API fallback.
+  - Added environment proxy detection (`HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY`) and automatic domestic mirror retry fallbacks (`ghfast.top`, `ghproxy.net`) for seamless asset downloads in restricted networks.
+  - Hardened desktop self-update on Windows by terminating active `jeikcode-desktop.exe` instances before applying updates to eliminate file locking collisions, and triggering NSIS in silent mode (`/S`) with automated relaunch.
+
+---
+
+- **[软件更新与守护进程] 免 GitHub API 频控静态清单、国内镜像自动加速与 Windows 静默自更新**:
+  - 彻底规避 GitHub REST API 每小时 60 次的未认证频控死穴（403 错误），版本检测优先拉取发布在 Release 资产上的静态 `latest.json` 清单，保留 API 作为后备探测。
+  - 智能继承系统与终端环境变量代理（`HTTPS_PROXY`、`ALL_PROXY` 等），并在直连受限或断流时自动按候选镜像源（如 `ghfast.top`、`ghproxy.net`）轮换重试，大幅提升国内下载稳定性。
+  - 完善 Windows 桌面端安装覆盖流程，更新启动前精准终止 `jeikcode-desktop.exe` 进程根除文件锁死冲突，并以标准 `/S` 静默参数拉起安装包，实现零弹窗无感覆盖与自动重新拉起。
+
 ## v1.0.5 (2026-11-08)
 
 - **[Chat & Navigation] Introduce DeepSeek-style Turn Navigation rail and metrics**:

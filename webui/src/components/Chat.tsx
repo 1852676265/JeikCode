@@ -4701,7 +4701,21 @@ export function Chat({
     const next = resolveActiveTurnId(
       items,
       (id) => {
-        const el = root.querySelector(`[data-turn-nav="${id}"]`);
+        let el = root.querySelector(`[data-turn-nav="${id}"]`);
+        if (!el) el = root.querySelector(`#${id}`);
+        if (!el) {
+          const item = items.find((it) => it.id === id);
+          if (item && item.text) {
+            const clean = item.text.slice(0, 15).toLowerCase();
+            const bubbles = root.querySelectorAll('.user-message-wrapper');
+            for (const bubble of bubbles) {
+              if (bubble.textContent?.toLowerCase().includes(clean)) {
+                el = bubble;
+                break;
+              }
+            }
+          }
+        }
         if (!el) return undefined;
         return el.getBoundingClientRect().top - rootRect.top + root.scrollTop;
       },
@@ -4956,8 +4970,10 @@ export function Chat({
     };
     const finish = () => {
       cleanup();
-      turnNavPinUntilRef.current = 0;
-      syncTurnNavFromScroll();
+      // 用户主动导航到指定 turn 时，保留短时间 pin 锁定，避免动画停止瞬间因微小滚动误差篡改高亮
+      if (Date.now() >= turnNavPinUntilRef.current) {
+        syncTurnNavFromScroll();
+      }
     };
     root.addEventListener('scrollend', finish, { once: true });
     timer = window.setTimeout(finish, 1600);
@@ -8965,25 +8981,6 @@ export function Chat({
     </div>
   );
 
-  // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
-  const quickChips: { label: string; insert: string }[] = [
-    { label: t('chat.chipReview'), insert: '/review ' },
-    { label: t('chat.chipExplain'), insert: t('chat.chipExplain') },
-    { label: t('chat.chipTest'), insert: t('chat.chipTest') },
-  ];
-  function fillInput(text: string) {
-    setInput(text);
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      ta.focus();
-      const pos = text.length;
-      ta.setSelectionRange(pos, pos);
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
-    });
-  }
-
   const currentSessionIdForModel = sessionId ?? activeIdRef.current;
 
   useEffect(() => {
@@ -9217,13 +9214,6 @@ export function Chat({
                 </div>
                 <div class="landing-input">
                   {inputBox}
-                </div>
-                <div class="landing-chips">
-                  {quickChips.map((c) => (
-                    <button key={c.label} class="landing-chip" onClick={() => fillInput(c.insert)}>
-                      {c.label}
-                    </button>
-                  ))}
                 </div>
               </div>
             </div>

@@ -15,12 +15,11 @@ test('landing composer starts at single-line text row and keeps shared auto-grow
   assert.match(chat, /ta\.style\.height = Math\.min\(ta\.scrollHeight, 160\) \+ 'px';/);
 });
 
-test('landing review shortcut uses the supported review command', () => {
+test('landing removes quick chips while review command i18n stays supported', () => {
   const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
   const i18n = readFileSync(join(root, 'src/i18n.ts'), 'utf8');
 
-  assert.match(chat, /insert: '\/review '/);
-  assert.doesNotMatch(chat, /insert: '\/code-review '/);
+  assert.doesNotMatch(chat, /class="landing-chips"/);
   assert.match(i18n, /'chat\.chipReview': '\/review /);
   assert.doesNotMatch(i18n, /'chat\.chipReview': '\/code-review /);
 });

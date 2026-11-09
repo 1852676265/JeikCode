@@ -74,7 +74,8 @@ export function buildTurnNavItemsFromOutline(
 ): TurnNavItem[] {
   const items: TurnNavItem[] = [];
   const loadedByOrdinal = new Map(loadedItems?.map((it) => [it.ordinal, it]));
-  let prevContextTokens = 0;
+  let runningCumulativeTokens = 0;
+
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
     // Older sessions may not mark injected user rows as synthetic. Keep the
@@ -92,40 +93,41 @@ export function buildTurnNavItemsFromOutline(
     const loaded = loadedByOrdinal.get(ordinal);
 
     let statTokens: number | undefined;
-    let statCumulative: number | undefined;
 
     if (turnStats && turnStats.length > 0) {
+      // 精准匹配当前轮次统计：优先基于 turn_id 匹配，仅当 turnStats 与大纲轮次完全一对一时才按下标回退
       const stat =
         turnStats.find((s) => s.turn_id === ordinal + 1) ??
         turnStats.find((s) => s.turn_id === i + 1) ??
-        turnStats[ordinal] ??
-        turnStats[i];
+        (turnStats.length === turns.length ? turnStats[i] : undefined);
 
       if (stat) {
-        const total = stat.total_tokens || stat.used_tokens || 0;
-        if (total > 0) {
-          statCumulative = total;
-          if (stat.model_usage && stat.model_usage.length > 0) {
-            let roundSum = 0;
-            for (const mu of stat.model_usage) {
-              const inTok = mu.prompt_tokens ?? mu.tokens?.input ?? 0;
-              const outTok = mu.completion_tokens ?? mu.tokens?.output ?? 0;
-              roundSum += inTok + outTok;
-            }
-            if (roundSum > 0) statTokens = roundSum;
+        // 优先累加本轮所有 tool_call 产生的实际模型输入与输出 Token 总额
+        if (stat.model_usage && stat.model_usage.length > 0) {
+          let roundSum = 0;
+          for (const mu of stat.model_usage) {
+            const inTok = mu.prompt_tokens ?? mu.tokens?.input ?? 0;
+            const outTok = mu.completion_tokens ?? mu.tokens?.output ?? 0;
+            roundSum += inTok + outTok;
           }
-          if (!statTokens && prevContextTokens > 0 && total >= prevContextTokens) {
-            statTokens = total - prevContextTokens;
-          } else if (!statTokens && prevContextTokens === 0) {
-            statTokens = total;
-          }
-          prevContextTokens = total;
+          if (roundSum > 0) statTokens = roundSum;
+        }
+        // 若无 model_usage 细项，回退到该轮请求所报告的 total_tokens
+        if (!statTokens && stat.total_tokens && stat.total_tokens > 0) {
+          statTokens = stat.total_tokens;
         }
       }
     }
 
+    // 本轮 Token：优先使用后端精确统计，无统计时回退到消息体估算值
     const finalTokens = statTokens ?? loaded?.tokens;
-    const finalCumulative = statCumulative ?? loaded?.cumulativeTokens;
+    if (typeof finalTokens === 'number' && finalTokens > 0) {
+      runningCumulativeTokens += finalTokens;
+    }
+
+    // 累计 Token：严格基于各轮真实消耗单调累加，杜绝“累计比单轮还小”或数值来回跳变的倒挂 Bug
+    const finalCumulative =
+      runningCumulativeTokens > 0 ? runningCumulativeTokens : loaded?.cumulativeTokens;
 
     items.push({
       id: turnNavId(ordinal),
@@ -245,18 +247,31 @@ export function resolveActiveTurnId(
 ): string | null {
   if (items.length === 0) return null;
   const markerOffsetPx = opts?.markerOffsetPx ?? 24;
-  const bottomSlack = opts?.bottomSlack ?? 32;
+  const bottomSlack = opts?.bottomSlack ?? 96;
   const { scrollTop, clientHeight, scrollHeight } = metrics;
   if (scrollTop + clientHeight >= scrollHeight - bottomSlack) {
     return items[items.length - 1].id;
   }
   const marker = scrollTop + markerOffsetPx;
   let active = items[0].id;
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const top = contentTopById(item.id);
     if (top == null || !Number.isFinite(top)) continue;
-    if (top <= marker) active = item.id;
-    else break;
+    if (top <= marker) {
+      active = item.id;
+    } else {
+      // 最后一轮特殊处理：当且仅当整个线程已滚动接近底端（例如下方无多余高度无法推至视口顶部），
+      // 且最后一轮问题本身已进入视口展现时，保持最后一轮激活
+      if (
+        i === items.length - 1 &&
+        top < scrollTop + clientHeight - 40 &&
+        scrollHeight - (scrollTop + clientHeight) < Math.max(bottomSlack * 2, 160)
+      ) {
+        active = item.id;
+      }
+      break;
+    }
   }
   return active;
 }

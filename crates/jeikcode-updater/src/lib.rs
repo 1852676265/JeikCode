@@ -77,11 +77,29 @@ pub fn download_base() -> &'static str {
 /// same value since the whole workspace shares one version).
 const JEIKCODE_USER_AGENT: &str = concat!("jeikcode/", env!("CARGO_PKG_VERSION"));
 
+/// 显式检测系统环境变量中配置的代理（与 Antigravity-Manager 完全对齐）
+pub fn detect_system_proxy() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Apply the process proxy policy to the download client: honor `no_proxy` mode,
-/// otherwise leave reqwest's env-based proxy detection intact. Same behavior as the
-/// retiring `jeikcode_core::proxy::apply_async_proxy_policy`, using the config crate's
-/// proxy env items so this crate needs no `jeikcode-core` dependency.
-fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+/// otherwise leave reqwest's env-based proxy detection intact and mount explicit system proxy.
+pub fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     jeikcode_config::proxy::ensure_runtime_initialized();
     if std::env::var(jeikcode_config::proxy::MODE_ENV)
         .ok()
@@ -90,8 +108,25 @@ fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder
     {
         builder.no_proxy()
     } else {
-        builder
+        let mut b = builder;
+        if let Some(proxy_url) = detect_system_proxy() {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                b = b.proxy(proxy);
+            }
+        }
+        b
     }
+}
+
+/// 解析用于国内网络加速的候选 URL 列表（直连优先，若为 GitHub 资产则自动附带加速镜像）
+pub fn get_mirror_urls(raw_url: &str) -> Vec<String> {
+    let mut urls = vec![raw_url.to_string()];
+    if raw_url.contains("github.com") {
+        for prefix in ["https://ghfast.top/", "https://ghproxy.net/"] {
+            urls.push(format!("{}{}", prefix, raw_url));
+        }
+    }
+    urls
 }
 
 /// Streamed progress events from the upgrade/rollback machinery.
@@ -619,6 +654,21 @@ pub async fn list_releases() -> Result<Vec<ListedRelease>> {
             merge_listed_releases(&mut all, pages);
         }
         if all.is_empty() {
+            // 对齐 Antigravity-Manager 策略：
+            // 当 GitHub REST API 遭遇 403 频控（未认证每小时仅限 60 次）或网络阻塞时，
+            // 自动降级拉取发布在 GitHub Releases 上的静态 latest.json 清单（直接走 CDN 资产分发，完全无频控限制）
+            if let Ok(manifest) = fetch_manifest().await {
+                let tag = manifest.version.clone();
+                all.push(ListedRelease {
+                    tag_name: tag.clone(),
+                    prerelease: tag_is_prerelease(&tag, false),
+                    body: Some("最新稳定发布版本 (由静态 Manifest 清单兜底)".to_string()),
+                    published_at: manifest.released_at,
+                    assets: vec![],
+                });
+            }
+        }
+        if all.is_empty() {
             return Err(anyhow!("no releases found for custom repository {repo}"));
         }
         return Ok(all);
@@ -992,22 +1042,41 @@ pub async fn fetch_manifest_from_url(url: &str) -> Result<Manifest> {
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(JEIKCODE_USER_AGENT)
         .build()?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch manifest from {}", url))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!(
-            "fetching manifest from {} returned HTTP {}",
-            url,
-            resp.status()
-        ));
+
+    let candidate_urls = get_mirror_urls(url);
+    let mut last_err = None;
+
+    for candidate in &candidate_urls {
+        match client.get(candidate).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await {
+                    let clean_body = body.trim_start_matches('\u{feff}');
+                    match serde_json::from_str(clean_body) {
+                        Ok(manifest) => return Ok(manifest),
+                        Err(e) => {
+                            last_err = Some(anyhow!(
+                                "parsing manifest from {} failed: {}",
+                                candidate,
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                last_err = Some(anyhow!(
+                    "fetching manifest from {} returned HTTP {}",
+                    candidate,
+                    resp.status()
+                ));
+            }
+            Err(e) => {
+                last_err = Some(anyhow!("failed to fetch manifest from {}: {}", candidate, e));
+            }
+        }
     }
-    let body = resp.text().await.context("reading manifest body")?;
-    let clean_body = body.trim_start_matches('\u{feff}');
-    serde_json::from_str(clean_body)
-        .with_context(|| format!("parsing manifest (body: {:?})", truncate(clean_body, 200)))
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to fetch manifest from all candidate URLs")))
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -1036,86 +1105,110 @@ async fn download_and_verify(
 ) -> Result<()> {
     use futures::StreamExt;
 
-    if dest.exists() {
-        let _ = std::fs::remove_file(dest);
-    }
-
+    let candidate_urls = get_mirror_urls(url);
     let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(600))
         .user_agent(JEIKCODE_USER_AGENT)
         .build()?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", url))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!(
-            "downloading {} returned HTTP {} — release may not exist for this platform",
-            url,
-            resp.status()
-        ));
+
+    let mut last_err = None;
+
+    for candidate in &candidate_urls {
+        if dest.exists() {
+            let _ = std::fs::remove_file(dest);
+        }
+
+        let resp = match client.get(candidate).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                last_err = Some(anyhow!(
+                    "downloading {} returned HTTP {} — release may not exist for this platform",
+                    candidate,
+                    r.status()
+                ));
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(anyhow!("GET {} failed: {}", candidate, e));
+                continue;
+            }
+        };
+
+        let mut file = match tokio::fs::File::create(dest).await {
+            Ok(f) => f,
+            Err(e) => return Err(anyhow!("creating {}: {}", dest.display(), e)),
+        };
+
+        let mut hasher = Sha256::new();
+        let mut written: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        let mut stream_err = None;
+
+        while let Some(chunk_res) = stream.next().await {
+            match chunk_res {
+                Ok(chunk) => {
+                    hasher.update(&chunk);
+                    if let Err(e) = file.write_all(&chunk).await {
+                        stream_err = Some(anyhow!("writing chunk to disk: {}", e));
+                        break;
+                    }
+                    written += chunk.len() as u64;
+                    let _ = progress.send(UpgradeEvent::Downloading {
+                        bytes: written,
+                        total: expected_size,
+                    });
+                }
+                Err(e) => {
+                    stream_err = Some(anyhow!("reading response chunk: {}", e));
+                    break;
+                }
+            }
+        }
+
+        if let Some(e) = stream_err {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(e);
+            continue;
+        }
+
+        if let Err(e) = file.flush().await {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(anyhow!("flushing download to disk: {}", e));
+            continue;
+        }
+        drop(file);
+
+        if expected_size > 0 && written != expected_size {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(anyhow!(
+                "short download from {}: got {} bytes, expected {}",
+                candidate,
+                written,
+                expected_size
+            ));
+            continue;
+        }
+
+        let _ = progress.send(UpgradeEvent::Verifying);
+        let got = hex_encode(&hasher.finalize());
+        let skip_hash = expected_sha256.is_empty()
+            || expected_sha256.eq_ignore_ascii_case("skip")
+            || expected_sha256.eq_ignore_ascii_case("none");
+        if !skip_hash && !got.eq_ignore_ascii_case(expected_sha256) {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(anyhow!(
+                "checksum mismatch from {}.\n  expected: {}\n  got:      {}",
+                candidate,
+                expected_sha256,
+                got
+            ));
+            continue;
+        }
+
+        return Ok(());
     }
 
-    // Don't bail on Content-Length mismatches.  The Content-Length
-    // header may differ from the manifest's `size` for several reasons:
-    //   - CDN mirrors or reverse proxies may alter Content-Length.
-    //   - The manifest may be slightly out of sync with the server's
-    //     binary (e.g. during a rolling release).
-    //   - Redirects can surface a different Content-Length from an
-    //     intermediate hop.
-    // The real integrity checks happen after the download completes:
-    //   1. Total bytes written must match `expected_size` (below).
-    //   2. SHA256 must match `expected_sha256`.
-    // These two checks are sufficient; an early Content-Length gate
-    // causes false-negative aborts (see issue #380).
-
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .with_context(|| format!("creating {}", dest.display()))?;
-    let mut hasher = Sha256::new();
-    let mut written: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading response chunk")?;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .context("writing download to disk")?;
-        written += chunk.len() as u64;
-        // Ignore send errors — receiver may have been dropped.
-        let _ = progress.send(UpgradeEvent::Downloading {
-            bytes: written,
-            total: expected_size,
-        });
-    }
-    file.flush().await.context("flushing download to disk")?;
-    drop(file);
-
-    if expected_size > 0 && written != expected_size {
-        let _ = std::fs::remove_file(dest);
-        return Err(anyhow!(
-            "short download: got {} bytes, expected {}",
-            written,
-            expected_size
-        ));
-    }
-
-    let _ = progress.send(UpgradeEvent::Verifying);
-    let got = hex_encode(&hasher.finalize());
-    let skip_hash = expected_sha256.is_empty()
-        || expected_sha256.eq_ignore_ascii_case("skip")
-        || expected_sha256.eq_ignore_ascii_case("none");
-    if !skip_hash && !got.eq_ignore_ascii_case(expected_sha256) {
-        let _ = std::fs::remove_file(dest);
-        return Err(anyhow!(
-            "checksum mismatch — possible corruption or tampering.\n  expected: {}\n  got:      {}",
-            expected_sha256,
-            got
-        ));
-    }
-
-    Ok(())
+    Err(last_err.unwrap_or_else(|| anyhow!("download failed from all candidate URLs")))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
