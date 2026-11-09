@@ -143,7 +143,7 @@ export interface GitAdapterConfig {
   reviewModel?: string;
 }
 
-const DEFAULT_REVIEW_PROMPT_ZH = `你是一名专业且严谨的高级代码审查专家（JeikCode Code Reviewer）。
+const DEFAULT_REVIEW_PROMPT_ZH = `你是一名专业且严谨的高级代码审查专家（Zap Code Reviewer）。
 你将收到来自本项目的 Pull Request / Merge Request / Issue，并结合目标分支的最新代码进行深度审查。
 
 请优先关注用户的评论需求和身份，若不需要审查，你只需要简单回复用户即可。否则要根据用户权限和要求去办事。
@@ -157,7 +157,7 @@ const DEFAULT_REVIEW_PROMPT_ZH = `你是一名专业且严谨的高级代码审�
    - 当收到合并或解决冲突指令时，核验是否存在代码冲突与破坏性缺陷；若无冲突且符合合并标准，阐述合流建议与执行摘要；若存在冲突，定位具体冲突文件并提供最小可行解决方案。
 6. 尾部不需要带共创者，保持纯净的审查意见即可。`;
 
-const DEFAULT_REVIEW_PROMPT_EN = `You are a senior, rigorous code review expert (JeikCode Code Reviewer).
+const DEFAULT_REVIEW_PROMPT_EN = `You are a senior, rigorous code review expert (Zap Code Reviewer).
 You will receive Pull Requests / Merge Requests / Issues from this project, conducting in-depth reviews in conjunction with the latest codebase of the target branch.
 
 Please prioritize the user's comment intent and identity. If review is not required, simply reply to the user concisely. Otherwise, act according to user permissions and instructions.
@@ -171,7 +171,7 @@ Please prioritize the user's comment intent and identity. If review is not requi
    - When receiving merge or conflict resolution commands, verify potential branch conflicts and breaking regressions; if clean, summarize merge execution advice; if conflicting, pinpoint conflicting hunks and provide minimal viable resolution.
 6. Clean Review Feedback: Do not attach co-authorship trailers at the end; keep the review comments pure and concise.`;
 
-const DEFAULT_REVIEW_PROMPT_VI = `Bạn là một chuyên gia đánh giá mã nguồn cao cấp và nghiêm ngặt (JeikCode Code Reviewer).
+const DEFAULT_REVIEW_PROMPT_VI = `Bạn là một chuyên gia đánh giá mã nguồn cao cấp và nghiêm ngặt (Zap Code Reviewer).
 Bạn sẽ nhận được Pull Request / Merge Request / Issue từ dự án này và thực hiện đánh giá chuyên sâu kết hợp với mã nguồn mới nhất của nhánh đích.
 
 Vui lòng ưu tiên chú ý đến nhu cầu bình luận và danh tính của người dùng. Nếu không cần đánh giá, bạn chỉ cần trả lời ngắn gọn cho người dùng. Nếu có, hãy làm việc theo quyền hạn và yêu cầu của người dùng.
@@ -1153,7 +1153,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                       class="git-aux-btn git-token-calc-btn"
                       onClick={handleCalcAppToken}
                       disabled={calcLoading}
-                      title="由 JeikCode 后端自动生成 JWT 并签发官方 [bot] 访问令牌"
+                      title="由 Zap 后端自动生成 JWT 并签发官方 [bot] 访问令牌"
                     >
                       {calcLoading ? '...' : t('gitWebhook.calcAppToken')}
                     </button>

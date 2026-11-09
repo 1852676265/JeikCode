@@ -38,9 +38,9 @@
 
 ---
 
-## 📌 What is JeikCode?
+## 📌 What is Zap?
 
-**JeikCode** is a next-generation, cross-platform, full-featured open-source AI Coding Agent built natively in pure **Rust**. Designed specifically for high-complexity production software engineering, it delivers extreme lightweight speed, complete control, and end-to-end multi-device workflows:
+**Zap** (formerly JeikCode) is a next-generation, cross-platform, full-featured open-source AI Coding Agent built natively in pure **Rust**. Designed specifically for high-complexity production software engineering, it delivers extreme lightweight speed, complete control, and end-to-end multi-device workflows:
 
 - 🔍 **Semantic CodeGraph (CodeExplore)**: Powered by Tree-Sitter across 12+ programming languages. Seamlessly integrates domain bilingual thesauruses (`thesaurus`) to query code using everyday business natural language, backed by 1~3ms zero-touch incremental patching;
 - 🛡️ **98–99% KV-Cache Protection (Sacred Floor)**: Enforces strict append-only byte immutability and memory preservation (`sacred_floor`), keeping system prefixes frozen across turns. Completely eliminates cache thrashing, slash token expenses by over 90%, and compresses TTFT to milliseconds;
@@ -89,25 +89,25 @@ Navigate to any codebase directory and start:
 
 ```bash
 cd /path/to/your/project
-jeikcode
+zap
 ```
 
-Common CLI commands:
+Common CLI commands (supports both `zap` and `jeikcode`):
 ```bash
 # Start in a specific project directory
-jeikcode -C /path/to/project
+zap -C /path/to/project
 
 # Launch and open the browser WebUI
-jeikcode webui
+zap webui
 
 # Continue / resume previous conversation session
-jeikcode -c
+zap -c
 
 # Headless autonomous task execution (ideal for CI/CD and scripts)
-jeikcode -p "Investigate and fix OAuth callback 404 issue"
+zap -p "Investigate and fix OAuth callback 404 issue"
 
 # One-click seamless upgrade to latest version
-jeikcode update
+zap update
 ```
 
 Update, rollback, and uninstall commands: https://jeikcode.top/guide/updates.html

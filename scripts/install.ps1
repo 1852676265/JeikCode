@@ -10,7 +10,8 @@
 
 $ErrorActionPreference = "Stop"
 
-$RepoBase   = if ($env:JEIKCODE_DOWNLOAD_BASE) { $env:JEIKCODE_DOWNLOAD_BASE.TrimEnd('/') } else { "https://github.com/1852676265/JeikCode/releases/download" }
+$DownloadBase = if ($env:ZAP_DOWNLOAD_BASE) { $env:ZAP_DOWNLOAD_BASE.TrimEnd('/') } elseif ($env:JEIKCODE_DOWNLOAD_BASE) { $env:JEIKCODE_DOWNLOAD_BASE.TrimEnd('/') } else { "https://github.com/1852676265/JeikCode/releases/download" }
+$RepoBase   = $DownloadBase
 function Normalize-ReleaseTag([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
     $Value = $Value.Trim()
@@ -18,9 +19,11 @@ function Normalize-ReleaseTag([string]$Value) {
     return "v$Value"
 }
 
-$RequestedTag = Normalize-ReleaseTag $env:JEIKCODE_VERSION
-$ManifestUrl = if ($env:JEIKCODE_MANIFEST_URL) {
-    $custom = $env:JEIKCODE_MANIFEST_URL.TrimEnd('/')
+$EffectiveVersion = if ($env:ZAP_VERSION) { $env:ZAP_VERSION } else { $env:JEIKCODE_VERSION }
+$RequestedTag = Normalize-ReleaseTag $EffectiveVersion
+$EffectiveManifest = if ($env:ZAP_MANIFEST_URL) { $env:ZAP_MANIFEST_URL } else { $env:JEIKCODE_MANIFEST_URL }
+$ManifestUrl = if ($EffectiveManifest) {
+    $custom = $EffectiveManifest.TrimEnd('/')
     if ($custom.EndsWith('.json')) { $custom } else { "$custom/latest.json" }
 } elseif ($RequestedTag) {
     "https://github.com/1852676265/JeikCode/releases/download/$RequestedTag/latest.json"
@@ -46,7 +49,7 @@ switch ($RealArch) {
 $ext = ".exe"
 
 # --- install dir ---
-$Prefix = if ($env:JEIKCODE_PREFIX) { $env:JEIKCODE_PREFIX } else { Join-Path $HOME ".local\bin" }
+$Prefix = if ($env:ZAP_PREFIX) { $env:ZAP_PREFIX } elseif ($env:JEIKCODE_PREFIX) { $env:JEIKCODE_PREFIX } else { Join-Path $HOME ".local\bin" }
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
 
 # --- resolve and validate release manifest ---
@@ -138,11 +141,23 @@ Write-Host ""
 Write-Host "Installed: $Target"
 try { & $Target --version 2>$null } catch {}
 
-# --- check & sync config if ~/.jeikcode exists ---
-$JeikcodeHome = if ($env:JEIKCODE_HOME) { $env:JEIKCODE_HOME } else { Join-Path $HOME ".jeikcode" }
-if (Test-Path $JeikcodeHome) {
+# Provide zap.exe alias alongside jeikcode.exe
+$ZapTarget = Join-Path $Prefix "zap$ext"
+try {
+    Copy-Item -Force $Target $ZapTarget -ErrorAction SilentlyContinue
+    if (Test-Path $ZapTarget) {
+        Write-Host "Created alias: $ZapTarget"
+    }
+} catch {}
+
+# --- check & sync config if ~/.zap or ~/.jeikcode exists ---
+$ZapHome = if ($env:ZAP_HOME) { $env:ZAP_HOME } elseif ($env:JEIKCODE_HOME) { $env:JEIKCODE_HOME } else {
+    $p = Join-Path $HOME ".zap"
+    if (Test-Path $p) { $p } else { Join-Path $HOME ".jeikcode" }
+}
+if (Test-Path $ZapHome) {
     Write-Host ""
-    Write-Host "==> 检测到已有配置目录 ($JeikcodeHome)，正在检查内置配置更新..."
+    Write-Host "==> 检测到已有配置目录 ($ZapHome)，正在检查内置配置更新..."
     try {
         & $Target __sync_config
     } catch {
@@ -151,7 +166,8 @@ if (Test-Path $JeikcodeHome) {
 }
 
 # --- PATH ---
-if ($env:JEIKCODE_NO_PATH_UPDATE -ne "1") {
+$NoPathUpdate = if ($env:ZAP_NO_PATH_UPDATE) { $env:ZAP_NO_PATH_UPDATE } else { $env:JEIKCODE_NO_PATH_UPDATE }
+if ($NoPathUpdate -ne "1") {
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($currentPath -notlike "*$Prefix*") {
         [Environment]::SetEnvironmentVariable("Path", "$Prefix;$currentPath", "User")
@@ -160,13 +176,16 @@ if ($env:JEIKCODE_NO_PATH_UPDATE -ne "1") {
         Write-Host "$Prefix already on user PATH."
     }
 
-    # Update current session PATH so jeikcode can be used immediately
+    # Update current session PATH so zap can be used immediately
     if ($env:Path -notlike "*$Prefix*") {
         $env:Path = "$Prefix;$env:Path"
     }
 }
 
 Write-Host ""
-Write-Host "==> JeikCode uses the official release update channel. To enable auto-update, add to ~/.jeikcode/config.toml:"
+Write-Host "To start using Zap right now, run:"
+Write-Host "    zap"
+Write-Host ""
+Write-Host "==> Zap uses the official release update channel. To enable auto-update, add to ~/.zap/config.toml:"
 Write-Host "    auto_update = true"
 exit 0

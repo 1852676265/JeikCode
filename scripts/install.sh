@@ -14,16 +14,19 @@
 # crates/jeikcode-cli/src/uninstall/paths.rs.
 set -eu
 
-REPO_BASE="${JEIKCODE_DOWNLOAD_BASE:-https://github.com/1852676265/JeikCode/releases/download}"
+ZAP_DOWNLOAD_BASE="${ZAP_DOWNLOAD_BASE:-${JEIKCODE_DOWNLOAD_BASE:-}}"
+REPO_BASE="${ZAP_DOWNLOAD_BASE:-https://github.com/1852676265/JeikCode/releases/download}"
 REQUESTED_TAG=""
-if [ -n "${JEIKCODE_VERSION:-}" ]; then
-    case "$JEIKCODE_VERSION" in
-        v*) REQUESTED_TAG="$JEIKCODE_VERSION" ;;
-        *)  REQUESTED_TAG="v$JEIKCODE_VERSION" ;;
+EFFECTIVE_VERSION="${ZAP_VERSION:-${JEIKCODE_VERSION:-}}"
+if [ -n "$EFFECTIVE_VERSION" ]; then
+    case "$EFFECTIVE_VERSION" in
+        v*) REQUESTED_TAG="$EFFECTIVE_VERSION" ;;
+        *)  REQUESTED_TAG="v$EFFECTIVE_VERSION" ;;
     esac
 fi
-if [ -n "${JEIKCODE_MANIFEST_URL:-}" ]; then
-    MANIFEST_URL="${JEIKCODE_MANIFEST_URL}"
+EFFECTIVE_MANIFEST_URL="${ZAP_MANIFEST_URL:-${JEIKCODE_MANIFEST_URL:-}}"
+if [ -n "$EFFECTIVE_MANIFEST_URL" ]; then
+    MANIFEST_URL="${EFFECTIVE_MANIFEST_URL}"
     case "$MANIFEST_URL" in
         *.json) ;;
         *) MANIFEST_URL="${MANIFEST_URL%/}/latest.json" ;;
@@ -64,8 +67,9 @@ case "$uname_m" in
 esac
 
 # --- pick install dir ---
-if [ -n "${JEIKCODE_PREFIX:-}" ]; then
-    PREFIX="$JEIKCODE_PREFIX"
+EFFECTIVE_PREFIX="${ZAP_PREFIX:-${JEIKCODE_PREFIX:-}}"
+if [ -n "$EFFECTIVE_PREFIX" ]; then
+    PREFIX="$EFFECTIVE_PREFIX"
 elif [ "$os" = "ohos" ] || [ "$os" = "windows" ]; then
     PREFIX="$HOME/.local/bin"
 elif [ -w /usr/local/bin ] 2>/dev/null; then
@@ -210,6 +214,19 @@ echo ""
 echo "Installed: $TARGET"
 "$TARGET" --version 2>/dev/null || true
 
+# Provide zap executable alias / symlink alongside jeikcode
+ZAP_TARGET="$PREFIX/zap${ext}"
+if [ "$TARGET" != "$ZAP_TARGET" ]; then
+    if [ "$os" = "windows" ]; then
+        cp -f "$TARGET" "$ZAP_TARGET" 2>/dev/null || true
+    else
+        ln -sf "$TARGET" "$ZAP_TARGET" 2>/dev/null || sudo ln -sf "$TARGET" "$ZAP_TARGET" 2>/dev/null || true
+    fi
+    if [ -f "$ZAP_TARGET" ] || [ -L "$ZAP_TARGET" ]; then
+        echo "Created alias: $ZAP_TARGET"
+    fi
+fi
+
 # --- OpenWrt compatibility: automatically link to /usr/bin if needed ---
 OPENWRT_LINKED=0
 if [ "$is_openwrt" = 1 ] && [ "$TARGET" != "/usr/bin/jeikcode${ext}" ] && [ -d /usr/bin ]; then
@@ -224,11 +241,18 @@ if [ "$is_openwrt" = 1 ] && [ "$TARGET" != "/usr/bin/jeikcode${ext}" ] && [ -d /
     fi
 fi
 
-# --- check & sync config if ~/.jeikcode exists ---
-JEIKCODE_HOME="${JEIKCODE_HOME:-$HOME/.jeikcode}"
-if [ -d "$JEIKCODE_HOME" ]; then
+# --- check & sync config if ~/.zap or ~/.jeikcode exists ---
+ZAP_HOME_DIR="${ZAP_HOME:-${JEIKCODE_HOME:-}}"
+if [ -z "$ZAP_HOME_DIR" ]; then
+    if [ -d "$HOME/.zap" ]; then
+        ZAP_HOME_DIR="$HOME/.zap"
+    else
+        ZAP_HOME_DIR="$HOME/.jeikcode"
+    fi
+fi
+if [ -d "$ZAP_HOME_DIR" ]; then
     echo ""
-    echo "==> 检测到已有配置目录 ($JEIKCODE_HOME)，正在检查内置配置更新..."
+    echo "==> 检测到已有配置目录 ($ZAP_HOME_DIR)，正在检查内置配置更新..."
     if [ -t 0 ]; then
         "$TARGET" __sync_config || true
     elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
@@ -245,7 +269,8 @@ if [ "$os" = "windows" ]; then
     echo "      powershell -c \"irm https://raw.githubusercontent.com/1852676265/JeikCode/main/scripts/install.ps1 | iex\""
 fi
 
-if [ "${JEIKCODE_NO_PATH_UPDATE:-0}" != "1" ]; then
+EFFECTIVE_NO_PATH_UPDATE="${ZAP_NO_PATH_UPDATE:-${JEIKCODE_NO_PATH_UPDATE:-0}}"
+if [ "$EFFECTIVE_NO_PATH_UPDATE" != "1" ]; then
     case ":$PATH:" in
         *":$PREFIX:"*) ;;
         *)
@@ -273,9 +298,10 @@ if [ "${JEIKCODE_NO_PATH_UPDATE:-0}" != "1" ]; then
                 fi
                 if [ "$OPENWRT_LINKED" != 1 ]; then
                     echo ""
-                    echo "To start using jeikcode right now, run:"
+                    echo "To start using Zap right now, run:"
                     echo ""
                     echo "    source $RC"
+                    echo "    zap"
                     echo ""
                 fi
             else
@@ -283,6 +309,9 @@ if [ "${JEIKCODE_NO_PATH_UPDATE:-0}" != "1" ]; then
                     echo ""
                     echo "Note: $PREFIX is not in your PATH. Add this line to your shell rc:"
                     echo "    $LINE"
+                    echo ""
+                    echo "Then run:"
+                    echo "    zap"
                 fi
             fi
             ;;
@@ -291,12 +320,12 @@ fi
 
 if [ "$OPENWRT_LINKED" = 1 ]; then
     echo ""
-    echo "To start using jeikcode right now, run:"
+    echo "To start using Zap right now, run:"
     echo ""
-    echo "    jeikcode --version"
+    echo "    zap --version"
     echo ""
 fi
 
 echo ""
-echo "==> JeikCode uses the official release update channel. To enable auto-update, add to ~/.jeikcode/config.toml:"
+echo "==> Zap uses the official release update channel. To enable auto-update, add to ~/.zap/config.toml:"
 echo "    auto_update = true"

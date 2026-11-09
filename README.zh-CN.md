@@ -38,9 +38,9 @@
 
 ---
 
-## 📌 什么是 JeikCode？
+## 📌 什么是 Zap？
 
-**JeikCode** 是一款采用纯 **Rust** 原生打造的新一代跨平台全功能开源 AI 编程智能体（AI Coding Agent）。它专为应对高复杂度生产工程交付而生，具备极致轻量、高可控与端到端协同能力：
+**Zap**（原名 JeikCode）是一款采用纯 **Rust** 原生打造的新一代跨平台全功能开源 AI 编程智能体（AI Coding Agent）。它专为应对高复杂度生产工程交付而生，具备极致轻量、高可控与端到端协同能力：
 
 - 🔍 **语义代码图谱 (CodeExplore)**：深度内置 Tree-Sitter 原生支持 12+ 种主流语言。融合领域双语词林（`thesaurus`），支持用业务大白话直接提问全局代码与上下游调用链路，1~3ms 极速无感增量差量更新；
 - 🛡️ **98–99% 极致缓存 (KV-Cache)**：基于严格 Append-Only 字节级不可变性与圣地地基设计（`sacred_floor`），首部系统提示词永久固化，彻底杜绝缓存雪崩（Cache Thrashing），API 调用成本降低 90%+，毫秒级首字极速吐出；
@@ -89,25 +89,25 @@ irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | 
 
 ```bash
 cd /path/to/your/project
-jeikcode
+zap
 ```
 
-常用 CLI 选项：
+常用 CLI 选项（`zap` 与 `jeikcode` 命令均完整支持）：
 ```bash
 # 指定工程目录启动
-jeikcode -C /path/to/project
+zap -C /path/to/project
 
 # 启动并在浏览器打开现代 WebUI 界面
-jeikcode webui
+zap webui
 
 # 持续对话，恢复上一轮会话
-jeikcode -c
+zap -c
 
 # 无头自动化批量执行任务（适合 CI/CD 与脚本排障）
-jeikcode -p "排查并修复 OAuth 回调 404 错误"
+zap -p "排查并修复 OAuth 回调 404 错误"
 
 # 一键平滑升级至最新版本
-jeikcode update
+zap update
 ```
 
 更新、回退与卸载的命令说明：https://jeikcode.top/zh/guide/updates.html
