@@ -92,31 +92,27 @@ fn upload_err(status: StatusCode, message: impl Into<String>) -> UploadError {
     }
 }
 
+fn get_global_uploads_dir() -> Result<PathBuf, UploadError> {
+    let base = jeikcode_config::util::real_home_dir().unwrap_or_else(std::env::temp_dir);
+    let global_dir = base.join(".zap").join("global_uploads");
+    std::fs::create_dir_all(&global_dir).map_err(|e| {
+        upload_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create global_uploads directory: {e}"),
+        )
+    })?;
+    Ok(global_dir)
+}
+
 fn prepare_store(working_dir: &str) -> Result<PathBuf, UploadError> {
     let trimmed = working_dir.trim();
     let cwd = if trimmed.is_empty() || trimmed == "__global__" {
-        let base = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
-        let global_dir = base.join(".zap").join("global_uploads");
-        std::fs::create_dir_all(&global_dir).map_err(|e| {
-            upload_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to create global_uploads directory: {e}"),
-            )
-        })?;
-        global_dir
+        get_global_uploads_dir()?
     } else {
         let candidate = normalize_dir_arg(trimmed);
         if !candidate.is_dir() {
             if std::fs::create_dir_all(&candidate).is_err() {
-                let base = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
-                let global_dir = base.join(".zap").join("global_uploads");
-                std::fs::create_dir_all(&global_dir).map_err(|e| {
-                    upload_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to create global_uploads directory: {e}"),
-                    )
-                })?;
-                global_dir
+                get_global_uploads_dir()?
             } else {
                 candidate
             }
