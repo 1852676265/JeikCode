@@ -141,8 +141,7 @@ pub async fn try_serve_plugin_asset(path: &str) -> Option<Response> {
 
     // 严禁 fallback 到 Zap 的 index.html！对插件路径严格返回 404
     Some((StatusCode::NOT_FOUND, format!("plugin '{plugin_id}' asset '{clean_subpath}' not found")).into_response())
-},
-};
+}
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
