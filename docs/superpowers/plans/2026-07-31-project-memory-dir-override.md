@@ -6,12 +6,12 @@
 
 **Architecture:** 两份字节兼容的 `MemoryStore`（capabilities 端口 + config 原版）各自把 `project()` 的硬编码 `.jeikcode` 拆成"纯函数 `project_memory_path` + 读 env"两层。读/写/prompt 注入都经各自 `project()`，故每份改一处即覆盖该 crate 全部路径，无调用点改动。
 
-**Tech Stack:** Rust；`jeikcode-capabilities`、`jeikcode-config`；各自 `#[cfg(test)] mod tests`。
+**Tech Stack:** Rust；`zap-capabilities`、`zap-config`；各自 `#[cfg(test)] mod tests`。
 
 ## Global Constraints
 
 - 默认（env 未设/空）行为**与现状逐字节一致**：`<project_root>/.jeikcode/memory.md`。
-- **两份 store 都要改，且逐字镜像**：`jeikcode-capabilities/src/memory/store.rs` 与 `jeikcode-config/src/config/memory.rs`（保持它们既有的 verbatim-port 关系）。
+- **两份 store 都要改，且逐字镜像**：`zap-capabilities/src/memory/store.rs` 与 `zap-config/src/config/memory.rs`（保持它们既有的 verbatim-port 关系）。
 - env 变量名 **`JEIKCODE_PROJECT_MEMORY_DIR`**（逐字，两份一致）。值语义：相对 → 挂 `project_root`；绝对 → 直接用（`Path::join` 语义）；空 → 回退默认。
 - **不做 env 集成测试**（进程全局 env + crate 内并行 → 会泄漏进 `remember_writes_project_entry` 致 flaky）；只测纯函数。`project()` 的 env 读取是 2 行 glue。
 - 不新增缓存/装配期参数/迁移逻辑（MVP）。
@@ -23,7 +23,7 @@
 ### Task 1: capabilities `MemoryStore::project` 读 env
 
 **Files:**
-- Modify: `crates/jeikcode-capabilities/src/memory/store.rs`（`project()` 约 L29-31；`mod tests` 约 L172+）
+- Modify: `crates/zap-capabilities/src/memory/store.rs`（`project()` 约 L29-31；`mod tests` 约 L172+）
 
 **Interfaces:**
 - Consumes: 既有 `MemoryStore::new(PathBuf) -> Self`。
@@ -60,7 +60,7 @@
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p jeikcode-capabilities --lib project_memory_path_resolves_override`
+Run: `cargo test -p zap-capabilities --lib project_memory_path_resolves_override`
 Expected: FAIL — `project_memory_path` 未定义（编译错误）。
 
 - [ ] **Step 3: 实现纯函数 + 改 `project()`**
@@ -97,19 +97,19 @@ Expected: FAIL — `project_memory_path` 未定义（编译错误）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p jeikcode-capabilities --lib project_memory_path_resolves_override`
+Run: `cargo test -p zap-capabilities --lib project_memory_path_resolves_override`
 Expected: PASS。
 
 - [ ] **Step 5: 跑 crate 全量确认无回归**
 
-Run: `cargo test -p jeikcode-capabilities`
+Run: `cargo test -p zap-capabilities`
 Expected: 全绿；尤其 `tools/memory.rs::remember_writes_project_entry`（env 未设 → 默认 `.jeikcode`）与 `memory/hook.rs` 测试仍通过。
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add crates/jeikcode-capabilities/src/memory/store.rs
-git commit -m "feat(memory): honor JEIKCODE_PROJECT_MEMORY_DIR in capabilities store" -- crates/jeikcode-capabilities/src/memory/store.rs
+git add crates/zap-capabilities/src/memory/store.rs
+git commit -m "feat(memory): honor JEIKCODE_PROJECT_MEMORY_DIR in capabilities store" -- crates/zap-capabilities/src/memory/store.rs
 ```
 
 ---
@@ -117,7 +117,7 @@ git commit -m "feat(memory): honor JEIKCODE_PROJECT_MEMORY_DIR in capabilities s
 ### Task 2: config `MemoryStore::project` 读 env(逐字镜像)+ 文档
 
 **Files:**
-- Modify: `crates/jeikcode-config/src/config/memory.rs`（`project()` 约 L22-24；`mod tests` 约 L155+）
+- Modify: `crates/zap-config/src/config/memory.rs`（`project()` 约 L22-24；`mod tests` 约 L155+）
 - Modify（文档，best-effort）: `site/docs/en/configuration.html` 与 `site/docs/zh/configuration.html`（在 `JEIKCODE_HOME` 说明旁补一条）
 
 **Interfaces:**
@@ -152,7 +152,7 @@ git commit -m "feat(memory): honor JEIKCODE_PROJECT_MEMORY_DIR in capabilities s
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p jeikcode-config --lib project_memory_path_resolves_override`
+Run: `cargo test -p zap-config --lib project_memory_path_resolves_override`
 Expected: FAIL — `project_memory_path` 未定义。
 
 - [ ] **Step 3: 实现(逐字镜像 Task 1)**
@@ -169,7 +169,7 @@ Expected: FAIL — `project_memory_path` 未定义。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p jeikcode-config --lib project_memory_path_resolves_override`
+Run: `cargo test -p zap-config --lib project_memory_path_resolves_override`
 Expected: PASS。
 
 - [ ] **Step 5: 补文档(best-effort)**
@@ -182,14 +182,14 @@ Expected: PASS。
 
 - [ ] **Step 6: 跑 crate 全量确认无回归**
 
-Run: `cargo test -p jeikcode-config`
+Run: `cargo test -p zap-config`
 Expected: 全绿（含 config/memory.rs 既有测试）。
 
 - [ ] **Step 7: 提交**
 
 ```bash
 git status --short   # 确认只暂存 config/memory.rs (+ 可能的两个 configuration.html)
-git add crates/jeikcode-config/src/config/memory.rs site/docs/en/configuration.html site/docs/zh/configuration.html
+git add crates/zap-config/src/config/memory.rs site/docs/en/configuration.html site/docs/zh/configuration.html
 git commit -m "feat(memory): honor JEIKCODE_PROJECT_MEMORY_DIR in config store + docs"
 ```
 （若跳过文档，则只 `git add` config/memory.rs。）

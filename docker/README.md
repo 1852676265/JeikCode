@@ -64,7 +64,7 @@ docker run --rm -it \
 然后构建 Docker 镜像：
 
 ```bash
-docker build -t jeikcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
+docker build -t zap-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
 ```
 
 ### 推送到华为云 SWR
@@ -73,14 +73,14 @@ docker build -t jeikcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
 
 ```bash
 # 标记镜像
-docker tag jeikcode-daemon:v5.0.3 swr.cn-north-4.myhuaweicloud.com/gitcode-be/jeikcode-daemon:v5.0.3
+docker tag zap-daemon:v5.0.3 swr.cn-north-4.myhuaweicloud.com/gitcode-be/zap-daemon:v5.0.3
 
 # 使用 buildx 构建并推送（推荐）
-docker buildx build --provenance=false --platform linux/amd64 -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/jeikcode-daemon:v5.0.3 --push -f docker/Dockerfile-Daemon .
+docker buildx build --provenance=false --platform linux/amd64 -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/zap-daemon:v5.0.3 --push -f docker/Dockerfile-Daemon .
 
 # 或者先构建再推送
-docker build --provenance=false -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/jeikcode-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
-docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/jeikcode-daemon:v5.0.3
+docker build --provenance=false -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/zap-daemon:v5.0.3 -f docker/Dockerfile-Daemon .
+docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/zap-daemon:v5.0.3
 ```
 
 > **注意**: 如果不添加 `--provenance=false`，推送时会报错: `Invalid image, fail to parse 'manifest.json'`
@@ -90,38 +90,38 @@ docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/jeikcode-daemon:v5.0.3
 ### 基本运行
 
 ```bash
-docker run -d --name jeikcode-daemon \
+docker run -d --name zap-daemon \
   -p 13456:13456 \
-  jeikcode-daemon:v5.0.3
+  zap-daemon:v5.0.3
 ```
 
 ### 挂载配置文件
 
 ```bash
-docker run -d --name jeikcode-daemon \
+docker run -d --name zap-daemon \
   -p 13456:13456 \
   -v /path/to/config.toml:/root/.jeikcode/config.toml \
-  jeikcode-daemon:v5.0.3
+  zap-daemon:v5.0.3
 ```
 
 ### 挂载项目目录
 
 ```bash
-docker run -d --name jeikcode-daemon \
+docker run -d --name zap-daemon \
   -p 13456:13456 \
   -v /path/to/config.toml:/root/.jeikcode/config.toml \
   -v /path/to/project:/workspace \
-  jeikcode-daemon:v5.0.3
+  zap-daemon:v5.0.3
 ```
 
 ### 传递环境变量
 
 ```bash
-docker run -d --name jeikcode-daemon \
+docker run -d --name zap-daemon \
   -p 13456:13456 \
   -e ANTHROPIC_API_KEY=your-api-key \
   -v $(pwd)/config.toml:/root/.jeikcode/config.toml \
-  jeikcode-daemon:v5.0.3
+  zap-daemon:v5.0.3
 ```
 
 ## 验证服务
@@ -131,15 +131,15 @@ docker run -d --name jeikcode-daemon \
 curl http://localhost:13456/
 
 # 查看日志
-docker logs jeikcode-daemon
+docker logs zap-daemon
 ```
 
 ## 常用命令
 
 ```bash
-docker start jeikcode-daemon     # 启动
-docker stop jeikcode-daemon      # 停止
-docker restart jeikcode-daemon   # 重启
-docker rm -f jeikcode-daemon     # 删除
-docker logs -f jeikcode-daemon   # 查看日志
+docker start zap-daemon     # 启动
+docker stop zap-daemon      # 停止
+docker restart zap-daemon   # 重启
+docker rm -f zap-daemon     # 删除
+docker logs -f zap-daemon   # 查看日志
 ```

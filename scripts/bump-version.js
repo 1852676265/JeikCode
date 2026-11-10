@@ -186,18 +186,18 @@ function bumpAllFiles(newVersion) {
 
   // 11. Cargo.lock (Workspace packages)
   const workspaceCrates = [
-    'jeikcode',
-    'jeikcode-auth',
-    'jeikcode-capabilities',
-    'jeikcode-clix',
-    'jeikcode-coding',
-    'jeikcode-config',
-    'jeikcode-daemon',
-    'jeikcode-kernel',
-    'jeikcode-review',
-    'jeikcode-telemetry',
-    'jeikcode-tuix',
-    'jeikcode-updater',
+    'zap',
+    'zap-auth',
+    'zap-capabilities',
+    'zap-clix',
+    'zap-coding',
+    'zap-config',
+    'zap-daemon',
+    'zap-kernel',
+    'zap-review',
+    'zap-telemetry',
+    'zap-tuix',
+    'zap-updater',
   ];
   if (updateFile(path.join(root, 'Cargo.lock'), text => {
     let updated = text;
@@ -210,9 +210,9 @@ function bumpAllFiles(newVersion) {
     updatedFiles.push('Cargo.lock');
   }
 
-  // 12. desktop/src-tauri/Cargo.lock (jeikcode-desktop package)
+  // 12. desktop/src-tauri/Cargo.lock (zap-desktop package)
   if (updateFile(path.join(root, 'desktop', 'src-tauri', 'Cargo.lock'), text => {
-    const regex = /(\[\[package\]\]\r?\nname = "jeikcode-desktop"\r?\nversion = )"[^"]+"/g;
+    const regex = /(\[\[package\]\]\r?\nname = "zap-desktop"\r?\nversion = )"[^"]+"/g;
     return text.replace(regex, `$1"${newVersion}"`);
   })) {
     updatedFiles.push('desktop/src-tauri/Cargo.lock');

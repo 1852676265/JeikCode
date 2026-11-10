@@ -79,15 +79,15 @@ test('release notes desktop links do not 404 (uses dot instead of space) and ins
 test('cargo lock only bumps workspace package versions', () => {
   const lock = [
     '[[package]]',
-    'name = "jeikcode-cli"',
+    'name = "zap-cli"',
     'version = "7.1.7"',
     '[[package]]',
     'name = "serde"',
     'version = "1.0.0"',
     '',
   ].join('\n');
-  const bumped = bumpCargoLock(lock, ['jeikcode-cli'], '7.1.30');
-  assert.match(bumped, /name = "jeikcode-cli"\nversion = "7\.1\.30"/);
+  const bumped = bumpCargoLock(lock, ['zap-cli'], '7.1.30');
+  assert.match(bumped, /name = "zap-cli"\nversion = "7\.1\.30"/);
   assert.match(bumped, /name = "serde"\nversion = "1\.0\.0"/);
 });
 

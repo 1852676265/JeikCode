@@ -124,7 +124,7 @@ test('quoting [bash-await-decision] in a non-bash tool does not keep it running'
     '# tools',
     'idle → `[bash-await-decision]`, then the model decides',
   ].join('\n');
-  assert.equal(toolResultStatus(true, guide, 'jeikcode_config_guide'), 'done');
+  assert.equal(toolResultStatus(true, guide, 'zap_config_guide'), 'done');
   assert.equal(toolResultStatus(true, guide), 'done');
 });
 
@@ -133,7 +133,7 @@ test('replaying tool_start after tool_result does not regress status or drop out
     {
       kind: 'tool',
       tool: tool('a', {
-        name: 'jeikcode_config_guide',
+        name: 'zap_config_guide',
         status: 'done',
         output: 'full guide',
         duration_ms: 8,
@@ -142,7 +142,7 @@ test('replaying tool_start after tool_result does not regress status or drop out
   ];
   const next = upsertToolPart(
     parts,
-    tool('a', { name: 'jeikcode_config_guide', status: 'pending' }),
+    tool('a', { name: 'zap_config_guide', status: 'pending' }),
   );
   const row = next[0]!.kind === 'tool' ? next[0].tool : undefined;
   assert.equal(row?.status, 'done');
@@ -152,7 +152,7 @@ test('replaying tool_start after tool_result does not regress status or drop out
 
 test('finalizeToolsAfterTurn settles leftover pending rows except live bash await', () => {
   const parts: MsgPart[] = [
-    { kind: 'tool', tool: tool('guide', { name: 'jeikcode_config_guide', output: 'docs' }) },
+    { kind: 'tool', tool: tool('guide', { name: 'zap_config_guide', output: 'docs' }) },
     {
       kind: 'tool',
       tool: tool('bash', {

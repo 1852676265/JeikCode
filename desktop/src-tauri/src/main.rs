@@ -114,7 +114,7 @@ fn read_host_away(window: &tauri::WebviewWindow) -> Option<bool> {
 }
 
 fn publish_host_away(window: &tauri::WebviewWindow, away: bool) {
-    let _ = window.eval(format!("window.__jeikcodeHostAway={away};"));
+    let _ = window.eval(format!("window.__zapHostAway={away}; window.__jeikcodeHostAway={away};"));
 }
 
 /// The page's document.hidden / hasFocus miss a minimized WebView. Push the
@@ -280,8 +280,11 @@ fn main() {
                             let p_str = path.to_string_lossy().replace('\\', "/");
                             let json_path = serde_json::to_string(&p_str).unwrap_or_default();
                             let script = format!(
-                                "window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {{ detail: 'preview' }}));\
+                                "window.dispatchEvent(new CustomEvent('zap:switch_right_tab', {{ detail: 'preview' }}));\
+                                 window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {{ detail: 'preview' }}));\
+                                 window.dispatchEvent(new CustomEvent('zap:preview:open_file', {{ detail: {{ filePath: {json_path} }} }}));\
                                  window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {{ detail: {{ filePath: {json_path} }} }}));\
+                                 window.dispatchEvent(new CustomEvent('zap:open_file', {{ detail: {{ path: {json_path} }} }}));\
                                  window.dispatchEvent(new CustomEvent('jeikcode:open_file', {{ detail: {{ path: {json_path} }} }}));"
                             );
                             let _ = drop_window.eval(&script);
@@ -418,7 +421,7 @@ fn spawn_desktop_server(
         Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("jeikcode webui 没有打印出地址".to_string());
+            return Err("zap webui 没有打印出地址".to_string());
         }
         Err(err) => {
             let _ = child.kill();

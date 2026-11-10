@@ -58,7 +58,7 @@ const TYPE_TO_KEY = {
 
 function assetName(tag, target) {
   const ext = target.startsWith('windows') ? '.exe' : '';
-  return `jeikcode-${tag}-${target}${ext}`;
+  return `zap-${tag}-${target}${ext}`;
 }
 
 function isStableTag(tag) {
@@ -77,10 +77,15 @@ function collectBinaries(distDir, tag) {
   const binaries = {};
   const missing = [];
   for (const target of TARGETS) {
-    const name = assetName(tag, target);
-    const filePath = path.join(distDir, name);
+    const ext = target.startsWith('windows') ? '.exe' : '';
+    let name = `zap-${tag}-${target}${ext}`;
+    let filePath = path.join(distDir, name);
     if (!fs.existsSync(filePath)) {
-      missing.push(name);
+      name = `jeikcode-${tag}-${target}${ext}`;
+      filePath = path.join(distDir, name);
+    }
+    if (!fs.existsSync(filePath)) {
+      missing.push(`zap-${tag}-${target}${ext}`);
       continue;
     }
     binaries[target] = hashFile(filePath);

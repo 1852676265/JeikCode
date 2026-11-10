@@ -360,7 +360,7 @@ export class DaemonProcess {
    *
    * Search order:
    * 1. User-configured binaryPath
-   * 2. Bundled standalone jeikcode-daemon in the extension package
+   * 2. Bundled standalone zap-daemon in the extension package
    * 3. `jeikcode` in PATH (uses `jeikcode daemon` subcommand)
    * 4. Common install locations
    * 5. Workspace build outputs (for developers)
@@ -368,7 +368,7 @@ export class DaemonProcess {
   private findBinary(port: number): DaemonBinary | undefined {
     const portArgs = ['--port', String(port), '--client', 'vscode'];
 
-    // 1. User-configured path (could be jeikcode or jeikcode-daemon)
+    // 1. User-configured path (could be jeikcode or zap-daemon)
     if (this.configBinaryPath && fs.existsSync(this.configBinaryPath)) {
       const name = path.basename(this.configBinaryPath);
       if (name.includes('daemon')) {
@@ -377,7 +377,7 @@ export class DaemonProcess {
       return { path: this.configBinaryPath, args: ['daemon', ...portArgs] };
     }
 
-    // 2. Bundled standalone jeikcode-daemon binary
+    // 2. Bundled standalone zap-daemon binary
     const bundled = this.findBundledDaemon();
     if (bundled) {
       return { path: bundled, args: portArgs };
@@ -411,11 +411,11 @@ export class DaemonProcess {
       }
     }
 
-    // 5. Standalone jeikcode-daemon binary (fallback)
+    // 5. Standalone zap-daemon binary (fallback)
     const daemonPaths = [
-      path.join(home, '.jeikcode', 'bin', 'jeikcode-daemon'),
-      path.join(home, '.cargo', 'bin', 'jeikcode-daemon'),
-      '/usr/local/bin/jeikcode-daemon',
+      path.join(home, '.jeikcode', 'bin', 'zap-daemon'),
+      path.join(home, '.cargo', 'bin', 'zap-daemon'),
+      '/usr/local/bin/zap-daemon',
     ];
     for (const p of daemonPaths) {
       if (fs.existsSync(p)) {
@@ -427,12 +427,12 @@ export class DaemonProcess {
     // Warn the user so they know a dev build is being used instead of the
     // bundled daemon that should have shipped with the extension.
     const devPaths = [
-      path.join(workspaceRoot, 'target', 'release', 'jeikcode-daemon'),
-      path.join(workspaceRoot, 'target', 'debug', 'jeikcode-daemon'),
+      path.join(workspaceRoot, 'target', 'release', 'zap-daemon'),
+      path.join(workspaceRoot, 'target', 'debug', 'zap-daemon'),
     ];
     for (const p of devPaths) {
       if (fs.existsSync(p)) {
-        console.warn(`[JeikCode] Using dev build daemon: ${p}. The bundled daemon was not found — the extension package may be missing resources/bin/<platform>/jeikcode-daemon.`);
+        console.warn(`[JeikCode] Using dev build daemon: ${p}. The bundled daemon was not found — the extension package may be missing resources/bin/<platform>/zap-daemon.`);
         vscode.window.showWarningMessage(
           `JeikCode is using a development build of the daemon (${p}). The bundled daemon was not found. Reinstall the extension or set jeikcode.daemon.binaryPath in settings.`
         );
@@ -449,7 +449,7 @@ export class DaemonProcess {
       return undefined;
     }
 
-    const executable = process.platform === 'win32' ? 'jeikcode-daemon.exe' : 'jeikcode-daemon';
+    const executable = process.platform === 'win32' ? 'zap-daemon.exe' : 'zap-daemon';
     const bundled = path.join(this.extensionUri.fsPath, 'resources', 'bin', platformDir, executable);
     if (!fs.existsSync(bundled)) {
       return undefined;

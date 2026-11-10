@@ -5,12 +5,12 @@
 **Goal:** Restore the configured per-turn Markdown datalog and per-LLM-round JSONL request log on the native `CodingRuntime` path.
 
 **Architecture:** Add a provider-neutral observer implementing both `LifecycleHooks`
-and `ToolMiddleware` in `jeikcode-capabilities` and mount the same instance from
-`jeikcode-coding::assemble`, the common production assembly boundary used by CLI,
+and `ToolMiddleware` in `zap-capabilities` and mount the same instance from
+`zap-coding::assemble`, the common production assembly boundary used by CLI,
 TUI, daemon, ACP, and clix. Preserve the project-bucket and paired Markdown/JSONL
 layout without restoring `jeikcode-core` or a second runtime owner.
 
-**Tech Stack:** Rust, `jeikcode-kernel::LifecycleHooks`, `jeikcode-config::DatalogConfig`, serde JSON, SHA-256.
+**Tech Stack:** Rust, `zap-kernel::LifecycleHooks`, `zap-config::DatalogConfig`, serde JSON, SHA-256.
 
 ---
 
@@ -44,30 +44,30 @@ mounts no hook and creates no files.
 ## Task 1: Add the neutral datalog hook
 
 **Files:**
-- Create: `crates/jeikcode-capabilities/src/datalog.rs`
-- Modify: `crates/jeikcode-capabilities/src/lib.rs`
+- Create: `crates/zap-capabilities/src/datalog.rs`
+- Modify: `crates/zap-capabilities/src/lib.rs`
 
 1. Add failing tests for disabled logging, path resolution, project collision
    avoidance, multi-round JSONL, Markdown response/error content, and terminal flush.
 2. Implement the minimal `LifecycleHooks` writer.
-3. Run `cargo test -p jeikcode-capabilities datalog --lib`.
+3. Run `cargo test -p zap-capabilities datalog --lib`.
 
 ## Task 2: Mount it at the common coding boundary
 
 **Files:**
-- Modify: `crates/jeikcode-coding/src/config.rs`
-- Modify: `crates/jeikcode-coding/src/parts.rs`
+- Modify: `crates/zap-coding/src/config.rs`
+- Modify: `crates/zap-coding/src/parts.rs`
 - Update: explicit `CodingAgentConfig` / `CodingRuntimeConfig` constructors reported
   by the compiler.
 
 1. Thread `DatalogConfig` from the product config into agent assembly.
 2. Mount one generation-local hook when enabled.
 3. Add an assembly test proving a real mock-provider turn creates both files.
-4. Run `cargo test -p jeikcode-coding datalog`.
+4. Run `cargo test -p zap-coding datalog`.
 
 ## Task 3: Cross-entry verification
 
-1. Run `cargo test -p jeikcode-capabilities -p jeikcode-coding --lib`.
+1. Run `cargo test -p zap-capabilities -p zap-coding --lib`.
 2. Run compile checks for CLI, daemon, clix, and TUI consumers if constructor changes
    reach them.
 3. Run `git diff --check`.

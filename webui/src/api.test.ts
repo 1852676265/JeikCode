@@ -432,7 +432,7 @@ test('getHealth reads the running binary version from GET /health', async () => 
   globalThis.fetch = (async (url: RequestInfo | URL) => {
     assert.equal(String(url), '/health');
     return new Response(
-      JSON.stringify({ status: 'ok', version: '7.0.13', service: 'jeikcode-daemon' }),
+      JSON.stringify({ status: 'ok', version: '7.0.13', service: 'zap-daemon' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
     );
   }) as typeof fetch;
@@ -441,7 +441,7 @@ test('getHealth reads the running binary version from GET /health', async () => 
     const { getHealth } = await import('./api.ts');
     const health = await getHealth();
     assert.equal(health.version, '7.0.13');
-    assert.equal(health.service, 'jeikcode-daemon');
+    assert.equal(health.service, 'zap-daemon');
   } finally {
     globalThis.fetch = originalFetch;
   }

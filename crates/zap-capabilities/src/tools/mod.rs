@@ -1,0 +1,1220 @@
+//! Neutral coding **tools** (L1): fs `read`/`write`/`edit`/`list` + `bash` +
+//! `grep`/`glob`, plus a generic approval middleware. Each implements the kernel
+//! [`Tool`](zap_kernel::tool::Tool) trait against the kernel's MINIMAL
+//! [`ToolContext`](zap_kernel::tool::ToolContext) (`working_dir` + `cancel`) —
+//! deliberately WITHOUT any coding enrichments (no semantic / graph / lsp /
+//! file_store / read_cache / file_history / budgets). Those belong to a higher
+//! `codeintel` (L1) / `coding` (L2) layer; the neutral fs/exec core lives here.
+//!
+//! # Trust model (inherited from the kernel)
+//!
+//! These tools run with the host process's FULL ambient authority — the kernel does
+//! not sandbox them (see [`zap_kernel::tool`]). Relative paths resolve against
+//! `ctx.working_dir`; absolute paths are honored as-is. There is deliberately NO
+//! path-escape enforcement here: faking a sandbox at this layer would be FALSE
+//! security. OS-level isolation (containers, seccomp, a restricted user) is the
+//! EMBEDDER's responsibility.
+//!
+//! # Risk & approval
+//!
+//! Each tool declares an arg-aware [`risk`](zap_kernel::tool::Tool::risk):
+//! read/list/grep/glob are always `Safe`; write/edit are always `Risky` (they mutate
+//! the filesystem); `bash` is `Risky` only for commands its danger classifier flags.
+//! Risk is advisory metadata — the GATE is the composable [`ApprovalMiddleware`],
+//! which reads `risk`, consults an injected [`PermissionStore`], and otherwise
+//! round-trips the driver for a decision.
+
+use ignore::WalkBuilder;
+use zap_kernel::tool::{ToolRegistry, ToolResult};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Last-resort per-turn high-water mark for composed child agents. Products can
+/// override it, including `0` for unbounded; exact no-progress loops are handled
+/// separately by the result-aware tool-loop policy.
+const DEFAULT_CHILD_MAX_ROUNDS: u32 = 230;
+
+pub mod approval;
+pub mod ast_grep;
+pub mod bash;
+pub mod bash_ctl;
+pub mod bash_log;
+pub mod bash_runtime;
+pub mod bash_workspace_gate;
+pub mod edit;
+pub mod edit_history;
+pub mod encoding;
+pub mod glob;
+pub mod grep;
+pub mod zap_config_guide;
+pub mod output_artifact;
+pub mod output_sanitizer;
+pub mod read;
+pub use crate::argument_repair as repair;
+pub mod report_finding;
+pub mod request_user_input;
+pub mod sensitive_path;
+pub mod task;
+pub mod todo;
+/// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
+#[cfg(feature = "web")]
+pub mod web_fetch;
+#[cfg(feature = "web")]
+pub mod web_search;
+pub mod write;
+pub mod write_approval;
+pub mod write_state;
+
+pub use crate::shell_names::{
+    extract_shell_command, is_shell_tool_name, SHELL_COMMAND_ALIASES, SHELL_COMMAND_KEY,
+    SHELL_TOOL_ALIASES, SHELL_TOOL_NAME,
+};
+pub use approval::{
+    parse_permission_decision, request_approval_decision, ApprovalMiddleware, ApprovalRequest,
+    ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
+};
+pub use ast_grep::AstGrepTool;
+pub use bash::{
+    bash_invocations, normalize_command_for_grant, run_shell, BashInvocation, BashTool, ShellExit,
+    ShellOutcome,
+};
+pub use bash_ctl::LongBashKeywordActionsTool;
+pub use bash_log::{cleanup_session_logs, BackgroundLogWriter};
+pub use bash_runtime::{bind_session_long_keywords, legacy_bash_runtime_state, BashRuntimeState};
+pub use bash_workspace_gate::BashWorkspaceGate;
+pub use edit::EditFileTool;
+pub use glob::GlobTool;
+pub use grep::GrepTool;
+pub use zap_config_guide::{JeikcodeConfigGuideTool, JeikcodeConfigTool};
+pub use output_artifact::{
+    artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
+    ARTIFACT_TRUNCATION_MARKER_PREFIX, TERMINAL_THRESHOLD_BYTES, THRESHOLD_BYTES,
+};
+pub use read::ReadFileTool;
+pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
+pub use report_finding::{Finding, ReportFindingTool};
+pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
+pub use task::TaskTool;
+pub use todo::{
+    bind_todo_session, bind_todowrite, clear_todo_board, close_todo_board_if_complete,
+    commit_todo_board, derive_current_todos, is_todo_tool_name, read_todo_board,
+    restore_todo_board, session_sticky_todos, todo_action_kind, todo_session_is_closed,
+    unbind_todo_session, TodoBoard, TodoItem, TodoLive, TodoTool, TODO_TOOL_ALIASES,
+    TODO_TOOL_NAME,
+};
+#[cfg(feature = "web")]
+pub use web_fetch::WebFetchTool;
+#[cfg(feature = "web")]
+pub use web_search::WebSearchTool;
+pub use write::WriteFileTool;
+pub use write_approval::WriteApprovalGate;
+pub use write_state::{
+    check_write_permitted, record_edit, record_read, record_read_confirmed, record_write_success,
+    WritePermission, WriteStateHook,
+};
+
+/// Names of the full neutral coding toolset — pass to
+/// [`ToolRegistry::mount`](zap_kernel::tool::ToolRegistry::mount).
+pub fn coding_tool_names() -> &'static [&'static str] {
+    &[
+        "read",
+        "write",
+        "edit",
+        "run_command",
+        "long_bash_keyword_actions",
+        "grep",
+        "glob",
+        "todo_write",
+        "zap_config",
+        "fetch_output",
+        "request_user_input",
+    ]
+}
+
+/// Register the full neutral coding toolset into `reg` (then `mount` the subset a
+/// given specialization should expose to the model). Vision support OFF — `read`
+/// reports images as binary (use [`register_coding_tools_with_vision`] for a VL model).
+pub fn register_coding_tools(reg: &mut ToolRegistry) {
+    register_coding_tools_with_vision(reg, false);
+}
+
+/// Like [`register_coding_tools`], but `vision` gates whether `read` hands an
+/// image file back to the model as an actual picture (a VISION model SEES it) instead
+/// of the "binary, cannot display" text. The caller decides the flag from the model
+/// using [`crate::provider::model_suggests_vision`], the same detector used by the
+/// provider image encoder.
+pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
+    register_coding_tools_with_vision_and_bash_state(
+        reg,
+        vision,
+        bash_runtime::legacy_bash_runtime_state(),
+    );
+}
+
+/// Register coding tools while sharing one bash runtime state across the shell
+/// tool and its control tools. CodingRuntime assembly should also pass this same
+/// handle to `StatusReminderHook::with_runtime_state` and any child shell tools.
+pub fn register_coding_tools_with_vision_and_bash_state(
+    reg: &mut ToolRegistry,
+    vision: bool,
+    bash_runtime: Arc<BashRuntimeState>,
+) {
+    reg.register(Arc::new(ReadFileTool::new(vision)));
+    reg.register(Arc::new(WriteFileTool));
+    reg.register(Arc::new(EditFileTool));
+    reg.register(Arc::new(BashTool::with_runtime_state(Arc::clone(
+        &bash_runtime,
+    ))));
+    reg.register(Arc::new(LongBashKeywordActionsTool::with_runtime_state(
+        Arc::clone(&bash_runtime),
+    )));
+    reg.register(Arc::new(GrepTool));
+    reg.register(Arc::new(GlobTool));
+    reg.register(Arc::new(JeikcodeConfigTool::new()));
+    // Gate on JEIKCODE_TODO env var (0/false/off → skip; anything else or absent → register).
+    // Mirrors jeikcode_core::config::todo_enabled_from_env but inlined here because
+    // zap-capabilities must NOT depend on jeikcode-core (layering constraint).
+    let todo_env_off = std::env::var("JEIKCODE_TODO")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(false);
+    if !todo_env_off {
+        // Single `todo_write` tool: accepts the full-list plan shape AND the incremental
+        // `{action}` shape (merged — was a separate `todo` tool). One tool = no plan-vs-patch
+        // tool-choice confusion for the model; the reducer distinguishes by arg SHAPE.
+        reg.register(Arc::new(TodoTool::new()));
+    }
+    // Gate on JEIKCODE_REQUEST_USER_INPUT (default ON — opt-out via 0/false/off/empty).
+    // Register UNLESS the env var is explicitly set to a falsy value.
+    //
+    // INTENTIONAL DUPLICATION: the same env-var logic lives in
+    // `zap_config::config::request_user_input_enabled_from_env` (the authoritative
+    // helper used by zap-coding's persona gate).  We cannot call that helper here
+    // because `zap-config` is NOT a dependency of `zap-capabilities` under the
+    // `tools` feature (it would drag in unwanted transitive deps for embedders that only
+    // need the tools layer).  If you change the logic here, mirror the change in
+    // `zap-config/src/config/mod.rs::request_user_input_enabled_from_env` and vice
+    // versa.  The two blocks MUST stay in sync.
+    let request_user_input_on = match std::env::var("JEIKCODE_REQUEST_USER_INPUT")
+        .ok()
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+    {
+        Some(v) if v == "0" || v == "false" || v == "off" || v.is_empty() => false,
+        _ => true, // default ON — unset, or any other value
+    };
+    if request_user_input_on {
+        reg.register(Arc::new(
+            crate::tools::request_user_input::RequestUserInputTool,
+        ));
+    }
+}
+
+/// Outcome of waiting on a spawned command capped by `[tools.bash] max_timeout_secs`.
+#[derive(Debug)]
+pub(crate) enum CappedCommandOutput {
+    Output(std::process::Output),
+    Io(std::io::Error),
+    TimedOut(u64),
+}
+
+/// Run `cmd.output()` with `kill_on_drop` and the shared command hard-cap
+/// (`[tools.bash] max_timeout_secs`). Every tool that waits on a spawned process
+/// (`bash`, `ast_grep`, `git clone`, `web_fetch` curl fallback,
+/// `parallel_edit` build probe) must go through this or `bash`'s own execute
+/// loop, which reads the same config.
+pub(crate) async fn output_with_max_timeout(cmd: tokio::process::Command) -> CappedCommandOutput {
+    output_with_timeout_secs(cmd, bash::command_max_timeout_secs()).await
+}
+
+/// Same as [`output_with_max_timeout`] with an explicit wait budget (tests).
+pub(crate) async fn output_with_timeout_secs(
+    mut cmd: tokio::process::Command,
+    secs: u64,
+) -> CappedCommandOutput {
+    use std::process::Stdio;
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let secs = secs.max(1);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return CappedCommandOutput::Io(e),
+    };
+    // Windows: Job Object reaps grandchildren (`cmd.exe` → `ping`, `git` →
+    // `git-remote-https`). Direct `kill_on_drop` only kills the leader and
+    // leaves the tree running, so the wait future (and the test runtime)
+    // would sit until the descendant exits.
+    #[cfg(windows)]
+    let job = crate::process_utils::assign_child_to_kill_on_close_job(&child);
+    #[cfg(windows)]
+    let pid = child.id();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(secs),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => CappedCommandOutput::Output(out),
+        Ok(Err(e)) => CappedCommandOutput::Io(e),
+        Err(_) => {
+            #[cfg(windows)]
+            crate::process_utils::kill_windows_tree(&job, pid);
+            CappedCommandOutput::TimedOut(secs)
+        }
+    }
+}
+
+/// Resolve a model-supplied path. Shared with `codeintel` via [`crate::pathutil`].
+pub(crate) use crate::pathutil::{is_absolute_path, resolve_path};
+
+/// Names every name-keyed gate must treat as a FILE MUTATION: the canonical tools first, then
+/// the aliases that still dispatch. `create_file` is a long-recognised spelling (the daemon,
+/// tuix and goal-summary layers already accept it), and the purged bulk-edit names stay listed
+/// so a hallucinated call can never skip a gate. Single source: adding an alias here covers the
+/// write-approval gate AND the worker scope gate at once.
+pub const FILE_MUTATION_TOOLS: &[&str] = &[
+    "edit",
+    "edit_file",
+    "write",
+    "write_file",
+    "create_file",
+    "search_replace",
+    "global_search_replace",
+    "parallel_edit_files",
+];
+
+/// Case-insensitive membership test over [`FILE_MUTATION_TOOLS`].
+pub fn is_file_mutation_tool(name: &str) -> bool {
+    FILE_MUTATION_TOOLS
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
+}
+
+/// The bulk-edit tools whose "target" is a search ROOT (a directory), not a single file.
+pub fn is_search_replace_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("search_replace")
+        || name.eq_ignore_ascii_case("global_search_replace")
+}
+
+/// Max entries listed in a not-found hint before it is truncated.
+const HINT_MAX_ENTRIES: usize = 40;
+
+/// Explain a not-found path by naming the deepest ancestor that DOES exist and listing what
+/// is in it. Returns `""` when there is nothing safe or useful to say.
+///
+/// Why: `path not found: <abs path>` tells the model only that it was wrong, not where the
+/// tree actually stops — so it guesses again, deeper (`app/src` → `app/src/main/java`), and
+/// burns a turn per guess. The nearest existing ancestor plus its entries is the one fact
+/// that ends the loop, and it is a fact we can prove by reading the directory (nothing here
+/// asserts anything about what the model was *trying* to find).
+///
+/// SAFETY: the walk stops at the workspace boundary. These tools deliberately do NOT enforce
+/// containment (see the module trust-model note), so a model may pass any absolute path; a
+/// hint that listed whatever lies outside would turn a typo into "enumerate the user's home
+/// directory into model context".
+///
+/// HANG-SAFE: the blocking `canonicalize`/`read_dir` run OFF the async runtime thread and are
+/// bounded by [`gate_fs_timeout`] (a workspace on a stalled network mount can wedge these for
+/// minutes — the same reason the permission gate uses [`run_bounded`]). A timeout degrades to
+/// no hint, never a frozen turn loop. Centralized here so no call site can forget it.
+pub(crate) async fn not_found_hint(missing: &Path, working_dir: &Path) -> String {
+    let missing = missing.to_path_buf();
+    let working_dir = working_dir.to_path_buf();
+    run_bounded(gate_fs_timeout(), String::new(), move || {
+        not_found_hint_blocking(&missing, &working_dir)
+    })
+    .await
+}
+
+/// Pure, blocking core of [`not_found_hint`] (kept separate so the boundary logic is unit-
+/// testable without a runtime). MUST run off the async worker — see the wrapper.
+fn not_found_hint_blocking(missing: &Path, working_dir: &Path) -> String {
+    let Ok(root) = crate::pathnorm::canonicalize(working_dir) else {
+        return String::new();
+    };
+    // Walk up from the parent — `missing` itself is the thing that does not exist.
+    let mut cur = missing.parent();
+    while let Some(candidate) = cur {
+        // `canonicalize` succeeds only for paths that exist, so this doubles as the
+        // existence test for each ancestor.
+        if let Ok(real) = crate::pathnorm::canonicalize(candidate) {
+            if !real.starts_with(&root) {
+                return String::new(); // left the workspace — say nothing
+            }
+            if !real.is_dir() {
+                return String::new(); // an ancestor is a FILE; there is nothing to list
+            }
+            return render_dir_hint(&real);
+        }
+        cur = candidate.parent();
+    }
+    String::new()
+}
+
+/// Render `dir`'s entries for a not-found hint: directories first (trailing `/`), then files,
+/// each group sorted by name so the text is deterministic. Build/VCS/cache dirs are dropped —
+/// the same noise the walkers skip.
+fn render_dir_hint(dir: &Path) -> String {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<(bool, String)> = Vec::new();
+    for ent in read.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        // Same filter the walkers use (`is_skip_dir` also drops `.venv-*`), so the hint
+        // never surfaces noise the tools would otherwise skip.
+        if is_skip_dir(&name) {
+            continue;
+        }
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        names.push((is_dir, name));
+    }
+    if names.is_empty() {
+        return format!(
+            "\nNearest existing directory: {} (it is empty).",
+            crate::pathnorm::to_display(dir)
+        );
+    }
+    names.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let total = names.len();
+    let mut shown: Vec<String> = names
+        .iter()
+        .take(HINT_MAX_ENTRIES)
+        .map(|(is_dir, n)| if *is_dir { format!("{n}/") } else { n.clone() })
+        .collect();
+    if total > HINT_MAX_ENTRIES {
+        shown.push(format!("… (+{} more)", total - HINT_MAX_ENTRIES));
+    }
+    format!(
+        "\nNearest existing directory: {} — contains: {}",
+        crate::pathnorm::to_display(dir),
+        shown.join(", ")
+    )
+}
+
+/// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
+/// to `\n`, then expand to the target. Idempotent for `"\n"`. Used by the editors so a
+/// model that copied LF text from `read` (which strips `\r` via `str::lines()`) can
+/// still match — and not corrupt — a CRLF file on disk.
+pub(crate) fn coerce_eol(s: &str, eol: &str) -> String {
+    if eol == "\r\n" {
+        s.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        s.replace("\r\n", "\n")
+    }
+}
+
+/// Directories never descended into during a walk (build artifacts / VCS / caches).
+/// Mirrors the production walkers so a grep/glob/list does not drown in `target/`
+/// or `node_modules/`.
+pub(crate) const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".cache",
+    "vendor",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    "datalog",
+    "logs",
+    "log",
+    ".zap",
+    ".jeikcode",
+    ".claude",
+    "runs",
+];
+
+/// Should a directory with this name be skipped during a walk?
+pub(crate) fn is_skip_dir(name: &str) -> bool {
+    SKIP_DIRS.contains(&name) || name.starts_with(".venv-")
+}
+
+/// WebUI user-upload store. Gitignored so it stays out of project VCS, but
+/// `read` / `grep` / `glob` must still see it — these files
+/// are attachments the model is expected to open, not project source.
+pub const USER_UPLOAD_STORE_DIR: &str = ".zap_store";
+
+pub(crate) fn is_upload_store_dir(name: &str) -> bool {
+    name.eq_ignore_ascii_case(USER_UPLOAD_STORE_DIR)
+}
+
+/// True when `path` is `.zap_store` itself or lives under one.
+pub(crate) fn path_in_upload_store(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .map(is_upload_store_dir)
+            .unwrap_or(false)
+    })
+}
+
+fn apply_skip_dirs(builder: &mut WalkBuilder) {
+    builder.filter_entry(|e| {
+        // The root entry being searched (depth 0) must never be pruned by name,
+        // even if the caller explicitly targeted a directory named e.g. "target" or "node_modules".
+        if e.depth() == 0 {
+            return true;
+        }
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(name) = e.file_name().to_str() {
+                if is_upload_store_dir(name) {
+                    return true;
+                }
+                return !is_skip_dir(name);
+            }
+        }
+        true
+    });
+}
+
+fn add_codegraph_ignores(builder: &mut WalkBuilder) {
+    builder
+        .add_custom_ignore_filename(".codegraphignore")
+        .add_custom_ignore_filename(".codegraignore");
+    let global_config = crate::paths::config_dir();
+    let global_ignore1 = global_config.join(".codegraphignore");
+    if global_ignore1.is_file() {
+        builder.add_ignore(global_ignore1);
+    }
+    let global_ignore2 = global_config.join(".codegraignore");
+    if global_ignore2.is_file() {
+        builder.add_ignore(global_ignore2);
+    }
+}
+
+fn gitignore_off_walk(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false);
+    builder
+}
+
+/// Gitignore-aware project walk that still visits `.jeikcode_store`.
+///
+/// `hidden` matches the historical grep (`true`) / glob (`false`) defaults for
+/// the main tree. The upload store is always walked with hidden+gitignore off
+/// so pasted attachments remain findable after they are gitignored.
+/// `visit` returns `false` to stop early (deadline / result cap).
+pub(crate) fn for_each_project_entry(
+    root: &Path,
+    hidden: bool,
+    mut visit: impl FnMut(&ignore::DirEntry) -> bool,
+) {
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut stopped = false;
+
+    let mut run = |mut builder: WalkBuilder| {
+        if stopped {
+            return;
+        }
+        apply_skip_dirs(&mut builder);
+        let mut loop_count = 0usize;
+        for entry in builder.build().flatten() {
+            if !seen.insert(entry.path().to_path_buf()) {
+                continue;
+            }
+            // 协作式让步：每遍历 128 个条目主动让出当前线程时间片，
+            // 避免在数万乃至数十万大项目中紧密密集调用系统调用（NTFS/VFS 遍历）霸占内核 I/O 调度，
+            // 确保异地远程访问时的并发网络通信、sshd 终端回显与 HTTP 请求平滑顺畅。
+            loop_count += 1;
+            if loop_count >= 128 {
+                loop_count = 0;
+                std::thread::yield_now();
+            }
+            if !visit(&entry) {
+                stopped = true;
+                return;
+            }
+        }
+    };
+
+    let in_store = path_in_upload_store(root);
+    if in_store {
+        run(gitignore_off_walk(root));
+        return;
+    }
+
+    // If the caller explicitly targeted a directory inside or under a skip-listed path
+    // (e.g. `node_modules/@lobehub/icons` or `target/doc`), disable parent gitignore
+    // filtering so the explicitly requested directory can actually be searched.
+    // Descendants (depth > 0) still adhere to `apply_skip_dirs` to prevent noise explosion.
+    let root_in_skip_or_ignore = root
+        .components()
+        .any(|c| c.as_os_str().to_str().map(is_skip_dir).unwrap_or(false));
+    let git_ignore_active = !root_in_skip_or_ignore;
+
+    let mut main = WalkBuilder::new(root);
+    main.hidden(hidden)
+        .git_ignore(git_ignore_active)
+        .git_global(git_ignore_active)
+        .git_exclude(git_ignore_active);
+    // The shipped/user ignore list is applied AS A WHOLE on purpose: its dir rules
+    // (`obj/`, `bin/Debug/`, …) and its file-level negations (`!bin/*.js`,
+    // `!src/bin/`) only work together — filtering it down to "dirs only" hides
+    // `bin/` and with it the negations that rescue `bin/cli.js` (see
+    // `shipped_ignore_keeps_source_bins_in_glob`). Consequently the list itself must
+    // never hide files an explicit search is asked for; that is why `.env*` was
+    // removed from the asset (it silently hid `.env.local` from `glob`/`grep`).
+    if git_ignore_active {
+        add_codegraph_ignores(&mut main);
+    }
+    run(main);
+
+    let store = root.join(USER_UPLOAD_STORE_DIR);
+    if store.is_dir() {
+        run(gitignore_off_walk(&store));
+    }
+}
+
+/// Heuristic binary sniff over the first 8 KiB: any NUL byte ⇒ binary (the `file(1)`
+/// heuristic); otherwise >30% non-text control bytes ⇒ binary. The 30% threshold
+/// tolerates UTF-8 multibyte text (CJK / emoji), which a byte-level scan would
+/// otherwise misread as "control".
+pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.is_empty() {
+        return false;
+    }
+    if sample.contains(&0) {
+        return true;
+    }
+    let nonprint = sample
+        .iter()
+        .filter(|&&b| b < 9 || (b > 13 && b < 32))
+        .count();
+    nonprint * 100 / sample.len() > 30
+}
+
+/// A successful tool result (`is_error: false`). `call_id` is filled by the kernel
+/// after `execute` returns.
+pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: false,
+        images: vec![],
+    }
+}
+/// A successful tool result that also carries inline `images` for a VISION model to
+/// SEE (e.g. `read` returning a picture). The agent loop lifts these onto a
+/// follow-up `Role::User` message — the only role a provider serializes images on.
+pub(crate) fn ok_with_images(
+    content: impl Into<String>,
+    images: Vec<zap_kernel::message::ImageContent>,
+) -> ToolResult {
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: false,
+        images,
+    }
+}
+/// A failed tool result (`is_error: true`) — surfaced to the model so it can recover.
+pub(crate) fn err(content: impl Into<String>) -> ToolResult {
+    ToolResult {
+        call_id: String::new(),
+        content: content.into(),
+        is_error: true,
+        images: vec![],
+    }
+}
+
+/// Load `[tools.timeouts]` from `~/.jeikcode/config.toml`, else recommended defaults.
+pub(crate) fn tool_timeouts() -> zap_config::config::ToolTimeoutsConfig {
+    zap_config::config::ToolTimeoutsConfig::load_effective()
+}
+
+/// Max wall-clock a permission gate may spend on blocking filesystem classification
+/// (path canonicalization). The workspace can sit on a stalled mount (e.g. a hung
+/// network share) where `std::fs::canonicalize` blocks for minutes; bounding it keeps
+/// the kernel's turn loop responsive (Esc/Ctrl-C stay live) instead of freezing — the
+/// exact symptom of a `before()` gate hanging on `/Volumes/<share>`.
+/// Sourced from `[tools.timeouts] fs_gate_secs` (default 36s).
+pub(crate) fn gate_fs_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(tool_timeouts().fs_gate_secs)
+}
+
+/// Run blocking `f` OFF the async worker (so a stalled syscall can't pin the runtime
+/// thread mid-poll), bounded by `timeout`. Returns `default` if `f` doesn't finish in
+/// time or its thread panics — a hung filesystem degrades to a safe fallback, never a
+/// hang. The orphaned blocking thread is abandoned (it finishes when the syscall
+/// eventually returns); acceptable for the rare stalled-mount case.
+pub(crate) async fn run_bounded<T, F>(timeout: std::time::Duration, default: T, f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => v,
+        _ => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zap_kernel::tool::ToolRegistry;
+
+    fn hanging_shell_command() -> tokio::process::Command {
+        #[cfg(windows)]
+        {
+            let mut c = tokio::process::Command::new("cmd.exe");
+            c.args(["/C", "ping -n 30 127.0.0.1 >nul"]);
+            crate::process_utils::suppress_console_window(&mut c);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", "sleep 30"]);
+            c
+        }
+    }
+
+    fn echo_shell_command() -> tokio::process::Command {
+        #[cfg(windows)]
+        {
+            let mut c = tokio::process::Command::new("cmd.exe");
+            c.args(["/C", "echo ok"]);
+            crate::process_utils::suppress_console_window(&mut c);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", "echo ok"]);
+            c
+        }
+    }
+
+    #[tokio::test]
+    async fn output_with_timeout_secs_kills_hanging_command() {
+        let start = std::time::Instant::now();
+        let got = output_with_timeout_secs(hanging_shell_command(), 1).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "hard cap must kill the process tree, not wait out the 30s hang: {:?}",
+            start.elapsed()
+        );
+        match got {
+            CappedCommandOutput::TimedOut(secs) => {
+                assert_eq!(secs, 1, "timeout budget is the value we passed in")
+            }
+            CappedCommandOutput::Output(out) => panic!(
+                "expected TimedOut, command exited {:?} stdout={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            ),
+            CappedCommandOutput::Io(e) => panic!("expected TimedOut, got Io: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_with_timeout_secs_returns_output_when_fast() {
+        let got = output_with_timeout_secs(echo_shell_command(), 15).await;
+        match got {
+            CappedCommandOutput::Output(out) => {
+                assert!(out.status.success(), "echo must succeed: {:?}", out.status);
+                assert!(
+                    String::from_utf8_lossy(&out.stdout)
+                        .to_ascii_lowercase()
+                        .contains("ok"),
+                    "stdout={:?}",
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bounded_yields_default_when_blocking_exceeds_timeout() {
+        // A stalled syscall (simulated by a long sleep on the blocking thread) must NOT
+        // hang the caller: the bound fires and returns the safe default well before the
+        // closure would finish.
+        let got = run_bounded(std::time::Duration::from_millis(50), false, || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            true
+        })
+        .await;
+        assert!(
+            !got,
+            "exceeding the timeout must return the default, not block"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_returns_value_when_fast() {
+        let got = run_bounded(std::time::Duration::from_secs(5), false, || true).await;
+        assert!(got, "a fast closure returns its real value");
+    }
+
+    /// A model that guesses a conventional layout (`app/src/main/java` for a Gradle project)
+    /// gets `path not found` and nothing else — so it guesses again, deeper. The hint gives it
+    /// the one fact that ends the guessing: where the path stops existing, and what is actually
+    /// there.
+    #[test]
+    fn not_found_hint_names_nearest_existing_ancestor_and_its_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path();
+        std::fs::create_dir(wd.join("app")).unwrap();
+        std::fs::write(wd.join("app").join("build.gradle"), "").unwrap();
+        std::fs::create_dir(wd.join("app").join("libs")).unwrap();
+
+        // The model guessed two levels past where the tree actually stops.
+        let hint = not_found_hint_blocking(&wd.join("app/src/main/java"), wd);
+
+        assert!(hint.contains("app"), "{hint}");
+        assert!(hint.contains("build.gradle"), "{hint}");
+        assert!(hint.contains("libs/"), "directories are marked: {hint}");
+    }
+
+    /// The tools deliberately do NOT enforce workspace containment (see the module trust-model
+    /// note), so a model can hand in any absolute path. Listing a directory outside the
+    /// workspace would pull the user's home — or anything else on disk — into model context as
+    /// a side effect of a typo. The hint stays inside the workspace or says nothing.
+    #[test]
+    fn not_found_hint_never_lists_outside_the_working_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        // A sibling of the workspace, holding something we must never enumerate.
+        let outside = d.path().join("elsewhere");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&outside.join("nope/deeper"), &wd);
+
+        assert!(
+            hint.is_empty(),
+            "must not enumerate outside the workspace: {hint}"
+        );
+    }
+
+    /// The HARD escape the boundary actually defends: a symlink INSIDE the workspace that
+    /// points OUT of it. A byte-prefix check on the un-resolved path would pass
+    /// (`<wd>/link/...` starts with `<wd>`) and leak the target's contents; the guard is only
+    /// sound because it canonicalizes both sides (resolving the symlink) before comparing. This
+    /// pins that — if `pathnorm::canonicalize` were ever swapped for a lexical normalizer, the
+    /// leak would come back and this test would catch it. (Unix-only: reliable symlink creation.)
+    #[cfg(unix)]
+    #[test]
+    fn not_found_hint_does_not_follow_a_symlink_out_of_the_workspace() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        let outside = d.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+        // A symlink inside the workspace pointing at the secret dir outside it.
+        std::os::unix::fs::symlink(&outside, wd.join("link")).unwrap();
+
+        // The model asks for a missing path UNDER the escaping symlink.
+        let hint = not_found_hint_blocking(&wd.join("link/nope"), &wd);
+
+        assert!(
+            hint.is_empty() && !hint.contains("id_rsa"),
+            "a symlink escaping the workspace must not be enumerated: {hint}"
+        );
+    }
+
+    /// `..` traversal that climbs out of the workspace is resolved by canonicalize and rejected,
+    /// same as the symlink case.
+    #[test]
+    fn not_found_hint_rejects_dotdot_escape() {
+        let d = tempfile::tempdir().unwrap();
+        let wd = d.path().join("workspace");
+        std::fs::create_dir(&wd).unwrap();
+        let outside = d.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&wd.join("../secrets/nope"), &wd);
+
+        assert!(hint.is_empty(), "a `..` escape must say nothing: {hint}");
+    }
+
+    /// The workspace root itself is a valid nearest-existing ancestor — that is the common
+    /// case for a first-turn guess like `src/` in a project that has no `src/`.
+    #[test]
+    fn not_found_hint_accepts_the_working_dir_itself_as_the_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.py"), "").unwrap();
+
+        let hint = not_found_hint_blocking(&d.path().join("src"), d.path());
+
+        assert!(hint.contains("main.py"), "{hint}");
+    }
+
+    /// The canonical list of tool names `register_coding_tools` and
+    /// `coding_tool_names` must agree on — the single source of truth for these
+    /// tests. Adding/removing a tool updates only this list; the assertions below
+    /// fail if the code doesn't match.
+    const EXPECTED_TOOL_NAMES: &[&str] = &[
+        "read",
+        "write",
+        "edit",
+        "run_command",
+        "long_bash_keyword_actions",
+        "grep",
+        "glob",
+        "todo_write",
+        "zap_config",
+    ];
+
+    #[test]
+    fn coding_tool_names_matches_expected_list() {
+        let names = coding_tool_names();
+        // Every name in EXPECTED_TOOL_NAMES must appear in coding_tool_names().
+        for expected_name in EXPECTED_TOOL_NAMES {
+            assert!(
+                names.contains(expected_name),
+                "coding_tool_names() must include '{expected_name}'"
+            );
+        }
+        // "request_user_input" is always included in coding_tool_names() (mount() skips it
+        // when JEIKCODE_REQUEST_USER_INPUT is off; the name itself is unconditional).
+        assert!(
+            names.contains(&"request_user_input"),
+            "coding_tool_names() must include 'request_user_input'"
+        );
+        // "fetch_output" is always in coding_tool_names() — mount() drops it when the
+        // session-gated FetchOutputTool is not registered; the name itself is unconditional.
+        assert!(
+            names.contains(&"fetch_output"),
+            "coding_tool_names() must include 'fetch_output'"
+        );
+        assert!(
+            !names.contains(&"memory"),
+            "coding_tool_names() must not include 'memory'"
+        );
+        // No stale or duplicate names beyond EXPECTED_TOOL_NAMES + the gated extras.
+        let extras: &[&str] = &["request_user_input", "fetch_output"];
+        let expected_full: Vec<&str> = EXPECTED_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(extras.iter().copied())
+            .collect();
+        let mut sorted_names = names.to_vec();
+        sorted_names.sort();
+        let mut sorted_expected = expected_full.clone();
+        sorted_expected.sort();
+        assert_eq!(
+            sorted_names, sorted_expected,
+            "coding_tool_names() must match EXPECTED_TOOL_NAMES + memory + request_user_input + fetch_output"
+        );
+    }
+
+    #[test]
+    fn register_coding_tools_has_no_extra_or_missing_tools() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+
+        // Mount all names from the expected list.
+        let mounted = reg.mount(EXPECTED_TOOL_NAMES);
+        for name in EXPECTED_TOOL_NAMES {
+            assert!(
+                mounted.get(name).is_some(),
+                "registered tool '{name}' must be mountable by name"
+            );
+            // Each mounted tool's name() must match the key it was registered under.
+            let tool = mounted.get(name).unwrap();
+            assert_eq!(
+                tool.name(),
+                *name,
+                "tool.name() must match the registration key '{name}'"
+            );
+        }
+        // The mount must have resolved exactly the expected number of tools.
+        assert_eq!(
+            mounted.defs().len(),
+            EXPECTED_TOOL_NAMES.len(),
+            "mount must resolve all expected tools"
+        );
+    }
+
+    #[test]
+    fn register_coding_tools_all_tools_have_valid_defs() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(EXPECTED_TOOL_NAMES);
+
+        for def in mounted.defs() {
+            assert!(!def.name.is_empty(), "tool name must not be empty");
+            assert!(
+                !def.description.is_empty(),
+                "tool '{}' must have a description",
+                def.name
+            );
+            assert!(
+                def.parameters.get("type").and_then(|v| v.as_str()) == Some("object"),
+                "tool '{}' parameters must be a JSON object with type=object",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn unmounted_tools_are_not_resolvable() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+
+        // Mount only a subset; tools not in this list must not resolve.
+        let subset = &["read_file", "bash", "grep"];
+        let mounted = reg.mount(subset);
+        assert!(mounted.get("read_file").is_some());
+        assert!(mounted.get("bash").is_some());
+        assert!(mounted.get("run_command").is_some());
+        assert_eq!(
+            mounted.get("bash").unwrap().name(),
+            "run_command",
+            "canonical name is run_command; bash is an alias"
+        );
+        assert!(mounted.get("grep").is_some());
+        // An unmounted tool must not be resolvable.
+        assert!(
+            mounted.get("write_file").is_none(),
+            "unmounted tool must not resolve"
+        );
+        assert!(
+            mounted.get("edit_file").is_none(),
+            "unmounted tool must not resolve"
+        );
+        assert!(
+            mounted.get("open_file").is_none(),
+            "unmounted tool must not resolve"
+        );
+    }
+
+    /// A `/model` swap re-registers `read_file` (see `coding::parts::assemble`) to refresh
+    /// its vision flag. This guards the mechanism that fix relies on: re-registering with a
+    /// new `vision` value OVERWRITES the prior `read_file`, so a model swap from text→vision
+    /// (or vision→text) actually changes how it treats an image — it does not go stale.
+    #[tokio::test]
+    async fn re_registering_read_file_overwrites_its_vision_flag() {
+        use zap_kernel::tool::{ProgressSink, ToolContext};
+        let d = tempfile::tempdir().unwrap();
+        // JPEG-ish blob with a NUL so `looks_binary` flags it.
+        std::fs::write(d.path().join("c.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00]).unwrap();
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+
+        // First mount: text-only model → read of an image stays the binary-text dead-end.
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let r = reg
+            .mount(&["read_file"])
+            .get("read_file")
+            .unwrap()
+            .execute(r#"{"file_path":"c.jpg"}"#, &ctx)
+            .await;
+        assert!(
+            r.images.is_empty() && r.content.starts_with("Binary file"),
+            "{}",
+            r.content
+        );
+
+        // Re-register on the SAME registry as if the model swapped to a VL model → the read
+        // tool must now hand over the image, proving the swap takes effect (no stale flag).
+        register_coding_tools_with_vision(&mut reg, true);
+        let r = reg
+            .mount(&["read_file"])
+            .get("read_file")
+            .unwrap()
+            .execute(r#"{"file_path":"c.jpg"}"#, &ctx)
+            .await;
+        assert_eq!(
+            r.images.len(),
+            1,
+            "after re-register with vision, image must be attached: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(legacy_bash_runtime)]
+    async fn legacy_registrar_shares_the_legacy_bash_runtime_state() {
+        use zap_kernel::tool::{ProgressSink, ToolContext};
+
+        let keyword = "legacy-registrar-runtime-probe";
+        bash_runtime::legacy_bash_runtime_state().set_live_long_keywords(vec![keyword.into()]);
+
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let mounted = reg.mount(&["long_bash_keyword_actions"]);
+        let tool = mounted.get("long_bash_keyword_actions").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+        let result = tool
+            .execute(
+                &serde_json::json!({
+                    "action": "delete",
+                    "keyword": keyword,
+                    "global": false
+                })
+                .to_string(),
+                &ctx,
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !bash_runtime::legacy_bash_runtime_state()
+                .session_long_keywords()
+                .iter()
+                .any(|value| value == keyword),
+            "legacy control tool and legacy free APIs must share one runtime state"
+        );
+    }
+
+    #[test]
+    fn todo_write_registered_under_canonical_name() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        let names: Vec<String> = mounted.defs().into_iter().map(|d| d.name).collect();
+        assert!(
+            names.iter().any(|n| n == TODO_TOOL_NAME),
+            "todo_write must be registered: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "todowrite"),
+            "legacy smashed name must not be advertised: {names:?}"
+        );
+        assert!(
+            mounted.get("todowrite").is_some(),
+            "legacy todowrite alias must still resolve"
+        );
+        assert_eq!(mounted.get("todowrite").unwrap().name(), TODO_TOOL_NAME);
+        assert_eq!(mounted.get("todo").unwrap().name(), TODO_TOOL_NAME);
+    }
+
+    #[test]
+    fn write_tool_registered_with_aliases_and_create_file() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        assert_eq!(mounted.get("write").unwrap().name(), "write");
+        assert_eq!(mounted.get("write_file").unwrap().name(), "write");
+        assert_eq!(mounted.get("create_file").unwrap().name(), "write");
+    }
+
+    #[test]
+    #[serial_test::serial(request_user_input_env)]
+    fn request_user_input_gated_on_by_default_off_when_opt_out() {
+        // default (unset) → registered (default ON)
+        std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        let names_on: Vec<String> = reg
+            .mount(&["request_user_input"])
+            .defs()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(
+            names_on.iter().any(|n| n == "request_user_input"),
+            "must be ON by default: {names_on:?}"
+        );
+
+        // explicit opt-out → NOT registered
+        std::env::set_var("JEIKCODE_REQUEST_USER_INPUT", "0");
+        let mut reg2 = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg2, false);
+        let names_off: Vec<String> = reg2
+            .mount(&["request_user_input"])
+            .defs()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(
+            !names_off.iter().any(|n| n == "request_user_input"),
+            "must be OFF when opt-out: {names_off:?}"
+        );
+        std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+    }
+
+    /// `memory` is registered when `JEIKCODE_MEMORY_TOOL` is unset, and absent when
+    #[cfg(feature = "memory")]
+    #[test]
+    fn memory_tool_not_mounted() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools_with_vision(&mut reg, false);
+        assert!(
+            reg.mount(&["memory"]).defs().is_empty(),
+            "memory tool should not be mounted"
+        );
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn coding_tool_names_excludes_memory() {
+        assert!(!coding_tool_names().contains(&"memory"));
+    }
+
+    /// Regression: the tool must reach `MountedTools::defs()` (the API tools array) by
+    /// default — not merely be registered. Previously `request_user_input` was registered
+    /// but absent from `coding_tool_names()`, so `mount()` never selected it and the model
+    /// never saw it.
+    #[test]
+    #[serial_test::serial(request_user_input_env)]
+    fn request_user_input_default_on_reaches_mounted_defs() {
+        std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        let has = mounted
+            .defs()
+            .iter()
+            .any(|d| d.name == "request_user_input");
+        assert!(
+            has,
+            "default-on request_user_input must be MOUNTED and present in API defs() when unset"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(request_user_input_env)]
+    fn request_user_input_absent_from_defs_when_opt_out() {
+        std::env::set_var("JEIKCODE_REQUEST_USER_INPUT", "0");
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
+        assert!(
+            !mounted
+                .defs()
+                .iter()
+                .any(|d| d.name == "request_user_input"),
+            "opt-out (JEIKCODE_REQUEST_USER_INPUT=0) must not mount request_user_input"
+        );
+    }
+}

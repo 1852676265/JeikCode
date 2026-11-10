@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "jeikcode-desktop"
+name = "zap-desktop"
 version = "1.0.8"
 edition = "2021"
 description = "Zap desktop shell"

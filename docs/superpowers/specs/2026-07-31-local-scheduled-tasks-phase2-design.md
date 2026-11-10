@@ -34,7 +34,7 @@ schedule enable          ──► install ;  schedule sync ──► 按 store 
 
 ## 组件与文件结构
 
-- **`OsScheduler` trait + 3 平台实现**（新文件 `crates/jeikcode-cli/src/schedule_os.rs`；消费 `jeikcode_config::schedule`）：
+- **`OsScheduler` trait + 3 平台实现**（新文件 `crates/zap-cli/src/schedule_os.rs`；消费 `zap_config::schedule`）：
   ```rust
   pub enum InstallState { Installed, Missing }
   pub trait OsScheduler {
@@ -46,7 +46,7 @@ schedule enable          ──► install ;  schedule sync ──► 按 store 
   ```
   平台实现用 **`#[cfg(target_os = "…")]`** 分区（Launchd / TaskScheduler / SystemdTimer + crontab fallback）。为可测：spawn 命令走一个注入的 `CommandRunner`（trait，默认真跑 `std::process::Command`，测试注入 fake 断言参数），文件根可注入（测试用 tempdir，不写真实 `~/Library/...`）。
 - **翻译纯函数**（同文件，无副作用、可单测）：`Schedule` → 各平台条目内容/参数。
-- **接线**（改 `crates/jeikcode-cli/src/schedule_cmd.rs`）：`add`/`remove`/`enable`/`disable` 调 `OsScheduler`；新增 `Sync` 子命令；`list` 显示注册状态。
+- **接线**（改 `crates/zap-cli/src/schedule_cmd.rs`）：`add`/`remove`/`enable`/`disable` 调 `OsScheduler`；新增 `Sync` 子命令；`list` 显示注册状态。
 - **I1 approver**（改 `run_task` 及其审批路径）：scheduled 执行不复用 `-p` 的 bash-blanket-approve，改用更严 decider。
 
 ## OS 条目细节
@@ -90,7 +90,7 @@ Cron kind 阶段 2 的支持：Linux 直接进 crontab / OnCalendar 最自然；
 - **翻译纯函数**：每平台 × 每频率 → 期望条目内容/参数字符串（单测）。
 - **install/uninstall**：注入 `CommandRunner`（记录被调命令与参数）+ 文件根（tempdir），断言：生成的 plist/unit/timer/schtasks 参数正确、写到对的相对路径、uninstall 幂等。不真动系统。
 - **I1 approver**：破坏性/越界 bash 审批请求 → scheduled decider 返回 deny；安全操作 → allow；Plan 模式只读不触发。纯逻辑单测。
-- 回归：`cargo test -p jeikcode-cli`（+ 相关 crate）全绿。
+- 回归：`cargo test -p zap-cli`（+ 相关 crate）全绿。
 - **端到端**（真装 OS 条目 + 到点真触发）需真机，不自动化。
 
 ## 范围

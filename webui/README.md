@@ -1,7 +1,7 @@
 # JeikCode webui
 
 A local browser UI for JeikCode (Preact + Vite + PostCSS), served by the
-`jeikcode-daemon` HTTP server. Launch it with `/webui` inside the TUI or
+`zap-daemon` HTTP server. Launch it with `/webui` inside the TUI or
 `jeikcode webui` from the CLI — both open a loopback-only page in your browser.
 
 ## Develop the frontend
@@ -19,7 +19,7 @@ bundle:
 ```bash
 JEIKCODE_WEBUI_DEV=http://localhost:5173 jeikcode webui
 # (or run the daemon directly)
-JEIKCODE_WEBUI_DEV=http://localhost:5173 cargo run -p jeikcode-daemon -- --port 13456
+JEIKCODE_WEBUI_DEV=http://localhost:5173 cargo run -p zap-daemon -- --port 13456
 ```
 
 API calls still hit the daemon; only the static page is redirected, so you keep
@@ -68,7 +68,7 @@ cargo build          # embeds that generated bundle into the binary
 reuse an older bundle after changing the lockfile: rebuild it or download the
 matching CI artifact before compiling a native binary. The daemon embeds
 these assets through `rust-embed` in
-`crates/jeikcode-daemon/src/webui.rs`.
+`crates/zap-daemon/src/webui.rs`.
 
 This dependency remediation does not publish a release or update an installed
 daemon. Use the repository's release pipeline when distributing new binaries.

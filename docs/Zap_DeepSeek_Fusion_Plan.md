@@ -74,7 +74,7 @@
      [dependencies]
      napi = { version = "2", features = ["async"] }
      napi-derive = "2"
-     jeikcode-coding = { path = "../jeikcode-coding" }
+     zap-coding = { path = "../zap-coding" }
      jeikcode-core = { path = "../jeikcode-core" }
      ```
   2. 导出两个关键原生能力：
@@ -84,7 +84,7 @@
      #[napi]
      pub fn zap_code_explore(scope_path: String, query: String) -> String {
          // 毫秒级直接调用 Zap 原生 Tree-Sitter 代码图谱
-         jeikcode_coding::explore_sync(&scope_path, &query)
+         zap_coding::explore_sync(&scope_path, &query)
      }
 
      #[napi]

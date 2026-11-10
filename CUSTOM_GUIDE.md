@@ -60,7 +60,7 @@
 - **规范做法**：将新功能组件、工具函数放在 `webui/src/custom/` 目录下，并在 `webui/src/custom/custom-registry.ts` 中注册。通过挂载监听、插槽或高阶包装（Wrapper）接入视图，不修改官方核心事件流。
 
 ### 3. 增加后端（Rust）自定义功能
-- **规范路径**：`crates/` 目录下新增独立 crate（如 `crates/jeikcode-my-feature`）
+- **规范路径**：`crates/` 目录下新增独立 crate（如 `crates/zap-my-feature`）
 - **规范做法**：根目录 `Cargo.toml` 采用了通配符 `members = ["crates/*"]`，任何新建在 `crates/` 下的 crate 都会被 Cargo 自动识别为工作区成员，**完全不需要修改根目录 Cargo.toml**。在需要调用的地方以依赖模块引入，保持官方已有 crate 的纯净。
 
 ---

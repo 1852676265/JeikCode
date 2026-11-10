@@ -1,0 +1,17761 @@
+//! JeikCode API Service
+//!
+//! Provides HTTP API for querying conversation history and streaming chat.
+//!
+//! The server logic is exposed as a library function [`run_server`] so that
+//! both the standalone `zap-daemon` binary and (in the future) the main
+//! `jeikcode` program can run the API server in-process.
+//!
+//! ─── bot review response ledger (feat/webui-msg-send-time, PR #601) ───
+//! • P2  SessionDetail.created_at (epoch seconds) 与 MessageInfo.created_at (epoch ms) 单位不一致
+//!       → 本次新 commit 按 bot 推荐的方案 A 统一为毫秒:
+//!         get_session_detail 赋值时 created_at/updated_at 均乘 1000,与 MessageInfo 一致;
+//!         SessionDetail 字段注释标注 epoch ms (见第 262-263 行)。
+//!         kernel 内部 session.created_at/updated_at 仍为秒,仅在 API 响应边界转换。
+//! • P3  formatMsgTime !ts 守卫把 ts=0 误判无效 → 23fb3db4 改为 ts == null || !Number.isFinite(ts)
+//! 我们愿意根据再审意见继续优化。
+
+// Redirect JEIKCODE_HOME to a throwaway temp dir before any test in this binary
+// runs, so the crate's own unit tests never persist sessions/config into the
+// developer's real `~/.jeikcode`. Tests that set their own JEIKCODE_HOME still
+// win (isolate_home is a no-op when the var is already set).
+#[cfg(test)]
+#[ctor::ctor]
+fn _isolate_jeikcode_home() {
+    zap_kernel::test_support::isolate_home();
+}
+
+mod api_config;
+mod api_git;
+pub mod api_git_webhook;
+mod api_provider;
+mod api_update;
+pub mod approval_mode;
+mod commands;
+mod compat_api;
+mod fs_upload;
+pub mod git_adapter;
+pub(crate) mod kernel_runtime;
+pub mod legacy_convert;
+pub mod live_hub;
+pub mod native_live;
+mod runtime_host;
+mod sidebar_projects;
+mod steer_prompt;
+/// File-sink diagnostic trace (`ctrace!` macro), enabled via `JEIKCODE_TUIX_LOG`.
+/// Moved here from the retired `jeikcode-core` (daemon is its only consumer;
+/// `zap_tuix::trace` keeps its own copy targeting the same append file).
+#[macro_use]
+pub mod trace;
+pub use kernel_runtime::{
+    spawn_native_runtime_for_session_deferred,
+    spawn_native_runtime_for_session_deferred_with_preprocessor, start_native_runtime,
+    start_native_runtime_with_session,
+};
+pub use runtime_host::{
+    coding_plan_rate_limit_source, coding_provider_factory, gather_plugin_skill_dirs,
+    gather_plugin_skill_dirs_for, installed_plugin_hook_source,
+};
+pub(crate) mod live_api;
+pub use live_api::live_set_mode;
+pub use live_api::live_set_working_dir;
+pub use live_api::live_switch_session;
+pub mod auth_token;
+pub mod permission_bridge;
+mod telemetry_scope;
+mod terminal_session;
+pub mod webui;
+pub mod plugin_rpc;
+
+pub(crate) use telemetry_scope::daemon_scope;
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocketUpgrade},
+        DefaultBodyLimit, Path, Query, State,
+    },
+    http::{header, request::Parts as RequestParts, HeaderName, HeaderValue, Method, StatusCode},
+    response::{sse::Sse, IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
+use futures::stream::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+
+use zap_auth as auth;
+use zap_capabilities::mcp::McpRegistry;
+use zap_capabilities::session::{SessionManager as NativeSessionManager, SessionStoreError};
+use zap_coding::CodingRuntimeEvent;
+use zap_config::config::Config;
+use zap_telemetry::detect_repo_origin;
+use zap_telemetry::{
+    config::{resolve, ProcessEnv},
+    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
+};
+
+const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+// ============================================================================
+// Shared DTOs for P0 API endpoints
+// ============================================================================
+
+/// Structured error response for all new P0 endpoints.
+#[derive(Debug, Serialize)]
+pub(crate) struct ApiError {
+    pub success: bool,
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+}
+
+/// Sanitized config response (never exposes api_key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ConfigResponse {
+    pub path: PathBuf,
+    pub default_provider: String,
+    pub default_workdir: Option<String>,
+    pub providers: Vec<ProviderInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountInfo>,
+    /// Global UI language. `"en"` when the user has not chosen one.
+    pub language: String,
+    /// Whether to display the GitHub repository logo in the UI.
+    pub github_logo: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AccountInfo {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub skip_tls_verify: bool,
+}
+
+/// Sanitized provider view (no api_key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub requires_login: bool,
+    pub is_default: bool,
+    pub context_window: usize,
+    pub max_tokens: Option<usize>,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget: Option<u32>,
+    pub thinking_type: Option<String>,
+    pub thinking_keep: Option<String>,
+    pub reasoning_history: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub skip_tls_verify: bool,
+    pub ephemeral: bool,
+    pub pricing: Option<zap_config::config::provider::ProviderPricing>,
+    /// Explicit vision flag from config (`None` = unset / protocol default opt-in false).
+    pub supports_vision: Option<bool>,
+    /// Explicit reasoning-model flag (`None` = unset / name heuristics).
+    pub reasoning_model: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// Create a structured JSON error response.
+pub(crate) fn json_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.into(),
+            code: None,
+            retryable: None,
+        }),
+    )
+}
+
+pub(crate) fn coded_json_error(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retryable: bool,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.into(),
+            code: Some(code.into()),
+            retryable: Some(retryable),
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectInfo {
+    /// Project hash (directory name in sessions/)
+    pub hash: String,
+    /// Project name (user-defined or directory name)
+    pub name: String,
+    /// Working directory path (from session files)
+    pub working_dir: PathBuf,
+    /// Optional description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Number of sessions
+    pub session_count: usize,
+    /// Creation timestamp
+    pub created_at: u64,
+    /// Last update timestamp
+    pub last_updated: u64,
+}
+
+/// Current project state (working directory)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectState {
+    /// Current working directory
+    pub working_dir: PathBuf,
+    /// Previous working directory (for /cd -)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_dir: Option<PathBuf>,
+    /// Recently visited directories (max 5)
+    pub recent_dirs: Vec<PathBuf>,
+    /// Project name (derived from directory name)
+    pub name: String,
+}
+
+/// Request to change working directory
+#[derive(Debug, Deserialize)]
+pub struct ChangeDirRequest {
+    /// New working directory path, or "-" to go back
+    pub path: String,
+    /// Also persist this as the daemon's `default_workdir` in config (survives
+    /// restart). When false (default), only the live in-memory project state is
+    /// updated — so a webui switch sticks across page refresh but does not
+    /// rewrite the configured default.
+    #[serde(default)]
+    pub set_default: bool,
+    /// 可选：切换目录的同时恢复该项目下的指定会话（手机 App 点开历史对话）。
+    /// Some 时广播 SessionSwitched（TUI 跟随 cd + 恢复该会话）而非
+    /// WorkingDirChanged（cd + 开新会话）。
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Response after changing directory
+#[derive(Debug, Serialize)]
+pub struct ChangeDirResponse {
+    pub success: bool,
+    pub message: String,
+    pub current_dir: PathBuf,
+    pub project_hash: String,
+}
+
+/// Search query parameters
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// Search keyword for session name
+    pub q: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionsByWorkingDirQuery {
+    pub working_dir: PathBuf,
+}
+
+/// Request to create a new session
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionRequest {
+    /// Optional working directory (uses current project dir if not provided)
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    /// Optional session title
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Response for created session
+#[derive(Debug, Serialize)]
+pub struct CreateSessionResponse {
+    pub id: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    pub project_hash: String,
+    pub created_at: u64,
+}
+
+/// Request to append externally handled messages to a session.
+#[derive(Debug, Deserialize)]
+pub struct AppendSessionMessagesRequest {
+    /// Optional working directory (uses current project dir if not provided)
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    pub messages: Vec<AppendSessionMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppendSessionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AppendSessionMessagesResponse {
+    pub success: bool,
+    pub session_id: String,
+    pub message_count: usize,
+    pub project_hash: String,
+}
+
+/// Optional window on `GET /projects/:hash/sessions/:id`.
+/// `tail=N` returns the last N messages (webui first paint). `offset`/`limit`
+/// page older history. Omitted query → full transcript (export / older clients).
+#[derive(Debug, Default, Deserialize)]
+struct SessionDetailQuery {
+    tail: Option<usize>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+fn apply_session_message_window<T>(
+    messages: Vec<T>,
+    query: &SessionDetailQuery,
+) -> (usize, usize, Vec<T>) {
+    let total = messages.len();
+    if let Some(n) = query.tail.filter(|n| *n > 0) {
+        let offset = total.saturating_sub(n);
+        return (total, offset, messages.into_iter().skip(offset).collect());
+    }
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    (
+        total,
+        offset,
+        messages.into_iter().skip(offset).take(limit).collect(),
+    )
+}
+
+#[cfg(test)]
+mod session_window_tests {
+    use super::*;
+
+    #[test]
+    fn tail_returns_last_n() {
+        let q = SessionDetailQuery {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+        };
+        let (total, offset, msgs) = apply_session_message_window(vec![1, 2, 3, 4, 5], &q);
+        assert_eq!(total, 5);
+        assert_eq!(offset, 3);
+        assert_eq!(msgs, vec![4, 5]);
+    }
+
+    #[test]
+    fn offset_limit_pages_older() {
+        let q = SessionDetailQuery {
+            tail: None,
+            offset: Some(1),
+            limit: Some(2),
+        };
+        let (total, offset, msgs) = apply_session_message_window(vec![10, 20, 30, 40], &q);
+        assert_eq!(total, 4);
+        assert_eq!(offset, 1);
+        assert_eq!(msgs, vec![20, 30]);
+    }
+
+    #[test]
+    fn omitted_query_returns_all() {
+        let (total, offset, msgs) =
+            apply_session_message_window(vec!['a', 'b'], &SessionDetailQuery::default());
+        assert_eq!((total, offset, msgs), (2, 0, vec!['a', 'b']));
+    }
+
+    #[test]
+    fn outline_ordinals_ignore_failed_turn_diagnostic_rows() {
+        let msgs = vec![
+            MessageInfo {
+                role: "user".into(),
+                content: "第一问".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+                id: None,
+            },
+            MessageInfo {
+                role: "assistant".into(),
+                content: "upstream unavailable".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: Some("turn_diagnostic".into()),
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+                id: None,
+            },
+            MessageInfo {
+                role: "user".into(),
+                content: "第二问".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+                id: None,
+            },
+            MessageInfo {
+                role: "assistant".into(),
+                content: "upstream unavailable again".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: Some("turn_diagnostic".into()),
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+                id: None,
+            },
+            MessageInfo {
+                role: "user".into(),
+                content: "服务恢复后继续".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+                id: None,
+            },
+        ];
+        let turns = session_user_outline(&msgs);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].ordinal, 0);
+        assert_eq!(turns[0].index, 0);
+        assert_eq!(turns[0].text, "第一问");
+        assert_eq!(turns[1].ordinal, 1);
+        assert_eq!(turns[1].index, 2);
+        assert_eq!(turns[1].text, "第二问");
+        assert_eq!(turns[2].ordinal, 2);
+        assert_eq!(turns[2].index, 4);
+        assert_eq!(turns[2].text, "服务恢复后继续");
+    }
+}
+
+#[cfg(test)]
+mod chat_replay_tests {
+    use super::*;
+
+    #[test]
+    fn chat_replay_coalesces_only_within_the_same_identity() {
+        let delta = |content: &str, message_id: &str, part_id: &str| ChatEvent::TextDelta {
+            content: content.into(),
+            message_id: Some(message_id.into()),
+            part_id: Some(part_id.into()),
+            part_seq: Some(1),
+        };
+        let mut buf = Vec::new();
+        push_chat_replay(&mut buf, delta("a", "m-1", "m-1:1:text"));
+        push_chat_replay(&mut buf, delta("b", "m-1", "m-1:1:text"));
+        assert_eq!(buf.len(), 1, "same identity coalesces");
+        // 身份不同绝不合并：合并后回放会把后一回合的正文画到前一回合名下。
+        push_chat_replay(&mut buf, delta("c", "m-2", "m-2:1:text"));
+        assert_eq!(buf.len(), 2, "a different round keeps its own replay entry");
+        match (&buf[0], &buf[1]) {
+            (
+                ChatEvent::TextDelta {
+                    content: first,
+                    message_id: Some(first_id),
+                    ..
+                },
+                ChatEvent::TextDelta {
+                    content: second,
+                    message_id: Some(second_id),
+                    ..
+                },
+            ) => {
+                assert_eq!(first, "ab");
+                assert_eq!(first_id, "m-1");
+                assert_eq!(second, "c");
+                assert_eq!(second_id, "m-2");
+            }
+            other => panic!("unexpected replay buffer: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_write_guard_tests {
+    /// 运行期禁止改写“会影响路径解析”的进程级环境变量。
+    ///
+    /// 契约：`Config::config_dir()` 在进程内只解析一次（`OnceLock`），因此任何
+    /// 运行期 `set_var` 这 4 个键的代码都会让“写”与“读”落到不同根目录 —— 这正是
+    /// 并行测试偶发的根因（scoped-home 测试改 env，另一个测试正好横跨读写窗口）。
+    ///
+    /// 正确做法：测试用 `zap_config::test_util::isolated_home()`（线程级注入，
+    /// 不碰 env）；bins 的 `main` 用 `special_dirs::sanitize_process_temp_env()`
+    /// （仅启动期一次）。
+    ///
+    /// 白名单**只减不增**，且只允许“每测试进程/每进程恰好一次”的启动期写入。
+    const GUARDED_KEYS: [&str; 4] = ["JEIKCODE_HOME", "TMPDIR", "TMP", "TEMP"];
+
+    const ALLOWED: [(&str, &str); 3] = [
+        (
+            "crates/zap-kernel/src/test_support.rs",
+            "每测试进程一次的 isolate_home()（在任何测试解析路径之前）",
+        ),
+        (
+            "crates/zap-capabilities/src/special_dirs.rs",
+            "bins main 启动期归一化 TMP/TMPDIR/TEMP",
+        ),
+        (
+            "crates/zap-capabilities/tests/temp_env_sanitize.rs",
+            "该用例的测试对象就是 TMPDIR/TMP/TEMP 的归一化本身（集成测试独立进程）",
+        ),
+    ];
+
+    /// 已登记的历史站点（**只减不增**）。迁移完成后本表应为空。
+    const PENDING_MIGRATION: [&str; 0] = [];
+
+    #[test]
+    fn runtime_code_must_not_write_path_env_vars() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|crates| crates.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root.join("crates"), &mut files);
+        assert!(!files.is_empty(), "源码扫描必须能枚举到 crates/**/*.rs");
+
+        let mut hits: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(&repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ALLOWED.iter().any(|(path, _)| *path == relative) {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // 注释里的示例不算违规。
+                if trimmed.starts_with("//")
+                    || !(line.contains("set_var") || line.contains("remove_var"))
+                {
+                    continue;
+                }
+                if GUARDED_KEYS
+                    .iter()
+                    .any(|key| line.contains(&format!("\"{key}\"")))
+                {
+                    hits.entry(relative.clone())
+                        .or_default()
+                        .push(format!("{}: {trimmed}", index + 1));
+                }
+            }
+        }
+
+        // ① 表外新违规 → 失败（阻止债务增长）。
+        let unexpected: Vec<String> = hits
+            .iter()
+            .filter(|(file, _)| !PENDING_MIGRATION.contains(&file.as_str()))
+            .map(|(file, lines)| format!("{file}\n  {}", lines.join("\n  ")))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "新增的运行期路径 env 写入（应改用线程级注入或启动期一次）；\n{}…",
+            unexpected.join("\n")
+        );
+
+        // ② 已登记但不再违规 → 失败（提醒收缩清单）。
+        let stale: Vec<&str> = PENDING_MIGRATION
+            .iter()
+            .copied()
+            .filter(|file| !hits.contains_key(*file))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "这些文件已不再违规，请从 PENDING_MIGRATION 里删除：{stale:?}"
+        );
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == "target" || name == ".git")
+                {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod global_events_tests {
+    use super::*;
+
+    #[test]
+    fn global_bus_fans_out_to_every_subscriber() {
+        // 跨实例语义：每个实例一条订阅，投递必须广播到所有订阅者（而不是竞争消费）。
+        let mut first = global_events().subscribe();
+        let mut second = global_events().subscribe();
+        publish_global(GlobalWireEvent::Activity {
+            session_id: "s-1".into(),
+            running: true,
+            terminal: None,
+            status: None,
+        });
+        publish_global(GlobalWireEvent::ReviewAsked {
+            session_id: "s-1".into(),
+        });
+        for rx in [&mut first, &mut second] {
+            let a = rx.try_recv().expect("first event reaches every subscriber");
+            let b = rx
+                .try_recv()
+                .expect("second event reaches every subscriber");
+            assert!(matches!(a, GlobalWireEvent::Activity { .. }));
+            assert!(matches!(b, GlobalWireEvent::ReviewAsked { .. }));
+        }
+    }
+
+    /// 路由级 smoke：`/events` 必须先发 `sync` 对齐帧，随后把总线上的增量事件
+    /// 真正推到 SSE 客户端（走 axum 路由 + ServiceExt::oneshot，与生产挂载同一 helper）。
+    #[tokio::test]
+    async fn global_events_route_streams_sync_then_incremental_events() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use futures::StreamExt as _;
+        use tower::ServiceExt as _;
+
+        let app = with_global_events_route(Router::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("/events must be mounted on the router");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        // 首帧：sync。累积读取，不依赖分片边界。
+        let mut seen = String::new();
+        while !seen.contains("\"type\":\"sync\"") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("sync frame must arrive")
+                .expect("stream stays open")
+                .expect("frame is valid");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+
+        // 真推送：订阅建立后发布增量事件，SSE 必须送达。
+        publish_global(GlobalWireEvent::ReviewAsked {
+            session_id: "s-route".into(),
+        });
+        while !seen.contains("review_asked") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("incremental event must arrive")
+                .expect("stream stays open")
+                .expect("frame is valid");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(seen.contains("\"session_id\":\"s-route\""), "{seen}");
+    }
+
+    #[test]
+    fn global_wire_events_carry_incremental_payloads() {
+        let upsert = serde_json::to_value(GlobalWireEvent::SessionUpsert {
+            session: SessionRowWire {
+                id: "s1".into(),
+                name: "n".into(),
+                working_dir: "E:/p".into(),
+                project_hash: "0123456789abcdef".into(),
+                created_at: 1,
+                updated_at: 2,
+                message_count: 3,
+                origin: "manual".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(upsert["type"], "session_upsert");
+        assert_eq!(upsert["session"]["id"], "s1");
+        assert_eq!(upsert["session"]["project_hash"], "0123456789abcdef");
+
+        let deleted = serde_json::to_value(GlobalWireEvent::SessionDeleted {
+            session_id: "s1".into(),
+            project_hash: "0123456789abcdef".into(),
+        })
+        .unwrap();
+        assert_eq!(deleted["type"], "session_deleted");
+        assert_eq!(deleted["session_id"], "s1");
+
+        // 终态带 kind（客户端据此出右下角通知）；运行中事件不带 terminal。
+        let terminal = serde_json::to_value(GlobalWireEvent::Activity {
+            session_id: "s1".into(),
+            running: false,
+            terminal: Some("completed"),
+            status: None,
+        })
+        .unwrap();
+        assert_eq!(terminal["type"], "activity");
+        assert_eq!(terminal["terminal"], "completed");
+        let running = serde_json::to_value(GlobalWireEvent::Activity {
+            session_id: "s1".into(),
+            running: true,
+            terminal: None,
+            status: None,
+        })
+        .unwrap();
+        assert!(running.get("terminal").is_none());
+
+        let asked = serde_json::to_value(GlobalWireEvent::ReviewAsked {
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(asked["type"], "review_asked");
+        let resolved = serde_json::to_value(GlobalWireEvent::ReviewResolved {
+            session_id: "s1".into(),
+            approval_id: Some("a1".into()),
+            request_id: None,
+        })
+        .unwrap();
+        assert_eq!(resolved["type"], "review_resolved");
+        assert_eq!(resolved["approval_id"], "a1");
+        assert!(resolved.get("request_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn fanout_chat_events_backfills_session_id_from_done_and_emits_terminal_activity() {
+        let mut global_rx = global_events().subscribe();
+        let (primary_tx, mut primary_rx) = mpsc::unbounded_channel();
+        let (bus_tx, _bus_rx) = tokio::sync::broadcast::channel(16);
+        let tx = fanout_chat_events_for_session(primary_tx, bus_tx, None, None, None);
+
+        tx.send(ChatEvent::Done {
+            tokens: 10,
+            tool_calls: 0,
+            session_id: "sid-fanout".into(),
+            stop_reason: None,
+            message: None,
+        })
+        .expect("send Done");
+        tx.send(ChatEvent::Stopped).expect("send Stopped");
+        drop(tx);
+
+        assert!(matches!(
+            primary_rx.recv().await,
+            Some(ChatEvent::Done { .. })
+        ));
+        assert!(matches!(primary_rx.recv().await, Some(ChatEvent::Stopped)));
+
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let evt = tokio::time::timeout(std::time::Duration::from_secs(2), global_rx.recv())
+                .await
+                .expect("activity frame must arrive")
+                .expect("global bus stays open");
+            if let GlobalWireEvent::Activity {
+                session_id,
+                running,
+                terminal,
+                ..
+            } = evt
+            {
+                if session_id == "sid-fanout" {
+                    seen.push((running, terminal));
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![(false, Some("completed")), (false, Some("stopped"))]
+        );
+    }
+}
+
+const DISPLAY_FIELD_CAP: usize = 24 * 1024;
+
+/// Compact user-question row for the session outline (right-rail). Not the
+/// model context — just labels.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTurnOutline {
+    /// Stable ordinal among real user questions. Unlike `index`, this is not
+    /// affected by assistant/tool/diagnostic rows inserted by failed turns.
+    pub ordinal: usize,
+    pub index: usize,
+    pub text: String,
+}
+
+const OUTLINE_TEXT_CAP: usize = 240;
+
+fn session_user_outline(messages: &[MessageInfo]) -> Vec<SessionTurnOutline> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, msg)| {
+            if !msg.role.eq_ignore_ascii_case("user") || msg.synthetic {
+                return None;
+            }
+            let text = msg.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if text.is_empty() {
+                return None;
+            }
+            let text = if text.chars().count() > OUTLINE_TEXT_CAP {
+                format!(
+                    "{}…",
+                    text.chars()
+                        .take(OUTLINE_TEXT_CAP.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                text
+            };
+            Some((index, text))
+        })
+        .enumerate()
+        .map(|(ordinal, (index, text))| SessionTurnOutline {
+            ordinal,
+            index,
+            text,
+        })
+        .collect()
+}
+
+fn cap_display_field(s: String) -> String {
+    if s.len() <= DISPLAY_FIELD_CAP {
+        return s;
+    }
+    let mut end = DISPLAY_FIELD_CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n… [truncated for display]");
+    out
+}
+
+/// Session detail response
+#[derive(Debug, Serialize)]
+pub struct SessionDetail {
+    pub id: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    /// Epoch milliseconds (统一为毫秒,与 MessageInfo.created_at 一致; kernel 内部 Session.created_at 为秒,此处 API 响应边界转毫秒)。
+    pub created_at: u64,
+    /// Epoch milliseconds (同上)。
+    pub updated_at: u64,
+    /// Total messages in the transcript (not the returned window size).
+    pub message_count: usize,
+    /// Index of `messages[0]` in the full transcript.
+    #[serde(default)]
+    pub offset: usize,
+    /// All user questions (short text) in transcript order. Independent of the
+    /// `messages` window so the WebUI turn rail can list the full session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<SessionTurnOutline>,
+    pub messages: Vec<MessageInfo>,
+    /// Per-session model selection. Absent on older sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    /// Footer occupancy from the last completed turn (`used_tokens` / last request).
+    /// Must not be turn-cumulative `model_usage` billing, or restart paints over-budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<SessionTokenUsage>,
+    /// `manual` / `scheduled` / `protocol`. Protocol sessions are observed in Auto.
+    #[serde(default, skip_serializing_if = "is_manual_session_origin")]
+    pub origin: zap_capabilities::session::SessionOrigin,
+    /// The session's single live checklist. Empty after a completed board is closed on stop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<zap_capabilities::tools::TodoItem>,
+    /// Per-turn telemetry stats (token usage, duration, tool call count, errors) for turn analysis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_stats: Vec<zap_capabilities::session::TurnStat>,
+}
+
+fn is_manual_session_origin(origin: &zap_capabilities::session::SessionOrigin) -> bool {
+    matches!(
+        origin,
+        zap_capabilities::session::SessionOrigin::Manual
+    )
+}
+
+/// Token footer snapshot derived from [`SessionMeta::turn_stats`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionTokenUsage {
+    pub prompt: usize,
+    pub completion: usize,
+    pub total: usize,
+    pub cached: usize,
+    #[serde(default)]
+    pub cached_estimated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_window: Option<usize>,
+}
+
+fn estimate_prefix_cached_tokens(current_prompt: usize, previous_prompt: usize) -> usize {
+    if current_prompt == 0 || previous_prompt == 0 {
+        return 0;
+    }
+    if current_prompt < previous_prompt * 9 / 10 {
+        return 0;
+    }
+    current_prompt.min(previous_prompt)
+}
+
+fn turn_stat_billing_prompt_tokens(stat: &zap_capabilities::session::TurnStat) -> usize {
+    let mut uncached_input = 0u64;
+    let mut cached_input = 0u64;
+    for usage in &stat.model_usage {
+        uncached_input = uncached_input.saturating_add(usage.tokens.input);
+        cached_input = cached_input.saturating_add(usage.tokens.cached_input);
+    }
+    usize::try_from(uncached_input.saturating_add(cached_input)).unwrap_or(usize::MAX)
+}
+
+fn turn_stat_billing_output_tokens(stat: &zap_capabilities::session::TurnStat) -> usize {
+    let output = stat
+        .model_usage
+        .iter()
+        .fold(0u64, |acc, usage| acc.saturating_add(usage.tokens.output));
+    usize::try_from(output).unwrap_or(0)
+}
+
+fn turn_stat_billing_cached_tokens(stat: &zap_capabilities::session::TurnStat) -> usize {
+    let cached = stat.model_usage.iter().fold(0u64, |acc, usage| {
+        acc.saturating_add(usage.tokens.cached_input)
+    });
+    usize::try_from(cached).unwrap_or(0)
+}
+
+/// Last-request prompt occupancy for the context-window gauge.
+///
+/// `TurnStat.model_usage` is **turn-cumulative billing** (every LLM round in
+/// the user turn is added). Using that sum as `prompt` made a restart paint
+/// 1.7M/1.0M until the next live `Usage` event replaced it with occupancy.
+fn turn_stat_occupancy_tokens(stat: &zap_capabilities::session::TurnStat) -> usize {
+    if stat.used_tokens > 0 {
+        stat.used_tokens as usize
+    } else if stat.total_tokens > 0 {
+        stat.total_tokens as usize
+    } else if stat.round_count <= 1 {
+        // Legacy rows without occupancy: a single-round billing total is the
+        // last request. Multi-round sums are not occupancy — refuse them.
+        turn_stat_billing_prompt_tokens(stat)
+    } else {
+        0
+    }
+}
+
+fn turn_stat_last_completion_tokens(stat: &zap_capabilities::session::TurnStat) -> usize {
+    if stat.used_tokens > 0 && stat.total_tokens > stat.used_tokens {
+        stat.total_tokens.saturating_sub(stat.used_tokens) as usize
+    } else if stat.round_count <= 1 {
+        turn_stat_billing_output_tokens(stat)
+    } else {
+        0
+    }
+}
+
+/// Live WebUI last-frame formula (also the restart restore formula):
+///
+/// ```text
+/// prompt     = last LLM request prompt   (occupancy; includes tools in that request)
+/// completion = last LLM request completion
+/// total      = prompt + completion       // footer 总上下文
+/// cached     = last LLM request cached
+/// ```
+///
+/// Each `Usage` event **replaces** the footer. Never sum rounds.
+/// `TurnStat.model_usage` is turn-cumulative billing for `/cost` and must not
+/// feed this gauge — that is how a 200k last frame became 1.7M after restart.
+fn footer_from_last_request(
+    prompt: usize,
+    completion: usize,
+    cached: usize,
+    ctx_window: Option<usize>,
+    cached_estimated: bool,
+) -> SessionTokenUsage {
+    let cached = if prompt == 0 { 0 } else { cached.min(prompt) };
+    SessionTokenUsage {
+        prompt,
+        completion,
+        total: prompt.saturating_add(completion),
+        cached,
+        cached_estimated,
+        ctx_window,
+    }
+}
+
+fn last_assistant_request_usage(
+    messages: &[zap_kernel::message::Message],
+) -> Option<(usize, usize, usize, usize)> {
+    use zap_kernel::message::Role;
+    let meta = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)?
+        .meta
+        .as_ref()?;
+    let prompt = if meta.tokens.prompt > 0 {
+        meta.tokens.prompt as usize
+    } else {
+        meta.used_tokens as usize
+    };
+    let completion = meta.tokens.completion as usize;
+    let cached = meta.tokens.cached as usize;
+    let ctx_window = meta.ctx_window as usize;
+    if prompt == 0 && completion == 0 {
+        return None;
+    }
+    Some((prompt, completion, cached, ctx_window))
+}
+
+fn estimate_cache_from_previous_turn(
+    meta: &zap_capabilities::session::SessionMeta,
+    prompt: usize,
+) -> Option<usize> {
+    if prompt == 0 {
+        return None;
+    }
+    let previous = meta
+        .turn_stats
+        .iter()
+        .rev()
+        .filter(|stat| stat.position_valid)
+        .skip(1)
+        .map(turn_stat_occupancy_tokens)
+        .find(|value| *value > 0)?;
+    let estimated = estimate_prefix_cached_tokens(prompt, previous);
+    (estimated > 0).then_some(estimated)
+}
+
+/// Restore the footer from the last assistant `MessageMeta` (same payload the
+/// live `Usage` event painted) and only fall back to turn-stat occupancy.
+pub(crate) fn session_token_usage_from_session(
+    meta: &zap_capabilities::session::SessionMeta,
+    snapshot: &zap_kernel::message::SessionSnapshot,
+) -> Option<SessionTokenUsage> {
+    if let Some((prompt, completion, cached, ctx_window)) =
+        last_assistant_request_usage(&snapshot.messages)
+    {
+        let mut cached_estimated = false;
+        let cached = if cached > 0 && cached <= prompt {
+            cached
+        } else if let Some(estimated) = estimate_cache_from_previous_turn(meta, prompt) {
+            cached_estimated = true;
+            estimated
+        } else {
+            0
+        };
+        return Some(footer_from_last_request(
+            prompt,
+            completion,
+            cached,
+            (ctx_window > 0).then_some(ctx_window),
+            cached_estimated,
+        ));
+    }
+    session_token_usage_from_meta(meta)
+}
+
+/// Occupancy fallback when the snapshot has no last-request `MessageMeta`.
+/// Uses `used_tokens` / `total_tokens` (last request), never `model_usage` sums.
+pub(crate) fn session_token_usage_from_meta(
+    meta: &zap_capabilities::session::SessionMeta,
+) -> Option<SessionTokenUsage> {
+    let stat = meta.turn_stats.iter().rev().find(|s| s.position_valid)?;
+    if stat.used_tokens == 0 && stat.total_tokens == 0 && stat.model_usage.is_empty() {
+        return None;
+    }
+
+    let prompt = turn_stat_occupancy_tokens(stat);
+    let completion = turn_stat_last_completion_tokens(stat);
+    if prompt == 0 && completion == 0 {
+        return None;
+    }
+
+    let billing_cached = turn_stat_billing_cached_tokens(stat);
+    let mut cached = 0usize;
+    let mut cached_estimated = false;
+    if billing_cached > 0 && billing_cached <= prompt {
+        cached = billing_cached;
+    } else if let Some(estimated) = estimate_cache_from_previous_turn(meta, prompt) {
+        cached = estimated;
+        cached_estimated = true;
+    }
+
+    let ctx_window = (stat.ctx_window > 0).then_some(stat.ctx_window as usize);
+    Some(footer_from_last_request(
+        prompt,
+        completion,
+        cached,
+        ctx_window,
+        cached_estimated,
+    ))
+}
+
+/// Global project state store (current working directory)
+/// Process-global lock serialising `$JEIKCODE_HOME` mutations across ALL daemon
+/// tests. `commands.rs` and `live_api.rs` compile into the same test binary and
+/// both point `JEIKCODE_HOME` at a tempdir; without a shared lock their separate
+/// per-module locks don't mutually exclude, so they race and read each other's
+/// sessions root. One lock here fixes that.
+#[cfg(test)]
+pub(crate) fn jeikcode_home_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+type ProjectStateStore = Arc<RwLock<ProjectState>>;
+
+pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> =
+    std::sync::Mutex::new(None);
+
+#[derive(Clone)]
+struct AdmittedUser {
+    content: String,
+    created_at: Option<u64>,
+}
+
+/// One admitted `/chat` operation. Aliases include both the persisted session id
+/// and the browser-generated request id so either client protocol can stop it.
+struct ActiveChatOperation {
+    started_at: u64,
+    session_id: Option<String>,
+    aliases: Vec<String>,
+    cancellation: CancellationToken,
+    /// Linearizes user stop against approval consumption. A stop must mark this
+    /// gate before signalling the cancellation token; approval delivery holds
+    /// the same gate until the runtime has consumed (or rejected) its response.
+    stop_gate: Arc<Mutex<bool>>,
+    /// Signalled in `complete` so a preempting request can wait until the
+    /// cancelled turn has persisted its snapshot and left the registry.
+    finished: Arc<Notify>,
+    stopped: bool,
+    /// When terminal (Done/Error/Stopped) is sent, the turn is logically completed
+    /// even if cleanup/shutdown is awaiting in background.
+    terminal_reached: bool,
+    /// Fan-out bus so WebUI (or other observers) can `GET /chat/watch` and
+    /// reattach to a turn started by OpenAI/API clients without owning the
+    /// primary SSE response.
+    event_bus: tokio::sync::broadcast::Sender<ChatEvent>,
+    /// The user message admitted for this turn, recorded right when it is
+    /// pushed to the conversation. `tokio::broadcast` does not replay history,
+    /// so a `/chat/watch` observer that attaches *after* the turn started would
+    /// otherwise never see the user's own message until the turn-boundary disk
+    /// snapshot lands. Late subscribers replay this instead.
+    admitted_user: Option<AdmittedUser>,
+    /// Full turn event log for late joiners (page refresh mid-stream). Broadcast
+    /// has no history; without this buffer a reattached WebUI only paints deltas
+    /// *after* subscribe and loses thinking/text/tools already streamed.
+    /// Consecutive text/reasoning deltas are coalesced to bound memory.
+    replay: Arc<std::sync::Mutex<Vec<ChatEvent>>>,
+    /// 本回合帧的起始游标：第 i 条缓冲帧的 seq = `seq_base + i + 1`。
+    /// 回合结束时把 `seq_base + 缓冲长度` 回写到会话计数器，下一回合接着往上走。
+    seq_base: u64,
+    /// Mid-turn steer inbox. Present only while `run_chat_turn_v2` is reading it.
+    /// A submit on this channel is folded at the next round boundary; it does not
+    /// cancel the in-flight model call or tool batch.
+    steer_tx: Option<mpsc::UnboundedSender<live_api::ChatSteerSignal>>,
+    /// FIFO of client correlation ids for `/chat/steer` submits awaiting fold.
+    /// Drained by the projection when a `Steered` event lands, so the wire can
+    /// echo the id and let the WebUI reconcile an in-flight steer after refresh.
+    steer_client_ids: std::collections::VecDeque<Option<String>>,
+}
+
+#[derive(Default)]
+struct ActiveChatIndex {
+    operations: HashMap<String, ActiveChatOperation>,
+    aliases: HashMap<String, String>,
+    /// `/chat/watch` observers that arrived while the session had NO active
+    /// turn. They stay parked here until a turn is admitted for this session
+    /// (`admit` drains and converts them to live broadcast subscribers), so the
+    /// WebUI gets a push the moment an API turn starts instead of having to
+    /// poll. Keyed by session id (the `session_id` alias the watcher used).
+    standby_watchers: HashMap<String, Vec<mpsc::UnboundedSender<ChatEvent>>>,
+    /// 会话级断点续传游标（严格单调递增）。
+    ///
+    /// 它是我们自己定义的序号，与模型上下文无关 —— 回合结束清空回合缓冲、
+    /// 上下文压缩、历史改写都不会重置它，所以跨回合重连可以带着旧游标精准续传。
+    session_seq: HashMap<String, u64>,
+}
+
+/// Atomic admission and identity-aware cleanup for background `/chat` turns.
+///
+/// The old `HashMap<alias, CancellationToken>` overwrote an existing entry when
+/// two requests targeted the same session, then let the older task remove the
+/// replacement entry during cleanup. Keeping operations and aliases in one lock
+/// makes single-flight admission and compare-by-operation cleanup indivisible.
+#[derive(Clone, Default)]
+struct ActiveChatRegistry {
+    inner: Arc<RwLock<ActiveChatIndex>>,
+}
+
+struct ActiveChatAdmission {
+    operation_id: String,
+    cancellation: CancellationToken,
+}
+
+/// Outcome of `subscribe_or_standby`: either attach to a running turn now
+/// (`Live`) or park until a turn is admitted for this session (`Standby`).
+enum WatchOutcome {
+    Live(tokio::sync::broadcast::Receiver<ChatEvent>),
+    Standby,
+}
+
+#[derive(Debug)]
+enum ActiveChatAdmissionError {
+    SessionBusy,
+    RequestBusy,
+}
+
+impl ActiveChatRegistry {
+    async fn admit(
+        &self,
+        session_id: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Result<ActiveChatAdmission, ActiveChatAdmissionError> {
+        self.admit_occupied(
+            session_id.map(str::to_string),
+            request_id.map(str::to_string),
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::admit`], plus an occupancy alias (compat `user` key) so a
+    /// first turn that has not yet bound a UUID still serializes the same client.
+    async fn admit_occupied(
+        &self,
+        session_id: Option<String>,
+        request_id: Option<String>,
+        occupancy: Option<String>,
+    ) -> Result<ActiveChatAdmission, ActiveChatAdmissionError> {
+        let mut index = self.inner.write().await;
+        if session_id
+            .as_deref()
+            .is_some_and(|alias| index.aliases.contains_key(alias))
+            || occupancy
+                .as_deref()
+                .is_some_and(|alias| index.aliases.contains_key(alias))
+        {
+            return Err(ActiveChatAdmissionError::SessionBusy);
+        }
+        if request_id
+            .as_deref()
+            .is_some_and(|alias| index.aliases.contains_key(alias))
+        {
+            return Err(ActiveChatAdmissionError::RequestBusy);
+        }
+
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let cancellation = CancellationToken::new();
+        let stop_gate = Arc::new(Mutex::new(false));
+        // 会话级游标起点：接着上一回合的序号继续走（严格单调递增）。
+        let seq_base = session_id
+            .as_deref()
+            .and_then(|sid| index.session_seq.get(sid).copied())
+            .unwrap_or(0);
+        // Capacity: expanded to 4096 to prevent Lagged event drops during heavy tool outputs / streaming.
+        let (event_bus, _) = tokio::sync::broadcast::channel(4096);
+        // Clone for waking standby watchers (the original moves into the operation).
+        let bus_for_drain = event_bus.clone();
+        let mut aliases = Vec::with_capacity(3);
+        for alias in [
+            session_id.as_deref(),
+            request_id.as_deref(),
+            occupancy.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !aliases.iter().any(|existing| existing == alias) {
+                aliases.push(alias.to_string());
+            }
+        }
+        for alias in &aliases {
+            index.aliases.insert(alias.clone(), operation_id.clone());
+        }
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        index.operations.insert(
+            operation_id.clone(),
+            ActiveChatOperation {
+                started_at,
+                session_id: session_id.clone(),
+                aliases,
+                cancellation: cancellation.clone(),
+                stop_gate,
+                finished: Arc::new(Notify::new()),
+                stopped: false,
+                terminal_reached: false,
+                event_bus,
+                admitted_user: None,
+                replay: Arc::new(std::sync::Mutex::new(Vec::new())),
+                seq_base,
+                steer_tx: None,
+                steer_client_ids: std::collections::VecDeque::new(),
+            },
+        );
+
+        // Wake any `/chat/watch` observers parked waiting for this session to
+        // start a turn (event-driven push instead of client polling).
+        if let Some(sid) = session_id.as_deref() {
+            let drained = Self::drain_standby_locked(&mut index, sid, &bus_for_drain);
+            if drained > 0 {
+                tracing::debug!(
+                    session_id = %sid,
+                    drained,
+                    "chat: drained standby watchers to live fan-out"
+                );
+            }
+        }
+
+        // 跨实例增量：新轮次开始 → 所有实例即时点亮该会话的活动状态。
+        if let Some(sid) = session_id.clone() {
+            publish_global(GlobalWireEvent::Activity {
+                session_id: sid,
+                running: true,
+                terminal: None,
+                status: None,
+            });
+        }
+
+        Ok(ActiveChatAdmission {
+            operation_id,
+            cancellation,
+        })
+    }
+
+    /// Clone the turn's event bus (for fan-out from the producer task).
+    async fn event_bus(
+        &self,
+        operation_id: &str,
+    ) -> Option<tokio::sync::broadcast::Sender<ChatEvent>> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .map(|op| op.event_bus.clone())
+    }
+
+    /// Event bus + shared replay log for a turn (fan-out records into `replay`).
+    async fn event_bus_with_replay(
+        &self,
+        operation_id: &str,
+    ) -> Option<(
+        tokio::sync::broadcast::Sender<ChatEvent>,
+        Arc<std::sync::Mutex<Vec<ChatEvent>>>,
+    )> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .map(|op| (op.event_bus.clone(), op.replay.clone()))
+    }
+
+    /// Broadcast an event to any live subscriber or parked standby watcher of `session_id`.
+    /// Used for out-of-turn differential mutations (rewrite, delete, truncate) so all
+    /// open tabs stay synchronized without polling or full-transcript reloads.
+    pub async fn broadcast_to_session(&self, session_id: &str, event: ChatEvent) {
+        let index = self.inner.read().await;
+        if let Some(operation_id) = index.aliases.get(session_id) {
+            if let Some(operation) = index.operations.get(operation_id) {
+                // 会话变更（删/改/截断）改写了权威转录：本回合的旧帧立即作废，
+                // 否则带旧游标或全量重连会把变更前发出的帧补回来（已删内容复活）。
+                if matches!(event, ChatEvent::SessionMutation { .. }) {
+                    operation
+                        .replay
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = operation.event_bus.send(event.clone());
+            }
+        }
+        if let Some(watchers) = index.standby_watchers.get(session_id) {
+            for tx in watchers {
+                let _ = tx.send(event.clone());
+            }
+        }
+    }
+
+    /// Snapshot of events so far for a late `/chat/watch` joiner.
+    /// Holds the replay lock while creating the broadcast subscription so no
+    /// event can land only on the bus (missed by both snapshot and subscriber).
+    async fn subscribe_live_with_replay(
+        &self,
+        session_id: &str,
+    ) -> Option<(
+        Vec<(u64, ChatEvent)>,
+        tokio::sync::broadcast::Receiver<ChatEvent>,
+    )> {
+        let index = self.inner.read().await;
+        let operation_id = index.aliases.get(session_id)?.clone();
+        let operation = index.operations.get(&operation_id)?;
+        if operation.terminal_reached || operation.stopped {
+            return None;
+        }
+        let guard = operation
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 游标就是缓冲序号（从 1 开始）：缓冲是追加式的（连续同身份合并只改最后一条的内容，
+        // 不改它的位置），所以同一个事件的 seq 永远稳定 —— 断点续传靠的就是这一点。
+        let mut snapshot: Vec<(u64, ChatEvent)> = guard
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (operation.seq_base + index as u64 + 1, event.clone()))
+            .collect();
+        let rx = operation.event_bus.subscribe();
+        drop(guard);
+        if let Some(ref admitted) = operation.admitted_user {
+            if !snapshot
+                .iter()
+                .any(|(_, e)| matches!(e, ChatEvent::User { .. }))
+            {
+                // 本轮提问的回声：不占游标（seq 0），因为它是幂等的用户气泡。
+                snapshot.insert(
+                    0,
+                    (
+                        operation.seq_base,
+                        ChatEvent::User {
+                            content: admitted.content.clone(),
+                            session_id: Some(session_id.to_string()),
+                            created_at: admitted
+                                .created_at
+                                .or((operation.started_at > 0).then_some(operation.started_at)),
+                            message_id: None,
+                            order: None,
+                            turn_ordinal: None,
+                        },
+                    ),
+                );
+            }
+        }
+        Some((snapshot, rx))
+    }
+
+    /// Unanswered permission / user-input prompts for an active session, derived
+    /// from the turn replay log. Empty when the session is idle or the turn has
+    /// already terminated.
+    async fn pending_interactive(
+        &self,
+        session_id: &str,
+    ) -> (Option<ChatEvent>, Option<ChatEvent>) {
+        let index = self.inner.read().await;
+        let Some(operation_id) = index.aliases.get(session_id) else {
+            return (None, None);
+        };
+        let Some(operation) = index.operations.get(operation_id) else {
+            return (None, None);
+        };
+        if operation.terminal_reached || operation.stopped {
+            return (None, None);
+        }
+        let guard = operation
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_interactive_from_replay(&guard)
+    }
+
+    /// True when the turn replay already closed `call_id` (result/output/terminal).
+    /// Stale `pending_permission.json` must not restore a card in that case.
+    async fn replay_resolves_call(&self, session_id: &str, call_id: &str) -> bool {
+        let index = self.inner.read().await;
+        let Some(operation_id) = index.aliases.get(session_id) else {
+            return false;
+        };
+        let Some(operation) = index.operations.get(operation_id) else {
+            return false;
+        };
+        let guard = operation
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        replay_resolves_call(&guard, call_id)
+    }
+
+    /// Subscribe to a session's turn **if one is already running**, otherwise
+    /// park the caller as a standby watcher so `admit` can wake it the instant an
+    /// API/native turn starts for this session. This is the event-driven path
+    /// that lets the WebUI observe an API turn without polling: the watch
+    /// connection stays open (SSE keepalive) while idle and is converted to a
+    /// live broadcast subscriber the moment a turn is admitted.
+    async fn subscribe_or_standby(
+        &self,
+        session_id: &str,
+        standby_tx: &mpsc::UnboundedSender<ChatEvent>,
+    ) -> WatchOutcome {
+        let mut index = self.inner.write().await;
+        if let Some(operation_id) = index.aliases.get(session_id).cloned() {
+            if let Some(operation) = index.operations.get(&operation_id) {
+                if !operation.terminal_reached && !operation.stopped {
+                    return WatchOutcome::Live(operation.event_bus.subscribe());
+                } else {
+                    index.aliases.remove(session_id);
+                }
+            } else {
+                index.aliases.remove(session_id);
+            }
+        }
+        // One standby slot per session: WebUI reconnect/refresh used to pile up
+        // many dead parkers (drained 4+), spamming admit logs and wasting tasks.
+        // Drop prior standby senders; their SSE side closes when the channel dies.
+        let entry = index
+            .standby_watchers
+            .entry(session_id.to_string())
+            .or_default();
+        entry.clear();
+        entry.push(standby_tx.clone());
+        WatchOutcome::Standby
+    }
+
+    /// Record the user message admitted for this turn so a *late* `/chat/watch`
+    /// subscriber (one that attaches after the broadcast, and therefore missed
+    /// the live `ChatEvent::User`) can replay it. The bus itself never replays.
+    async fn record_user_message(
+        &self,
+        operation_id: &str,
+        content: String,
+        created_at: Option<u64>,
+    ) {
+        if let Some(op) = self.inner.write().await.operations.get_mut(operation_id) {
+            let created = created_at.or((op.started_at > 0).then_some(op.started_at));
+            op.admitted_user = Some(AdmittedUser {
+                content,
+                created_at: created,
+            });
+        }
+    }
+
+    /// Resolve a session alias to its currently-admitted operation id.
+    async fn operation_for_session(&self, session_id: &str) -> Option<String> {
+        self.inner.read().await.aliases.get(session_id).cloned()
+    }
+
+    /// The user message admitted for `operation_id`, if the turn has already
+    /// recorded one (i.e. the turn started before this watcher subscribed).
+    async fn admitted_user_message(&self, operation_id: &str) -> Option<AdmittedUser> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .and_then(|op| op.admitted_user.clone())
+    }
+
+    async fn replay_admitted_user(&self, session_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+        let Some(operation_id) = self.operation_for_session(session_id).await else {
+            return;
+        };
+        let (admitted, started_at) = {
+            let index = self.inner.read().await;
+            let op = index.operations.get(&operation_id);
+            (
+                op.and_then(|o| o.admitted_user.clone()),
+                op.map(|o| o.started_at).unwrap_or(0),
+            )
+        };
+        let Some(admitted) = admitted else {
+            return;
+        };
+        let created_at = admitted
+            .created_at
+            .or((started_at > 0).then_some(started_at));
+        let _ = tx.send(ChatEvent::User {
+            content: admitted.content,
+            session_id: Some(session_id.to_string()),
+            created_at,
+            message_id: None,
+            order: None,
+            turn_ordinal: None,
+        });
+    }
+
+    /// Drain (wake) all standby watchers parked for `session_id`, converting
+    /// each to a live broadcast subscriber on `bus`. Called from `admit` while
+    /// still holding the write lock so no watcher can be added between the
+    /// alias insert and the drain.
+    fn drain_standby_locked(
+        index: &mut ActiveChatIndex,
+        session_id: &str,
+        bus: &tokio::sync::broadcast::Sender<ChatEvent>,
+    ) -> usize {
+        if let Some(watchers) = index.standby_watchers.remove(session_id) {
+            let n = watchers.len();
+            for tx in watchers {
+                let mut rx = bus.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => {
+                                let terminal = matches!(
+                                    event,
+                                    ChatEvent::Done { .. }
+                                        | ChatEvent::Error { .. }
+                                        | ChatEvent::Stopped
+                                );
+                                if tx.send(event).is_err() {
+                                    break;
+                                }
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+            n
+        } else {
+            0
+        }
+    }
+
+    /// Bind the runtime's canonical session id after a first-turn session has
+    /// been allocated (or a requested id has been resolved to its canonical id).
+    async fn bind_session(&self, operation_id: &str, session_id: &str) -> anyhow::Result<()> {
+        let mut index = self.inner.write().await;
+        if let Some(owner) = index.aliases.get(session_id) {
+            if owner != operation_id {
+                anyhow::bail!("chat session {session_id} became active while this turn started");
+            }
+        }
+        let operation = index
+            .operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow::anyhow!("chat operation is no longer active"))?;
+        operation.session_id = Some(session_id.to_string());
+        if !operation.aliases.iter().any(|alias| alias == session_id) {
+            operation.aliases.push(session_id.to_string());
+        }
+        index
+            .aliases
+            .insert(session_id.to_string(), operation_id.to_string());
+        Ok(())
+    }
+
+    /// Mark and cooperatively cancel an operation addressed by either alias.
+    async fn stop_alias(&self, alias: &str) -> bool {
+        let operation_id = {
+            let index = self.inner.read().await;
+            let Some(operation_id) = index.aliases.get(alias).cloned() else {
+                return false;
+            };
+            operation_id
+        };
+        self.stop_operation(&operation_id).await
+    }
+
+    /// Stop the occupant of `alias` (same path as WebUI `/chat/stop`) and wait
+    /// until it leaves the registry. `true` means the alias is idle (already
+    /// gone, or the cancelled turn finished). `false` means the timeout fired
+    /// while the previous turn was still persisting.
+    ///
+    /// `timeout = None` waits for the release to be real instead of timing out.
+    /// Send-now callers need that verdict: a hard cap there misreported
+    /// "still busy" for turns that were already releasing, which pushed the
+    /// user's message back into the queue. `Some(limit)` keeps the bounded
+    /// behaviour of the session-deletion paths.
+    async fn stop_and_wait(&self, alias: String, timeout: Option<Duration>) -> bool {
+        let operation_id = {
+            let index = self.inner.read().await;
+            let Some(operation_id) = index.aliases.get(&alias).cloned() else {
+                return true;
+            };
+            if !index.operations.contains_key(operation_id.as_str()) {
+                return true;
+            }
+            operation_id
+        };
+        self.stop_alias_owned(alias).await;
+        let await_release = async {
+            loop {
+                let finished = {
+                    let index = self.inner.read().await;
+                    match index.operations.get(&operation_id) {
+                        None => return,
+                        Some(operation) => operation.finished.clone(),
+                    }
+                };
+                let notified = finished.notified();
+                {
+                    let index = self.inner.read().await;
+                    if !index.operations.contains_key(&operation_id) {
+                        return;
+                    }
+                }
+                notified.await;
+            }
+        };
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, await_release).await.is_ok(),
+            // Unterminated wait: the operation always leaves the registry (the
+            // chat task completes even on panic), so this resolves, not hangs.
+            None => {
+                await_release.await;
+                true
+            }
+        }
+    }
+
+    async fn stop_alias_owned(&self, alias: String) -> bool {
+        let operation_id = {
+            let index = self.inner.read().await;
+            let Some(operation_id) = index.aliases.get(&alias).cloned() else {
+                return false;
+            };
+            operation_id
+        };
+        self.stop_operation(&operation_id).await
+    }
+
+    async fn stop_operation(&self, operation_id: &str) -> bool {
+        let (cancellation, stop_gate, op_session_id) = {
+            let index = self.inner.read().await;
+            let Some(operation) = index.operations.get(operation_id) else {
+                return false;
+            };
+            (
+                operation.cancellation.clone(),
+                operation.stop_gate.clone(),
+                operation.session_id.clone(),
+            )
+        };
+
+        // This is the stop/approval linearization point. If an approval already
+        // holds the gate, its runtime consumption wins and this stop follows it.
+        // Otherwise mark stopped before the cancellation token becomes visible,
+        // so a later approval cannot cross the runtime boundary.
+        {
+            let mut stopped = stop_gate.lock().await;
+            *stopped = true;
+        }
+        {
+            let mut index = self.inner.write().await;
+            if let Some(operation) = index.operations.get_mut(operation_id) {
+                operation.stopped = true;
+            }
+        }
+        cancellation.cancel();
+        if let Some(ref sid) = op_session_id {
+            zap_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(
+                sid,
+            );
+        } else {
+            zap_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
+        }
+        true
+    }
+
+    async fn stop_gate(&self, operation_id: &str) -> Option<Arc<Mutex<bool>>> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .map(|operation| operation.stop_gate.clone())
+    }
+
+    /// Compat latest-wins: if the session is busy, cancel the running turn
+    /// (bash/tools included), wait for snapshot persist + `complete`, then admit.
+    /// Retries until this caller occupies the aliases or `timeout` elapses.
+    ///
+    /// Takes `self` by value (cheap Arc clone) so axum handlers stay `Send`.
+    async fn admit_or_preempt(
+        self,
+        session_id: Option<String>,
+        occupancy: Option<String>,
+        timeout: Duration,
+    ) -> Result<ActiveChatAdmission, ActiveChatAdmissionError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match self
+                .admit_occupied(session_id.clone(), None, occupancy.clone())
+                .await
+            {
+                Ok(admission) => return Ok(admission),
+                Err(ActiveChatAdmissionError::RequestBusy) => {
+                    return Err(ActiveChatAdmissionError::RequestBusy);
+                }
+                Err(ActiveChatAdmissionError::SessionBusy) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ActiveChatAdmissionError::SessionBusy);
+                    }
+                    // The occupant may be keyed by UUID, by the compat `user`
+                    // alias, or both. A first turn often occupies only the user
+                    // key until `bind_session` lands — stopping only the UUID
+                    // would spin until timeout.
+                    let mut keys = Vec::new();
+                    if let Some(sid) = session_id.clone() {
+                        keys.push(sid);
+                    }
+                    if let Some(occ) = occupancy.clone() {
+                        keys.push(occ);
+                    }
+                    if !self.stop_and_wait_any(keys, remaining).await {
+                        return Err(ActiveChatAdmissionError::SessionBusy);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn stop_and_wait_any(&self, aliases: Vec<String>, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut saw_alias = false;
+        for alias in aliases {
+            saw_alias = true;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if !self.stop_and_wait(alias, Some(remaining)).await {
+                return false;
+            }
+        }
+        saw_alias
+    }
+
+    async fn was_stopped(&self, operation_id: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .is_some_and(|operation| operation.stopped)
+    }
+
+    async fn session_id(&self, operation_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .await
+            .operations
+            .get(operation_id)
+            .and_then(|operation| operation.session_id.clone())
+    }
+
+    /// Attach the turn's steer inbox. Lookup is by any alias (session id or request id).
+    async fn install_steer(
+        &self,
+        operation_id: &str,
+        tx: mpsc::UnboundedSender<live_api::ChatSteerSignal>,
+    ) {
+        let mut index = self.inner.write().await;
+        if let Some(operation) = index.operations.get_mut(operation_id) {
+            operation.steer_tx = Some(tx);
+        }
+    }
+
+    async fn steer_sender(
+        &self,
+        alias: &str,
+    ) -> Option<mpsc::UnboundedSender<live_api::ChatSteerSignal>> {
+        let index = self.inner.read().await;
+        let operation_id = index.aliases.get(alias)?;
+        index.operations.get(operation_id)?.steer_tx.clone()
+    }
+
+    /// Record a `/chat/steer` submit's client correlation id (FIFO; `None` when
+    /// the client sent none) so the turn projection can echo it on `steered`.
+    async fn record_steer_client_id(&self, alias: &str, client_input_id: Option<String>) {
+        let mut index = self.inner.write().await;
+        if let Some(operation_id) = index.aliases.get(alias).cloned() {
+            if let Some(operation) = index.operations.get_mut(&operation_id) {
+                operation.steer_client_ids.push_back(client_input_id);
+            }
+        }
+    }
+
+    /// Drain up to `count` recorded steer client ids for the operation (FIFO),
+    /// padding with `None` so the returned list always aligns 1:1 with the folded
+    /// inputs reported by the kernel.
+    async fn take_steer_client_ids(&self, operation_id: &str, count: usize) -> Vec<Option<String>> {
+        let mut index = self.inner.write().await;
+        let Some(operation) = index.operations.get_mut(operation_id) else {
+            return Vec::new();
+        };
+        (0..count)
+            .map(|_| operation.steer_client_ids.pop_front().unwrap_or(None))
+            .collect()
+    }
+
+    /// Remove only the exact operation that finished. A late cleanup from an
+    /// older generation can never erase a replacement operation's aliases.
+    async fn complete(&self, operation_id: &str) -> bool {
+        let mut index = self.inner.write().await;
+        let Some(operation) = index.operations.remove(operation_id) else {
+            return false;
+        };
+        // 会话级游标推进：把本回合已发出的帧数累加进去，下一回合从更高的序号开始。
+        // 严格单调递增，且与上下文/压缩无关。
+        let turn_frames = operation
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        let next_base = operation.seq_base + turn_frames;
+        for alias in &operation.aliases {
+            index.session_seq.insert(alias.clone(), next_base);
+        }
+        for alias in operation.aliases {
+            if index
+                .aliases
+                .get(&alias)
+                .is_some_and(|owner| owner == operation_id)
+            {
+                index.aliases.remove(&alias);
+            }
+        }
+        operation.finished.notify_waiters();
+        // 跨实例增量：操作结束 → 活动状态回落（不触发任何整表重拉）。
+        if let Some(sid) = operation.session_id.clone() {
+            publish_global(GlobalWireEvent::Activity {
+                session_id: sid,
+                running: false,
+                terminal: None,
+                status: None,
+            });
+        }
+        true
+    }
+
+    /// Mark that a terminal event (Done, Stopped, or Error) has been emitted.
+    /// Immediately excludes this operation from `active_session_ids` so the UI
+    /// spinner stops rotating without waiting for background handle.shutdown() or task join.
+    async fn mark_terminal(&self, operation_id: &str) {
+        let mut index = self.inner.write().await;
+        if let Some(op) = index.operations.get_mut(operation_id) {
+            op.terminal_reached = true;
+        }
+    }
+
+    async fn active_session_ids(&self) -> Vec<String> {
+        let mut sessions: Vec<String> = self
+            .inner
+            .read()
+            .await
+            .operations
+            .values()
+            .filter(|operation| !operation.terminal_reached)
+            .filter_map(|operation| operation.session_id.clone())
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        sessions
+    }
+
+    async fn has_active_operations(&self) -> bool {
+        !self.inner.read().await.operations.is_empty()
+    }
+
+    #[cfg(test)]
+    async fn cancel_all(&self) {
+        let cancellations: Vec<(CancellationToken, Arc<Mutex<bool>>)> = self
+            .inner
+            .read()
+            .await
+            .operations
+            .values()
+            .map(|operation| (operation.cancellation.clone(), operation.stop_gate.clone()))
+            .collect();
+        for (cancellation, stop_gate) in cancellations {
+            *stop_gate.lock().await = true;
+            cancellation.cancel();
+        }
+    }
+}
+
+const DANGEROUS_TOOLS_ENV: &str = "JEIKCODE_DAEMON_ENABLE_DANGEROUS_TOOLS";
+
+/// RAII guard that decrements `active_connections` on drop, ensuring the counter
+/// is always decremented even if the SSE client disconnects abruptly (TCP RST).
+struct SseConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+/// Truncate a value for diagnostic logging, cutting at a char boundary so a
+/// multi-byte (CJK etc.) argument never panics `&s[..n]`.
+fn log_truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(max + 3);
+    for ch in value.chars().take(max) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// Scan a turn's replay log for interactive prompts that are still unanswered.
+/// Used by `GET /chat/pending` so a refreshed WebUI can restore approval /
+/// user-input cards even if it misses the SSE edge that first emitted them.
+///
+/// A `PermissionRequest` is still pending when no later `ToolCallResult` (or
+/// terminal) has closed that `call_id`. A `UserInputRequest` is pending until
+/// a later `request_user_input` tool result or the turn ends — TUI/live can
+/// answer or decline without a dedicated chat-bus resolve event.
+fn pending_interactive_from_replay(events: &[ChatEvent]) -> (Option<ChatEvent>, Option<ChatEvent>) {
+    // A PermissionRequest is only "answered" by a resolution event that occurs
+    // AFTER it (by index). A tool that started / produced output / returned a
+    // result BEFORE the request cannot be what answered it, so a genuinely
+    // unanswered card (the request being the newest event) is still restored.
+    // This preserves the in-flight-tool-switch guard (a resolved tool is never
+    // re-toasted) while no longer dropping an unanswered request that happens to
+    // share a call id with an earlier ToolCallStarted.
+    let mut last_permission: Option<(usize, ChatEvent)> = None;
+    let mut last_user_input: Option<ChatEvent> = None;
+    let mut last_resolution: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut turn_terminal = false;
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            ChatEvent::ToolCallStarted { id, .. } => {
+                // Tool already started running — approval was granted / not needed.
+                last_resolution.insert(id.clone(), index);
+            }
+            ChatEvent::ToolCallResult { id, name, .. } => {
+                last_resolution.insert(id.clone(), index);
+                if name == "request_user_input" {
+                    last_user_input = None;
+                }
+            }
+            ChatEvent::ToolOutputChunk { id, .. } => {
+                // Output means the tool already started — approval was granted.
+                last_resolution.insert(id.clone(), index);
+            }
+            ChatEvent::Done { .. } | ChatEvent::Stopped | ChatEvent::Error { .. } => {
+                turn_terminal = true;
+            }
+            ChatEvent::PermissionRequest { .. } => {
+                last_permission = Some((index, event.clone()));
+            }
+            ChatEvent::UserInputRequest { .. } => {
+                last_user_input = Some(event.clone());
+            }
+            _ => {}
+        }
+    }
+    if turn_terminal {
+        return (None, None);
+    }
+    let permission = last_permission.and_then(|(req_index, ev)| match &ev {
+        ChatEvent::PermissionRequest { call_id, .. } => {
+            let answered = last_resolution
+                .get(call_id)
+                .is_some_and(|&res_index| res_index > req_index);
+            (!answered).then_some(ev)
+        }
+        _ => None,
+    });
+    let user_input = last_user_input;
+    (permission, user_input)
+}
+
+fn replay_resolves_call(events: &[ChatEvent], call_id: &str) -> bool {
+    events.iter().any(|event| match event {
+        ChatEvent::ToolCallStarted { id, .. }
+        | ChatEvent::ToolCallResult { id, .. }
+        | ChatEvent::ToolOutputChunk { id, .. } => id == call_id,
+        ChatEvent::Done { .. } | ChatEvent::Stopped | ChatEvent::Error { .. } => true,
+        _ => false,
+    })
+}
+
+/// 全局失效总线（跨实例推送）。
+///
+/// 现有推送通道都是「按会话」的：`SessionRuntimeRegistry` 每个会话一条
+/// broadcast（订阅必须带 session_id），`LiveViewHub` 只绑定一个执行会话，
+/// `/chat/watch` 同样需要指定会话。于是「实例 B」无从得知「实例 A 新建/删除了
+/// 会话、某会话弹出了审批/提问卡」——只能靠窗口聚焦重拉（历史上的 15s 轮询
+/// 兜底已被拔除）。这里补上唯一缺失的一环：一条进程级全局广播 + `/events`。
+///
+/// 只发「失效信号」（不发 payload 副本）：客户端收到后单次重拉既有接口，
+/// 保证实时性的同时让数据形状与一致性仍由单一数据源决定。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum GlobalWireEvent {
+    /// 会话行新增/更新（新建、改名、回合完成后的 updated_at/message_count）。
+    /// 客户端按 id 就地 upsert，不重拉列表。
+    #[serde(rename = "session_upsert")]
+    SessionUpsert { session: SessionRowWire },
+    /// 会话删除（含批量）：客户端就地删行并丢弃该 id 的本地缓存。
+    #[serde(rename = "session_deleted")]
+    SessionDeleted {
+        session_id: String,
+        project_hash: String,
+    },
+    /// 活动/转圈变化；`terminal` 非空时同时携带终态供右下角通知去重；`status` 可携带 "compacting" 等阶段状态。
+    #[serde(rename = "activity")]
+    Activity {
+        session_id: String,
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// 某会话弹出待交互卡片（审批/提问）。只带会话 id，客户端对该会话做一次
+    /// 定向 pending 拉取（单会话、小请求），避免重拉整表。
+    #[serde(rename = "review_asked")]
+    ReviewAsked { session_id: String },
+    /// 待交互卡片已解决：客户端直接就地移除卡片。
+    #[serde(rename = "review_resolved")]
+    ReviewResolved {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+    },
+    /// 全局配置热重载（如 CLI 执行 jeikcode ghimg 或后台变更）。
+    #[serde(rename = "config_reloaded")]
+    ConfigReloaded,
+    /// Git 仓库状态变更（discard / stage / commit / pull / fetch / checkout 等），跨设备全量广播
+    #[serde(rename = "git_updated")]
+    GitUpdated { cwd: String },
+    /// 终端会话状态变更（创建 / 关闭 / 清空），项目级跨设备全局广播
+    #[serde(rename = "terminal_updated")]
+    TerminalUpdated { cwd: String },
+}
+
+/// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
+/// 客户端按 `id` 就地 upsert。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SessionRowWire {
+    pub id: String,
+    pub name: String,
+    pub working_dir: String,
+    pub project_hash: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: u32,
+    pub origin: String,
+}
+
+/// Build the incremental session row for one stored session. `None` when the
+/// aggregate is not (yet) durable.
+pub(crate) fn session_row_wire(
+    working_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    let manager = NativeSessionManager::for_project(working_dir);
+    let meta = manager.read_meta(session_id).ok()?;
+    let origin = match meta.origin {
+        zap_capabilities::session::SessionOrigin::Manual => "manual",
+        zap_capabilities::session::SessionOrigin::Scheduled => "scheduled",
+        zap_capabilities::session::SessionOrigin::Protocol => "protocol",
+    };
+    Some(SessionRowWire {
+        id: session_id.to_string(),
+        name: meta.name.clone(),
+        working_dir: meta.working_dir.clone(),
+        project_hash: response_project_hash(std::path::Path::new(&meta.working_dir)),
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0),
+        updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
+        message_count: meta.message_count,
+        origin: origin.to_string(),
+    })
+}
+
+/// Same row, addressed by project bucket instead of a working dir (catalog
+/// mutation helpers already hold the bucket).
+pub(crate) fn session_row_wire_in_bucket(
+    project_bucket: &str,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_bucket));
+    let meta = manager.read_meta(session_id).ok()?;
+    let origin = match meta.origin {
+        zap_capabilities::session::SessionOrigin::Manual => "manual",
+        zap_capabilities::session::SessionOrigin::Scheduled => "scheduled",
+        zap_capabilities::session::SessionOrigin::Protocol => "protocol",
+    };
+    Some(SessionRowWire {
+        id: session_id.to_string(),
+        name: meta.name.clone(),
+        working_dir: meta.working_dir.clone(),
+        project_hash: project_bucket.to_string(),
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0),
+        updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
+        message_count: meta.message_count,
+        origin: origin.to_string(),
+    })
+}
+
+/// 推送一条会话行的增量快照（读 meta 失败即静默跳过：下次事件/冷启动收敛）。
+pub(crate) fn publish_session_upsert(working_dir: &std::path::Path, session_id: &str) {
+    if let Some(session) = session_row_wire(working_dir, session_id) {
+        publish_global(GlobalWireEvent::SessionUpsert { session });
+    }
+}
+
+const GLOBAL_EVENTS_CAP: usize = 256;
+
+/// Process-wide invalidation bus shared by every connected client instance.
+pub(crate) fn global_events() -> &'static tokio::sync::broadcast::Sender<GlobalWireEvent> {
+    static BUS: std::sync::OnceLock<tokio::sync::broadcast::Sender<GlobalWireEvent>> =
+        std::sync::OnceLock::new();
+    BUS.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(GLOBAL_EVENTS_CAP);
+        tx
+    })
+}
+
+/// Broadcast an invalidation signal. No subscribers / lagged receivers are fine:
+/// the next invalidation (or a client's cold start) reconciles the state.
+pub(crate) fn publish_global(event: GlobalWireEvent) {
+    let _ = global_events().send(event);
+}
+
+/// `/events` 的挂载点。单独抽成 helper，生产路由与测试共用同一份定义：
+/// 路由一旦被从生产路由上拿掉，`global_events_route_tests` 会立即失败。
+pub(crate) fn with_global_events_route<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.route("/events", get(global_events_stream))
+}
+
+/// GET /events — cross-instance invalidation stream (SSE).
+///
+/// The first frame is `{"type":"sync"}` so a connecting client performs one
+/// cold-start alignment; afterwards only real changes are pushed.
+async fn global_events_stream() -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt as _;
+    use std::convert::Infallible;
+
+    let mut rx = global_events().subscribe();
+    let (tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let _ = tx.send(serde_json::json!({ "type": "sync" }).to_string());
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => match serde_json::to_string(&event) {
+                    Ok(json) => {
+                        if tx.send(json).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx)
+        .map(|json| Ok::<Event, Infallible>(Event::default().data(json)));
+    let mut resp = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp
+}
+
+/// Append `event` to the turn replay log, coalescing consecutive text/reasoning
+/// deltas so a long stream does not allocate one Vec entry per token.
+///
+/// Coalescing is IDENTITY-SCOPED: two deltas may merge only when they carry the
+/// same `message_id`/`part_id`. Merging across identities used to fuse a later
+/// round's tail into an earlier round's entry, so a watch/live replay repainted
+/// that text under the WRONG stored message (ghost rounds + misplaced text).
+fn push_chat_replay(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
+    match (&event, buf.last_mut()) {
+        (
+            ChatEvent::TextDelta {
+                content,
+                message_id,
+                part_id,
+                ..
+            },
+            Some(ChatEvent::TextDelta {
+                content: prev,
+                message_id: prev_message_id,
+                part_id: prev_part_id,
+                ..
+            }),
+        ) if message_id == prev_message_id && part_id == prev_part_id => {
+            prev.push_str(content);
+        }
+        (
+            ChatEvent::ReasoningDelta {
+                content,
+                message_id,
+                part_id,
+                ..
+            },
+            Some(ChatEvent::ReasoningDelta {
+                content: prev,
+                message_id: prev_message_id,
+                part_id: prev_part_id,
+                ..
+            }),
+        ) if message_id == prev_message_id && part_id == prev_part_id => {
+            prev.push_str(content);
+        }
+        (
+            ChatEvent::ToolOutputChunk { id, chunk },
+            Some(ChatEvent::ToolOutputChunk {
+                id: prev_id,
+                chunk: prev,
+            }),
+        ) if id == prev_id => {
+            prev.push_str(chunk);
+        }
+        _ => buf.push(event),
+    }
+}
+
+/// Bridge a producer channel so every `ChatEvent` reaches both the primary SSE
+/// client **and** any `/chat/watch` subscribers on the turn's broadcast bus.
+///
+/// When `replay` is set, each event is also recorded (coalesced) so late watchers
+/// can rehydrate the full turn after a browser refresh.
+pub(crate) fn fanout_chat_events(
+    primary: mpsc::UnboundedSender<ChatEvent>,
+    bus: tokio::sync::broadcast::Sender<ChatEvent>,
+    replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
+) -> mpsc::UnboundedSender<ChatEvent> {
+    fanout_chat_events_for_session(primary, bus, replay, None, None)
+}
+
+/// Like [`fanout_chat_events`], but also mirrors stream events into the L2
+/// `SessionRuntimeRegistry` so `/live?session_id=` viewers see `/chat` / OpenAI
+/// compat turns on the same session.
+pub(crate) fn fanout_chat_events_for_session(
+    primary: mpsc::UnboundedSender<ChatEvent>,
+    bus: tokio::sync::broadcast::Sender<ChatEvent>,
+    replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
+    session_id: Option<String>,
+    working_dir: Option<std::path::PathBuf>,
+) -> mpsc::UnboundedSender<ChatEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
+    tokio::spawn(async move {
+        let mut current_sid = session_id;
+        let current_wd = working_dir;
+        while let Some(event) = rx.recv().await {
+            match &event {
+                ChatEvent::ToolCallStarted {
+                    name, arguments, ..
+                } => {
+                    tracing::info!(
+                        tool = %name,
+                        args = %log_truncate(arguments, 300),
+                        "chat: tool call started"
+                    );
+                }
+                ChatEvent::PermissionRequest {
+                    session_id,
+                    tool_name,
+                    call_id,
+                    ..
+                } => {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        call_id = %call_id,
+                        "chat: PERMISSION REQUEST emitted (approval round-trip)"
+                    );
+                    publish_global(GlobalWireEvent::ReviewAsked {
+                        session_id: session_id.clone(),
+                    });
+                }
+                ChatEvent::UserInputRequest { session_id, .. } => {
+                    tracing::warn!(
+                        "chat: user_input_request emitted (model asked a structured question)"
+                    );
+                    publish_global(GlobalWireEvent::ReviewAsked {
+                        session_id: session_id.clone(),
+                    });
+                }
+                ChatEvent::User { session_id, .. } => {
+                    let sid = session_id.clone().or_else(|| current_sid.clone());
+                    if let Some(sid) = sid {
+                        publish_global(GlobalWireEvent::Activity {
+                            session_id: sid,
+                            running: true,
+                            terminal: None,
+                            status: None,
+                        });
+                    }
+                }
+                ChatEvent::Done {
+                    session_id,
+                    stop_reason,
+                    ..
+                } => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        stop_reason = ?stop_reason,
+                        "chat: turn done"
+                    );
+                    if current_sid.is_none() {
+                        current_sid = Some(session_id.clone());
+                    }
+                    publish_global(GlobalWireEvent::Activity {
+                        session_id: session_id.clone(),
+                        running: false,
+                        terminal: Some(chat_done_terminal_label(stop_reason.as_deref())),
+                        status: None,
+                    });
+                    if let Some(wd) = current_wd.clone() {
+                        publish_session_upsert(&wd, session_id);
+                    }
+                }
+                ChatEvent::Stopped | ChatEvent::Error { .. } => {
+                    if matches!(event, ChatEvent::Stopped) {
+                        tracing::info!("chat: turn stopped");
+                    }
+                    if let Some(sid) = current_sid.clone() {
+                        publish_global(GlobalWireEvent::Activity {
+                            session_id: sid,
+                            running: false,
+                            terminal: Some("stopped"),
+                            status: None,
+                        });
+                    }
+                }
+                ChatEvent::ToolCallResult { name, success, .. } => {
+                    tracing::info!(tool = %name, success, "chat: tool result");
+                }
+                ChatEvent::SessionAssigned { session_id }
+                | ChatEvent::SessionRenamed { session_id, .. } => {
+                    if current_sid.is_none() {
+                        current_sid = Some(session_id.clone());
+                    }
+                    if let Some(wd) = current_wd.clone() {
+                        publish_session_upsert(&wd, session_id);
+                    }
+                }
+                _ => {}
+            }
+            let effective_sid = match &event {
+                ChatEvent::SessionAssigned { session_id } => Some(session_id.as_str()),
+                ChatEvent::Done { session_id, .. } => Some(session_id.as_str()),
+                ChatEvent::SessionRenamed { session_id, .. } => Some(session_id.as_str()),
+                _ => current_sid.as_deref(),
+            };
+            if let Some(sid) = effective_sid {
+                mirror_chat_event_to_registry(sid, &event);
+            }
+            if let Some(ref replay) = replay {
+                let mut guard = replay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                push_chat_replay(&mut guard, event.clone());
+                let _ = bus.send(event.clone());
+            } else {
+                let _ = bus.send(event.clone());
+            }
+            let _ = primary.send(event);
+        }
+    });
+    tx
+}
+
+fn mirror_chat_event_to_registry(session_id: &str, event: &ChatEvent) {
+    use zap_coding::session_runtime_registry::{SessionRuntimeRegistry, SessionViewEvent};
+    use zap_kernel::event::AgentEvent;
+    let reg = SessionRuntimeRegistry::global();
+    let working_dir = reg
+        .lookup(&session_id.to_string())
+        .map(|e| e.working_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = reg.open_or_attach(session_id.to_string(), working_dir);
+    match event {
+        ChatEvent::TextDelta { content, .. } => {
+            let _ = reg.push_runtime_event(
+                &session_id.to_string(),
+                0,
+                CodingRuntimeEvent::Agent(AgentEvent::TextDelta(content.clone())),
+            );
+        }
+        ChatEvent::ReasoningDelta { content, .. } => {
+            let _ = reg.push_runtime_event(
+                &session_id.to_string(),
+                0,
+                CodingRuntimeEvent::Agent(AgentEvent::Reasoning(content.clone())),
+            );
+        }
+        ChatEvent::User { content, .. } => {
+            let _ = reg.push_view_event(
+                &session_id.to_string(),
+                SessionViewEvent::InputAccepted {
+                    input: zap_coding::UserInput::from(content.as_str()),
+                    client_input_id: None,
+                },
+            );
+        }
+        ChatEvent::PermissionRequest { .. } => {
+            let _ = reg.set_activity(
+                &session_id.to_string(),
+                zap_coding::session_runtime_registry::RuntimeActivity::WaitingApproval,
+            );
+        }
+        ChatEvent::UserInputRequest { .. } => {
+            let _ = reg.set_activity(
+                &session_id.to_string(),
+                zap_coding::session_runtime_registry::RuntimeActivity::WaitingUserInput,
+            );
+        }
+        ChatEvent::Done { stop_reason, .. } => {
+            let _ = reg.note_terminal(
+                &session_id.to_string(),
+                chat_done_terminal_label(stop_reason.as_deref()),
+            );
+        }
+        ChatEvent::Stopped => {
+            let _ = reg.note_terminal(&session_id.to_string(), "stopped");
+        }
+        ChatEvent::Error { .. } => {
+            let _ = reg.note_terminal(&session_id.to_string(), "failed");
+        }
+        _ => {}
+    }
+}
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Combined app state for Axum
+#[derive(Clone)]
+pub struct AppState {
+    pub project: ProjectStateStore,
+    /// Admitted background chat operations and their session/request aliases.
+    active_chats: ActiveChatRegistry,
+    /// MCP server registry (global, used for /mcp/status backward compat)
+    pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
+    /// Per-project MCP connection pool (shared across chat runtimes in this process).
+    pub mcp_pool: Arc<zap_capabilities::mcp::ProjectMcpPool>,
+    /// Process-unique generation for invalidating daemon-owned operation IDs.
+    pub(crate) daemon_instance_id: Arc<str>,
+    /// Shared telemetry handle (R1.4)
+    pub telemetry: Arc<Telemetry>,
+    /// Repo origin detected at daemon launch (R4.2)
+    pub repo_origin: RepoOrigin,
+    /// Sender to trigger graceful shutdown via POST /shutdown (R7.1, R7.2)
+    pub shutdown_tx: watch::Sender<bool>,
+    /// Timestamp (unix ms) of last non-health HTTP request — used for idle timeout
+    pub last_activity: Arc<std::sync::atomic::AtomicI64>,
+    /// Number of active SSE streaming connections (chat in progress)
+    pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// 本地 webui 一次性 token 存储（Phase 1）
+    pub webui_tokens: auth_token::WebuiTokenStore,
+    /// 仅 webui 模式（启动时提供了 token store）强制 token 鉴权；
+    /// 独立 daemon / VSCode 实例不强制，保持原行为。
+    /// 临时远程访问启用带 token 的监听时可动态开启。
+    pub enforce_token: Arc<std::sync::atomic::AtomicBool>,
+    pub initial_enforce_token: bool,
+    /// App 远程访问模式的期望 user_id（来自二维码 token 前缀）。
+    /// 非空时强制校验每条请求的 `X-JeikCode-User-Id` 头，与桌面端登录账号一致才放行。
+    /// 空串表示不校验（未登录 / 非 app 模式）。
+    pub app_user_id: String,
+    /// webui 交互式权限：session_id -> decider response 发送端
+    pub pending_permissions: permission_bridge::PermissionResponders,
+    /// `/chat` structured user-input answers, keyed by (session_id, native request_id).
+    pub pending_user_inputs: permission_bridge::UserInputResponders,
+    /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
+    pub bind_host: String,
+    pub bind_port: u16,
+    /// Workspace the OpenAI / Responses / Anthropic protocol surface is pinned
+    /// to: the directory this process was started in (`jeikcode serve --host
+    /// --port` cwd, or `working_dir_override`). WebUI multi-project switches
+    /// update `project` for the session panel; they must not move protocol
+    /// conversations into the first sidebar project.
+    pub bind_working_dir: PathBuf,
+    /// This instance's port-scoped webui cookie name (`jeikcode_webui_<port>`),
+    /// resolved ONCE at construction from the actual bound port. Read it directly
+    /// — never re-derive the name from the bare `WEBUI_COOKIE` const at a call
+    /// site, or that site silently fails to authenticate (a sibling `/webui` on a
+    /// different localhost port would shadow the shared-jar cookie). See
+    /// [`auth_token::webui_cookie_name`].
+    pub webui_cookie_name: String,
+    /// Serve `--yolo`: auto-approve tools and unmount `request_user_input`.
+    /// When true, no permission / user-input modal can stall an API or WebUI turn.
+    pub yolo: bool,
+    /// Temporary remote access turned token checks off for this process.
+    pub token_optional: Arc<std::sync::atomic::AtomicBool>,
+    /// Router cloned into an extra listener opened from the WebUI.
+    pub http_router: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The extra listener, if the WebUI opened one.
+    pub extra_remote: Arc<std::sync::Mutex<Option<ExtraRemoteBind>>>,
+}
+
+/// A second bind opened from the WebUI remote-access control.
+pub struct ExtraRemoteBind {
+    pub host: String,
+    pub port: u16,
+    pub aborts: Vec<tokio::task::AbortHandle>,
+    pub token: Option<String>,
+}
+
+impl ExtraRemoteBind {
+    pub fn abort_all(&self) {
+        for handle in &self.aborts {
+            handle.abort();
+        }
+    }
+}
+
+impl AppState {
+    #[inline]
+    pub fn is_token_enforced(&self) -> bool {
+        self.enforce_token
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 检查指定会话当前是否处于活动运行中（如第一轮审查正在执行中）
+    pub async fn is_session_active(&self, session_id: &str) -> bool {
+        self.active_chats
+            .active_session_ids()
+            .await
+            .iter()
+            .any(|id| id == session_id)
+    }
+
+    /// 将新消息安全存入目标会话的代发卡片队列，并自动触发总线向前后端广播 QueueUpdated 事件
+    pub async fn push_to_session_queue(&self, session_id: &str, text: &str) {
+        let sid = session_id.trim().to_string();
+        if sid.is_empty() {
+            return;
+        }
+        let map = get_session_queues_map().await;
+        let mut writer = map.write().await;
+        let list = writer.entry(sid.clone()).or_default();
+        list.push(QueuedMessageItem {
+            id: serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+            text: text.to_string(),
+            images: None,
+            kind: "queue".to_string(),
+            approval_mode: None,
+        });
+        let cloned_list = list.clone();
+        if let Some(path) = session_queue_file_path(&sid) {
+            if let Ok(json_str) = serde_json::to_string_pretty(&cloned_list) {
+                let _ = tokio::fs::write(path, json_str).await;
+            }
+        }
+        let value_items: Vec<serde_json::Value> = cloned_list
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap_or_default())
+            .collect();
+        self.active_chats
+            .broadcast_to_session(
+                &sid,
+                ChatEvent::QueueUpdated {
+                    session_id: sid.clone(),
+                    items: value_items,
+                },
+            )
+            .await;
+    }
+}
+
+/// Cached MCP registry for a specific project directory.
+pub use zap_capabilities::mcp::CachedMcpRegistry;
+
+/// Maximum number of per-project MCP registries to cache.
+pub use zap_capabilities::mcp::MCP_CACHE_MAX;
+
+/// Get default working directory
+fn default_working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Initialize project state from config or default
+/// Decide the initial working directory.
+///
+/// Precedence: an explicit launch-time override (if it exists) wins over the
+/// configured `default_workdir` (if it exists), which wins over the process
+/// cwd. The override exists so the in-process `jeikcode webui` launcher can
+/// pin the daemon to the directory the user actually ran the command from,
+/// rather than inheriting a stale `default_workdir` (e.g. a leftover `/tmp`).
+fn resolve_initial_working_dir(
+    override_dir: Option<PathBuf>,
+    config_default: Option<PathBuf>,
+    cwd: PathBuf,
+) -> PathBuf {
+    if let Some(o) = override_dir {
+        if o.exists() {
+            return o;
+        }
+    }
+    if let Some(d) = config_default {
+        if d.exists() {
+            return d;
+        }
+    }
+    cwd
+}
+
+/// Fold the working directory to its true on-disk case so the webui footer and
+/// newly-created sessions don't drift (e.g. a launcher passing `C:\users\danan`
+/// for a dir the history recorded as `C:\Users\danan`).
+///
+/// Windows-only, and guarded: it adopts the canonical form ONLY when that form
+/// maps to the SAME session bucket as the input. On Windows `hash_path` already
+/// lowercases, so a pure case-fold never changes the bucket — but a junction /
+/// symlink whose resolution WOULD change the bucket (and thus hide existing
+/// sessions) is left untouched. Other platforms keep the path verbatim to avoid
+/// symlink-resolution surprises and bucket orphaning (`hash_path` does not fold
+/// case off Windows).
+#[cfg(windows)]
+pub(crate) fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&p) {
+        Ok(c) => {
+            let c = zap_capabilities::pathnorm::strip_verbatim_path(&c);
+            if hash_path(&c) == hash_path(&p) {
+                c
+            } else {
+                p
+            }
+        }
+        Err(_) => p,
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn normalize_working_dir_case(p: PathBuf) -> PathBuf {
+    p
+}
+
+fn init_project_state(override_dir: Option<PathBuf>) -> ProjectState {
+    let config_default = Config::load(&Config::default_path())
+        .ok()
+        .and_then(|c| c.default_workdir.map(PathBuf::from));
+    // A TUI sharing its runtime via `/webui` / `/sync` registered its embedded binding in
+    // THIS (in-process) daemon BEFORE the server started. Its working dir is the user's
+    // ACTUAL directory, unlike the caller's `current_dir()` override (just where the
+    // process launched). Prefer it so the webui footer + session list seed from the TUI's
+    // project instead of the process cwd. `/cd` keeps `state.project` current afterward via
+    // `live_set_working_dir`, so the read path (GET /project) stays authoritative.
+    let embedded_dir = crate::native_live::embedded_binding().map(|binding| binding.working_dir);
+    let path = normalize_working_dir_case(resolve_initial_working_dir(
+        embedded_dir.or(override_dir),
+        config_default,
+        default_working_dir(),
+    ));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+    ProjectState {
+        working_dir: path,
+        previous_dir: None,
+        recent_dirs: vec![],
+        name,
+    }
+}
+/// Artifact info for API response
+#[derive(Debug, Serialize, Clone)]
+pub struct ArtifactInfo {
+    pub id: String,
+    pub artifact_type: String, // "html", "svg", "mermaid", "code"
+    pub title: Option<String>,
+    pub language: Option<String>,
+    pub content: String,
+}
+
+/// Tool call info for API response
+#[derive(Debug, Serialize)]
+pub struct ToolCallInfo {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub display: String,
+}
+
+/// Tool result info for API response
+#[derive(Debug, Serialize)]
+pub struct ToolResultInfo {
+    pub call_id: String,
+    pub success: bool,
+    pub summary: String,
+    pub line_count: usize,
+}
+
+/// Message info for API response
+#[derive(Debug, Serialize)]
+pub struct MessageInfo {
+    pub role: String,
+    /// Stable per-message identity from the kernel `Message.id` (SIDECAR). Lets
+    /// WebUI cache/disk/wire agree on the same handle. Absent for messages
+    /// persisted before the field existed. ADDITIVE: `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub content: String,
+    /// The model's reasoning/thinking for an ASSISTANT message — persisted
+    /// losslessly in the kernel `Message.reasoning` but until now dropped at
+    /// the API boundary, so a WebUI reload lost all earlier thinking and only
+    /// showed whatever reasoning streamed in after the refresh. Now serialized
+    /// so history (getSession / session detail) can re-render the full chain
+    /// of thought.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// True when a `Role::User` message was injected by the agent/runtime rather
+    /// than authored by the human. UI clients use this to avoid rendering
+    /// internal reminders as user input bubbles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallInfo>>,
+    /// Tool result summary (for tool role messages)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<ToolResultInfo>,
+    /// Artifacts detected in this message (code blocks, HTML files, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<ArtifactInfo>>,
+    /// Attached images (base64) for MultiPart user messages — lets the webui
+    /// re-render thumbnails when loading history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
+    /// Epoch MILLISECONDS this message was authored/received. lets the webui
+    /// stamp each bubble with a send time (PR #562). The kernel's `Message`
+    /// has no per-message clock, so for replayed history we approximate with
+    /// the owning `Session::updated_at` (epoch SECONDS → ms); for live/snapshot
+    /// turns the webui injects `Date.now()` client-side. `#[serde(default)]`
+    /// keeps old daemons/clients interoperating when the field is absent.
+    /// 注意单位: 毫秒 —— 与 `SessionDetail.created_at`/`updated_at` 一致
+    /// (kernel 内部 `Session.created_at` 为秒, API 响应边界乘 1000 转换, bot review P2)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    /// Wall-clock duration of the whole user turn (user send → final answer),
+    /// not a single LLM round. Kernel `MessageMeta.elapsed_ms` is per-round;
+    /// [`stamp_turn_elapsed_on_last_assistants`] rewrites the last assistant of
+    /// each turn from `TurnStat.duration_ms` (or the user/assistant timestamp
+    /// span) so refresh / session switch still shows the live "用时" total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Serializable image payload returned in session history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    pub media_type: String,
+    pub data: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+}
+
+impl ImageData {
+    fn missing_placeholder() -> Self {
+        Self {
+            media_type: "image/png".to_string(),
+            data: String::new(),
+            missing: true,
+        }
+    }
+}
+
+fn strip_vision_marker(raw: &str) -> (String, bool) {
+    match raw
+        .find("[图片内容（由")
+        .or_else(|| raw.find("[图片识别失败]"))
+    {
+        Some(i) => (raw[..i].trim_end().to_string(), true),
+        None => (raw.to_string(), false),
+    }
+}
+
+/// Compact preview of a tool result for history UI. Prefer head+tail over first-line-only
+/// so multi-row tables / JSON don't look empty after refresh. Already-compacted stubs
+/// (single line starting with `[` and containing ` lines`) are returned as-is (capped).
+fn tool_result_summary(text: &str) -> String {
+    const CAP: usize = 240;
+    let line_count = text.lines().count();
+    let first = text.lines().next().unwrap_or("");
+    // Compaction stubs / short single-line results: keep as one line.
+    if line_count <= 1 {
+        return if first.chars().count() > CAP {
+            format!(
+                "{}…",
+                first
+                    .chars()
+                    .take(CAP.saturating_sub(1))
+                    .collect::<String>()
+            )
+        } else {
+            first.to_string()
+        };
+    }
+    let head: String = first.chars().take(80).collect();
+    let tail: String = text.lines().last().unwrap_or("").chars().take(80).collect();
+    let summary = if tail.is_empty() || tail == head {
+        format!("{line_count} lines | head: {head}")
+    } else {
+        format!("{line_count} lines | head: {head} | tail: {tail}")
+    };
+    if summary.chars().count() > CAP {
+        format!(
+            "{}…",
+            summary
+                .chars()
+                .take(CAP.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        summary
+    }
+}
+
+impl MessageInfo {
+    fn from_kernel(msg: &zap_kernel::message::Message) -> Self {
+        Self::from_kernel_in(msg, None)
+    }
+
+    fn from_kernel_in(
+        msg: &zap_kernel::message::Message,
+        working_dir: Option<&std::path::Path>,
+    ) -> Self {
+        use zap_kernel::message::Role;
+
+        let role = match msg.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        let tool_calls = (!msg.tool_calls.is_empty()).then(|| {
+            msg.tool_calls
+                .iter()
+                .map(|call| ToolCallInfo {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: cap_display_field(call.arguments.clone()),
+                    display: format_tool_args(&call.name, &call.arguments),
+                })
+                .collect()
+        });
+        let tool_result = (msg.role == Role::Tool).then(|| {
+            ToolResultInfo {
+                call_id: msg.tool_call_id.clone().unwrap_or_default(),
+                success: !msg.is_error,
+                // Head+tail summary (not first-line-only) so WebUI history doesn't look
+                // empty after multi-line SQL/table outputs. Full text remains in `content`.
+                summary: tool_result_summary(&msg.text),
+                line_count: msg.text.lines().count(),
+            }
+        });
+        let artifacts = extract_artifacts_from_call_fields(
+            msg.tool_calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.arguments.as_str())),
+        );
+        let mut content = cap_display_field(msg.text.clone());
+        let mut images = (!msg.images.is_empty()).then(|| {
+            msg.images
+                .iter()
+                .map(|image| ImageData {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                    missing: false,
+                })
+                .collect()
+        });
+        if msg.role == Role::User {
+            let cwd = working_dir.unwrap_or_else(|| std::path::Path::new("."));
+            content = zap_capabilities::session::user_text_for_display(cwd, &content);
+            let (display, had_vision_marker) = strip_vision_marker(&content);
+            if had_vision_marker {
+                content = display;
+                if images.is_none() {
+                    images = Some(vec![ImageData::missing_placeholder()]);
+                }
+            }
+        }
+        Self {
+            role: role.into(),
+            id: msg.id.clone(),
+            content,
+            reasoning: msg.reasoning.clone().map(cap_display_field),
+            synthetic: msg.synthetic,
+            internal_origin: msg.internal_origin.clone(),
+            tool_calls,
+            tool_result,
+            artifacts,
+            images,
+            created_at: (msg.created_at_ms > 0).then_some(msg.created_at_ms),
+            elapsed_ms: msg.meta.as_ref().map(|m| m.elapsed_ms).filter(|&ms| ms > 0),
+        }
+    }
+}
+
+fn extract_artifacts_from_call_fields<'a>(
+    tool_calls: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<Vec<ArtifactInfo>> {
+    let mut artifacts = Vec::new();
+
+    for (name, arguments) in tool_calls {
+        if matches!(
+            name,
+            "write" | "write_file" | "create_file" | "edit" | "edit_file"
+        ) {
+            // Parse arguments
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let path = match args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+            {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
+                ("html", "html")
+            } else if path.ends_with(".svg") {
+                ("svg", "xml")
+            } else if path.ends_with(".md") || path.ends_with(".markdown") {
+                ("markdown", "markdown")
+            } else if path.ends_with(".pptx") {
+                ("pptx", "pptx")
+            } else if path.ends_with(".docx") {
+                ("docx", "docx")
+            } else if path.ends_with(".xlsx") {
+                ("xlsx", "xlsx")
+            } else if path.ends_with(".pdf") {
+                ("pdf", "pdf")
+            } else {
+                continue; // Skip other file types
+            };
+
+            // Get content from arguments (optional for binary files)
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Extract title from path
+            let title = PathBuf::from(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
+
+            artifacts.push(ArtifactInfo {
+                id: format!("file-{}", artifacts.len() + 1),
+                artifact_type: artifact_type.to_string(),
+                title,
+                language: Some(language.to_string()),
+                content,
+            });
+        } else if zap_capabilities::tools::is_shell_tool_name(name) {
+            // Extract artifacts from bash commands that create files
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let command = match args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(|v| v.as_str())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Look for file redirection ( > or >> ) to artifact file types
+            if let Some(path) = extract_output_file_from_bash(command) {
+                let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm")
+                {
+                    ("html", "html")
+                } else if path.ends_with(".svg") {
+                    ("svg", "xml")
+                } else if path.ends_with(".md") || path.ends_with(".markdown") {
+                    ("markdown", "markdown")
+                } else if path.ends_with(".pptx") {
+                    ("pptx", "pptx")
+                } else if path.ends_with(".docx") {
+                    ("docx", "docx")
+                } else if path.ends_with(".xlsx") {
+                    ("xlsx", "xlsx")
+                } else if path.ends_with(".pdf") {
+                    ("pdf", "pdf")
+                } else {
+                    continue;
+                };
+
+                let title = PathBuf::from(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+
+                artifacts.push(ArtifactInfo {
+                    id: format!("file-{}", artifacts.len() + 1),
+                    artifact_type: artifact_type.to_string(),
+                    title,
+                    language: Some(language.to_string()),
+                    content: String::new(), // Content not available from bash
+                });
+            }
+        }
+    }
+
+    if artifacts.is_empty() {
+        None
+    } else {
+        Some(artifacts)
+    }
+}
+
+/// Extract output file path from bash command (handles > and >> redirection, and quoted paths)
+fn extract_output_file_from_bash(command: &str) -> Option<String> {
+    // Artifact file extensions to look for
+    let artifact_extensions = [
+        ".html",
+        ".htm",
+        ".svg",
+        ".md",
+        ".markdown",
+        ".pptx",
+        ".docx",
+        ".xlsx",
+        ".pdf",
+    ];
+
+    // First, try to find > or >> redirection
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '>' {
+            // Found redirection
+            let append_mode = i + 1 < chars.len() && chars[i + 1] == '>';
+            let start = if append_mode { i + 2 } else { i + 1 };
+
+            // Skip whitespace
+            let mut j = start;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+
+            // Extract file path until whitespace or end
+            let mut path_end = j;
+            while path_end < chars.len()
+                && !chars[path_end].is_whitespace()
+                && chars[path_end] != ';'
+                && chars[path_end] != '&'
+            {
+                path_end += 1;
+            }
+
+            if j < path_end {
+                let path: String = chars[j..path_end].iter().collect();
+                // Remove quotes if present
+                let path = path.trim_matches(|c| c == '"' || c == '\'').to_string();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Look for quoted paths with artifact extensions
+    // Pattern: 'path.pptx' or "path.docx"
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut quote_start = 0usize;
+    let chars: Vec<char> = command.chars().collect();
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        if ch == '\'' && !in_double_quote {
+            if in_single_quote {
+                // End of single-quoted string
+                let path: String = chars[quote_start..idx].iter().collect();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+                in_single_quote = false;
+            } else {
+                in_single_quote = true;
+                quote_start = idx + 1;
+            }
+        } else if ch == '"' && !in_single_quote {
+            if in_double_quote {
+                // End of double-quoted string
+                let path: String = chars[quote_start..idx].iter().collect();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+                in_double_quote = false;
+            } else {
+                in_double_quote = true;
+                quote_start = idx + 1;
+            }
+        }
+    }
+
+    None
+}
+
+/// Format tool arguments for display (CLI style)
+fn format_tool_args(tool_name: &str, args_json: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    match tool_name {
+        "read" | "read_file" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let short = short_path(path);
+            let mut s = short;
+            if let Some(offset) = args.get("offset").and_then(|v| v.as_u64()) {
+                if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
+                    s.push_str(&format!(" L{}-{}", offset, offset + limit));
+                }
+            }
+            s
+        }
+        "write" | "write_file" | "create_file" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let size = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            format!("{} ({} bytes)", short_path(path), size)
+        }
+        "edit" | "edit_file" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            short_path(path)
+        }
+        "bash" | "run_command" => {
+            let cmd = args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let shown = if cmd.chars().count() > 80 {
+                format!("{}...", cmd.chars().take(77).collect::<String>())
+            } else {
+                cmd.to_string()
+            };
+            let summary = args
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if summary.is_empty() {
+                format!("`{shown}`")
+            } else {
+                format!("{summary} — `{shown}`")
+            }
+        }
+        "code_explore" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("\"{}\" in {}", query, short_path(path))
+        }
+        "task" => {
+            if let Some(tasks) = args.get("tasks").and_then(|t| t.as_array()) {
+                format!("{} subtask(s)", tasks.len())
+            } else {
+                "subtask".to_string()
+            }
+        }
+        "list_directory" => {
+            // Schema primary key is `target_directory`; `path` is a serde alias for older calls.
+            let path = args
+                .get("target_directory")
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            short_path(path)
+        }
+        "grep" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("\"{}\" in {}", pattern, short_path(path))
+        }
+        "glob" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", pattern)
+        }
+        "web_search" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", query)
+        }
+        "web_fetch" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            url.to_string()
+        }
+        _ => {
+            if let Some(obj) = args.as_object() {
+                obj.iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            serde_json::Value::String(s) if s.chars().count() > 30 => {
+                                format!("{}...", s.chars().take(27).collect::<String>())
+                            }
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{}={}", k, val)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    match parts.len() {
+        0 | 1 => path.to_string(),
+        2 => format!("{}/{}", parts[1], parts[0]),
+        _ => format!(".../{}/{}", parts[1], parts[0]),
+    }
+}
+fn dangerous_tools_enabled() -> bool {
+    std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
+}
+
+fn cors_layer() -> CorsLayer {
+    // Loopback-only was correct when the daemon only ever bound 127.0.0.1.
+    // `jeikcode serve --host 0.0.0.0` (and LAN binds) serve the SPA from a
+    // private IP; some browsers/WebViews treat custom-header POSTs as CORS
+    // even on that host. Allow loopback + private-network origins so remote
+    // LAN clients can call the API. Public internet origins stay denied —
+    // token auth is the real gate for serve mode, not CORS.
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(is_allowed_cors_origin))
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("x-zap-client"),
+        ])
+        .allow_credentials(true)
+}
+
+/// Middleware that updates `last_activity` timestamp on every request except
+/// GET /health and POST /shutdown (these should not prevent idle timeout).
+async fn activity_tracker_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let skip = (req.method() == Method::GET && req.uri().path() == "/health")
+        || (req.method() == Method::POST && req.uri().path() == "/shutdown");
+
+    if !skip {
+        if let Some(activity) = req.extensions().get::<Arc<std::sync::atomic::AtomicI64>>() {
+            activity.store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // Resolve client mode from X-JeikCode-Client header
+    let client_mode = req
+        .headers()
+        .get("x-zap-client")
+        .and_then(|v| v.to_str().ok())
+        .map(resolve_client_mode)
+        .unwrap_or(SessionMode::Ide);
+    let mut req = req;
+    req.extensions_mut().insert(client_mode);
+
+    next.run(req).await
+}
+
+/// Map X-JeikCode-Client header value to SessionMode.
+/// Unknown values fall back to Ide.
+fn resolve_client_mode(header: &str) -> SessionMode {
+    match header {
+        "channel" => SessionMode::Channel,
+        "vscode" => SessionMode::Vscode,
+        "jetbrains" => SessionMode::Jetbrains,
+        "webui" => SessionMode::Webui,
+        "jeikcode-air" => SessionMode::JeikcodeAir,
+        _ => SessionMode::Ide,
+    }
+}
+
+/// CORS allowlist for webui: loopback **or** RFC1918 / link-local private hosts.
+/// Used so LAN clients of `jeikcode serve` are not blocked when a browser emits
+/// an Origin header for same-host API calls with custom headers.
+fn is_allowed_cors_origin(origin: &HeaderValue, _request_parts: &RequestParts) -> bool {
+    let Some(authority) = origin_authority(origin) else {
+        return false;
+    };
+    if is_loopback_authority(&authority) || is_private_network_authority(&authority) {
+        return true;
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        authority.split(':').next().unwrap_or(&authority)
+    };
+    // 允许局域网/Tailscale/常见内部域名
+    if host.ends_with(".local") || host.ends_with(".lan") || host.ends_with(".ts.net") {
+        return true;
+    }
+    // 若 Origin authority 与请求的 Host 头一致（同主机直连自托管请求，包括公网 IPv4 / 双栈公网 IPv6 / 域名直连），直接放行
+    if let Some(host_hdr) = _request_parts
+        .headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+    {
+        if authority.eq_ignore_ascii_case(host_hdr.trim()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn origin_authority(origin: &HeaderValue) -> Option<String> {
+    let origin = origin.to_str().ok()?;
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    Some(authority.to_string())
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    if let Some(rest) = authority.strip_prefix("[::1]") {
+        return rest.is_empty() || rest.starts_with(':');
+    }
+
+    let host = authority.split(':').next().unwrap_or(authority);
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Host part of an Origin/authority is a private/LAN address (not public internet).
+fn is_private_network_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: [::ffff:192.168.0.1]:port or [fe80::1]:port
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64; // RFC 6598 100.64.0.0/10 (Tailscale)
+                v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified() || is_cgnat
+            }
+            std::net::IpAddr::V6(v6) => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback()
+                    || (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
+                    || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            }
+        };
+    }
+    false
+}
+
+/// Whether this client can receive interactive approval prompts.
+///
+/// - **WebUI** always can: the SPA has `PermissionCard` + `POST /chat/permission`
+///   and shows Build / Accept Edits / Auto / Plan. Honoring that UI must not
+///   depend on bind host or token — otherwise LAN `serve --host 0.0.0.0`
+///   (with or without `--no-token`) silently sets `dangerously_skip_permissions`
+///   for Build and contradicts the mode pill.
+/// - **Other known clients** (channel / VSCode / JetBrains): interactive when
+///   token-protected, or on loopback (UI can answer `/chat/permission`).
+/// - **API** never uses this path (`ChatTurnOrigin::Api` → automation policy).
+fn client_interactive_permission(
+    client_mode: SessionMode,
+    enforce_token: bool,
+    bind_host: &str,
+) -> bool {
+    if matches!(client_mode, SessionMode::Webui) {
+        return true;
+    }
+    enforce_token
+        || (matches!(
+            client_mode,
+            SessionMode::Channel | SessionMode::Vscode | SessionMode::Jetbrains
+        ) && is_loopback_authority(bind_host))
+}
+
+/// Who owns a `/chat` turn and which interaction policy applies.
+///
+/// Product rules (serve):
+/// - **API** (OpenAI/Anthropic `/v1/*`): low-confirm — Auto tools; no permission /
+///   user-input modals; residual `request_user_input` → final-answer handoff so the
+///   client replies in the **next** message. WebUI `/chat/watch` is an **observer**
+///   of this policy (must not open extra modals). Unchanged by WebUI mode pill.
+/// - **Native WebUI** (`POST /chat` from the SPA input): full mode pill —
+///   Build / Accept Edits / Auto / Plan — always interactive for permission +
+///   user-input (LAN / no-token included). Request body `approval_mode` (or
+///   global `/approval_mode`) is honored; never force Auto here.
+/// - **Other native** (channel / IDE on loopback or token): interactive when the
+///   client can answer `/chat/permission`.
+/// - **Yolo** (`serve --yolo`): every path follows automation — Auto, no modals,
+///   `request_user_input` unmounted process-wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatTurnOrigin {
+    /// OpenAI / Anthropic compatible HTTP API.
+    Api,
+    /// WebUI, TUI-attached clients, channel, VSCode, etc. sending their own turn.
+    Native,
+}
+
+/// Resolved interaction flags for one chat turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChatTurnPolicy {
+    pub origin: ChatTurnOrigin,
+    /// Wait on `/chat/permission` (every mode except Auto, when the client can answer).
+    pub interactive_permission: bool,
+    /// Wait on WebUI `/chat/user-input` for `request_user_input`.
+    pub interactive_user_input: bool,
+    /// When set, force this approval mode for the turn (API / YOLO → Auto).
+    pub force_approval_mode: Option<crate::approval_mode::ApprovalMode>,
+}
+
+impl ChatTurnPolicy {
+    /// `serve --yolo`: all surfaces share automation policy.
+    pub fn yolo() -> Self {
+        Self {
+            origin: ChatTurnOrigin::Api,
+            interactive_permission: false,
+            interactive_user_input: false,
+            force_approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+        }
+    }
+
+    /// OpenAI/Anthropic `/v1/*` (and any pure automation chat entry).
+    pub fn api_automation() -> Self {
+        Self {
+            origin: ChatTurnOrigin::Api,
+            interactive_permission: false,
+            interactive_user_input: false,
+            force_approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+        }
+    }
+
+    /// WebUI / channel / IDE own message — honor the client's mode pill when the
+    /// client can answer approval / user-input. Does **not** force Auto (that is
+    /// reserved for API + YOLO).
+    pub fn native(client_mode: SessionMode, enforce_token: bool, bind_host: &str) -> Self {
+        Self {
+            origin: ChatTurnOrigin::Native,
+            interactive_permission: client_interactive_permission(
+                client_mode,
+                enforce_token,
+                bind_host,
+            ),
+            // Only WebUI implements the typed user-input response endpoint today.
+            interactive_user_input: matches!(client_mode, SessionMode::Webui),
+            // Native turns use the request/global mode (Build/AcceptEdits/Auto/Plan).
+            force_approval_mode: None,
+        }
+    }
+
+    /// Resolve policy for a daemon chat entry.
+    /// YOLO wins over origin; otherwise API vs native as requested.
+    pub fn resolve(
+        yolo: bool,
+        origin: ChatTurnOrigin,
+        client_mode: SessionMode,
+        enforce_token: bool,
+        bind_host: &str,
+    ) -> Self {
+        if yolo {
+            return Self::yolo();
+        }
+        match origin {
+            ChatTurnOrigin::Api => Self::api_automation(),
+            ChatTurnOrigin::Native => Self::native(client_mode, enforce_token, bind_host),
+        }
+    }
+}
+
+fn effective_chat_approval_mode(
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+) -> crate::approval_mode::ApprovalMode {
+    effective_chat_approval_mode_scoped(request_mode, None)
+}
+
+fn effective_chat_approval_mode_scoped(
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+    session_id: Option<&str>,
+) -> crate::approval_mode::ApprovalMode {
+    request_mode.unwrap_or_else(|| live_api::live_session_approval_mode(session_id))
+}
+
+/// Modes that park the turn until the WebUI/TUI answers `/chat/permission`.
+/// Only **Auto** (`bypass`) auto-approves and must not register a responder.
+/// Build / AcceptEdits / Plan all need a human when a tool is gated.
+fn approval_mode_requires_responder(mode: crate::approval_mode::ApprovalMode) -> bool {
+    !matches!(mode, crate::approval_mode::ApprovalMode::Auto)
+}
+
+/// Map a working directory to its physical session-bucket name.
+///
+/// Delegates to the native store so API project ids and physical buckets stay
+/// byte-for-byte identical.
+pub(crate) fn hash_path(path: &std::path::Path) -> String {
+    NativeSessionManager::project_hash(path)
+}
+
+fn response_project_hash(path: &std::path::Path) -> String {
+    hash_path(path)
+}
+
+/// System temp directory prefixes to exclude from the project list.
+/// These are directories that are not meaningful as user projects.
+fn is_system_temp_dir(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+    // Unix/Linux/macOS temp dirs
+    if path_str.starts_with("/tmp/") || path_str == "/tmp" {
+        return true;
+    }
+    if path_str.starts_with("/var/tmp/") || path_str == "/var/tmp" {
+        return true;
+    }
+    // Windows temp dirs
+    if path_str.contains("\\Temp\\")
+        || path_str.contains("\\TEMP\\")
+        || path_str.ends_with("\\Temp")
+        || path_str.ends_with("\\TEMP")
+    {
+        return true;
+    }
+    // /private/tmp (macOS symlink target for /tmp)
+    if path_str.starts_with("/private/tmp/") || path_str == "/private/tmp" {
+        return true;
+    }
+    false
+}
+
+/// List all projects (scans sessions directory)
+fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
+    let sessions_root = NativeSessionManager::sessions_root();
+    let scan = catalog_scan_in_root(&sessions_root)?;
+    let active = active_catalog_location(&scan.entries);
+    list_projects_in_root(&sessions_root, active.as_ref())
+}
+
+/// Global default workspace for standalone sessions (not bound to any specific project).
+pub(crate) fn global_standalone_workspace() -> PathBuf {
+    let home = zap_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let ws = home.join(".zap").join("workspace");
+    if !ws.exists() {
+        let _ = std::fs::create_dir_all(&ws);
+    }
+    ws
+}
+
+fn list_projects_in_root(
+    sessions_root: &std::path::Path,
+    active: Option<&zap_capabilities::session::CatalogLocation>,
+) -> std::io::Result<Vec<ProjectInfo>> {
+    let scan = catalog_scan_in_root(sessions_root)?;
+    let mut by_project_entries = std::collections::BTreeMap::<
+        String,
+        Vec<zap_capabilities::session::CatalogEntry>,
+    >::new();
+    let global_ws = global_standalone_workspace();
+    for entry in scan.entries {
+        if is_system_temp_dir(&entry.working_dir) || entry.working_dir == global_ws {
+            continue;
+        }
+        if !catalog_entry_is_visible(sessions_root, &entry, active) {
+            continue;
+        }
+        by_project_entries
+            .entry(entry.project_bucket.clone())
+            .or_default()
+            .push(entry);
+    }
+    let mut projects = Vec::new();
+    for (bucket, mut entries) in by_project_entries {
+        NativeSessionManager::collapse_fork_lineages(&mut entries);
+        if entries.is_empty() {
+            continue;
+        }
+        let session_count = entries.len();
+        let mut created_at = u64::MAX;
+        let mut last_updated = 0;
+        let mut name = String::new();
+        let mut working_dir = PathBuf::new();
+
+        for entry in &entries {
+            let c = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
+            let u = u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000;
+            created_at = created_at.min(c);
+            if u >= last_updated {
+                last_updated = u;
+                working_dir = entry.working_dir.clone();
+                name = entry
+                    .working_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into());
+            }
+        }
+        if created_at == u64::MAX {
+            created_at = last_updated;
+        }
+
+        projects.push(ProjectInfo {
+            hash: bucket,
+            name,
+            working_dir,
+            description: None,
+            session_count,
+            created_at,
+            last_updated,
+        });
+    }
+    projects.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
+    Ok(projects)
+}
+
+/// 根据项目哈希查找关联的项目工作目录
+pub fn find_working_dir_for_project_hash(project_hash: &str) -> Option<PathBuf> {
+    let hash = project_hash.trim();
+    if hash.is_empty() {
+        return None;
+    }
+    if let Ok(projects) = list_projects() {
+        for p in projects {
+            if p.hash == hash {
+                return Some(p.working_dir);
+            }
+        }
+    }
+    None
+}
+
+/// Session metadata with project hash for cross-project listing
+#[derive(Debug, Serialize)]
+pub struct SessionMetaWithProject {
+    pub project_hash: String,
+    #[serde(flatten)]
+    pub meta: SessionSummary,
+}
+
+/// Daemon/API listing DTO. Its wire shape intentionally matches the retired
+/// core `SessionMeta`, but it is sourced directly from the native catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: usize,
+    #[serde(default)]
+    pub file_size: u64,
+}
+
+fn catalog_scan_in_root(
+    root: &std::path::Path,
+) -> std::io::Result<zap_capabilities::session::CatalogScan> {
+    let scan = zap_capabilities::session::SessionManager::scan_catalog(root);
+    for diagnostic in &scan.diagnostics {
+        tracing::warn!(
+            path = %diagnostic.path.display(),
+            kind = ?diagnostic.kind,
+            message = %diagnostic.message,
+            "session catalog entry was skipped"
+        );
+    }
+    Ok(scan)
+}
+
+fn catalog_entry_to_session_summary(
+    entry: &zap_capabilities::session::CatalogEntry,
+) -> SessionSummary {
+    SessionSummary {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        working_dir: entry.working_dir.clone(),
+        created_at: u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000,
+        updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
+        message_count: entry.message_count,
+        file_size: 0,
+    }
+}
+
+fn catalog_entry_with_project(
+    entry: &zap_capabilities::session::CatalogEntry,
+) -> SessionMetaWithProject {
+    SessionMetaWithProject {
+        project_hash: entry.project_bucket.clone(),
+        meta: catalog_entry_to_session_summary(entry),
+    }
+}
+
+fn active_catalog_location(
+    entries: &[zap_capabilities::session::CatalogEntry],
+) -> Option<zap_capabilities::session::CatalogLocation> {
+    let binding = crate::native_live::binding().ok()?;
+    resolve_active_catalog_location(entries, &binding.session_id, &binding.working_dir)
+}
+
+fn resolve_active_catalog_location(
+    entries: &[zap_capabilities::session::CatalogEntry],
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> Option<zap_capabilities::session::CatalogLocation> {
+    let working_dir_key = zap_capabilities::pathnorm::path_case_key(working_dir);
+    let mut matches = entries.iter().filter(|entry| {
+        entry.id == session_id
+            && zap_capabilities::pathnorm::path_case_key(&entry.working_dir) == working_dir_key
+    });
+    let entry = matches.next()?;
+    // A logical working directory is not a physical catalog identity: resumed
+    // and imported sessions may live in a historical bucket. Fail closed on an
+    // ambiguous duplicate instead of manufacturing a bucket from the cwd.
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(zap_capabilities::session::CatalogLocation {
+        id: entry.id.clone(),
+        project_bucket: entry.project_bucket.clone(),
+    })
+}
+
+fn binding_targets_catalog_location(
+    entries: &[zap_capabilities::session::CatalogEntry],
+    binding: &crate::live_hub::LiveBinding,
+    project_bucket: &str,
+    session_id: &str,
+) -> bool {
+    binding.session_id == session_id
+        && resolve_active_catalog_location(entries, session_id, &binding.working_dir)
+            .is_some_and(|location| location.project_bucket == project_bucket)
+}
+
+fn catalog_entry_is_visible(
+    sessions_root: &std::path::Path,
+    entry: &zap_capabilities::session::CatalogEntry,
+    active: Option<&zap_capabilities::session::CatalogLocation>,
+) -> bool {
+    if entry.message_count > 0 {
+        return true;
+    }
+    if active.is_some_and(|location| {
+        location.id == entry.id && location.project_bucket == entry.project_bucket
+    }) {
+        return true;
+    }
+    if entry.presence == zap_capabilities::session::CatalogPresence::LegacyOnly {
+        return false;
+    }
+    NativeSessionManager::with_root(sessions_root.join(&entry.project_bucket))
+        .has_valid_inflight_snapshot(&entry.id)
+}
+
+static SESSION_CATALOG_IO: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Run bulk catalog scans off the async runtime and serialize them so queued
+/// refreshes rescan after any durable placeholder-name repairs.
+async fn run_session_catalog_io<T>(
+    operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+{
+    let permit = SESSION_CATALOG_IO.acquire().await.map_err(|error| {
+        std::io::Error::other(format!("session catalog coordinator closed: {error}"))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("session catalog task failed: {error}")))?
+}
+
+/// List sessions for a project
+fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let active = active_catalog_location(&scan.entries);
+    list_sessions_in_root(
+        &NativeSessionManager::sessions_root(),
+        project_hash,
+        active.as_ref(),
+    )
+}
+
+fn list_sessions_in_root(
+    sessions_root: &std::path::Path,
+    project_hash: &str,
+    active: Option<&zap_capabilities::session::CatalogLocation>,
+) -> std::io::Result<Vec<SessionSummary>> {
+    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            entry.project_bucket == project_hash
+                && catalog_entry_is_visible(sessions_root, entry, active)
+        })
+        .collect();
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
+    crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries
+        .iter()
+        .map(catalog_entry_to_session_summary)
+        .collect())
+}
+
+/// List all sessions across all projects
+fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root())?;
+    let active = active_catalog_location(&scan.entries);
+    list_all_sessions_in_root(&NativeSessionManager::sessions_root(), active.as_ref())
+}
+
+fn list_all_sessions_in_root(
+    sessions_root: &std::path::Path,
+    active: Option<&zap_capabilities::session::CatalogLocation>,
+) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
+        .entries
+        .into_iter()
+        .filter(|entry| catalog_entry_is_visible(sessions_root, entry, active))
+        .collect();
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
+    // Bound snapshot hydration to the same newest-50 surface the API returns.
+    entries.truncate(50);
+    crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries.iter().map(catalog_entry_with_project).collect())
+}
+
+/// Resolve a (possibly short) session id to its full record by scanning bucket
+/// directory ENTRIES. The filename is `<id>.json`, so we match on the name and
+/// parse only the ONE file that matches — cheap, and UNCAPPED (unlike
+/// `/sessions`, which truncates to 50 across all projects and so can't locate an
+/// older session). Prefers an exact id match; otherwise the most-recent prefix
+/// match. `project_hash` is the physical bucket the file lives in.
+///
+/// Split from `resolve_session_by_id` so the scan can be unit-tested against a
+/// temp root without touching the real sessions directory.
+fn resolve_session_in_root(
+    sessions_root: &std::path::Path,
+    id_prefix: &str,
+) -> std::io::Result<Option<SessionMetaWithProject>> {
+    if id_prefix.is_empty() {
+        return Ok(None);
+    }
+    catalog_scan_in_root(sessions_root)?
+        .find(id_prefix)
+        .map(|entry| entry.as_ref().map(catalog_entry_with_project))
+        .map_err(std::io::Error::from)
+}
+
+pub(crate) fn resolve_session_by_id(
+    id_prefix: &str,
+) -> std::io::Result<Option<SessionMetaWithProject>> {
+    resolve_session_in_root(&NativeSessionManager::sessions_root(), id_prefix)
+}
+
+// ============== HTTP Handlers ==============
+
+/// Health check response
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub service: &'static str,
+    pub binary_hash: &'static str,
+    pub instance_id: String,
+}
+
+fn executable_sha256() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+
+        std::env::current_exe()
+            .and_then(std::fs::read)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .unwrap_or_else(|_| "unknown".to_string())
+    })
+}
+
+/// GET /health - Health check endpoint
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        service: "zap-daemon",
+        binary_hash: executable_sha256(),
+        instance_id: state.daemon_instance_id.to_string(),
+    })
+}
+
+/// Webui index route with token → cookie handoff (and SPA-visible bootstrap).
+///
+/// `/webui` / `jeikcode serve` open `http://host:port/?token=<uuid>`.
+///
+/// Previously we 302'd immediately after setting an HttpOnly cookie, so the
+/// SPA never saw the token and relied on cookie-only auth. That works on
+/// local loopback browsers, but remote LAN clients (phones, other PCs,
+/// in-app WebViews) often fail to attach the cookie on subsequent API/SSE
+/// calls — the UI loads (static assets are public) while `/chat` and `/live`
+/// 401, leaving a blinking cursor with no response.
+///
+/// Current handoff:
+/// 1. Set HttpOnly cookie (`SameSite=Lax` — more reliable than Strict for
+///    top-level opens from chat apps / QR scanners on LAN).
+/// 2. Serve `index.html` **with** `?token=` still present so the SPA can
+///    copy it into `sessionStorage` + `Authorization: Bearer` (and then
+///    `history.replaceState` to strip the address bar — CWE-598 mitigation
+///    still applies client-side).
+///
+/// Auth accepts cookie **or** Bearer (see `require_webui_token`).
+///
+/// `Secure` is intentionally omitted: the webui is plain HTTP on
+/// localhost/LAN, where a `Secure` cookie would never be sent.
+async fn serve_webui_index(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    if state.is_token_enforced() {
+        if let Some(query) = uri.query() {
+            if let Some(token) = first_query_value(query, "token") {
+                if !token.is_empty() && state.webui_tokens.is_valid(&token) {
+                    // SameSite=Lax: set on top-level navigations (QR / shared
+                    // link / chat app open) and sent on same-site fetches.
+                    // Strict blocked some in-app WebView → LAN flows.
+                    let cookie = format!(
+                        "{}={}; Path=/; HttpOnly; SameSite=Lax",
+                        state.webui_cookie_name, token
+                    );
+                    let mut response = webui::serve_webui(uri).await;
+                    if let Ok(value) = HeaderValue::from_str(&cookie) {
+                        response.headers_mut().insert(header::SET_COOKIE, value);
+                    }
+                    return response;
+                }
+            }
+        }
+    }
+    webui::serve_webui(uri).await
+}
+
+/// First value for `key` in a raw `a=b&c=d` query string. Returns the raw
+/// (still percent-encoded) value; the webui token is a hex UUID so no
+/// decoding is needed.
+fn first_query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        match (it.next(), it.next()) {
+            (Some(k), Some(v)) if k == key => Some(v.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// Drop every `key=…` pair from a raw query string, preserving the rest
+/// verbatim. Only used in unit tests (SPA strips `token` client-side after
+/// capture; see webui `captureWebuiToken`).
+#[cfg(test)]
+fn strip_query_key(query: &str, key: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| pair.split('=').next().unwrap_or("") != key)
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// POST /shutdown - Trigger graceful shutdown via HTTP (R7.1, R7.2)
+async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.shutdown_tx.send(true).ok();
+    Json(serde_json::json!({"success": true}))
+}
+
+/// Current project state plus the physical session-bucket hash for the
+/// working directory. The webui uses `project_hash` — NOT the mutable
+/// `working_dir` string — to decide which sessions belong to this project,
+/// so it must be the same hash the session store files them under.
+#[derive(Debug, Serialize)]
+struct ProjectStateResponse {
+    working_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_dir: Option<PathBuf>,
+    recent_dirs: Vec<PathBuf>,
+    name: String,
+    project_hash: String,
+}
+
+/// GET /project - Get current project state
+async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.project.read().await;
+    Json(ProjectStateResponse {
+        working_dir: state.working_dir.clone(),
+        previous_dir: state.previous_dir.clone(),
+        recent_dirs: state.recent_dirs.clone(),
+        name: state.name.clone(),
+        project_hash: hash_path(&state.working_dir),
+    })
+}
+
+pub(crate) fn update_project_state(project: &mut ProjectState, new_path: &std::path::Path) {
+    let new_path = zap_capabilities::pathnorm::strip_verbatim_path(new_path);
+    let new_path = normalize_working_dir_case(new_path);
+    let old_dir = project.working_dir.clone();
+    if old_dir != new_path {
+        project.previous_dir = Some(old_dir);
+        project.working_dir = new_path.clone();
+        project.name = new_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+
+        let new_key = zap_capabilities::pathnorm::path_case_key(&new_path);
+        project
+            .recent_dirs
+            .retain(|d| zap_capabilities::pathnorm::path_case_key(d) != new_key);
+        project.recent_dirs.insert(0, new_path);
+        project.recent_dirs.truncate(5);
+    }
+}
+
+/// POST /cd - Change working directory (like /cd command)
+async fn change_dir(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Json(req): Json<ChangeDirRequest>,
+) -> impl IntoResponse {
+    let state_clone = state.clone();
+    daemon_scope(&state, None, client_mode, || async move {
+        let state = state_clone;
+        let mut project = state.project.write().await;
+
+        // Handle "-" to go back to previous directory
+        let new_path = if req.path == "-" {
+            match &project.previous_dir {
+                Some(prev) => prev.clone(),
+                None => {
+                    return Json(ChangeDirResponse {
+                        success: false,
+                        message: "No previous directory to go back to".to_string(),
+                        current_dir: project.working_dir.clone(),
+                        project_hash: hash_path(&project.working_dir),
+                    });
+                }
+            }
+        } else {
+            // Expand ~ and make absolute
+            let expanded = if req.path.starts_with('~') {
+                zap_config::util::real_home_dir()
+                    .map(|h| {
+                        h.join(
+                            req.path
+                                .strip_prefix('~')
+                                .unwrap_or("")
+                                .trim_start_matches('/'),
+                        )
+                    })
+                    .unwrap_or_else(|| PathBuf::from(&req.path))
+            } else {
+                PathBuf::from(&req.path)
+            };
+
+            let resolved = if expanded.is_absolute() {
+                expanded
+            } else {
+                project.working_dir.join(&expanded)
+            };
+
+            // Check if directory exists
+            if !resolved.exists() {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Directory does not exist: {}", resolved.display()),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+
+            if !resolved.is_dir() {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Not a directory: {}", resolved.display()),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+
+            resolved
+        };
+
+        // Strip any `\\?\` verbatim prefix before it reaches working_dir /
+        // session cwd / hash, so a path that round-tripped through a
+        // `canonicalize()`-based client still groups with the plain TUI form.
+        let new_path = zap_capabilities::pathnorm::strip_verbatim_path(&new_path);
+        // Fold case to the on-disk truth (Windows, bucket-safe) so a `/cd` with a
+        // differently-cased path doesn't leave the footer/new sessions drifting.
+        let new_path = normalize_working_dir_case(new_path);
+
+        // When a native live runtime is attached, it is the working-directory
+        // owner. Reject the HTTP mutation if the runtime cannot accept the same
+        // transition; otherwise the UI state and the executing runtime diverge.
+        if let Ok(previous_binding) = crate::native_live::binding() {
+            if let Err(error) = crate::native_live::change_directory(new_path.clone()).await {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Runtime rejected directory change: {error:?}"),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+            if let Some(session_id) = req
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+            {
+                if let Err(error) =
+                    crate::live_api::live_switch_session(session_id.to_string()).await
+                {
+                    let rollback_error = match crate::native_live::change_directory(
+                        previous_binding.working_dir.clone(),
+                    )
+                    .await
+                    {
+                        Ok(_) => crate::live_api::live_switch_session(
+                            previous_binding.session_id.clone(),
+                        )
+                        .await
+                        .err()
+                        .map(|error| format!("session restore failed: {error:?}")),
+                        Err(error) => Some(format!("directory restore failed: {error:?}")),
+                    };
+                    return Json(ChangeDirResponse {
+                        success: false,
+                        message: match rollback_error {
+                            Some(rollback) => format!(
+                                "Runtime rejected session switch: {error:?}; rollback failed: {rollback}"
+                            ),
+                            None => format!("Runtime rejected session switch: {error:?}"),
+                        },
+                        current_dir: project.working_dir.clone(),
+                        project_hash: hash_path(&project.working_dir),
+                    });
+                }
+            }
+        }
+
+        // Update state
+        update_project_state(&mut project, &new_path);
+
+        // Persist to config only when explicitly requested. The live in-memory
+        // state above is always updated (so a webui switch survives refresh);
+        // rewriting the configured default is gated behind `set_default`.
+        if req.set_default {
+            let _ = zap_config::ConfigStore::default_store().update(|config| {
+                config.default_workdir = Some(new_path.to_string_lossy().to_string());
+                Ok(())
+            });
+        }
+
+        let hash = hash_path(&new_path);
+        state.telemetry.track(Event::UseCommand {
+            type_: "cd".into(),
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
+
+        // 同步 daemon 项目视图；已绑定 runtime 已在上方接受原生目录切换。
+        crate::live_api::live_set_working_dir(new_path.clone());
+        // MCP registry is loaded per-request based on working_dir, no need to reload here.
+
+        Json(ChangeDirResponse {
+            success: true,
+            message: format!("Changed to {}", new_path.display()),
+            current_dir: new_path,
+            project_hash: hash,
+        })
+    })
+    .await
+}
+
+/// GET /projects - List all projects (historical, from sessions directory)
+async fn get_projects() -> impl IntoResponse {
+    match run_session_catalog_io(list_projects).await {
+        Ok(projects) => Json(projects).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to list projects: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /projects/:hash/sessions - List sessions for a project
+async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
+    match run_session_catalog_io(move || list_sessions(&hash)).await {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to list sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /sessions/resolve/:id - Resolve a (short or full) session id to its full
+/// record across all projects. Backs the webui's URL-restore, which carries
+/// only a short id and must find which project bucket owns it without the
+/// 50-session cap of `/sessions`.
+async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
+    match resolve_session_by_id(&id) {
+        Ok(Some(s)) => Json(s).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to resolve session: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /sessions/by-working-dir?working_dir=/path - List sessions for an explicit working directory
+async fn get_sessions_by_working_dir(
+    Query(query): Query<SessionsByWorkingDirQuery>,
+) -> impl IntoResponse {
+    let hash = hash_path(&query.working_dir);
+    let list_hash = hash.clone();
+    match run_session_catalog_io(move || list_sessions(&list_hash)).await {
+        Ok(sessions) => {
+            let sessions: Vec<SessionMetaWithProject> = sessions
+                .into_iter()
+                .map(|meta| SessionMetaWithProject {
+                    project_hash: hash.clone(),
+                    meta,
+                })
+                .collect();
+            Json(sessions).into_response()
+        }
+        Err(e) => {
+            let msg = format!("Failed to list sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SessionFreshness {
+    /// Sum of snapshot, jsonl, and UI presentation file sizes.
+    bytes: u64,
+    /// Newest mtime among those files, in unix milliseconds.
+    mtime_ms: u64,
+    /// True while this session has a live or `/chat` turn.
+    running: bool,
+}
+
+fn stat_session_file(path: &std::path::Path, bytes: &mut u64, mtime_ms: &mut u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    *bytes = bytes.saturating_add(meta.len());
+    let Ok(modified) = meta.modified() else {
+        return;
+    };
+    let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    *mtime_ms = (*mtime_ms).max(ms);
+}
+
+/// Stat the transcript files only. Does not read or parse message bodies.
+fn session_disk_freshness(project_hash: &str, session_id: &str) -> SessionFreshness {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    let mut bytes = 0u64;
+    let mut mtime_ms = 0u64;
+    for path in [
+        manager.snapshot_path(session_id),
+        manager.jsonl_path(session_id),
+        manager.presentation_path(session_id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        stat_session_file(&path, &mut bytes, &mut mtime_ms);
+    }
+    SessionFreshness {
+        bytes,
+        mtime_ms,
+        running: false,
+    }
+}
+
+/// GET /projects/:hash/sessions/:id/freshness
+///
+/// Cheap catch-up probe: file size and mtime only. The WebUI reads the
+/// transcript body only when this signature changes.
+async fn get_session_freshness(
+    State(state): State<AppState>,
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut freshness = session_disk_freshness(&hash, &id);
+    freshness.running = state
+        .active_chats
+        .active_session_ids()
+        .await
+        .iter()
+        .any(|sid| sid == &id)
+        || crate::native_live::live_running_session_id().as_deref() == Some(id.as_str())
+        || zap_coding::session_runtime_registry::SessionRuntimeRegistry::global()
+            .live_turn_session_ids()
+            .iter()
+            .any(|sid| sid == &id);
+    Json(freshness)
+}
+
+/// GET /projects/:hash/sessions/:id - Get session detail
+async fn get_session_detail(
+    State(state): State<AppState>,
+    Path((hash, id)): Path<(String, String)>,
+    Query(query): Query<SessionDetailQuery>,
+) -> impl IntoResponse {
+    match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
+        Ok(Some(session)) => {
+            let _ = crate::native_live::take_session_draft(&id);
+            let messages = match merge_catalog_session_messages_for_display(&session) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    let msg = format!("Failed to load session: {error}");
+                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                }
+            };
+            let turns = session_user_outline(&messages);
+            let (message_count, offset, messages) = apply_session_message_window(messages, &query);
+            let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
+            let turn_running = state
+                .active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|sid| sid == &id)
+                || crate::native_live::live_running_session_id().as_deref() == Some(id.as_str())
+                || zap_coding::session_runtime_registry::SessionRuntimeRegistry::global()
+                    .live_turn_session_ids()
+                    .iter()
+                    .any(|sid| sid == &id);
+            let _ = turn_running;
+            let todos = zap_capabilities::tools::read_todo_board(&id)
+                .map(|board| board.items)
+                .unwrap_or_default();
+            let detail = SessionDetail {
+                id: session.meta.id,
+                name: session.meta.name,
+                working_dir: PathBuf::from(session.meta.working_dir),
+                created_at: u64::try_from(session.meta.created_at.max(0)).unwrap_or(0),
+                updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
+                message_count,
+                offset,
+                turns,
+                messages,
+                preferred_model: session.meta.preferred_model.clone(),
+                token_usage,
+                origin: session.meta.origin,
+                todos,
+                turn_stats: session.meta.turn_stats.clone(),
+            };
+            Json(detail).into_response()
+        }
+        Ok(None) if crate::native_live::is_session_draft(&id) => {
+            // OpenCode draft: allocated via POST /sessions but not catalog-persisted yet.
+            let working_dir = crate::native_live::session_draft_working_dir(&id)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let detail = SessionDetail {
+                id: id.clone(),
+                name: format!("session-{id}"),
+                working_dir,
+                created_at: 0,
+                updated_at: 0,
+                message_count: 0,
+                offset: 0,
+                turns: Vec::new(),
+                messages: Vec::new(),
+                preferred_model: None,
+                token_usage: None,
+                origin: zap_capabilities::session::SessionOrigin::Manual,
+                todos: Vec::new(),
+                turn_stats: Vec::new(),
+            };
+            Json(detail).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to load session: {}", e);
+            (StatusCode::NOT_FOUND, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /projects/:hash/sessions/:id/lineage - Get conversation fork lineage and child branches
+async fn get_session_lineage(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+    if !valid_project_bucket(&hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "INVALID_PROJECT",
+                "message": format!("Invalid project identifier: {hash}")
+            })),
+        )
+            .into_response();
+    }
+    let sessions_root = NativeSessionManager::sessions_root();
+    let manager = NativeSessionManager::with_root(sessions_root.join(&hash));
+    match manager.session_lineage(&id) {
+        Ok(Some(lineage)) => (StatusCode::OK, Json(lineage)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "SESSION_NOT_FOUND",
+                "message": format!("Session '{id}' was not found in project '{hash}'")
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "STORAGE_ERROR",
+                "message": format!("{error}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Display-only image sidecar: the ORIGINAL images of VL-preprocessed user messages.
+///
+/// When the active model lacks vision, the runtime's VL seam strips the image from the
+/// conversation (only the text caption reaches the model + the persisted snapshot). The
+/// image must NOT go back into the conversation — the kernel counts every stored image as
+/// ~1600 tokens (`Message::estimate_tokens`) and the adapter would re-send it — so we
+/// stash the originals HERE, out of band, and re-attach them for DISPLAY only on load.
+/// Ordered: one entry per VL-preprocessed submission, matched to the VL-marker user
+/// messages in order (each such submission produces exactly one).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImageSidecar {
+    #[serde(default)]
+    pub sets: Vec<Vec<ImageData>>,
+}
+
+fn image_sidecar_path(working_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    zap_capabilities::session::SessionManager::for_project(working_dir)
+        .root()
+        .join(format!("{session_id}.images.json"))
+}
+
+/// Append a VL-preprocessed message's ORIGINAL images to the session's display-only
+/// sidecar. Best-effort: a failure just means the image later shows as the "missing"
+/// placeholder — it never blocks the turn and never touches the model context.
+pub(crate) fn append_display_images(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    images: Vec<ImageData>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let path = image_sidecar_path(working_dir, session_id);
+    let mut sidecar: ImageSidecar = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    sidecar.sets.push(images);
+    if let Ok(bytes) = serde_json::to_vec(&sidecar) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Re-attach display-only sidecar images to the VL-preprocessed user messages that
+/// currently render the "missing image" placeholder, IN ORDER. Real (vision-model)
+/// images and non-user messages are left untouched.
+pub(crate) fn attach_display_images(
+    messages: &mut [MessageInfo],
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let sets = std::fs::read(image_sidecar_path(working_dir, session_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ImageSidecar>(&bytes).ok())
+        .map(|sidecar| sidecar.sets)
+        .unwrap_or_default();
+    attach_image_sets(messages, sets);
+}
+
+fn is_visible_user_turn_start(msg: &MessageInfo) -> bool {
+    msg.role == "user" && !msg.synthetic
+}
+
+fn is_visible_assistant_reply(msg: &MessageInfo) -> bool {
+    msg.role == "assistant" && msg.internal_origin.as_deref() != Some("turn_diagnostic")
+}
+
+/// Stamp each user-turn's last assistant with the full agent-loop wall clock.
+///
+/// Live WebUI measures user-bubble → final answer. Kernel `MessageMeta.elapsed_ms`
+/// is only the last LLM round, so a reload would otherwise shrink "用时 20min"
+/// down to the last reply. Prefer persisted [`TurnStat::duration_ms`], then the
+/// user/assistant `created_at` span.
+pub(crate) fn stamp_turn_elapsed_on_last_assistants(
+    messages: &mut [MessageInfo],
+    turn_stats: &[zap_capabilities::session::TurnStat],
+) {
+    let mut i = 0usize;
+    let mut turn_i = 0usize;
+    while i < messages.len() {
+        if !is_visible_user_turn_start(&messages[i]) {
+            i += 1;
+            continue;
+        }
+        let user_ts = messages[i].created_at;
+        let mut last_asst = None;
+        let mut j = i + 1;
+        while j < messages.len() && !is_visible_user_turn_start(&messages[j]) {
+            if is_visible_assistant_reply(&messages[j]) {
+                last_asst = Some(j);
+            }
+            j += 1;
+        }
+        if let Some(ai) = last_asst {
+            let from_ts = match (user_ts, messages[ai].created_at) {
+                (Some(user), Some(asst)) if asst > user => Some(asst - user),
+                _ => None,
+            };
+            let from_stat = turn_stats
+                .get(turn_i)
+                .map(|stat| stat.duration_ms)
+                .filter(|ms| *ms > 0);
+            if let Some(total) = from_stat.or(from_ts) {
+                messages[ai].elapsed_ms = Some(total);
+            }
+        }
+        turn_i += 1;
+        i = j;
+    }
+}
+
+/// Pure matcher (see [`attach_display_images`]): replace each VL-marker user message's
+/// "missing image" placeholder with the next sidecar image set, IN ORDER. Real images and
+/// non-user messages are left untouched.
+fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
+    if sets.is_empty() {
+        return;
+    }
+    let mut next = sets.into_iter();
+    for message in messages.iter_mut() {
+        let is_missing_placeholder = message.role == "user"
+            && message
+                .images
+                .as_ref()
+                .is_some_and(|imgs| imgs.iter().any(|img| img.missing));
+        if is_missing_placeholder {
+            if let Some(images) = next.next() {
+                if !images.is_empty() {
+                    message.images = Some(images);
+                }
+            }
+        }
+    }
+}
+
+fn merge_catalog_session_messages_for_display(
+    session: &crate::legacy_convert::CatalogSessionView,
+) -> anyhow::Result<Vec<MessageInfo>> {
+    use zap_capabilities::session::{DisplayAnchor, PresentationRole};
+
+    let runtime_messages: Vec<_> = session
+        .snapshot
+        .messages
+        .iter()
+        .filter(|message| {
+            message.internal_origin.as_deref()
+                != Some(zap_kernel::message::LEGACY_COLD_SUMMARY_ORIGIN)
+                && !zap_capabilities::reminder::is_system_reminder(&message.text)
+        })
+        .collect();
+    let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
+    for entry in &session.presentation.entries {
+        let after_message = match entry.anchor {
+            DisplayAnchor::AtStart => 0,
+            DisplayAnchor::AfterTurn { turn_id } => session
+                .meta
+                .turn_stats
+                .iter()
+                .find(|stat| stat.position_valid && stat.turn_id == turn_id)
+                .map(|stat| stat.after_message)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("presentation references missing turn id {turn_id}")
+                })?,
+        };
+        presentation.entry(after_message).or_default().push(entry);
+    }
+    let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
+    let working_dir = std::path::Path::new(&session.meta.working_dir);
+    let mut messages =
+        Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
+    let unwrap_presentation_text = |role: PresentationRole, text: &str| -> String {
+        if role == PresentationRole::User {
+            zap_capabilities::session::user_text_for_display(working_dir, text)
+        } else {
+            text.to_string()
+        }
+    };
+    let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
+        for entry in presentation.remove(&position).unwrap_or_default() {
+            if zap_capabilities::reminder::is_system_reminder(&entry.text) {
+                continue;
+            }
+            messages.push(MessageInfo {
+                role: match entry.role {
+                    PresentationRole::User => "user",
+                    PresentationRole::Assistant => "assistant",
+                }
+                .into(),
+                id: None,
+                content: unwrap_presentation_text(entry.role, &entry.text),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: timestamp,
+                elapsed_ms: None,
+            });
+        }
+    };
+    append_presentation(0, &mut messages);
+    for (index, message) in runtime_messages.into_iter().enumerate() {
+        let mut info = MessageInfo::from_kernel_in(message, Some(working_dir));
+        if info.created_at.is_none() {
+            info.created_at = timestamp;
+        }
+        messages.push(info);
+        append_presentation(index + 1, &mut messages);
+    }
+    for (_, entries) in presentation {
+        for entry in entries {
+            if zap_capabilities::reminder::is_system_reminder(&entry.text) {
+                continue;
+            }
+            messages.push(MessageInfo {
+                role: match entry.role {
+                    PresentationRole::User => "user",
+                    PresentationRole::Assistant => "assistant",
+                }
+                .into(),
+                id: None,
+                content: unwrap_presentation_text(entry.role, &entry.text),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: timestamp,
+                elapsed_ms: None,
+            });
+        }
+    }
+    // Re-attach display-only images (VL-preprocessed originals) stashed out of band, so a
+    // reloaded session shows the thumbnail instead of the "missing image" placeholder.
+    attach_display_images(
+        &mut messages,
+        std::path::Path::new(&session.meta.working_dir),
+        &session.meta.id,
+    );
+    stamp_turn_elapsed_on_last_assistants(&mut messages, &session.meta.turn_stats);
+    Ok(messages)
+}
+
+/// GET /sessions - List all sessions across all projects
+async fn get_all_sessions() -> impl IntoResponse {
+    match run_session_catalog_io(list_all_sessions).await {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to list sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// POST /sessions - Create a new session
+async fn create_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> impl IntoResponse {
+    // Determine working directory
+    let mut working_dir = match req.working_dir {
+        Some(dir) if !dir.as_os_str().is_empty() && dir.to_string_lossy() != "__global__" => {
+            let mut proj = state.project.write().await;
+            update_project_state(&mut proj, &dir);
+            dir
+        }
+        Some(_) => global_standalone_workspace(),
+        None => {
+            // Use current project's working directory
+            let project = state.project.read().await;
+            project.working_dir.clone()
+        }
+    };
+
+    // Ensure working directory exists
+    if !working_dir.exists() {
+        // Create jeikchat directory in user's home if default
+        let home = zap_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let jeikchat_dir = home.join("jeikchat");
+        if jeikchat_dir.exists() || std::fs::create_dir_all(&jeikchat_dir).is_ok() {
+            working_dir = jeikchat_dir;
+        } else {
+            let msg = format!("Working directory does not exist: {:?}", working_dir);
+            return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = zap_capabilities::session::now_ms();
+    let mut meta =
+        zap_capabilities::session::SessionMeta::new(&id, working_dir.to_string_lossy(), now);
+    meta.owner = zap_capabilities::session::StorageOwner::Native;
+    if let Some(title) = req.title {
+        meta.name = title;
+        meta.user_renamed = true;
+    }
+    // OpenCode-style draft: allocate identity without writing an empty catalog row.
+    // The first real user Submit (via CodingRuntime staged publish) persists it.
+    crate::native_live::register_session_draft(id.clone(), working_dir.clone());
+
+    let project_hash = response_project_hash(&working_dir);
+
+    let response = CreateSessionResponse {
+        id: id.clone(),
+        name: meta.name.clone(),
+        working_dir: working_dir.clone(),
+        project_hash,
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0) / 1_000,
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+/// POST /sessions/:id/messages - Append externally handled, UI-only messages.
+async fn append_session_messages(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<AppendSessionMessagesRequest>,
+) -> impl IntoResponse {
+    let working_dir = match req.working_dir {
+        Some(dir) => dir,
+        None => {
+            let project = state.project.read().await;
+            project.working_dir.clone()
+        }
+    };
+
+    let mut messages = Vec::with_capacity(req.messages.len());
+    for msg in req.messages {
+        let role = match msg.role.to_ascii_lowercase().as_str() {
+            "user" => zap_capabilities::session::PresentationRole::User,
+            "assistant" => zap_capabilities::session::PresentationRole::Assistant,
+            _ => {
+                let err = format!("Unsupported message role: {}", msg.role);
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+        };
+        messages.push((role, msg.content));
+    }
+
+    let project_hash = response_project_hash(&working_dir);
+    let message_count = match crate::legacy_convert::append_catalog_presentation_in_project(
+        &project_hash,
+        &session_id,
+        &messages,
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let msg = format!("Failed to save session: {error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
+        }
+    };
+
+    let response = AppendSessionMessagesResponse {
+        success: true,
+        session_id,
+        message_count,
+        project_hash,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Search sessions by name across all projects
+fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    search_sessions_by_name_in_root(&NativeSessionManager::sessions_root(), keyword)
+}
+
+fn search_sessions_by_name_in_root(
+    sessions_root: &std::path::Path,
+    keyword: &str,
+) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let keyword_lower = keyword.to_lowercase();
+    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
+        .entries
+        .into_iter()
+        .filter(|entry| entry.message_count > 0)
+        .collect();
+    crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            entry.name.to_lowercase().contains(&keyword_lower)
+                || entry
+                    .working_dir
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&keyword_lower)
+                || entry.id.to_lowercase().starts_with(&keyword_lower)
+        })
+        .map(catalog_entry_with_project)
+        .collect())
+}
+
+/// GET /sessions/search?q=keyword - Search sessions by name
+async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
+    if query.q.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json("Search keyword cannot be empty"),
+        )
+            .into_response();
+    }
+
+    let keyword = query.q;
+    match run_session_catalog_io(move || search_sessions_by_name(&keyword)).await {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to search sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// Delete one inactive session aggregate.
+///
+/// Keep the typed storage error in the anyhow chain: the HTTP boundary must
+/// distinguish an active lease (`409`) from missing data (`404`) and an
+/// unexpected storage failure (`500`). Flattening everything into
+/// `io::Error::other` made that distinction impossible.
+fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
+    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)?;
+    // 跨实例增量：删行 + 让客户端丢弃该 id 的本地缓存。
+    publish_global(GlobalWireEvent::SessionDeleted {
+        session_id: session_id.to_string(),
+        project_hash: project_hash.to_string(),
+    });
+    Ok(())
+}
+
+fn valid_project_bucket(project_bucket: &str) -> bool {
+    project_bucket.len() == 16 && project_bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn delete_session_api_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.to_string(),
+            code: Some(code.to_string()),
+            retryable: Some(false),
+        }),
+    )
+}
+
+fn classify_delete_session_error(error: &anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    match error.downcast_ref::<SessionStoreError>() {
+        Some(SessionStoreError::SessionInUse { .. }) => delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session is active. Switch to or create another session, then try again.",
+        ),
+        Some(SessionStoreError::NotFound { .. }) => delete_session_api_error(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            "The session was not found.",
+        ),
+        Some(SessionStoreError::InvalidId { .. } | SessionStoreError::AmbiguousId { .. }) => {
+            delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The session identifier is invalid.",
+            )
+        }
+        _ => delete_session_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_FAILED",
+            "Failed to delete the session. Check the JeikCode logs for details.",
+        ),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepairSessionRequest {
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepairSessionResponse {
+    pub success: bool,
+    pub status: &'static str,
+    pub applied: bool,
+    pub metadata: &'static str,
+    pub snapshot: &'static str,
+    pub presentation: &'static str,
+    pub transcript: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+}
+
+fn transcript_state(manager: &NativeSessionManager, id: &str) -> &'static str {
+    let Ok(path) = manager.jsonl_path(id) else {
+        return "invalid";
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => "unsafe",
+        Ok(metadata) if metadata.len() == 0 => "empty",
+        Ok(_) => "present",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
+        Err(_) => "unreadable",
+    }
+}
+
+fn repair_session_file(
+    project_hash: &str,
+    session_id: &str,
+    apply: bool,
+) -> Result<RepairSessionResponse, RepairSessionFailure> {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    repair_session_with_manager(&manager, session_id, apply).map_err(|error| RepairSessionFailure {
+        transcript: transcript_state(&manager, session_id),
+        error,
+    })
+}
+
+#[derive(Debug)]
+struct RepairSessionFailure {
+    error: SessionStoreError,
+    transcript: &'static str,
+}
+
+fn repair_session_with_manager(
+    manager: &NativeSessionManager,
+    session_id: &str,
+    apply: bool,
+) -> Result<RepairSessionResponse, SessionStoreError> {
+    let lease = manager.acquire_lease(session_id)?;
+    let outcome = manager.repair_missing_presentation(&lease, apply)?;
+    let transcript = transcript_state(manager, session_id);
+    use zap_capabilities::session::NativeSessionRepairOutcome as Outcome;
+    let (status, applied, presentation, message_count) = match outcome {
+        Outcome::Healthy(session) => ("healthy", false, "valid", session.snapshot.messages.len()),
+        Outcome::RepairableMissingPresentation { snapshot, .. } => (
+            "repairable_missing_presentation",
+            false,
+            "missing",
+            snapshot.messages.len(),
+        ),
+        Outcome::Repaired(session) => ("repaired", true, "valid", session.snapshot.messages.len()),
+    };
+    Ok(RepairSessionResponse {
+        success: true,
+        status,
+        applied,
+        metadata: "valid",
+        snapshot: "valid",
+        presentation,
+        transcript,
+        message_count: Some(message_count),
+    })
+}
+
+fn repair_artifact_kind(error: &SessionStoreError) -> Option<(&'static str, &'static str)> {
+    fn normalize(kind: &str) -> Option<&'static str> {
+        if matches!(kind, "session meta" | "meta turn stats" | "metadata") {
+            Some("metadata")
+        } else if kind.starts_with("snapshot") {
+            Some("snapshot")
+        } else if kind.starts_with("presentation") {
+            Some("presentation")
+        } else {
+            None
+        }
+    }
+
+    match error {
+        SessionStoreError::NotFound { path } => match path.extension().and_then(|ext| ext.to_str())
+        {
+            Some("snapshot") => Some(("snapshot", "missing")),
+            Some("presentation") => Some(("presentation", "missing")),
+            _ => None,
+        },
+        SessionStoreError::Corrupt { kind, .. } => normalize(kind).map(|kind| (kind, "corrupt")),
+        SessionStoreError::FutureSchema { kind, .. } => {
+            normalize(kind).map(|kind| (kind, "future_schema"))
+        }
+        SessionStoreError::TooLarge { kind, .. } => normalize(kind).map(|kind| (kind, "too_large")),
+        SessionStoreError::UnsafeFile { path, .. } => {
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("meta") => Some(("metadata", "unsafe")),
+                Some("snapshot") => Some(("snapshot", "unsafe")),
+                Some("presentation") => Some(("presentation", "unsafe")),
+                _ => None,
+            }
+        }
+        SessionStoreError::OwnershipConflict { .. } => Some(("metadata", "non_native_owner")),
+        _ => None,
+    }
+}
+
+fn not_repairable_response(
+    artifact: &'static str,
+    state: &'static str,
+    transcript: &'static str,
+) -> RepairSessionResponse {
+    let mut response = RepairSessionResponse {
+        success: false,
+        status: "not_repairable",
+        applied: false,
+        metadata: "valid",
+        snapshot: "valid",
+        presentation: "valid",
+        transcript,
+        message_count: None,
+    };
+    match artifact {
+        "metadata" | "meta" => {
+            response.metadata = state;
+            response.snapshot = "unchecked";
+            response.presentation = "unchecked";
+        }
+        "snapshot" => {
+            response.snapshot = state;
+            response.presentation = "unchecked";
+        }
+        "presentation" => response.presentation = state,
+        _ => {
+            response.metadata = "unchecked";
+            response.snapshot = "unchecked";
+            response.presentation = "unchecked";
+        }
+    }
+    response
+}
+
+fn classify_repair_session_error(
+    error: &SessionStoreError,
+    transcript: &'static str,
+) -> axum::response::Response {
+    match error {
+        SessionStoreError::SessionInUse { .. } => delete_session_api_error(
+            StatusCode::CONFLICT,
+            "SESSION_IN_USE",
+            "This session is active. Switch to or create another session, then try again.",
+        )
+        .into_response(),
+        SessionStoreError::NotFound { path }
+            if path.extension().and_then(|ext| ext.to_str()) == Some("meta") =>
+        {
+            delete_session_api_error(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "The session metadata was not found.",
+            )
+            .into_response()
+        }
+        SessionStoreError::InvalidId { .. } | SessionStoreError::AmbiguousId { .. } => {
+            delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The project or session identifier is invalid.",
+            )
+            .into_response()
+        }
+        _ if repair_artifact_kind(error).is_some() => {
+            let (artifact, state) = repair_artifact_kind(error).expect("guarded above");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(not_repairable_response(artifact, state, transcript)),
+            )
+                .into_response()
+        }
+        _ => delete_session_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "REPAIR_FAILED",
+            "Failed to inspect or repair the session. Check the JeikCode logs for details.",
+        )
+        .into_response(),
+    }
+}
+
+/// POST /projects/:hash/sessions/:id/repair - Inspect or explicitly repair a session.
+async fn repair_session(
+    Path((hash, id)): Path<(String, String)>,
+    Json(request): Json<RepairSessionRequest>,
+) -> impl IntoResponse {
+    if !valid_project_bucket(&hash) {
+        return delete_session_api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SESSION",
+            "The project or session identifier is invalid.",
+        )
+        .into_response();
+    }
+    let task = tokio::task::spawn_blocking(move || repair_session_file(&hash, &id, request.apply));
+    match task.await {
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Err(failure)) => {
+            tracing::warn!(error = %failure.error, "session repair was rejected");
+            classify_repair_session_error(&failure.error, failure.transcript)
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "session repair task failed");
+            delete_session_api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REPAIR_FAILED",
+                "Failed to inspect or repair the session. Check the JeikCode logs for details.",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// DELETE /projects/:hash/sessions/:id - Delete a session
+async fn delete_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        if !valid_project_bucket(&hash) {
+            tracing::warn!(project_bucket = %hash, "rejected invalid session delete request");
+            return delete_session_api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SESSION",
+                "The project or session identifier is invalid.",
+            )
+            .into_response();
+        }
+        // ViewBinding (WebUI/TUI 正在看哪个会话) is not ownership. Release the
+        // idle execution runtime or registry runner that actually holds the
+        // lease. Active turns stay fail-closed as SESSION_IN_USE.
+        match crate::native_live::release_idle_session_for_delete(&id).await {
+            Ok(()) => {}
+            Err(crate::live_hub::HubError::ActiveTurn) => {
+                return delete_session_api_error(
+                    StatusCode::CONFLICT,
+                    "SESSION_IN_USE",
+                    "This session has an active turn. Stop it, then try again.",
+                )
+                .into_response();
+            }
+            Err(crate::live_hub::HubError::StaleBinding)
+            | Err(crate::live_hub::HubError::RuntimeGenerationChanged { .. })
+            | Err(crate::live_hub::HubError::Unbound) => {}
+            Err(error) => {
+                tracing::warn!(
+                    project_bucket = %hash,
+                    session_id = %id,
+                    error = ?error,
+                    "failed to release current session before delete"
+                );
+                return delete_session_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DELETE_FAILED",
+                    "Failed to release the current session before deleting it.",
+                )
+                .into_response();
+            }
+        }
+
+        let delete_hash = hash.clone();
+        let delete_id = id.clone();
+        let deleted =
+            tokio::task::spawn_blocking(move || delete_session_file(&delete_hash, &delete_id))
+                .await;
+        match deleted {
+            Ok(Ok(())) => {
+                let working_dir = state_clone.project.read().await.working_dir.clone();
+                let id_for_cleanup = id.clone();
+                // Session files are already gone. Reap MCP, kill session background tasks,
+                // and clean up session background log files asynchronously.
+                tokio::spawn(async move {
+                    let pool = zap_capabilities::mcp::SessionMcpPool::global();
+                    pool.retire_session(&working_dir, &id_for_cleanup).await;
+                    pool.retire_session_id(&id_for_cleanup).await;
+
+                    // Cascade terminate all background services owned by this session
+                    zap_capabilities::tools::bash_runtime::kill_by_session_id(&id_for_cleanup);
+
+                    // Delete all ephemeral log files matching jeikcode-back-{session_id}-*.log
+                    zap_capabilities::tools::cleanup_session_logs(&id_for_cleanup).await;
+
+                    // Release session-scoped approval mode override
+                    crate::live_api::live_clear_session_approval_mode(&id_for_cleanup);
+                });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "delete_session".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
+                let msg = format!("Session {} deleted successfully", id);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Ok(Err(e)) => {
+                let response = classify_delete_session_error(&e);
+                if response.0 == StatusCode::INTERNAL_SERVER_ERROR {
+                    tracing::error!(
+                        project_bucket = %hash,
+                        session_id = %id,
+                        error = ?e,
+                        "failed to delete session"
+                    );
+                }
+                response.into_response()
+            }
+            Err(error) => {
+                tracing::error!(
+                    project_bucket = %hash,
+                    session_id = %id,
+                    error = %error,
+                    "session delete task failed"
+                );
+                delete_session_api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DELETE_FAILED",
+                    "Failed to delete the session. Check the JeikCode logs for details.",
+                )
+                .into_response()
+            }
+        }
+    })
+    .await
+}
+
+/// Rename request body
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    pub name: String,
+}
+
+/// Rename a session
+fn rename_session_file(
+    project_hash: &str,
+    session_id: &str,
+    new_name: &str,
+) -> std::io::Result<()> {
+    crate::legacy_convert::rename_catalog_session_in_project(project_hash, session_id, new_name)
+        .map(|_| ())
+        .map_err(std::io::Error::other)?;
+    // 跨实例增量：就地 upsert 该行（改名 + updated_at），不重拉列表。
+    if let Some(session) = session_row_wire_in_bucket(project_hash, session_id) {
+        publish_global(GlobalWireEvent::SessionUpsert { session });
+    }
+    Ok(())
+}
+
+/// PATCH /projects/:hash/sessions/:id/rename - Rename a session
+async fn rename_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+    Json(req): Json<RenameRequest>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        match rename_session_file(&hash, &id, &req.name) {
+            Ok(()) => {
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "rename".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
+                let msg = format!("Session {} renamed to '{}'", id, req.name);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Err(e) => {
+                let msg = format!("Failed to rename session: {}", e);
+                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+            }
+        }
+    })
+    .await
+}
+
+/// Request to patch an existing session message in place
+#[derive(Debug, Deserialize)]
+pub struct PatchMessageRequest {
+    pub text: String,
+    #[serde(default)]
+    pub images: Option<Vec<ImageInput>>,
+    #[serde(default)]
+    pub expected_text: Option<String>,
+    #[serde(default)]
+    pub expected_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
+}
+
+/// Query parameters for deleting a session message
+#[derive(Debug, Deserialize)]
+pub struct DeleteMessageQuery {
+    #[serde(default)]
+    pub delete_turn: Option<bool>,
+    #[serde(default)]
+    pub expected_text: Option<String>,
+    #[serde(default)]
+    pub expected_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
+}
+
+/// Request to truncate session history to a target point
+#[derive(Debug, Deserialize)]
+pub struct TruncateSessionRequest {
+    pub target_index: usize,
+    #[serde(default)]
+    pub target_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_text: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
+    #[serde(default)]
+    pub inclusive: Option<bool>,
+}
+
+/// Request to fork (branch) a session, optionally at a target message index
+#[derive(Debug, Deserialize, Default)]
+pub struct ForkSessionRequest {
+    #[serde(default)]
+    pub target_index: Option<usize>,
+    #[serde(default)]
+    pub target_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_text: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
+    #[serde(default)]
+    pub inclusive: Option<bool>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Response for a forked session
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForkSessionResponse {
+    pub success: bool,
+    pub id: String,
+    pub name: String,
+    pub parent_id: String,
+    pub root_id: String,
+    pub working_dir: PathBuf,
+    pub project_hash: String,
+    pub message_count: u32,
+    pub turn_count: u32,
+    pub created_at: u64,
+}
+
+fn resolve_target_message_index(
+    messages: &[zap_kernel::message::Message],
+    target_index: usize,
+    expected_text: Option<&str>,
+    expected_role: Option<&str>,
+) -> Option<usize> {
+    let role_matches = |role: &zap_kernel::message::Role| -> bool {
+        expected_role.map_or(true, |r| match role {
+            zap_kernel::message::Role::System => r.eq_ignore_ascii_case("system"),
+            zap_kernel::message::Role::User => r.eq_ignore_ascii_case("user"),
+            zap_kernel::message::Role::Assistant => r.eq_ignore_ascii_case("assistant"),
+            zap_kernel::message::Role::Tool => r.eq_ignore_ascii_case("tool"),
+        })
+    };
+
+    let text_trimmed = expected_text.map(|t| t.trim()).filter(|t| !t.is_empty());
+
+    let msg_text_matches = |msg: &zap_kernel::message::Message, t: &str| -> bool {
+        let m_trimmed = msg.text.trim();
+        if m_trimmed == t {
+            return true;
+        }
+        if let Some(reasoning) = &msg.reasoning {
+            let r_trimmed = reasoning.trim();
+            if r_trimmed == t {
+                return true;
+            }
+            let combined = format!("{}\n{}", r_trimmed, m_trimmed);
+            if combined.trim() == t {
+                return true;
+            }
+        }
+        false
+    };
+
+    let msg_text_contains = |msg: &zap_kernel::message::Message, t: &str| -> bool {
+        let m_trimmed = msg.text.trim();
+        if !m_trimmed.is_empty()
+            && (m_trimmed.starts_with(t) || m_trimmed.contains(t) || t.contains(m_trimmed))
+        {
+            return true;
+        }
+        if let Some(reasoning) = &msg.reasoning {
+            let r_trimmed = reasoning.trim();
+            if !r_trimmed.is_empty()
+                && (r_trimmed.starts_with(t) || r_trimmed.contains(t) || t.contains(r_trimmed))
+            {
+                return true;
+            }
+            let combined = format!("{}\n{}", r_trimmed, m_trimmed);
+            let c_trimmed = combined.trim();
+            if !c_trimmed.is_empty()
+                && (c_trimmed.starts_with(t) || c_trimmed.contains(t) || t.contains(c_trimmed))
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    // 1. 优先命中：物理索引处直接匹配（角色匹配 + 文本一致/无指定文本）
+    if let Some(msg) = messages.get(target_index) {
+        if role_matches(&msg.role) {
+            if let Some(t) = text_trimmed {
+                if msg_text_matches(msg, t) {
+                    return Some(target_index);
+                }
+            } else {
+                return Some(target_index);
+            }
+        }
+    }
+
+    // 2. 文本精准匹配：在所有角色匹配的消息中，寻找完全相等且距离 target_index 最近的项
+    if let Some(t) = text_trimmed {
+        let mut best_exact: Option<(usize, usize)> = None;
+        for (i, msg) in messages.iter().enumerate() {
+            if role_matches(&msg.role) && msg_text_matches(msg, t) {
+                let dist = if i >= target_index {
+                    i - target_index
+                } else {
+                    target_index - i
+                };
+                if best_exact.map_or(true, |(_, d)| dist < d) {
+                    best_exact = Some((i, dist));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_exact {
+            return Some(idx);
+        }
+
+        // 3. 前缀/包含模糊匹配（仅当严格符合目标角色时才允许，杜绝反向包含误伤）
+        let mut best_fuzzy: Option<(usize, usize)> = None;
+        for (i, msg) in messages.iter().enumerate() {
+            if role_matches(&msg.role) && msg_text_contains(msg, t) {
+                let dist = if i >= target_index {
+                    i - target_index
+                } else {
+                    target_index - i
+                };
+                if best_fuzzy.map_or(true, |(_, d)| dist < d) {
+                    best_fuzzy = Some((i, dist));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_fuzzy {
+            return Some(idx);
+        }
+    }
+
+    // 4. 次选降级：若 target_index 处角色匹配则使用
+    if let Some(msg) = messages.get(target_index) {
+        if role_matches(&msg.role) {
+            return Some(target_index);
+        }
+    }
+
+    // 5. 寻找距离 target_index 最近且符合目标角色的任意消息
+    if expected_role.is_some() {
+        let mut best_role: Option<(usize, usize)> = None;
+        for (i, msg) in messages.iter().enumerate() {
+            if role_matches(&msg.role) {
+                let dist = if i >= target_index {
+                    i - target_index
+                } else {
+                    target_index - i
+                };
+                if best_role.map_or(true, |(_, d)| dist < d) {
+                    best_role = Some((i, dist));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_role {
+            return Some(idx);
+        }
+    }
+
+    // 6. 最终兜底
+    if target_index < messages.len() {
+        Some(target_index)
+    } else {
+        None
+    }
+}
+
+/// PATCH /projects/:hash/sessions/:id/messages/:index - Mutate message in place
+async fn patch_session_message(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id, index)): Path<(String, String, usize)>,
+    Json(req): Json<PatchMessageRequest>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        let _ = state_clone
+            .active_chats
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
+            .await;
+        let _ = crate::native_live::cancel_via_registry(&id);
+
+        let sessions_root = NativeSessionManager::sessions_root();
+        let bucket = if valid_project_bucket(&hash) {
+            hash.clone()
+        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+            resolved.project_hash
+        } else {
+            hash.clone()
+        };
+        let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
+        let (manager, mut snapshot, mut meta) = match (manager.load_snapshot(&id), manager.read_meta(&id)) {
+            (Ok(s), Ok(m)) => (manager, s, m),
+            _ => {
+                if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+                    let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+                    if let (Ok(s), Ok(m)) = (mgr.load_snapshot(&id), mgr.read_meta(&id)) {
+                        (mgr, s, m)
+                    } else {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                        )
+                            .into_response();
+                    }
+                } else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        let target_idx = resolve_target_message_index(
+            &snapshot.messages,
+            index,
+            req.expected_text.as_deref(),
+            req.expected_role.as_deref(),
+        );
+        let Some(real_index) = target_idx else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "success": false, "error": "message not found" })),
+            )
+                .into_response();
+        };
+
+        snapshot.messages[real_index].text = req.text.clone();
+        if let Some(imgs) = req.images.as_ref() {
+            snapshot.messages[real_index].images = imgs
+                .iter()
+                .map(|img| zap_kernel::message::ImageContent {
+                    media_type: img.media_type.clone(),
+                    data: img.data.clone(),
+                })
+                .collect();
+        }
+        snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        meta.updated_at = zap_capabilities::session::now_ms();
+        if let Err(e) = manager.save_snapshot(&id, &snapshot) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        manager.clear_inflight_snapshot(&id);
+        let _ = manager.write_meta(&meta);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let event = ChatEvent::SessionMutation {
+            session_id: id.clone(),
+            revision: snapshot.cache_epoch,
+            action: "patch".into(),
+            message_id: req.expected_message_id,
+            source_index: Some(real_index),
+            text: Some(req.text),
+            images: req.images,
+            delete_turn: None,
+            target_index: None,
+            target_message_id: None,
+            ts: Some(now),
+        };
+        state_clone.active_chats.broadcast_to_session(&id, event).await;
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "revision": snapshot.cache_epoch, "source_index": real_index })),
+        )
+            .into_response()
+    })
+    .await
+}
+
+/// DELETE /projects/:hash/sessions/:id/messages/:index - Delete message or entire turn
+async fn delete_session_message(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id, index)): Path<(String, String, usize)>,
+    Query(query): Query<DeleteMessageQuery>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        let _ = state_clone
+            .active_chats
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
+            .await;
+        let _ = crate::native_live::cancel_via_registry(&id);
+
+        let sessions_root = NativeSessionManager::sessions_root();
+        let bucket = if valid_project_bucket(&hash) {
+            hash.clone()
+        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+            resolved.project_hash
+        } else {
+            hash.clone()
+        };
+        let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
+        let (manager, mut snapshot, mut meta) = match (manager.load_snapshot(&id), manager.read_meta(&id)) {
+            (Ok(s), Ok(m)) => (manager, s, m),
+            _ => {
+                if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+                    let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+                    if let (Ok(s), Ok(m)) = (mgr.load_snapshot(&id), mgr.read_meta(&id)) {
+                        (mgr, s, m)
+                    } else {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                        )
+                            .into_response();
+                    }
+                } else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        let target_idx = resolve_target_message_index(
+            &snapshot.messages,
+            index,
+            query.expected_text.as_deref(),
+            query.expected_role.as_deref(),
+        );
+        let Some(real_index) = target_idx else {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": true, "notFound": true })),
+            )
+                .into_response();
+        };
+
+        let delete_turn = query.delete_turn.unwrap_or(false);
+        let mutation_start_idx;
+        if delete_turn {
+            // 用户消息删除（整回合删除：删除该用户消息以及随后的整轮 Agent 中间输出和回答）
+            mutation_start_idx = real_index;
+            let mut end = real_index + 1;
+            while end < snapshot.messages.len()
+                && snapshot.messages[end].role != zap_kernel::message::Role::User
+            {
+                end += 1;
+            }
+            snapshot.messages.drain(real_index..end);
+        } else {
+            // Agent 消息删除（删除当轮 Agent 的所有中间输出、工具调用和最终回答，保留前置 User 消息）
+            if snapshot.messages[real_index].role == zap_kernel::message::Role::Assistant
+                || snapshot.messages[real_index].role == zap_kernel::message::Role::Tool
+            {
+                let mut start = real_index;
+                while start > 0
+                    && snapshot.messages[start - 1].role != zap_kernel::message::Role::User
+                {
+                    start -= 1;
+                }
+                let mut end = real_index + 1;
+                while end < snapshot.messages.len()
+                    && snapshot.messages[end].role != zap_kernel::message::Role::User
+                {
+                    end += 1;
+                }
+                mutation_start_idx = start;
+                snapshot.messages.drain(start..end);
+            } else {
+                mutation_start_idx = real_index;
+                snapshot.messages.remove(real_index);
+            }
+        }
+
+        let (turn_c, req_c) =
+            zap_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
+        snapshot.turn_counter = turn_c;
+        snapshot.request_counter = req_c;
+        snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        meta.updated_at = zap_capabilities::session::now_ms();
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
+        meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        if let Err(e) = manager.save_snapshot(&id, &snapshot) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        manager.clear_inflight_snapshot(&id);
+        let _ = manager.write_meta(&meta);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let event = ChatEvent::SessionMutation {
+            session_id: id.clone(),
+            revision: snapshot.cache_epoch,
+            action: "delete".into(),
+            message_id: query.expected_message_id,
+            source_index: Some(mutation_start_idx),
+            text: None,
+            images: None,
+            delete_turn: Some(delete_turn),
+            target_index: None,
+            target_message_id: None,
+            ts: Some(now),
+        };
+        state_clone.active_chats.broadcast_to_session(&id, event).await;
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "revision": snapshot.cache_epoch, "source_index": mutation_start_idx })),
+        )
+            .into_response()
+    })
+    .await
+}
+
+/// POST /projects/:hash/sessions/:id/truncate - Truncate session history
+async fn truncate_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+    Json(req): Json<TruncateSessionRequest>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        let _ = state_clone
+            .active_chats
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
+            .await;
+        let _ = crate::native_live::cancel_via_registry(&id);
+
+        let sessions_root = NativeSessionManager::sessions_root();
+        let bucket = if valid_project_bucket(&hash) {
+            hash.clone()
+        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+            resolved.project_hash
+        } else {
+            hash.clone()
+        };
+        let manager = NativeSessionManager::with_root(sessions_root.join(&bucket));
+        let (manager, mut snapshot, mut meta) = match (manager.load_snapshot(&id), manager.read_meta(&id)) {
+            (Ok(s), Ok(m)) => (manager, s, m),
+            _ => {
+                if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+                    let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+                    if let (Ok(s), Ok(m)) = (mgr.load_snapshot(&id), mgr.read_meta(&id)) {
+                        (mgr, s, m)
+                    } else {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                        )
+                            .into_response();
+                    }
+                } else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        let target_idx = resolve_target_message_index(
+            &snapshot.messages,
+            req.target_index,
+            req.expected_text.as_deref(),
+            req.expected_role.as_deref(),
+        );
+        let Some(real_index) = target_idx else {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": true, "notFound": true })),
+            )
+                .into_response();
+        };
+
+        let keep_count = if req.inclusive.unwrap_or(false) {
+            (real_index + 1).min(snapshot.messages.len())
+        } else {
+            real_index.min(snapshot.messages.len())
+        };
+
+        snapshot.messages.truncate(keep_count);
+        let (turn_c, req_c) =
+            zap_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
+        snapshot.turn_counter = turn_c;
+        snapshot.request_counter = req_c;
+        snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        meta.updated_at = zap_capabilities::session::now_ms();
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
+        meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        if let Err(e) = manager.save_snapshot(&id, &snapshot) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        manager.clear_inflight_snapshot(&id);
+        let _ = manager.write_meta(&meta);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let event = ChatEvent::SessionMutation {
+            session_id: id.clone(),
+            revision: snapshot.cache_epoch,
+            action: "truncate".into(),
+            message_id: None,
+            source_index: None,
+            text: None,
+            images: None,
+            delete_turn: None,
+            target_index: Some(keep_count),
+            target_message_id: req.target_message_id,
+            ts: Some(now),
+        };
+        state_clone.active_chats.broadcast_to_session(&id, event).await;
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "revision": snapshot.cache_epoch, "target_index": keep_count })),
+        )
+            .into_response()
+    })
+    .await
+}
+
+/// POST /projects/:hash/sessions/:id/fork - Fork (branch) a session
+async fn fork_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+    body: Option<Json<ForkSessionRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        let sessions_root = NativeSessionManager::sessions_root();
+        let (project_hash, manager, source_id, source) = if valid_project_bucket(&hash) {
+            let mgr = NativeSessionManager::with_root(sessions_root.join(&hash));
+            if let Ok(loaded) = mgr.load_native_session(&id) {
+                (hash.clone(), mgr, id.clone(), loaded)
+            } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+                let mgr =
+                    NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+                if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+                    (resolved.project_hash, mgr, resolved.meta.id, loaded)
+                } else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                    )
+                        .into_response();
+                }
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                )
+                    .into_response();
+            }
+        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+            let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+            if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+                (resolved.project_hash, mgr, resolved.meta.id, loaded)
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "success": false, "error": "session not found" })),
+            )
+                .into_response();
+        };
+
+        let target_message_count = req.target_index.map(|target_index| {
+            if let Some(real_index) = resolve_target_message_index(
+                &source.snapshot.messages,
+                target_index,
+                req.expected_text.as_deref(),
+                req.expected_role.as_deref(),
+            ) {
+                if req.inclusive.unwrap_or(true) {
+                    (real_index + 1).min(source.snapshot.messages.len())
+                } else {
+                    real_index.min(source.snapshot.messages.len())
+                }
+            } else {
+                target_index.min(source.snapshot.messages.len())
+            }
+        });
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = zap_capabilities::session::now_ms();
+        let (mut forked, _lease) =
+            match manager.fork_native_session_at(&source_id, &new_id, target_message_count, now) {
+                Ok(res) => res,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+
+        forked.meta.updated_at = now.saturating_add(1);
+        if let Some(title) = req
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            forked.meta.name = title.to_string();
+            forked.meta.user_renamed = true;
+        }
+        let _ = manager.write_meta(&forked.meta);
+
+        if let Some(session) = session_row_wire_in_bucket(&project_hash, &new_id) {
+            publish_global(GlobalWireEvent::SessionUpsert { session });
+        }
+
+        state_clone.telemetry.track(Event::UseCommand {
+            type_: "fork_session".into(),
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
+
+        let root_id = forked
+            .meta
+            .fork_info
+            .as_ref()
+            .map(|f| f.root_id.clone())
+            .unwrap_or_else(|| source_id.clone());
+
+        let response = ForkSessionResponse {
+            success: true,
+            id: new_id,
+            name: forked.meta.name,
+            parent_id: source_id,
+            root_id,
+            working_dir: PathBuf::from(&forked.meta.working_dir),
+            project_hash,
+            message_count: forked.meta.message_count,
+            turn_count: forked.meta.turn_count,
+            created_at: u64::try_from(forked.meta.created_at.max(0)).unwrap_or(0) / 1_000,
+        };
+
+        (StatusCode::OK, Json(response)).into_response()
+    })
+    .await
+}
+
+/// POST /sessions/:id/fork - Fork (branch) a session by id across projects
+async fn fork_session_by_id(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path(id): Path<String>,
+    body: Option<Json<ForkSessionRequest>>,
+) -> impl IntoResponse {
+    fork_session(
+        State(state),
+        axum::Extension(client_mode),
+        Path((String::new(), id)),
+        body,
+    )
+    .await
+}
+
+/// Model info for API response
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    /// Selection id (config key / alias). Often `account/alias`.
+    pub provider: String,
+    /// Wire model identifier sent to the upstream API.
+    pub model: String,
+    /// Parent provider-account id when this row comes from `[models.*]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Provider type (claude, openai, ollama)
+    pub provider_type: String,
+    /// Whether this is the default provider
+    pub is_default: bool,
+    /// Whether this model accepts the DeepSeek `reasoning_effort` control
+    /// (the deepseek-v4 family). The webui shows the effort selector only
+    /// for models where this is true.
+    pub effort_applicable: bool,
+    /// Current `reasoning_effort` for this provider: `"high"`, `"max"`, or
+    /// `null` (the model's own default). Lets the webui reflect the active
+    /// effort in the selector.
+    pub reasoning_effort: Option<String>,
+    /// Available reasoning effort levels for this model (e.g. `["low", "medium", "high", "xhigh"]`).
+    pub reasoning_levels: Vec<String>,
+    /// Model's configured context window size in tokens, if known (e.g. 128000, 1000000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Model's configured thinking budget in tokens, if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    /// Model's configured max output tokens cap, if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+}
+
+/// Build the `/models` list from the UNIFIED model catalog (`logical_models`)
+/// so folded CodingPlan / new-schema `[models.*]` models — which no longer live
+/// in `config.providers` — appear in the webui + VSCode model pickers, matching
+/// `/config` (`config_response`) and `/providers` (`get_providers`). The old
+/// body iterated only `config.providers` and so silently dropped them.
+fn models_from_config(config: &Config) -> Vec<ModelInfo> {
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let logical_models = config.logical_models();
+    let mut ids: Vec<String> = logical_models.keys().cloned().collect();
+    ids.sort();
+    ids.iter()
+        .filter_map(|id| {
+            let account = logical_models.get(id).map(|m| m.account.clone());
+            config.provider_config_for_selection(id).map(|p| ModelInfo {
+                provider: id.clone(),
+                model: p.model.clone(),
+                account,
+                provider_type: p.provider_type.clone(),
+                is_default: id == &default_selection,
+                effort_applicable: zap_capabilities::provider::effort_control_applicable(
+                    &p.model,
+                    p.reasoning_model,
+                    p.reasoning_effort.as_deref(),
+                    p.reasoning_levels.as_deref(),
+                ),
+                reasoning_effort: p.reasoning_effort.clone(),
+                reasoning_levels: p.effective_reasoning_levels(),
+                context_window: Some(p.context_window).filter(|w| *w > 0),
+                thinking_budget: p.thinking_budget,
+                max_tokens: p.max_tokens,
+            })
+        })
+        .collect()
+}
+
+/// GET /models - List all selectable models from the unified catalog.
+async fn get_models() -> impl IntoResponse {
+    let config_path = Config::default_path();
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(_e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<ModelInfo>::new()),
+            )
+                .into_response();
+        }
+    };
+
+    (StatusCode::OK, Json(models_from_config(&config))).into_response()
+}
+
+/// Public OpenAI/Anthropic-compatible model id: always `{account}/{wire_model}`.
+///
+/// Config catalog keys may still be legacy (`claude`), CodingPlan hyphenated
+/// (`JeikCode-GLM-5.2`), or already slash-form (`acc/ds`). Externally we always
+/// present and accept the stable `account/model` form so clients never see a mix
+/// of `provider-model` vs `provider/model`.
+pub fn public_compat_model_id(account: &str, wire_model: &str) -> String {
+    format!("{}/{}", account.trim(), wire_model.trim())
+}
+
+/// Resolve the model selection used by `/chat` through the unified config boundary.
+///
+/// New-schema CodingPlan models live in `[models.*]` and therefore are not present in
+/// the legacy `config.providers` map. Keep the selection id intact for the runtime while
+/// projecting the flattened provider config needed by image preprocessing and runtime
+/// metadata.
+///
+/// Accepted `requested` forms (first match wins):
+/// 1. Exact catalog selection id (`JeikCode-GLM-5.2`, `claude`, `acc/ds`)
+/// 2. Public id `account/wire_model` (`JeikCode/GLM-5.2`, `claude/claude-opus-4-7`)
+/// 3. Wire model name alone (`GLM-5.2`, `claude-opus-4-7`)
+pub fn resolve_chat_provider(
+    config: &Config,
+    requested: Option<String>,
+) -> anyhow::Result<(String, zap_config::config::provider::ProviderConfig)> {
+    let Some(requested) = requested
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        let selection = config
+            .effective_model_selection()
+            .ok_or_else(|| anyhow::anyhow!("no model selected"))?;
+        let provider = config
+            .provider_config_for_selection(&selection)
+            .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", selection))?;
+        return Ok((selection, provider));
+    };
+
+    // Prefer exact selection id (logical model / legacy provider key).
+    if let Some(provider) = config.provider_config_for_selection(&requested) {
+        return Ok((requested, provider));
+    }
+
+    // Public id: first '/' splits account from wire model (wire may itself contain '/').
+    if let Some((account, model)) = requested.split_once('/') {
+        let account = account.trim();
+        let model = model.trim();
+        if !account.is_empty() && !model.is_empty() {
+            let mut entries: Vec<(String, _)> = config.logical_models().into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, profile) in entries {
+                if profile.account == account && profile.model == model {
+                    if let Some(provider) = config.provider_config_for_selection(&id) {
+                        return Ok((id, provider));
+                    }
+                }
+            }
+        }
+    }
+
+    // Compat clients often send the wire model name (e.g. "glm-4.6") rather than
+    // JeikCode's selection id — match by ProviderConfig.model as well.
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    for id in ids {
+        if let Some(provider) = config.provider_config_for_selection(&id) {
+            if provider.model == requested {
+                return Ok((id, provider));
+            }
+        }
+    }
+    for (id, provider) in &config.providers {
+        if provider.model == requested {
+            return Ok((id.clone(), provider.clone()));
+        }
+    }
+
+    Err(anyhow::anyhow!("model '{requested}' not found"))
+}
+
+// ============== Streaming Chat API ==============
+
+/// Chat request body
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    /// User message content
+    pub message: String,
+    /// Working directory (defaults to current dir)
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    /// Provider name (defaults to configured default)
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Session ID to continue (optional, creates new if not provided)
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Per-request cancellation key supplied by the webui. Unlike `session_id`,
+    /// this is available during the first turn of a brand-new conversation.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Attached images (base64). Empty = text-only. The native `/chat` path forwards
+    /// them to vision-capable models and uses the configured VL preprocessor when the
+    /// active model is text-only, matching `/live` and the TUI.
+    #[serde(default)]
+    pub images: Vec<ImageInput>,
+    /// Optional per-request approval mode. When absent, the daemon falls back
+    /// to the current runtime mode set via `/approval_mode` or `/live/mode`.
+    #[serde(default)]
+    pub approval_mode: Option<crate::approval_mode::ApprovalMode>,
+    /// Optional client system text (OpenAI/Anthropic compat). Appended after
+    /// AGENTS.md / glossary / db packs in SESSION CONTEXT.
+    #[serde(default)]
+    pub extra_system_append: Option<String>,
+    /// Optional display name for a newly created session (OpenAI `user` / user_title).
+    #[serde(default)]
+    pub session_title: Option<String>,
+}
+
+/// One attached image from the webui (base64-encoded), mapped to core `ImagePart`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageInput {
+    /// MIME type, e.g. "image/png".
+    pub media_type: String,
+    /// Base64-encoded image bytes (no data-URL prefix).
+    pub data: String,
+}
+
+fn default_fence_len() -> usize {
+    3
+}
+
+fn is_default_fence_len(len: &usize) -> bool {
+    *len == 3
+}
+
+/// SSE event types for streaming chat
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum ChatEvent {
+    /// Exact provider/model resolved for this request.
+    #[serde(rename = "runtime_info")]
+    RuntimeInfo { provider: String, model: String },
+    /// Canonical native session identity for this operation. Emitted as soon as
+    /// the daemon has allocated or resolved the session, before provider work can
+    /// delay the first turn. Clients must use this id for every later request.
+    #[serde(rename = "session_assigned")]
+    SessionAssigned { session_id: String },
+    /// User message admitted for this turn. Emitted once right after the user
+    /// message is pushed to the conversation, so `/chat/watch` observers (WebUI
+    /// detached) render the user's own message in real time instead of only
+    /// seeing it after disk persistence at the turn boundary.
+    #[serde(rename = "user")]
+    User {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Epoch ms the user message was authored. Lets a mid-turn refresh keep
+        /// the footer stopwatch instead of restarting at 0s.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_at: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_ordinal: Option<u32>,
+    },
+    /// The STORED identity of the real user prompt this turn runs on (from the
+    /// kernel `UserMessage` boundary). Identity-only — the visible bubble is
+    /// already painted by the `user` echo; this lets a client bind that
+    /// optimistic bubble to the id the disk transcript carries.
+    #[serde(rename = "user_identified")]
+    UserIdentified {
+        message_id: String,
+        turn_ordinal: u32,
+    },
+    /// Tool batch started (all tools in this assistant turn)
+    #[serde(rename = "tool_batch")]
+    ToolBatchStarted {
+        calls: Vec<zap_kernel::event::ToolBatchCall>,
+    },
+    /// LLM text delta
+    #[serde(rename = "text")]
+    TextDelta {
+        content: String,
+        /// Streaming assistant-message identity (from `AssistantMessage`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        /// Unique part id for this streamed text run: `{message_id}:{part_seq}:text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        /// Monotonic part counter within the message (bumped on kind change).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
+    /// LLM reasoning/thinking content
+    #[serde(rename = "reasoning")]
+    ReasoningDelta {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
+    /// Tool call started
+    #[serde(rename = "tool_start")]
+    ToolCallStarted {
+        id: String,
+        name: String,
+        arguments: String,
+        /// Assistant message (round) that issued this call. Lets the WebUI
+        /// attach the row to the OWNING round instead of "whatever assistant
+        /// is last" — a mid-turn steer bubble can sit after that round while
+        /// its remaining tool calls still stream in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Real-time tool output chunk (stdout). `id` is the tool call id so parallel
+    /// tools can be attributed correctly on the OpenAI/Anthropic compat surface.
+    #[serde(rename = "tool_output")]
+    ToolOutputChunk { id: String, chunk: String },
+    /// Ephemeral latest-wins tool activity; never persisted as output.
+    /// Used heavily by `task` subagents (per-child queued/running/done lines).
+    #[serde(rename = "tool_progress")]
+    ToolProgress { id: String, progress: String },
+    /// One or more inputs folded into the active turn at a round boundary (steer).
+    #[serde(rename = "steered")]
+    Steered {
+        count: usize,
+        inputs: Vec<zap_kernel::event::SteeredInput>,
+        /// Client-correlation ids for the folded inputs, in FIFO order (`None`
+        /// when a submit carried none). Lets the WebUI promote its optimistic
+        /// steer card/bubble to the persisted message by id across a refresh.
+        #[serde(default)]
+        client_input_ids: Vec<Option<String>>,
+    },
+    /// Tool call completed
+    #[serde(rename = "tool_result")]
+    ToolCallResult {
+        id: String,
+        name: String,
+        output: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    /// Token usage update
+    #[serde(rename = "tokens")]
+    TokenUsage {
+        prompt: usize,
+        completion: usize,
+        total: usize,
+        /// Provider-reported prompt-cache hits. Always serialized (including `0`)
+        /// so clients can tell an explicit miss apart from absent telemetry.
+        #[serde(default)]
+        cached: usize,
+    },
+    /// Artifact started - detected code block or HTML
+    #[serde(rename = "artifact_start")]
+    ArtifactStart {
+        id: String,
+        artifact_type: String,    // "code", "html", "markdown"
+        language: Option<String>, // for code blocks
+        title: Option<String>,
+        #[serde(
+            default = "default_fence_len",
+            skip_serializing_if = "is_default_fence_len"
+        )]
+        fence_len: usize,
+    },
+    /// Artifact content chunk
+    #[serde(rename = "artifact_content")]
+    ArtifactContent { id: String, content: String },
+    /// Artifact ended
+    #[serde(rename = "artifact_end")]
+    ArtifactEnd { id: String },
+    /// Chat completed
+    #[serde(rename = "done")]
+    Done {
+        tokens: usize,
+        tool_calls: usize,
+        session_id: String,
+        /// Native runtime terminal reason. Additive so older clients can keep
+        /// treating `done` as before while newer clients distinguish success,
+        /// cancellation, safety fuses, provider failure, and timeouts.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        /// Last runtime error associated with this terminal, when available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// A tool requires user approval. The browser must POST the decision back
+    /// to `/chat/permission`, correlated by `session_id` and `approval_id`.
+    /// The decider blocks until the decision arrives (or the turn is cancelled).
+    #[serde(rename = "permission_request")]
+    PermissionRequest {
+        session_id: String,
+        approval_id: String,
+        tool_name: String,
+        reason: String,
+        call_id: String,
+        arguments: String,
+    },
+    /// The model asks the user a structured question. The browser answers through
+    /// `/chat/user-input`, correlated by session and native request id.
+    #[serde(rename = "user_input_request")]
+    UserInputRequest {
+        session_id: String,
+        request_id: u64,
+        #[serde(flatten)]
+        payload: serde_json::Value,
+    },
+    /// Chat was stopped by user
+    #[serde(rename = "stopped")]
+    Stopped,
+    /// Error occurred
+    #[serde(rename = "error")]
+    Error { message: String },
+    /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
+    /// `Error` so clients render a muted notice instead of a red error.
+    #[serde(rename = "warning")]
+    Warning { message: String },
+    /// Auxiliary session persistence failed. Clients must display this outside
+    /// the assistant message timeline.
+    #[serde(rename = "persistence_warning")]
+    PersistenceWarning { message: String },
+    /// Rate-limit hit: provider has throttled requests. Carries display-ready reset
+    /// time and label so the client can render a countdown notice.
+    #[serde(rename = "rate_limited")]
+    RateLimited {
+        reset_at_display: String,
+        reset_label: String,
+        secs_until_reset: Option<u64>,
+        /// `true` = WaitAndRetry (kernel will sleep then retry automatically);
+        /// `false` = Pause (kernel stopped the turn, user must act).
+        #[serde(default)]
+        auto_resuming: bool,
+        /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
+        #[serde(default)]
+        server_message: Option<String>,
+    },
+    /// AI session title generated / renamed
+    #[serde(rename = "session_renamed")]
+    SessionRenamed { session_id: String, name: String },
+    /// Session execution status change (idle, running, compacting, aborted).
+    #[serde(rename = "session_status")]
+    SessionStatus { session_id: String, status: String },
+    /// Authoritative steer queue update for this session.
+    #[serde(rename = "queue_updated")]
+    QueueUpdated {
+        session_id: String,
+        items: Vec<serde_json::Value>,
+    },
+    /// Authoritative message mutation in history (rewrite, delete, truncate).
+    /// Emitted over the fan-out bus to notify all active tabs of incremental diffs.
+    #[serde(rename = "session_mutation")]
+    SessionMutation {
+        session_id: String,
+        revision: u64,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageInput>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delete_turn: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ts: Option<u64>,
+    },
+}
+
+/// Notification label for a `/chat` `done` event.
+/// Kernel wire `stopped` is a normal finish. `cancelled` is a user stop.
+pub(crate) fn chat_done_terminal_label(reason: Option<&str>) -> &'static str {
+    match reason.unwrap_or("stopped") {
+        "" | "stopped" => "completed",
+        "cancelled" => "stopped",
+        "provider_error" | "timeout" | "prompt_rejected" | "policy_denied" | "internal_error" => {
+            "failed"
+        }
+        _ => "stopped",
+    }
+}
+
+pub(crate) fn stop_reason_wire(reason: zap_kernel::event::StopReason) -> &'static str {
+    use zap_kernel::event::StopReason;
+
+    match reason {
+        StopReason::Stopped => "stopped",
+        StopReason::MaxRounds => "max_rounds",
+        StopReason::RepeatLoop => "repeat_loop",
+        StopReason::ToolLoopDetected => "tool_loop_detected",
+        StopReason::MaxContinuations => "max_continuations",
+        StopReason::ProviderError => "provider_error",
+        StopReason::Timeout => "timeout",
+        StopReason::Cancelled => "cancelled",
+        StopReason::PromptRejected => "prompt_rejected",
+        StopReason::PolicyDenied => "policy_denied",
+        StopReason::RateLimited => "rate_limited",
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod chat_terminal_label_tests {
+    use super::chat_done_terminal_label;
+
+    #[test]
+    fn kernel_stopped_wire_is_a_completed_task() {
+        assert_eq!(chat_done_terminal_label(Some("stopped")), "completed");
+        assert_eq!(chat_done_terminal_label(None), "completed");
+        assert_eq!(chat_done_terminal_label(Some("")), "completed");
+    }
+
+    #[test]
+    fn cancel_and_failures_are_not_a_clean_finish() {
+        assert_eq!(chat_done_terminal_label(Some("cancelled")), "stopped");
+        assert_eq!(chat_done_terminal_label(Some("provider_error")), "failed");
+        assert_eq!(chat_done_terminal_label(Some("timeout")), "failed");
+        assert_eq!(chat_done_terminal_label(Some("max_rounds")), "stopped");
+    }
+}
+
+#[cfg(test)]
+mod session_token_usage_tests {
+    use super::{
+        session_token_usage_from_meta, session_token_usage_from_session, SessionTokenUsage,
+    };
+    use zap_capabilities::session::{ModelUsageStat, SessionMeta, TokenBreakdown, TurnStat};
+    use zap_kernel::message::{Message, MessageMeta, SessionSnapshot};
+    use zap_kernel::stream::TokenUsage as KernelTokenUsage;
+
+    fn usage_stat(prompt: u32, completion: u32, cached: u32) -> TurnStat {
+        TurnStat {
+            after_message: 1,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: prompt.saturating_add(completion),
+            errored: false,
+            used_tokens: prompt,
+            ctx_window: 1_000_000,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "main".into(),
+                model_id: "test".into(),
+                tokens: TokenBreakdown {
+                    input: u64::from(prompt.saturating_sub(cached)),
+                    output: u64::from(completion),
+                    cached_input: u64::from(cached),
+                },
+                pricing: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn derives_footer_tokens_from_last_valid_turn() {
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.turn_stats = vec![
+            usage_stat(10_000, 100, 8_000),
+            usage_stat(38_555, 18, 32_540),
+        ];
+        let usage = session_token_usage_from_meta(&meta).unwrap();
+        assert_eq!(
+            usage,
+            SessionTokenUsage {
+                prompt: 38_555,
+                completion: 18,
+                total: 38_573,
+                cached: 32_540,
+                cached_estimated: false,
+                ctx_window: Some(1_000_000),
+            }
+        );
+    }
+
+    #[test]
+    fn estimates_cache_when_last_turn_lacks_persisted_cached_input() {
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.turn_stats = vec![
+            TurnStat {
+                after_message: 1,
+                position_valid: true,
+                turn_id: 1,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 10_100,
+                errored: false,
+                used_tokens: 10_000,
+                ctx_window: 0,
+                model_usage: Vec::new(),
+            },
+            TurnStat {
+                after_message: 2,
+                position_valid: true,
+                turn_id: 2,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 38_573,
+                errored: false,
+                used_tokens: 38_555,
+                ctx_window: 1_000_000,
+                model_usage: Vec::new(),
+            },
+        ];
+        let usage = session_token_usage_from_meta(&meta).unwrap();
+        assert_eq!(usage.prompt, 38_555);
+        assert_eq!(usage.cached, 10_000);
+        assert!(usage.cached_estimated);
+    }
+
+    #[test]
+    fn restart_footer_uses_last_request_occupancy_not_turn_billing_sum() {
+        // A tool-heavy turn records occupancy on the FINAL request, but
+        // `model_usage` accumulates every round's prompt/cache. Restart must
+        // restore the gauge (used_tokens), not 1.7M of summed billing.
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.turn_stats = vec![
+            usage_stat(48_000, 80, 40_000),
+            TurnStat {
+                after_message: 4,
+                position_valid: true,
+                turn_id: 2,
+                round_count: 12,
+                tool_call_count: 11,
+                duration_ms: 90_000,
+                total_tokens: 51_311,
+                errored: false,
+                used_tokens: 50_000,
+                ctx_window: 1_000_000,
+                model_usage: vec![ModelUsageStat {
+                    provider_id: "main".into(),
+                    model_id: "test".into(),
+                    tokens: TokenBreakdown {
+                        input: 2_337,
+                        output: 1_311,
+                        cached_input: 1_721_920,
+                    },
+                    pricing: None,
+                }],
+            },
+        ];
+        let usage = session_token_usage_from_meta(&meta).unwrap();
+        assert_eq!(
+            usage,
+            SessionTokenUsage {
+                prompt: 50_000,
+                completion: 1_311,
+                total: 51_311,
+                cached: 48_000,
+                cached_estimated: true,
+                ctx_window: Some(1_000_000),
+            }
+        );
+        assert!(
+            usage.prompt <= usage.ctx_window.unwrap(),
+            "restart gauge must not exceed the context window from stacked billing"
+        );
+        assert!(usage.cached <= usage.prompt);
+    }
+
+    #[test]
+    fn refuses_multi_round_billing_sum_when_occupancy_fields_are_missing() {
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.turn_stats = vec![TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 8,
+            tool_call_count: 7,
+            duration_ms: 1,
+            total_tokens: 0,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 1_000_000,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "main".into(),
+                model_id: "test".into(),
+                tokens: TokenBreakdown {
+                    input: 2_337,
+                    output: 1_311,
+                    cached_input: 1_721_920,
+                },
+                pricing: None,
+            }],
+        }];
+        assert_eq!(session_token_usage_from_meta(&meta), None);
+    }
+
+    #[test]
+    fn restart_matches_live_last_request_not_billing_sum() {
+        // Live footer last frame: prompt 200_000 + completion 1_500 = 201_500.
+        // Disk model_usage is the 12-round billing sum (~1.7M). Restart must
+        // restore the last assistant MessageMeta — the same Usage the WebUI
+        // painted — not the billing sum.
+        let mut assistant = Message::assistant("ok", Vec::new());
+        assistant.meta = Some(MessageMeta {
+            tokens: KernelTokenUsage {
+                prompt: 200_000,
+                completion: 1_500,
+                cached: 180_000,
+            },
+            used_tokens: 200_000,
+            ctx_window: 1_000_000,
+            ..MessageMeta::default()
+        });
+        let snapshot = SessionSnapshot::new(vec![Message::user("go"), assistant]);
+
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.turn_stats = vec![TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 12,
+            tool_call_count: 11,
+            duration_ms: 90_000,
+            total_tokens: 201_500,
+            errored: false,
+            used_tokens: 200_000,
+            ctx_window: 1_000_000,
+            model_usage: vec![ModelUsageStat {
+                provider_id: "main".into(),
+                model_id: "test".into(),
+                tokens: TokenBreakdown {
+                    input: 2_337,
+                    output: 1_311,
+                    cached_input: 1_721_920,
+                },
+                pricing: None,
+            }],
+        }];
+
+        let usage = session_token_usage_from_session(&meta, &snapshot).unwrap();
+        assert_eq!(
+            usage,
+            SessionTokenUsage {
+                prompt: 200_000,
+                completion: 1_500,
+                total: 201_500,
+                cached: 180_000,
+                cached_estimated: false,
+                ctx_window: Some(1_000_000),
+            }
+        );
+        assert_eq!(
+            usage.total,
+            usage.prompt.saturating_add(usage.completion),
+            "restart 总上下文 must use the live formula prompt+completion"
+        );
+        assert!(
+            usage.total < 300_000,
+            "must not restore the 1.7M billing sum"
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatSteerCancelRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ChatSteerCancelResponse {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST /chat/steer/cancel or DELETE /chat/steer — cancel a pending steer from the running turn.
+async fn chat_steer_cancel(
+    State(state): State<AppState>,
+    Json(req): Json<ChatSteerCancelRequest>,
+) -> impl IntoResponse {
+    let mut _cancelled = false;
+
+    // 1. 若存在活跃的 /chat 通道，通过 steer 信号通道发送撤回
+    if let Some(tx) = state.active_chats.steer_sender(&req.session_id).await {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(live_api::ChatSteerSignal::Cancel {
+                text: req.message.clone(),
+                done: done_tx,
+            })
+            .is_ok()
+        {
+            if let Ok(outcome) = tokio::time::timeout(Duration::from_secs(5), done_rx).await {
+                if outcome.is_ok() {
+                    _cancelled = true;
+                }
+            }
+        }
+    }
+
+    // 2. 若存在全局活跃 runner handle（Live / 共享会话模式），通过 handle 撤回
+    if let Some(handle) = crate::native_live::existing_runner_handle(&req.session_id) {
+        if handle.cancel_steer(req.message).await.is_ok() {
+            _cancelled = true;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ChatSteerCancelResponse {
+            accepted: true,
+            error: None,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod chat_event_type_tests {
+    use super::{ChatEvent, ChatRuntimeProjector};
+
+    #[test]
+    fn runtime_info_serializes_the_exact_resolved_selection() {
+        let json = serde_json::to_value(ChatEvent::RuntimeInfo {
+            provider: "main".into(),
+            model: "model-x".into(),
+        })
+        .unwrap();
+
+        assert_eq!(json["type"], "runtime_info");
+        assert_eq!(json["provider"], "main");
+        assert_eq!(json["model"], "model-x");
+        assert!(json.get("config_revision").is_none());
+    }
+
+    #[test]
+    fn session_assignment_is_an_additive_non_terminal_event() {
+        let json = serde_json::to_value(ChatEvent::SessionAssigned {
+            session_id: "session-1".into(),
+        })
+        .unwrap();
+
+        assert_eq!(json["type"], "session_assigned");
+        assert_eq!(json["session_id"], "session-1");
+    }
+
+    #[test]
+    fn tool_batch_payload_is_kernel_native() {
+        let calls: Vec<zap_kernel::event::ToolBatchCall> =
+            vec![zap_kernel::event::ToolBatchCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+                parallel_safe: true,
+            }];
+
+        let event = ChatEvent::ToolBatchStarted { calls };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["calls"][0]["id"], "call-1");
+    }
+
+    #[test]
+    fn native_steered_event_reaches_chat_projection() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_agent(
+            zap_kernel::event::AgentEvent::Steered {
+                count: 1,
+                inputs: vec![zap_kernel::event::SteeredInput {
+                    text: "next instruction".into(),
+                    images: Vec::new(),
+                    message_id: Some("m-steer-1".into()),
+                }],
+            },
+            "test-session",
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::Steered { count: 1, inputs, .. }] if inputs[0].text == "next instruction"
+        ));
+    }
+
+    #[test]
+    fn native_tool_batch_reaches_chat_without_core_projection() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_agent(
+            zap_kernel::event::AgentEvent::ToolBatchStarted {
+                batch_id: "batch-1".into(),
+                calls: vec![zap_kernel::event::ToolBatchCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                    parallel_safe: true,
+                }],
+            },
+            "test-session",
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::ToolBatchStarted { calls }] if calls[0].id == "call-1"
+        ));
+    }
+
+    #[test]
+    fn native_usage_updates_chat_summary() {
+        let mut projector = ChatRuntimeProjector::default();
+        let meta = zap_kernel::message::MessageMeta {
+            tokens: zap_kernel::stream::TokenUsage {
+                prompt: 7,
+                completion: 5,
+                cached: 2,
+            },
+            ..Default::default()
+        };
+        let events = projector.project_agent(
+            zap_kernel::event::AgentEvent::Usage(meta),
+            "test-session",
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::TokenUsage {
+                prompt: 7,
+                completion: 5,
+                total: 12,
+                cached: 2,
+            }]
+        ));
+        assert_eq!(projector.total_tokens, 12);
+    }
+
+    #[test]
+    fn native_approval_request_keeps_runtime_correlation() {
+        let mut projector = ChatRuntimeProjector::default();
+        let request = zap_coding::RuntimeRequest {
+            id: 42,
+            kind: zap_capabilities::tools::APPROVAL_KIND.into(),
+            payload: serde_json::json!({
+                "approval_id": "approval-42",
+                "call_id": "call-42",
+                "tool": "bash",
+                "args": "{\"command\":\"git status\"}"
+            }),
+            snapshot: None,
+        };
+        let events = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::Request(request),
+            "session-1",
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::PermissionRequest {
+                session_id,
+                approval_id,
+                call_id,
+                tool_name,
+                ..
+            }] if session_id == "session-1"
+                && approval_id == "approval-42"
+                && call_id == "call-42"
+                && tool_name == "bash"
+        ));
+    }
+
+    #[test]
+    fn native_user_input_request_keeps_session_request_and_batch_payload() {
+        let mut projector = ChatRuntimeProjector::default();
+        let request = zap_coding::RuntimeRequest {
+            id: 77,
+            kind: zap_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND.into(),
+            payload: serde_json::json!({
+                "questions": [{
+                    "header": "Pick",
+                    "question": "Red or blue?",
+                    "mode": "single",
+                    "options": [{"label": "Red"}, {"label": "Blue"}]
+                }]
+            }),
+            snapshot: None,
+        };
+
+        let events = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::Request(request),
+            "session-1",
+        );
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["type"], "user_input_request");
+        assert_eq!(json["session_id"], "session-1");
+        assert_eq!(json["request_id"], 77);
+        assert_eq!(json["questions"][0]["options"][1]["label"], "Blue");
+    }
+
+    #[test]
+    fn abnormal_completed_turn_reaches_done_with_its_authoritative_reason() {
+        for (reason, expected) in [
+            (zap_kernel::event::StopReason::MaxRounds, "max_rounds"),
+            (
+                zap_kernel::event::StopReason::RepeatLoop,
+                "repeat_loop",
+            ),
+            (
+                zap_kernel::event::StopReason::ToolLoopDetected,
+                "tool_loop_detected",
+            ),
+            (
+                zap_kernel::event::StopReason::PolicyDenied,
+                "policy_denied",
+            ),
+        ] {
+            let mut projector = ChatRuntimeProjector::default();
+            let events = projector.project_runtime(
+                zap_coding::CodingRuntimeEvent::TurnFinished(
+                    zap_coding::TurnCompletion::Completed {
+                        turn_id: 7,
+                        reason,
+                        snapshot: std::sync::Arc::new(
+                            zap_kernel::message::SessionSnapshot::new(Vec::new()),
+                        ),
+                        stats: zap_coding::RuntimeTurnStats::default(),
+                    },
+                ),
+                "session-1",
+            );
+
+            let done = events
+                .iter()
+                .find(|event| matches!(event, ChatEvent::Done { .. }))
+                .expect("TurnFinished must reach the HTTP terminal event");
+            let json = serde_json::to_value(done).unwrap();
+            assert_eq!(json["stop_reason"], expected);
+        }
+    }
+
+    #[test]
+    fn agent_error_is_diagnostic_until_turn_finished_is_authoritative() {
+        let mut projector = ChatRuntimeProjector::default();
+        let diagnostic = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::Agent(zap_kernel::event::AgentEvent::Error {
+                message: "provider failed".into(),
+                http_status: Some(500),
+                code: None,
+            }),
+            "session-1",
+        );
+        assert!(matches!(diagnostic.as_slice(), [ChatEvent::Warning { .. }]));
+
+        let terminal = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::TurnFinished(
+                zap_coding::TurnCompletion::Completed {
+                    turn_id: 8,
+                    reason: zap_kernel::event::StopReason::ProviderError,
+                    snapshot: std::sync::Arc::new(zap_kernel::message::SessionSnapshot::new(
+                        Vec::new(),
+                    )),
+                    stats: zap_coding::RuntimeTurnStats::default(),
+                },
+            ),
+            "session-1",
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [ChatEvent::Done {
+                stop_reason: Some(reason),
+                message: Some(message),
+                ..
+            }] if reason == "provider_error" && message == "provider failed"
+        ));
+    }
+
+    #[test]
+    fn start_failure_snapshot_unavailable_is_an_authoritative_error() {
+        // `/chat` used to emit Agent Error (a Warning) when prepare hit
+        // SessionInUse, so the WebUI spinner never got a terminal event.
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::TurnFinished(
+                zap_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 0,
+                    reason: zap_kernel::event::StopReason::ProviderError,
+                    error: zap_coding::RuntimeSnapshotError {
+                        message: r#"session "ed6dc9be" is already in use by another runtime"#
+                            .into(),
+                    },
+                    stats: zap_coding::RuntimeTurnStats::default(),
+                },
+            ),
+            "session-1",
+        );
+        assert!(
+            projector.terminal_seen,
+            "start failure must close the /chat SSE as a turn terminal"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::Error { message }]
+                if message.contains("already in use by another runtime")
+        ));
+    }
+}
+
+/// Artifact detector for code blocks and HTML in streaming text
+struct ArtifactDetector {
+    /// Current artifact ID counter
+    artifact_counter: usize,
+    /// Current state
+    state: ArtifactDetectorState,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactDetectorState {
+    /// Normal text output
+    Normal,
+    /// Inside a code block
+    InCodeBlock {
+        id: String,
+        artifact_type: String,
+        fence_len: usize,
+        depth: usize,
+    },
+    /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
+    InHtml { id: String, content: String },
+    /// Inside SVG block (detected by <svg> tag)
+    InSvg { id: String, content: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FenceInsideBlock {
+    /// True close of the outermost code block (depth == 1 and pure close with cur_len >= fence_len)
+    OuterClose {
+        line_start: usize,
+        after_fence_line: usize,
+    },
+    /// An inner code block opening (has info tag, cur_len >= fence_len)
+    InnerOpen { after_fence_line: usize },
+    /// An inner code block closing (depth > 1, pure close with cur_len >= fence_len)
+    InnerClose { after_fence_line: usize },
+}
+
+impl ArtifactDetector {
+    fn new() -> Self {
+        Self {
+            artifact_counter: 0,
+            state: ArtifactDetectorState::Normal,
+        }
+    }
+
+    fn next_id(&mut self) -> String {
+        self.artifact_counter += 1;
+        format!("artifact_{}", self.artifact_counter)
+    }
+
+    /// Map code block language to artifact type for rendering
+    fn artifact_type_for_language(language: &str) -> (String, Option<String>) {
+        let lang_lower = language.to_lowercase();
+        let artifact_type = match lang_lower.as_str() {
+            // Mermaid diagrams
+            "mermaid" => "mermaid",
+            // HTML content
+            "html" | "htm" => "html",
+            // SVG graphics
+            "svg" | "xmlsvg" => "svg",
+            // Markdown content
+            "markdown" | "md" => "markdown",
+            // All other code blocks
+            _ => "code",
+        };
+        let title = if artifact_type == "code" && !language.is_empty() {
+            Some(language.to_string())
+        } else {
+            None
+        };
+        (artifact_type.to_string(), title)
+    }
+
+    /// Process incoming text delta and return events to emit
+    fn process(&mut self, text: &str) -> Vec<ChatEvent> {
+        let mut events = Vec::new();
+        let mut remaining = text;
+
+        while !remaining.is_empty() {
+            match self.state.clone() {
+                ArtifactDetectorState::Normal => {
+                    // Check for code block start
+                    if let Some((fence_start, content_start, fence_len, language)) =
+                        Self::find_code_fence_start(remaining)
+                    {
+                        if fence_start > 0 {
+                            events.push(ChatEvent::TextDelta {
+                                content: remaining[..fence_start].to_string(),
+                                message_id: None,
+                                part_id: None,
+                                part_seq: None,
+                            });
+                        }
+
+                        let (artifact_type, title) = Self::artifact_type_for_language(&language);
+                        let id = self.next_id();
+                        events.push(ChatEvent::ArtifactStart {
+                            id: id.clone(),
+                            artifact_type: artifact_type.clone(),
+                            language: if language.is_empty() {
+                                None
+                            } else {
+                                Some(language)
+                            },
+                            title,
+                            fence_len,
+                        });
+
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth: 1,
+                        };
+                        remaining = &remaining[content_start..];
+                    }
+                    // Check for SVG block start (standalone <svg> tag)
+                    else if self.is_svg_start(remaining) {
+                        let id = self.next_id();
+                        events.push(ChatEvent::ArtifactStart {
+                            id: id.clone(),
+                            artifact_type: "svg".to_string(),
+                            language: None,
+                            title: None,
+                            fence_len: 3,
+                        });
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+
+                        self.state = ArtifactDetectorState::InSvg {
+                            id,
+                            content: remaining.to_string(),
+                        };
+                        remaining = "";
+                    }
+                    // Check for HTML block start
+                    else if self.is_html_start(remaining) {
+                        let id = self.next_id();
+                        events.push(ChatEvent::ArtifactStart {
+                            id: id.clone(),
+                            artifact_type: "html".to_string(),
+                            language: None,
+                            title: None,
+                            fence_len: 3,
+                        });
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+
+                        self.state = ArtifactDetectorState::InHtml {
+                            id,
+                            content: remaining.to_string(),
+                        };
+                        remaining = "";
+                    } else {
+                        // Normal text
+                        events.push(ChatEvent::TextDelta {
+                            content: remaining.to_string(),
+                            message_id: None,
+                            part_id: None,
+                            part_seq: None,
+                        });
+                        remaining = "";
+                    }
+                }
+                ArtifactDetectorState::InCodeBlock {
+                    id,
+                    artifact_type,
+                    fence_len,
+                    mut depth,
+                } => match Self::find_next_fence_in_block(
+                    remaining,
+                    fence_len,
+                    depth,
+                    &artifact_type,
+                ) {
+                    Some(FenceInsideBlock::OuterClose {
+                        line_start,
+                        after_fence_line,
+                    }) => {
+                        if line_start > 0 {
+                            events.push(ChatEvent::ArtifactContent {
+                                id: id.clone(),
+                                content: remaining[..line_start].to_string(),
+                            });
+                        }
+                        events.push(ChatEvent::ArtifactEnd { id });
+                        self.state = ArtifactDetectorState::Normal;
+                        remaining = &remaining[after_fence_line..];
+                    }
+                    Some(FenceInsideBlock::InnerOpen { after_fence_line }) => {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining[..after_fence_line].to_string(),
+                        });
+                        depth += 1;
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth,
+                        };
+                        remaining = &remaining[after_fence_line..];
+                    }
+                    Some(FenceInsideBlock::InnerClose { after_fence_line }) => {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining[..after_fence_line].to_string(),
+                        });
+                        depth = depth.saturating_sub(1);
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth,
+                        };
+                        remaining = &remaining[after_fence_line..];
+                    }
+                    None => {
+                        // 结构性终结自愈：如果当前非 markdown 代码块内部遇到了明确的顶层大纲结构（如 `\n### 第二步`）
+                        if artifact_type != "markdown" {
+                            if let Some(term_pos) = Self::find_structural_terminator(remaining) {
+                                if term_pos > 0 {
+                                    events.push(ChatEvent::ArtifactContent {
+                                        id: id.clone(),
+                                        content: remaining[..term_pos].to_string(),
+                                    });
+                                }
+                                events.push(ChatEvent::ArtifactEnd { id });
+                                self.state = ArtifactDetectorState::Normal;
+                                remaining = &remaining[term_pos..];
+                                continue;
+                            }
+                        }
+
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth,
+                        };
+                        remaining = "";
+                    }
+                },
+                ArtifactDetectorState::InHtml { id, mut content } => {
+                    // Check for HTML end (simple heuristic: </html> or </body>)
+                    let trimmed = remaining.trim();
+                    if trimmed.ends_with("</html>")
+                        || trimmed.ends_with("</HTML>")
+                        || trimmed.ends_with("</body>")
+                        || trimmed.ends_with("</BODY>")
+                    {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        events.push(ChatEvent::ArtifactEnd { id });
+                        self.state = ArtifactDetectorState::Normal;
+                    } else {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        self.state = ArtifactDetectorState::InHtml { id, content };
+                    }
+                    remaining = "";
+                }
+                ArtifactDetectorState::InSvg { id, mut content } => {
+                    // Check for SVG end (</svg> tag)
+                    let trimmed = remaining.trim();
+                    if trimmed.ends_with("</svg>") || trimmed.ends_with("</SVG>") {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        events.push(ChatEvent::ArtifactEnd { id });
+                        self.state = ArtifactDetectorState::Normal;
+                    } else {
+                        content.push_str(remaining);
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining.to_string(),
+                        });
+                        self.state = ArtifactDetectorState::InSvg { id, content };
+                    }
+                    remaining = "";
+                }
+            }
+        }
+
+        events
+    }
+
+    fn is_valid_fence_indentation(indentation: &str) -> bool {
+        let trimmed = indentation.trim();
+        if trimmed.is_empty() {
+            indentation.len() <= 8
+        } else {
+            // 允许前导可选的 blockquote 引用标记（例如 ">", "> ", ">> ", "> > "）
+            trimmed.chars().all(|ch| ch == '>' || ch.is_whitespace())
+        }
+    }
+
+    fn find_code_fence_start(text: &str) -> Option<(usize, usize, usize, String)> {
+        let mut search_start = 0;
+        while let Some(relative_marker_start) = text[search_start..].find("```") {
+            let marker_start = search_start + relative_marker_start;
+            let line_start = text[..marker_start]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let indentation = &text[line_start..marker_start];
+
+            if Self::is_valid_fence_indentation(indentation) {
+                let fence_len = text[marker_start..]
+                    .chars()
+                    .take_while(|&ch| ch == '`')
+                    .count();
+                let after_marker = marker_start + fence_len;
+                let line_end = text[after_marker..]
+                    .find('\n')
+                    .map(|index| after_marker + index);
+                let raw_lang = match line_end {
+                    Some(end) => text[after_marker..end].trim(),
+                    None => text[after_marker..].trim(),
+                };
+                if !raw_lang.contains('`') {
+                    let language = raw_lang.split_whitespace().next().unwrap_or("").to_string();
+                    let content_start = line_end.map_or(text.len(), |index| index + 1);
+                    return Some((line_start, content_start, fence_len, language));
+                }
+            }
+
+            search_start = marker_start + 3;
+        }
+
+        None
+    }
+
+    fn find_next_fence_in_block(
+        text: &str,
+        outer_fence_len: usize,
+        current_depth: usize,
+        artifact_type: &str,
+    ) -> Option<FenceInsideBlock> {
+        let mut search_start = 0;
+        while let Some(relative_marker_start) = text[search_start..].find("```") {
+            let marker_start = search_start + relative_marker_start;
+            let line_start = text[..marker_start]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let indentation = &text[line_start..marker_start];
+
+            if Self::is_valid_fence_indentation(indentation) {
+                let cur_fence_len = text[marker_start..]
+                    .chars()
+                    .take_while(|&ch| ch == '`')
+                    .count();
+                let after_marker = marker_start + cur_fence_len;
+                let line_end = text[after_marker..]
+                    .find('\n')
+                    .map(|index| after_marker + index);
+                let trailing = match line_end {
+                    Some(end) => text[after_marker..end].trim(),
+                    None => text[after_marker..].trim(),
+                };
+
+                let after_fence_line = line_end.map_or(text.len(), |index| index + 1);
+
+                // CommonMark: Only fences with cur_fence_len >= outer_fence_len can close or nest
+                if cur_fence_len >= outer_fence_len {
+                    if trailing.is_empty() {
+                        // 仅当当前代码块本身是 Markdown 容器类型时，才支持内部子代码块深度栈跟踪；
+                        // 对于普通代码块（如 diff, bash, rust 等），内部的反引号只是普通代码文本，
+                        // 遇到与外层围栏匹配的纯闭合行时直接作为外部代码块的 OuterClose 闭合！
+                        if artifact_type == "markdown" && current_depth > 1 {
+                            return Some(FenceInsideBlock::InnerClose { after_fence_line });
+                        } else {
+                            return Some(FenceInsideBlock::OuterClose {
+                                line_start,
+                                after_fence_line,
+                            });
+                        }
+                    } else if artifact_type == "markdown" && !trailing.contains('`') {
+                        return Some(FenceInsideBlock::InnerOpen { after_fence_line });
+                    }
+                }
+            }
+
+            search_start = marker_start + 3;
+        }
+
+        None
+    }
+
+    fn find_structural_terminator(text: &str) -> Option<usize> {
+        let mut search_start = 0;
+        while let Some(rel_newline) = text[search_start..].find('\n') {
+            let line_start = search_start + rel_newline + 1;
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |idx| line_start + idx);
+            let line = text[line_start..line_end].trim();
+            if Self::is_structural_heading(line) {
+                return Some(line_start);
+            }
+            search_start = line_start;
+        }
+        None
+    }
+
+    fn is_structural_heading(line: &str) -> bool {
+        let trimmed = line.trim();
+        let heading = trimmed.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
+        if !heading.starts_with('#') {
+            return false;
+        }
+        let hashes = heading.chars().take_while(|&c| c == '#').count();
+        if hashes < 1 || hashes > 6 {
+            return false;
+        }
+        let after_hashes = &heading[hashes..];
+        if !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t') {
+            return false;
+        }
+        let title = after_hashes.trim();
+        if title.is_empty() {
+            return false;
+        }
+
+        let is_doc_keyword = title.starts_with("第一")
+            || title.starts_with("第二")
+            || title.starts_with("第三")
+            || title.starts_with("第四")
+            || title.starts_with("第五")
+            || title.starts_with("第六")
+            || title.starts_with("第七")
+            || title.starts_with("第八")
+            || title.starts_with("第九")
+            || title.starts_with("第十")
+            || title.starts_with("一、")
+            || title.starts_with("二、")
+            || title.starts_with("三、")
+            || title.starts_with("四、")
+            || title.starts_with("五、")
+            || title.starts_with("方案")
+            || title.starts_with("步骤")
+            || title.starts_with("总结")
+            || title.starts_with("结论")
+            || title.starts_with("注意事项")
+            || title.starts_with("核心结论")
+            || title.starts_with("为什么")
+            || title.starts_with("如何");
+
+        let is_numbered = title.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && (title.contains(". ")
+                || title.contains("、")
+                || title.contains("：")
+                || title.contains(":"));
+
+        let is_doc_keyword_en = title.to_lowercase().starts_with("step")
+            || title.to_lowercase().starts_with("summary")
+            || title.to_lowercase().starts_with("conclusion")
+            || title.to_lowercase().starts_with("overview")
+            || title.to_lowercase().starts_with("solution")
+            || title.to_lowercase().starts_with("option")
+            || title.to_lowercase().starts_with("note");
+
+        let has_cjk = title
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fa5}').contains(&c));
+        let has_cjk_punct = title.contains('？')
+            || title.contains('！')
+            || title.contains('：')
+            || title.contains('（')
+            || title.contains('）')
+            || title.contains('?')
+            || title.contains('!');
+
+        is_doc_keyword || is_doc_keyword_en || is_numbered || (has_cjk && has_cjk_punct)
+    }
+
+    fn is_html_start(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("<!DOCTYPE html")
+            || trimmed.starts_with("<!DOCTYPE HTML")
+            || trimmed.starts_with("<html")
+            || trimmed.starts_with("<HTML")
+    }
+
+    fn is_svg_start(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("<svg") || trimmed.starts_with("<SVG")
+    }
+
+    /// Finalize any pending artifact
+    fn finish(&mut self) -> Option<ChatEvent> {
+        match &self.state {
+            ArtifactDetectorState::InCodeBlock { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::InHtml { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::InSvg { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::Normal => None,
+        }
+    }
+}
+
+struct ChatRuntimeProjector {
+    artifacts: ArtifactDetector,
+    live_tools: HashMap<String, (String, std::time::Instant)>,
+    total_tokens: usize,
+    tool_call_count: usize,
+    terminal_reason: Option<zap_kernel::event::StopReason>,
+    terminal_seen: bool,
+    last_error: Option<String>,
+    /// Compat/OpenAI clients need the original markdown (```json / ```kjson /
+    /// nested ```` fences) as `content`. ArtifactDetector is a WebUI widget
+    /// split and must not run on that path or mixed last-turn text is lost.
+    keep_raw_markdown: bool,
+    /// Stable id of the assistant message currently streaming (from
+    /// `AgentEvent::AssistantMessage`). Tags text/reasoning deltas with the same
+    /// identity the persisted `Message` carries.
+    current_message_id: Option<String>,
+    /// Monotonic per-message part counter; bumped when the streaming part KIND
+    /// changes (reasoning → text → …) so each part gets a unique `part_id`.
+    part_seq: u32,
+    last_part_kind: Option<String>,
+}
+
+impl Default for ChatRuntimeProjector {
+    fn default() -> Self {
+        Self {
+            artifacts: ArtifactDetector::new(),
+            live_tools: HashMap::new(),
+            total_tokens: 0,
+            tool_call_count: 0,
+            terminal_reason: None,
+            terminal_seen: false,
+            last_error: None,
+            keep_raw_markdown: false,
+            current_message_id: None,
+            part_seq: 0,
+            last_part_kind: None,
+        }
+    }
+}
+
+impl ChatRuntimeProjector {
+    fn project_runtime(
+        &mut self,
+        event: CodingRuntimeEvent,
+        permission_session_id: &str,
+    ) -> Vec<ChatEvent> {
+        use zap_coding::runtime::CompactionCompletion;
+        use zap_coding::TurnCompletion;
+
+        match event {
+            CodingRuntimeEvent::Agent(event) => self.project_agent(event, permission_session_id),
+            CodingRuntimeEvent::Request(request) => {
+                use zap_capabilities::tools::{
+                    request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,
+                };
+
+                if request.kind == REQUEST_USER_INPUT_KIND {
+                    return vec![ChatEvent::UserInputRequest {
+                        session_id: permission_session_id.to_string(),
+                        request_id: request.id,
+                        payload: request.payload,
+                    }];
+                }
+                if request.kind != APPROVAL_KIND {
+                    return Vec::new();
+                }
+                let approval_id = request
+                    .payload
+                    .get("approval_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if approval_id.is_empty() {
+                    return Vec::new();
+                }
+                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
+                else {
+                    return Vec::new();
+                };
+                vec![ChatEvent::PermissionRequest {
+                    session_id: permission_session_id.to_string(),
+                    approval_id,
+                    tool_name: approval.tool,
+                    reason: "Requires approval".into(),
+                    call_id: approval.call_id,
+                    arguments: approval.args,
+                }]
+            }
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } if outcome.committed => vec![ChatEvent::Warning {
+                message: zap_config::i18n::format_compaction_mark(
+                    outcome.removed_messages,
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                ),
+            }],
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } if outcome.is_manual() => {
+                let text = zap_config::i18n::format_compaction_noop(
+                    outcome.estimated_tokens_before,
+                    outcome.estimated_tokens_after,
+                    outcome.summary_would_grow(),
+                );
+                if self.keep_raw_markdown {
+                    vec![ChatEvent::TextDelta {
+                        content: text,
+                        message_id: None,
+                        part_id: None,
+                        part_seq: None,
+                    }]
+                } else {
+                    self.artifacts.process(&text)
+                }
+            }
+            CodingRuntimeEvent::CompactionFinished {
+                completion:
+                    CompactionCompletion::Interrupted {
+                        trigger: zap_kernel::message::CompactTrigger::Manual { .. },
+                        ..
+                    },
+            } => vec![ChatEvent::Warning {
+                message: zap_config::i18n::format_compaction_interrupted(),
+            }],
+            CodingRuntimeEvent::CompactionFinished {
+                completion:
+                    CompactionCompletion::Failed {
+                        trigger: zap_kernel::message::CompactTrigger::Manual { .. },
+                        error,
+                    },
+            } => vec![ChatEvent::Error {
+                message: format!("compact failed: {error}"),
+            }],
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                reason, stats, ..
+            }) => {
+                if self.terminal_seen {
+                    return Vec::new();
+                }
+                self.terminal_seen = true;
+                self.terminal_reason = Some(reason);
+                if let Some(usage) = stats.last_usage {
+                    self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
+                }
+                self.tool_call_count = self.tool_call_count.max(stats.tool_call_count);
+
+                let mut events = Vec::new();
+                if let Some(event) = self.finish() {
+                    events.push(event);
+                }
+                events.push(ChatEvent::Done {
+                    tokens: self.total_tokens,
+                    tool_calls: self.tool_call_count,
+                    session_id: permission_session_id.to_string(),
+                    stop_reason: Some(stop_reason_wire(reason).to_string()),
+                    message: self.last_error.clone(),
+                });
+                if reason == zap_kernel::event::StopReason::Cancelled {
+                    // Legacy clients still understand `stopped`; typed clients latch
+                    // the authoritative `done(cancelled)` emitted immediately before it.
+                    events.push(ChatEvent::Stopped);
+                }
+                events
+            }
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
+                reason,
+                error,
+                ..
+            }) => {
+                if self.terminal_seen {
+                    return Vec::new();
+                }
+                self.terminal_seen = true;
+                self.terminal_reason = Some(reason);
+                self.last_error = Some(error.message.clone());
+                let mut events = Vec::new();
+                if let Some(event) = self.finish() {
+                    events.push(event);
+                }
+                events.push(ChatEvent::Error {
+                    message: error.message,
+                });
+                events
+            }
+            CodingRuntimeEvent::ControllerWarning(message) => {
+                vec![ChatEvent::Warning { message }]
+            }
+            CodingRuntimeEvent::PersistenceWarning(message) => {
+                vec![ChatEvent::PersistenceWarning { message }]
+            }
+            CodingRuntimeEvent::SessionNameSuggested { name }
+            | CodingRuntimeEvent::SessionTitleSeeded { name } => {
+                vec![ChatEvent::SessionRenamed {
+                    session_id: permission_session_id.to_string(),
+                    name,
+                }]
+            }
+            CodingRuntimeEvent::CompactionStarted { .. }
+            | CodingRuntimeEvent::CompactionFinished { .. }
+            | CodingRuntimeEvent::RuntimeStopped(_)
+            | CodingRuntimeEvent::ModeChanged { .. }
+            | CodingRuntimeEvent::Reconfiguring { .. }
+            | CodingRuntimeEvent::Reconfigured { .. }
+            | CodingRuntimeEvent::ProviderChanged { .. }
+            | CodingRuntimeEvent::ProviderUnavailable { .. }
+            | CodingRuntimeEvent::SessionChanged(_)
+            | CodingRuntimeEvent::WorkingDirectoryChanged(_)
+            | CodingRuntimeEvent::GoalChanged(_)
+            | CodingRuntimeEvent::LoopChanged(_)
+            | CodingRuntimeEvent::UndoFinished(_)
+            | CodingRuntimeEvent::ContextStatsRefreshed(_)
+            | CodingRuntimeEvent::SnapshotRestoreFinished { .. }
+            | CodingRuntimeEvent::ProviderReloadFinished(_)
+            | CodingRuntimeEvent::ProviderDeactivationFinished(_) => Vec::new(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Allocate the id set for the current streaming part `kind` (bumping
+    /// `part_seq` when the kind changes). `None` ids when no assistant-message
+    /// boundary has been seen (older driver / non-boundary text such as a
+    /// compaction advisory).
+    fn next_part_stamp(&mut self, kind: &str) -> (Option<String>, Option<String>, Option<u32>) {
+        let message_id = self.current_message_id.clone();
+        if self.last_part_kind.as_deref() != Some(kind) {
+            self.part_seq += 1;
+            self.last_part_kind = Some(kind.to_string());
+        }
+        let has_id = message_id.is_some();
+        let part_id = message_id
+            .as_ref()
+            .map(|m| format!("{m}:{}:{kind}", self.part_seq));
+        (message_id, part_id, has_id.then_some(self.part_seq))
+    }
+
+    /// Close the current streaming part so the next delta opens a fresh one.
+    /// Called on tool boundaries: a tool ends the prose run, and the run after it
+    /// must carry its own `part_id` or a replay cannot converge them separately.
+    fn end_streaming_part(&mut self) {
+        self.last_part_kind = None;
+    }
+
+    fn project_agent(
+        &mut self,
+        event: zap_kernel::event::AgentEvent,
+        session_id: &str,
+    ) -> Vec<ChatEvent> {
+        use zap_kernel::event::AgentEvent as Agent;
+
+        match event {
+            Agent::AssistantMessage { message_id } => {
+                // Boundary marker: tag subsequent deltas with this identity.
+                self.current_message_id = Some(message_id);
+                self.part_seq = 0;
+                self.last_part_kind = None;
+                Vec::new()
+            }
+            Agent::UserMessage {
+                message_id,
+                turn_ordinal,
+            } => {
+                // Identity-only boundary: the `user` echo already painted the
+                // bubble; this binds it to the stored message id.
+                vec![ChatEvent::UserIdentified {
+                    message_id,
+                    turn_ordinal,
+                }]
+            }
+            Agent::TextDelta(text) => {
+                let (message_id, part_id, part_seq) = self.next_part_stamp("text");
+                let mut events = if self.keep_raw_markdown {
+                    vec![ChatEvent::TextDelta {
+                        content: text,
+                        message_id: message_id.clone(),
+                        part_id: part_id.clone(),
+                        part_seq,
+                    }]
+                } else {
+                    self.artifacts.process(&text)
+                };
+                // ArtifactDetector emits TextDelta without ids — stamp them here.
+                for ev in events.iter_mut() {
+                    if let ChatEvent::TextDelta {
+                        message_id: m,
+                        part_id: p,
+                        part_seq: s,
+                        ..
+                    } = ev
+                    {
+                        if m.is_none() {
+                            *m = message_id.clone();
+                        }
+                        if p.is_none() {
+                            *p = part_id.clone();
+                        }
+                        if s.is_none() {
+                            *s = part_seq;
+                        }
+                    }
+                }
+                events
+            }
+            Agent::Reasoning(content) => {
+                let (message_id, part_id, part_seq) = self.next_part_stamp("reasoning");
+                vec![ChatEvent::ReasoningDelta {
+                    content,
+                    message_id,
+                    part_id,
+                    part_seq,
+                }]
+            }
+            Agent::ToolBatchStarted { calls, .. } => {
+                // A tool batch closes the current prose run: the next delta must open a
+                // NEW part id. Sharing one part id across a tool boundary makes pre- and
+                // post-tool prose indistinguishable on replay, so the browser cannot
+                // converge the part in place and re-appends it instead.
+                self.end_streaming_part();
+                vec![ChatEvent::ToolBatchStarted { calls }]
+            }
+            Agent::ToolStarted { call } => {
+                self.end_streaming_part();
+                self.project_tool_started(call)
+            }
+            Agent::ToolProgress { call_id, message } => {
+                if let Some(progress) = message.strip_prefix('\u{1e}') {
+                    vec![ChatEvent::ToolProgress {
+                        id: call_id,
+                        progress: progress.to_string(),
+                    }]
+                } else {
+                    vec![ChatEvent::ToolOutputChunk {
+                        id: call_id,
+                        chunk: message,
+                    }]
+                }
+            }
+            Agent::ToolResult { result } => {
+                let (name, started) = self
+                    .live_tools
+                    .remove(&result.call_id)
+                    .unwrap_or_else(|| ("tool".into(), std::time::Instant::now()));
+                vec![ChatEvent::ToolCallResult {
+                    id: result.call_id,
+                    name,
+                    output: result.content,
+                    success: !result.is_error,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }]
+            }
+            Agent::Usage(meta) => {
+                let prompt = meta.tokens.prompt as usize;
+                let completion = meta.tokens.completion as usize;
+                let cached = meta.tokens.cached as usize;
+                let total = prompt + completion;
+                self.total_tokens = total;
+                vec![ChatEvent::TokenUsage {
+                    prompt,
+                    completion,
+                    total,
+                    cached,
+                }]
+            }
+            Agent::Error { message, .. } => {
+                self.last_error = Some(message.clone());
+                // Agent errors are diagnostics until the runtime emits TurnFinished.
+                // Emitting a terminal HTTP error here would create Error + Done for one turn.
+                vec![ChatEvent::Warning { message }]
+            }
+            Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                server_message,
+            } => vec![ChatEvent::RateLimited {
+                reset_at_display,
+                reset_label,
+                secs_until_reset,
+                auto_resuming,
+                server_message,
+            }],
+            Agent::Steered { count, inputs } => {
+                let mut events = Vec::new();
+                if let Some(event) = self.finish() {
+                    events.push(event);
+                }
+                events.push(ChatEvent::Steered {
+                    count,
+                    inputs,
+                    client_input_ids: Vec::new(),
+                });
+                events
+            }
+            Agent::CompactionStarted { .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: Some("compacting".to_string()),
+                });
+                vec![ChatEvent::SessionStatus {
+                    session_id: session_id.to_string(),
+                    status: "compacting".to_string(),
+                }]
+            }
+            Agent::Compacted {
+                removed,
+                bytes_before,
+                bytes_after,
+                committed: true,
+                ..
+            } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                let est_before = (bytes_before as f32 / 3.5).ceil() as usize;
+                let est_after = (bytes_after as f32 / 3.5).ceil() as usize;
+                vec![
+                    ChatEvent::SessionStatus {
+                        session_id: session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                    ChatEvent::Warning {
+                        message: zap_config::i18n::format_compaction_mark(
+                            removed, est_before, est_after,
+                        ),
+                    },
+                ]
+            }
+            Agent::CompactionFailed { error, .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![
+                    ChatEvent::SessionStatus {
+                        session_id: session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                    ChatEvent::Warning {
+                        message: format!("Compaction failed: {error}"),
+                    },
+                ]
+            }
+            Agent::TurnStarted
+            | Agent::ToolCallStreaming { .. }
+            | Agent::ToolBatchCompleted { .. }
+            | Agent::Request { .. }
+            | Agent::Snapshot { .. }
+            | Agent::TurnComplete { .. }
+            | Agent::Cancelled
+            | Agent::Compacted { .. } => Vec::new(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn project_tool_started(&mut self, call: zap_kernel::tool::ToolCall) -> Vec<ChatEvent> {
+        self.tool_call_count += 1;
+        self.live_tools.insert(
+            call.id.clone(),
+            (call.name.clone(), std::time::Instant::now()),
+        );
+        let mut events = vec![ChatEvent::ToolCallStarted {
+            id: call.id,
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            message_id: self.current_message_id.clone(),
+        }];
+
+        if !self.keep_raw_markdown
+            && matches!(
+                call.name.as_str(),
+                "write" | "write_file" | "create_file" | "edit" | "edit_file"
+            )
+        {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                if let Some(path) = args
+                    .get("path")
+                    .or_else(|| args.get("file_path"))
+                    .and_then(|value| value.as_str())
+                {
+                    let artifact_type = if path.ends_with(".html") || path.ends_with(".htm") {
+                        "html"
+                    } else if path.ends_with(".svg") {
+                        "svg"
+                    } else {
+                        ""
+                    };
+                    if !artifact_type.is_empty() {
+                        if let Some(content) = args.get("content").and_then(|value| value.as_str())
+                        {
+                            let id = format!("file-{}", uuid::Uuid::new_v4());
+                            let title = PathBuf::from(path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string());
+                            events.push(ChatEvent::ArtifactStart {
+                                id: id.clone(),
+                                artifact_type: artifact_type.to_string(),
+                                language: Some("html".to_string()),
+                                title,
+                                fence_len: 3,
+                            });
+                            events.push(ChatEvent::ArtifactContent {
+                                id: id.clone(),
+                                content: content.to_string(),
+                            });
+                            events.push(ChatEvent::ArtifactEnd { id });
+                        }
+                    }
+                }
+            }
+        }
+
+        events
+    }
+
+    fn finish(&mut self) -> Option<ChatEvent> {
+        self.artifacts.finish()
+    }
+}
+
+/// POST /chat - Stream chat response with SSE
+async fn chat_stream(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    headers: axum::http::HeaderMap,
+    Json(mut req): Json<ChatRequest>,
+) -> axum::response::Response {
+    // Ensure a valid session_id exists ahead of admission so RPC response and event bus always bind cleanly.
+    if req
+        .session_id
+        .as_deref()
+        .map_or(true, |s| s.trim().is_empty())
+    {
+        req.session_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+
+    // Parse session UUID for telemetry scope
+    let session_uuid = req
+        .session_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // Use current project working directory if not specified
+    if let Some(ref dir) = req.working_dir {
+        if dir.as_os_str().is_empty() || dir.to_string_lossy() == "__global__" {
+            req.working_dir = Some(global_standalone_workspace());
+        }
+    } else {
+        let project = state.project.read().await;
+        req.working_dir = Some(project.working_dir.clone());
+    }
+
+    let admission = match state
+        .active_chats
+        .admit(req.session_id.as_deref(), req.request_id.as_deref())
+        .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            let (code, message) = match error {
+                ActiveChatAdmissionError::SessionBusy => (
+                    "session_busy",
+                    "This session already has an active chat operation",
+                ),
+                ActiveChatAdmissionError::RequestBusy => (
+                    "request_busy",
+                    "This request id already has an active chat operation",
+                ),
+            };
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    success: false,
+                    error: message.to_string(),
+                    code: Some(code.to_string()),
+                    retryable: Some(true),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let (client_tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+    let operation_id = admission.operation_id.clone();
+    let cancel_token = admission.cancellation;
+    let event_bus = state
+        .active_chats
+        .event_bus(&admission.operation_id)
+        .await
+        .expect("just admitted operation always has an event bus");
+    // Fan-out so /chat/watch (WebUI reattach) sees the same events as this SSE,
+    // including a full replay log for mid-turn page refresh.
+    let replay = state
+        .active_chats
+        .event_bus_with_replay(&admission.operation_id)
+        .await
+        .map(|(_, r)| r);
+    let fan_tx = fanout_chat_events_for_session(
+        client_tx.clone(),
+        event_bus,
+        replay,
+        req.session_id.clone(),
+        req.working_dir.clone(),
+    );
+
+    // Clone state for the spawned task
+    let active_chats = state.active_chats.clone();
+    let mcp_pool = state.mcp_pool.clone();
+    let telemetry = state.telemetry.clone();
+    let pending_permissions = state.pending_permissions.clone();
+    let pending_user_inputs = state.pending_user_inputs.clone();
+    // POST /chat is always a *native* owner turn (WebUI / channel / IDE).
+    // Observers of API turns use GET /chat/watch and do not enter here.
+    // YOLO forces automation on every surface; otherwise honor native UX.
+    let policy = ChatTurnPolicy::resolve(
+        state.yolo,
+        ChatTurnOrigin::Native,
+        client_mode,
+        state.is_token_enforced(),
+        &state.bind_host,
+    );
+    let interactive_permission = policy.interactive_permission;
+    let interactive_user_input = policy.interactive_user_input;
+    if let Some(mode) = policy.force_approval_mode {
+        req.approval_mode = Some(mode);
+    }
+    tracing::info!(
+        client_mode = ?client_mode,
+        yolo = state.yolo,
+        enforce_token = state.is_token_enforced(),
+        interactive_permission,
+        interactive_user_input,
+        approval_mode = ?req.approval_mode,
+        "chat_stream: native turn policy"
+    );
+
+    // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
+    // Use the request's working_dir to detect repo_origin dynamically (not the
+    // startup-time cached value), because the user may switch projects via /cd.
+    let chat_repo_origin = detect_repo_origin(
+        req.working_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
+    let ctx_for_task = CurrentContext {
+        mode: Some(client_mode),
+        repo_origin: Some(chat_repo_origin),
+        session_id: session_uuid,
+        ..CurrentContext::current()
+    };
+
+    let chat_session_id = session_uuid.map(|u| u.to_string()).unwrap_or_default();
+    let task_session_id = chat_session_id.clone();
+    let cleanup_op = operation_id.clone();
+    let rpc_op_id = operation_id.clone();
+    let rpc_sid = chat_session_id.clone();
+    let cleanup_chats = active_chats.clone();
+    let inner_event_tx = fan_tx.clone();
+    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner_terminal_sent = terminal_sent.clone();
+
+    tokio::spawn(async move {
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx_for_task, || async move {
+                process_chat_request(
+                    req,
+                    inner_event_tx,
+                    cancel_token,
+                    operation_id,
+                    active_chats,
+                    mcp_pool,
+                    telemetry,
+                    pending_permissions,
+                    pending_user_inputs,
+                    interactive_permission,
+                    interactive_user_input,
+                    inner_terminal_sent,
+                    false,
+                )
+                .await
+            })
+            .await
+        });
+        finalize_chat_task(
+            inner,
+            &fan_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            &task_session_id,
+            &terminal_sent,
+        )
+        .await;
+    });
+
+    // Check if client requested a pure stateless RPC response (Single Event Bus pattern).
+    // In this mode, the client does not read the SSE response stream; all events are
+    // broadcast over the event bus (/chat/watch), eliminating dual-stream race conditions.
+    let wants_rpc = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/json"))
+        .unwrap_or(false);
+
+    if wants_rpc {
+        return (
+            axum::http::StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "admitted",
+                "operation_id": rpc_op_id,
+                "session_id": rpc_sid,
+            })),
+        )
+            .into_response();
+    }
+
+    // Track active SSE connections for idle timeout using a Drop guard
+    // to ensure decrement happens even if the client disconnects abruptly.
+    let active_conns = state.active_connections.clone();
+    active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let stream_session_id = chat_session_id.clone();
+    let stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        let mut val = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = val {
+            if !map.contains_key("session_id") {
+                map.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(stream_session_id.clone()),
+                );
+            }
+        }
+        let json = serde_json::to_string(&val).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
+    });
+
+    // The guard must outlive the stream. We achieve this by chaining a final
+    // item that captures the guard — when the stream is dropped (client disconnect
+    // or natural end), the guard's Drop fires and decrements the counter.
+    let conn_guard = SseConnectionGuard(active_conns);
+    let guarded_stream = stream.chain(futures::stream::once(async move {
+        drop(conn_guard); // explicitly drop to decrement
+                          // This event is never actually sent because the stream ends here
+        Ok(axum::response::sse::Event::default().comment("bye"))
+    }));
+
+    let mut resp = Sse::new(guarded_stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    resp
+}
+
+/// Await the inner chat task, translating its outcome into SSE events and
+/// always calling `active_chats.complete()` afterwards — even on panic.
+async fn finalize_chat_task(
+    inner: tokio::task::JoinHandle<anyhow::Result<()>>,
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+    cleanup_chats: &ActiveChatRegistry,
+    cleanup_operation_id: &str,
+    requested_session_id: &str,
+    terminal_sent: &std::sync::atomic::AtomicBool,
+) {
+    match inner.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx.send(ChatEvent::Error {
+                message: e.to_string(),
+            });
+        }
+        Err(join_error) => {
+            tracing::error!(
+                operation_id = cleanup_operation_id,
+                error = %join_error,
+                cancelled = join_error.is_cancelled(),
+                "chat task failed"
+            );
+            let _ = event_tx.send(ChatEvent::Error {
+                message: "chat task failed".into(),
+            });
+            if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let session_id = cleanup_chats
+                    .session_id(cleanup_operation_id)
+                    .await
+                    .unwrap_or_else(|| requested_session_id.to_string());
+                let _ = event_tx.send(ChatEvent::Done {
+                    tokens: 0,
+                    tool_calls: 0,
+                    session_id,
+                    stop_reason: Some("internal_error".into()),
+                    message: Some("chat task failed".into()),
+                });
+            }
+        }
+    }
+    cleanup_chats.complete(cleanup_operation_id).await;
+}
+
+/// Process a chat request and stream events
+pub(crate) async fn process_chat_request(
+    req: ChatRequest,
+    event_tx: mpsc::UnboundedSender<ChatEvent>,
+    cancel_token: CancellationToken,
+    operation_id: String,
+    active_chats: ActiveChatRegistry,
+    // Daemon-owned, per-project MCP connections shared by all short-lived
+    // `/chat` runtimes. Each runtime only mounts adapters/catalog entries.
+    mcp_pool: Arc<zap_capabilities::mcp::ProjectMcpPool>,
+    telemetry: Arc<Telemetry>,
+    pending_permissions: permission_bridge::PermissionResponders,
+    pending_user_inputs: permission_bridge::UserInputResponders,
+    interactive_permission: bool,
+    interactive_user_input: bool,
+    terminal_sent: Arc<std::sync::atomic::AtomicBool>,
+    keep_raw_markdown: bool,
+) -> anyhow::Result<()> {
+    let approval_mode =
+        effective_chat_approval_mode_scoped(req.approval_mode, req.session_id.as_deref());
+    // Load config
+    let config = zap_config::ConfigStore::default_store().read()?.config;
+    zap_config::proxy::apply_process_proxy_config(&config.network.proxy);
+
+    // Determine the unified model selection. CodingPlan/new-schema selections live in
+    // `[models.*]`, not the retired per-model `[providers.*]` projection.
+    let (provider_name, provider_config) = resolve_chat_provider(&config, req.provider)?;
+    // The provider config's existence is validated above; the native runtime
+    // builds (and validates) its own kernel provider for the actual turn and
+    // surfaces a clean error there. No core-provider preflight is needed — the
+    // VL preprocessor builds its own session-bound provider (see
+    // `preprocess_image_caption`), so nothing here consumes `core::provider`.
+    let _ = event_tx.send(ChatEvent::RuntimeInfo {
+        provider: provider_name.clone(),
+        model: provider_config.model.clone(),
+    });
+
+    // Get working directory
+    let mut working_dir = match req.working_dir {
+        Some(dir) if !dir.as_os_str().is_empty() && dir.to_string_lossy() != "__global__" => dir,
+        _ => global_standalone_workspace(),
+    };
+
+    let (session_id, initial_messages, is_new_session) =
+        if let Some(ref session_id_str) = req.session_id {
+            // 优先检查：是否为 POST /sessions 分配的草稿 (Session Draft)。
+            // 草稿在分配时已经明确绑定了所属的 working_dir。即使客户端在多项目之间
+            // 快速切换或存在前端竞态导致传了其他项目的 req.working_dir，
+            // 草稿注册时的 working directory 具有绝对权威，绝不能穿透或归入其他项目桶！
+            if let Some(draft_dir) = crate::native_live::session_draft_working_dir(session_id_str) {
+                working_dir = draft_dir;
+            }
+            let project_bucket = NativeSessionManager::project_hash(&working_dir);
+            match crate::legacy_convert::load_catalog_session_view_in_project(
+                &project_bucket,
+                session_id_str,
+            )? {
+                Some(session) => (session.meta.id, session.snapshot.messages, false),
+                None if crate::native_live::is_session_draft(session_id_str) => {
+                    // Draft from POST /sessions: keep the client id, persist on first turn.
+                    (session_id_str.clone(), Vec::new(), true)
+                }
+                None => {
+                    // 如果在该 project_bucket 未找到，跨项目尝试解析该会话真实的归属项目，
+                    // 自动校正 working_dir，避免因客户端传错目录导致报错或落盘错乱。
+                    if let Ok(Some(resolved)) = resolve_session_by_id(session_id_str) {
+                        let resolved_dir = PathBuf::from(&resolved.meta.working_dir);
+                        let resolved_bucket = &resolved.project_hash;
+                        if let Ok(Some(session)) =
+                            crate::legacy_convert::load_catalog_session_view_in_project(
+                                resolved_bucket,
+                                session_id_str,
+                            )
+                        {
+                            working_dir = resolved_dir;
+                            (session.meta.id, session.snapshot.messages, false)
+                        } else {
+                            // 在统一单事件总线与异步 RPC 架构中，客户端未传 ID（由 chat_stream 入口自动分配新 UUID）
+                            // 或传入全新 ID 时，在工程桶与全局均无既有记录属于正常新建会话场景。
+                            // 平滑作为新会话初始化，彻底拔除此处抛错导致后台任务静默崩溃、前端长久卡在 working 的隐患。
+                            (session_id_str.clone(), Vec::new(), true)
+                        }
+                    } else {
+                        (session_id_str.clone(), Vec::new(), true)
+                    }
+                }
+            }
+        } else {
+            (uuid::Uuid::new_v4().to_string(), Vec::new(), true)
+        };
+    active_chats
+        .bind_session(&operation_id, &session_id)
+        .await?;
+    publish_chat_session_assignment(
+        &working_dir,
+        &session_id,
+        is_new_session,
+        &event_tx,
+        req.session_title.as_deref(),
+        Some(&req.message),
+    )?;
+    if !is_new_session
+        && req
+            .session_title
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|title| !title.is_empty())
+    {
+        mark_protocol_origin(&working_dir, &session_id);
+    }
+
+    // AI session title is owned exclusively by CodingRuntime (first-submit
+    // spawn + gated turn-end retry). Do not spawn a second attempt here —
+    // that raced the runtime and produced duplicate /v1/responses calls.
+
+    // Key used to route interactive permission decisions back to this turn's
+    // decider. We use the *actual* session id (not req.session_id, which may be
+    // empty for brand-new chats and would collide across concurrent new
+    // sessions). Both the responder registration AND the emitted
+    // `permission_request` SSE event use this same key.
+    let perm_session_key = session_id.clone();
+
+    // The kernel-native buffer is the live transport (cold summaries inline as
+    // synthetic messages); persisted history was loaded from the native session view
+    // above. The native runtime owns turn boundaries — no daemon-side turn tracker.
+    let conversation = Arc::new(tokio::sync::Mutex::new(initial_messages));
+    // Keep the original images in the persisted/display conversation, but preprocess the
+    // runtime caption first when the active model is text-only. `run_chat_turn_v2` detects
+    // the marker and omits the already-described image bytes from the kernel input.
+    {
+        use zap_kernel::message::{ImageContent, Message};
+
+        let images: Vec<ImageContent> = req
+            .images
+            .iter()
+            .map(|i| ImageContent {
+                media_type: i.media_type.clone(),
+                data: i.data.clone(),
+            })
+            .collect();
+        let runtime_text = live_api::preprocess_image_caption(
+            &config,
+            &provider_config.model,
+            &working_dir,
+            telemetry.clone(),
+            Some(&session_id),
+            &req.message,
+            &images,
+        )
+        .await;
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut conv = conversation.lock().await;
+        let mut user_msg = if images.is_empty() {
+            Message::user(runtime_text.clone())
+        } else {
+            Message::user_with_images(runtime_text.clone(), images)
+        };
+        user_msg.created_at_ms = created_at;
+        conv.push(user_msg);
+        drop(conv);
+        // Emit the admitted user message to the fan-out bus so `/chat/watch`
+        // observers (WebUI detached) render it in real time, instead of only
+        // seeing it after turn-boundary disk persistence.
+        //
+        // Record it FIRST: broadcast has no replay window, so late watchers
+        // (connected after this send) get the message back from
+        // `chat_watch`'s Live replay. A watcher attaching between the record
+        // and the send may receive both — the WebUI dedups identical user text.
+        let created_at = (created_at > 0).then_some(created_at);
+        active_chats
+            .record_user_message(&operation_id, runtime_text.clone(), created_at)
+            .await;
+        let _ = event_tx.send(ChatEvent::User {
+            content: runtime_text,
+            session_id: Some(session_id.clone()),
+            created_at,
+            message_id: None,
+            order: None,
+            turn_ordinal: None,
+        });
+    }
+    // Interactive approval bridged over HTTP: interactive local clients (WebUI,
+    // channel, VSCode, JetBrains) in Build and Accept Edits modes route
+    // `/chat/permission`
+    // decisions back to the native runtime producer via `pending_permissions` (see
+    // the registration in the turn task below). Plan and Auto are explicit
+    // modes and never depend on an approver.
+    let registered_permission_responder =
+        interactive_permission && approval_mode_requires_responder(approval_mode);
+    tracing::info!(
+        approval_mode = ?approval_mode,
+        interactive_permission,
+        interactive_user_input,
+        registered_permission_responder,
+        session_id = %session_id,
+        "chat turn: permission responder registration"
+    );
+    // Native runtime observations stay native until this daemon driver projects
+    // them to the HTTP ChatEvent wire model.
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel::<CodingRuntimeEvent>();
+
+    // Check if session was stopped before we started the turn loop.
+    // If so, save the current conversation (session messages + user message)
+    // and return so the user can resume from this point later.
+    if active_chats.was_stopped(&operation_id).await {
+        // Save what we have — align with TUI behaviour: a stopped
+        // conversation should still be resumable via /resume.
+        {
+            let conv = conversation.lock().await;
+            let snapshot = zap_kernel::message::SessionSnapshot::new(conv.clone());
+            if let Err(e) = crate::legacy_convert::persist_pre_runtime_terminal(
+                &working_dir,
+                &session_id,
+                &snapshot,
+            ) {
+                eprintln!("Warning: Failed to save native session after early stop: {e}");
+            }
+        }
+        let _ = event_tx.send(ChatEvent::Stopped);
+        // Turn never ran — the turn task (which registers the responder) never
+        // spawned, so this is a defensive no-op cleanup for interactive modes.
+        if registered_permission_responder {
+            pending_permissions.unregister_session(&perm_session_key);
+        }
+        pending_user_inputs.unregister_session(&perm_session_key);
+        return Ok(());
+    }
+
+    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
+    let tel_ctx = CurrentContext::current();
+
+    // Run turn(s) in a background task on the native kernel stack; the
+    // downstream native-event → ChatEvent projector shapes the HTTP stream.
+    {
+        let shared_mcp_reg = Some(mcp_pool.registry(&working_dir).await);
+        let mut runtime_cfg =
+            live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry.clone());
+        runtime_cfg.shared_mcp_registry = shared_mcp_reg;
+        runtime_cfg.extra_system_append = req.extra_system_append.clone();
+        runtime_cfg.session_display_name = req.session_title.clone();
+        runtime_cfg.dangerously_skip_permissions = approval_mode
+            == crate::approval_mode::ApprovalMode::Auto
+            || (approval_mode == crate::approval_mode::ApprovalMode::Build
+                && !interactive_permission);
+        // Interactive approval: each native approval request registers its exact
+        // `(session_id, call_id)` route immediately before the card is published.
+        let permission_responders =
+            registered_permission_responder.then(|| pending_permissions.clone());
+        let conv = conversation.clone();
+        let cancel = cancel_token.clone();
+        let runtime_session_id = perm_session_key.clone();
+        let stop_gate = active_chats
+            .stop_gate(&operation_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("chat operation is no longer active"))?;
+        let runtime_user_inputs = pending_user_inputs.clone();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        active_chats.install_steer(&operation_id, steer_tx).await;
+        tokio::spawn(async move {
+            CurrentContext::scope(tel_ctx, || async move {
+                live_api::run_chat_turn_v2(
+                    runtime_session_id,
+                    conv,
+                    runtime_event_tx,
+                    cancel,
+                    stop_gate,
+                    runtime_cfg,
+                    permission_responders,
+                    if interactive_user_input {
+                        Some(runtime_user_inputs)
+                    } else {
+                        None
+                    },
+                    approval_mode,
+                    steer_rx,
+                )
+                .await;
+            })
+            .await;
+        });
+    }
+
+    let mut projector = ChatRuntimeProjector {
+        keep_raw_markdown,
+        ..ChatRuntimeProjector::default()
+    };
+    while let Some(event) = runtime_event_rx.recv().await {
+        for mut chat_event in projector.project_runtime(event, &perm_session_key) {
+            // Echo the recorded client correlation ids on a steer fold, so the
+            // WebUI can reconcile an in-flight steer (id → persisted message).
+            if let ChatEvent::Steered {
+                count,
+                client_input_ids,
+                ..
+            } = &mut chat_event
+            {
+                if client_input_ids.is_empty() {
+                    *client_input_ids = active_chats
+                        .take_steer_client_ids(&operation_id, *count)
+                        .await;
+                }
+            }
+            if matches!(
+                chat_event,
+                ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+            ) {
+                terminal_sent.store(true, std::sync::atomic::Ordering::Release);
+                active_chats.mark_terminal(&operation_id).await;
+            }
+            let _ = event_tx.send(chat_event);
+        }
+    }
+
+    // A closed producer is not success by itself. Only the native runtime's
+    // TurnFinished event can authorize `done`.
+    if !projector.terminal_seen {
+        if let Some(event) = projector.finish() {
+            let _ = event_tx.send(event);
+        }
+        let message = projector
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "coding runtime event stream closed before turn terminal".into());
+        let _ = event_tx.send(ChatEvent::Error { message });
+    }
+
+    // The native runtime owns turn boundaries, mid-turn cancel cleanup
+    // (`backfill_cancelled_tool_results`), and terminal persistence via its
+    // SnapshotHook + the authoritative terminal snapshot written back into the
+    // kernel buffer. The daemon buffer is a display/transport projection only and is
+    // never written back here, so no post-turn cancel bookkeeping or image restore is
+    // needed — the kernel terminal snapshot is authoritative.
+
+    // Turn finished (the forwarding loop above exits when runtime_event_rx closes).
+    // Drop the permission
+    // registration so it doesn't leak. Only registered in interactive prompt modes.
+    if registered_permission_responder {
+        pending_permissions.unregister_session(&perm_session_key);
+    }
+    pending_user_inputs.unregister_session(&perm_session_key);
+    Ok(())
+}
+
+/// Publish a `/chat` session identity only after a newly allocated native
+/// aggregate is durable. Existing sessions already crossed this boundary when
+/// they were loaded above. Keeping persistence and notification in one helper
+/// prevents clients from binding an id that a later request cannot resume.
+///
+/// `session_title`: OpenAI/Anthropic `user` (or `"default"` when omitted). When
+/// set, the durable display name is that title with `user_renamed=true` so
+/// first-prompt auto-naming does not overwrite it.
+fn mark_protocol_origin(working_dir: &std::path::Path, session_id: &str) {
+    let manager = NativeSessionManager::for_project(working_dir);
+    let _ = manager.update_meta(session_id, |meta| {
+        meta.origin = zap_capabilities::session::SessionOrigin::Protocol;
+    });
+}
+
+fn publish_chat_session_assignment(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    is_new_session: bool,
+    event_tx: &mpsc::UnboundedSender<ChatEvent>,
+    session_title: Option<&str>,
+    first_user_prompt: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut provisional_name = None;
+    if is_new_session {
+        let manager = NativeSessionManager::for_project(working_dir);
+        let lease = manager.acquire_lease(session_id)?;
+        let now = zap_capabilities::session::now_ms();
+        let mut meta = zap_capabilities::session::SessionMeta::new(
+            session_id,
+            working_dir.to_string_lossy(),
+            now,
+        );
+        meta.owner = zap_capabilities::session::StorageOwner::Native;
+        meta.message_count = 1;
+        if let Some(title) = session_title.map(str::trim).filter(|t| !t.is_empty()) {
+            meta.name = title.to_string();
+            // Pin API / client-provided titles (including the stable "default"
+            // key) so turn-complete auto-name and AI naming leave them alone.
+            meta.user_renamed = true;
+            meta.origin = zap_capabilities::session::SessionOrigin::Protocol;
+        } else if let Some(provisional) = first_user_prompt
+            .and_then(zap_coding::session_title::provisional_title_from_user_input)
+        {
+            meta.name = provisional.clone();
+            provisional_name = Some(provisional);
+        }
+        manager.commit_native_import(
+            &lease,
+            Some(&zap_kernel::message::SessionSnapshot::new(Vec::new())),
+            Some(&zap_capabilities::session::PresentationFile::default()),
+            &meta,
+        )?;
+        publish_session_upsert(working_dir, session_id);
+        publish_global(GlobalWireEvent::Activity {
+            session_id: session_id.to_string(),
+            running: true,
+            terminal: None,
+            status: None,
+        });
+    }
+    let _ = event_tx.send(ChatEvent::SessionAssigned {
+        session_id: session_id.to_string(),
+    });
+    if let Some(name) = provisional_name {
+        let _ = event_tx.send(ChatEvent::SessionRenamed {
+            session_id: session_id.to_string(),
+            name,
+        });
+    }
+    Ok(())
+}
+
+/// Build system prompt for daemon/API mode.
+///
+/// Aligned with TUI's `AgentLoop::build_system_prompt` to provide the same
+/// capabilities (model identity, layered instructions, memory, git snapshot,
+/// full rules). The only omission is plan mode (not applicable in API mode).
+///
+/// This function is self-contained — it does NOT touch any TUI code path.
+
+/// Request to stop a chat session
+#[derive(Debug, Deserialize)]
+struct StopChatRequest {
+    session_id: String,
+}
+
+/// Response for stop chat request
+#[derive(Debug, Serialize)]
+struct StopChatResponse {
+    success: bool,
+    /// Authoritative release verdict for callers that aim to start a new turn
+    /// right after stopping (WebUI send-now): the compat registry slot is free
+    /// **and** no native-runtime turn still occupies the session.
+    released: bool,
+    message: String,
+}
+
+/// One `/chat/watch` replay frame.
+///
+/// `seq` is the frame's position in the turn replay buffer (the resume cursor).
+/// Only REPLAYED frames carry it: a frame without `seq` is a live delta and is
+/// always new to the client. The browser stores the highest `seq` it applied and
+/// sends it back as `after_seq` on reconnect, so a reconnect never re-paints what
+/// is already on screen (and never has to guess by content).
+fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) -> String {
+    let mut val = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = val {
+        if !map.contains_key("session_id") {
+            map.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(seq) = seq {
+            map.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+        }
+    }
+    serde_json::to_string(&val).unwrap_or_default()
+}
+
+/// Handshake for `after_seq = -1` (a brand-new session / empty canvas).
+///
+/// There is nothing to catch up on, so the server skips the replay entirely and
+/// only tells the client where the cursor starts; every later frame is live.
+fn chat_watch_session_start_json(session_id: &str, cursor: u64) -> String {
+    serde_json::json!({
+        "type": "session_start",
+        "session_id": session_id,
+        "cursor": cursor,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod chat_watch_frame_tests {
+    use super::*;
+
+    fn text_delta() -> ChatEvent {
+        ChatEvent::TextDelta {
+            content: "正文 2".into(),
+            message_id: Some("m-round-2".into()),
+            part_id: Some("m-round-2:2:text".into()),
+            part_seq: Some(2),
+        }
+    }
+
+    #[test]
+    fn replayed_frames_carry_the_cursor_and_live_frames_do_not() {
+        let replayed: serde_json::Value =
+            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", Some(7))).unwrap();
+        assert_eq!(replayed["seq"], serde_json::Value::Number(7.into()));
+        assert_eq!(replayed["type"], "text");
+        assert_eq!(replayed["session_id"], "s-1");
+        assert_eq!(replayed["part_id"], "m-round-2:2:text");
+
+        // A live delta carries no cursor: it is always new, never re-painted.
+        let live: serde_json::Value =
+            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", None)).unwrap();
+        assert!(live.get("seq").is_none());
+        assert_eq!(live["content"], "正文 2");
+    }
+
+    #[test]
+    fn session_start_handshake_carries_the_starting_cursor() {
+        let handshake: serde_json::Value =
+            serde_json::from_str(&chat_watch_session_start_json("s-1", 42)).unwrap();
+        assert_eq!(handshake["type"], "session_start");
+        assert_eq!(handshake["session_id"], "s-1");
+        assert_eq!(handshake["cursor"], serde_json::Value::Number(42.into()));
+    }
+}
+
+#[cfg(test)]
+mod chat_part_identity_tests {
+    use super::*;
+
+    #[test]
+    fn tool_boundary_opens_a_new_text_part() {
+        use zap_kernel::event::AgentEvent as Agent;
+        let mut projector = ChatRuntimeProjector::default();
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-1".into(),
+            },
+            "sess-1",
+        );
+        let part_of = |events: Vec<ChatEvent>| match events.into_iter().next() {
+            Some(ChatEvent::TextDelta { part_id, .. }) => part_id.unwrap_or_default(),
+            other => panic!("expected a text delta, got {other:?}"),
+        };
+        let before = part_of(projector.project_agent(Agent::TextDelta("正文 1".into()), "sess-1"));
+        projector.project_agent(
+            Agent::ToolBatchStarted {
+                batch_id: "b1".into(),
+                calls: Vec::new(),
+            },
+            "sess-1",
+        );
+        let after = part_of(projector.project_agent(Agent::TextDelta("正文 2".into()), "sess-1"));
+        assert_eq!(before, "m-1:1:text");
+        // Sharing one part id across a tool boundary makes the two prose runs
+        // indistinguishable on replay: the browser then re-appends instead of
+        // converging the part in place.
+        assert_eq!(after, "m-1:2:text");
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatWatchQuery {
+    session_id: String,
+    /// Idle WebUI observers wait for the *next* admit. Do not dump a stale
+    /// in-memory replay of an already-finished (or still-aliased) turn — that
+    /// armed the stop button and blinking cursor on completed sessions.
+    #[serde(default)]
+    standby: bool,
+    /// 断点续传游标：
+    /// - `-1`：我没有缓存（新会话/空画布）→ 不补发，只回一条 `session_start`；
+    /// - `N`：只补 `seq >= N` 的回放帧，然后转实时；
+    /// - 缺省：全量补发（无游标兜底，前端按身份幂等收敛）。
+    #[serde(default)]
+    after_seq: Option<i64>,
+}
+
+/// GET /chat/watch?session_id=… — reattach to a turn owned by another client.
+///
+/// Emits the same `ChatEvent` JSON SSE frames as `POST /chat`, so the WebUI can
+/// stream progress for OpenAI/API-started turns instead of only polling history.
+async fn chat_watch(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ChatWatchQuery>,
+) -> axum::response::Response {
+    let session_id = q.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                success: false,
+                error: "session_id is required".into(),
+                code: Some("missing_session_id".into()),
+                retryable: Some(false),
+            }),
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+    // 断点续传：回放帧带 seq（回合缓冲序号 = 游标），实时帧不带。
+    // 帧语义由「这次连接请求了什么」决定 —— 前端自己就知道，不需要逐帧猜：
+    //   after_seq = -1 → 新会话/空画布：不补发，只回 session_start 后转实时
+    //   after_seq = N  → 只补 seq >= N 的回放帧，然后转实时
+    //   缺省           → 全量补发（无游标兜底，前端按身份幂等收敛）
+    let mut replay_head: Vec<(u64, ChatEvent)> = Vec::new();
+    let mut handshake: Option<String> = None;
+    let mut buffer_len = 0u64;
+    // Prefer atomic snapshot+subscribe when a turn is live so a mid-stream
+    // browser refresh gets the full thinking/text/tool history, not only
+    // deltas after reconnect. Idle standby watchers skip this so a leftover
+    // alias cannot replay a finished turn into the composer.
+    if !q.standby {
+        if let Some((snapshot, mut bus_rx)) = state
+            .active_chats
+            .subscribe_live_with_replay(&session_id)
+            .await
+        {
+            buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+            tracing::debug!(
+                session_id = %session_id,
+                replay_events = snapshot.len(),
+                after_seq = ?q.after_seq,
+                "chat_watch: LIVE with replay"
+            );
+            let maybe_user = snapshot
+                .iter()
+                .find(|(_, e)| matches!(e, ChatEvent::User { .. }))
+                .cloned();
+
+            match q.after_seq {
+                Some(-1) => {
+                    // 新会话：画布本来就是空的，补发毫无意义；只给一个起始游标。
+                    // 但是如果本轮存在活跃用户提问，必须在头部送达，防止刷新后用户提问丢失！
+                    handshake = Some(chat_watch_session_start_json(&session_id, buffer_len));
+                    if let Some(user) = maybe_user {
+                        replay_head = vec![user];
+                    }
+                }
+                // 游标有效（没越过缓冲末尾）：只补它之后的帧。
+                // 核心防线：当前回合的活跃用户提问（ChatEvent::User）必须始终放在头部，
+                // 绝不受 after_seq 过滤丢弃，确保断线重连或 F5 刷新后用户消息绝不丢失！
+                Some(after) if after >= 0 && (after as u64) <= buffer_len => {
+                    let mut filtered: Vec<(u64, ChatEvent)> = snapshot
+                        .into_iter()
+                        .filter(|(seq, e)| {
+                            !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64
+                        })
+                        .collect();
+                    if let Some(user) = maybe_user {
+                        filtered.insert(0, user);
+                    }
+                    replay_head = filtered;
+                }
+                // 无游标，或游标已失效（换设备 / 清缓存 / 新回合）：全量补发。
+                _ => replay_head = snapshot,
+            }
+            // 终态已在补发里：截到终态为止，且绝不再挂实时总线。
+            let terminal_at = replay_head.iter().position(|(_, event)| {
+                matches!(
+                    event,
+                    ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+                )
+            });
+            if let Some(cut) = terminal_at {
+                replay_head.truncate(cut + 1);
+            }
+            if terminal_at.is_none() {
+                tokio::spawn(async move {
+                    loop {
+                        match bus_rx.recv().await {
+                            Ok(event) => {
+                                let terminal = matches!(
+                                    event,
+                                    ChatEvent::Done { .. }
+                                        | ChatEvent::Error { .. }
+                                        | ChatEvent::Stopped
+                                );
+                                if tx.send(event).is_err() {
+                                    break;
+                                }
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            } else {
+                // No live pump: drop the sender so the SSE stream ends cleanly
+                // after the replayed terminal instead of hanging on keepalive.
+                drop(tx);
+            }
+        } else {
+            match state
+                .active_chats
+                .subscribe_or_standby(&session_id, &tx)
+                .await
+            {
+                WatchOutcome::Live(mut bus_rx) => {
+                    // Race: turn admitted between the two lookups — no replay buffer
+                    // snapshot, fall back to live-only + admitted user message.
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "chat_watch: LIVE race fallback (no snapshot)"
+                    );
+                    state
+                        .active_chats
+                        .replay_admitted_user(&session_id, &tx)
+                        .await;
+                    tokio::spawn(async move {
+                        loop {
+                            match bus_rx.recv().await {
+                                Ok(event) => {
+                                    let terminal = matches!(
+                                        event,
+                                        ChatEvent::Done { .. }
+                                            | ChatEvent::Error { .. }
+                                            | ChatEvent::Stopped
+                                    );
+                                    if tx.send(event).is_err() {
+                                        break;
+                                    }
+                                    if terminal {
+                                        break;
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                }
+                WatchOutcome::Standby => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "chat_watch: STANDBY until next admit"
+                    );
+                }
+            }
+        }
+    } else {
+        match state
+            .active_chats
+            .subscribe_or_standby(&session_id, &tx)
+            .await
+        {
+            WatchOutcome::Live(mut bus_rx) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "chat_watch: STANDBY-ONLY attached live (admitted user + live)"
+                );
+                // Idle-watch reconnect often loses the race to `admit`: the
+                // User event is already on the bus. Replay it so the new
+                // bubble is not dropped while the previous turn's assistant
+                // keeps streaming.
+                state
+                    .active_chats
+                    .replay_admitted_user(&session_id, &tx)
+                    .await;
+                tokio::spawn(async move {
+                    loop {
+                        match bus_rx.recv().await {
+                            Ok(event) => {
+                                let terminal = matches!(
+                                    event,
+                                    ChatEvent::Done { .. }
+                                        | ChatEvent::Error { .. }
+                                        | ChatEvent::Stopped
+                                );
+                                if tx.send(event).is_err() {
+                                    break;
+                                }
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+            WatchOutcome::Standby => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "chat_watch: STANDBY until next admit"
+                );
+            }
+        }
+    }
+
+    let active_conns = state.active_connections.clone();
+    active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let head_session_id = session_id.clone();
+    let live_session_id = session_id.clone();
+    // 补发/握手帧在前（带 seq），实时帧在后（同样携带单调递增 seq）。
+    // 前端每收到一帧就实时推进本地游标，断线/刷新重连带回来续传 —— 精准无缝续接，不重复、不重播！
+    let last_head_seq = replay_head
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max()
+        .unwrap_or(buffer_len);
+
+    let head_json: Vec<String> = handshake
+        .into_iter()
+        .chain(
+            replay_head
+                .iter()
+                .map(|(seq, event)| chat_watch_frame_json(event, &head_session_id, Some(*seq))),
+        )
+        .collect();
+    let head_stream = futures::stream::iter(head_json).map(|json| {
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
+    });
+
+    let live_seq_counter =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
+    let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(chat_watch_frame_json(
+                &event,
+                &live_session_id,
+                Some(seq),
+            )),
+        )
+    });
+    let stream = head_stream.chain(live_stream);
+    let conn_guard = SseConnectionGuard(active_conns);
+    let guarded = stream.chain(futures::stream::once(async move {
+        drop(conn_guard);
+        Ok(axum::response::sse::Event::default().comment("bye"))
+    }));
+
+    let mut resp = Sse::new(guarded)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    resp
+}
+
+/// POST /chat/stop - Stop a running chat session
+async fn stop_chat(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Json(req): Json<StopChatRequest>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&req.session_id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        let resolved_session_id = state_clone.active_chats.session_id(&req.session_id).await;
+        // 与「停止按钮同源」的停止：无上限等待该会话的 compat 运行中操作真正离场。
+        // 正常路径下与“秒停”同步完成，固定上限反而会把正在收尾的回合误报成占用。
+        let stopped_alias = state_clone
+            .active_chats
+            .stop_and_wait(req.session_id.clone(), None)
+            .await;
+        let mut stopped_reg = crate::native_live::cancel_via_registry(&req.session_id).is_ok();
+        if let Some(ref sid) = resolved_session_id {
+            if sid != &req.session_id {
+                stopped_reg = crate::native_live::cancel_via_registry(sid).is_ok() || stopped_reg;
+            }
+            zap_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(
+                sid,
+            );
+        } else {
+            zap_capabilities::tools::bash_runtime::cancel_foreground_live_bash_for_session(
+                &req.session_id,
+            );
+        }
+        // 调用方（WebUI「立即发送」）能否安全紧接一个新回合的权威结论。
+        // stop_and_wait 返回时 compat 槽位已经空闲：别名「本来就没在跑」同样是空闲，
+        // 不能再把 released 写成 false，否则前端会整段跳过投递。
+        // 唯一仍要拒绝的是 native runtime 回合还占着会话（取消是异步的）。
+        let live_busy = crate::native_live::live_turn_running(&req.session_id)
+            || resolved_session_id.as_deref().map_or(false, |sid| {
+                sid != req.session_id.as_str() && crate::native_live::live_turn_running(sid)
+            });
+        let released = !live_busy;
+        if stopped_alias || stopped_reg {
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
+            (
+                axum::http::StatusCode::OK,
+                Json(StopChatResponse {
+                    success: true,
+                    released,
+                    message: format!("Chat session {} stopped", req.session_id),
+                }),
+            )
+        } else {
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
+            (
+                axum::http::StatusCode::OK,
+                Json(StopChatResponse {
+                    success: true,
+                    released,
+                    message: format!("Chat session {} was not running", req.session_id),
+                }),
+            )
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ChatSteerRequest {
+    /// Session id, or the browser request id that admitted the running turn.
+    session_id: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    images: Vec<ImageInput>,
+    /// Client correlation id (opaque). Echoed on the `steered` wire event so the
+    /// WebUI can promote an optimistic steer to the persisted message by id.
+    #[serde(default)]
+    client_input_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedMessageItem {
+    pub id: serde_json::Value,
+    pub text: String,
+    #[serde(default)]
+    pub images: Option<serde_json::Value>,
+    #[serde(default)]
+    pub kind: String, // "queue" | "steering" | "steered"
+    #[serde(default)]
+    pub approval_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatQueueQuery {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatQueueUpdateRequest {
+    session_id: String,
+    items: Vec<QueuedMessageItem>,
+}
+
+static SESSION_QUEUES: tokio::sync::OnceCell<
+    tokio::sync::RwLock<HashMap<String, Vec<QueuedMessageItem>>>,
+> = tokio::sync::OnceCell::const_new();
+
+async fn get_session_queues_map(
+) -> &'static tokio::sync::RwLock<HashMap<String, Vec<QueuedMessageItem>>> {
+    SESSION_QUEUES
+        .get_or_init(|| async { tokio::sync::RwLock::new(HashMap::new()) })
+        .await
+}
+
+fn session_queue_file_path(session_id: &str) -> Option<PathBuf> {
+    let clean = session_id.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let home = zap_config::util::real_home_dir()?;
+    let dir = home.join(".zap").join("state").join("queues");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join(format!("{clean}.json")))
+}
+
+async fn get_chat_queue(Query(q): Query<ChatQueueQuery>) -> impl IntoResponse {
+    let sid = q.session_id.trim();
+    if sid.is_empty() {
+        return Json(serde_json::json!([]));
+    }
+    let map = get_session_queues_map().await;
+    {
+        let reader = map.read().await;
+        if let Some(items) = reader.get(sid) {
+            return Json(serde_json::to_value(items).unwrap_or_default());
+        }
+    }
+    if let Some(path) = session_queue_file_path(sid) {
+        if path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if let Ok(items) = serde_json::from_str::<Vec<QueuedMessageItem>>(&content) {
+                    let mut writer = map.write().await;
+                    writer.insert(sid.to_string(), items.clone());
+                    return Json(serde_json::to_value(items).unwrap_or_default());
+                }
+            }
+        }
+    }
+    Json(serde_json::json!([]))
+}
+
+async fn update_chat_queue(Json(req): Json<ChatQueueUpdateRequest>) -> impl IntoResponse {
+    let sid = req.session_id.trim().to_string();
+    if !sid.is_empty() {
+        let map = get_session_queues_map().await;
+        let mut writer = map.write().await;
+        if req.items.is_empty() {
+            writer.remove(&sid);
+            if let Some(path) = session_queue_file_path(&sid) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        } else {
+            writer.insert(sid.clone(), req.items.clone());
+            if let Some(path) = session_queue_file_path(&sid) {
+                if let Ok(json_str) = serde_json::to_string_pretty(&req.items) {
+                    let _ = tokio::fs::write(path, json_str).await;
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "success": true }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RevealPathRequest {
+    path: String,
+}
+
+async fn reveal_file_or_folder(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
+    let p = std::path::PathBuf::from(req.path.trim());
+    if !p.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
+        );
+    }
+    // 异步后台线程拉起系统文件管理器，无桌面环境或异地请求时静默忽略，杜绝挂起卡死
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        {
+            if p.is_file() {
+                let _ = std::process::Command::new("explorer")
+                    .arg(format!("/select,{}", p.display()))
+                    .spawn();
+            } else {
+                let _ = std::process::Command::new("explorer").arg(&p).spawn();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&p).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("DISPLAY").is_some()
+                || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            }
+        }
+    });
+    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+}
+
+async fn open_file_with_os(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
+    let p = std::path::PathBuf::from(req.path.trim());
+    if !p.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
+        );
+    }
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "", &p.to_string_lossy()])
+                .spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&p).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("DISPLAY").is_some()
+                || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            }
+        }
+    });
+    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct FsRawQuery {
+    path: String,
+}
+
+async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
+    let raw = q.path.trim().trim_start_matches("./");
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.exists() || !p.is_file() {
+        if let Ok(cur) = std::env::current_dir() {
+            let candidate = cur.join(raw);
+            if candidate.exists() && candidate.is_file() {
+                p = candidate;
+            }
+        }
+    }
+    if !p.exists() || !p.is_file() {
+        return (StatusCode::NOT_FOUND, "Not found".into_response());
+    }
+    match std::fs::read(&p) {
+        Ok(bytes) => {
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "svg" => "image/svg+xml",
+                "ico" => "image/x-icon",
+                "bmp" => "image/bmp",
+                "pdf" => "application/pdf",
+                "mp4" => "video/mp4",
+                "mp3" => "audio/mpeg",
+                _ => "application/octet-stream",
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(val) = mime.parse() {
+                headers.insert(axum::http::header::CONTENT_TYPE, val);
+            }
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(
+                    "public, max-age=86400, stale-while-revalidate=604800",
+                ),
+            );
+            (StatusCode::OK, (headers, bytes).into_response())
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e}").into_response(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsActionPayload {
+    action: String,
+    path: String,
+    new_name: Option<String>,
+}
+
+async fn fs_action_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FsActionPayload>,
+) -> impl IntoResponse {
+    let raw = req.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        p = state.bind_working_dir.join(raw);
+    }
+    match req.action.as_str() {
+        "create_file" | "create" => {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+            {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "File created" })),
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Already exists" })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                ),
+            }
+        }
+        "create_folder" | "mkdir" => match std::fs::create_dir_all(&p) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "success": true, "message": "Folder created" })),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+            ),
+        },
+        "rename" => {
+            let Some(new_name) = req
+                .new_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "success": false, "error": "Missing new_name" })),
+                );
+            };
+            let Some(parent) = p.parent() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "success": false, "error": "Invalid parent path" })),
+                );
+            };
+            let new_path = parent.join(new_name);
+            match std::fs::rename(&p, &new_path) {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Renamed" })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                ),
+            }
+        }
+        "delete" => {
+            if !p.exists() {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Already deleted" })),
+                );
+            }
+            let res = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            match res {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "message": "Deleted" })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": format!("{e}") })),
+                ),
+            }
+        }
+        _ => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "success": true, "message": "Ignored" })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsTreeQuery {
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FsEntryDto {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_ignored: bool,
+}
+
+async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) -> impl IntoResponse {
+    let req_path = q.path.as_deref().unwrap_or("").trim();
+    let abs_dir = if req_path.is_empty() || req_path == "." {
+        state.bind_working_dir.clone()
+    } else {
+        let p = std::path::PathBuf::from(req_path);
+        if p.is_absolute() {
+            p
+        } else {
+            state.bind_working_dir.join(p)
+        }
+    };
+    let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
+    let abs_dir = zap_capabilities::pathnorm::strip_verbatim_path(&abs_dir);
+
+    if !abs_dir.exists() || !abs_dir.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "path": abs_dir.to_string_lossy().replace('\\', "/"),
+                "entries": [],
+                "dirs": [],
+                "files": [],
+                "error": "Directory not found"
+            })),
+        );
+    }
+
+    let mut entries_res: Vec<FsEntryDto> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+
+    if let Ok(read_dir) = std::fs::read_dir(&abs_dir) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git" {
+                continue;
+            }
+            let file_type = entry.file_type();
+            let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+            let full_p = abs_dir.join(&name).to_string_lossy().replace('\\', "/");
+            let is_ignored = name == "target"
+                || name == "node_modules"
+                || name == "dist"
+                || name.starts_with('.');
+
+            if is_dir {
+                dirs.push(name.clone());
+            } else {
+                files.push(name.clone());
+            }
+
+            entries_res.push(FsEntryDto {
+                name,
+                path: full_p,
+                is_dir,
+                is_ignored,
+            });
+        }
+    }
+
+    entries_res.sort_by(|a, b| {
+        if a.is_dir == b.is_dir {
+            a.name.cmp(&b.name)
+        } else if a.is_dir {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+    dirs.sort();
+    files.sort();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "path": abs_dir.to_string_lossy().replace('\\', "/"),
+            "entries": entries_res,
+            "dirs": dirs,
+            "files": files,
+            "success": true
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct FsReadQuery {
+    path: String,
+    cwd: Option<String>,
+}
+
+async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
+    let raw = q.path.trim().trim_start_matches("./");
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        if let Some(ref cwd_str) = q.cwd {
+            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
+            if candidate_cwd.exists() {
+                p = candidate_cwd;
+            } else {
+                let candidate = state.bind_working_dir.join(raw);
+                if candidate.exists() {
+                    p = candidate;
+                } else if let Ok(cur) = std::env::current_dir() {
+                    let candidate2 = cur.join(raw);
+                    if candidate2.exists() {
+                        p = candidate2;
+                    }
+                }
+            }
+        } else {
+            let candidate = state.bind_working_dir.join(raw);
+            if candidate.exists() {
+                p = candidate;
+            } else if let Ok(cur) = std::env::current_dir() {
+                let candidate2 = cur.join(raw);
+                if candidate2.exists() {
+                    p = candidate2;
+                }
+            }
+        }
+    }
+
+    let p = p.canonicalize().unwrap_or(p);
+    let p = zap_capabilities::pathnorm::strip_verbatim_path(&p);
+
+    if !p.exists() || !p.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "path": q.path,
+                "content": "",
+                "success": false,
+                "error": "File not found"
+            })),
+        );
+    }
+
+    match tokio::fs::read_to_string(&p).await {
+        Ok(content) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "path": p.to_string_lossy().replace('\\', "/"),
+                "content": content,
+                "success": true
+            })),
+        ),
+        Err(_) => match tokio::fs::read(&p).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "path": p.to_string_lossy().replace('\\', "/"),
+                    "content": String::from_utf8_lossy(&bytes).to_string(),
+                    "success": true
+                })),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "path": q.path,
+                    "content": "",
+                    "success": false,
+                    "error": format!("{e}")
+                })),
+            ),
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsWritePayload {
+    path: String,
+    content: Option<String>,
+}
+
+async fn fs_write(
+    State(state): State<AppState>,
+    Json(body): Json<FsWritePayload>,
+) -> impl IntoResponse {
+    let raw = body.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        p = state.bind_working_dir.join(raw);
+    }
+    if let Some(parent) = p.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let content = body.content.unwrap_or_default();
+    match tokio::fs::write(&p, content.as_bytes()).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "message": "File saved successfully"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("{e}")
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FsSearchQuery {
+    q: String,
+    path: Option<String>,
+}
+
+async fn fs_search(
+    State(state): State<AppState>,
+    Query(q): Query<FsSearchQuery>,
+) -> impl IntoResponse {
+    let query_str = q.q.trim().to_string();
+    let root = q.path.as_deref().unwrap_or("").trim();
+    let search_dir = if root.is_empty() {
+        state.bind_working_dir.clone()
+    } else {
+        let p = std::path::PathBuf::from(root);
+        if p.is_absolute() {
+            p
+        } else {
+            state.bind_working_dir.join(p)
+        }
+    };
+
+    let results = tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        if query_str.is_empty() || !search_dir.exists() {
+            return matches;
+        }
+        let lower_query = query_str.to_lowercase();
+        fn walk_search(
+            dir: &std::path::Path,
+            q: &str,
+            matches: &mut Vec<serde_json::Value>,
+            depth: usize,
+        ) {
+            if depth > 8 || matches.len() >= 100 {
+                return;
+            }
+            let Ok(read_dir) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.')
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "dist"
+                {
+                    continue;
+                }
+                let p = entry.path();
+                if p.is_dir() {
+                    walk_search(&p, q, matches, depth + 1);
+                } else if p.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&p) {
+                        for (idx, line) in content.lines().enumerate() {
+                            if line.to_lowercase().contains(q) {
+                                let norm_p = p.to_string_lossy().replace('\\', "/");
+                                matches.push(serde_json::json!({
+                                    "file": norm_p,
+                                    "line": idx + 1,
+                                    "content": line.trim(),
+                                }));
+                                if matches.len() >= 100 {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk_search(&search_dir, &lower_query, &mut matches, 0);
+        matches
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "query": q.q,
+        "results": results
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct FsLocateQuery {
+    q: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FsLocateItem {
+    name: String,
+    path: String,
+    rel_path: String,
+    is_dir: bool,
+}
+
+async fn fs_locate(
+    State(state): State<AppState>,
+    Query(q): Query<FsLocateQuery>,
+) -> impl IntoResponse {
+    let raw_query = q.q.trim().trim_matches('"').trim_matches('\'').trim();
+    let root = q.path.as_deref().unwrap_or("").trim();
+    let search_dir = if root.is_empty() || root == "." {
+        state.bind_working_dir.clone()
+    } else {
+        let p = std::path::PathBuf::from(root);
+        if p.is_absolute() {
+            p
+        } else {
+            state.bind_working_dir.join(p)
+        }
+    };
+    let search_dir = search_dir.canonicalize().unwrap_or(search_dir);
+    let search_dir = zap_capabilities::pathnorm::strip_verbatim_path(&search_dir);
+
+    if raw_query.is_empty() || !search_dir.exists() {
+        return Json(serde_json::json!({
+            "query": q.q,
+            "results": Vec::<FsLocateItem>::new()
+        }));
+    }
+
+    let search_dir_clone = search_dir.clone();
+    let query_str = raw_query.to_string();
+
+    let results = tokio::task::spawn_blocking(move || {
+        let mut matches: Vec<FsLocateItem> = Vec::new();
+        let query_normalized = query_str.replace('\\', "/").to_lowercase();
+        let is_path_query = query_normalized.contains('/');
+
+        // 优先检查直接命中的相对路径（如 extensions/jetbrains/src/main/kotlin/com/jeikcode/jetbrains/ui/JeikCodeChatPanel.kt）
+        let direct_candidate = search_dir_clone.join(query_str.trim_start_matches("./"));
+        if direct_candidate.exists() {
+            let is_dir = direct_candidate.is_dir();
+            let norm_path = direct_candidate.to_string_lossy().replace('\\', "/");
+            let norm_base = search_dir_clone.to_string_lossy().replace('\\', "/");
+            let rel = if norm_path
+                .to_lowercase()
+                .starts_with(&norm_base.to_lowercase())
+            {
+                norm_path[norm_base.len()..]
+                    .trim_start_matches('/')
+                    .to_string()
+            } else {
+                norm_path.clone()
+            };
+            let name = direct_candidate
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            matches.push(FsLocateItem {
+                name,
+                path: norm_path,
+                rel_path: rel,
+                is_dir,
+            });
+        }
+
+        fn walk_locate(
+            base: &std::path::Path,
+            current: &std::path::Path,
+            q: &str,
+            is_path_q: bool,
+            matches: &mut Vec<FsLocateItem>,
+            depth: usize,
+        ) {
+            if depth > 16 || matches.len() >= 150 {
+                return;
+            }
+            let Ok(read_dir) = std::fs::read_dir(current) else {
+                return;
+            };
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".git"
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "dist"
+                    || name.starts_with('.')
+                {
+                    continue;
+                }
+                let file_type = entry.file_type();
+                let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+                let entry_path = entry.path();
+                let norm_path = entry_path.to_string_lossy().replace('\\', "/");
+                let norm_base = base.to_string_lossy().replace('\\', "/");
+                let rel = if norm_path
+                    .to_lowercase()
+                    .starts_with(&norm_base.to_lowercase())
+                {
+                    norm_path[norm_base.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    norm_path.clone()
+                };
+
+                let lower_name = name.to_lowercase();
+                let lower_rel = rel.to_lowercase();
+
+                let is_hit = if is_path_q {
+                    lower_rel.contains(q)
+                } else {
+                    lower_name.contains(q) || lower_rel.contains(q)
+                };
+
+                if is_hit
+                    && !matches
+                        .iter()
+                        .any(|m| m.path.eq_ignore_ascii_case(&norm_path))
+                {
+                    matches.push(FsLocateItem {
+                        name: name.clone(),
+                        path: norm_path,
+                        rel_path: rel,
+                        is_dir,
+                    });
+                    if matches.len() >= 150 {
+                        return;
+                    }
+                }
+
+                if is_dir {
+                    walk_locate(base, &entry_path, q, is_path_q, matches, depth + 1);
+                }
+            }
+        }
+
+        walk_locate(
+            &search_dir_clone,
+            &search_dir_clone,
+            &query_normalized,
+            is_path_query,
+            &mut matches,
+            0,
+        );
+
+        // 排序：精准相对路径匹配最高，其次名称精准匹配，其次前缀匹配，浅层路径优先
+        matches.sort_by(|a, b| {
+            let a_exact_rel = a.rel_path.to_lowercase() == query_normalized;
+            let b_exact_rel = b.rel_path.to_lowercase() == query_normalized;
+            if a_exact_rel != b_exact_rel {
+                return b_exact_rel.cmp(&a_exact_rel);
+            }
+
+            let a_exact_name = a.name.to_lowercase() == query_normalized;
+            let b_exact_name = b.name.to_lowercase() == query_normalized;
+            if a_exact_name != b_exact_name {
+                return b_exact_name.cmp(&a_exact_name);
+            }
+            let a_starts = a.name.to_lowercase().starts_with(&query_normalized);
+            let b_starts = b.name.to_lowercase().starts_with(&query_normalized);
+            if a_starts != b_starts {
+                return b_starts.cmp(&a_starts);
+            }
+            let a_rel_starts = a.rel_path.to_lowercase().starts_with(&query_normalized);
+            let b_rel_starts = b.rel_path.to_lowercase().starts_with(&query_normalized);
+            if a_rel_starts != b_rel_starts {
+                return b_rel_starts.cmp(&a_rel_starts);
+            }
+            if a.rel_path.len() != b.rel_path.len() {
+                return a.rel_path.len().cmp(&b.rel_path.len());
+            }
+            a.name.len().cmp(&b.name.len())
+        });
+
+        matches
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "query": q.q,
+        "results": results
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalWsQuery {
+    id: Option<String>,
+    cwd: Option<String>,
+    shell: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+async fn terminal_ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<TerminalWsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_terminal_socket(socket, q, state))
+}
+
+async fn handle_terminal_socket(
+    socket: axum::extract::ws::WebSocket,
+    q: TerminalWsQuery,
+    state: AppState,
+) {
+    use futures::{SinkExt, StreamExt};
+
+    let term_id = q.id.unwrap_or_else(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("term_{}", now.as_millis())
+    });
+    let cwd = q
+        .cwd
+        .unwrap_or_else(|| state.bind_working_dir.to_string_lossy().to_string());
+    let shell = q.shell.unwrap_or_else(|| {
+        if cfg!(windows) {
+            "powershell".to_string()
+        } else {
+            "bash".to_string()
+        }
+    });
+
+    let cols = q.cols.unwrap_or(80);
+    let rows = q.rows.unwrap_or(24);
+    let proc =
+        match terminal_session::get_or_spawn_terminal_process(&term_id, &cwd, &shell, cols, rows)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("failed to spawn terminal: {e}");
+                let (mut sender, _) = socket.split();
+                let _ = sender
+                    .send(Message::Text(format!(
+                        "\r\n\x1b[31m[JeikCode] failed to start terminal: {e}\x1b[0m\r\n"
+                    )))
+                    .await;
+                return;
+            }
+        };
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // 先取已有输出再订阅，避免把历史再播一遍；中间没有 await，窗口极短。
+    let history = terminal_session::output_snapshot(&proc);
+    let mut rx = terminal_session::subscribe(&proc);
+    if !history.is_empty() {
+        if ws_sender.send(Message::Text(history)).await.is_err() {
+            return;
+        }
+    }
+
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(text) = rx.recv().await {
+            if ws_sender.send(Message::Text(text)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let proc_input = proc.clone();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if let Some((cols, rows)) = terminal_session::parse_resize_message(&text) {
+                        terminal_session::resize_terminal(&proc_input, cols, rows);
+                        continue;
+                    }
+                    terminal_session::write_terminal_bytes(&proc_input, text.as_bytes());
+                }
+                Message::Binary(bin) => {
+                    terminal_session::write_terminal_bytes(&proc_input, &bin);
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonTerminalItem {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    pub shell: String,
+    pub history: Vec<String>,
+    pub timestamp: i64,
+}
+
+fn daemon_terminals() -> &'static std::sync::Mutex<HashMap<String, DaemonTerminalItem>> {
+    static TERMINALS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, DaemonTerminalItem>>> =
+        std::sync::OnceLock::new();
+    TERMINALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalCreatePayload {
+    shell: Option<String>,
+    cwd: Option<String>,
+}
+
+async fn terminal_create(Json(req): Json<TerminalCreatePayload>) -> impl IntoResponse {
+    let shell = req.shell.unwrap_or_else(|| {
+        if cfg!(windows) {
+            "powershell".to_string()
+        } else {
+            "bash".to_string()
+        }
+    });
+    let cwd = req.cwd.unwrap_or_else(|| ".".to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let term_id = format!("term_{}_{:x}", now.as_millis(), now.as_nanos() % 100000);
+    let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+    let count = guard.len() + 1;
+    let name = format!("{shell} {count}");
+    let item = DaemonTerminalItem {
+        id: term_id.clone(),
+        name: name.clone(),
+        cwd: cwd.clone(),
+        shell,
+        history: vec![
+            format!("[JeikCode Persistent Terminal Session: {term_id}]"),
+            format!("Active workspace: {cwd}"),
+            "Connected to background process runner.\r\n".to_string(),
+        ],
+        timestamp: now.as_millis() as i64,
+    };
+    guard.insert(term_id.clone(), item);
+    publish_global(GlobalWireEvent::TerminalUpdated { cwd: cwd.clone() });
+    Json(serde_json::json!({
+        "success": true,
+        "terminal_id": term_id,
+        "name": name,
+        "cwd": cwd,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalListQuery {
+    cwd: Option<String>,
+}
+
+async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse {
+    let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+    let list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
+        let norm_req = req_cwd
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        guard
+            .values()
+            .filter(|t| {
+                if norm_req.is_empty() {
+                    return true;
+                }
+                let norm_term = t
+                    .cwd
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_lowercase();
+                norm_term == norm_req
+                    || norm_term.starts_with(&norm_req)
+                    || norm_req.starts_with(&norm_term)
+            })
+            .cloned()
+            .collect()
+    } else {
+        guard.values().cloned().collect()
+    };
+    let platform = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    Json(serde_json::json!({ "success": true, "terminals": list, "platform": platform }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalClosePayload {
+    terminal_id: String,
+}
+
+async fn terminal_close(Json(req): Json<TerminalClosePayload>) -> impl IntoResponse {
+    let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+    let removed = guard.remove(&req.terminal_id);
+    let cwd = removed
+        .map(|item| item.cwd)
+        .unwrap_or_else(|| ".".to_string());
+    publish_global(GlobalWireEvent::TerminalUpdated { cwd });
+    if let Some(proc) = terminal_session::take_live_terminal(&req.terminal_id) {
+        tokio::task::spawn_blocking(move || {
+            terminal_session::kill_terminal_process(&proc);
+        });
+    }
+    Json(serde_json::json!({ "success": true }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalInputPayload {
+    terminal_id: String,
+    input: String,
+}
+
+async fn terminal_input(Json(req): Json<TerminalInputPayload>) -> impl IntoResponse {
+    let input = req.input.trim().to_string();
+    if input.is_empty() {
+        return Json(serde_json::json!({ "success": true, "output": "" }));
+    }
+    if input == "\x03" {
+        if let Some(proc) = terminal_session::lookup_live_terminal(&req.terminal_id) {
+            terminal_session::write_terminal_bytes(&proc, b"\x03");
+        }
+        return Json(serde_json::json!({ "success": true, "output": "^C\r\n" }));
+    }
+
+    // 交互式 PTY 用 `\r` 提交；不要再追加 `\n`，否则 bash 会连着执行两次。
+    if let Some(proc) = terminal_session::lookup_live_terminal(&req.terminal_id) {
+        terminal_session::write_terminal_command(&proc, &input);
+        return Json(serde_json::json!({ "success": true, "output": "" }));
+    }
+
+    let cwd = {
+        let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&req.terminal_id)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| ".".to_string())
+    };
+
+    let output_str = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let output = std::process::Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(&input)
+            .current_dir(&cwd)
+            .output();
+
+        #[cfg(not(target_os = "windows"))]
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&input)
+            .current_dir(&cwd)
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.is_empty() {
+                    format!("{stdout}{stderr}")
+                } else {
+                    stdout.to_string()
+                }
+            }
+            Err(e) => format!("Execution error: {e}\r\n"),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| "Execution panicked\r\n".to_string());
+
+    {
+        let mut guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = guard.get_mut(&req.terminal_id) {
+            for line in output_str.lines() {
+                if !line.is_empty() {
+                    t.history.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "success": true, "output": output_str }))
+}
+
+#[derive(Serialize)]
+struct ChatSteerResponse {
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// POST /chat/steer — fold a queued follow-up into the running turn.
+///
+/// Does not cancel the in-flight model call or tool batch. The kernel drains
+/// the steer buffer at the next round boundary and sends it with the soft note
+/// from [`steer_prompt::compose_steer_text`].
+async fn chat_steer(
+    State(state): State<AppState>,
+    Json(req): Json<ChatSteerRequest>,
+) -> impl IntoResponse {
+    if req.message.trim().is_empty() && req.images.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("steer message is empty".into()),
+            }),
+        );
+    }
+    let Some(tx) = state.active_chats.steer_sender(&req.session_id).await else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("no active turn to steer".into()),
+            }),
+        );
+    };
+    // Record the client correlation id BEFORE submitting, so a fast round-boundary
+    // fold cannot emit `steered` before the id is available to echo.
+    state
+        .active_chats
+        .record_steer_client_id(&req.session_id, req.client_input_id.clone())
+        .await;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let pending = live_api::PendingChatSteer {
+        text: steer_prompt::compose_steer_text(&req.message),
+        images: req
+            .images
+            .into_iter()
+            .map(|image| zap_kernel::message::ImageContent {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect(),
+        done: done_tx,
+    };
+    if tx.send(live_api::ChatSteerSignal::Submit(pending)).is_err() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("turn ended before the steer was accepted".into()),
+            }),
+        );
+    }
+    let outcome = match tokio::time::timeout(Duration::from_secs(30), done_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("turn ended before the steer was accepted".into()),
+        Err(_) => Err("timed out waiting for the running turn to accept the steer".into()),
+    };
+    match outcome {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ChatSteerResponse {
+                accepted: true,
+                error: None,
+            }),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some(error),
+            }),
+        ),
+    }
+}
+
+/// GET /chat/active - Return list of session IDs currently generating
+async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    use zap_coding::session_runtime_registry::SessionRuntimeRegistry;
+    use std::collections::HashSet;
+
+    let mut ids: HashSet<String> = state
+        .active_chats
+        .active_session_ids()
+        .await
+        .into_iter()
+        .collect();
+    if let Some(live_id) = crate::native_live::live_running_session_id() {
+        ids.insert(live_id);
+    }
+    // Registry `Starting` / handle-less rows are view subscriptions (GET /live
+    // `subscribe_or_empty`, InputAccepted before bind). They are not occupancy —
+    // including them made WebUI keep a stop square and sidebar spinner after the
+    // background turn had already finished, then rehydrate on every session switch.
+    for id in SessionRuntimeRegistry::global().live_turn_session_ids() {
+        ids.insert(id);
+    }
+    Json(ids.into_iter().collect::<Vec<_>>())
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeSessionRow {
+    session_id: String,
+    working_dir: String,
+    activity: String,
+    /// `completed`, `stopped`, or `failed` after a turn ends. Null before that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_terminal: Option<String>,
+    /// Increases once per terminal so clients notify on the edge, not the level.
+    terminal_seq: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SystemNotifyBody {
+    title: String,
+    body: String,
+    /// Caller-chosen identity so a poll and a replay do not toast twice.
+    #[serde(default)]
+    tag: String,
+    /// Session to open when the OS toast is clicked. Empty for a bare notice.
+    #[serde(default)]
+    session_id: String,
+    /// Exact `/chat` approval identity. When present, the OS toast may expose
+    /// correlated Approve/Deny actions; otherwise review toasts are focus-only.
+    #[serde(default)]
+    approval_id: String,
+}
+
+fn notify_focus_port() -> &'static std::sync::atomic::AtomicU16 {
+    static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    &PORT
+}
+
+fn notify_focus_secret() -> &'static str {
+    static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+        .as_str()
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct NotifyFocusState {
+    version: u64,
+    session_id: Option<String>,
+}
+
+fn notify_focus_pending() -> &'static std::sync::Mutex<NotifyFocusState> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<NotifyFocusState>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(NotifyFocusState::default()))
+}
+
+fn publish_notify_focus_port(port: u16) {
+    notify_focus_port().store(port, std::sync::atomic::Ordering::Relaxed);
+    zap_capabilities::notify::ensure_focus_protocol();
+}
+
+fn system_notify_launch(
+    port: u16,
+    secret: &str,
+    session_id: &str,
+    approval_id: Option<&str>,
+) -> Option<String> {
+    match approval_id.filter(|id| !id.trim().is_empty()) {
+        Some(approval_id) => zap_capabilities::notify::focus_launch_for_permission(
+            port,
+            secret,
+            session_id,
+            approval_id,
+        )
+        .or_else(|| zap_capabilities::notify::focus_launch(port, secret, session_id)),
+        None => zap_capabilities::notify::focus_launch(port, secret, session_id),
+    }
+}
+
+fn notifications_enabled() -> bool {
+    let path = zap_config::config::Config::default_path();
+    match zap_config::config::Config::load(&path) {
+        Ok(cfg) => cfg.notifications.enabled,
+        Err(_) => true,
+    }
+}
+
+fn allow_system_notify(tag: &str, session_id: Option<&str>, title: &str) -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static RECENT: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+    let key = if !tag.trim().is_empty() {
+        tag.trim().to_string()
+    } else {
+        format!("{}:{}", session_id.unwrap_or("default"), title.trim())
+    };
+    let mut guard = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    guard.retain(|(_, at)| now.saturating_duration_since(*at) < Duration::from_secs(8));
+    if guard.iter().any(|(seen, _)| seen == &key) {
+        return false;
+    }
+    guard.push((key, now));
+    if guard.len() > 64 {
+        let drop_n = guard.len() - 64;
+        guard.drain(0..drop_n);
+    }
+    true
+}
+
+/// POST /system-notify — detached OS toast for a WebUI session.
+///
+/// The page asks for this when a review is waiting in the background, or when
+/// any session finishes or stops. Delivery is async: the handler only spawns
+/// the notifier. `[notifications] enabled = false` skips the spawn.
+async fn system_notify(Json(req): Json<SystemNotifyBody>) -> impl IntoResponse {
+    let title = req.title.trim();
+    let body = req.body.trim();
+    if title.is_empty() && body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "title or body is required",
+            })),
+        );
+    }
+    if !notifications_enabled()
+        || !allow_system_notify(&req.tag, Some(req.session_id.as_str()), title)
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "delivered": false })),
+        );
+    }
+    let launch = system_notify_launch(
+        notify_focus_port().load(std::sync::atomic::Ordering::Relaxed),
+        notify_focus_secret(),
+        &req.session_id,
+        Some(req.approval_id.as_str()),
+    );
+    zap_capabilities::notify::notify_system_launch(title, body, launch.as_deref());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "delivered": true })),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NotifyFocusPost {
+    session_id: String,
+    secret: String,
+}
+
+/// POST /notify-focus — the OS toast protocol handler. Public because the
+/// click script has no webui cookie. The per-process secret is the check.
+async fn post_notify_focus(Json(req): Json<NotifyFocusPost>) -> impl IntoResponse {
+    let expected = notify_focus_secret();
+    let secret_ok = req.secret.len() == expected.len()
+        && req
+            .secret
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+            == 0;
+    if !secret_ok {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let Some(session_id) =
+        zap_capabilities::notify::sanitize_focus_session_id(&req.session_id)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    };
+    if let Ok(mut slot) = notify_focus_pending().lock() {
+        slot.version = slot.version.wrapping_add(1);
+        slot.session_id = Some(session_id);
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /notify-focus — the open WebUI / Desktop polls this and selects the session.
+async fn get_notify_focus() -> impl IntoResponse {
+    let state = notify_focus_pending()
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "version": state.version,
+        "session_id": state.session_id,
+    }))
+}
+
+/// GET /runtime/sessions — live runners with activity (OpenCode-style registry view).
+async fn runtime_sessions() -> impl IntoResponse {
+    use zap_coding::session_runtime_registry::{RuntimeActivity, SessionRuntimeRegistry};
+
+    fn activity_label(activity: RuntimeActivity) -> &'static str {
+        match activity {
+            RuntimeActivity::Starting => "starting",
+            RuntimeActivity::Ready => "ready",
+            RuntimeActivity::Running => "running",
+            RuntimeActivity::WaitingApproval => "waiting_approval",
+            RuntimeActivity::WaitingUserInput => "waiting_user_input",
+            RuntimeActivity::Reconfiguring => "reconfiguring",
+            RuntimeActivity::Stopping => "stopping",
+            RuntimeActivity::Stopped => "stopped",
+            RuntimeActivity::Failed => "failed",
+        }
+    }
+
+    let rows: Vec<RuntimeSessionRow> = SessionRuntimeRegistry::global()
+        .list_all()
+        .into_iter()
+        .map(|entry| RuntimeSessionRow {
+            session_id: entry.session_id,
+            working_dir: entry.working_dir.to_string_lossy().into_owned(),
+            activity: activity_label(entry.activity).to_string(),
+            last_terminal: entry.last_terminal,
+            terminal_seq: entry.terminal_seq,
+        })
+        .collect();
+    Json(rows)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ChatPendingQuery {
+    session_id: String,
+}
+
+/// GET /chat/pending?session_id=… — restore interactive prompts after refresh /
+/// session switch. The SPA used to only listen for edge `permission_request`
+/// events; when those were dropped (or suppressed as "observer"), Build /
+/// AcceptEdits / Plan turns stayed forever in WaitingApproval with no card.
+///
+/// Returns the latest unanswered permission and/or user-input prompt from the
+/// active turn's replay log (null when idle or already resolved).
+async fn chat_pending(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ChatPendingQuery>,
+) -> impl IntoResponse {
+    let session_id = q.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "session_id is required",
+            })),
+        )
+            .into_response();
+    }
+    let active = state
+        .active_chats
+        .active_session_ids()
+        .await
+        .iter()
+        .any(|id| id == &session_id);
+    let (permission, user_input) = state.active_chats.pending_interactive(&session_id).await;
+    // Auto never parks on tool approval. A leftover pending_permission.json from
+    // Build must not resurrect a ghost card after the user switched to Auto.
+    let auto_mode =
+        live_api::live_current_approval_mode() == crate::approval_mode::ApprovalMode::Auto;
+    let mut permission_json = if auto_mode {
+        None
+    } else {
+        permission.map(|ev| match ev {
+            ChatEvent::PermissionRequest {
+                session_id,
+                approval_id,
+                tool_name,
+                reason,
+                call_id,
+                arguments,
+            } => serde_json::json!({
+                "type": "permission_request",
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "tool_name": tool_name,
+                "reason": reason,
+                "call_id": call_id,
+                "arguments": arguments,
+            }),
+            _ => serde_json::Value::Null,
+        })
+    };
+    if active
+        && !auto_mode
+        && (permission_json.is_none()
+            || permission_json
+                .as_ref()
+                .map(|v| v.is_null())
+                .unwrap_or(false))
+    {
+        if let Some(pending) =
+            zap_capabilities::session::SessionManager::load_pending_permission_any_project(
+                &session_id,
+            )
+        {
+            let stale = state
+                .active_chats
+                .replay_resolves_call(&session_id, &pending.call_id)
+                .await;
+            if !stale {
+                permission_json = Some(serde_json::json!({
+                    "type": "permission_request",
+                    "session_id": pending.session_id,
+                    "approval_id": permission_bridge::approval_id_for_pending(&pending),
+                    "tool_name": pending.tool_name,
+                    "reason": pending.reason,
+                    "call_id": pending.call_id,
+                    "arguments": pending.arguments,
+                }));
+            }
+        }
+    }
+    let user_input_json = user_input.map(|ev| match ev {
+        ChatEvent::UserInputRequest {
+            session_id,
+            request_id,
+            payload,
+        } => {
+            let mut obj = payload;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("type".into(), serde_json::json!("user_input_request"));
+                map.insert("session_id".into(), serde_json::json!(session_id));
+                map.insert("request_id".into(), serde_json::json!(request_id));
+            }
+            obj
+        }
+        _ => serde_json::Value::Null,
+    });
+    Json(serde_json::json!({
+        "success": true,
+        "active": active,
+        "permission": permission_json,
+        "user_input": user_input_json,
+    }))
+    .into_response()
+}
+
+/// POST /chat/permission - Deliver a permission decision for a pending tool-approval request.
+///
+/// The browser receives a `permission_request` SSE event (emitted by `/chat`)
+/// that contains the `session_id`. It POSTs back here with the user's choice so
+/// the blocked turn can resume.
+#[derive(Debug, serde::Deserialize)]
+pub struct PermissionDecisionRequest {
+    pub session_id: String,
+    /// Stable identity of the exact `permission_request` card.
+    pub approval_id: String,
+    /// "allow" | "deny" | "always_allow" | "allow_persist"
+    pub decision: String,
+    /// Full MCP tool name (`mcp__{server}__{tool}`); required for `allow_persist`.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+}
+
+async fn chat_permission(
+    State(state): State<AppState>,
+    Json(req): Json<PermissionDecisionRequest>,
+) -> impl IntoResponse {
+    use zap_capabilities::tools::parse_permission_decision;
+    let requested_session_id = req.session_id.trim();
+    let approval_id = req.approval_id.trim();
+    if requested_session_id.is_empty() || approval_id.is_empty() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "session_id and approval_id are required"
+        }));
+    }
+    let decision = parse_permission_decision(&req.decision);
+    let active_operation = state
+        .active_chats
+        .operation_for_session(requested_session_id)
+        .await;
+    let canonical_session_id = if let Some(operation_id) = active_operation.as_deref() {
+        state
+            .active_chats
+            .session_id(operation_id)
+            .await
+            .unwrap_or_else(|| requested_session_id.to_string())
+    } else {
+        requested_session_id.to_string()
+    };
+
+    match state.pending_permissions.deliver(
+        &canonical_session_id,
+        approval_id,
+        permission_bridge::PermissionSubmission {
+            decision,
+            persist: req.decision == "allow_persist",
+        },
+    ) {
+        permission_bridge::PermissionDelivery::Submitted { accepted, .. } => {
+            // A queued oneshot value can still lose a race with the driver's
+            // request timeout. Report success only after the driver consumes
+            // this exact decision; timeout/cancel drops the acknowledgement.
+            return match accepted.await {
+                Ok(()) => Json(serde_json::json!({ "success": true })),
+                Err(_) => Json(serde_json::json!({
+                    "success": false,
+                    "error": "permission request expired"
+                })),
+            };
+        }
+        permission_bridge::PermissionDelivery::Expired => {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "permission request expired"
+            }));
+        }
+        permission_bridge::PermissionDelivery::Absent => {}
+    }
+
+    // An active `/chat` operation owns approval routing exclusively. If its exact
+    // `(session_id, approval_id)` route is absent, this POST is stale/duplicate; never
+    // fall through to a different live transport or an on-disk request.
+    if active_operation.is_some() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "stale or unknown permission request"
+        }));
+    }
+    // A persisted checkpoint without an active turn is not an executable capability.
+    // The daemon cannot prove whether the prior owner timed out, was cancelled, or
+    // crashed after a side effect but before durable history was committed. Replaying
+    // that call here can therefore duplicate destructive work. Fail closed and require
+    // the user to retry the operation in a fresh active turn. If this exact stale
+    // checkpoint still exists, consume the sidecar best-effort so it cannot resurrect
+    // a ghost card later; a mismatched approval id must never consume a newer checkpoint.
+    use zap_capabilities::session::SessionManager;
+    if let Some(manager) = SessionManager::find_manager_for_session(&canonical_session_id) {
+        if let Ok(Some(pending)) = manager.load_pending_permission(&canonical_session_id) {
+            if permission_bridge::approval_id_for_pending(&pending) != approval_id {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": "stale or unknown permission request"
+                }));
+            }
+            manager.clear_pending_permission(&canonical_session_id);
+        }
+    }
+    Json(serde_json::json!({
+        "success": false,
+        "error": "permission request is no longer active; retry the operation"
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ChatUserInputAnswerRequest {
+    session_id: String,
+    #[serde(flatten)]
+    answer: live_api::UserInputAnswerReq,
+}
+
+/// POST /chat/user-input — answer a structured question emitted on the `/chat` SSE stream.
+async fn chat_user_input(
+    State(state): State<AppState>,
+    Json(req): Json<ChatUserInputAnswerRequest>,
+) -> impl IntoResponse {
+    let request_id = req.answer.request_id;
+    let value = req.answer.into_response_value();
+    let accepted = state
+        .pending_user_inputs
+        .deliver(&req.session_id, request_id, value);
+    Json(serde_json::json!({ "accepted": accepted }))
+}
+
+// --- MCP API handlers ---
+
+#[derive(Serialize)]
+struct McpServerStatus {
+    name: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct McpStatusResponse {
+    servers: Vec<McpServerStatus>,
+    /// Whether the current project's `.mcp.json` has been explicitly trusted by
+    /// the user.  False means project-source servers are withheld.
+    trusted: bool,
+    /// Names of project-source MCP servers that are blocked because the project
+    /// is not yet trusted.  Empty when trusted or when no project-source servers
+    /// are configured.
+    blocked: Vec<String>,
+}
+
+/// Merge a registry's known server statuses with the full set of *configured*
+/// server names. A configured server the registry hasn't recorded yet (still
+/// mid-`initialize()` — common for remote HTTP during the connect window) is
+/// surfaced as `Connecting`, so the panel shows it immediately instead of an
+/// empty list. A status the registry already knows (Connected / Failed /
+/// Disconnected) always wins over the synthetic `Connecting`.
+fn merge_configured_mcp_statuses(
+    statuses: Vec<(String, zap_capabilities::mcp::ServerStatus)>,
+    configured_names: &[String],
+) -> Vec<(String, zap_capabilities::mcp::ServerStatus)> {
+    let mut by_name: std::collections::BTreeMap<String, zap_capabilities::mcp::ServerStatus> =
+        statuses.into_iter().collect();
+    for name in configured_names {
+        by_name
+            .entry(name.clone())
+            .or_insert(zap_capabilities::mcp::ServerStatus::Connecting);
+    }
+    by_name.into_iter().collect()
+}
+
+async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
+    Json(build_mcp_status(&state).await)
+}
+
+/// Build the full MCP status response. Shared by `GET /mcp/status` and the MCP half
+/// of `GET /capabilities`.
+async fn build_mcp_status(state: &AppState) -> McpStatusResponse {
+    // Agent `zap_config_reload` dirties the daemon MCP cache; rebuild it
+    // here so the WebUI sidebar reflects newly written mcp.json. Live-runtime
+    // remount happens at TurnFinished (reload_capabilities is Busy mid-turn).
+    if zap_capabilities::config_reload::take_pending_mcp_cache_reload() {
+        let working_dir = state.project.read().await.working_dir.clone();
+        let registry = state.mcp_pool.reload_full(&working_dir).await;
+        *state.mcp_registry.write().await = registry;
+    }
+    // Prefer the per-project `/chat` registry when it exists; otherwise report
+    // the daemon registry. Live runtime capability changes use the awaitable
+    // CodingRuntime boundary and are reported on the live event stream.
+    let working_dir = state.project.read().await.working_dir.clone();
+    let registry = if let Some(reg) = state.mcp_pool.cached_registry(&working_dir).await {
+        reg
+    } else {
+        state.mcp_registry.read().await.clone()
+    };
+
+    let session_schema = zap_capabilities::mcp::ensure_session_mcp_schema(&working_dir).await;
+    let session_registry = if let Some(session_id) = crate::native_live::live_view_session_id() {
+        zap_capabilities::mcp::SessionMcpPool::global()
+            .cached_registry(&working_dir, &session_id)
+            .await
+    } else {
+        None
+    };
+    let mut statuses = registry.server_statuses().await;
+    if let Some(session_registry) = &session_registry {
+        statuses.extend(session_registry.server_statuses().await);
+    } else {
+        statuses.extend(session_schema.statuses.clone());
+    }
+
+    let all_cfgs = zap_capabilities::mcp::load_mcp_config(&working_dir).unwrap_or_default();
+
+    // Trust / blocked enrichment: compute blocked FIRST so we can exclude them from the
+    // "connecting" synthetic entries below. Blocked (untrusted-project) servers are withheld
+    // — they never connect — so they must NOT appear as "connecting" in the status list while
+    // simultaneously appearing in `blocked[]` (a contradiction the webui rendered).
+    let trusted = zap_capabilities::mcp::trust::is_project_trusted(&working_dir);
+    let blocked: Vec<String> =
+        zap_capabilities::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
+            .blocked
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+
+    // Surface configured-but-not-yet-connected servers as `connecting` so a slow
+    // handshake (especially remote HTTP) renders as "connecting", not an empty
+    // panel. Names come from the same user + project mcp.json the registry loads.
+    // Blocked servers are excluded: they aren't "connecting", they're withheld, and they
+    // already appear in the `blocked[]` list above.
+    let configured_names: Vec<String> = all_cfgs
+        .iter()
+        .filter(|config| config.scope == zap_capabilities::mcp::McpScope::Project)
+        .map(|c| c.name.clone())
+        .filter(|n| !blocked.contains(n))
+        .collect();
+    let mut statuses = merge_configured_mcp_statuses(statuses, &configured_names);
+    let session_names: Vec<String> = all_cfgs
+        .iter()
+        .filter(|config| config.scope == zap_capabilities::mcp::McpScope::Session)
+        .filter(|config| !blocked.contains(&config.name))
+        .map(|c| c.name.clone())
+        .collect();
+    // Session-scoped servers are catalog-ready from the shared probe cache even
+    // before a per-session process exists. Never synthesize Disconnected.
+    statuses = merge_configured_mcp_statuses(statuses, &session_names);
+    for (name, status) in &session_schema.statuses {
+        if matches!(status, zap_capabilities::mcp::ServerStatus::Connected) {
+            statuses
+                .iter_mut()
+                .filter(|(existing, _)| existing == name)
+                .for_each(|(_, current)| {
+                    if matches!(
+                        current,
+                        zap_capabilities::mcp::ServerStatus::Connecting
+                    ) {
+                        *current = zap_capabilities::mcp::ServerStatus::Connected;
+                    }
+                });
+        }
+    }
+    statuses.sort_by(|left, right| left.0.cmp(&right.0));
+
+    // Fetch the tool list once (was previously re-fetched per connected server).
+    let mut tools = registry.list_all_tools_cached().await;
+    if let Some(session_registry) = session_registry {
+        tools.extend(session_registry.list_all_tools_cached().await);
+    } else {
+        tools.extend(session_schema.tools);
+    }
+    let servers = build_mcp_server_rows(statuses, &tools);
+    McpStatusResponse {
+        servers,
+        trusted,
+        blocked,
+    }
+}
+
+/// Build the `/mcp` status server rows from raw registry statuses.
+///
+/// Blocked (untrusted-project) servers are surfaced ONLY via the response's
+/// `blocked[]` list — never as a server row. The capabilities `McpRegistry`
+/// reports withheld servers as `ServerStatus::BlockedUntrusted` (core's enum had
+/// no such variant), so without this skip they would render twice: once as a
+/// "blocked" status row here and once in the blocked banner.
+fn build_mcp_server_rows(
+    statuses: Vec<(String, zap_capabilities::mcp::ServerStatus)>,
+    tools: &[zap_capabilities::mcp::McpToolInfo],
+) -> Vec<McpServerStatus> {
+    use zap_capabilities::mcp::ServerStatus;
+    let mut servers = Vec::new();
+    for (name, status) in statuses {
+        let (status_str, error) = match &status {
+            ServerStatus::Connecting => ("connecting".to_string(), None),
+            ServerStatus::Connected => ("connected".to_string(), None),
+            ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
+            ServerStatus::Disconnected => ("disconnected".to_string(), None),
+            // Withheld: represented in `blocked[]` only, never as a server row.
+            ServerStatus::BlockedUntrusted => continue,
+        };
+        let tool_count = if matches!(status, ServerStatus::Connected) {
+            Some(tools.iter().filter(|t| t.server_name == name).count())
+        } else {
+            None
+        };
+        servers.push(McpServerStatus {
+            name,
+            status: status_str,
+            tool_count,
+            error,
+        });
+    }
+    servers
+}
+
+pub(crate) async fn get_or_init_project_mcp_registry_from_cache(
+    mcp_pool: &Arc<zap_capabilities::mcp::ProjectMcpPool>,
+    project_dir: &std::path::Path,
+) -> Arc<McpRegistry> {
+    mcp_pool.registry(project_dir).await
+}
+
+/// Get or lazily initialize the shared per-project MCP registry.
+pub(crate) async fn get_or_init_project_mcp_registry(
+    state: &AppState,
+    project_dir: &std::path::Path,
+) -> Arc<McpRegistry> {
+    state.mcp_pool.registry(project_dir).await
+}
+
+/// Replace the daemon fallback registry and invalidate the per-project cache
+/// under one cache write barrier. The replacement also occupies the cache key
+/// so a concurrent cache-miss build cannot resurrect its stale registry after
+/// this cutover.
+pub(crate) async fn replace_project_mcp_registry(
+    state: &AppState,
+    project_dir: &std::path::Path,
+    replacement: Arc<McpRegistry>,
+) {
+    state
+        .mcp_pool
+        .replace(project_dir, replacement.clone())
+        .await;
+    let stale_fallback = {
+        let mut fallback = state.mcp_registry.write().await;
+        std::mem::replace(&mut *fallback, replacement.clone())
+    };
+    if !Arc::ptr_eq(&stale_fallback, &replacement) {
+        stale_fallback.shutdown().await;
+    }
+}
+
+/// Rebuild the per-project MCP registry from disk and remount live capabilities.
+/// Shared by `POST /mcp/reload` and `POST /config/reload`.
+pub(crate) async fn reload_mcp_and_live_runtime(state: &AppState) -> bool {
+    let project = state.project.read().await;
+    let project_dir = project.working_dir.clone();
+    drop(project);
+    let registry = state.mcp_pool.reload_full(&project_dir).await;
+    *state.mcp_registry.write().await = registry;
+    match crate::native_live::binding() {
+        Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
+        Err(_) => true,
+    }
+}
+
+async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    Json(serde_json::json!({
+        "ok": runtime_reloaded,
+        "status": "reloading",
+        "runtime_reloaded": runtime_reloaded,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Unified capability surface (MCP + skills, GLOBAL + PROJECT scopes)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct CapItemResponse {
+    kind: &'static str,
+    id: String,
+    name: String,
+    description: String,
+    global_disabled: bool,
+    project_disabled: bool,
+    effective_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+}
+
+/// Bare skill name without its namespace prefix (`skills:foo` → `foo`).
+fn bare_skill_name(name: &str) -> &str {
+    name.rsplit_once(':').map(|(_, bare)| bare).unwrap_or(name)
+}
+
+/// GET /capabilities — unified MCP + skills inventory with per-scope disable state.
+/// The WebUI renders ONE toggle component for both families, so switching projects
+/// surfaces each project's own disable differences.
+async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+
+    // MCP: disable state from mcp.json (global + project), enriched with live status.
+    let mcp_status = build_mcp_status(&state).await;
+    let mut items: Vec<CapItemResponse> = Vec::new();
+    for item in zap_capabilities::control::mcp_items(&working_dir) {
+        let row = mcp_status
+            .servers
+            .iter()
+            .find(|s| s.name == item.id && !item.effective_disabled);
+        items.push(CapItemResponse {
+            kind: "mcp",
+            id: item.id,
+            name: item.name,
+            description: item.description,
+            global_disabled: item.global_disabled,
+            project_disabled: item.project_disabled,
+            effective_disabled: item.effective_disabled,
+            status: row.map(|r| r.status.clone()),
+            tool_count: row.and_then(|r| r.tool_count),
+            error: row.and_then(|r| r.error.clone()),
+            dir: None,
+        });
+    }
+
+    // Skills: disable state from skills.json (global + project).
+    let mut registry = zap_capabilities::skills::SkillRegistry::new();
+    zap_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
+    let global = zap_capabilities::skills::controls::load_global();
+    let project = zap_capabilities::skills::controls::load_project(&working_dir);
+    for skill in registry.user_invocable() {
+        let global_disabled =
+            zap_capabilities::skills::controls::is_skill_disabled(&global, &skill.name);
+        let project_disabled =
+            zap_capabilities::skills::controls::is_skill_disabled(&project, &skill.name);
+        items.push(CapItemResponse {
+            kind: "skill",
+            id: skill.name.clone(),
+            name: bare_skill_name(&skill.name).to_string(),
+            description: skill.description.clone(),
+            global_disabled,
+            project_disabled,
+            effective_disabled: global_disabled || project_disabled,
+            status: None,
+            tool_count: None,
+            error: None,
+            dir: Some(skill.skill_dir.to_string_lossy().to_string()),
+        });
+    }
+
+    Json(serde_json::json!({ "items": items }))
+}
+
+#[derive(serde::Deserialize)]
+struct CapToggleRequest {
+    kind: zap_capabilities::control::CapKind,
+    id: String,
+    scope: zap_capabilities::control::CapScope,
+    disabled: bool,
+}
+
+/// POST /capabilities/toggle — persist a capability's disabled flag at the chosen
+/// scope, then rebuild capabilities (MCP registry + live runtime + skills) so the
+/// change lands in the VERY NEXT prompt.
+async fn capabilities_toggle(
+    State(state): State<AppState>,
+    Json(req): Json<CapToggleRequest>,
+) -> axum::response::Response {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    if let Err(error) = zap_capabilities::control::set_disabled(
+        &working_dir,
+        req.kind,
+        &req.id,
+        req.scope,
+        req.disabled,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response();
+    }
+    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "runtime_reloaded": runtime_reloaded })),
+    )
+        .into_response()
+}
+
+/// Wait for the first shutdown signal (Ctrl-C, SIGTERM on Unix, or watch channel).
+/// Once received, log and return so that `axum::serve(...).with_graceful_shutdown(...)`
+/// can begin draining in-flight connections. (R10.1, R7.2, R7.3)
+///
+/// After the first signal, arm a **force-exit** path: a second Ctrl+C or a 10s
+/// timeout kills the process. Large monorepos / stuck tool tasks used to make
+/// graceful drain hang so Ctrl+C appeared to do nothing.
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let http_shutdown = async {
+        // Wait until the watch channel value becomes true (sent by POST /shutdown)
+        while !*shutdown_rx.borrow_and_update() {
+            if shutdown_rx.changed().await.is_err() {
+                // Sender dropped — treat as shutdown
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {
+            eprintln!("Shutting down... (Ctrl+C again to force exit)");
+            tracing::info!("Received Ctrl-C, starting graceful shutdown");
+        }
+        _ = terminate => {
+            eprintln!("Shutting down (SIGTERM)...");
+            tracing::info!("Received SIGTERM, starting graceful shutdown");
+        }
+        _ = http_shutdown => {
+            tracing::info!("Received /shutdown request, starting graceful shutdown");
+        }
+    }
+
+    // Force-exit arm: do not block returning from this future (graceful drain
+    // needs to start). Second Ctrl+C or 10s hang → hard exit.
+    tokio::spawn(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Forced exit (second interrupt)");
+                std::process::exit(130);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                eprintln!("Graceful shutdown timed out after 10s; forcing exit");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
+/// Install a panic hook that emits a scrubbed `Event::Panic` telemetry event
+/// before delegating to the default hook (preserving stderr output). (R9.1-R9.4)
+fn install_panic_hook(telemetry: Arc<Telemetry>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let home = zap_telemetry::identity::real_home_dir();
+        let cwd = std::env::current_dir().ok();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let scrubbed_loc =
+            zap_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+        let scrubbed_msg = zap_telemetry::scrub::truncate_head(
+            &zap_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
+            zap_telemetry::scrub::HEAD_MAX,
+        );
+        let frames =
+            zap_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+        telemetry.track(Event::Panic {
+            location: scrubbed_loc,
+            message_head: scrubbed_msg,
+            thread: std::thread::current().name().unwrap_or("unknown").into(),
+            backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
+        });
+        default_hook(info); // R9.4: preserve stderr output
+    }));
+}
+
+/// Get current unix timestamp in milliseconds.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Spawn a background task that checks for idle timeout and triggers shutdown.
+fn spawn_idle_timeout_task(
+    idle_timeout_secs: u64,
+    last_activity: Arc<std::sync::atomic::AtomicI64>,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    active_chats: ActiveChatRegistry,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    if idle_timeout_secs == 0 {
+        return; // Disabled
+    }
+    let timeout_ms = (idle_timeout_secs * 1000) as i64;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await; // consume immediate first tick
+        loop {
+            interval.tick().await;
+            let conns = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            if conns > 0 {
+                continue; // Active streaming connections, not idle
+            }
+            if active_chats.has_active_operations().await {
+                continue; // The SSE consumer disconnected, but its chat still runs.
+            }
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            let elapsed = now_unix_ms() - last;
+            if elapsed >= timeout_ms {
+                tracing::info!(
+                    elapsed_mins = elapsed / 60_000,
+                    timeout_mins = idle_timeout_secs / 60,
+                    "Daemon idle timeout reached, shutting down"
+                );
+                shutdown_tx.send(true).ok();
+                break;
+            }
+        }
+    });
+}
+
+// ============================================================================
+// 进程内 webui 启动器（Task 9）
+// ============================================================================
+
+/// 进程内 webui server 的全局句柄。在主进程第一次调用
+/// [`ensure_server_and_open`] 时初始化；`stop_server` 可清除以支持重启。
+struct WebuiHandle {
+    /// 与 server 共享的同一 token store；用于 mint 一次性 token。
+    tokens: auth_token::WebuiTokenStore,
+    /// server 绑定的端口。
+    port: u16,
+    /// server 绑定的地址（如 `127.0.0.1` / `0.0.0.0`）；换绑前需先 stop。
+    host: String,
+    /// server task 的 abort handle；用于 `/webui stop` 停止。
+    abort: tokio::task::AbortHandle,
+}
+
+static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
+
+async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
+    let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let Ok(stream) =
+        std::net::TcpStream::connect_timeout(&loopback, std::time::Duration::from_millis(30))
+    else {
+        return false;
+    };
+    drop(stream);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(600))
+        .build();
+    let Ok(client) = client else { return false };
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    if let Ok(resp) = client.get(&health_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                if text.contains("zap-daemon") {
+                    let shutdown_url = format!("http://127.0.0.1:{port}/shutdown");
+                    let _ = client.post(&shutdown_url).send().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 从 `start_port` 起尝试绑定 `host`，遇 `AddrInUse` 递增端口，直到成功或试满
+/// `max_tries` 个端口。支持通配地址（0.0.0.0 / ::）双栈监听（IPv4 + IPv6）。
+/// 返回 (主监听器, 可选次级双栈监听器, 真实端口)。
+///
+/// 就地升级的后继进程带 `JEIKCODE_RESTART_EXACT_PORT`。它只重试自己的端口，
+/// 不调用 `/shutdown`，也不顺延到旁边的 TUI / 另一个桌面端。
+async fn bind_scanning(
+    host: &str,
+    start_port: u16,
+    max_tries: u16,
+) -> anyhow::Result<(
+    tokio::net::TcpListener,
+    Option<tokio::net::TcpListener>,
+    u16,
+)> {
+    if let Some(port) = exact_restart_port(start_port) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match bind_scanning_ports(host, port, 1, false).await {
+                Ok(bound) => return Ok(bound),
+                Err(err) if bind_failure_is_busy(&err) && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    bind_scanning_ports(host, start_port, max_tries, true).await
+}
+
+fn exact_restart_port(fallback: u16) -> Option<u16> {
+    let exact = std::env::var(zap_updater::RESTART_EXACT_PORT_ENV).ok();
+    if exact.as_deref() != Some("1") {
+        return None;
+    }
+    let listen = std::env::var(zap_updater::RESTART_LISTEN_PORT_ENV).ok();
+    std::env::remove_var(zap_updater::RESTART_EXACT_PORT_ENV);
+    std::env::remove_var(zap_updater::RESTART_LISTEN_PORT_ENV);
+    zap_updater::planned_restart_port(exact.as_deref(), listen.as_deref(), fallback)
+}
+
+fn bind_failure_is_busy(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("no free port")
+        || text.contains("AddrInUse")
+        || text.contains("occupied")
+        || text.contains("os error 98")
+        || text.contains("os error 10048")
+}
+
+/// `serve` 不走端口扫描。升级后继进程在前代刚退出时重试同一地址，失败就退出，
+/// 不会改去旁边的端口。
+async fn bind_restart_listener(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let exact = std::env::var(zap_updater::RESTART_EXACT_PORT_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
+    let attempts = if exact { 50 } else { 1 };
+    let mut last = None;
+    for _ in 0..attempts {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) if exact && err.kind() == std::io::ErrorKind::AddrInUse => {
+                last = Some(err);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("bind failed")))
+}
+
+async fn bind_scanning_ports(
+    host: &str,
+    start_port: u16,
+    max_tries: u16,
+    reclaim_stale: bool,
+) -> anyhow::Result<(
+    tokio::net::TcpListener,
+    Option<tokio::net::TcpListener>,
+    u16,
+)> {
+    if reclaim_stale && start_port > 0 {
+        let _ = try_terminate_stale_daemon_on_port(start_port).await;
+    }
+    let mut last_err: Option<std::io::Error> = None;
+    for offset in 0..max_tries {
+        let Some(port) = start_port.checked_add(offset) else {
+            break; // 触及 u16 上限
+        };
+        if host == "0.0.0.0" {
+            // 在 Windows 等系统上，若已有其它进程（例如 TUI 的 /webui）绑定了 127.0.0.1:port，
+            // 直接 bind 0.0.0.0:port 并不会报错（不会触发 AddrInUse）。
+            // 但本机访问 127.0.0.1:port 时连接会被内核路由到先绑定的 127.0.0.1 进程，
+            // 导致 Desktop 连上 TUI 且 Token 不匹配（401 Unauthorized）卡在加载中。
+            // 因此：当请求绑定 0.0.0.0 时，必须确保该端口在回环地址（127.0.0.1）上也是干净未被占用的！
+            let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+            if std::net::TcpStream::connect_timeout(&loopback, std::time::Duration::from_millis(25))
+                .is_ok()
+            {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("127.0.0.1:{port} is actively occupied"),
+                ));
+                continue;
+            }
+            match api_config::bind_listener(loopback, false) {
+                Ok(probe) => {
+                    drop(probe);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+            let primary = match api_config::bind_listener(v4, false) {
+                Ok(listener) => listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let actual_port = primary.local_addr()?.port();
+            let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, actual_port));
+            let secondary = match api_config::bind_listener(v6, true) {
+                Ok(listener) => {
+                    tracing::info!(%v6, "webui dual-stack: IPv6 listener active");
+                    Some(listener)
+                }
+                Err(err) => {
+                    tracing::warn!(%v6, %err, "webui dual-stack: IPv6 bind failed (IPv4 only)");
+                    None
+                }
+            };
+            return Ok((primary, secondary, actual_port));
+        } else if host == "::" || host == "[::]" {
+            let loopback_v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+            if std::net::TcpStream::connect_timeout(
+                &loopback_v6,
+                std::time::Duration::from_millis(25),
+            )
+            .is_ok()
+            {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("[::1]:{port} is actively occupied"),
+                ));
+                continue;
+            }
+            match api_config::bind_listener(loopback_v6, true) {
+                Ok(probe) => {
+                    drop(probe);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+            let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+            let primary = match api_config::bind_listener(v6, true) {
+                Ok(listener) => listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let actual_port = primary.local_addr()?.port();
+            let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, actual_port));
+            let secondary = match api_config::bind_listener(v4, false) {
+                Ok(listener) => {
+                    tracing::info!(%v4, "webui dual-stack: IPv4 listener active");
+                    Some(listener)
+                }
+                Err(err) => {
+                    tracing::warn!(%v4, %err, "webui dual-stack: IPv4 bind failed");
+                    None
+                }
+            };
+            return Ok((primary, secondary, actual_port));
+        } else if let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() {
+            match api_config::bind_listener(addr, addr.is_ipv6()) {
+                Ok(listener) => {
+                    let actual = listener.local_addr()?.port();
+                    return Ok((listener, None, actual));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            let addr = format!("{host}:{port}");
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    let actual = listener.local_addr()?.port();
+                    return Ok((listener, None, actual));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no free port in [{}, {}){}",
+        start_port,
+        start_port.saturating_add(max_tries),
+        last_err.map(|e| format!(": {e}")).unwrap_or_default()
+    ))
+}
+
+/// 探测本机主用的非回环 IPv4（用 UDP connect 选路，不实际发包）。绑定非回环地址
+/// 时用于给出可供其它设备访问的 URL 提示；拿不到则返回 None。
+pub fn primary_lan_ipv4() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // connect 仅让内核按路由表选定出口网卡，不会真的发包。
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if api_config::ipv4_is_shareable(&v4) => Some(v4.to_string()),
+        _ => None,
+    }
+}
+
+/// 探测本机主用的非回环 IPv6（用 UDP connect 选路，不实际发包）。绑定非回环地址
+/// 时用于给出可供其它设备访问的 URL 提示；拿不到则返回 None。
+pub fn primary_lan_ipv6() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("[::]:0").ok()?;
+    // connect 仅让内核按路由表选定出口网卡，不会真的发包。
+    sock.connect("[2001:4860:4860::8888]:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V6(v6) if api_config::ipv6_is_shareable(&v6) => Some(v6.to_string()),
+        _ => None,
+    }
+}
+
+/// 进程内 webui server 的默认端口。**刻意区别于独立守护进程的 13456**。
+///
+/// 进程内 webui（TUI `/webui`、`jeikcode webui`）以 `enforce_token=true` 启动，而
+/// VSCode 扩展自带的守护进程以 `enforce_token=false`（不带 token）在 13456 上工作。
+/// 二者若共用 13456，会互相踩端口：webui 抢到后，VSCode 的 `/project`、`/models`、
+/// `/chat` 乃至 `/shutdown` 都会因缺 token 返回 401，扩展既用不了也停不掉它，表现为
+/// “daemon started but not responding”。让 webui 默认错开到 13457 即可彻底分离
+/// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
+pub const WEBUI_DEFAULT_PORT: u16 = 13457;
+
+fn startup_webui_token(
+    tokens: &auth_token::WebuiTokenStore,
+    fixed_token: Option<&str>,
+) -> Result<String, String> {
+    let token = if let Some(fixed) = fixed_token.map(str::trim).filter(|item| !item.is_empty()) {
+        if !tokens.register(fixed) {
+            return Err("webui 启动失败：token 为空".to_string());
+        }
+        fixed.to_string()
+    } else if let Some(existing) = tokens.display() {
+        existing
+    } else {
+        tokens.mint()
+    };
+    tokens.set_display(&token);
+    Ok(token)
+}
+
+/// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
+///
+/// 返回给用户展示的状态串。在 `jeikcode` 主程序（已有 tokio runtime）内调用。
+/// `host` 为绑定地址（默认 `127.0.0.1`；`0.0.0.0` 暴露到局域网/外网）。
+/// `port` 为首选端口（CLI 子命令可自定义；TUI 传 13456）；被占用时自动向上扫描。
+///
+/// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
+/// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
+/// 页面靠 SPA 自带 loading 态在 server bootstrap 完成前过渡。
+pub async fn ensure_server_and_open(host: &str, port: u16, session_id: Option<&str>) -> String {
+    ensure_webui(host, port, true, None, session_id).await
+}
+
+/// 同 [`ensure_server_and_open`]。`open_browser` 为 false 时不调用系统浏览器，
+/// 仍把带 token 的地址写进返回串，供桌面壳自己打开。
+/// `session_id` 写入 `?session=`，让 TUI `/webui` 打开的页面就是当前会话。
+/// 不再接受 sync 开关：浏览器与 TUI 共用这一条会话链路。
+pub async fn ensure_webui(
+    host: &str,
+    port: u16,
+    open_browser: bool,
+    fixed_token: Option<&str>,
+    session_id: Option<&str>,
+) -> String {
+    // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
+    //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
+    let reuse = {
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(handle) if !handle.abort.is_finished() => {
+                Some((handle.tokens.clone(), handle.port, handle.host.clone()))
+            }
+            _ => None,
+        }
+    };
+
+    let (tokens, actual_port, bound_host) = if let Some((tokens, p, h)) = reuse {
+        (tokens, p, h)
+    } else {
+        // 2) 预绑定端口：首选 `port`，被占则递增扫描（拿到真实端口）。按请求的 host 绑定。
+        let (listener, secondary, actual_port) = match bind_scanning(host, port, 100).await {
+            Ok(v) => v,
+            Err(e) => {
+                return format!("webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）");
+            }
+        };
+        let tokens = auth_token::WebuiTokenStore::new();
+        let opts = ServerOpts {
+            host: host.to_string(),
+            port: actual_port,
+            // 与 parse_daemon_args 的“无 --no-telemetry”默认一致。
+            cli_override: CliOverride::default(),
+            // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
+            // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
+            idle_timeout_secs: 0,
+            // 进程内 webui（TUI `/webui`、`jeikcode webui`）的会话开启事件应归因到 webui，
+            // 而非 parse_daemon_args 的默认 Ide。run_server 启动时据此发 OpenJeikcode{mode:webui}，
+            // 让"webui 会话开启数"可被统计——逐请求的 X-JeikCode-Client 头只覆盖会话内事件，
+            // 覆盖不到会话级的 open。宿主进程（TUI/CLI）自身的 OpenJeikcode 早已单独上报，互不影响。
+            startup_mode: SessionMode::Webui,
+            // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
+            webui_tokens: Some(tokens.clone()),
+            // 进程内启动：抑制启动横幅，避免污染 TUI 画面。
+            quiet: true,
+            // `jeikcode webui` 的初始目录应是用户运行命令的目录，而非 config 默认。
+            working_dir_override: std::env::current_dir().ok(),
+            // 预绑定的监听器：run_server 直接复用，跳过内部 bind。
+            prebound_listener: Some(listener),
+            prebound_dual_stack_v6: secondary,
+            // webui 模式不需要 app user_id 校验。
+            app_user_id: None,
+            startup_footer: None,
+            yolo: false,
+        };
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_server(opts).await {
+                eprintln!("webui server error: {e}");
+            }
+        });
+        {
+            let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(WebuiHandle {
+                tokens: tokens.clone(),
+                port: actual_port,
+                host: host.to_string(),
+                abort: task.abort_handle(),
+            });
+        }
+        (tokens, actual_port, host.to_string())
+    };
+
+    let token = match startup_webui_token(&tokens, fixed_token) {
+        Ok(token) => token,
+        Err(err) => return err,
+    };
+    // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），同步写回配置，
+    // 确保 webui-listen.json 里的端口与实际绑定的端口一致，界面输入框不会残留冲突前的旧端口。
+    let _ = api_config::save_webui_listen_pref(actual_port, Some(token.clone()));
+    // 选择自动打开浏览器用的本机地址：
+    // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
+    // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
+    //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
+    let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::" || bound_host == "[::]";
+    // 桌面窗口只用 127.0.0.1。先把这条地址刷出 stderr，再去做局域网探测，
+    // 避免第一次启动时 UDP 选路或防火墙提示把启动页卡住。
+    if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
+        let mut early = format!("http://127.0.0.1:{actual_port}/?token={token}");
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let short: String = id.chars().take(8).collect();
+            early.push_str("&session=");
+            early.push_str(&short);
+        }
+        eprintln!("webui 已启动：{early}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    // 通配绑定（用户意在暴露到网络）时探测本机局域网/公网 IP（优先 IPv4，回退 IPv6）。
+    // 桌面壳自己改写到 127.0.0.1，探测只增加启动等待，第一次还可能弹出防火墙提示。
+    let lan_ip = if is_wildcard && std::env::var_os("JEIKCODE_DESKTOP").is_none() {
+        primary_lan_ipv4().or_else(primary_lan_ipv6)
+    } else {
+        None
+    };
+    // 选择自动打开浏览器 + 主显示用的地址：
+    // - 回环绑定：127.0.0.1。
+    // - 通配绑定（0.0.0.0/::）：优先用局域网 IP —— 它在本机和其它设备上都可访问，
+    //   契合 `--host 0.0.0.0` 暴露到网络的意图；用 127.0.0.1 只在本机有效、对远端
+    //   设备（手机/另一台机器）打开就是连接被拒。探测不到局域网 IP 时才回退 127.0.0.1。
+    // - 绑定具体非回环地址（如 Tailscale 100.x）：socket 只监听该地址，必须用它。
+    let open_host: String = if is_loopback_authority(&bound_host) {
+        "127.0.0.1".to_string()
+    } else if let Some(ip) = lan_ip.clone() {
+        ip
+    } else if is_wildcard {
+        "127.0.0.1".to_string()
+    } else {
+        bound_host.clone()
+    };
+    let display_host = if open_host.contains(':') && !open_host.starts_with('[') {
+        format!("[{open_host}]")
+    } else {
+        open_host
+    };
+    let mut local_url = format!("http://{}:{}/?token={}", display_host, actual_port, token);
+    if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        let short: String = id.chars().take(8).collect();
+        local_url.push_str("&session=");
+        local_url.push_str(&short);
+    }
+    let opened = open_browser && zap_auth::oauth::open_browser(&local_url).is_ok();
+    let mut msg = if !open_browser {
+        format!("webui 已启动：{local_url}")
+    } else if opened {
+        format!("已在浏览器打开 webui：{local_url}")
+    } else {
+        format!("请手动在浏览器打开：{local_url}")
+    };
+
+    // 复用了一个绑定地址不同的运行实例：提示如何换绑。
+    if bound_host.as_str() != host {
+        msg.push_str(&format!(
+            "\n（webui 已在运行，绑定 {bound_host}；如需改绑 {host}，请先 /webui stop 再重试）"
+        ));
+    }
+
+    // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
+    if !is_loopback_authority(&bound_host) {
+        if is_wildcard {
+            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
+            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
+            msg.push_str(
+                "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
+            );
+        } else {
+            // 显式指定了具体地址：local_url 已是该地址，这里仅补安全提示。
+            msg.push_str(
+                "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
+            );
+        }
+    }
+
+    msg
+}
+
+/// 停止进程内 webui server（若在运行）。返回状态串。
+pub fn stop_server() -> String {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.take() {
+        handle.abort.abort();
+        "已停止 webui server".to_string()
+    } else {
+        "webui server 未在运行".to_string()
+    }
+}
+
+// ============================================================================
+// App 远程访问：进程内 server（无 token / 不开浏览器），配合 TUI `/app` 命令
+// ============================================================================
+
+/// `/app` 进程内 server 的默认端口。刻意错开 webui(13457)与独立守护(13456)，
+/// 三者各占一端口、互不踩；被占时由 [bind_scanning] 向上扫描。
+pub const APP_DEFAULT_PORT: u16 = 13458;
+
+struct AppServerHandle {
+    port: u16,
+    host: String,
+    abort: tokio::task::AbortHandle,
+}
+
+static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex::new(None);
+
+/// 起一个进程内 server 供移动端 App 经中继访问，返回 `(bound_host, actual_port)`。
+///
+/// 与 `/webui` 的关键区别：
+/// - **daemon 模式**（`webui_tokens=None` → `enforce_token=false`）：App 的 Cloud 模式
+///   只发 `X-JeikCode-Token`（中继路由用），不发 `Authorization: Bearer`；鉴权边界落在
+///   中继的 route token + 本机回环绑定（server 只听 127.0.0.1，仅本机隧道可达）。
+/// - **不开浏览器**：App 用二维码配对，不需要打开网页。
+///
+/// `user_id`：可选，桌面端当前登录用户 id。传入后将启用 `X-JeikCode-User-Id` 请求头校验，
+/// 确保请求来自同一账号的手机 App。
+///
+/// 与 `/webui` 共用 live hub 绑定的 Coding Runtime，所以 TUI / 浏览器 / App
+/// 看到的是同一段对话并双向实时同步。
+pub async fn ensure_app_server(
+    host: &str,
+    port: u16,
+    user_id: Option<String>,
+) -> Result<(String, u16), String> {
+    // 复用仍在运行的实例（含其绑定地址/端口）。
+    let reuse = {
+        let guard = APP_SERVER.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|h| !h.abort.is_finished())
+            .map(|h| (h.port, h.host.clone()))
+    };
+    if let Some((p, h)) = reuse {
+        return Ok((h, p));
+    }
+
+    let (listener, secondary, actual_port) = bind_scanning(host, port, 100)
+        .await
+        .map_err(|e| format!("绑定 {host}:{port} 失败（{e}）"))?;
+    let opts = ServerOpts {
+        host: host.to_string(),
+        port: actual_port,
+        cli_override: CliOverride::default(),
+        // 随主程序常驻，关闭 idle 看门狗。
+        idle_timeout_secs: 0,
+        startup_mode: SessionMode::Webui,
+        // None → enforce_token=false（daemon 模式，不要 Bearer）。
+        webui_tokens: None,
+        // 进程内启动：抑制启动横幅，避免污染 TUI 画面。
+        quiet: true,
+        working_dir_override: std::env::current_dir().ok(),
+        prebound_listener: Some(listener),
+        prebound_dual_stack_v6: secondary,
+        app_user_id: user_id,
+        startup_footer: None,
+        yolo: false,
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = run_server(opts).await {
+            eprintln!("app server error: {e}");
+        }
+    });
+    {
+        let mut guard = APP_SERVER.lock().unwrap();
+        *guard = Some(AppServerHandle {
+            port: actual_port,
+            host: host.to_string(),
+            abort: task.abort_handle(),
+        });
+    }
+    Ok((host.to_string(), actual_port))
+}
+
+/// 停止 `/app` 进程内 server（若在运行）。返回是否确实停了一个。
+pub fn stop_app_server() -> bool {
+    let mut guard = APP_SERVER.lock().unwrap();
+    if let Some(handle) = guard.take() {
+        handle.abort.abort();
+        true
+    } else {
+        false
+    }
+}
+
+// ============================================================================
+// GET /tunnel/status — 远程访问探测（蒲公英 Oray PGY + 绑定可达性 + 二维码）
+// ============================================================================
+
+#[derive(serde::Serialize)]
+struct PgyInfo {
+    /// 本机是否装了蒲公英（应用 bundle 或 oray 守护进程存在）。
+    installed: bool,
+    /// 本机的蒲公英虚拟 IPv4；未连接/未分配时为 None。
+    ipv4: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TunnelStatus {
+    /// server 绑定地址（127.0.0.1=仅本机；0.0.0.0/具体 IP=可被其它设备访问）。
+    bind_host: String,
+    port: u16,
+    /// 是否绑定到非回环地址（手机/其它设备可达的前提）。
+    reachable: bool,
+    pgy: PgyInfo,
+    /// 推荐的远程访问 URL（蒲公英 IP + 当前 token）；不可用时 None。
+    remote_url: Option<String>,
+    /// remote_url 的二维码（SVG 字符串）；不可用时 None。
+    qr_svg: Option<String>,
+}
+
+/// 从 ifconfig 文本抽出蒲公英候选虚拟 IP —— 纯函数，与系统解耦，可单测。
+///
+/// 蒲公英无 CLI、虚拟网段（默认 172.16/16）管理端可改，故不按具体网段匹配，
+/// 改用两个结构性特征:接口 flags 含 `POINTOPOINT`（VPN 隧道网卡）且 `inet`
+/// 属 RFC1918（`Ipv4Addr::is_private()`）。这天然排除 Tailscale 的 100.64/10
+/// （CGNAT，非 RFC1918）与物理 en*（BROADCAST，非 POINTOPOINT）。
+fn pgy_ipv4_candidates(ifconfig_output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_p2p = false; // 当前接口块是否为 POINTOPOINT
+    for line in ifconfig_output.lines() {
+        // 接口块以非空白字符开头（如 `utun7: flags=...`）；缩进行是其属性。
+        let is_header = line
+            .chars()
+            .next()
+            .map(|c| !c.is_whitespace())
+            .unwrap_or(false);
+        if is_header {
+            in_p2p = line.contains("POINTOPOINT");
+            continue;
+        }
+        if !in_p2p {
+            continue;
+        }
+        // 属性行示例:`\tinet 172.16.2.14 --> 172.16.2.14 netmask 0xfffffc00`
+        if let Some(rest) = line.trim_start().strip_prefix("inet ") {
+            if let Some(addr) = rest.split_whitespace().next() {
+                if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                    if ip.is_private() {
+                        out.push(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从一行日志里抽 `ip=<ipv4>`（蒲公英自报）。仅用于多候选消歧，loose 匹配即可——
+/// 正确性最终由调用方 `candidates.contains(ip)` 兜底。
+fn extract_ip_eq(line: &str) -> Option<String> {
+    let idx = line.find("ip=")?;
+    let rest = &line[idx + 3..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let cand = &rest[..end];
+    cand.parse::<std::net::Ipv4Addr>()
+        .ok()
+        .map(|_| cand.to_string())
+}
+
+/// 兜底:从蒲公英日志抓自报虚拟 IP（段无关、权威），取最后一条 `ip=`。
+fn pgy_ipv4_from_log() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::Path::new(&home).join("Library/Logs/PgyVisitor");
+    let mut latest: Option<String> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if let Some(ip) = extract_ip_eq(line) {
+                latest = Some(ip);
+            }
+        }
+    }
+    latest
+}
+
+/// 从候选网卡 IP + 日志自报 IP 决定最终虚拟 IP —— 纯函数，可单测。
+/// 单候选直接用；零候选视为未连接；多候选（多 VPN 共存）用日志 IP 消歧，
+/// 仍无法确定则 None（宁缺毋滥，不误报）。
+fn pgy_pick_ipv4(candidates: Vec<String>, log_ip: Option<String>) -> Option<String> {
+    match candidates.len() {
+        1 => candidates.into_iter().next(),
+        0 => None,
+        _ => log_ip.filter(|ip| candidates.contains(ip)),
+    }
+}
+
+/// 检测蒲公英是否安装（macOS）:应用 bundle 或 oray 守护进程 plist 存在。
+fn pgy_installed() -> bool {
+    if std::path::Path::new("/Applications/PgyVisitor_download.app").exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir("/Library/LaunchDaemons") {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                let n = name.to_ascii_lowercase();
+                if n.starts_with("com.oray.") && n.contains("pgy") && n.ends_with(".plist") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 探测本机蒲公英状态（同步阻塞，调用方用 spawn_blocking 包裹）。
+fn pgy_probe() -> PgyInfo {
+    let installed = pgy_installed();
+    let candidates = std::process::Command::new("ifconfig")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| pgy_ipv4_candidates(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
+    let ipv4 = pgy_pick_ipv4(candidates, pgy_ipv4_from_log());
+    PgyInfo { installed, ipv4 }
+}
+
+/// GET /tunnel/status - 远程访问探测：绑定地址、蒲公英状态、远程 URL + 二维码。
+async fn get_tunnel_status(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let pgy = tokio::task::spawn_blocking(pgy_probe)
+        .await
+        .unwrap_or(PgyInfo {
+            installed: false,
+            ipv4: None,
+        });
+
+    let reachable = !is_loopback_authority(&state.bind_host);
+
+    // 仅当 server 实际绑在「能从蒲公英网络访问的地址」上时，才给出远程 URL：
+    // 0.0.0.0/:: 覆盖所有网卡，或显式绑到了该蒲公英 IP。
+    let pgy_reachable = matches!(state.bind_host.as_str(), "0.0.0.0" | "::")
+        || pgy.ipv4.as_deref() == Some(state.bind_host.as_str());
+
+    // 复用请求自带的 token（与当前页面同一 token）拼远程 URL。
+    // 与 require_webui_token 一致：Bearer / x-api-key / api-key / cookie。
+    let token = auth_token::token_from_header(
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok()),
+    )
+    .or_else(|| {
+        auth_token::token_from_x_api_key_header(
+            headers.get("x-api-key").and_then(|h| h.to_str().ok()),
+        )
+    })
+    .or_else(|| {
+        auth_token::token_from_api_key_header(headers.get("api-key").and_then(|h| h.to_str().ok()))
+    })
+    .or_else(|| {
+        auth_token::token_from_cookie(
+            headers
+                .get(axum::http::header::COOKIE)
+                .and_then(|h| h.to_str().ok()),
+            &state.webui_cookie_name,
+        )
+    });
+
+    let (remote_url, qr_svg) = match (&pgy.ipv4, &token) {
+        (Some(ip), Some(tok)) if pgy_reachable => {
+            let url = format!("http://{}:{}/?token={}", ip, state.bind_port, tok);
+            let qr = qrcode::QrCode::new(url.as_bytes()).ok().map(|code| {
+                code.render::<qrcode::render::svg::Color>()
+                    .min_dimensions(200, 200)
+                    .quiet_zone(true)
+                    .build()
+            });
+            (Some(url), qr)
+        }
+        _ => (None, None),
+    };
+
+    Json(TunnelStatus {
+        bind_host: state.bind_host.clone(),
+        port: state.bind_port,
+        reachable,
+        pgy,
+        remote_url,
+        qr_svg,
+    })
+}
+
+// ============================================================================
+// GET /skills — 列出 user-invocable 技能（webui 技能选择器）
+// ============================================================================
+
+/// Skill info for API response.
+#[derive(serde::Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// GET /skills - List user-invocable skills for the current project.
+async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    // Standard home/project skill dirs, then installed-plugin skill dirs.
+    // Keep this composition in the plugin integration layer so the shared
+    // SkillRegistry remains independent of plugin storage.
+    let mut registry = zap_capabilities::skills::SkillRegistry::new();
+    zap_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
+    // Honor the persisted GLOBAL/PROJECT disable state — the same set the prompt
+    // catalog and the sidebar capability list use, so all three agree.
+    registry.retain_enabled(&zap_capabilities::skills::controls::load_disabled(
+        &working_dir,
+    ));
+    let skills: Vec<SkillInfo> = registry
+        .user_invocable()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+        })
+        .collect();
+    Json(skills)
+}
+
+// ============================================================================
+// GET /fs/list — 目录列举端点（Task 15a）
+// ============================================================================
+
+/// 展开 `~`，返回路径（不校验存在性）。复用与 /cd 一致的展开规则。
+pub fn normalize_dir_arg(arg: &str) -> PathBuf {
+    // `\\?\`, `//?/`, and the one-slash-dropped `/?/` form all have to be gone
+    // before `~` expansion and before the path is hashed, or the web picker
+    // and the native catalog land in different session buckets.
+    let stripped = zap_capabilities::pathnorm::strip_verbatim(arg);
+    let arg = stripped.as_ref().trim();
+
+    #[cfg(target_os = "windows")]
+    if arg.len() == 2 && arg.as_bytes()[1] == b':' && arg.as_bytes()[0].is_ascii_alphabetic() {
+        return PathBuf::from(format!("{}\\", arg.to_ascii_uppercase()));
+    }
+
+    if let Some(rest) = arg.strip_prefix('~') {
+        if let Some(home) = zap_config::util::real_home_dir() {
+            return home.join(rest.trim_start_matches(['/', '\\']));
+        }
+    }
+    PathBuf::from(arg)
+}
+
+#[derive(serde::Serialize)]
+pub struct FsShortcut {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub path: String,
+}
+
+/// 列出当前系统的磁盘驱动器（Windows 下为可用盘符如 `["C:", "D:"]`，Unix 为 `["/"]`）。
+pub fn list_system_drives() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut drives = Vec::new();
+        for c in b'A'..=b'Z' {
+            let drive_root = format!("{}:\\", c as char);
+            if std::path::Path::new(&drive_root).is_dir() {
+                drives.push(format!("{}:", (c as char).to_ascii_uppercase()));
+            }
+        }
+        if drives.is_empty() {
+            drives.push("C:".to_string());
+        }
+        drives
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec!["/".to_string()]
+    }
+}
+
+/// 列出系统核心快捷路径（Home, Desktop, Downloads, Documents 等），支持跨平台快速访问。
+pub fn list_system_shortcuts() -> Vec<FsShortcut> {
+    let mut shortcuts = Vec::new();
+    if let Some(home) = zap_config::util::real_home_dir() {
+        let home_clean = zap_capabilities::pathnorm::strip_verbatim_path(&home);
+        shortcuts.push(FsShortcut {
+            id: "home",
+            name: "Home",
+            path: home_clean.to_string_lossy().to_string(),
+        });
+
+        // 桌面：与 shell `$DESKTOP` / 内置工具 `$DESKTOP` 同源解析（Windows 走 OS Known
+        // Folder / 注册表 `User Shell Folders\Desktop`，重定向与 OneDrive 桌面均已生效），
+        // 不再假设 `~/Desktop`。
+        if let Some(desktop) = zap_capabilities::special_dirs::desktop_dir() {
+            if desktop.is_dir() {
+                let clean = zap_capabilities::pathnorm::strip_verbatim_path(&desktop);
+                shortcuts.push(FsShortcut {
+                    id: "desktop",
+                    name: "Desktop",
+                    path: clean.to_string_lossy().to_string(),
+                });
+            }
+        }
+
+        let downloads = home.join("Downloads");
+        if downloads.is_dir() {
+            let clean = zap_capabilities::pathnorm::strip_verbatim_path(&downloads);
+            shortcuts.push(FsShortcut {
+                id: "downloads",
+                name: "Downloads",
+                path: clean.to_string_lossy().to_string(),
+            });
+        }
+
+        let documents = home.join("Documents");
+        if documents.is_dir() {
+            let clean = zap_capabilities::pathnorm::strip_verbatim_path(&documents);
+            shortcuts.push(FsShortcut {
+                id: "documents",
+                name: "Documents",
+                path: clean.to_string_lossy().to_string(),
+            });
+        }
+    }
+    shortcuts
+}
+
+/// 列出某目录下的直接子目录名（不含文件、不递归、跳过隐藏目录）。
+pub fn list_subdirs(dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// List regular (non-directory) files in `dir`, skipping hidden (`.`-prefixed)
+/// entries. Used by the webui file picker to insert an absolute file path into
+/// the chat input.
+pub fn list_files(dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with('.') {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+pub struct FsListQuery {
+    pub path: String,
+}
+
+async fn fs_list(
+    State(_state): State<AppState>,
+    Query(q): Query<FsListQuery>,
+) -> impl IntoResponse {
+    // canonicalize 消解 `..`/符号链接；失败时退回展开后的路径。
+    // Windows 上 canonicalize 会加 `\\?\` 扩展长度前缀，剥掉它，否则 webui
+    // 拿到 `\\?\D:\path` 回传给 /cd，会与 TUI 的 `D:\path` 落进不同的会话 hash 桶。
+    let expanded = normalize_dir_arg(&q.path);
+    let dir = expanded.canonicalize().unwrap_or(expanded);
+    let dir = zap_capabilities::pathnorm::strip_verbatim_path(&dir);
+    match list_subdirs(&dir) {
+        Ok(dirs) => Json(serde_json::json!({
+            "path": dir.to_string_lossy(),
+            "dirs": dirs,
+            // 文件列表供 webui 文件选择器使用；出错则空数组（不影响目录浏览）。
+            "files": list_files(&dir).unwrap_or_default(),
+            "drives": list_system_drives(),
+            "shortcuts": list_system_shortcuts(),
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct FsMkdirRequest {
+    pub path: String,
+}
+
+async fn fs_mkdir(
+    State(_state): State<AppState>,
+    Json(req): Json<FsMkdirRequest>,
+) -> impl IntoResponse {
+    let dir = normalize_dir_arg(&req.path);
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => {
+            let canon = dir.canonicalize().unwrap_or(dir);
+            // Strip the Windows `\\?\` prefix (parity with fs_list): the returned
+            // path is round-tripped back into /cd, and an unstripped verbatim form
+            // would split the session hash bucket.
+            let canon = zap_capabilities::pathnorm::strip_verbatim_path(&canon);
+            Json(serde_json::json!({ "path": canon.to_string_lossy() })).into_response()
+        }
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+enum NativePickResult {
+    Selected(String),
+    Canceled,
+    Unavailable,
+}
+
+#[cfg(target_os = "windows")]
+fn pick_directory_modern() -> NativePickResult {
+    use windows::core::w;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PICKFOLDERS,
+        SIGDN_FILESYSPATH,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    // HRESULT for ERROR_CANCELLED (0x800704C7).
+    const ERROR_CANCELLED_HRESULT: i32 = 0x800704C7_u32 as i32;
+
+    // Windows 规范要求所有 Shell UI 组件必须在 STA (Single-Threaded Apartment) 线程中运行。
+    // Tokio blocking 线程池可能被其他任务重用或残留 MTA 状态导致 RPC_E_CHANGED_MODE。
+    // 在专用独立 OS 线程中运行，确保 COM 生命周期与 STA 环境 100% 干净隔离。
+    let handle = std::thread::Builder::new()
+        .name("jeikcode-dir-picker-sta".to_string())
+        .spawn(move || unsafe {
+            let init_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let initialized = init_hr.is_ok();
+
+            let outcome = (|| -> NativePickResult {
+                let dialog: IFileOpenDialog =
+                    match CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::info!(error = %e, "fs/pick_dir: IFileOpenDialog unavailable");
+                            return NativePickResult::Unavailable;
+                        }
+                    };
+
+                if dialog
+                    .SetTitle(w!("选择项目目录 / Select Project Directory"))
+                    .is_err()
+                {
+                    return NativePickResult::Unavailable;
+                }
+                if dialog
+                    .SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR)
+                    .is_err()
+                {
+                    return NativePickResult::Unavailable;
+                }
+
+                // 取当前前台活动窗口（如桌面端 WebView 或 WebUI 浏览器窗口）作为 owner。
+                // 解决后台无窗口服务（CREATE_NO_WINDOW）创建对话框时缺乏 owner 被压在底层导致的假死现象。
+                let owner = GetForegroundWindow();
+                if let Err(e) = dialog.Show(owner) {
+                    if e.code().0 == ERROR_CANCELLED_HRESULT {
+                        tracing::info!("fs/pick_dir: modern folder picker canceled by user");
+                        return NativePickResult::Canceled;
+                    }
+                    tracing::warn!(error = %e, "fs/pick_dir: modern folder picker Show failed");
+                    return NativePickResult::Unavailable;
+                }
+
+                let item = match dialog.GetResult() {
+                    Ok(item) => item,
+                    Err(e) => {
+                        if e.code().0 == ERROR_CANCELLED_HRESULT {
+                            return NativePickResult::Canceled;
+                        }
+                        return NativePickResult::Unavailable;
+                    }
+                };
+
+                let pwstr = match item.GetDisplayName(SIGDN_FILESYSPATH) {
+                    Ok(p) => p,
+                    Err(_) => return NativePickResult::Unavailable,
+                };
+
+                let path_str = pwstr.to_string().ok();
+                CoTaskMemFree(Some(pwstr.0.cast_const().cast()));
+
+                let path = match path_str {
+                    Some(p) => p.trim().to_string(),
+                    None => return NativePickResult::Unavailable,
+                };
+
+                if path.is_empty() {
+                    NativePickResult::Canceled
+                } else {
+                    NativePickResult::Selected(path)
+                }
+            })();
+
+            if initialized {
+                CoUninitialize();
+            }
+
+            outcome
+        });
+
+    match handle {
+        Ok(t) => t.join().unwrap_or(NativePickResult::Unavailable),
+        Err(e) => {
+            tracing::warn!(error = %e, "fs/pick_dir: failed to spawn STA picker thread");
+            NativePickResult::Unavailable
+        }
+    }
+}
+
+pub fn pick_directory_native() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // 1. 优先尝试现代 Windows IFileOpenDialog（资源管理器同款，支持快速访问、地址栏、搜索、UTF-16 零乱码）
+        match pick_directory_modern() {
+            NativePickResult::Selected(path) => {
+                let p = std::path::Path::new(&path);
+                if p.is_dir() {
+                    let clean = zap_capabilities::pathnorm::strip_verbatim_path(p);
+                    return Some(clean.to_string_lossy().to_string());
+                }
+            }
+            NativePickResult::Canceled => {
+                // 用户主动点击取消，直接退出，绝不 fallback 二次弹窗
+                return None;
+            }
+            NativePickResult::Unavailable => {
+                tracing::info!(
+                    "fs/pick_dir: modern picker unavailable; falling back to powershell"
+                );
+            }
+        }
+
+        // 2. 兜底回退：PowerShell FolderBrowserDialog（保留 Base64 纯 ASCII 管道安全机制）
+        use std::os::windows::process::CommandExt;
+        let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.FolderBrowserDialog
+$f.Description = '选择项目目录 / Select Project Directory'
+$f.ShowNewFolderButton = $true
+if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($f.SelectedPath)
+    [Convert]::ToBase64String($bytes)
+}
+"#;
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let output = cmd.output().ok()?;
+        if output.status.success() {
+            if let Some(path) = decode_native_picked_path(&output.stdout) {
+                let p = std::path::Path::new(&path);
+                if p.is_dir() {
+                    let clean = zap_capabilities::pathnorm::strip_verbatim_path(p);
+                    return Some(clean.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"POSIX path of (choose folder with prompt "选择项目目录 / Select Project Directory")"#;
+        let output = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            if let Some(path) = decode_native_picked_path(&output.stdout) {
+                let p = std::path::Path::new(&path);
+                if p.is_dir() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // 若处于 Headless（无图形界面环境），快速返回，不产生无效外部进程调用延迟
+        let has_display =
+            std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if has_display {
+            if let Ok(output) = std::process::Command::new("zenity")
+                .args([
+                    "--file-selection",
+                    "--directory",
+                    "--title=选择项目目录 / Select Project Directory",
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    if let Some(path) = decode_native_picked_path(&output.stdout) {
+                        let p = std::path::Path::new(&path);
+                        if p.is_dir() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+            if let Ok(output) = std::process::Command::new("kdialog")
+                .args([
+                    "--getexistingdirectory",
+                    "--title",
+                    "选择项目目录 / Select Project Directory",
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    if let Some(path) = decode_native_picked_path(&output.stdout) {
+                        let p = std::path::Path::new(&path);
+                        if p.is_dir() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn decode_native_picked_path(raw: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let trimmed = std::str::from_utf8(raw).ok()?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 优先尝试 Base64 解码，防范 Windows 控制台/管道代码页损坏多语言 UTF-8 字节
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(trimmed) {
+        if let Ok(s) = String::from_utf8(bytes) {
+            let s = s.trim();
+            if !s.is_empty() && !s.contains('\u{FFFD}') {
+                return Some(s.to_string());
+            }
+        }
+    }
+    // 若不是 Base64（如 macOS osascript 或 Linux zenity 输出），直接按纯 UTF-8 字符串处理
+    if !trimmed.contains('\u{FFFD}') {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+async fn fs_pick_dir() -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(pick_directory_native)
+        .await
+        .unwrap_or(None);
+
+    match result {
+        Some(path) => {
+            let p = PathBuf::from(&path);
+            let canon = p.canonicalize().unwrap_or(p);
+            let clean = zap_capabilities::pathnorm::strip_verbatim_path(&canon);
+            Json(serde_json::json!({
+                "path": clean.to_string_lossy(),
+                "canceled": false
+            }))
+        }
+        None => Json(serde_json::json!({
+            "path": null,
+            "canceled": true
+        })),
+    }
+}
+
+/// Options controlling how [`run_server`] builds and runs the API server.
+///
+/// Field types intentionally mirror the tuple returned by the binary's
+/// `parse_daemon_args()` so the two stay in lock-step.
+pub struct ServerOpts {
+    /// Bind host (e.g. `127.0.0.1`). Non-loopback hosts emit a security warning.
+    pub host: String,
+    /// Bind port (e.g. `13456`).
+    pub port: u16,
+    /// Telemetry CLI override (e.g. `--no-telemetry`).
+    pub cli_override: CliOverride,
+    /// Idle timeout in seconds; `0` disables the idle-shutdown watchdog.
+    pub idle_timeout_secs: u64,
+    /// Session mode reported to telemetry on startup.
+    pub startup_mode: SessionMode,
+    /// webui token 存储；进程内启动器传入以共享同一 store，独立二进制传 None。
+    pub webui_tokens: Option<auth_token::WebuiTokenStore>,
+    /// 启动时的工作目录覆盖。进程内 `jeikcode webui` 传入其启动 cwd，使 daemon
+    /// 初始项目目录为用户实际运行命令的目录，而非 config 里陈旧的 default_workdir。
+    /// 独立二进制 / VSCode 传 None（沿用 config 默认）。
+    pub working_dir_override: Option<PathBuf>,
+    /// 安静模式：不向 stdout/stderr 打印启动横幅（telemetry 状态、监听地址、API
+    /// 端点清单等）。TUI 内 `/webui` 进程内启动时为 true，避免污染 ratatui 画面；
+    /// 独立二进制为 false，保留完整启动信息。
+    pub quiet: bool,
+    /// 预绑定的监听器。进程内 webui 启动器先绑定端口（拿到真实端口、支持动态端口）
+    /// 再传入，`run_server` 直接复用、跳过内部 bind。独立二进制传 None，照旧自行 bind。
+    pub prebound_listener: Option<tokio::net::TcpListener>,
+    /// 预绑定的次级双栈监听器（如 IPv6 [::]）。独立二进制传 None。
+    pub prebound_dual_stack_v6: Option<tokio::net::TcpListener>,
+    /// App 远程访问模式期望的 user_id。非空时 daemon 启用 `X-JeikCode-User-Id` 请求头校验。
+    pub app_user_id: Option<String>,
+    /// Optional footer printed after bind / dual-stack notes (and after the API
+    /// endpoint list). Used by `jeikcode serve` so client URLs and attach hints
+    /// stay at the bottom of startup output instead of scrolling above the API
+    /// catalog.
+    ///
+    /// Honors [`Self::quiet`]: when `quiet` is true the footer is not printed
+    /// (same rule as the API endpoint catalog), so callers cannot accidentally
+    /// pollute a TUI / embedded stderr by pairing footer text with quiet mode.
+    pub startup_footer: Option<String>,
+    /// Headless YOLO: auto-approve every tool and hide `request_user_input`
+    /// (never block the stream on a WebUI/TUI modal).
+    /// Intended for API automation (`jeikcode serve --yolo`).
+    pub yolo: bool,
+}
+
+/// Build and run the axum server until a shutdown signal is received.
+///
+/// Shared by the standalone `zap-daemon` binary and (in the future) the
+/// main `jeikcode` program's in-process `/webui` server. This performs the full
+/// bootstrap sequence (config load, telemetry init, repo-origin detection,
+/// MCP registry init, `AppState` construction) before binding and serving.
+///
+/// Note: early bootstrap that is process-global (panic hook, Windows console
+/// attach, legacy session migration) is handled by the binary's `main()` before
+/// calling this; see `src/main.rs`.
+pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
+    use axum::routing::{patch, put};
+
+    let ServerOpts {
+        host,
+        port,
+        cli_override,
+        idle_timeout_secs,
+        startup_mode,
+        webui_tokens,
+        quiet,
+        working_dir_override,
+        prebound_listener,
+        prebound_dual_stack_v6,
+        app_user_id,
+        startup_footer,
+        yolo,
+    } = opts;
+    if yolo {
+        // Global live approval mode → Auto so /live and /chat default the same.
+        live_api::live_set_approval_mode(crate::approval_mode::ApprovalMode::Auto);
+        // Unmount `request_user_input` for this process (tool registry + persona
+        // both read JEIKCODE_REQUEST_USER_INPUT). Do NOT auto-answer questions —
+        // the model must not have a "ask user" tool under YOLO automation.
+        // SAFETY: serve is headless; setting process env here is intentional.
+        std::env::set_var("JEIKCODE_REQUEST_USER_INPUT", "0");
+        if !quiet {
+            eprintln!(
+                "serve: --yolo enabled (auto-approve tools; request_user_input tool hidden; no modal stalls)"
+            );
+        }
+    }
+
+    // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default.
+    // Also seed the offline verdict + note ONCE from config + env here, before
+    // telemetry init and any tool/provider assembly (Step 4).
+    let startup_config = match Config::load(&Config::default_path()) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(?e, "Failed to load config, using defaults");
+            None
+        }
+    };
+    // Tool text and upgrade copy in this process follow config.language.
+    // A missing choice stays English, matching a fresh install.
+    let ui_locale = startup_config
+        .as_ref()
+        .and_then(|cfg| cfg.language)
+        .unwrap_or(zap_config::locale::Locale::En);
+    zap_config::i18n::set_locale(ui_locale);
+    let cfg_telemetry = startup_config
+        .as_ref()
+        .map(|c| c.telemetry.clone())
+        .unwrap_or_default();
+
+    // Seed the offline verdict + note ONCE from config + env, before any tool/telemetry assembly.
+    zap_config::config::offline::seed_offline_from_config(startup_config.as_ref());
+    if !zap_config::config::offline::is_offline_active() {
+        // Best-effort metadata; failure leaves `/cost` token-only and never
+        // prevents daemon/provider startup.
+        zap_capabilities::provider::spawn_models_dev_catalog_refresh();
+    }
+
+    // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
+    let resolved = resolve(
+        &cfg_telemetry,
+        &cli_override,
+        Config::config_dir(),
+        &ProcessEnv,
+        zap_config::config::offline::is_offline_active(),
+    );
+
+    // Step 3: Print telemetry status line (R2.6) — suppressed in quiet (TUI) mode.
+    if !quiet {
+        match &resolved.state {
+            TelemetryState::Enabled => println!("Telemetry: enabled"),
+            TelemetryState::Disabled(reason) => {
+                println!("Telemetry: disabled (reason: {})", reason)
+            }
+        }
+    }
+
+    // Step 4: Initialize telemetry runtime (R1.3, R1.6)
+    let jeikcode_dir = resolved.jeikcode_dir.clone();
+    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+
+    // Launch-level fallback mode (Ide for the standalone daemon, Webui for the
+    // in-process webui). Per-request `daemon_scope` overrides this with the
+    // client's X-JeikCode-Client mode; the fallback only kicks in for telemetry
+    // emitted outside any per-request scope (e.g. an un-scoped spawned task),
+    // which previously landed as `mode: null`.
+    telemetry.set_default_mode(Some(startup_mode));
+
+    // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
+    install_panic_hook(telemetry.clone());
+
+    // Emit install_completed when daemon/webui is the first post-install entrypoint.
+    telemetry.maybe_emit_install_completed(&jeikcode_dir).await;
+
+    // Step 5: Precompute repo_origin (R4.2)
+    // Use the project working directory (from config or cwd) rather than the
+    // raw process cwd, because VS Code may spawn the daemon with a cwd that
+    // is not inside a git repository (e.g. the extension install directory).
+    let project_state = init_project_state(working_dir_override);
+    let repo_origin = detect_repo_origin(&project_state.working_dir);
+
+    // Step 6: Seed account_id from stored auth (R4.3)
+    telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
+
+    // Initialize MCP registry from project working directory config
+    // This reads both $JEIKCODE_HOME/mcp.json (user-level) and <project>/.mcp.json (project-level)
+    let initial_mcp_project = project_state.working_dir.clone();
+    let mcp_pool = zap_capabilities::mcp::ProjectMcpPool::global();
+    let mcp_registry = mcp_pool.registry(&initial_mcp_project).await;
+
+    // Step 7: Build AppState (R1.4)
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let project_store = Arc::new(RwLock::new(project_state));
+    *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
+
+    let state = AppState {
+        project: project_store,
+        active_chats: ActiveChatRegistry::default(),
+        mcp_registry: Arc::new(RwLock::new(mcp_registry)),
+        mcp_pool: mcp_pool.clone(),
+        daemon_instance_id: Arc::from(uuid::Uuid::new_v4().to_string()),
+        telemetry: telemetry.clone(),
+        repo_origin: repo_origin.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        last_activity: last_activity.clone(),
+        active_connections: active_connections.clone(),
+        enforce_token: Arc::new(std::sync::atomic::AtomicBool::new(webui_tokens.is_some())),
+        initial_enforce_token: webui_tokens.is_some(),
+        webui_tokens: webui_tokens.unwrap_or_default(),
+        app_user_id: app_user_id.unwrap_or_default(),
+        pending_permissions: permission_bridge::PermissionResponders::new(),
+        pending_user_inputs: permission_bridge::UserInputResponders::new(),
+        bind_host: host.clone(),
+        bind_port: port,
+        bind_working_dir: initial_mcp_project.clone(),
+        // `port` here is the ACTUAL bound port (the enforce_token=true webui path
+        // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
+        // instances get distinct cookie names.
+        webui_cookie_name: auth_token::webui_cookie_name(port),
+        yolo,
+        token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        http_router: Arc::new(std::sync::OnceLock::new()),
+        extra_remote: Arc::new(std::sync::Mutex::new(None)),
+    };
+
+    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查 + 外部 Git Webhook 回调（由 HMAC 专有验签保护）。
+    let public = Router::new()
+        // Health check
+        .route("/health", get(health))
+        // Toast click. The protocol script has no cookie; the body secret is checked.
+        .route("/notify-focus", post(post_notify_focus))
+        // 外部 Git Webhook 入口：GitHub/GitLab 服务器推送回调（无法携带 WebUI Bearer/Cookie，由内部 HMAC 签名验签）
+        .route(
+            "/api/webhooks/git",
+            post(api_git_webhook::handle_git_webhook_api)
+                .get(api_git_webhook::get_git_webhook_info_api),
+        )
+        .route(
+            "/api/webhooks/github",
+            post(api_git_webhook::handle_git_webhook_api)
+                .get(api_git_webhook::get_git_webhook_info_api),
+        )
+        // 外部本地扩展插件 RPC 服务接口（如 DevOrbit 工作台本地数据同步）
+        .route(
+            "/api/plugins-rpc/:plugin_id",
+            post(plugin_rpc::handle_plugin_rpc),
+        )
+        // WebUI static assets + SPA fallback (Task 3/4). The `/` route
+        // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the
+        // fallback serves SPA routes/assets and never carries a token.
+        .route("/", axum::routing::get(serve_webui_index))
+        .fallback(webui::serve_webui);
+
+    // 受保护路由：所有数据/API 端点。仅 webui 模式（enforce_token=true）强制 token 鉴权；
+    // 独立 daemon/VSCode（enforce_token=false）中间件直接放行（见 auth_token.rs）。
+    let protected = Router::new()
+        // Shutdown endpoint (R7.1)
+        .route("/shutdown", post(shutdown_handler))
+        // Session APIs
+        .route("/sessions", get(get_all_sessions).post(create_session))
+        .route("/sessions/by-working-dir", get(get_sessions_by_working_dir))
+        .route("/sessions/search", get(search_sessions))
+        .route("/sessions/resolve/:id", get(resolve_session))
+        // Current project state (working directory)
+        .route("/project", get(get_project_state))
+        .route("/cd", post(change_dir))
+        // Historical projects (from sessions directory)
+        .route("/projects", get(get_projects))
+        .route(
+            "/projects/sidebar",
+            get(sidebar_projects::get_sidebar_projects),
+        )
+        .route(
+            "/projects/sidebar/hide",
+            post(sidebar_projects::hide_sidebar_project),
+        )
+        .route(
+            "/projects/sidebar/show",
+            post(sidebar_projects::show_sidebar_project),
+        )
+        .route(
+            "/projects/sidebar/reveal",
+            post(sidebar_projects::reveal_sidebar_project),
+        )
+        .route("/projects/:hash/sessions", get(get_project_sessions))
+        .route("/sessions/:id/messages", post(append_session_messages))
+        .route(
+            "/projects/:hash/sessions/:id/freshness",
+            get(get_session_freshness),
+        )
+        .route(
+            "/projects/:hash/sessions/:id/lineage",
+            get(get_session_lineage),
+        )
+        .route(
+            "/projects/:hash/sessions/:id",
+            get(get_session_detail).delete(delete_session),
+        )
+        .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
+        .route("/projects/:hash/sessions/:id/repair", post(repair_session))
+        .route(
+            "/projects/:hash/sessions/:id/messages/:index",
+            patch(patch_session_message).delete(delete_session_message),
+        )
+        .route(
+            "/projects/:hash/sessions/:id/truncate",
+            post(truncate_session),
+        )
+        .route("/projects/:hash/sessions/:id/fork", post(fork_session))
+        .route("/sessions/:id/fork", post(fork_session_by_id))
+        // Model API
+        .route("/models", get(get_models))
+        // Chat API
+        .route(
+            "/chat",
+            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route("/chat/stop", post(stop_chat))
+        .route("/fs/reveal", post(reveal_file_or_folder))
+        .route("/fs/open", post(open_file_with_os))
+        .route("/fs/raw", get(fs_raw_handler))
+        .route("/fs/action", post(fs_action_handler))
+        .route("/fs/tree", get(fs_tree))
+        .route("/fs/read", get(fs_read))
+        .route("/fs/write", post(fs_write))
+        .route("/fs/search", get(fs_search))
+        .route("/fs/locate", get(fs_locate))
+        .route("/terminal/list", get(terminal_list))
+        .route("/terminal/create", post(terminal_create))
+        .route("/terminal/input", post(terminal_input))
+        .route("/terminal/close", post(terminal_close))
+        .route("/terminal/ws", get(terminal_ws_handler))
+        .route("/chat/queue", get(get_chat_queue).post(update_chat_queue))
+        .route(
+            "/chat/steer",
+            post(chat_steer)
+                .delete(chat_steer_cancel)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/chat/steer/cancel",
+            post(chat_steer_cancel).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route("/chat/active", get(active_chat_sessions))
+        .route("/runtime/sessions", get(runtime_sessions))
+        .route("/system-notify", post(system_notify))
+        .route("/notify-focus", get(get_notify_focus))
+        // Restore unanswered approval / user-input cards after refresh or switch.
+        .route("/chat/pending", get(chat_pending))
+        // Reattach to a turn started by another client (OpenAI API / another tab).
+        .route("/chat/watch", get(chat_watch))
+        // 跨实例增量推送（会话行/活动/待交互卡片）——所有实例共用的唯一全局信道。
+        // 经 helper 挂载：与路由级测试共用同一份定义。
+        .merge(with_global_events_route(Router::<AppState>::new()))
+        .route("/chat/permission", post(chat_permission))
+        .route("/chat/user-input", post(chat_user_input))
+        // OpenAI / Anthropic compatible surface (same token gate as /chat).
+        .route("/v1/models", get(compat_api::openai_list_models))
+        // Catch-all so public ids like `JeikCode/GLM-5.2` work (not only one path segment).
+        .route("/v1/models/*id", get(compat_api::openai_get_model))
+        // Anthropic-shaped model list (same catalog; different JSON envelope).
+        .route(
+            "/v1/anthropic/models",
+            get(compat_api::anthropic_list_models),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(compat_api::openai_chat_completions)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/responses",
+            post(compat_api::openai_responses)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/messages",
+            post(compat_api::anthropic_messages)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route("/v1/sessions", get(compat_api::list_sessions))
+        .route("/v1/sessions/:id", get(compat_api::get_session))
+        .route(
+            "/approval_mode",
+            get(live_api::approval_mode_get).post(live_api::approval_mode_set),
+        )
+        // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
+        .route("/tunnel/status", get(get_tunnel_status))
+        // Live session API (阶段②)
+        .route("/live", get(live_api::live_stream))
+        .route(
+            "/live/message",
+            post(live_api::live_message)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route("/live/stop", post(live_api::live_stop))
+        .route("/live/permission", post(live_api::live_permission))
+        .route("/live/user-input", post(live_api::live_user_input))
+        .route("/live/provider", post(live_api::live_provider))
+        .route("/live/mode", post(live_api::live_mode))
+        .route("/live/cancel", post(live_api::live_cancel))
+        .route("/live/compact", post(live_api::live_compact))
+        .route("/live/command", post(live_api::live_command))
+        .route("/live/mcp/trust", post(live_api::live_mcp_trust))
+        .route("/command", post(commands::run_command))
+        .route(
+            "/live/switch_session",
+            post(live_api::live_switch_session_endpoint),
+        )
+        .route(
+            "/live/reasoning_effort",
+            post(live_api::live_reasoning_effort),
+        )
+        // Skills API
+        .route("/skills", get(get_skills))
+        .route("/api/skills", get(get_skills))
+        // Filesystem API
+        .route("/fs/list", get(fs_tree))
+        .route("/fs/mkdir", post(fs_mkdir))
+        .route("/fs/pick_dir", post(fs_pick_dir))
+        .route(
+            "/fs/upload",
+            post(fs_upload::fs_upload).layer(DefaultBodyLimit::disable()),
+        )
+        // Git API (WebUI source control & branch graph)
+        .route("/git/repos", get(api_git::get_git_repos))
+        .route("/git/branches", get(api_git::get_git_branches))
+        .route("/git/graph", get(api_git::get_git_graph))
+        .route("/git/checkout", post(api_git::git_checkout))
+        .route("/git/commit-detail", get(api_git::get_git_commit_detail))
+        .route("/git/file-diff", get(api_git::get_git_file_diff))
+        .route("/git/status", get(api_git::get_git_status))
+        .route("/git/stage", post(api_git::git_stage))
+        .route("/git/unstage", post(api_git::git_unstage))
+        .route("/git/discard", post(api_git::git_discard))
+        .route("/git/commit", post(api_git::git_commit))
+        .route("/git/push", post(api_git::git_push))
+        .route("/git/pull", post(api_git::git_pull))
+        .route("/git/fetch", post(api_git::git_fetch))
+        .route("/git/action", post(api_git::git_action))
+        .route("/git/working-diff", get(api_git::get_git_working_diff))
+        // Git Webhook 内部绑定配置管理 API（受 WebUI 登录 Token 保护）
+        .route(
+            "/api/git/binding",
+            get(api_git_webhook::get_git_binding_api).post(api_git_webhook::save_git_binding_api),
+        )
+        .route("/api/git/test", post(api_git_webhook::test_git_binding_api))
+        .route(
+            "/api/git/generate-token",
+            post(api_git_webhook::generate_app_token_api),
+        )
+        // MCP API
+        .route("/mcp", get(mcp_status))
+        .route("/mcp/status", get(mcp_status))
+        .route("/mcp/reload", post(mcp_reload))
+        .route("/api/mcp", get(mcp_status))
+        .route("/api/mcp/status", get(mcp_status))
+        .route("/api/mcp/reload", post(mcp_reload))
+        // Unified capability surface (MCP + skills, GLOBAL + PROJECT scopes)
+        .route("/capabilities", get(capabilities))
+        .route("/capabilities/toggle", post(capabilities_toggle))
+        // Config API (P0)
+        .route("/config", get(api_config::get_config))
+        .route("/config/reload", post(api_config::reload_config))
+        .route("/config/language", post(api_config::set_language))
+        .route(
+            "/api/remote-access",
+            get(api_config::get_remote_access).post(api_config::post_remote_access),
+        )
+        // Provider API (P0)
+        .route(
+            "/providers",
+            get(api_provider::get_providers).post(api_provider::create_provider),
+        )
+        .route(
+            "/providers/upstream-models",
+            post(api_provider::list_upstream_models),
+        )
+        .route(
+            "/providers/:name",
+            patch(api_provider::patch_provider).delete(api_provider::delete_provider),
+        )
+        .route(
+            "/providers/:name/default",
+            post(api_provider::set_default_provider),
+        )
+        .route(
+            "/providers/:name/thinking",
+            patch(api_provider::patch_thinking),
+        )
+        .route(
+            "/provider-accounts",
+            post(api_provider::create_or_update_provider_account),
+        )
+        .route(
+            "/provider-accounts/:id",
+            put(api_provider::create_or_update_provider_account)
+                .delete(api_provider::delete_provider_account),
+        );
+    let protected = api_update::register_update_routes(protected)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_token::require_webui_token,
+        ))
+        // App 远程访问 user_id 校验（仅 /app 模式启用）。
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_token::require_app_user_id,
+        ));
+
+    let active_chats = state.active_chats.clone();
+    let router_slot = state.http_router.clone();
+    let app = public
+        .merge(protected)
+        .with_state(state)
+        .layer(axum::middleware::from_fn(activity_tracker_middleware))
+        .layer(axum::Extension(last_activity.clone()))
+        .layer(cors_layer());
+    let _ = router_slot.set(app.clone());
+
+    // Spawn idle timeout watchdog task
+    spawn_idle_timeout_task(
+        idle_timeout_secs,
+        last_activity,
+        active_connections,
+        active_chats,
+        shutdown_tx,
+    );
+    if !quiet {
+        if idle_timeout_secs > 0 {
+            println!("Idle timeout: {} minutes", idle_timeout_secs / 60);
+        } else {
+            println!("Idle timeout: disabled");
+        }
+    }
+
+    // Default to loopback-only for security. The daemon hosts chat / file-edit /
+    // tool-execution endpoints that should not be reachable from another host on
+    // the LAN without explicit configuration (PR #82 briefly broke this by
+    // hard-coding 0.0.0.0; see commit `tianchang fix(daemon): harden daemon chat
+    // access` for the original loopback-default rationale).
+    //
+    // Users can override the bind address via --host <ip>. When binding a
+    // non-loopback address, a security warning is printed. For production use,
+    // consider running a reverse proxy in front instead.
+    let addr = format!("{host}:{port}");
+    // 非 loopback 的安全警告即便在 quiet 模式也应输出（仅独立二进制可能触发，
+    // 进程内 webui 恒为 127.0.0.1）。
+    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        eprintln!(
+            "Warning: binding to non-loopback address '{}'. \
+            The daemon exposes sensitive endpoints (chat, file-edit, tool-execution). \
+            Ensure the network is trusted or use a reverse proxy with authentication.",
+            host
+        );
+    }
+    if dangerous_tools_enabled() {
+        eprintln!(
+            "Warning: {}=1 enables bash and write-capable daemon tools.",
+            DANGEROUS_TOOLS_ENV
+        );
+    }
+    // 启动横幅（监听地址 + API 端点清单）仅在非 quiet 模式打印。TUI 内 `/webui`
+    // 走 quiet 路径，由 ensure_server_and_open 单独返回一行干净的浏览器地址。
+    if !quiet {
+        println!("JeikCode API server listening on http://{}", addr);
+        println!("\nAPI endpoints:");
+        println!("  GET    /health                        - Health check");
+        println!("  GET    /project                        - Get current working directory");
+        println!(
+            "  POST   /cd                             - Change working directory (like /cd command)"
+        );
+        println!("  GET    /projects                       - List historical projects");
+        println!("  GET    /projects/sidebar               - Pinned and hidden sidebar projects");
+        println!("  POST   /projects/sidebar/hide          - Hide a project from the sidebar");
+        println!("  POST   /projects/sidebar/show          - Pin a directory into the sidebar");
+        println!("  POST   /projects/sidebar/reveal        - Unhide a project (live activity)");
+        println!("  GET    /projects/:hash/sessions        - List sessions in a project");
+        println!("  GET    /projects/:hash/sessions/:id    - Get session detail");
+        println!("  GET    /projects/:hash/sessions/:id/lineage - Get fork lineage and branches");
+        println!("  DELETE /projects/:hash/sessions/:id    - Delete a session");
+        println!("  PATCH  /projects/:hash/sessions/:id/rename - Rename a session");
+        println!("  POST   /projects/:hash/sessions/:id/repair - Inspect or repair a session");
+        println!("  GET    /sessions                       - List all sessions (cross-project)");
+        println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
+        println!("  GET    /models                         - List available models");
+        println!("  POST   /chat                           - Stream chat response (SSE)");
+        println!("  GET    /v1/models                      - OpenAI/Responses model list (id = account/model)");
+        println!("  GET    /v1/models/*id                  - OpenAI-compatible model get");
+        println!("  GET    /v1/anthropic/models            - Anthropic-compatible model list (id = account/model)");
+        println!("  POST   /v1/chat/completions            - OpenAI Chat Completions (model = account/model)");
+        println!("  POST   /v1/responses                   - OpenAI Responses API (model = account/model)");
+        println!(
+            "  POST   /v1/messages                    - Anthropic Messages (model = account/model)"
+        );
+        println!("  GET    /v1/sessions[?user=key]         - List sessions (by user session key)");
+        println!("  GET    /v1/sessions/:id                - Get session by id or user key");
+        println!("  GET    /config                         - Get sanitized config");
+        println!("  POST   /config/reload                  - Reload config from disk");
+        println!("  GET    /providers                      - List providers");
+        println!("  POST   /providers                      - Create/replace provider");
+        println!("  POST   /providers/upstream-models      - List upstream model ids");
+        println!("  PATCH  /providers/:name                - Partially update provider");
+        println!("  DELETE /providers/:name                - Delete provider");
+        println!("  POST   /providers/:name/default        - Set default provider");
+        println!("  PATCH  /providers/:name/thinking       - Update thinking settings");
+        println!("  GET    /skills                         - List user-invocable skills");
+        println!("\nChange directory body:");
+        println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
+        println!("\nChat request body:");
+        println!("  {{\"message\": \"your question\", \"provider\": \"optional\"}}");
+    }
+
+    // Step 9: Bind listener (R4.1 gate). 进程内 webui 已预先绑定并传入 listener
+    // （拿到真实端口、支持动态端口），此处直接复用、跳过内部 bind；独立二进制
+    // 走 bind 分支，bind 失败仍按 R4.4 发 OpenJeikcode 再退出。
+    //
+    // When the requested host is IPv4 unspecified (`0.0.0.0`), also try to bind
+    // `[::]:port` so dual-stack hosts accept both v4 and v6 clients (IPv4-only
+    // `0.0.0.0` does not cover IPv6). Failure to bind v6 is non-fatal.
+    let (listener, dual_stack_v6) = match prebound_listener {
+        Some(l) => (l, prebound_dual_stack_v6),
+        None => {
+            let primary = match bind_restart_listener(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Fatal: failed to bind to {}: {}", addr, e);
+                    // Step 12: On bind failure, still emit OpenJeikcode (R4.4) then exit
+                    CurrentContext::scope(
+                        CurrentContext {
+                            mode: Some(startup_mode),
+                            repo_origin: Some(repo_origin.clone()),
+                            session_id: None,
+                            ..CurrentContext::default()
+                        },
+                        || async {
+                            telemetry.track(Event::OpenJeikcode {
+                                dangerously_skip_permissions: false,
+                            });
+                        },
+                    )
+                    .await;
+                    telemetry.shutdown(Duration::from_millis(500)).await;
+                    std::process::exit(1);
+                }
+            };
+            let secondary = if host == "0.0.0.0" {
+                let v6_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+                match api_config::bind_listener(v6_addr, true) {
+                    Ok(l) => {
+                        if !quiet {
+                            println!("Also listening on http://[::]:{port} (IPv6 dual-stack)");
+                        }
+                        Some(l)
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!(
+                                "Note: IPv6 bind on [::]:{port} failed ({e}); serving IPv4 only"
+                            );
+                        }
+                        None
+                    }
+                }
+            } else if host == "::" || host == "[::]" {
+                let v4_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+                match api_config::bind_listener(v4_addr, false) {
+                    Ok(l) => {
+                        if !quiet {
+                            println!("Also listening on http://0.0.0.0:{port} (IPv4 dual-stack)");
+                        }
+                        Some(l)
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!(
+                                "Note: IPv4 bind on 0.0.0.0:{port} failed ({e}); serving IPv6 only"
+                            );
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (primary, secondary)
+        }
+    };
+    let focus_port = listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .unwrap_or(port);
+    publish_notify_focus_port(focus_port);
+
+    // Print client-facing serve hints last so they stay at the bottom of
+    // startup output (below the API catalog and dual-stack notes).
+    // Respect quiet the same way the API catalog does.
+    if !quiet {
+        if let Some(footer) = startup_footer {
+            if !footer.is_empty() {
+                // Leading blank line separates from the API catalog above.
+                // Match format_serve_banner: connection info goes to stderr.
+                eprintln!();
+                eprint!("{footer}");
+                if !footer.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+        }
+    }
+
+    // Steps 10-11: Enter CurrentContext scope and emit OpenJeikcode (R4.1, R4.2)
+    CurrentContext::scope(
+        CurrentContext {
+            mode: Some(startup_mode),
+            repo_origin: Some(repo_origin.clone()),
+            session_id: None,
+            ..CurrentContext::default()
+        },
+        || async {
+            telemetry.track(Event::OpenJeikcode {
+                dangerously_skip_permissions: false,
+            });
+        },
+    )
+    .await;
+
+    // Step 13: Serve with graceful shutdown (R10.1-R10.5).
+    // Optional second listener for IPv6 when dual-stack was requested.
+    // Keep a JoinHandle so if the primary (IPv4) serve returns for any reason
+    // (error or graceful), we abort the v6 task and do not leave a listener
+    // running while the process tears down.
+    let v6_task = if let Some(v6_listener) = dual_stack_v6 {
+        let app_v6 = app.clone();
+        let shutdown_rx_v6 = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(v6_listener, app_v6)
+                .with_graceful_shutdown(shutdown_signal(shutdown_rx_v6))
+                .await
+            {
+                tracing::error!(?e, "axum::serve (IPv6) error");
+            }
+        }))
+    } else {
+        None
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await
+        .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
+
+    if let Some(handle) = v6_task {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // Reap project-scoped and session-scoped stdio MCP trees with this host.
+    zap_capabilities::mcp::shutdown_all_mcp_pools().await;
+
+    // Step 14: Final telemetry flush before process exit (R10.2-R10.5)
+    telemetry.shutdown(Duration::from_millis(500)).await;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod fs_list_tests {
+    use super::*;
+
+    #[test]
+    fn expands_tilde() {
+        if let Some(home) = zap_config::util::real_home_dir() {
+            assert_eq!(normalize_dir_arg("~"), home);
+            assert_eq!(normalize_dir_arg("~/x"), home.join("x"));
+        }
+    }
+
+    #[test]
+    fn lists_subdirs_of_temp() {
+        // create a temp dir with a child dir + a file; expect only the child dir name
+        let base =
+            std::env::temp_dir().join(format!("jeikcode_fslist_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(base.join("childdir"));
+        let _ = std::fs::write(base.join("afile.txt"), b"x");
+        let dirs = list_subdirs(&base).unwrap();
+        assert!(dirs.contains(&"childdir".to_string()));
+        assert!(!dirs.iter().any(|d| d == "afile.txt"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn errors_on_missing_dir() {
+        assert!(list_subdirs(std::path::Path::new("/no/such/dir/xyz123")).is_err());
+    }
+
+    #[test]
+    fn lists_multilingual_subdirs_and_files() {
+        use std::fs;
+        let base =
+            std::env::temp_dir().join(format!("jeikcode_i18n_fs_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let subdirs = [
+            "中文目录",
+            "Tiếng_Việt_Thư_Mục",
+            "日本語フォルダ",
+            "مجلد_عربي",
+        ];
+        for d in &subdirs {
+            fs::create_dir_all(base.join(d)).unwrap();
+        }
+
+        let files = ["测试文件.txt", "tập_tin.md", "ファイル.rs"];
+        for f in &files {
+            fs::write(base.join(f), b"content").unwrap();
+        }
+
+        let listed_dirs = list_subdirs(&base).unwrap();
+        for d in &subdirs {
+            assert!(listed_dirs.contains(&d.to_string()), "missing subdir {d}");
+        }
+
+        let listed_files = list_files(&base).unwrap();
+        for f in &files {
+            assert!(listed_files.contains(&f.to_string()), "missing file {f}");
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decode_native_picked_path_handles_base64_and_utf8_safely() {
+        use base64::Engine;
+        // 1. Base64 编码的全球多语言路径（模拟 Windows PowerShell 管道输出）
+        for raw_path in [
+            r"D:\桌面\项目abc",
+            r"C:\Users\User\Dự_án_Tiếng_Việt",
+            r"E:\日本語\ワークスペース",
+            r"F:\مجلد\مشروع",
+        ] {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(raw_path.as_bytes());
+            let decoded = decode_native_picked_path(b64.as_bytes());
+            assert_eq!(decoded.as_deref(), Some(raw_path));
+        }
+
+        // 2. 纯 UTF-8 文本（模拟 macOS/Linux 原生弹窗输出）
+        assert_eq!(
+            decode_native_picked_path("  /Users/alice/桌面/项目  ".as_bytes()),
+            Some("/Users/alice/桌面/项目".to_string())
+        );
+
+        // 3. 损坏/乱码路径安全拒绝（含 U+FFFD 或空白）
+        assert_eq!(decode_native_picked_path("".as_bytes()), None);
+        assert_eq!(decode_native_picked_path("   \r\n".as_bytes()), None);
+        assert_eq!(
+            decode_native_picked_path("D:\\bad\u{FFFD}path".as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_dir_arg_cleans_verbatim_multibyte_paths() {
+        assert_eq!(
+            normalize_dir_arg(r"\\?\D:\桌面\项目"),
+            PathBuf::from(r"D:\桌面\项目")
+        );
+        assert_eq!(
+            normalize_dir_arg(r"//?/D:\桌面\项目"),
+            PathBuf::from(r"D:\桌面\项目")
+        );
+        assert_eq!(
+            normalize_dir_arg(r"/?/D:\桌面\项目"),
+            PathBuf::from(r"D:\桌面\项目")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_turn_policy_api_is_low_confirm() {
+        let p = ChatTurnPolicy::resolve(
+            false,
+            ChatTurnOrigin::Api,
+            SessionMode::Channel,
+            true,
+            "0.0.0.0",
+        );
+        assert_eq!(p.origin, ChatTurnOrigin::Api);
+        assert!(!p.interactive_permission);
+        assert!(!p.interactive_user_input);
+        assert_eq!(
+            p.force_approval_mode,
+            Some(crate::approval_mode::ApprovalMode::Auto)
+        );
+    }
+
+    #[test]
+    fn chat_turn_policy_webui_native_is_interactive() {
+        let p = ChatTurnPolicy::resolve(
+            false,
+            ChatTurnOrigin::Native,
+            SessionMode::Webui,
+            true, // token-protected
+            "0.0.0.0",
+        );
+        assert_eq!(p.origin, ChatTurnOrigin::Native);
+        assert!(p.interactive_permission);
+        assert!(p.interactive_user_input);
+        assert!(p.force_approval_mode.is_none());
+    }
+
+    #[test]
+    fn chat_turn_policy_webui_lan_no_token_still_interactive() {
+        // LAN serve without token must still honor Build / Accept Edits UI —
+        // previously this path set dangerously_skip_permissions and auto-ran
+        // risky bash while the mode pill said "改动前逐个审批".
+        let p = ChatTurnPolicy::resolve(
+            false,
+            ChatTurnOrigin::Native,
+            SessionMode::Webui,
+            false, // --no-token
+            "0.0.0.0",
+        );
+        assert_eq!(p.origin, ChatTurnOrigin::Native);
+        assert!(
+            p.interactive_permission,
+            "WebUI must register /chat/permission responder on LAN"
+        );
+        assert!(p.interactive_user_input);
+        assert!(
+            p.force_approval_mode.is_none(),
+            "WebUI must not force Auto; mode pill owns approval_mode"
+        );
+        assert!(client_interactive_permission(
+            SessionMode::Webui,
+            false,
+            "0.0.0.0"
+        ));
+    }
+
+    #[test]
+    fn chat_turn_policy_api_stays_automation_on_lan() {
+        // API policy is independent of WebUI: always Auto, no modals.
+        let p = ChatTurnPolicy::resolve(
+            false,
+            ChatTurnOrigin::Api,
+            SessionMode::Webui, // header irrelevant for API origin
+            false,
+            "0.0.0.0",
+        );
+        assert_eq!(p.origin, ChatTurnOrigin::Api);
+        assert!(!p.interactive_permission);
+        assert!(!p.interactive_user_input);
+        assert_eq!(
+            p.force_approval_mode,
+            Some(crate::approval_mode::ApprovalMode::Auto)
+        );
+    }
+
+    #[test]
+    fn chat_turn_policy_yolo_overrides_native_webui() {
+        let p = ChatTurnPolicy::resolve(
+            true,
+            ChatTurnOrigin::Native,
+            SessionMode::Webui,
+            true,
+            "127.0.0.1",
+        );
+        assert!(!p.interactive_permission);
+        assert!(!p.interactive_user_input);
+        assert_eq!(
+            p.force_approval_mode,
+            Some(crate::approval_mode::ApprovalMode::Auto)
+        );
+    }
+
+    #[test]
+    fn chat_resolves_new_schema_model_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "JeikCode-deepseek-v4-flash",
+            "provider_accounts": {
+                "JeikCode": {
+                    "provider": "openai",
+                    "base_url": ""
+                }
+            },
+            "models": {
+                "JeikCode-deepseek-v4-flash": {
+                    "account": "JeikCode",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) =
+            resolve_chat_provider(&config, Some("JeikCode-deepseek-v4-flash".into())).unwrap();
+        assert_eq!(selection, "JeikCode-deepseek-v4-flash");
+        assert_eq!(provider.model, "deepseek-v4-flash");
+        assert_eq!(provider.provider_type, "openai");
+    }
+
+    #[test]
+    fn chat_defaults_to_effective_model_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "stale-legacy-default",
+            "default_model": "JeikCode-GLM-5.2",
+            "provider_accounts": {
+                "JeikCode": {
+                    "provider": "openai",
+                    "base_url": ""
+                }
+            },
+            "models": {
+                "JeikCode-GLM-5.2": {
+                    "account": "JeikCode",
+                    "model": "GLM-5.2",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) = resolve_chat_provider(&config, None).unwrap();
+        assert_eq!(selection, "JeikCode-GLM-5.2");
+        assert_eq!(provider.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn chat_still_resolves_legacy_provider() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let (selection, provider) = resolve_chat_provider(&config, None).unwrap();
+        assert_eq!(selection, "claude");
+        assert_eq!(provider.model, "claude-opus-4-7");
+        assert_eq!(provider.provider_type, "claude");
+    }
+
+    #[test]
+    fn chat_rejects_unknown_selection() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let error = resolve_chat_provider(&config, Some("missing".into())).unwrap_err();
+        assert_eq!(error.to_string(), "model 'missing' not found");
+    }
+
+    #[test]
+    fn resolve_accepts_public_account_slash_model_id() {
+        // CodingPlan catalog keys are hyphenated; public API uses account/model.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "JeikCode-GLM-5.2",
+            "provider_accounts": {
+                "JeikCode": {
+                    "provider": "openai",
+                    "base_url": ""
+                }
+            },
+            "models": {
+                "JeikCode-GLM-5.2": {
+                    "account": "JeikCode",
+                    "model": "GLM-5.2",
+                    "context_window": 128000
+                },
+                "JeikCode-deepseek-v4-flash": {
+                    "account": "JeikCode",
+                    "model": "deepseek-v4-flash",
+                    "context_window": 128000
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            public_compat_model_id("JeikCode", "GLM-5.2"),
+            "JeikCode/GLM-5.2"
+        );
+
+        // Public form
+        let (sel, p) = resolve_chat_provider(&config, Some("JeikCode/GLM-5.2".into())).unwrap();
+        assert_eq!(sel, "JeikCode-GLM-5.2");
+        assert_eq!(p.model, "GLM-5.2");
+
+        // Legacy hyphen selection still works
+        let (sel2, _) =
+            resolve_chat_provider(&config, Some("JeikCode-deepseek-v4-flash".into())).unwrap();
+        assert_eq!(sel2, "JeikCode-deepseek-v4-flash");
+
+        // Wire model alone
+        let (sel3, _) = resolve_chat_provider(&config, Some("deepseek-v4-flash".into())).unwrap();
+        assert_eq!(sel3, "JeikCode-deepseek-v4-flash");
+    }
+
+    #[test]
+    fn resolve_public_id_for_legacy_provider() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": {
+                    "type": "claude",
+                    "model": "claude-opus-4-7"
+                }
+            }
+        }))
+        .unwrap();
+
+        let (sel, p) =
+            resolve_chat_provider(&config, Some("claude/claude-opus-4-7".into())).unwrap();
+        assert_eq!(sel, "claude");
+        assert_eq!(p.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn models_endpoint_lists_new_schema_and_folded_codingplan_models() {
+        // Selectable models living ONLY in the new schema (models/provider_accounts),
+        // NOT in [providers.*] — the `/models` endpoint used to iterate only
+        // `config.providers` and silently dropped these from the webui picker.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_model": "JeikCode-GLM-5.2",
+            "provider_accounts": { "JeikCode": { "provider": "openai", "base_url": "" } },
+            "models": {
+                "JeikCode-GLM-5.2": { "account": "JeikCode", "model": "GLM-5.2", "context_window": 128000 },
+                "JeikCode-Qwen": { "account": "JeikCode", "model": "Qwen", "context_window": 128000 }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        assert!(
+            ids.contains(&"JeikCode-GLM-5.2"),
+            "new-schema model listed: {ids:?}"
+        );
+        assert!(ids.contains(&"JeikCode-Qwen"), "{ids:?}");
+        let glm = models
+            .iter()
+            .find(|m| m.provider == "JeikCode-GLM-5.2")
+            .unwrap();
+        assert!(glm.is_default, "effective selection is the default");
+        assert_eq!(glm.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn models_endpoint_still_lists_legacy_providers() {
+        // No models lost: a pure old-schema config ([providers.*]) is unchanged.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider": "claude",
+            "providers": {
+                "claude": { "type": "claude", "model": "claude-opus-4-7" },
+                "glm": { "type": "openai", "model": "z-ai/glm-5" }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let ids: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
+        assert!(ids.contains(&"claude") && ids.contains(&"glm"), "{ids:?}");
+        assert!(
+            models
+                .iter()
+                .find(|m| m.provider == "claude")
+                .unwrap()
+                .is_default,
+            "default_provider maps to the default selection"
+        );
+    }
+
+    #[test]
+    fn delete_session_errors_preserve_storage_semantics() {
+        assert!(valid_project_bucket("0123456789abcdef"));
+        assert!(!valid_project_bucket("../outside"));
+
+        let active = anyhow::Error::new(SessionStoreError::SessionInUse {
+            id: "active".to_string(),
+            path: PathBuf::from("active.lease"),
+        });
+        let (status, Json(body)) = classify_delete_session_error(&active);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code.as_deref(), Some("SESSION_IN_USE"));
+        assert!(!body.error.contains("active.lease"));
+
+        let missing = anyhow::Error::new(SessionStoreError::NotFound {
+            path: PathBuf::from("missing.meta"),
+        });
+        let (status, Json(body)) = classify_delete_session_error(&missing);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.code.as_deref(), Some("SESSION_NOT_FOUND"));
+        assert!(!body.error.contains("missing.meta"));
+
+        let invalid = anyhow::Error::new(SessionStoreError::InvalidId {
+            id: "../outside".to_string(),
+            reason: "path separators are forbidden",
+        });
+        let (status, Json(body)) = classify_delete_session_error(&invalid);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("INVALID_SESSION"));
+        assert!(!body.error.contains("../outside"));
+
+        let unexpected = anyhow::anyhow!("unexpected storage failure");
+        let (status, Json(body)) = classify_delete_session_error(&unexpected);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.code.as_deref(), Some("DELETE_FAILED"));
+        assert!(!body.error.contains("unexpected storage failure"));
+    }
+
+    #[tokio::test]
+    async fn get_session_lineage_rejects_invalid_project_and_reports_not_found() {
+        let invalid_resp = get_session_lineage(Path(("../invalid".into(), "s1".into())))
+            .await
+            .into_response();
+        assert_eq!(invalid_resp.status(), StatusCode::BAD_REQUEST);
+
+        let not_found_resp = get_session_lineage(Path((
+            "0123456789abcdef".into(),
+            "nonexistent_session".into(),
+        )))
+        .await
+        .into_response();
+        assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn session_repair_dry_run_does_not_write_and_apply_restores_strict_load() {
+        use zap_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+        use zap_kernel::message::{Message, SessionSnapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = NativeSessionManager::with_root(dir.path());
+        let lease = manager.acquire_lease("s1").unwrap();
+        let snapshot = SessionSnapshot::new(vec![Message::user("recover me")]);
+        let mut meta = SessionMeta::new("s1", "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        assert!(matches!(
+            repair_session_with_manager(&manager, "s1", false),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        drop(lease);
+        std::fs::remove_file(manager.presentation_path("s1").unwrap()).unwrap();
+
+        let inspected = repair_session_with_manager(&manager, "s1", false).unwrap();
+        assert_eq!(inspected.status, "repairable_missing_presentation");
+        assert!(!inspected.applied);
+        assert_eq!(inspected.metadata, "valid");
+        assert_eq!(inspected.snapshot, "valid");
+        assert_eq!(inspected.presentation, "missing");
+        assert_eq!(inspected.message_count, Some(1));
+        assert_eq!(inspected.transcript, "missing");
+        assert!(!manager.presentation_path("s1").unwrap().exists());
+
+        let repaired = repair_session_with_manager(&manager, "s1", true).unwrap();
+        assert_eq!(repaired.status, "repaired");
+        assert!(repaired.applied);
+        assert_eq!(
+            manager.load_native_session("s1").unwrap().snapshot,
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_session_repair_error_is_non_destructive_and_redacted() {
+        let error = SessionStoreError::Corrupt {
+            kind: "presentation",
+            message: "private corrupt bytes".into(),
+        };
+        let response = classify_repair_session_error(&error, "missing");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "not_repairable");
+        assert_eq!(body["metadata"], "valid");
+        assert_eq!(body["snapshot"], "valid");
+        assert_eq!(body["presentation"], "corrupt");
+        assert_eq!(body["transcript"], "missing");
+        assert!(!String::from_utf8_lossy(&bytes).contains("private corrupt bytes"));
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_is_not_misreported_as_a_missing_session() {
+        let response = classify_repair_session_error(
+            &SessionStoreError::NotFound {
+                path: PathBuf::from("existing.snapshot"),
+            },
+            "present",
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "not_repairable");
+        assert_eq!(body["metadata"], "valid");
+        assert_eq!(body["snapshot"], "missing");
+        assert_eq!(body["presentation"], "unchecked");
+        assert_eq!(body["transcript"], "present");
+    }
+
+    #[tokio::test]
+    async fn real_metadata_error_kinds_are_structured_as_not_repairable() {
+        let cases = [
+            (
+                SessionStoreError::Corrupt {
+                    kind: "session meta",
+                    message: "bad json".into(),
+                },
+                "corrupt",
+            ),
+            (
+                SessionStoreError::FutureSchema {
+                    kind: "session meta",
+                    found: 9,
+                    supported: 1,
+                },
+                "future_schema",
+            ),
+            (
+                SessionStoreError::TooLarge {
+                    kind: "session meta",
+                    limit: 10,
+                    actual: 11,
+                },
+                "too_large",
+            ),
+        ];
+
+        for (error, expected_state) in cases {
+            let response = classify_repair_session_error(&error, "missing");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["status"], "not_repairable");
+            assert_eq!(body["metadata"], expected_state);
+            assert_eq!(body["snapshot"], "unchecked");
+            assert_eq!(body["presentation"], "unchecked");
+        }
+    }
+
+    pub(crate) struct ScopedChatHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        /// Thread-local home override instead of `set_var("JEIKCODE_HOME")`:
+        /// runtime env stays constant (the resolved-once production path depends
+        /// on that) and parallel tests keep the real home.
+        _home: zap_config::test_util::IsolatedHome,
+    }
+
+    impl ScopedChatHome {
+        pub(crate) fn new() -> Self {
+            let lock = jeikcode_home_test_lock()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let dir = tempfile::tempdir().expect("chat test home");
+            let home = zap_config::test_util::IsolatedHome::at(dir.path());
+            Self {
+                _lock: lock,
+                _dir: dir,
+                _home: home,
+            }
+        }
+    }
+
+    fn chat_test_telemetry(home: &ScopedChatHome) -> Arc<Telemetry> {
+        Telemetry::init(
+            zap_telemetry::ResolvedConfig {
+                state: TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                jeikcode_dir: home._dir.path().to_path_buf(),
+            },
+            "test".into(),
+        )
+    }
+
+    pub(crate) fn chat_test_state(home: &ScopedChatHome) -> AppState {
+        let working_dir = home._dir.path().to_path_buf();
+        let (shutdown_tx, _) = watch::channel(false);
+        AppState {
+            project: Arc::new(RwLock::new(ProjectState {
+                working_dir: working_dir.clone(),
+                previous_dir: None,
+                recent_dirs: Vec::new(),
+                name: "chat-test".into(),
+            })),
+            active_chats: ActiveChatRegistry::default(),
+            mcp_registry: Arc::new(RwLock::new(Arc::new(McpRegistry::new()))),
+            mcp_pool: zap_capabilities::mcp::ProjectMcpPool::global(),
+            daemon_instance_id: Arc::from("chat-test-instance"),
+            telemetry: chat_test_telemetry(home),
+            repo_origin: detect_repo_origin(&working_dir),
+            shutdown_tx,
+            last_activity: Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms())),
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            webui_tokens: auth_token::WebuiTokenStore::default(),
+            enforce_token: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initial_enforce_token: false,
+            app_user_id: String::new(),
+            pending_permissions: permission_bridge::PermissionResponders::new(),
+            pending_user_inputs: permission_bridge::UserInputResponders::new(),
+            bind_host: "127.0.0.1".into(),
+            bind_port: 13456,
+            bind_working_dir: working_dir.clone(),
+            webui_cookie_name: auth_token::webui_cookie_name(13456),
+            yolo: false,
+            token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            http_router: Arc::new(std::sync::OnceLock::new()),
+            extra_remote: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn new_chat_assignment_is_sent_only_after_the_native_aggregate_is_durable() {
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        publish_chat_session_assignment(
+            &working_dir,
+            session_id,
+            true,
+            &event_tx,
+            Some("jeik"),
+            None,
+        )
+        .unwrap();
+
+        let manager = NativeSessionManager::for_project(&working_dir);
+        let loaded = manager.load_native_session(session_id).unwrap();
+        assert!(loaded.snapshot.messages.is_empty());
+        assert_eq!(loaded.meta.name, "jeik");
+        assert!(loaded.meta.user_renamed);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ChatEvent::SessionAssigned { session_id: assigned }) if assigned == session_id
+        ));
+    }
+
+    #[test]
+    fn protocol_bind_dir_stays_on_serve_cwd_when_webui_switches_project() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let bind = state.bind_working_dir.clone();
+        let other = home._dir.path().join("other-project");
+        std::fs::create_dir_all(&other).unwrap();
+        {
+            let mut project = state.project.try_write().expect("project lock");
+            crate::update_project_state(&mut project, &other);
+        }
+        assert_eq!(state.bind_working_dir, bind);
+        assert_ne!(
+            state.project.try_read().expect("project lock").working_dir,
+            state.bind_working_dir
+        );
+    }
+
+    #[test]
+    fn new_chat_assignment_seeds_provisional_title_when_no_title_given() {
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let session_id = "33333333-3333-4333-8333-333333333333";
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        publish_chat_session_assignment(
+            &working_dir,
+            session_id,
+            true,
+            &event_tx,
+            None,
+            Some("帮我写一个快速排序算法"),
+        )
+        .unwrap();
+
+        let manager = NativeSessionManager::for_project(&working_dir);
+        let loaded = manager.load_native_session(session_id).unwrap();
+        assert_eq!(loaded.meta.name, "帮我写一个快速排序算法");
+        assert!(!loaded.meta.user_renamed);
+        assert!(!loaded.meta.ai_named);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ChatEvent::SessionAssigned { session_id: assigned }) if assigned == session_id
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ChatEvent::SessionRenamed { session_id: assigned, name }) if assigned == session_id && name == "帮我写一个快速排序算法"
+        ));
+    }
+
+    #[test]
+    fn failed_new_chat_persistence_does_not_publish_a_session_id() {
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let sessions_root = NativeSessionManager::sessions_root();
+        std::fs::write(&sessions_root, b"block session directory creation").unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let result = publish_chat_session_assignment(
+            &working_dir,
+            "22222222-2222-4222-8222-222222222222",
+            true,
+            &event_tx,
+            Some("default"),
+            None,
+        );
+
+        assert!(result.is_err());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacing_project_mcp_registry_invalidates_the_cached_registry() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = state.project.read().await.working_dir.clone();
+        let stale = state.mcp_pool.registry(&working_dir).await;
+        let replacement = Arc::new(McpRegistry::new());
+
+        replace_project_mcp_registry(&state, &working_dir, replacement.clone()).await;
+
+        let cached = state
+            .mcp_pool
+            .cached_registry(&working_dir)
+            .await
+            .expect("replacement must occupy the cache key");
+        assert!(Arc::ptr_eq(&cached, &replacement));
+        let current = state.mcp_registry.read().await;
+        assert!(Arc::ptr_eq(&*current, &replacement));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                stale.wait_for_cancellation(),
+            )
+            .await
+            .is_ok(),
+            "an explicitly replaced registry must cancel its pending work"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_mcp_pool_reuses_registry_for_same_working_dir() {
+        let pool = Arc::new(zap_capabilities::mcp::ProjectMcpPool::new());
+        let project = tempfile::tempdir().unwrap();
+        let first = pool.registry(project.path()).await;
+        let second = pool.registry(project.path()).await;
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn project_mcp_pool_eviction_shuts_down_the_oldest_registry() {
+        let pool = Arc::new(zap_capabilities::mcp::ProjectMcpPool::new());
+        let oldest = tempfile::tempdir().unwrap();
+        let oldest_registry = pool.registry(oldest.path()).await;
+        for index in 1..MCP_CACHE_MAX {
+            let dir = tempfile::tempdir().unwrap();
+            let _ = pool.registry(dir.path()).await;
+            std::mem::forget(dir);
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        let _new = pool.registry(project.path()).await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                oldest_registry.wait_for_cancellation(),
+            )
+            .await
+            .is_ok(),
+            "evicting an MCP registry must cancel its pending connection work"
+        );
+        assert!(
+            pool.cached_registry(oldest.path()).await.is_none(),
+            "evicted project must be removed from the pool"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_chat_permission_cannot_consume_or_persist_a_reused_call_id() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let tool_name = "mcp__srv__query";
+        let admission = state
+            .active_chats
+            .admit(Some(session_id), None)
+            .await
+            .unwrap();
+        state
+            .active_chats
+            .bind_session(&admission.operation_id, session_id)
+            .await
+            .unwrap();
+
+        let old_pending = zap_capabilities::session::PendingPermission {
+            session_id: session_id.into(),
+            call_id: "ollama_call_0".into(),
+            tool_name: tool_name.into(),
+            reason: "Requires approval".into(),
+            arguments: serde_json::json!({ "query": "old" }),
+            created_at: 1_000,
+        };
+        let mut current_pending = old_pending.clone();
+        current_pending.arguments = serde_json::json!({ "query": "current" });
+        current_pending.created_at = 2_000;
+        let old_approval_id = permission_bridge::approval_id_for_pending(&old_pending);
+        let current_approval_id = permission_bridge::approval_id_for_pending(&current_pending);
+        assert_ne!(old_approval_id, current_approval_id);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.pending_permissions.register(
+            session_id.into(),
+            current_approval_id.clone(),
+            tool_name.into(),
+            tx,
+        );
+
+        let stale = chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: old_approval_id,
+                decision: "allow_persist".into(),
+                tool_name: Some(tool_name.into()),
+            }),
+        )
+        .await
+        .into_response();
+        let stale_bytes = axum::body::to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stale_body: serde_json::Value = serde_json::from_slice(&stale_bytes).unwrap();
+        assert_eq!(stale_body["success"], false);
+        assert_eq!(stale_body["error"], "stale or unknown permission request");
+
+        assert!(
+            !state
+                .mcp_registry
+                .read()
+                .await
+                .is_tool_auto_approved(tool_name),
+            "a stale allow_persist must not mutate approval policy"
+        );
+        let stale_always = chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: permission_bridge::approval_id_for_pending(&old_pending),
+                decision: "always_allow".into(),
+                tool_name: Some(tool_name.into()),
+            }),
+        )
+        .await
+        .into_response();
+        let stale_always_bytes = axum::body::to_bytes(stale_always.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stale_always_body: serde_json::Value =
+            serde_json::from_slice(&stale_always_bytes).unwrap();
+        assert_eq!(stale_always_body["success"], false);
+        assert!(
+            !state
+                .mcp_registry
+                .read()
+                .await
+                .is_tool_auto_approved(tool_name),
+            "a stale always_allow must not mutate approval policy"
+        );
+        let delivery = state.pending_permissions.deliver(
+            session_id,
+            &current_approval_id,
+            permission_bridge::PermissionSubmission {
+                decision: zap_capabilities::tools::PermissionDecision::Deny,
+                persist: false,
+            },
+        );
+        let permission_bridge::PermissionDelivery::Submitted { accepted, .. } = delivery else {
+            panic!("the current approval route must remain pending after a stale POST")
+        };
+        let submission = rx.await.unwrap().accept();
+        assert!(accepted.await.is_ok());
+        assert_eq!(
+            submission.decision,
+            zap_capabilities::tools::PermissionDecision::Deny
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_permission_success_requires_driver_consumption_ack() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "12121212-1212-4212-8212-121212121212";
+        let admission = state
+            .active_chats
+            .admit(Some(session_id), None)
+            .await
+            .unwrap();
+        state
+            .active_chats
+            .bind_session(&admission.operation_id, session_id)
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.pending_permissions.register(
+            session_id.into(),
+            "approval-accept".into(),
+            "bash".into(),
+            tx,
+        );
+        let accepted_request = tokio::spawn(chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: "approval-accept".into(),
+                decision: "allow".into(),
+                tool_name: None,
+            }),
+        ));
+        let envelope = rx.await.unwrap();
+        assert!(
+            !accepted_request.is_finished(),
+            "HTTP success must wait until the driver consumes the queued decision"
+        );
+        let submission = envelope.submission();
+        assert!(
+            !accepted_request.is_finished(),
+            "reading the submission is not a runtime-consumption acknowledgement"
+        );
+        assert_eq!(
+            submission.decision,
+            zap_capabilities::tools::PermissionDecision::AllowOnce
+        );
+        envelope.acknowledge();
+        let accepted_response = accepted_request.await.unwrap().into_response();
+        let accepted_bytes = axum::body::to_bytes(accepted_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let accepted_body: serde_json::Value = serde_json::from_slice(&accepted_bytes).unwrap();
+        assert_eq!(accepted_body["success"], true);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.pending_permissions.register(
+            session_id.into(),
+            "approval-drop".into(),
+            "bash".into(),
+            tx,
+        );
+        let dropped_request = tokio::spawn(chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: "approval-drop".into(),
+                decision: "allow".into(),
+                tool_name: None,
+            }),
+        ));
+        drop(rx.await.unwrap());
+        let dropped_response = dropped_request.await.unwrap().into_response();
+        let dropped_bytes = axum::body::to_bytes(dropped_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dropped_body: serde_json::Value = serde_json::from_slice(&dropped_bytes).unwrap();
+        assert_eq!(dropped_body["success"], false);
+        assert_eq!(dropped_body["error"], "permission request expired");
+
+        state.active_chats.complete(&admission.operation_id).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persisted_chat_permission_requires_an_active_turn_and_exact_approval_id() {
+        use zap_capabilities::session::{
+            PendingPermission, PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = home._dir.path().to_path_buf();
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        let manager = SessionManager::for_project(&working_dir);
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, working_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&zap_kernel::message::SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let pending = PendingPermission {
+            session_id: session_id.into(),
+            call_id: "ollama_call_0".into(),
+            tool_name: "mcp__srv__query".into(),
+            reason: "Requires approval".into(),
+            arguments: serde_json::json!({ "query": "current" }),
+            created_at: 2_000,
+        };
+        manager
+            .save_pending_permission(session_id, &pending)
+            .unwrap();
+        let exact_approval_id = permission_bridge::approval_id_for_pending(&pending);
+        let mut old_pending = pending.clone();
+        old_pending.created_at = 1_000;
+        let stale_approval_id = permission_bridge::approval_id_for_pending(&old_pending);
+        assert_ne!(stale_approval_id, exact_approval_id);
+
+        let stale = chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: stale_approval_id,
+                decision: "allow_persist".into(),
+                tool_name: Some(pending.tool_name.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        let stale_bytes = axum::body::to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stale_body: serde_json::Value = serde_json::from_slice(&stale_bytes).unwrap();
+        assert_eq!(stale_body["success"], false);
+        assert_eq!(stale_body["error"], "stale or unknown permission request");
+        assert_eq!(
+            manager.load_pending_permission(session_id).unwrap(),
+            Some(pending.clone()),
+            "a stale persisted approval must not consume the current checkpoint"
+        );
+        assert!(
+            !state
+                .mcp_registry
+                .read()
+                .await
+                .is_tool_auto_approved(&pending.tool_name),
+            "a stale persisted allow_persist must not mutate approval policy"
+        );
+
+        let restored = chat_pending(
+            State(state.clone()),
+            axum::extract::Query(ChatPendingQuery {
+                session_id: session_id.into(),
+            }),
+        )
+        .await
+        .into_response();
+        let restored_bytes = axum::body::to_bytes(restored.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let restored_body: serde_json::Value = serde_json::from_slice(&restored_bytes).unwrap();
+        assert!(
+            restored_body["permission"].is_null(),
+            "an inactive persisted checkpoint must not resurrect an actionable card"
+        );
+
+        let exact = chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: exact_approval_id,
+                decision: "allow_persist".into(),
+                tool_name: Some("caller-controlled-name".into()),
+            }),
+        )
+        .await
+        .into_response();
+        let exact_bytes = axum::body::to_bytes(exact.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let exact_body: serde_json::Value = serde_json::from_slice(&exact_bytes).unwrap();
+        assert_eq!(exact_body["success"], false);
+        assert_eq!(
+            exact_body["error"],
+            "permission request is no longer active; retry the operation"
+        );
+        assert!(
+            !manager
+                .pending_permission_path(session_id)
+                .unwrap()
+                .exists(),
+            "an exact inactive checkpoint should be retired so it cannot resurrect"
+        );
+        assert!(
+            !state
+                .mcp_registry
+                .read()
+                .await
+                .is_tool_auto_approved(&pending.tool_name),
+            "an inactive persisted allow_persist must not mutate approval policy"
+        );
+        assert_eq!(
+            manager.read_meta(session_id).unwrap().message_count,
+            0,
+            "inactive permission recovery must not synthesize or execute a tool result"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_live_permission_cannot_mutate_auto_approval_policy() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "33333333-3333-4333-8333-333333333333".to_string();
+        let tool_name = "mcp__srv__query";
+        let registry = zap_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+        registry
+            .open_or_attach(session_id.clone(), home._dir.path().to_path_buf())
+            .unwrap();
+
+        let response = live_api::live_permission(
+            State(state.clone()),
+            Json(live_api::LivePermissionReq {
+                decision: "allow_persist".into(),
+                runtime_instance_id: "stale-runtime".into(),
+                generation: 1,
+                request_id: 41,
+                tool_name: Some(tool_name.into()),
+                session_id: session_id.clone(),
+            }),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["accepted"], false);
+        assert!(
+            !state
+                .mcp_registry
+                .read()
+                .await
+                .is_tool_auto_approved(tool_name),
+            "a stale live permission must not mutate approval policy"
+        );
+        registry.force_remove(&session_id);
+    }
+
+    #[test]
+    fn live_permission_json_requires_exact_session_and_request_identity() {
+        let missing_session =
+            serde_json::from_value::<live_api::LivePermissionReq>(serde_json::json!({
+                "decision": "allow",
+                "runtime_instance_id": "runtime-1",
+                "generation": 1,
+                "request_id": 41,
+            }));
+        assert!(missing_session.is_err());
+
+        let missing_request =
+            serde_json::from_value::<live_api::LivePermissionReq>(serde_json::json!({
+                "decision": "allow",
+                "runtime_instance_id": "runtime-1",
+                "generation": 1,
+                "session_id": "33333333-3333-4333-8333-333333333333",
+            }));
+        assert!(missing_request.is_err());
+
+        let missing_generation =
+            serde_json::from_value::<live_api::LivePermissionReq>(serde_json::json!({
+                "decision": "allow",
+                "runtime_instance_id": "runtime-1",
+                "session_id": "33333333-3333-4333-8333-333333333333",
+                "request_id": 41,
+            }));
+        assert!(missing_generation.is_err());
+
+        let missing_runtime_instance =
+            serde_json::from_value::<live_api::LivePermissionReq>(serde_json::json!({
+                "decision": "allow",
+                "generation": 1,
+                "session_id": "33333333-3333-4333-8333-333333333333",
+                "request_id": 41,
+            }));
+        assert!(missing_runtime_instance.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_admission_rejects_the_same_session_across_request_aliases() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let request = |request_id: &str| ChatRequest {
+            message: "hold this turn".into(),
+            working_dir: Some(home._dir.path().to_path_buf()),
+            provider: None,
+            session_id: Some(session_id.into()),
+            request_id: Some(request_id.into()),
+            images: Vec::new(),
+            approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+            extra_system_append: None,
+            session_title: None,
+        };
+
+        let first = chat_stream(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            axum::http::HeaderMap::new(),
+            Json(request("request-a")),
+        )
+        .await
+        .into_response();
+        let second = chat_stream(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            axum::http::HeaderMap::new(),
+            Json(request("request-b")),
+        )
+        .await
+        .into_response();
+        let first_status = first.status();
+        let second_status = second.status();
+
+        state.active_chats.cancel_all().await;
+        drop((first, second));
+        tokio::task::yield_now().await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(
+            second_status,
+            StatusCode::CONFLICT,
+            "a distinct request alias must not bypass same-session admission"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_chat_listing_exposes_real_sessions_not_request_aliases() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        let response = chat_stream(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            axum::http::HeaderMap::new(),
+            Json(ChatRequest {
+                message: "hold this turn".into(),
+                working_dir: Some(home._dir.path().to_path_buf()),
+                provider: None,
+                session_id: Some(session_id.into()),
+                request_id: Some("request-only-alias".into()),
+                images: Vec::new(),
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+                extra_system_append: None,
+                session_title: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let active = active_chat_sessions(State(state.clone()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(active.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let active_ids: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+
+        state.active_chats.cancel_all().await;
+        drop(response);
+        tokio::task::yield_now().await;
+
+        assert_eq!(active_ids, vec![session_id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn terminated_chat_operation_is_not_treated_as_live_by_watch() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-term"), None).await.unwrap();
+        registry.mark_terminal(&admission.operation_id).await;
+
+        // subscribe_live_with_replay should return None for terminated turn
+        assert!(registry
+            .subscribe_live_with_replay("session-term")
+            .await
+            .is_none());
+
+        // subscribe_or_standby should return Standby and remove stale alias
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry.subscribe_or_standby("session-term", &tx).await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+    }
+
+    #[tokio::test]
+    async fn stale_chat_cleanup_cannot_remove_a_replacement_operation() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        assert!(registry.complete(&first.operation_id).await);
+        let replacement = registry.admit(Some("session-1"), None).await.unwrap();
+
+        assert!(!registry.complete(&first.operation_id).await);
+
+        assert!(
+            registry
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|session| session == "session-1"),
+            "cleanup for an older operation must compare identity before removal"
+        );
+        registry.complete(&replacement.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn occupancy_alias_serializes_compat_user_before_session_id_exists() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry
+            .admit_occupied(None, None, Some("compat-user:alice".into()))
+            .await
+            .unwrap();
+        let second = registry
+            .admit_occupied(None, None, Some("compat-user:alice".into()))
+            .await;
+        assert!(matches!(second, Err(ActiveChatAdmissionError::SessionBusy)));
+        registry.complete(&first.operation_id).await;
+        let third = registry
+            .admit_occupied(None, None, Some("compat-user:alice".into()))
+            .await;
+        assert!(third.is_ok());
+        registry.complete(&third.unwrap().operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn admit_or_preempt_cancels_busy_session_and_waits_for_complete() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        let first_cancel = first.cancellation.clone();
+        let first_op = first.operation_id.clone();
+        let registry_bg = registry.clone();
+        let completer = tokio::spawn(async move {
+            loop {
+                if first_cancel.is_cancelled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            registry_bg.complete(&first_op).await;
+        });
+
+        let second = registry
+            .clone()
+            .admit_or_preempt(Some("session-1".into()), None, Duration::from_secs(2))
+            .await
+            .expect("preempt should admit after previous turn completes");
+        assert_ne!(second.operation_id, first.operation_id);
+        assert!(first.cancellation.is_cancelled());
+        completer.await.unwrap();
+        registry.complete(&second.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn admit_or_preempt_stops_occupancy_when_session_id_is_not_bound_yet() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry
+            .admit_occupied(None, None, Some("compat-user:alice".into()))
+            .await
+            .unwrap();
+        let first_cancel = first.cancellation.clone();
+        let first_op = first.operation_id.clone();
+        let registry_bg = registry.clone();
+        let completer = tokio::spawn(async move {
+            loop {
+                if first_cancel.is_cancelled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            registry_bg.complete(&first_op).await;
+        });
+
+        let second = registry
+            .clone()
+            .admit_or_preempt(
+                Some("unbound-uuid".into()),
+                Some("compat-user:alice".into()),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("occupancy alias must be enough to preempt");
+        assert!(first.cancellation.is_cancelled());
+        completer.await.unwrap();
+        registry.complete(&second.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn replay_admitted_user_includes_created_at() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-1"), None).await.unwrap();
+        registry
+            .record_user_message(
+                &admission.operation_id,
+                "hello".into(),
+                Some(1_700_000_000_000),
+            )
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.replay_admitted_user("session-1", &tx).await;
+        let event = rx.try_recv().expect("admitted user should replay");
+        match event {
+            ChatEvent::User {
+                content,
+                session_id,
+                created_at,
+                ..
+            } => {
+                assert_eq!(content, "hello");
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(created_at, Some(1_700_000_000_000));
+            }
+            other => panic!("expected user event, got {other:?}"),
+        }
+        registry.complete(&admission.operation_id).await;
+    }
+
+    #[test]
+    fn user_event_serializes_created_at() {
+        let json = serde_json::to_value(ChatEvent::User {
+            content: "hi".into(),
+            session_id: Some("s1".into()),
+            created_at: Some(42),
+            message_id: None,
+            order: None,
+            turn_ordinal: None,
+        })
+        .unwrap();
+        assert_eq!(json["type"], "user");
+        assert_eq!(json["created_at"], 42);
+
+        // 身份回传事件：与可见气泡分离的纯身份通道。
+        let identified = serde_json::to_value(ChatEvent::UserIdentified {
+            message_id: "m-user-1".into(),
+            turn_ordinal: 3,
+        })
+        .unwrap();
+        assert_eq!(identified["type"], "user_identified");
+        assert_eq!(identified["message_id"], "m-user-1");
+        assert_eq!(identified["turn_ordinal"], 3);
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_times_out_if_previous_turn_never_completes() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        assert!(
+            !registry
+                .stop_and_wait("session-1".into(), Some(Duration::from_millis(30)))
+                .await
+        );
+        assert!(first.cancellation.is_cancelled());
+        registry.complete(&first.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_without_timeout_returns_only_after_the_operation_left() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        let operation_id = first.operation_id.clone();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry_bg = registry.clone();
+        let flag = released.clone();
+        let completer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            registry_bg.complete(&operation_id).await;
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        // Uncapped wait: the verdict must be the real release, never an early
+        // "still busy" that would bounce a send-now message back into the queue.
+        assert!(registry.stop_and_wait("session-1".into(), None).await);
+        completer.await.unwrap();
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        assert!(first.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn chat_stop_linearizes_after_inflight_permission_consumption() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-1"), None).await.unwrap();
+        let stop_gate = registry
+            .stop_gate(&admission.operation_id)
+            .await
+            .expect("admitted operation has a stop gate");
+        let gate_guard = stop_gate.lock().await;
+
+        let registry_for_stop = registry.clone();
+        let mut stop = tokio::spawn(async move { registry_for_stop.stop_alias("session-1").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut stop)
+                .await
+                .is_err(),
+            "stop must wait while approval consumption owns the linearization gate"
+        );
+        assert!(!admission.cancellation.is_cancelled());
+
+        drop(gate_guard);
+        assert!(stop.await.unwrap());
+        assert!(admission.cancellation.is_cancelled());
+        assert!(*stop_gate.lock().await);
+        registry.complete(&admission.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn chat_panic_cleanup_removes_operation_and_allows_resubmit() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let cleanup_chats = active_chats.clone();
+        let cleanup_op = admission.operation_id.clone();
+        active_chats
+            .bind_session(&cleanup_op, "canonical-session")
+            .await
+            .unwrap();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
+
+        let inner = tokio::spawn(async move {
+            panic!("simulated secret panic payload");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { message } if message == "chat task failed")),
+            "panic must produce a redacted Error event"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ChatEvent::Done { session_id, .. } if session_id == "canonical-session"
+            )),
+            "panic must produce a Done event with the canonical session id"
+        );
+
+        assert!(
+            !active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|s| s == "session-1"),
+            "panic cleanup must remove the active-chat record"
+        );
+
+        let second = active_chats.admit(Some("session-1"), None).await;
+        assert!(
+            second.is_ok(),
+            "same session must be able to submit again after panic cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_panic_cleanup_preserves_task_local_context() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let cleanup_chats = active_chats.clone();
+        let cleanup_op = admission.operation_id.clone();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(false);
+
+        let session_id = uuid::Uuid::new_v4();
+        let ctx = CurrentContext {
+            mode: Some(zap_telemetry::SessionMode::Headless),
+            repo_origin: None,
+            session_id: Some(session_id),
+            ..CurrentContext::current()
+        };
+
+        let inner = tokio::spawn(async move {
+            CurrentContext::scope(ctx, || async move {
+                let current = CurrentContext::current();
+                assert!(current.mode.is_some(), "mode must propagate across spawn");
+                assert_eq!(current.session_id, Some(session_id));
+                Ok(())
+            })
+            .await
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &cleanup_chats,
+            &cleanup_op,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, ChatEvent::Error { .. })),
+            "successful task with task-local context must not produce an Error"
+        );
+
+        assert!(
+            !active_chats
+                .active_session_ids()
+                .await
+                .iter()
+                .any(|s| s == "session-1"),
+            "cleanup must run after successful task"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_panic_after_terminal_does_not_emit_a_second_done() {
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some("session-1"), None).await.unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let terminal_sent = std::sync::atomic::AtomicBool::new(true);
+
+        let inner = tokio::spawn(async move {
+            panic!("panic after terminal");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        });
+        finalize_chat_task(
+            inner,
+            &event_tx,
+            &active_chats,
+            &admission.operation_id,
+            "session-1",
+            &terminal_sent,
+        )
+        .await;
+
+        let events: Vec<_> = (0..10).filter_map(|_| event_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { .. })),
+            "the supervisor must still report the panic"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Done { .. })),
+            "the supervisor must not emit a second terminal"
+        );
+        assert!(active_chats.active_session_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_accepts_both_session_and_request_aliases() {
+        let registry = ActiveChatRegistry::default();
+        let by_request = registry
+            .admit(Some("session-1"), Some("request-1"))
+            .await
+            .unwrap();
+        assert!(registry.stop_alias("request-1").await);
+        assert!(by_request.cancellation.is_cancelled());
+        registry.complete(&by_request.operation_id).await;
+
+        let by_session = registry
+            .admit(Some("session-2"), Some("request-2"))
+            .await
+            .unwrap();
+        assert!(registry.stop_alias("session-2").await);
+        assert!(by_session.cancellation.is_cancelled());
+        registry.complete(&by_session.operation_id).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_without_turn_finished_never_emits_done() {
+        use zap_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let home = ScopedChatHome::new();
+        let working_dir = home._dir.path().to_path_buf();
+        let mut config = Config::with_default_provider("main");
+        config.providers.insert(
+            "main".into(),
+            test_provider("test-model", "http://127.0.0.1:9/v1".into()),
+        );
+        config.save(&Config::default_path()).unwrap();
+
+        let session_id = "33333333-3333-4333-8333-333333333333";
+        let manager = SessionManager::for_project(&working_dir);
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, working_dir.to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&zap_kernel::message::SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats.admit(Some(session_id), None).await.unwrap();
+        let operation_id = admission.operation_id.clone();
+        process_chat_request(
+            ChatRequest {
+                message: "this runtime cannot acquire the held session".into(),
+                working_dir: Some(working_dir),
+                provider: Some("main".into()),
+                session_id: Some(session_id.into()),
+                request_id: None,
+                images: Vec::new(),
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+                extra_system_append: None,
+                session_title: None,
+            },
+            event_tx,
+            admission.cancellation,
+            admission.operation_id,
+            active_chats.clone(),
+            zap_capabilities::mcp::ProjectMcpPool::global(),
+            chat_test_telemetry(&home),
+            permission_bridge::PermissionResponders::new(),
+            permission_bridge::UserInputResponders::new(),
+            false,
+            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        active_chats.complete(&operation_id).await;
+        drop(lease);
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error { .. })),
+            "the missing runtime terminal must be surfaced as an error"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Done { .. })),
+            "Done requires an authoritative TurnFinished"
+        );
+    }
+
+    async fn spawn_openai_sse(
+        response_text: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let payload = serde_json::json!({
+            "choices": [{
+                "delta": { "content": response_text },
+                "finish_reason": null
+            }]
+        });
+        let sse = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept provider request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read provider request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write provider response");
+        });
+        (format!("http://{address}/v1"), request_rx, task)
+    }
+
+    fn test_provider(
+        model: &str,
+        base_url: String,
+    ) -> zap_config::config::provider::ProviderConfig {
+        zap_config::config::provider::ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("test-key".into()),
+            model: model.into(),
+            base_url: Some(base_url),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: Some(1024),
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            reasoning_effort: None,
+            reasoning_levels: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+            capable_model: None,
+            pricing: None,
+            supports_vision: Some(zap_config::util::model_name_suggests_vision(model)),
+            reasoning_model: None,
+        }
+    }
+
+    // 回归：远程 HTTP MCP 服务器在 `/mcp/status` 面板显示为空。根因之一是 in-flight
+    // （仍在 initialize() 途中）的服务器既不在 servers、也不在 failed_servers → 被
+    // server_statuses() 略过 → 面板空。修复：把配置里有、但 registry 尚未记录的服务器
+    // 补成 connecting，让面板在连接窗口里就有东西显示，而不是空列表。
+    #[test]
+    fn merge_surfaces_configured_servers_as_connecting() {
+        use zap_capabilities::mcp::ServerStatus;
+        let statuses = vec![
+            ("connected-srv".to_string(), ServerStatus::Connected),
+            (
+                "failed-srv".to_string(),
+                ServerStatus::Failed("boom".to_string()),
+            ),
+        ];
+        let configured = vec![
+            "connected-srv".to_string(),
+            "failed-srv".to_string(),
+            "pending-srv".to_string(),
+        ];
+        let merged: std::collections::HashMap<_, _> =
+            merge_configured_mcp_statuses(statuses, &configured)
+                .into_iter()
+                .collect();
+        assert_eq!(merged.len(), 3);
+        assert!(matches!(
+            merged.get("connected-srv"),
+            Some(ServerStatus::Connected)
+        ));
+        assert!(matches!(
+            merged.get("failed-srv"),
+            Some(ServerStatus::Failed(_))
+        ));
+        // The not-yet-connected configured server is visible as connecting, not dropped.
+        assert!(matches!(
+            merged.get("pending-srv"),
+            Some(ServerStatus::Connecting)
+        ));
+    }
+
+    #[test]
+    fn merge_keeps_registry_status_over_synthetic_connecting() {
+        use zap_capabilities::mcp::ServerStatus;
+        // A server already known as Failed/Connected must NOT be downgraded to the
+        // synthetic Connecting just because it's also in the config file.
+        let merged = merge_configured_mcp_statuses(
+            vec![("s".to_string(), ServerStatus::Failed("x".to_string()))],
+            &["s".to_string()],
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].1, ServerStatus::Failed(_)));
+    }
+
+    #[test]
+    fn merge_no_config_is_identity() {
+        use zap_capabilities::mcp::ServerStatus;
+        let merged =
+            merge_configured_mcp_statuses(vec![("s".to_string(), ServerStatus::Connected)], &[]);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].1, ServerStatus::Connected));
+    }
+
+    #[test]
+    fn blocked_untrusted_servers_are_excluded_from_server_rows() {
+        use zap_capabilities::mcp::ServerStatus;
+        // A withheld (untrusted-project) server is reported via the response's
+        // `blocked[]` list, NOT as a server row — otherwise the webui renders it
+        // twice (once as a "blocked" status row, once in the blocked banner).
+        let rows = build_mcp_server_rows(
+            vec![
+                ("ok".to_string(), ServerStatus::Connected),
+                ("evil".to_string(), ServerStatus::BlockedUntrusted),
+            ],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "ok");
+    }
+
+    // 回归：daemon 解析工作目录→物理会话桶名的 hash 必须与 native 会话存储命名目录
+    // 用的 hash 完全一致。曾经 daemon 自持一份用 `str::hash`（而非 `Path::hash`）的
+    // 拷贝，对同一路径算出不同 hash → `/project` 指向磁盘上不存在的桶 → webui 退化成
+    // 按可变的 `working_dir` 字段匹配会话，导致跨项目串台。
+    #[test]
+    fn daemon_hash_path_matches_shared_project_bucket_naming() {
+        for p in [
+            "/Users/theo/Documents/workspace/jeikcode",
+            "/Users/theo/Desktop",
+            "/tmp/nested/proj/",
+            "/",
+        ] {
+            let path = std::path::Path::new(p);
+            assert_eq!(
+                hash_path(path),
+                zap_config::util::stable_project_hash(path),
+                "daemon hash for {p:?} diverged from the shared bucket naming"
+            );
+        }
+    }
+
+    #[test]
+    fn response_project_hash_matches_session_bucket_hash() {
+        let path = std::path::Path::new("/tmp/nested/proj/");
+        assert_eq!(
+            response_project_hash(path),
+            hash_path(path),
+            "session create/append responses must return the physical session bucket hash"
+        );
+    }
+
+    #[test]
+    fn catalog_consumers_keep_valid_entries_when_an_orphan_sidecar_is_diagnosed() {
+        use zap_capabilities::session::{SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("0123456789abcdef");
+        let manager = SessionManager::with_root(&bucket);
+        manager
+            .write_meta(&SessionMeta::new("valid", "/project", 1))
+            .unwrap();
+        manager
+            .save_snapshot(
+                "orphan",
+                &zap_kernel::message::SessionSnapshot::new(Vec::new()),
+            )
+            .unwrap();
+
+        let scan = catalog_scan_in_root(tmp.path())
+            .expect("an unrelated damaged session must not hide valid catalog entries");
+
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "valid");
+        assert_eq!(scan.diagnostics.len(), 1);
+        assert!(scan.diagnostics[0]
+            .message
+            .contains("sidecars but no metadata"));
+    }
+
+    #[test]
+    fn daemon_project_listing_repairs_placeholder_session_names() {
+        use zap_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "historical-session";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let snapshot = zap_kernel::message::SessionSnapshot::new(vec![
+            zap_kernel::message::Message::user("修复 VS Code 历史标题"),
+        ]);
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "修复 VS Code 历史标题");
+        assert_eq!(
+            manager.read_meta(session_id).unwrap().name,
+            "修复 VS Code 历史标题"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_listing_keeps_a_zero_count_session_with_valid_inflight_work() {
+        use zap_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, SnapshotHook, StorageOwner,
+        };
+        use zap_kernel::hook::LifecycleHooks;
+        use zap_kernel::message::{Conversation, Message, SessionSnapshot};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "running-first-turn";
+        std::fs::create_dir_all(tmp.path().join(project_bucket)).unwrap();
+        let manager =
+            std::sync::Arc::new(SessionManager::with_root(tmp.path().join(project_bucket)));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&SessionSnapshot::new(Vec::new())),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+
+        let hook = SnapshotHook::new(manager.clone(), session_id, "/project").with_lease(lease);
+        let mut conversation = Conversation::default();
+        conversation.push(Message::user("正在执行的首轮任务"));
+        hook.turn_start(&mut conversation).await;
+        hook.drain_inflight_jobs().await;
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(
+            sessions[0].message_count, 0,
+            "catalog meta remains canonical until turn completion"
+        );
+    }
+
+    #[test]
+    fn daemon_listing_exposes_only_the_active_empty_session() {
+        use zap_capabilities::session::{CatalogLocation, SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        for id in ["active-empty", "unused-empty"] {
+            manager
+                .write_meta(&SessionMeta::new(id, "/project", 1))
+                .unwrap();
+        }
+        let active = CatalogLocation {
+            id: "active-empty".into(),
+            project_bucket: project_bucket.into(),
+        };
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "active-empty");
+    }
+
+    #[test]
+    fn list_projects_in_root_matches_visible_sessions_count() {
+        use zap_capabilities::session::{CatalogLocation, SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+
+        // 1. 正常有消息会话
+        let mut normal_meta = SessionMeta::new("normal-session", "/project", 1);
+        normal_meta.message_count = 5;
+        manager.write_meta(&normal_meta).unwrap();
+
+        // 2. 遗弃的历史空会话（无消息，非 active）
+        let empty_unused = SessionMeta::new("unused-empty", "/project", 2);
+        manager.write_meta(&empty_unused).unwrap();
+
+        // 3. 当前活跃的空会话（无消息，active）
+        let empty_active = SessionMeta::new("active-empty", "/project", 3);
+        manager.write_meta(&empty_active).unwrap();
+
+        let active = CatalogLocation {
+            id: "active-empty".into(),
+            project_bucket: project_bucket.into(),
+        };
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, Some(&active)).unwrap();
+        let projects = list_projects_in_root(tmp.path(), Some(&active)).unwrap();
+
+        assert_eq!(sessions.len(), 2, "只有 normal 和 active-empty 可见");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].hash, project_bucket);
+        assert_eq!(
+            projects[0].session_count,
+            sessions.len(),
+            "projects session_count 必须与可见会话列表长度完全一致"
+        );
+    }
+
+    #[test]
+    fn active_catalog_identity_uses_the_physical_historical_bucket() {
+        use zap_capabilities::session::{CatalogEntry, CatalogPresence};
+
+        let working_dir = std::path::PathBuf::from("/project/current-name");
+        let historical_bucket = "0123456789abcdef";
+        assert_ne!(
+            historical_bucket,
+            zap_capabilities::session::SessionManager::project_hash(&working_dir)
+        );
+        let entry = CatalogEntry {
+            id: "resumed-session".into(),
+            name: "resumed".into(),
+            fork_root_id: None,
+            project_bucket: historical_bucket.into(),
+            working_dir: working_dir.clone(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            message_count: 0,
+            turn_count: 0,
+            presence: CatalogPresence::NativeOnly,
+        };
+
+        let entries = [entry];
+        let location =
+            resolve_active_catalog_location(&entries, "resumed-session", &working_dir).unwrap();
+
+        assert_eq!(location.project_bucket, historical_bucket);
+        let binding = crate::live_hub::LiveBinding {
+            id: 1,
+            runtime_instance_id: "runtime-1".into(),
+            generation: 1,
+            session_id: "resumed-session".into(),
+            working_dir,
+            provider: String::new(),
+            provider_fingerprint: String::new(),
+        };
+        assert!(binding_targets_catalog_location(
+            &entries,
+            &binding,
+            historical_bucket,
+            "resumed-session"
+        ));
+        assert!(!binding_targets_catalog_location(
+            &entries,
+            &binding,
+            "ffffffffffffffff",
+            "resumed-session"
+        ));
+    }
+
+    #[test]
+    fn daemon_global_listing_and_search_use_repaired_session_names() {
+        use zap_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "searchable-history";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let snapshot = zap_kernel::message::SessionSnapshot::new(vec![
+            zap_kernel::message::Message::user("可搜索的历史标题"),
+        ]);
+        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let global = list_all_sessions_in_root(tmp.path(), None).unwrap();
+        let search = search_sessions_by_name_in_root(tmp.path(), "可搜索").unwrap();
+
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].meta.name, "可搜索的历史标题");
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0].meta.id, session_id);
+    }
+
+    #[test]
+    fn daemon_legacy_listing_repairs_name_without_cutting_over_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let project = tmp.path().join(project_bucket);
+        std::fs::create_dir_all(&project).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/session/legacy_full.json"))
+                .unwrap();
+        let session_id = legacy["id"].as_str().unwrap().to_string();
+        legacy["name"] = serde_json::Value::String(format!("session-{session_id}"));
+        legacy["user_renamed"] = serde_json::Value::Bool(false);
+        legacy["ai_named"] = serde_json::Value::Bool(false);
+        std::fs::write(
+            project.join(format!("{session_id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "inspect this image");
+        assert!(!project.join(format!("{session_id}.meta")).exists());
+        assert!(!project.join(format!("{session_id}.snapshot")).exists());
+        assert!(!project.join(format!("{session_id}.ui.json")).exists());
+    }
+
+    #[test]
+    fn daemon_global_listing_keeps_latest_fifty_sessions() {
+        use zap_capabilities::session::{SessionManager, SessionMeta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(tmp.path().join("0123456789abcdef"));
+        for index in 0..51 {
+            let id = format!("history-{index:02}");
+            let mut meta = SessionMeta::new(&id, "/project", index);
+            meta.name = format!("history title {index:02}");
+            meta.message_count = 1;
+            manager.write_meta(&meta).unwrap();
+        }
+
+        let sessions = list_all_sessions_in_root(tmp.path(), None).unwrap();
+
+        assert_eq!(sessions.len(), 50);
+        assert_eq!(sessions[0].meta.id, "history-50");
+        assert!(!sessions
+            .iter()
+            .any(|session| session.meta.id == "history-00"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_catalog_io_is_offloaded_and_single_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first_started = std::sync::Arc::new(AtomicBool::new(false));
+        let first_started_in_task = std::sync::Arc::clone(&first_started);
+        let (release_first, wait_for_release) = std::sync::mpsc::channel();
+        let first = tokio::spawn(run_session_catalog_io(move || {
+            first_started_in_task.store(true, Ordering::SeqCst);
+            wait_for_release.recv().map_err(std::io::Error::other)?;
+            Ok("first")
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !first_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking catalog work should start off the runtime thread");
+
+        let runtime_progressed = std::sync::Arc::new(AtomicBool::new(false));
+        let runtime_progressed_in_task = std::sync::Arc::clone(&runtime_progressed);
+        tokio::spawn(async move {
+            runtime_progressed_in_task.store(true, Ordering::SeqCst);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !runtime_progressed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("catalog file IO must not block the current-thread runtime");
+
+        let second_started = std::sync::Arc::new(AtomicBool::new(false));
+        let second_started_in_task = std::sync::Arc::clone(&second_started);
+        let second = tokio::spawn(run_session_catalog_io(move || {
+            second_started_in_task.store(true, Ordering::SeqCst);
+            Ok("second")
+        }));
+        let overlapped = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            while !second_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        release_first.send(()).unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), "first");
+        assert_eq!(second.await.unwrap().unwrap(), "second");
+        assert!(!overlapped, "catalog scans must execute one at a time");
+    }
+
+    // 回归：webui URL 刷新恢复只带短 id,必须能跨桶按 id 定位会话(且不受 /sessions
+    // 的 50 条上限影响)。resolve_session_in_root 按文件名前缀扫桶:短前缀命中、
+    // 完整 id 精确命中、未知 id 返回 None,并回带物理桶作为 project_hash。
+    #[test]
+    fn resolve_session_by_short_and_full_id_across_buckets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |bucket: &str, wd: &str, id: &str| {
+            use zap_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::with_root(root.join(bucket));
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = zap_kernel::message::SessionSnapshot::new(vec![
+                zap_kernel::message::Message::user("fixture"),
+            ]);
+            let mut meta = SessionMeta::new(id, wd, 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+            id.to_string()
+        };
+        // A decoy in a different bucket + the real target.
+        let _decoy = mk(
+            "0000000000000000",
+            "/proj/decoy",
+            "00000000-0000-4000-8000-000000000000",
+        );
+        let target = mk(
+            "1111111111111111",
+            "/proj/target",
+            "11111111-1111-4111-8111-111111111111",
+        );
+
+        // Short prefix resolves to the target and reports its physical bucket.
+        let short = &target[..8];
+        let found = resolve_session_in_root(root, short)
+            .unwrap()
+            .expect("short id should resolve");
+        assert_eq!(found.project_hash, "1111111111111111");
+        assert_eq!(found.meta.id, target);
+
+        // Full id resolves exactly.
+        let found_full = resolve_session_in_root(root, &target)
+            .unwrap()
+            .expect("full id should resolve");
+        assert_eq!(found_full.meta.id, target);
+
+        // Unknown id → None.
+        assert!(resolve_session_in_root(root, "zzzzzzzz").unwrap().is_none());
+    }
+
+    // 回归：/chat (HTTP) 路径上非致命提示作为独立的 `warning` 事件下发,而不是 error。
+    // webui 的 /api/chat 消费 ChatEvent；旧实现把 Warning 当成 error-shaped 事件，
+    // 被前端染成红色「[错误: …]」并塞进回复气泡。
+    #[test]
+    fn chat_warning_serializes_as_its_own_type_not_error() {
+        let json = serde_json::to_string(&ChatEvent::Warning {
+            message: "conversation compacted".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"warning","message":"conversation compacted"}"#
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_preprocesses_images_before_submitting_to_a_text_only_model() {
+        let home = ScopedChatHome::new();
+        let (main_url, main_request, main_task) = spawn_openai_sse("main response").await;
+        let (vl_url, vl_request, vl_task) = spawn_openai_sse("recognized screenshot text").await;
+
+        let mut config = Config::with_default_provider("main");
+        config
+            .providers
+            .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
+        config
+            .providers
+            .insert("vl".into(), test_provider("qwen3-vl-plus", vl_url));
+        config.vision_preprocessor_provider = Some("vl".into());
+        config
+            .save(&Config::default_path())
+            .expect("save chat test config");
+
+        let telemetry = zap_telemetry::Telemetry::init(
+            zap_telemetry::ResolvedConfig {
+                state: zap_telemetry::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                jeikcode_dir: home._dir.path().to_path_buf(),
+            },
+            "test".into(),
+        );
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats
+            .admit(None, Some("chat-vl-regression"))
+            .await
+            .unwrap();
+        let operation_id = admission.operation_id.clone();
+        process_chat_request(
+            ChatRequest {
+                message: "explain this screenshot".into(),
+                working_dir: Some(home._dir.path().to_path_buf()),
+                provider: Some("main".into()),
+                session_id: None,
+                request_id: Some("chat-vl-regression".into()),
+                images: vec![ImageInput {
+                    media_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                }],
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+                extra_system_append: None,
+                session_title: None,
+            },
+            event_tx,
+            admission.cancellation,
+            admission.operation_id,
+            active_chats.clone(),
+            zap_capabilities::mcp::ProjectMcpPool::global(),
+            telemetry,
+            permission_bridge::PermissionResponders::new(),
+            permission_bridge::UserInputResponders::new(),
+            false,
+            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .expect("chat request succeeds");
+        active_chats.complete(&operation_id).await;
+
+        let vl_request = tokio::time::timeout(std::time::Duration::from_secs(2), vl_request)
+            .await
+            .expect("configured VL provider must be called")
+            .expect("VL request captured");
+        let main_request = tokio::time::timeout(std::time::Duration::from_secs(2), main_request)
+            .await
+            .expect("main provider must be called")
+            .expect("main request captured");
+        assert!(
+            vl_request.contains("aW1hZ2U="),
+            "VL request must carry the image"
+        );
+        assert!(
+            main_request.contains("recognized screenshot text"),
+            "main text-only provider must receive the VL description: {main_request}"
+        );
+
+        main_task.await.expect("main provider task");
+        vl_task.await.expect("VL provider task");
+    }
+
+    // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），
+    // 携带 reset_at_display/reset_label/secs_until_reset，供 webui 渲染倒计时提示。
+    #[test]
+    fn chat_rate_limited_serializes_as_its_own_type() {
+        let json = serde_json::to_string(&ChatEvent::RateLimited {
+            reset_at_display: "18:09".into(),
+            reset_label: "5h".into(),
+            secs_until_reset: Some(7200),
+            auto_resuming: false,
+            server_message: None,
+        })
+        .unwrap();
+        // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)
+        assert!(
+            json.contains(r#""type":"rate_limited""#),
+            "wrong type: {json}"
+        );
+        assert!(json.contains(r#""reset_at_display":"18:09""#), "{json}");
+        assert!(json.contains(r#""reset_label":"5h""#), "{json}");
+        assert!(json.contains(r#""secs_until_reset":7200"#), "{json}");
+        assert!(json.contains(r#""auto_resuming":false"#), "{json}");
+    }
+
+    #[test]
+    fn message_info_user_text_with_vl_marker_renders_missing_image_placeholder() {
+        use zap_kernel::message::Message;
+
+        let msg = Message::user(
+            "识别图片内容\n\n[图片内容（由 JeikCode-Qwen-Qwen3-VL-8B-Instruct 识别）]\n这是一张图片",
+        );
+
+        let info = MessageInfo::from_kernel(&msg);
+
+        assert_eq!(info.content, "识别图片内容");
+        assert!(matches!(
+            info.images.as_deref(),
+            Some([ImageData { missing: true, .. }])
+        ));
+    }
+
+    #[test]
+    fn message_info_preserves_synthetic_user_flag() {
+        use zap_kernel::message::Message;
+
+        let msg = Message::synthetic_user("internal reminder");
+        let info = MessageInfo::from_kernel(&msg);
+
+        assert_eq!(info.role, "user");
+        assert!(
+            info.synthetic,
+            "daemon API must expose synthetic provenance"
+        );
+    }
+
+    #[test]
+    fn message_info_exposes_created_at_and_elapsed_from_kernel() {
+        use zap_kernel::message::{Message, MessageMeta};
+
+        let mut user = Message::user("hello");
+        user.created_at_ms = 1_700_000_000_000;
+        let user_info = MessageInfo::from_kernel(&user);
+        assert_eq!(user_info.created_at, Some(1_700_000_000_000));
+        assert_eq!(user_info.elapsed_ms, None);
+
+        let mut assistant = Message::assistant("done", vec![]);
+        assistant.created_at_ms = 1_700_000_012_000;
+        assistant.meta = Some(MessageMeta {
+            elapsed_ms: 12_000,
+            ..Default::default()
+        });
+        let asst = MessageInfo::from_kernel(&assistant);
+        assert_eq!(asst.created_at, Some(1_700_000_012_000));
+        assert_eq!(asst.elapsed_ms, Some(12_000));
+    }
+
+    fn history_msg(role: &str, elapsed_ms: Option<u64>) -> MessageInfo {
+        MessageInfo {
+            role: role.into(),
+            content: role.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms,
+            id: None,
+        }
+    }
+
+    #[test]
+    fn stamp_turn_elapsed_uses_full_turn_stat_not_last_round() {
+        use zap_capabilities::session::TurnStat;
+
+        let mut messages = vec![
+            history_msg("user", None),
+            history_msg("assistant", Some(5_000)),
+            history_msg("assistant", Some(18_000)),
+            history_msg("user", None),
+            history_msg("assistant", Some(2_000)),
+        ];
+        let stats = vec![
+            TurnStat {
+                after_message: 3,
+                position_valid: true,
+                turn_id: 1,
+                round_count: 2,
+                tool_call_count: 4,
+                duration_ms: 1_200_000,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 1,
+                model_usage: vec![],
+            },
+            TurnStat {
+                after_message: 5,
+                position_valid: true,
+                turn_id: 2,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 40_000,
+                total_tokens: 1,
+                errored: false,
+                used_tokens: 1,
+                ctx_window: 1,
+                model_usage: vec![],
+            },
+        ];
+        stamp_turn_elapsed_on_last_assistants(&mut messages, &stats);
+        assert_eq!(
+            messages[1].elapsed_ms,
+            Some(5_000),
+            "mid-turn round stays per-round"
+        );
+        assert_eq!(
+            messages[2].elapsed_ms,
+            Some(1_200_000),
+            "last assistant of turn 1 must be the full agent-loop wall clock"
+        );
+        assert_eq!(messages[4].elapsed_ms, Some(40_000));
+    }
+
+    #[test]
+    fn stamp_turn_elapsed_falls_back_to_created_at_span() {
+        let mut messages = vec![
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_000);
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(18_000));
+                m.created_at = Some(1_241_000);
+                m
+            },
+        ];
+        stamp_turn_elapsed_on_last_assistants(&mut messages, &[]);
+        assert_eq!(messages[1].elapsed_ms, Some(1_240_000));
+    }
+
+    #[test]
+    fn message_info_preserves_internal_origin() {
+        use zap_kernel::message::Message;
+
+        let mut msg = Message::assistant("hidden", Vec::new());
+        msg.internal_origin = Some("verify_cadence".to_string());
+        let info = MessageInfo::from_kernel(&msg);
+
+        assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
+    }
+
+    #[test]
+    fn artifact_detector_does_not_repeat_full_code_block_content_on_close() {
+        let mut detector = ArtifactDetector::new();
+        assert!(matches!(
+            detector.process("```typescript\n").as_slice(),
+            [ChatEvent::ArtifactStart { .. }]
+        ));
+
+        let first_delta = detector.process("export const value = 1;\n");
+        assert!(matches!(
+            first_delta.as_slice(),
+            [ChatEvent::ArtifactContent { content, .. }] if content == "export const value = 1;\n"
+        ));
+
+        let close_events = detector.process("```");
+        assert!(matches!(
+            close_events.as_slice(),
+            [ChatEvent::ArtifactEnd { .. }]
+        ));
+    }
+
+    #[test]
+    fn artifact_detector_splits_fenced_code_when_delta_contains_surrounding_text() {
+        let mut detector = ArtifactDetector::new();
+        let events = detector.process("验证：\n```rust\n#[test]\nfn renders_code() {}\n```\n完成");
+
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            ChatEvent::TextDelta { content, .. } if content == "验证：\n"
+        ));
+        assert!(matches!(
+            &events[1],
+            ChatEvent::ArtifactStart { artifact_type, language, title, .. }
+                if artifact_type == "code"
+                    && language.as_deref() == Some("rust")
+                    && title.as_deref() == Some("rust")
+        ));
+        assert!(matches!(
+            &events[2],
+            ChatEvent::ArtifactContent { content, .. }
+                if content == "#[test]\nfn renders_code() {}\n"
+        ));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(matches!(
+            &events[4],
+            ChatEvent::TextDelta { content, .. } if content == "完成"
+        ));
+    }
+
+    #[test]
+    fn artifact_detector_preserves_nested_code_blocks_and_avoids_fragmentation() {
+        let mut detector = ArtifactDetector::new();
+        let input = "前言：\n````markdown\n模板：\n```mermaid\ngraph TD\n    A --> B\n```\n````\n#### 结论：完成";
+        let events = detector.process(input);
+
+        assert_eq!(events.len(), 5, "Events: {events:#?}");
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "前言：\n")
+        );
+        assert!(matches!(
+            &events[1],
+            ChatEvent::ArtifactStart {
+                ref artifact_type,
+                ref language,
+                fence_len,
+                ..
+            } if artifact_type == "markdown" && language.as_deref() == Some("markdown") && *fence_len == 4
+        ));
+        assert!(matches!(
+            &events[2],
+            ChatEvent::ArtifactContent { ref content, .. }
+                if content.contains("```mermaid") && content.contains("graph TD")
+        ));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(matches!(
+            &events[4],
+            ChatEvent::TextDelta { content, .. } if content == "#### 结论：完成"
+        ));
+    }
+
+    #[test]
+    fn artifact_detector_depth_tracks_same_length_nested_blocks() {
+        let mut detector = ArtifactDetector::new();
+        let input = "```markdown\n```bash\necho 1\n```\n```\n后续正文";
+        let events = detector.process(input);
+
+        assert_eq!(events.len(), 5, "Events: {events:#?}");
+        assert!(matches!(&events[0], ChatEvent::ArtifactStart { .. }));
+        assert!(matches!(&events[1], ChatEvent::ArtifactContent { .. }));
+        assert!(matches!(&events[2], ChatEvent::ArtifactContent { .. }));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content == "后续正文")
+        );
+    }
+
+    #[test]
+    fn artifact_detector_recognizes_quoted_fence_closure() {
+        let mut detector = ArtifactDetector::new();
+        let input = "修改方式：\n```bash\nsed -i 's/cpu/cuda/g' config.py\n> ```\n\n---\n\n### 第二步：为什么把并发定在 6~8？\n正文";
+        let events = detector.process(input);
+
+        // 验证：文本必须切分为 前导文本 -> 开启 -> 代码内容 -> 闭合 -> 后续文本
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "修改方式：\n")
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&events[2], ChatEvent::ArtifactContent { content, .. } if content.contains("sed -i"))
+        );
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
+        );
+    }
+
+    #[test]
+    fn artifact_detector_closes_diff_block_with_internal_backticks() {
+        let mut detector = ArtifactDetector::new();
+        let input = "看你工具打印出来的 Diff：\n```diff\n--- expected\n+++ actual\n ```bash\n-```\n+```\n```\n后续正文标题";
+        let events = detector.process(input);
+
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content.contains("Diff："))
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("diff"))
+        );
+        assert!(matches!(&events[2], ChatEvent::ArtifactContent { .. }));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content.contains("后续正文标题"))
+        );
+    }
+
+    #[test]
+    fn artifact_detector_structural_terminator_heals_unclosed_code_block() {
+        let mut detector = ArtifactDetector::new();
+        let input = "```bash\necho 1\n\n### 第二步：为什么把并发定在 6~8？\n正文";
+        let events = detector.process(input);
+
+        assert!(
+            matches!(&events[0], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactContent { content, .. } if content.contains("echo 1"))
+        );
+        assert!(matches!(&events[2], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[3], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
+        );
+    }
+
+    #[test]
+    fn first_query_value_extracts_token() {
+        assert_eq!(first_query_value("token=abc", "token"), Some("abc".into()));
+        assert_eq!(
+            first_query_value("session=Y&token=abc&sync=1", "token"),
+            Some("abc".into())
+        );
+        assert_eq!(first_query_value("session=Y", "token"), None);
+        assert_eq!(first_query_value("", "token"), None);
+        // A bare key with no `=` is not a value.
+        assert_eq!(first_query_value("token", "token"), None);
+    }
+
+    #[test]
+    fn strip_query_key_preserves_other_params() {
+        assert_eq!(strip_query_key("token=abc", "token"), "");
+        assert_eq!(strip_query_key("token=abc&session=Y", "token"), "session=Y");
+        assert_eq!(
+            strip_query_key("session=Y&token=abc&sync=1", "token"),
+            "session=Y&sync=1"
+        );
+        assert_eq!(strip_query_key("session=Y", "token"), "session=Y");
+    }
+
+    fn origin_is_allowed(origin: &str) -> bool {
+        let origin = HeaderValue::from_str(origin).unwrap();
+        let request = axum::http::Request::builder().body(()).unwrap();
+        let (parts, _) = request.into_parts();
+        is_allowed_cors_origin(&origin, &parts)
+    }
+
+    #[test]
+    fn cors_allows_loopback_origins() {
+        assert!(origin_is_allowed("http://localhost:3000"));
+        assert!(origin_is_allowed("http://127.0.0.1:3000"));
+        assert!(origin_is_allowed("http://[::1]:3000"));
+        assert!(origin_is_allowed("https://localhost"));
+    }
+
+    #[test]
+    fn cors_allows_private_lan_origins() {
+        // Remote clients of `jeikcode serve --host 0.0.0.0` load the SPA from
+        // a LAN IP; their Origin is that private host, not loopback.
+        assert!(origin_is_allowed("http://192.168.6.3:4096"));
+        assert!(origin_is_allowed("http://10.0.0.5:13456"));
+        assert!(origin_is_allowed("http://172.16.2.14:8080"));
+    }
+
+    #[test]
+    fn cors_allows_matching_host_header_direct_connections() {
+        // Global IPv6 (e.g. 2409:... China Mobile) or public IP / DDNS direct connections
+        let origin =
+            HeaderValue::from_str("http://[2409:8a55:9ef2:b040:1d93:12d9:d43b:9fc1]:4096").unwrap();
+        let request = axum::http::Request::builder()
+            .header(
+                header::HOST,
+                "[2409:8a55:9ef2:b040:1d93:12d9:d43b:9fc1]:4096",
+            )
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        assert!(is_allowed_cors_origin(&origin, &parts));
+
+        // Public IPv4 direct connection
+        let origin_v4 = HeaderValue::from_str("http://123.123.123.123:4096").unwrap();
+        let req_v4 = axum::http::Request::builder()
+            .header(header::HOST, "123.123.123.123:4096")
+            .body(())
+            .unwrap();
+        let (parts_v4, _) = req_v4.into_parts();
+        assert!(is_allowed_cors_origin(&origin_v4, &parts_v4));
+    }
+
+    #[test]
+    fn initial_workdir_override_wins_over_config_default() {
+        // `jeikcode webui` launch dir (override) must beat a stale config default.
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resolved = resolve_initial_working_dir(
+            Some(here.clone()),
+            Some(PathBuf::from("/tmp")),
+            PathBuf::from("/nonexistent_jeikcode_cwd"),
+        );
+        assert_eq!(resolved, here);
+    }
+
+    #[test]
+    fn initial_workdir_falls_back_to_config_then_cwd() {
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // No override → existing config default wins.
+        assert_eq!(
+            resolve_initial_working_dir(None, Some(here.clone()), PathBuf::from("/x")),
+            here
+        );
+        // No override, nonexistent config default → cwd.
+        assert_eq!(
+            resolve_initial_working_dir(
+                None,
+                Some(PathBuf::from("/nonexistent_jeikcode_default")),
+                here.clone()
+            ),
+            here
+        );
+    }
+
+    #[test]
+    fn initial_workdir_ignores_nonexistent_override() {
+        // A bogus override is skipped, falling through to the config default.
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resolved = resolve_initial_working_dir(
+            Some(PathBuf::from("/nonexistent_jeikcode_override")),
+            Some(here.clone()),
+            PathBuf::from("/x"),
+        );
+        assert_eq!(resolved, here);
+    }
+
+    #[test]
+    fn initial_workdir_prefers_shared_tui_over_process_cwd() {
+        // A shared TUI runtime's dir (registered before the server starts) wins over the
+        // caller's process-cwd override, so the webui project state (footer + session
+        // list) seeds from the user's actual TUI directory. Both must exist for
+        // resolve_initial_working_dir to accept them, so use real dirs.
+        let embedded = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let process_cwd = std::env::temp_dir();
+        // Mirrors init_project_state's precedence: embedded.or(override).
+        let resolved = resolve_initial_working_dir(
+            Some(embedded.clone()).or(Some(process_cwd.clone())),
+            None,
+            PathBuf::from("/x"),
+        );
+        assert_eq!(resolved, embedded);
+    }
+
+    #[test]
+    fn attach_image_sets_replaces_placeholders_in_order_only() {
+        fn msg(role: &str, images: Option<Vec<ImageData>>) -> MessageInfo {
+            MessageInfo {
+                role: role.into(),
+                content: String::new(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images,
+                created_at: None,
+                elapsed_ms: None,
+                id: None,
+            }
+        }
+        let real = |tag: &str| ImageData {
+            media_type: "image/png".into(),
+            data: tag.into(),
+            missing: false,
+        };
+        // Two VL-preprocessed user messages (placeholders), an assistant, and a real
+        // (vision-model) image message that must NOT be touched.
+        let mut messages = vec![
+            msg("user", Some(vec![ImageData::missing_placeholder()])),
+            msg("assistant", None),
+            msg("user", Some(vec![ImageData::missing_placeholder()])),
+            msg("user", Some(vec![real("keep-me")])),
+        ];
+        attach_image_sets(&mut messages, vec![vec![real("A")], vec![real("B")]]);
+
+        assert_eq!(
+            messages[0].images.as_ref().unwrap()[0].data,
+            "A",
+            "1st placeholder → 1st set"
+        );
+        assert!(messages[1].images.is_none(), "assistant untouched");
+        assert_eq!(
+            messages[2].images.as_ref().unwrap()[0].data,
+            "B",
+            "2nd placeholder → 2nd set"
+        );
+        assert_eq!(
+            messages[3].images.as_ref().unwrap()[0].data,
+            "keep-me",
+            "a real image is never overwritten"
+        );
+    }
+
+    #[test]
+    fn list_files_returns_files_skips_dirs_and_hidden() {
+        let tmp = std::env::temp_dir().join(format!("jeikcode_list_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("b.txt"), b"x").unwrap();
+        std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+        std::fs::write(tmp.join(".hidden"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.join("subdir")).unwrap();
+
+        let files = list_files(&tmp).unwrap();
+        assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        // 目录不混入文件列表，但仍出现在 list_subdirs。
+        assert!(list_subdirs(&tmp).unwrap().contains(&"subdir".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_returns_a_free_port() {
+        // start_port=0 → OS assigns; actual port is filled from local_addr (non-zero).
+        let (listener, secondary, port) = bind_scanning("127.0.0.1", 0, 1).await.unwrap();
+        assert_ne!(port, 0);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        assert!(secondary.is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_skips_occupied_port() {
+        // Hold a port, then scan starting at it → must skip to a higher free port.
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = occupied.local_addr().unwrap().port();
+        let (listener, secondary, port) = bind_scanning("127.0.0.1", busy, 50).await.unwrap();
+        assert_ne!(port, busy);
+        assert!(port > busy);
+        assert!(secondary.is_none());
+        drop(listener);
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_supports_wildcard_dual_stack() {
+        let (primary, secondary, port) = bind_scanning("0.0.0.0", 0, 10).await.unwrap();
+        assert_ne!(port, 0);
+        assert_eq!(primary.local_addr().unwrap().port(), port);
+        // On systems with IPv6 stack, secondary is active on the same port with only_v6
+        if let Some(sec) = secondary {
+            assert_eq!(sec.local_addr().unwrap().port(), port);
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_skips_loopback_occupied_when_binding_wildcard() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = occupied.local_addr().unwrap().port();
+        let (primary, secondary, port) = bind_scanning("0.0.0.0", busy, 50).await.unwrap();
+        assert_ne!(port, busy);
+        assert!(port > busy);
+        drop(primary);
+        drop(secondary);
+        drop(occupied);
+    }
+
+    #[test]
+    fn cors_rejects_public_and_opaque_origins() {
+        // Public internet origins must not get CORS (protects loopback daemon
+        // from evil.com). Private LAN IPs are allowed — see above.
+        assert!(!origin_is_allowed("http://8.8.8.8:3000"));
+        assert!(!origin_is_allowed("https://evil.example"));
+        assert!(!origin_is_allowed("http://localhost.evil.example"));
+        assert!(!origin_is_allowed("null"));
+        assert!(!origin_is_allowed("file://local/index.html"));
+    }
+
+    // ---- 蒲公英(Oray PGY)远程访问探测 ----
+
+    /// 真实 macOS ifconfig 片段:物理 en0(BROADCAST)+ Tailscale utun6(100.x,
+    /// POINTOPOINT)+ 蒲公英 utun7(172.16.x,POINTOPOINT)。仅蒲公英那个应入选。
+    const IFCONFIG_SAMPLE: &str = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 172.20.23.187 netmask 0xfffffc00 broadcast 172.20.23.255
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.117.29.83 --> 100.117.29.83 netmask 0xffffffff
+utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
+\tinet 172.16.2.14 --> 172.16.2.14 netmask 0xfffffc00
+";
+
+    #[test]
+    fn pgy_candidates_picks_only_p2p_rfc1918() {
+        // en0 排除(BROADCAST,非 POINTOPOINT);utun6 排除(100.64/10 CGNAT,
+        // 非 RFC1918);仅 utun7 的蒲公英 IP 入选。
+        assert_eq!(pgy_ipv4_candidates(IFCONFIG_SAMPLE), vec!["172.16.2.14"]);
+    }
+
+    #[test]
+    fn pgy_candidates_excludes_rfc1918_on_non_p2p() {
+        // 公司 LAN 走 172.16 但接口是 BROADCAST(非 POINTOPOINT)→ 不入选。
+        let s = "en5: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500\n\
+                 \tinet 172.16.5.9 netmask 0xffff0000 broadcast 172.16.255.255\n";
+        assert!(pgy_ipv4_candidates(s).is_empty());
+    }
+
+    #[test]
+    fn pgy_candidates_is_segment_agnostic() {
+        // 不依赖 172.16:10/8 与 192.168/16 的 POINTOPOINT 同样入选。
+        let s = "utun9: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300\n\
+                 \tinet 10.8.0.3 --> 10.8.0.3 netmask 0xffffff00\n\
+                 utun10: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300\n\
+                 \tinet 192.168.50.2 --> 192.168.50.2 netmask 0xffffff00\n";
+        assert_eq!(pgy_ipv4_candidates(s), vec!["10.8.0.3", "192.168.50.2"]);
+    }
+
+    #[test]
+    fn pgy_candidates_empty_when_none() {
+        let s = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+                 \tinet 127.0.0.1 netmask 0xff000000\n";
+        assert!(pgy_ipv4_candidates(s).is_empty());
+    }
+
+    #[test]
+    fn pgy_pick_single_candidate() {
+        assert_eq!(
+            pgy_pick_ipv4(vec!["172.16.2.14".into()], None),
+            Some("172.16.2.14".into())
+        );
+    }
+
+    #[test]
+    fn pgy_pick_zero_candidates_is_none() {
+        assert_eq!(pgy_pick_ipv4(vec![], Some("172.16.2.14".into())), None);
+    }
+
+    #[test]
+    fn pgy_pick_multi_disambiguates_via_log() {
+        // 两个 POINTOPOINT VPN:日志自报 IP 命中其一 → 选中;否则 None。
+        let cands = vec!["172.16.2.14".to_string(), "10.99.0.5".to_string()];
+        assert_eq!(
+            pgy_pick_ipv4(cands.clone(), Some("10.99.0.5".into())),
+            Some("10.99.0.5".into())
+        );
+        assert_eq!(
+            pgy_pick_ipv4(cands.clone(), Some("172.31.9.9".into())),
+            None
+        );
+        assert_eq!(pgy_pick_ipv4(cands, None), None);
+    }
+
+    #[test]
+    fn extract_ip_eq_parses_log_line() {
+        assert_eq!(
+            extract_ip_eq("2026-06-01 worker connected ip=172.16.2.14 gw=172.16.0.159"),
+            Some("172.16.2.14".into())
+        );
+        assert_eq!(extract_ip_eq("no ip here"), None);
+    }
+
+    #[tokio::test]
+    async fn fork_session_creates_independent_branch_with_optional_truncation() {
+        use zap_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+        use zap_kernel::message::{Message, MessageMeta, SessionSnapshot};
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let project_hash = NativeSessionManager::project_hash(&working_dir);
+        let manager = NativeSessionManager::for_project(&working_dir);
+
+        let source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let source_lease = manager.acquire_lease(source_id).unwrap();
+        let mut m1 = Message::user("first question");
+        m1.meta = Some(MessageMeta {
+            turn_id: 1,
+            request_id: 1,
+            ..Default::default()
+        });
+        let mut m2 = Message::assistant("first answer", Vec::new());
+        m2.meta = Some(MessageMeta {
+            turn_id: 1,
+            request_id: 1,
+            ..Default::default()
+        });
+        let mut m3 = Message::user("second question");
+        m3.meta = Some(MessageMeta {
+            turn_id: 2,
+            request_id: 2,
+            ..Default::default()
+        });
+        let mut m4 = Message::assistant("second answer", Vec::new());
+        m4.meta = Some(MessageMeta {
+            turn_id: 2,
+            request_id: 2,
+            ..Default::default()
+        });
+        let snapshot = SessionSnapshot::new(vec![m1, m2, m3, m4]);
+        let mut meta = SessionMeta::new(source_id, working_dir.to_string_lossy(), 100);
+        meta.owner = StorageOwner::Native;
+        meta.name = "Original Session".into();
+        meta.user_renamed = true;
+        meta.message_count = 4;
+        meta.turn_count = 2;
+        manager
+            .commit_native_import(
+                &source_lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(source_lease);
+
+        // 1. Full fork with custom title
+        let full_resp = fork_session(
+            State(state.clone()),
+            axum::Extension(SessionMode::Ide),
+            Path((project_hash.clone(), source_id.to_string())),
+            Some(Json(ForkSessionRequest {
+                title: Some("Branched Full".into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(full_resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(full_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let full_fork: ForkSessionResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(full_fork.success);
+        assert_ne!(full_fork.id, source_id);
+        assert_eq!(full_fork.name, "Branched Full");
+        assert_eq!(full_fork.parent_id, source_id);
+        assert_eq!(full_fork.root_id, source_id);
+        assert_eq!(full_fork.message_count, 4);
+        assert_eq!(full_fork.turn_count, 2);
+
+        // 2. Truncated fork at index 1 (inclusive -> keeps first 2 messages / 1 turn)
+        let trunc_resp = fork_session_by_id(
+            State(state.clone()),
+            axum::Extension(SessionMode::Ide),
+            Path(source_id.to_string()),
+            Some(Json(ForkSessionRequest {
+                target_index: Some(1),
+                inclusive: Some(true),
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(trunc_resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(trunc_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let trunc_fork: ForkSessionResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(trunc_fork.success);
+        assert_eq!(trunc_fork.parent_id, source_id);
+        assert_eq!(trunc_fork.root_id, source_id);
+        assert_eq!(trunc_fork.message_count, 2);
+        assert_eq!(trunc_fork.turn_count, 1);
+
+        let loaded_trunc = manager.load_native_session(&trunc_fork.id).unwrap();
+        assert_eq!(loaded_trunc.snapshot.messages.len(), 2);
+        assert_eq!(loaded_trunc.snapshot.messages[0].text, "first question");
+        assert_eq!(loaded_trunc.snapshot.messages[1].text, "first answer");
+
+        // 3. Source session immutability & first fork preserved
+        let loaded_source = manager.load_native_session(source_id).unwrap();
+        assert_eq!(loaded_source.snapshot.messages.len(), 4);
+        assert_eq!(loaded_source.meta.message_count, 4);
+        assert!(manager.load_native_session(&full_fork.id).is_ok());
+
+        // 4. 404 on missing session
+        let missing_resp = fork_session(
+            State(state),
+            axum::Extension(SessionMode::Ide),
+            Path((
+                project_hash,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            )),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod channel_mode_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_channel_header() {
+        assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
+        assert_eq!(resolve_client_mode("vscode"), SessionMode::Vscode);
+        assert_eq!(resolve_client_mode("jetbrains"), SessionMode::Jetbrains);
+        assert_eq!(resolve_client_mode("nope"), SessionMode::Ide);
+    }
+
+    #[test]
+    fn known_clients_interactive_on_loopback_or_token() {
+        assert!(client_interactive_permission(
+            SessionMode::Ide,
+            true,
+            "0.0.0.0"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Channel,
+            false,
+            "127.0.0.1"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Vscode,
+            false,
+            "127.0.0.1"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Jetbrains,
+            false,
+            "localhost:17321"
+        ));
+        // WebUI: always interactive (mode pill), any bind / token combo.
+        assert!(client_interactive_permission(
+            SessionMode::Webui,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Webui,
+            true,
+            "0.0.0.0"
+        ));
+        assert!(client_interactive_permission(
+            SessionMode::Webui,
+            false,
+            "127.0.0.1"
+        ));
+        // Channel / VSCode without token on LAN stay non-interactive.
+        assert!(!client_interactive_permission(
+            SessionMode::Channel,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(!client_interactive_permission(
+            SessionMode::Vscode,
+            false,
+            "0.0.0.0"
+        ));
+        assert!(!client_interactive_permission(
+            SessionMode::Ide,
+            false,
+            "127.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn request_approval_mode_overrides_global_mode() {
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Build);
+        assert_eq!(
+            effective_chat_approval_mode(Some(crate::approval_mode::ApprovalMode::Plan)),
+            crate::approval_mode::ApprovalMode::Plan
+        );
+
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Auto);
+        assert_eq!(
+            effective_chat_approval_mode(None),
+            crate::approval_mode::ApprovalMode::Auto
+        );
+    }
+
+    #[test]
+    fn interactive_responder_is_required_for_all_non_auto_modes() {
+        use crate::approval_mode::ApprovalMode;
+
+        // Only Auto auto-approves; Build / AcceptEdits / Plan park on /chat/permission.
+        assert!(approval_mode_requires_responder(ApprovalMode::Build));
+        assert!(approval_mode_requires_responder(ApprovalMode::AcceptEdits));
+        assert!(approval_mode_requires_responder(ApprovalMode::Plan));
+        assert!(!approval_mode_requires_responder(ApprovalMode::Auto));
+    }
+
+    #[test]
+    fn pending_interactive_from_replay_keeps_unanswered_permission() {
+        let events = vec![
+            ChatEvent::ToolCallStarted {
+                id: "c1".into(),
+                name: "task".into(),
+                arguments: "{}".into(),
+                message_id: None,
+            },
+            ChatEvent::PermissionRequest {
+                session_id: "s1".into(),
+                approval_id: "approval-c1".into(),
+                tool_name: "task".into(),
+                reason: "Requires approval".into(),
+                call_id: "c1".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let (perm, user) = pending_interactive_from_replay(&events);
+        assert!(matches!(
+            perm,
+            Some(ChatEvent::PermissionRequest { call_id, .. }) if call_id == "c1"
+        ));
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn pending_interactive_from_replay_clears_after_tool_result() {
+        let events = vec![
+            ChatEvent::PermissionRequest {
+                session_id: "s1".into(),
+                approval_id: "approval-c1".into(),
+                tool_name: "bash".into(),
+                reason: "Requires approval".into(),
+                call_id: "c1".into(),
+                arguments: "{}".into(),
+            },
+            ChatEvent::ToolCallResult {
+                id: "c1".into(),
+                name: "bash".into(),
+                success: true,
+                output: "ok".into(),
+                duration_ms: 1,
+            },
+        ];
+        let (perm, _) = pending_interactive_from_replay(&events);
+        assert!(perm.is_none(), "resolved call must not restore a card");
+    }
+
+    #[test]
+    fn pending_interactive_from_replay_clears_after_tool_output() {
+        let events = vec![
+            ChatEvent::PermissionRequest {
+                session_id: "s1".into(),
+                approval_id: "approval-c1".into(),
+                tool_name: "edit".into(),
+                reason: "Requires approval".into(),
+                call_id: "c1".into(),
+                arguments: "{}".into(),
+            },
+            ChatEvent::ToolOutputChunk {
+                id: "c1".into(),
+                chunk: "writing".into(),
+            },
+        ];
+        let (perm, _) = pending_interactive_from_replay(&events);
+        assert!(perm.is_none(), "output means approval already granted");
+        assert!(replay_resolves_call(&events, "c1"));
+        assert!(!replay_resolves_call(&events, "other"));
+    }
+
+    #[test]
+    fn pending_interactive_from_replay_clears_on_terminal() {
+        let events = vec![
+            ChatEvent::PermissionRequest {
+                session_id: "s1".into(),
+                approval_id: "approval-c1".into(),
+                tool_name: "bash".into(),
+                reason: "Requires approval".into(),
+                call_id: "c1".into(),
+                arguments: "{}".into(),
+            },
+            ChatEvent::Done {
+                tokens: 0,
+                tool_calls: 0,
+                session_id: "s1".into(),
+                stop_reason: None,
+                message: None,
+            },
+        ];
+        let (perm, user) = pending_interactive_from_replay(&events);
+        assert!(perm.is_none());
+        assert!(user.is_none());
+    }
+
+    #[test]
+    fn pending_interactive_from_replay_clears_user_input_after_tool_result() {
+        let events = vec![
+            ChatEvent::UserInputRequest {
+                session_id: "s1".into(),
+                request_id: 7,
+                payload: serde_json::json!({
+                    "header": "Choose",
+                    "question": "merge?",
+                    "mode": "single",
+                    "options": [],
+                }),
+            },
+            ChatEvent::ToolCallResult {
+                id: "call-7".into(),
+                name: "request_user_input".into(),
+                success: true,
+                output: "No answer was provided. Proceed with your own best judgment; only ask again if you are truly blocked.".into(),
+                duration_ms: 1,
+            },
+        ];
+        let (perm, user) = pending_interactive_from_replay(&events);
+        assert!(perm.is_none());
+        assert!(
+            user.is_none(),
+            "declined/answered request_user_input must not restore a card while TUI keeps chatting"
+        );
+    }
+
+    #[test]
+    fn session_draft_working_dir_guards_against_cross_project_penetration() {
+        let draft_id = format!("test-draft-{}", uuid::Uuid::new_v4());
+        let project_b_dir = std::env::temp_dir().join(format!("proj-b-{}", uuid::Uuid::new_v4()));
+        let project_a_dir = std::env::temp_dir().join(format!("proj-a-{}", uuid::Uuid::new_v4()));
+
+        // 模拟在项目 B 创建草稿
+        crate::native_live::register_session_draft(draft_id.clone(), project_b_dir.clone());
+        assert!(crate::native_live::is_session_draft(&draft_id));
+
+        // 模拟客户端快速切换到项目 A，导致发来的请求携带了项目 A 的 working_dir
+        let client_racing_working_dir = project_a_dir.clone();
+
+        // 后端权威校准逻辑：优先使用草稿注册时的 working_dir
+        let authoritative_dir = crate::native_live::session_draft_working_dir(&draft_id)
+            .unwrap_or_else(|| client_racing_working_dir.clone());
+
+        assert_eq!(
+            authoritative_dir, project_b_dir,
+            "草稿工作目录必须坚守注册时的项目 B，坚决不受请求中带入的项目 A 污染"
+        );
+
+        let bucket_b = response_project_hash(&authoritative_dir);
+        let bucket_a = response_project_hash(&project_a_dir);
+        assert_ne!(
+            bucket_b, bucket_a,
+            "项目 B 的 bucket hash 必须与项目 A 隔离，杜绝穿透到项目 A 的会话列表"
+        );
+
+        // 清理草稿
+        let taken = crate::native_live::take_session_draft(&draft_id);
+        assert_eq!(taken, Some(project_b_dir));
+        assert!(!crate::native_live::is_session_draft(&draft_id));
+    }
+
+    #[tokio::test]
+    async fn notify_focus_versioned_broadcast_preserves_multiclient_delivery() {
+        let test_session_1 = format!("test-session-focus-{}", uuid::Uuid::new_v4());
+        let secret = notify_focus_secret().to_string();
+
+        let req1 = NotifyFocusPost {
+            session_id: test_session_1.clone(),
+            secret: secret.clone(),
+        };
+        let _ = post_notify_focus(axum::Json(req1)).await;
+
+        let state1 = notify_focus_pending().lock().unwrap().clone();
+        assert!(state1.version > 0);
+        assert_eq!(state1.session_id, Some(test_session_1.clone()));
+
+        // 客户端 1（例如后台浏览器标签页）读取，不发生破坏性清空
+        let resp1 = get_notify_focus().await.into_response();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // 客户端 2（例如桌面端 Tauri 窗口）随后读取，仍然能拿到相同的 version 和 session_id
+        let resp2 = get_notify_focus().await.into_response();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let state2 = notify_focus_pending().lock().unwrap().clone();
+        assert_eq!(state2.version, state1.version);
+        assert_eq!(state2.session_id, Some(test_session_1));
+    }
+
+    #[test]
+    fn fs_drives_and_shortcuts_system_support() {
+        let drives = list_system_drives();
+        assert!(!drives.is_empty(), "system drives should never be empty");
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(drives.iter().any(|d| d.ends_with(':')));
+            // 验证盘符单字规范化为带反斜杠根路径
+            let norm_c = normalize_dir_arg("C:");
+            assert_eq!(norm_c.to_string_lossy(), "C:\\");
+            let norm_c_lower = normalize_dir_arg("c:");
+            assert_eq!(norm_c_lower.to_string_lossy(), "C:\\");
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(drives, vec!["/".to_string()]);
+        }
+
+        let shortcuts = list_system_shortcuts();
+        assert!(
+            shortcuts.iter().any(|s| s.id == "home"),
+            "system shortcuts should contain home entry"
+        );
+    }
+
+    #[test]
+    fn resolve_target_message_index_matches_reasoning_and_text() {
+        use zap_kernel::message::Message;
+        let mut msg_with_reasoning = Message::assistant("这是正式回答", Vec::new());
+        msg_with_reasoning.reasoning = Some("这是详细的思考过程".into());
+
+        let messages = vec![
+            Message::user("你好"),
+            msg_with_reasoning,
+            Message::user("第二问"),
+            Message::assistant("第二答", Vec::new()),
+        ];
+
+        // 1. 通过正文匹配
+        let idx1 =
+            resolve_target_message_index(&messages, 1, Some("这是正式回答"), Some("assistant"));
+        assert_eq!(idx1, Some(1));
+
+        // 2. 通过思考过程匹配
+        let idx2 = resolve_target_message_index(
+            &messages,
+            1,
+            Some("这是详细的思考过程"),
+            Some("assistant"),
+        );
+        assert_eq!(idx2, Some(1));
+
+        // 3. 通过前端拼接的全文（思考过程 + 正文）匹配
+        let combined = "这是详细的思考过程\n这是正式回答";
+        let idx3 = resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"));
+        assert_eq!(idx3, Some(1));
+
+        // 4. 第二轮助手匹配
+        let idx4 = resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"));
+        assert_eq!(idx4, Some(3));
+    }
+
+    #[test]
+    fn delete_session_message_turn_and_agent_isolation() {
+        use zap_kernel::message::{Message, Role};
+        let mut turn0_tool = Message::assistant("", Vec::new());
+        turn0_tool.tool_calls = vec![zap_kernel::tool::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }];
+
+        let mut messages = vec![
+            Message::user("问题1"),
+            turn0_tool,
+            Message::tool_result("call-1", "文件内容", false),
+            Message::assistant("问题1最终回答", Vec::new()),
+            Message::user("问题2"),
+            Message::assistant("问题2回答", Vec::new()),
+        ];
+
+        // 模拟删除问题1的 Agent 回复（从中间输出到最终回答，保留问题1的 User 消息）
+        let target_idx =
+            resolve_target_message_index(&messages, 3, Some("问题1最终回答"), Some("assistant"))
+                .unwrap();
+        assert_eq!(target_idx, 3);
+
+        // 模拟 delete_turn: false 下的 Agent 范围清理逻辑
+        let mut start = target_idx;
+        while start > 0 && messages[start - 1].role != Role::User {
+            start -= 1;
+        }
+        let mut end = target_idx + 1;
+        while end < messages.len() && messages[end].role != Role::User {
+            end += 1;
+        }
+        messages.drain(start..end);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].text, "问题1");
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].text, "问题2");
+        assert_eq!(messages[2].role, Role::Assistant);
+        assert_eq!(messages[2].text, "问题2回答");
+
+        // 验证元数据计数器派生正确性
+        let (turn_c, req_c) = zap_kernel::message::SessionSnapshot::derive_counters(&messages);
+        assert_eq!(turn_c, 0);
+        assert_eq!(req_c, 0);
+    }
+
+    #[test]
+    fn format_tool_args_supports_modern_and_legacy_tool_names() {
+        // 1. read / read_file
+        let read_args = r#"{"path":"src/main.rs","offset":10,"limit":50}"#;
+        assert_eq!(format_tool_args("read", read_args), "src/main.rs L10-60");
+        let read_legacy = r#"{"file_path":"crates/core/lib.rs"}"#;
+        assert_eq!(
+            format_tool_args("read_file", read_legacy),
+            ".../core/lib.rs"
+        );
+
+        // 2. write / write_file / create_file
+        let write_args = r#"{"path":"index.html","content":"<html></html>"}"#;
+        assert_eq!(
+            format_tool_args("write", write_args),
+            "index.html (13 bytes)"
+        );
+        let write_legacy = r#"{"file_path":"app.py","content":"print(1)"}"#;
+        assert_eq!(
+            format_tool_args("create_file", write_legacy),
+            "app.py (8 bytes)"
+        );
+
+        // 3. edit / edit_file
+        let edit_args = r#"{"path":"crates/zap-daemon/src/lib.rs"}"#;
+        assert_eq!(format_tool_args("edit", edit_args), ".../src/lib.rs");
+        let edit_legacy = r#"{"file_path":"crates/zap-daemon/src/lib.rs"}"#;
+        assert_eq!(format_tool_args("edit_file", edit_legacy), ".../src/lib.rs");
+
+        // 4. run_command / bash with command or cmd
+        let cmd_args = r#"{"command":"cargo test","summary":"run test suite"}"#;
+        assert_eq!(
+            format_tool_args("run_command", cmd_args),
+            "run test suite — `cargo test`"
+        );
+        let cmd_alias = r#"{"cmd":"git status"}"#;
+        assert_eq!(format_tool_args("run_command", cmd_alias), "`git status`");
+
+        // 5. code_explore
+        let explore_args = r#"{"query":"CodeExploreTool","path":"crates/capabilities"}"#;
+        assert_eq!(
+            format_tool_args("code_explore", explore_args),
+            "\"CodeExploreTool\" in crates/capabilities"
+        );
+
+        // 6. task
+        let task_args = r#"{"tasks":[{"description":"sub1"},{"description":"sub2"}]}"#;
+        assert_eq!(format_tool_args("task", task_args), "2 subtask(s)");
+    }
+
+    #[test]
+    fn extract_artifacts_supports_modern_write_edit_and_cmd() {
+        let calls = vec![
+            (
+                "write",
+                r#"{"path":"chart.html","content":"<h1>Chart</h1>"}"#,
+            ),
+            ("edit", r#"{"path":"diagram.svg","content":"<svg></svg>"}"#),
+            (
+                "create_file",
+                r##"{"file_path":"notes.md","content":"# Notes"}"##,
+            ),
+            ("run_command", r#"{"cmd":"echo 'Report' > report.md"}"#),
+            ("bash", r#"{"command":"python script.py >> results.html"}"#),
+        ];
+
+        let artifacts = extract_artifacts_from_call_fields(calls).expect("artifacts extracted");
+        assert_eq!(artifacts.len(), 5);
+
+        // 1. write -> chart.html
+        assert_eq!(artifacts[0].artifact_type, "html");
+        assert_eq!(artifacts[0].title.as_deref(), Some("chart.html"));
+        assert_eq!(artifacts[0].content, "<h1>Chart</h1>");
+
+        // 2. edit -> diagram.svg
+        assert_eq!(artifacts[1].artifact_type, "svg");
+        assert_eq!(artifacts[1].title.as_deref(), Some("diagram.svg"));
+
+        // 3. create_file -> notes.md
+        assert_eq!(artifacts[2].artifact_type, "markdown");
+        assert_eq!(artifacts[2].title.as_deref(), Some("notes.md"));
+
+        // 4. run_command -> report.md via redirect
+        assert_eq!(artifacts[3].artifact_type, "markdown");
+        assert_eq!(artifacts[3].title.as_deref(), Some("report.md"));
+
+        // 5. bash -> results.html via append redirect
+        assert_eq!(artifacts[4].artifact_type, "html");
+        assert_eq!(artifacts[4].title.as_deref(), Some("results.html"));
+    }
+}

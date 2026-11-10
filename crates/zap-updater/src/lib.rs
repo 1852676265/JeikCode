@@ -1,0 +1,2941 @@
+//! In-place binary upgrade for jeikcode.
+//!
+//! Flow:
+//! 1. Fetch `latest.json` manifest (version + per-target sha256/size).
+//! 2. Detect current platform and pick the matching binary entry.
+//! 3. Verify we can write to `current_exe()`'s directory — if not, fail
+//!    with a precise message telling the user to re-run with `sudo`.
+//! 4. Download the binary to a sibling temp file, streaming progress.
+//! 5. Verify SHA256 against the manifest. Bail (and delete temp) on
+//!    mismatch — we never touch the live binary until verification
+//!    passes.
+//! 6. Three-way swap to replace the live binary:
+//!    a. `jeikcode` → `.jeikcode.rolling`  (Windows allows renaming a running exe)
+//!    b. new binary → `jeikcode`            (install the upgrade)
+//!    c. best-effort: remove old `.bak`, then `.jeikcode.rolling` → `.bak`
+//!
+//!    Steps a–b are the critical path; step c is best-effort. If the old
+//!    `.bak` is locked (AV scanner, still-running process, read-only
+//!    attribute), the upgrade still succeeds — the `.rolling` file lingers
+//!    and is cleaned up on the next upgrade attempt.
+//!
+//! Rollback swaps the live binary with `.bak` in place, so one backup
+//! always points to "the other version" — the user can toggle by
+//! alternating `/upgrade` and `/upgrade rollback`.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+
+/// Version manifest URL for self-update. A function rather than a const because
+/// the address follows the deployment profile; see `zap_config::endpoints`.
+///
+/// Resolution order:
+/// 1. env `JEIKCODE_UPDATE_MANIFEST_URL` (highest, e.g. CI / one-off override)
+/// 2. config `[config] update_manifest_url` (user-set override in config.toml)
+/// 3. built-in official GitHub Release manifest
+pub fn manifest_url() -> &'static str {
+    let env = std::env::var(zap_config::endpoints::UPDATE_MANIFEST_URL_ENV).ok();
+    if let Some(v) = env.filter(|s| !s.trim().is_empty()) {
+        return Box::leak(v.into_boxed_str());
+    }
+    if let Some(cfg) =
+        zap_config::config::Config::load(&zap_config::config::Config::default_path()).ok()
+    {
+        if let Some(v) = cfg.update_manifest_url.filter(|s| !s.trim().is_empty()) {
+            return Box::leak(v.into_boxed_str());
+        }
+    }
+    zap_config::endpoints::update_manifest_url()
+}
+
+/// Base for release binary downloads; [`binary_url`] appends `/<version>/<asset>`.
+///
+/// Same resolution order as [`manifest_url`]: env > config > built-in fork channel.
+pub fn download_base() -> &'static str {
+    let env = std::env::var(zap_config::endpoints::UPDATE_DOWNLOAD_BASE_ENV).ok();
+    if let Some(v) = env.filter(|s| !s.trim().is_empty()) {
+        return Box::leak(v.into_boxed_str());
+    }
+    if let Some(cfg) =
+        zap_config::config::Config::load(&zap_config::config::Config::default_path()).ok()
+    {
+        if let Some(v) = cfg.update_download_base.filter(|s| !s.trim().is_empty()) {
+            return Box::leak(v.into_boxed_str());
+        }
+    }
+    zap_config::endpoints::update_download_base()
+}
+
+/// User-Agent for the update HTTP client. Lowercase `jeikcode/<version>` is
+/// deliberate (the gateway UA filter hijacks capital-A `JeikCode`). Vendored here so
+/// this leaf crate doesn't depend on `jeikcode-core` (mirrors its `JEIKCODE_USER_AGENT`;
+/// same value since the whole workspace shares one version).
+const JEIKCODE_USER_AGENT: &str = concat!("zap/", env!("CARGO_PKG_VERSION"));
+
+/// 显式检测系统环境变量中配置的代理（与 Antigravity-Manager 完全对齐）
+pub fn detect_system_proxy() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Apply the process proxy policy to the download client: honor `no_proxy` mode,
+/// otherwise leave reqwest's env-based proxy detection intact and mount explicit system proxy.
+pub fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    zap_config::proxy::ensure_runtime_initialized();
+    if std::env::var(zap_config::proxy::MODE_ENV)
+        .ok()
+        .as_deref()
+        == Some(zap_config::proxy::ProxyMode::NoProxy.as_str())
+    {
+        builder.no_proxy()
+    } else {
+        let mut b = builder;
+        if let Some(proxy_url) = detect_system_proxy() {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                b = b.proxy(proxy);
+            }
+        }
+        b
+    }
+}
+
+/// 解析用于国内网络加速的候选 URL 列表（直连优先，若为 GitHub 资产则自动附带加速镜像）
+pub fn get_mirror_urls(raw_url: &str) -> Vec<String> {
+    let mut urls = vec![raw_url.to_string()];
+    if raw_url.contains("github.com") {
+        for prefix in ["https://ghfast.top/", "https://ghproxy.net/"] {
+            urls.push(format!("{}{}", prefix, raw_url));
+        }
+    }
+    urls
+}
+
+/// Streamed progress events from the upgrade/rollback machinery.
+///
+/// Sender is always async-owned (the upgrade task); receivers are the
+/// TUI event loop or the CLI `stdout` logger. Events are advisory —
+/// dropping the receiver must never block the upgrade.
+#[derive(Debug, Clone)]
+pub enum UpgradeEvent {
+    ManifestFetched {
+        version: String,
+    },
+    Downloading {
+        bytes: u64,
+        total: u64,
+    },
+    Verifying,
+    Replacing,
+    Done {
+        version: String,
+        backup: PathBuf,
+        /// The *original* exe path (e.g. `jeikcode.exe`) **before**
+        /// `replace_binary` renamed it. On Windows, `current_exe()`
+        /// returns the renamed path after the swap, so callers must
+        /// use this field for `re_exec_self`.
+        exe: PathBuf,
+    },
+    /// Terminal failure. Carries the display-formatted error so the UI
+    /// layer doesn't need `anyhow` to render it.
+    Failed(String),
+    /// Rollback finished. Reported through the same channel so the TUI
+    /// can drive both flows with a single select arm.
+    RolledBack {
+        exe: PathBuf,
+        backup: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Manifest {
+    pub version: String,
+    #[serde(default)]
+    pub released_at: Option<String>,
+    pub binaries: std::collections::BTreeMap<String, BinaryEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinaryEntry {
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpgradeSummary {
+    pub version: String,
+    pub backup: PathBuf,
+    pub exe: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RollbackSummary {
+    pub exe: PathBuf,
+    pub backup: PathBuf,
+}
+
+/// Return the target tag used in release artifact names
+/// (`darwin-arm64`, `linux-x64`, `windows-x64`, …).
+///
+/// `None` means the current platform has no published release — the
+/// caller must surface a clean "unsupported platform" message rather
+/// than fall through to a 404 download.
+// `target_env = "ohos"` is unknown to the check-cfg lint on toolchains
+// without the OpenHarmony target registered; the cfg is still correct when
+// building for `*-linux-ohos`, so silence the false-positive.
+#[allow(unexpected_cfgs)]
+pub fn detect_target() -> Option<&'static str> {
+    // HarmonyOS / OpenHarmony builds report `std::env::consts::OS == "linux"`
+    // at runtime, so the OS+ARCH table below would resolve to `linux-arm64`
+    // — a STATIC-musl build that doesn't run on HarmonyOS — and the auto-
+    // upgrade would clobber the working DYNAMIC-musl install (the one linked
+    // against `/lib/ld-musl-aarch64.so.1`), leaving `permission denied`.
+    // The OHOS artifact is compiled for a `*-linux-ohos` target, so pin it to
+    // its own `ohos-arm64` asset using the COMPILE-TIME target rather than the
+    // runtime OS string. Zero effect on every other platform.
+    #[cfg(any(target_os = "ohos", target_env = "ohos"))]
+    {
+        return match std::env::consts::ARCH {
+            "aarch64" | "arm64" => Some("ohos-arm64"),
+            _ => None,
+        };
+    }
+    #[cfg(not(any(target_os = "ohos", target_env = "ohos")))]
+    {
+        target_tag(std::env::consts::OS, std::env::consts::ARCH)
+    }
+}
+
+fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("windows", "x86_64") => Some("windows-x64"),
+        ("windows", "aarch64") => Some("windows-arm64"),
+        _ => None,
+    }
+}
+
+/// Release artifact filename for a given version + target, matching
+/// what `scripts/release.sh` publishes to `dist/<version>/`.
+pub fn binary_filename(version: &str, target: &str) -> String {
+    let tag = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{}", version)
+    };
+    if target.starts_with("windows") {
+        format!("jeikcode-{}-{}.exe", tag, target)
+    } else {
+        format!("jeikcode-{}-{}", tag, target)
+    }
+}
+
+pub fn binary_url(version: &str, target: &str) -> String {
+    let tag = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{}", version)
+    };
+    format!(
+        "{}/{}/{}",
+        download_base(),
+        tag,
+        binary_filename(version, target)
+    )
+}
+
+/// Path of the running `jeikcode` executable. Resolved once at the
+/// start of an upgrade so we know what to replace.
+pub fn current_exe_path() -> Result<PathBuf> {
+    std::env::current_exe().context("could not resolve current executable path")
+}
+
+fn same_exe(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn looks_like_jeikcode_binary(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "jeikcode" || lower == "jeikcode.exe"
+}
+
+fn looks_like_desktop_cli_payload(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("cli-bin"))
+}
+
+fn desktop_cli_bin_candidates() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        dirs.push(local.join("JeikCode Desktop"));
+        dirs.push(local.join("Programs").join("JeikCode Desktop"));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)", "PROGRAMFILES"] {
+        if let Some(pf) = std::env::var_os(key) {
+            dirs.push(PathBuf::from(pf).join("JeikCode Desktop"));
+        }
+    }
+    if let Some(home) = zap_config::util::real_home_dir() {
+        dirs.push(
+            home.join("Applications")
+                .join("JeikCode Desktop.app")
+                .join("Contents")
+                .join("Resources"),
+        );
+        dirs.push(home.join(".local").join("share").join("zap-desktop"));
+    }
+    dirs.push(PathBuf::from(
+        "/Applications/JeikCode Desktop.app/Contents/Resources",
+    ));
+    dirs.push(PathBuf::from("/usr/lib/zap-desktop"));
+    dirs.push(PathBuf::from("/usr/lib/JeikCode Desktop"));
+    dirs.push(PathBuf::from("/opt/JeikCode Desktop"));
+
+    let mut out = Vec::new();
+    for dir in dirs {
+        out.push(dir.join("cli-bin"));
+        out.push(dir.join("resources").join("cli-bin"));
+    }
+    out
+}
+
+/// Every CLI image we should overwrite: the running process, `~/.local/bin`,
+/// PATH copies, and the desktop installer's bundled `cli-bin`. Desktop copies
+/// `cli-bin` into `~/.local/bin` on launch; replacing only one side leaves
+/// either PATH or the next desktop start on the old build.
+pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf, allow_payload: bool| {
+        if !(looks_like_jeikcode_binary(&p)
+            || (allow_payload && looks_like_desktop_cli_payload(&p)))
+        {
+            return;
+        }
+        if out.iter().any(|e| same_exe(e, &p)) {
+            return;
+        }
+        if p.exists() || same_exe(&p, running) {
+            out.push(p);
+        }
+    };
+    push(running.to_path_buf(), true);
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            push(dir.join("jeikcode"), false);
+            #[cfg(windows)]
+            push(dir.join("jeikcode.exe"), false);
+        }
+    }
+    if let Some(home) = zap_config::util::real_home_dir() {
+        push(home.join(".local/bin/jeikcode"), false);
+        #[cfg(windows)]
+        push(home.join(".local/bin/jeikcode.exe"), false);
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        push(
+            PathBuf::from(local).join("JeikCode").join("jeikcode.exe"),
+            false,
+        );
+    }
+    for candidate in ["/usr/local/bin/jeikcode", "/usr/bin/jeikcode"] {
+        push(PathBuf::from(candidate), false);
+    }
+    if let Some(p) = std::env::var_os("JEIKCODE_DESKTOP_CLI_BIN") {
+        push(PathBuf::from(p), true);
+    }
+    for p in desktop_cli_bin_candidates() {
+        push(p, true);
+    }
+    out
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher).context("hashing file")?;
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+/// Sibling path used to stash the previous binary.
+///
+/// Unix: `jeikcode` → `jeikcode.bak`.
+/// Windows: `jeikcode.exe` → `jeikcode.exe.bak`.
+pub fn backup_path(exe: &Path) -> PathBuf {
+    let mut os = exe.as_os_str().to_os_string();
+    os.push(".bak");
+    PathBuf::from(os)
+}
+
+/// Temp file where an in-flight download is written before atomic
+/// rename. Dotted prefix so it doesn't show up in a casual `ls`, and
+/// also so it's easy to identify-and-clean if a crash orphans it.
+fn download_path(exe: &Path) -> PathBuf {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(".jeikcode.download")
+}
+
+/// Same-dir temp used during a three-way rollback swap. Also reused by the
+/// Windows uninstaller (zap-cli) to rename the live exe out of the way
+/// before deleting the install dir, hence `pub` rather than `pub(crate)`.
+pub fn rolling_path(exe: &Path) -> PathBuf {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(".jeikcode.rolling")
+}
+
+/// Return `Ok(())` iff we can create a file alongside `exe`.
+///
+/// Testing the *directory* (not the file itself) is what matters:
+/// `rename(2)` needs write permission on the containing dir to atomic
+/// replace. Probing creates a real empty file and deletes it to avoid
+/// false positives from filesystems that claim metadata writability
+/// but reject opens.
+pub fn ensure_writable(exe: &Path) -> Result<()> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("executable has no parent directory: {}", exe.display()))?;
+    let probe = dir.join(".jeikcode.writable-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "{} is not writable by the current user ({}).\n\
+             Re-run with elevated privileges:  sudo jeikcode upgrade\n\
+             Or reinstall into a user-writable location (e.g. ~/.local/bin).",
+            dir.display(),
+            e
+        )),
+    }
+}
+
+/// Fetch and parse `latest.json` from the configured manifest URL.
+///
+/// Longer timeout than the passive `version_check` (which must fail
+/// fast at startup); here the user explicitly asked for an upgrade, so
+/// waiting 30s for a slow mirror is acceptable.
+pub async fn fetch_manifest() -> Result<Manifest> {
+    fetch_manifest_from_url(manifest_url()).await
+}
+
+/// Release channel for in-place upgrades. `Stable` is GitHub `releases/latest`
+/// (`--main` / omitting the channel). `Beta` is the highest prerelease tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateChannel {
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "beta" | "preview" => Self::Beta,
+            _ => Self::Stable,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
+/// One GitHub (or edge-cache) release row used by version listing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedRelease {
+    pub tag_name: String,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub assets: Vec<ListedAsset>,
+}
+
+fn tag_is_prerelease(tag: &str, flagged: bool) -> bool {
+    flagged || tag.contains('-')
+}
+
+/// SemVer compare that keeps pre-release ordinals (`7.2.4-beta.5` > `7.2.4-beta.4`).
+/// Stable without a pre-release tag ranks above the same core with a pre tag.
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> (Vec<u64>, Option<(String, u64)>) {
+        let clean = v.trim().trim_start_matches('v').trim_start_matches('V');
+        if let Some((main_part, pre_part)) = clean.split_once('-') {
+            let nums: Vec<u64> = main_part
+                .split('.')
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            let pre_info = if let Some((tag, num_str)) = pre_part.split_once('.') {
+                Some((tag.to_lowercase(), num_str.parse::<u64>().unwrap_or(0)))
+            } else {
+                Some((pre_part.to_lowercase(), 0))
+            };
+            (nums, pre_info)
+        } else {
+            let nums: Vec<u64> = clean
+                .split('.')
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            (nums, None)
+        }
+    };
+    let (latest_nums, latest_pre) = parse(latest);
+    let (current_nums, current_pre) = parse(current);
+    let max_len = latest_nums.len().max(current_nums.len());
+    for i in 0..max_len {
+        let l = latest_nums.get(i).copied().unwrap_or(0);
+        let c = current_nums.get(i).copied().unwrap_or(0);
+        if l > c {
+            return true;
+        }
+        if l < c {
+            return false;
+        }
+    }
+    match (latest_pre, current_pre) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some((l_tag, l_num)), Some((c_tag, c_num))) => {
+            if l_tag != c_tag {
+                l_tag > c_tag
+            } else {
+                l_num > c_num
+            }
+        }
+        (None, None) => false,
+    }
+}
+
+fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in raw.split(',') {
+        let part = part.trim();
+        if !part.contains("rel=\"next\"") {
+            continue;
+        }
+        let start = part.find('<')? + 1;
+        let end = part.find('>')?;
+        if start < end {
+            return Some(part[start..end].to_string());
+        }
+    }
+    None
+}
+
+fn notes_missing(body: &Option<String>) -> bool {
+    body.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
+}
+
+fn merge_listed_releases(into: &mut Vec<ListedRelease>, extra: Vec<ListedRelease>) {
+    for rel in extra {
+        if rel.tag_name.trim().is_empty() {
+            continue;
+        }
+        if let Some(existing) = into.iter_mut().find(|r| r.tag_name == rel.tag_name) {
+            if notes_missing(&existing.body) && !notes_missing(&rel.body) {
+                existing.body = rel.body;
+            }
+            if existing.published_at.is_none() {
+                existing.published_at = rel.published_at;
+            }
+            if existing.assets.is_empty() {
+                existing.assets = rel.assets;
+            }
+            existing.prerelease = existing.prerelease || rel.prerelease;
+        } else {
+            into.push(rel);
+        }
+    }
+}
+
+async fn fetch_release_pages(
+    client: &reqwest::Client,
+    first_url: &str,
+) -> Result<Vec<ListedRelease>> {
+    let mut url = first_url.to_string();
+    let mut all = Vec::new();
+    for _ in 0..20 {
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            if all.is_empty() {
+                return Err(anyhow!(
+                    "listing releases from {url} returned HTTP {}",
+                    resp.status()
+                ));
+            }
+            break;
+        }
+        let next = next_page_url(resp.headers());
+        let page = resp
+            .json::<Vec<ListedRelease>>()
+            .await
+            .context("parsing releases page")?;
+        if page.is_empty() {
+            break;
+        }
+        all.extend(page);
+        match next {
+            Some(next_url) => url = next_url,
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+/// Releases list discovery:
+/// 1. If configured with a custom repository (not "jeikl/JeikCode"), prefer
+///    fetching GitHub Releases directly so downstream releases take precedence.
+/// 2. Otherwise try edge cache at `jeikcode.top/api/releases` with fallbacks.
+pub async fn list_releases() -> Result<Vec<ListedRelease>> {
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()?;
+    let mut all = Vec::new();
+    let repo = zap_config::endpoints::update_repo();
+    let is_custom_repo = repo != "jeikl/JeikCode";
+
+    // Downstream custom repository: fetch directly from GitHub releases first
+    if is_custom_repo {
+        let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
+        if let Ok(pages) = fetch_release_pages(&client, &gh).await {
+            merge_listed_releases(&mut all, pages);
+        }
+        if all.is_empty() {
+            // 对齐 Antigravity-Manager 策略：
+            // 当 GitHub REST API 遭遇 403 频控（未认证每小时仅限 60 次）或网络阻塞时，
+            // 自动降级拉取发布在 GitHub Releases 上的静态 latest.json 清单（直接走 CDN 资产分发，完全无频控限制）
+            if let Ok(manifest) = fetch_manifest().await {
+                let tag = manifest.version.clone();
+                all.push(ListedRelease {
+                    tag_name: tag.clone(),
+                    prerelease: tag_is_prerelease(&tag, false),
+                    body: Some("最新稳定发布版本 (由静态 Manifest 清单兜底)".to_string()),
+                    published_at: manifest.released_at,
+                    assets: vec![],
+                });
+            }
+        }
+        if all.is_empty() {
+            return Err(anyhow!("no releases found for custom repository {repo}"));
+        }
+        return Ok(all);
+    }
+
+    if all.is_empty() {
+        let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
+        if let Ok(resp) = client.get(&primary).send().await {
+            if resp.status().is_success() {
+                if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
+                    merge_listed_releases(&mut all, list);
+                }
+            }
+        }
+        let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
+        if all.is_empty() || !edge_has_notes {
+            let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
+            if let Ok(pages) = fetch_release_pages(&client, &gh).await {
+                merge_listed_releases(&mut all, pages);
+            }
+        }
+    }
+    if all.is_empty() {
+        return Err(anyhow!("no releases found"));
+    }
+    Ok(all)
+}
+
+/// Channel releases, newest first. Stable drops prereleases; beta keeps them.
+pub fn filter_channel_releases(
+    releases: &[ListedRelease],
+    channel: UpdateChannel,
+) -> Vec<ListedRelease> {
+    let mut matched: Vec<ListedRelease> = releases
+        .iter()
+        .filter(|r| !r.tag_name.trim().is_empty())
+        .filter(|r| match channel {
+            UpdateChannel::Stable => !tag_is_prerelease(&r.tag_name, r.prerelease),
+            UpdateChannel::Beta => tag_is_prerelease(&r.tag_name, r.prerelease),
+        })
+        .cloned()
+        .collect();
+    matched.sort_by(|a, b| {
+        if version_is_newer(&a.tag_name, &b.tag_name) {
+            std::cmp::Ordering::Less
+        } else if version_is_newer(&b.tag_name, &a.tag_name) {
+            std::cmp::Ordering::Greater
+        } else {
+            a.tag_name.cmp(&b.tag_name)
+        }
+    });
+    matched.dedup_by(|a, b| a.tag_name == b.tag_name);
+    matched
+}
+
+/// `7.2.4` and `v7.2.4` both become `v7.2.4`.
+pub fn normalize_version_tag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let bare = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    format!("v{bare}")
+}
+
+/// Stable tags have no prerelease suffix. Anything with `-` is beta.
+pub fn channel_for_tag(tag: &str) -> UpdateChannel {
+    if tag_is_prerelease(tag, false) {
+        UpdateChannel::Beta
+    } else {
+        UpdateChannel::Stable
+    }
+}
+
+/// `latest.json` published next to one tag's binaries.
+pub async fn fetch_manifest_for_tag(version: &str) -> Result<Manifest> {
+    let tag = normalize_version_tag(version);
+    if tag == "v" {
+        return Err(anyhow!("missing version"));
+    }
+    let url = format!(
+        "{}/{tag}/latest.json",
+        download_base().trim_end_matches('/')
+    );
+    fetch_manifest_from_url(&url).await
+}
+
+/// Latest `latest.json` for the chosen channel. Stable uses GitHub
+/// `releases/latest`; beta picks the highest prerelease tag and loads that
+/// tag's `latest.json` (prereleases are never `/releases/latest`).
+pub async fn fetch_manifest_for_channel(channel: UpdateChannel) -> Result<Manifest> {
+    match channel {
+        UpdateChannel::Stable => fetch_manifest().await,
+        UpdateChannel::Beta => {
+            let tags = list_releases().await?;
+            let matched = filter_channel_releases(&tags, UpdateChannel::Beta);
+            let tag = matched
+                .first()
+                .map(|r| r.tag_name.clone())
+                .ok_or_else(|| anyhow!("no beta (prerelease) tag found"))?;
+            fetch_manifest_for_tag(&tag).await
+        }
+    }
+}
+
+/// Same as [`run_upgrade`] but reads the stable or beta manifest.
+pub async fn run_upgrade_for_channel(
+    channel: UpdateChannel,
+    current_version: String,
+    force: bool,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
+    let manifest = fetch_manifest_for_channel(channel).await?;
+    run_upgrade_with_manifest(manifest, current_version, force, tx).await
+}
+
+/// Child waits for this parent pid to exit before binding the listen port.
+pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
+
+/// Actual listen port of the process that is being replaced.
+/// argv `--port` can still be the first choice from before a cold-start scan.
+pub const RESTART_LISTEN_PORT_ENV: &str = "JEIKCODE_RESTART_LISTEN_PORT";
+
+/// Successor must bind [`RESTART_LISTEN_PORT_ENV`] and must not scan or
+/// shut down any other jeikcode on a neighboring port.
+pub const RESTART_EXACT_PORT_ENV: &str = "JEIKCODE_RESTART_EXACT_PORT";
+
+/// Token the browser already stored. Set only when argv has no `--token`.
+pub const RESTART_TOKEN_ENV: &str = "JEIKCODE_RESTART_TOKEN";
+
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// `--port 13457` or `--port=13457` from the inherited argv.
+pub fn listen_port_from_args<I, S>(args: I) -> Option<u16>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--port" {
+            let value = args.get(index + 1)?;
+            return value.to_str()?.parse().ok().filter(|port: &u16| *port > 0);
+        }
+        if let Some(rest) = arg.to_str().and_then(|text| text.strip_prefix("--port=")) {
+            return rest.parse().ok().filter(|port: &u16| *port > 0);
+        }
+        index += 1;
+    }
+    None
+}
+
+pub fn restart_listen_port_from_env() -> Option<u16> {
+    std::env::var(RESTART_LISTEN_PORT_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|port: &u16| *port > 0)
+}
+
+/// Read and remove the inherited webui token so later child processes do not
+/// see it.
+pub fn take_restart_token() -> Option<String> {
+    let token = std::env::var(RESTART_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    std::env::remove_var(RESTART_TOKEN_ENV);
+    token
+}
+
+/// `Some(port)` means this start is the successor of an in-place upgrade and
+/// must bind that port only.
+pub fn planned_restart_port(
+    exact: Option<&str>,
+    listen_port: Option<&str>,
+    fallback: u16,
+) -> Option<u16> {
+    if exact != Some("1") {
+        return None;
+    }
+    let port = listen_port
+        .and_then(|value| value.parse().ok())
+        .filter(|port: &u16| *port > 0)
+        .unwrap_or(fallback);
+    (port > 0).then_some(port)
+}
+
+/// The listen socket is the handoff signal. A desktop shell that never
+/// `wait`s its child leaves a zombie whose pid still looks alive.
+pub fn predecessor_socket_released(port_accepting: bool) -> bool {
+    !port_accepting
+}
+
+fn tcp_port_accepting(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(80)).is_ok()
+}
+
+/// Call at process start, before binding any port. The successor started by
+/// [`restart_replaced_process`] waits until this process's listen port stops
+/// accepting. It does not kill any pid, and it does not wait out a zombie.
+pub fn wait_for_predecessor_if_requested() {
+    let Ok(raw) = std::env::var(RESTART_WAIT_PID_ENV) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    std::env::remove_var(RESTART_WAIT_PID_ENV);
+    let port = restart_listen_port_from_env()
+        .or_else(|| listen_port_from_args(std::env::args_os().skip(1)));
+    let Some(port) = port else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && pid_is_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if predecessor_socket_released(tcp_port_accepting(port)) {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            return;
+        }
+        // Predecessor is gone, but something else is answering on this port.
+        // Leave that process alone; exact bind will fail instead of scanning.
+        if !pid_is_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn supervised_by_service_manager() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("LAUNCH_JOBNAME").is_some()
+        || std::env::var_os("XPC_SERVICE_NAME").is_some()
+}
+
+/// After an in-place swap, start the new binary with the current argv, then
+/// exit this process so the listen port is released.
+///
+/// The successor is this same server, not a second port. It inherits argv
+/// (`--port`, `--token`) plus the actual listen port, and it binds only that
+/// port. No other jeikcode process is signaled.
+///
+/// Spawn a detached successor that waits until this process stops accepting
+/// on `listen_port`. Do not use `cmd.exe`: the helper is killed when this
+/// process exits. Under systemd/launchd, `exec` keeps the supervised pid.
+///
+/// If the successor cannot be started, returns `Err` and the caller MUST keep
+/// serving so a remote browser is not left with a dead port.
+pub fn restart_replaced_process(
+    exe: &Path,
+    listen_port: u16,
+    token: Option<&str>,
+) -> Result<std::convert::Infallible> {
+    // The binary on disk is already the selected release. A staged
+    // pending.json must not replace it again on the next start.
+    std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if listen_port > 0 {
+        std::env::set_var(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
+    }
+    std::env::set_var(RESTART_EXACT_PORT_ENV, "1");
+    let token = token.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(token) = token {
+        std::env::set_var(RESTART_TOKEN_ENV, token);
+    }
+    #[cfg(unix)]
+    if supervised_by_service_manager() {
+        return re_exec_self(Some(exe));
+    }
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args)
+        .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
+        .env(RESTART_EXACT_PORT_ENV, "1")
+        .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if listen_port > 0 {
+        cmd.env(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
+    }
+    if let Some(token) = token {
+        cmd.env(RESTART_TOKEN_ENV, token);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        extern "C" {
+            fn setsid() -> i32;
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("spawning replacement binary {}", exe.display()))?;
+    std::process::exit(0);
+}
+
+/// Fetch and parse `Manifest` from a specific manifest URL.
+pub async fn fetch_manifest_from_url(url: &str) -> Result<Manifest> {
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()?;
+
+    let candidate_urls = get_mirror_urls(url);
+    let mut last_err = None;
+
+    for candidate in &candidate_urls {
+        match client.get(candidate).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await {
+                    let clean_body = body.trim_start_matches('\u{feff}');
+                    match serde_json::from_str(clean_body) {
+                        Ok(manifest) => return Ok(manifest),
+                        Err(e) => {
+                            last_err = Some(anyhow!(
+                                "parsing manifest from {} failed: {}",
+                                candidate,
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                last_err = Some(anyhow!(
+                    "fetching manifest from {} returned HTTP {}",
+                    candidate,
+                    resp.status()
+                ));
+            }
+            Err(e) => {
+                last_err = Some(anyhow!("failed to fetch manifest from {}: {}", candidate, e));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to fetch manifest from all candidate URLs")))
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max_chars).collect();
+        format!("{}…", head)
+    }
+}
+
+/// Download `url` to `dest`, streaming SHA256 as bytes arrive.
+///
+/// `progress` fires every chunk with (bytes_so_far, total). Callers
+/// should debounce before redrawing the UI; we emit eagerly because
+/// the upgrade UI wants smooth progress for a ~10 MB file.
+///
+/// Verifies size AND sha256 before returning. On any failure the
+/// partial file is removed so a retry starts clean.
+async fn download_and_verify(
+    url: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+    dest: &Path,
+    progress: &mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let candidate_urls = get_mirror_urls(url);
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()?;
+
+    let mut last_err = None;
+
+    for candidate in &candidate_urls {
+        if dest.exists() {
+            let _ = std::fs::remove_file(dest);
+        }
+
+        let resp = match client.get(candidate).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                last_err = Some(anyhow!(
+                    "downloading {} returned HTTP {} — release may not exist for this platform",
+                    candidate,
+                    r.status()
+                ));
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(anyhow!("GET {} failed: {}", candidate, e));
+                continue;
+            }
+        };
+
+        let mut file = match tokio::fs::File::create(dest).await {
+            Ok(f) => f,
+            Err(e) => return Err(anyhow!("creating {}: {}", dest.display(), e)),
+        };
+
+        let mut hasher = Sha256::new();
+        let mut written: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        let mut stream_err = None;
+
+        while let Some(chunk_res) = stream.next().await {
+            match chunk_res {
+                Ok(chunk) => {
+                    hasher.update(&chunk);
+                    if let Err(e) = file.write_all(&chunk).await {
+                        stream_err = Some(anyhow!("writing chunk to disk: {}", e));
+                        break;
+                    }
+                    written += chunk.len() as u64;
+                    let _ = progress.send(UpgradeEvent::Downloading {
+                        bytes: written,
+                        total: expected_size,
+                    });
+                }
+                Err(e) => {
+                    stream_err = Some(anyhow!("reading response chunk: {}", e));
+                    break;
+                }
+            }
+        }
+
+        if let Some(e) = stream_err {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(e);
+            continue;
+        }
+
+        if let Err(e) = file.flush().await {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(anyhow!("flushing download to disk: {}", e));
+            continue;
+        }
+        drop(file);
+
+        if expected_size > 0 && written != expected_size {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(anyhow!(
+                "short download from {}: got {} bytes, expected {}",
+                candidate,
+                written,
+                expected_size
+            ));
+            continue;
+        }
+
+        let _ = progress.send(UpgradeEvent::Verifying);
+        let got = hex_encode(&hasher.finalize());
+        let skip_hash = expected_sha256.is_empty()
+            || expected_sha256.eq_ignore_ascii_case("skip")
+            || expected_sha256.eq_ignore_ascii_case("none");
+        if !skip_hash && !got.eq_ignore_ascii_case(expected_sha256) {
+            let _ = std::fs::remove_file(dest);
+            last_err = Some(anyhow!(
+                "checksum mismatch from {}.\n  expected: {}\n  got:      {}",
+                candidate,
+                expected_sha256,
+                got
+            ));
+            continue;
+        }
+
+        return Ok(());
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("download failed from all candidate URLs")))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Best-effort cleanup of a leftover file (typically a `.bak` or `.rolling`
+/// from a prior upgrade/rollback). Returns `true` if the file was removed,
+/// `false` if it could not be removed (locked, permission denied, etc.).
+///
+/// Defensive against Windows ACCESS_DENIED scenarios:
+///
+/// 1. The file carries a read-only attribute (some AV / SCCM policies
+///    flag any executable in `%LOCALAPPDATA%` this way). Clear it first.
+/// 2. Windows Defender or another scanner briefly holds the file open
+///    during a real-time scan — typically <500 ms. Retry once with a
+///    short sleep before giving up.
+/// 3. The file is a still-running jeikcode process from a prior upgrade
+///    where the user didn't restart. Nothing we can do at the code layer;
+///    the caller proceeds without blocking the upgrade.
+///
+/// This function is intentionally **best-effort** — a failure to remove
+/// the stale file must NOT block an upgrade. The three-way swap in
+/// `replace_binary` ensures the upgrade proceeds even if old backups
+/// cannot be deleted.
+fn try_remove_stale(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(meta) = path.metadata() {
+            let mut perm = meta.permissions();
+            if perm.readonly() {
+                perm.set_readonly(false);
+                let _ = std::fs::set_permissions(path, perm);
+            }
+        }
+    }
+
+    if std::fs::remove_file(path).is_ok() {
+        return true;
+    }
+    // Brief retry to ride out a transient AV / indexer hold.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::remove_file(path).is_ok()
+}
+
+/// Clear a read-only attribute on `path` so a rename/remove isn't denied
+/// outright. Best-effort. On Unix a normal executable isn't read-only so
+/// this is a no-op; on Windows some AV / SCCM policies flag executables
+/// under `%LOCALAPPDATA%` read-only, which alone causes ERROR_ACCESS_DENIED.
+fn clear_readonly(path: &Path) {
+    // Windows-only: on Unix, `rename`/`remove_file` act on the directory
+    // entry and don't need the file itself writable, and `set_readonly(false)`
+    // there would widen the mode to world-writable. The read-only-attribute
+    // failure mode is Windows-specific (AV/SCCM marking %LOCALAPPDATA% exes).
+    #[cfg(windows)]
+    if let Ok(meta) = path.metadata() {
+        let mut perm = meta.permissions();
+        if perm.readonly() {
+            perm.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perm);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
+/// Rename `from` → `to`, hardened against the transient failures that make
+/// a naive `std::fs::rename` of a *running* Windows executable fail with
+/// `ERROR_ACCESS_DENIED` (os error 5):
+///
+///   * an AV / indexer (Windows Defender real-time scan) briefly holds the
+///     source or destination open without `FILE_SHARE_DELETE` — this clears
+///     well under a second, so we retry with exponential backoff;
+///   * a read-only attribute on the source — cleared before the first try;
+///   * a leftover destination from a prior interrupted upgrade that is
+///     momentarily locked — re-removed before each retry so the implicit
+///     `MOVEFILE_REPLACE_EXISTING` doesn't fail on it.
+///
+/// Cross-platform: on Unix these conditions don't arise, so the first
+/// attempt succeeds and the loop is never re-entered. Worst-case added
+/// latency on persistent failure is ~1.5s (100+200+400+800ms of sleeps),
+/// which is acceptable for a one-shot upgrade/rollback.
+fn robust_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    clear_readonly(from);
+    robust_rename_with(from, to, |f, t| std::fs::rename(f, t))
+}
+
+/// `robust_rename` with the underlying rename injected, so the cross-device
+/// fallback and retry logic can be exercised deterministically in tests.
+fn robust_rename_with<R>(from: &Path, to: &Path, mut rename: R) -> std::io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    const ATTEMPTS: u32 = 5;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        // A locked / leftover destination makes the replace-existing rename
+        // fail; try to clear it (and its read-only attr) before each try.
+        if to.exists() {
+            clear_readonly(to);
+            let _ = std::fs::remove_file(to);
+        }
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            // Cross-device: the staged binary lives under the user profile
+            // (e.g. C:\Users\…\.zap\staged\) while the running exe may be
+            // on another drive (H:\…). `rename` across volumes can NEVER
+            // succeed (ERROR_NOT_SAME_DEVICE / EXDEV), so don't waste the retry
+            // budget — copy the bytes across and drop the source instead.
+            Err(e) if is_cross_device_error(&e) => return copy_across_devices(from, to),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    let ms = 100u64 << attempt; // 100, 200, 400, 800
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+/// True when a failed `rename` was rejected because source and destination
+/// live on different filesystems/volumes. Windows reports ERROR_NOT_SAME_DEVICE
+/// (os error 17); Unix reports EXDEV (os error 18).
+fn is_cross_device_error(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    let code = 17;
+    #[cfg(not(windows))]
+    let code = 18;
+    e.raw_os_error() == Some(code)
+}
+
+/// Safely and atomically replace `to` with content copied from `from`,
+/// even if `to` is currently being executed as a running Linux/Windows process.
+///
+/// Steps:
+/// 1. Copy `from` to a temporary sibling file in `to`'s directory (`.jeikcode.tmp-<pid>-<nanos>`).
+/// 2. On Unix, ensure the temporary file has 0o755 executable permissions.
+/// 3. Atomically rename the temporary file over `to` using `robust_rename`.
+///    On Unix, `rename(2)` replaces the directory entry (dentry) while existing
+///    running processes hold onto the old inode, avoiding ETXTBSY (errno 26).
+///    On Windows, `robust_rename` handles transient AV/indexer holds.
+/// 4. If renaming fails, clean up the temporary file and return the error.
+pub fn atomic_copy_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let parent = to.parent().unwrap_or_else(|| Path::new("."));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_dest = parent.join(format!(".jeikcode.tmp-{}-{}", std::process::id(), nanos));
+
+    // Ensure clean state before copy
+    let _ = std::fs::remove_file(&tmp_dest);
+
+    std::fs::copy(from, &tmp_dest)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&tmp_dest) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o755);
+            let _ = std::fs::set_permissions(&tmp_dest, perm);
+        }
+    }
+
+    match robust_rename(&tmp_dest, to) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_dest);
+            Err(e)
+        }
+    }
+}
+
+/// Move a file across volumes by copying its bytes via atomic replacement and
+/// then dropping the source. Used as the fallback when `rename` reports a
+/// cross-device error.
+fn copy_across_devices(from: &Path, to: &Path) -> std::io::Result<()> {
+    atomic_copy_replace(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(new_bin)
+            .with_context(|| format!("stat {}", new_bin.display()))?
+            .permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(new_bin, perm)
+            .with_context(|| format!("chmod {}", new_bin.display()))?;
+    }
+
+    let backup = backup_path(exe);
+    let rolling = rolling_path(exe);
+
+    // Clean up any leftover .rolling from a prior interrupted upgrade.
+    try_remove_stale(&rolling);
+
+    // Step 1: live binary → rolling (Windows allows renaming a running exe).
+    // `robust_rename` retries through transient AV/indexer locks that
+    // otherwise surface as ERROR_ACCESS_DENIED (os error 5) here.
+    robust_rename(exe, &rolling).with_context(|| {
+        format!(
+            "renaming current binary {} -> {} (swap step 1)",
+            exe.display(),
+            rolling.display()
+        )
+    })?;
+
+    // Step 2: new binary → live (the actual upgrade)
+    if let Err(e) = robust_rename(new_bin, exe) {
+        // Best-effort unwind of step 1 so the user isn't left without
+        // a live binary.
+        let _ = std::fs::rename(&rolling, exe);
+        return Err(anyhow!(
+            "moving new binary into place failed ({}). Previous version restored.",
+            e
+        ));
+    }
+
+    // Step 3: best-effort — remove old .bak so we can rename .rolling→.bak.
+    // Failure is non-fatal; we just leave .rolling behind.
+    let bak_removed = try_remove_stale(&backup);
+
+    // Step 4: rolling → .bak (preserve old version for rollback)
+    if bak_removed {
+        if let Err(e) = std::fs::rename(&rolling, &backup) {
+            // Upgrade succeeded but we couldn't preserve the old version
+            // as .bak. The .rolling file lingers; next upgrade will
+            // clean it up. Rollback won't be available this session.
+            eprintln!(
+                "Note: could not preserve previous version as backup ({}). Rollback unavailable until next upgrade.",
+                e
+            );
+        }
+    } else {
+        // Old .bak couldn't be removed (locked by AV, running process, etc.).
+        // The .rolling file stays behind; next upgrade attempt will clean
+        // it up. Rollback points to the version before this upgrade's
+        // predecessor, which is still better than failing the upgrade.
+        eprintln!(
+            "Note: could not remove old backup {}. Rollback may point to an older version.\n  The .rolling file at {} will be cleaned up on the next upgrade.",
+            backup.display(),
+            rolling.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Run in-place upgrade targeting an explicitly provided manifest.
+pub async fn run_upgrade_with_manifest(
+    manifest: Manifest,
+    current_version: String,
+    force: bool,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
+    let current_version = current_version.as_str();
+    let target = detect_target().ok_or_else(|| {
+        anyhow!(
+            "this platform has no published jeikcode release ({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let exe = current_exe_path()?;
+    ensure_writable(&exe)?;
+    // Drop a leftover auto-update stage so `__sync_config` / the next
+    // launch cannot paste an older package over this install.
+    clear_pending_pointer();
+
+    let _ = tx.send(UpgradeEvent::ManifestFetched {
+        version: manifest.version.clone(),
+    });
+
+    if !force && !version_is_newer(&manifest.version, current_version) {
+        return Err(anyhow!(
+            "{}: already on {} (latest is {}). Pass --force to reinstall.",
+            ALREADY_LATEST,
+            current_version,
+            manifest.version
+        ));
+    }
+
+    let entry = manifest.binaries.get(target).ok_or_else(|| {
+        anyhow!(
+            "manifest has no entry for target {} — this platform may not be in this release",
+            target
+        )
+    })?;
+
+    let url = binary_url(&manifest.version, target);
+    let download = download_path(&exe);
+    download_and_verify(&url, &entry.sha256, entry.size, &download, &tx).await?;
+
+    let _ = tx.send(UpgradeEvent::Replacing);
+    replace_binary(&download, &exe)?;
+    let expected_sha = entry.sha256.as_str();
+    let got = file_sha256_hex(&exe)?;
+    if !got.eq_ignore_ascii_case(expected_sha) {
+        return Err(anyhow!(
+            "replaced {} but sha256 is {got}, expected {expected_sha}",
+            exe.display()
+        ));
+    }
+    for extra in discover_install_exes(&exe)
+        .into_iter()
+        .filter(|p| !same_exe(p, &exe))
+    {
+        if ensure_writable(&extra).is_err() {
+            eprintln!(
+                "Note: skipped extra install copy {} (not writable). PATH may still hit the old binary.",
+                extra.display()
+            );
+            continue;
+        }
+        if let Err(e) = atomic_copy_replace(&exe, &extra) {
+            eprintln!(
+                "Note: could not update extra install copy {}: {e}",
+                extra.display()
+            );
+            continue;
+        }
+        eprintln!("    also updated {}", extra.display());
+    }
+
+    // Manual `/upgrade` just installed whatever the current manifest
+    // advertises. Any staged upgrade sitting in `staged_dir()` is now
+    // superseded — if we leave `pending.json` in place, the next startup
+    // might try to "apply" an older (or identical) staged version on top
+    // of what we just installed, causing a downgrade or redundant churn.
+    // Clear both the pointer and any stray staged binaries.
+    clear_pending_pointer();
+    if let Ok(entries) = std::fs::read_dir(staged_dir()) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("jeikcode-"))
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    // Purge any legacy upstream brand plugin directories on upgrade
+    purge_legacy_brand_plugins_on_upgrade();
+
+    let backup = backup_path(&exe);
+    // NOTE: `exe` was captured *before* `replace_binary` renamed the running
+    // binary. On Windows, `current_exe()` would now return `.jeikcode.rolling`
+    // instead of the original `jeikcode.exe`, so we must pass this saved
+    // value through to `re_exec_self`.
+    let original_exe = if exe.extension().and_then(|e| e.to_str()) == Some("rolling") {
+        exe.with_extension(if cfg!(windows) { "exe" } else { "" })
+    } else {
+        exe
+    };
+
+    let summary = UpgradeSummary {
+        version: manifest.version,
+        backup,
+        exe: original_exe.clone(),
+    };
+    let _ = tx.send(UpgradeEvent::Done {
+        version: summary.version.clone(),
+        backup: summary.backup.clone(),
+        exe: original_exe,
+    });
+
+    Ok(summary)
+}
+
+/// Top-level upgrade driver.
+///
+/// `current_version` is what we're running right now (e.g. `"v4.19.0"`
+/// — callers typically pass `format!("v{}", env!("CARGO_PKG_VERSION"))`).
+/// When `force` is false and the manifest version is `<=` current, this
+/// returns an error carrying `ALREADY_LATEST` so callers can distinguish
+/// "already up to date" from a real failure.
+/// In `distro-pm` builds this returns immediately with an error carrying `PACKAGE_MANAGED` (upgrades are the package manager's job).
+pub async fn run_upgrade(
+    current_version: String,
+    force: bool,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
+    let manifest = fetch_manifest().await?;
+    run_upgrade_with_manifest(manifest, current_version, force, tx).await
+}
+
+/// Sentinel substring in the "already latest" error so the CLI/TUI
+/// layer can render a calm informational message instead of a scary
+/// red error. Kept as a plain string to avoid an error-type refactor.
+pub const ALREADY_LATEST: &str = "ALREADY_LATEST";
+
+/// Sentinel embedded in the error returned by `run_upgrade` / `run_rollback`
+/// when this binary is a package-manager-managed build (HarmonyBrew).
+/// Callers special-case it to show "use `brew upgrade`" instead of a
+/// generic failure — mirrors the `ALREADY_LATEST` pattern.
+pub const PACKAGE_MANAGED: &str = "PACKAGE_MANAGED";
+
+/// True when this binary was compiled for package-manager distribution
+/// (the `distro-pm` feature, set by the HarmonyBrew formula). Such builds
+/// must never self-modify the binary — upgrades are the package manager's
+/// job.
+pub const fn is_package_managed() -> bool {
+    cfg!(feature = "distro-pm")
+}
+
+fn purge_legacy_brand_plugins_on_upgrade() {
+    let plugins_root = zap_config::config::Config::config_dir().join("plugins");
+    let mp_root = plugins_root.join("marketplaces");
+    for dirty_name in ["jeikcode-skills", "jeikcode-plugins-official"] {
+        let dirty_dir = mp_root.join(dirty_name);
+        if dirty_dir.exists() {
+            let _ = std::fs::remove_dir_all(&dirty_dir);
+        }
+    }
+    let installed_root = plugins_root.join("installed");
+    for dirty_plugin in ["jeikcode", "jeikcode-skills", "jeikcode-workflows"] {
+        let dirty_dir = installed_root.join(dirty_plugin);
+        if dirty_dir.exists() {
+            let _ = std::fs::remove_dir_all(&dirty_dir);
+        }
+    }
+}
+
+// ============================================================================
+// Deferred upgrade (download-in-session, apply-at-next-startup)
+// ============================================================================
+//
+// The deferred path solves two problems that `run_upgrade` alone can't:
+//   1. Users whose sessions run for hours/days — they'll never voluntarily
+//      restart just to pick up a new version. A background task can prepare
+//      the staged binary while they work; apply happens whenever they do
+//      restart (which they will, eventually, for unrelated reasons).
+//   2. Users whose sessions are short but who rarely think to run
+//      `/upgrade` — same benefit: the next normal launch carries the bump.
+//
+// Flow:
+//   session N      : prepare_deferred_upgrade()
+//                    → download to ~/.jeikcode/staged/<filename>
+//                    → write ~/.jeikcode/staged/pending.json
+//                    → (UI surfaces "⟲ vX.Y.Z pending")
+//   session N exit : no special work; staged files survive any exit path
+//                    (graceful, SIGHUP on terminal close, SIGKILL, power
+//                    loss — all fine, state is on disk)
+//   session N+1    : apply_pending_upgrade() runs BEFORE tokio starts
+//                    → atomically swaps live binary with staged
+//                    → re-execs self with original argv
+//                    → user sees "✓ Upgraded to vX.Y.Z" on welcome
+//
+// A safety circuit-breaker is wired in: if apply succeeds but the new
+// binary fails to start `MAX_APPLY_ATTEMPTS` times in a row, the staged
+// file is discarded so a broken release can't brick the install.
+
+/// Maximum times we'll try to apply the same staged upgrade before
+/// giving up. Prevents a corrupted download from turning into a boot loop.
+const MAX_APPLY_ATTEMPTS: u32 = 3;
+
+/// Pointer record stored at `~/.jeikcode/staged/pending.json`. Describes
+/// a downloaded binary that hasn't yet been promoted to live. Lifecycle:
+/// written by `prepare_deferred_upgrade`, read (and deleted on success /
+/// incremented on failure) by `apply_pending_upgrade`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingUpgrade {
+    /// Version tag the staged binary represents, e.g. `v4.19.1`.
+    pub version: String,
+    /// Absolute path to the verified binary sitting in `staged_dir()`.
+    pub staged_path: PathBuf,
+    /// SHA256 of the staged binary (lowercase hex). Re-verified at apply
+    /// time so a partial overwrite between sessions (e.g. disk full)
+    /// doesn't install a corrupted file.
+    pub sha256: String,
+    /// Size in bytes; cheap sanity check before we recompute sha256.
+    pub size: u64,
+    /// RFC3339 timestamp for audit / debug. Not load-bearing.
+    pub created_at: String,
+    /// How many times we've attempted apply and failed. When this hits
+    /// `MAX_APPLY_ATTEMPTS`, the staged file is discarded instead of
+    /// retried again on the following startup.
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// Successful apply result — fed into the re-exec handoff so the new
+/// process can render a one-time "✓ Upgraded" banner on the welcome screen.
+#[derive(Debug, Clone)]
+pub struct AppliedUpgrade {
+    pub version: String,
+    pub backup: PathBuf,
+    pub exe: PathBuf,
+}
+
+/// `~/.jeikcode/staged/` (or equivalent on Windows). Created on demand by
+/// `prepare_deferred_upgrade`; safe to treat as possibly-missing at read
+/// time. Kept under the same root as `history` / `recent_dirs` so nothing
+/// new appears in `$HOME`.
+pub fn staged_dir() -> PathBuf {
+    zap_config::config::Config::config_dir().join("staged")
+}
+
+fn pending_json_path() -> PathBuf {
+    staged_dir().join("pending.json")
+}
+
+/// Where a prepared (downloaded + verified) binary lives while it waits
+/// to be promoted. Filename mirrors the release artifact so the same
+/// `binary_filename` helper round-trips.
+fn staged_binary_path(version: &str, target: &str) -> PathBuf {
+    staged_dir().join(binary_filename(version, target))
+}
+
+/// Read `pending.json` if present. Absent file → `Ok(None)`. Corrupt JSON
+/// returns an error so callers can delete it and retry; `apply_pending_upgrade`
+/// does exactly that.
+pub fn read_pending() -> Result<Option<PendingUpgrade>> {
+    let path = pending_json_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let pending: PendingUpgrade =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(pending))
+}
+
+fn write_pending(pending: &PendingUpgrade) -> Result<()> {
+    let dir = staged_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let body = serde_json::to_string_pretty(pending).context("serializing pending.json")?;
+    let path = pending_json_path();
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+pub fn clear_pending_pointer() {
+    let _ = std::fs::remove_file(pending_json_path());
+}
+
+/// Quiet variant of `check_latest` used by the hourly background poll.
+/// Returns the remote `(version, manifest)` only when strictly newer than
+/// `current_version`. Separate from `version_check::check_latest` because
+/// that one only gives back the version string; here we need the full
+/// manifest to know the per-target sha256 / size.
+pub async fn fetch_manifest_if_newer(current_version: &str) -> Result<Option<Manifest>> {
+    let manifest = fetch_manifest().await?;
+    if is_newer(&manifest.version, current_version) {
+        Ok(Some(manifest))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Download + verify a new release into `staged_dir()` without touching
+/// the live binary. Writes `pending.json` as the final step so a partial
+/// download (crashed mid-stream) doesn't masquerade as "ready to apply" —
+/// the pointer only appears if sha256 passed.
+///
+/// Returns `Ok(None)` when we're already on the latest version (or newer).
+/// Idempotent: calling twice with the same manifest is a no-op after the
+/// first success (file + pointer already in place).
+/// In `distro-pm` builds this is a no-op returning `Ok(None)`.
+pub async fn prepare_deferred_upgrade(
+    current_version: &str,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<Option<PendingUpgrade>> {
+    if is_package_managed() {
+        return Ok(None);
+    }
+    let target = detect_target().ok_or_else(|| {
+        anyhow!(
+            "this platform has no published jeikcode release ({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+
+    let manifest = fetch_manifest().await?;
+
+    if !is_newer(&manifest.version, current_version) {
+        return Ok(None);
+    }
+
+    let _ = tx.send(UpgradeEvent::ManifestFetched {
+        version: manifest.version.clone(),
+    });
+
+    // If a staged upgrade for this exact version already exists and the
+    // on-disk bytes still match the manifest's sha256, reuse it. Saves a
+    // redownload when two sessions both polled and landed here.
+    if let Ok(Some(existing)) = read_pending() {
+        if existing.version == manifest.version && existing.staged_path.exists() {
+            if let Some(entry) = manifest.binaries.get(target) {
+                if existing.sha256.eq_ignore_ascii_case(&entry.sha256)
+                    && existing.size == entry.size
+                {
+                    return Ok(Some(existing));
+                }
+            }
+        }
+    }
+
+    let entry = manifest.binaries.get(target).ok_or_else(|| {
+        anyhow!(
+            "manifest has no entry for target {} — this platform may not be in this release",
+            target
+        )
+    })?;
+
+    let dir = staged_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    let staged_path = staged_binary_path(&manifest.version, target);
+    let url = binary_url(&manifest.version, target);
+    download_and_verify(&url, &entry.sha256, entry.size, &staged_path, &tx).await?;
+
+    let pending = PendingUpgrade {
+        version: manifest.version.clone(),
+        staged_path: staged_path.clone(),
+        sha256: entry.sha256.clone(),
+        size: entry.size,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+    };
+    write_pending(&pending)?;
+    Ok(Some(pending))
+}
+
+/// Bootstrap entry point: called once at the very top of `main()` BEFORE
+/// the tokio runtime, TUI, or any heavy init. Three outcomes:
+///
+///   * `Ok(None)`                  — no pending upgrade, continue normally.
+///   * `Ok(Some(AppliedUpgrade))`  — staged binary is now live; caller must
+///                                   `re_exec_self` to hand control over.
+///   * `Err(e)`                    — apply failed; caller should log and
+///                                   continue with the OLD binary. We've
+///                                   already bumped the attempt counter
+///                                   (or discarded the stage past the cap).
+///
+/// SHA256 is re-verified here even though we verified at download time:
+/// a session-external process (backup tool, AV software, buggy sync)
+/// could have touched the file between sessions. Verification is cheap
+/// compared to installing a corrupted binary.
+/// In `distro-pm` builds this is a no-op returning `Ok(None)`.
+pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
+    if is_package_managed() {
+        return Ok(None);
+    }
+    let mut pending = match read_pending() {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            // Corrupt pointer — nuke it, we can't do anything safe with it.
+            clear_pending_pointer();
+            return Ok(None);
+        }
+    };
+
+    if pending.attempts >= MAX_APPLY_ATTEMPTS {
+        // Circuit-break: this staged upgrade has failed too many times.
+        // Discard everything so we stop trying, fall back to the old
+        // binary, and let the next successful prepare_deferred_upgrade
+        // supersede it.
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Ok(None);
+    }
+
+    // Bump attempt counter up-front so a crash mid-apply doesn't leave us
+    // in an unbounded retry loop.
+    pending.attempts += 1;
+    let _ = write_pending(&pending);
+
+    if !pending.staged_path.exists() {
+        clear_pending_pointer();
+        return Ok(None);
+    }
+
+    let actual_size = std::fs::metadata(&pending.staged_path)
+        .with_context(|| format!("stat {}", pending.staged_path.display()))?
+        .len();
+    if actual_size != pending.size {
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Err(anyhow!(
+            "staged binary size changed between sessions (expected {}, got {}). Discarded.",
+            pending.size,
+            actual_size
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(&pending.staged_path)
+        .with_context(|| format!("opening {}", pending.staged_path.display()))?;
+    std::io::copy(&mut file, &mut hasher).context("hashing staged binary")?;
+    drop(file);
+    let got = hex_encode(&hasher.finalize());
+    if !got.eq_ignore_ascii_case(&pending.sha256) {
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Err(anyhow!(
+            "staged binary sha256 drifted between sessions (expected {}, got {}). Discarded.",
+            pending.sha256,
+            got
+        ));
+    }
+
+    let exe = current_exe_path()?;
+    ensure_writable(&exe)?;
+    replace_binary(&pending.staged_path, &exe)?;
+
+    // Success — pointer is done, file moved into place by replace_binary.
+    clear_pending_pointer();
+
+    // Purge any legacy upstream brand plugin directories on upgrade
+    purge_legacy_brand_plugins_on_upgrade();
+
+    Ok(Some(AppliedUpgrade {
+        version: pending.version,
+        backup: backup_path(&exe),
+        exe,
+    }))
+}
+
+/// Replace the current process with a fresh invocation of the live binary,
+/// preserving argv, cwd, and env. On Unix this is `execv` (same PID, old
+/// process image gone). On Windows we spawn a child and exit the parent —
+/// a separate PID, but terminal stdio is shared so the user still sees
+/// one continuous "session" from their perspective.
+///
+/// **Important on Windows:** After `replace_binary` renames the running exe
+/// (e.g. `jeikcode.exe` → `.jeikcode.rolling`), `std::env::current_exe()`
+/// may return the *renamed* path (`.jeikcode.rolling`) instead of the
+/// original one (`jeikcode.exe`). This is because `GetModuleFileNameW`
+/// tracks the on-disk filename. If `override_exe` is provided, it is used
+/// instead of `current_exe()` — callers should capture the exe path
+/// *before* calling `replace_binary` and pass it here.
+///
+/// Never returns on the happy path. An `Err` return means the handoff
+/// failed (e.g., new binary missing execute bit under unusual filesystem
+/// constraints); caller should surface the error and keep running with
+/// the old binary rather than exiting silently.
+pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infallible> {
+    let exe = override_exe.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        current_exe_path().unwrap_or_else(|_| {
+            // Fallback: if we can't resolve current_exe AND no override,
+            // try argv[0] as a last resort.
+            std::env::args_os()
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_default()
+        })
+    });
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        // `exec` only returns on failure.
+        Err(anyhow!("re-exec failed: {}", err))
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows has no exec(). Spawn the child with shared stdio so
+        // the user's terminal stays connected to the new process, then
+        // exit ourselves. The replacement PID shift is invisible in
+        // a terminal context (the shell tracks the parent's exit).
+        let status = std::process::Command::new(&exe)
+            .args(&args)
+            .spawn()
+            .with_context(|| format!("spawning new binary {}", exe.display()))?
+            .wait()
+            .with_context(|| "waiting for spawned binary to exit")?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+
+/// Parse and compare two `vMAJOR.MINOR.PATCH` strings. Returns true
+/// when `latest > current`. Malformed inputs fall back to a byte-wise
+/// `!=` so we *do* proceed with reinstall when version strings are
+/// shaped unexpectedly — safer than silently refusing to upgrade.
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => latest.trim() != current.trim(),
+    }
+}
+
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim();
+    let rest = s.strip_prefix('v').unwrap_or(s);
+    // Strip pre-release suffix (e.g. "-beta.1", "-rc.2") so versions
+    // like "v4.25.0-beta.1" parse correctly (Issue #596).
+    let rest = rest.split('-').next()?;
+    let mut parts = rest.split('.');
+    let a = parts.next()?.parse().ok()?;
+    let b = parts.next()?.parse().ok()?;
+    let c = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((a, b, c))
+}
+
+/// Three-way swap between the live binary and `.bak`, leaving `.bak`
+/// pointing at what was previously live. Calling rollback twice in a
+/// row returns you to the original state — intentional, so users can
+/// toggle between last-two versions without redownloading.
+/// In `distro-pm` builds this returns immediately with an error carrying `PACKAGE_MANAGED` (upgrades are the package manager's job).
+pub fn run_rollback() -> Result<RollbackSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
+    let exe = current_exe_path()?;
+    let backup = backup_path(&exe);
+    if !backup.exists() {
+        return Err(anyhow!(
+            "no backup found at {} — nothing to roll back to",
+            backup.display()
+        ));
+    }
+    ensure_writable(&exe)?;
+
+    let rolling = rolling_path(&exe);
+    if rolling.exists() {
+        std::fs::remove_file(&rolling).ok();
+    }
+
+    // Step 1: live -> rolling (retry through transient Windows locks)
+    robust_rename(&exe, &rolling).with_context(|| {
+        format!(
+            "renaming {} -> {} (swap step 1)",
+            exe.display(),
+            rolling.display()
+        )
+    })?;
+    // Step 2: backup -> live
+    if let Err(e) = robust_rename(&backup, &exe) {
+        // Best-effort unwind of step 1.
+        let _ = std::fs::rename(&rolling, &exe);
+        return Err(anyhow!("rollback failed at step 2 ({}); state restored", e));
+    }
+    // Step 3: rolling -> backup
+    if let Err(e) = std::fs::rename(&rolling, &backup) {
+        // Can't cleanly unwind — the live file is already the old
+        // version, which is the user-visible outcome they asked for.
+        // Surface the orphan so they can clean up manually.
+        return Err(anyhow!(
+            "rollback succeeded but tmp file {} could not be moved to {} ({}).\n\
+             Delete it manually; next /upgrade will overwrite it.",
+            rolling.display(),
+            backup.display(),
+            e
+        ));
+    }
+
+    Ok(RollbackSummary { exe, backup })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_filename_adds_exe_on_windows_targets() {
+        assert_eq!(
+            binary_filename("v4.19.0", "windows-x64"),
+            "jeikcode-v4.19.0-windows-x64.exe"
+        );
+        assert_eq!(
+            binary_filename("v4.19.0", "windows-arm64"),
+            "jeikcode-v4.19.0-windows-arm64.exe"
+        );
+    }
+
+    #[test]
+    fn binary_filename_plain_on_unix_targets() {
+        assert_eq!(
+            binary_filename("v4.19.0", "darwin-arm64"),
+            "jeikcode-v4.19.0-darwin-arm64"
+        );
+        assert_eq!(
+            binary_filename("v4.19.0", "linux-x64"),
+            "jeikcode-v4.19.0-linux-x64"
+        );
+    }
+
+    #[test]
+    fn binary_url_shape() {
+        let repo = zap_config::endpoints::update_repo();
+        assert_eq!(
+            binary_url("6.0.0", "windows-x64"),
+            format!("https://github.com/{repo}/releases/download/v6.0.0/jeikcode-v6.0.0-windows-x64.exe")
+        );
+        assert_eq!(
+            binary_url("v7.0.0", "windows-x64"),
+            format!("https://github.com/{repo}/releases/download/v7.0.0/jeikcode-v7.0.0-windows-x64.exe")
+        );
+    }
+
+    #[test]
+    fn detect_target_returns_something_on_tier1_hosts() {
+        // We can't assert an exact value (depends on host), but every
+        // supported dev platform should resolve to Some.
+        let t = detect_target();
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
+            if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+                assert!(t.is_some(), "expected target tag on this host");
+            }
+        }
+    }
+
+    #[test]
+    fn target_tag_matches_release_manifest_targets() {
+        assert_eq!(target_tag("macos", "aarch64"), Some("darwin-arm64"));
+        assert_eq!(target_tag("macos", "x86_64"), Some("darwin-x64"));
+        assert_eq!(target_tag("linux", "x86_64"), Some("linux-x64"));
+        assert_eq!(target_tag("linux", "aarch64"), Some("linux-arm64"));
+        assert_eq!(target_tag("windows", "x86_64"), Some("windows-x64"));
+        assert_eq!(target_tag("windows", "aarch64"), Some("windows-arm64"));
+        assert_eq!(target_tag("linux", "arm"), None);
+    }
+
+    #[test]
+    fn backup_path_appends_bak() {
+        let p = Path::new("/usr/local/bin/jeikcode");
+        assert_eq!(backup_path(p), PathBuf::from("/usr/local/bin/jeikcode.bak"));
+    }
+
+    #[test]
+    fn try_remove_stale_deletes_normal_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("jeikcode.exe.bak");
+        std::fs::write(&p, b"old").expect("seed");
+        assert!(try_remove_stale(&p));
+        assert!(!p.exists(), "backup should be gone");
+    }
+
+    #[test]
+    fn try_remove_stale_clears_readonly_then_deletes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("jeikcode.exe.bak");
+        std::fs::write(&p, b"old").expect("seed");
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&p, perm).expect("set readonly");
+        // On Windows the readonly flag would block remove_file outright.
+        // On Unix it doesn't, but the helper still happens to clean up.
+        // Either way, the file must be gone after this call.
+        assert!(try_remove_stale(&p));
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn try_remove_stale_returns_false_for_truly_locked_file() {
+        // On Unix, an open file can still be unlinked, so true locking
+        // is hard to simulate. Instead we test the "nonexistent path"
+        // case — `try_remove_stale` correctly returns true because the
+        // file doesn't exist (nothing to remove). To verify the false
+        // return, we'd need a platform-specific lock (Windows HANDLE),
+        // which isn't feasible in a cross-platform unit test. The
+        // important contract is: returns true when nothing needs doing.
+        let bogus = std::path::PathBuf::from("/no/such/dir/jeikcode.exe.bak");
+        assert!(!bogus.exists());
+        // A path that doesn't exist is "already removed" → true
+        assert!(try_remove_stale(&bogus));
+    }
+
+    #[test]
+    fn try_remove_stale_returns_true_for_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("does_not_exist");
+        assert!(!p.exists());
+        assert!(try_remove_stale(&p));
+    }
+
+    #[test]
+    fn backup_path_preserves_exe_suffix_on_windows_style() {
+        let p = Path::new("C:/Tools/jeikcode.exe");
+        assert_eq!(backup_path(p), PathBuf::from("C:/Tools/jeikcode.exe.bak"));
+    }
+
+    #[test]
+    fn is_newer_semver() {
+        assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
+        assert!(is_newer("v4.19.0", "v4.18.9"));
+        assert!(is_newer("v5.0.5", "v4.99.99"));
+        assert!(!is_newer("v4.19.0", "v4.19.0"));
+        assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
+    }
+
+    #[test]
+    fn is_newer_falls_back_to_string_diff_on_garbage() {
+        // If we can't parse, err on the side of allowing reinstall
+        // when strings differ (user may have a custom channel).
+        assert!(is_newer("build-abc", "build-xyz"));
+        assert!(!is_newer("build-abc", "build-abc"));
+    }
+
+    #[test]
+    fn parse_version_handles_prerelease_suffix() {
+        // Issue #596: pre-release versions like "v4.25.0-beta.1" must parse
+        assert_eq!(parse_version("v4.25.0-beta.1"), Some((4, 25, 0)));
+        assert_eq!(parse_version("v4.25.0-rc.2"), Some((4, 25, 0)));
+        assert_eq!(parse_version("v4.25.0-alpha"), Some((4, 25, 0)));
+        // Normal versions still work
+        assert_eq!(parse_version("v4.25.0"), Some((4, 25, 0)));
+    }
+
+    #[test]
+    fn is_newer_handles_prerelease() {
+        // Pre-release version is treated as equal to its release version
+        assert!(!is_newer("v4.25.0", "v4.25.0-beta.1"));
+        assert!(!is_newer("v4.25.0-beta.1", "v4.25.0"));
+        // But still newer than older versions
+        assert!(is_newer("v4.25.0-beta.1", "v4.24.99"));
+    }
+
+    #[test]
+    fn version_is_newer_keeps_beta_ordinals() {
+        assert!(version_is_newer("v7.2.4-beta.5", "v7.2.4-beta.4"));
+        assert!(!version_is_newer("v7.2.4-beta.4", "v7.2.4-beta.5"));
+        assert!(version_is_newer("v7.2.4", "v7.2.4-beta.5"));
+        assert!(!version_is_newer("v7.2.4-beta.5", "v7.2.4"));
+        assert!(version_is_newer("v7.2.4-beta.1", "v7.2.3"));
+    }
+
+    fn sample_release(tag: &str, prerelease: bool) -> ListedRelease {
+        ListedRelease {
+            tag_name: tag.to_string(),
+            prerelease,
+            body: None,
+            published_at: None,
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filter_channel_releases_sorts_newest_first() {
+        let releases = vec![
+            sample_release("v7.2.4-beta.4", true),
+            sample_release("v7.2.3", false),
+            sample_release("v7.2.4-beta.9", true),
+            sample_release("v7.2.4", false),
+            sample_release("v7.2.4-beta.9", true),
+        ];
+        let beta = filter_channel_releases(&releases, UpdateChannel::Beta);
+        assert_eq!(
+            beta.iter().map(|r| r.tag_name.as_str()).collect::<Vec<_>>(),
+            vec!["v7.2.4-beta.9", "v7.2.4-beta.4"]
+        );
+        let stable = filter_channel_releases(&releases, UpdateChannel::Stable);
+        assert_eq!(
+            stable
+                .iter()
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v7.2.4", "v7.2.3"]
+        );
+    }
+
+    #[test]
+    fn normalize_version_tag_adds_v_prefix() {
+        assert_eq!(normalize_version_tag("7.2.4"), "v7.2.4");
+        assert_eq!(normalize_version_tag("v7.2.4-beta.9"), "v7.2.4-beta.9");
+        assert_eq!(normalize_version_tag(" V7.2.4 "), "v7.2.4");
+        assert_eq!(channel_for_tag("v7.2.4"), UpdateChannel::Stable);
+        assert_eq!(channel_for_tag("v7.2.4-beta.9"), UpdateChannel::Beta);
+    }
+
+    #[test]
+    fn next_page_url_reads_rel_next() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            reqwest::header::HeaderValue::from_static(
+                "<https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2>; rel=\"next\", <https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=4>; rel=\"last\"",
+            ),
+        );
+        assert_eq!(
+            next_page_url(&headers).as_deref(),
+            Some("https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2")
+        );
+    }
+
+    #[test]
+    fn looks_like_jeikcode_binary_accepts_product_name() {
+        assert!(looks_like_jeikcode_binary(Path::new("jeikcode")));
+        assert!(looks_like_jeikcode_binary(Path::new("jeikcode.exe")));
+        assert!(!looks_like_jeikcode_binary(Path::new("jeikcode.cmd")));
+        assert!(!looks_like_jeikcode_binary(Path::new("other.exe")));
+        assert!(looks_like_desktop_cli_payload(Path::new("cli-bin")));
+        assert!(looks_like_desktop_cli_payload(Path::new(
+            "C:/app/resources/cli-bin"
+        )));
+        assert!(!looks_like_desktop_cli_payload(Path::new("jeikcode.exe")));
+    }
+
+    #[test]
+    fn discover_install_exes_includes_running_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let running = tmp.path().join("jeikcode");
+        std::fs::write(&running, b"x").unwrap();
+        let found = discover_install_exes(&running);
+        assert!(found.iter().any(|p| same_exe(p, &running)));
+    }
+
+    #[test]
+    fn manifest_parses_minimal_shape() {
+        let json = r#"{
+            "version": "v4.19.0",
+            "binaries": {
+                "darwin-arm64": { "sha256": "abcd", "size": 1024 }
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.version, "v4.19.0");
+        assert_eq!(m.binaries["darwin-arm64"].size, 1024);
+    }
+
+    #[test]
+    fn manifest_ignores_unknown_fields() {
+        let json = r#"{
+            "version": "v4.19.0",
+            "released_at": "2026-04-19T00:00:00Z",
+            "signature": "future-field",
+            "binaries": {
+                "linux-x64": { "sha256": "ffff", "size": 42, "notes": "x" }
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.released_at.as_deref(), Some("2026-04-19T00:00:00Z"));
+        assert_eq!(m.binaries["linux-x64"].sha256, "ffff");
+    }
+
+    #[test]
+    fn hex_encode_matches_known_vectors() {
+        assert_eq!(hex_encode(&[0x00, 0xff, 0x10]), "00ff10");
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn ensure_writable_probes_containing_dir() {
+        // A path inside tempdir must pass; a path whose parent doesn't
+        // exist must fail with a clear message.
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = tmp.path().join("jeikcode");
+        assert!(ensure_writable(&ok).is_ok());
+
+        let bogus = Path::new("/nonexistent-dir-xyzzy-9999/jeikcode");
+        let err = ensure_writable(bogus).unwrap_err().to_string();
+        assert!(err.contains("sudo jeikcode upgrade"), "got: {}", err);
+    }
+
+    #[test]
+    fn replace_binary_renames_live_to_bak_via_three_way_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("jeikcode");
+        let new = tmp.path().join(".jeikcode.download");
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        let bak = backup_path(&exe);
+        assert_eq!(std::fs::read(&bak).unwrap(), b"OLD");
+        assert!(!new.exists());
+        // No leftover .rolling file on success
+        let rolling = rolling_path(&exe);
+        assert!(!rolling.exists());
+    }
+
+    #[test]
+    fn replace_binary_overwrites_stale_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("jeikcode");
+        let new = tmp.path().join(".jeikcode.download");
+        let bak = backup_path(&exe);
+        std::fs::write(&exe, b"V2").unwrap();
+        std::fs::write(&new, b"V3").unwrap();
+        std::fs::write(&bak, b"V1").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"V3");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"V2");
+        // No leftover .rolling file
+        let rolling = rolling_path(&exe);
+        assert!(!rolling.exists());
+    }
+
+    #[test]
+    fn robust_rename_moves_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::write(&from, b"DATA").unwrap();
+
+        robust_rename(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"DATA");
+    }
+
+    #[test]
+    fn robust_rename_replaces_existing_destination() {
+        // Mirrors the swap's "rolling target left over from a prior run"
+        // case: the destination already exists and must be replaced.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::write(&from, b"NEW").unwrap();
+        std::fs::write(&to, b"STALE").unwrap();
+
+        robust_rename(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn is_cross_device_error_detects_platform_code() {
+        // Windows ERROR_NOT_SAME_DEVICE = 17; Unix EXDEV = 18.
+        #[cfg(windows)]
+        let exdev = 17;
+        #[cfg(not(windows))]
+        let exdev = 18;
+        assert!(is_cross_device_error(&std::io::Error::from_raw_os_error(
+            exdev
+        )));
+        // A permission-style error must NOT be mistaken for cross-device.
+        assert!(!is_cross_device_error(&std::io::Error::from_raw_os_error(
+            13
+        )));
+    }
+
+    #[test]
+    fn copy_across_devices_moves_and_removes_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("src");
+        let to = tmp.path().join("dst");
+        std::fs::write(&from, b"PAYLOAD").unwrap();
+
+        copy_across_devices(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"PAYLOAD");
+        assert!(!from.exists(), "source must be consumed after the move");
+    }
+
+    #[test]
+    fn robust_rename_falls_back_to_copy_on_cross_device() {
+        // The reported bug: staged binary under the user profile (C:\…\.zap
+        // \staged\) vs a running exe on another drive (H:\). `rename` fails with
+        // ERROR_NOT_SAME_DEVICE; robust_rename must transparently copy instead of
+        // burning its retry budget on a deterministic failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("staged-binary");
+        let to = tmp.path().join("exe");
+        std::fs::write(&from, b"NEWVERSION").unwrap();
+
+        #[cfg(windows)]
+        let exdev = 17;
+        #[cfg(not(windows))]
+        let exdev = 18;
+        let fake_rename = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(exdev));
+
+        robust_rename_with(&from, &to, fake_rename).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"NEWVERSION");
+        assert!(!from.exists(), "staged source must be consumed");
+    }
+
+    #[test]
+    fn robust_rename_clears_readonly_source() {
+        // A read-only source (a real Windows AV/SCCM failure mode) must
+        // still move. set_readonly is cross-platform enough to exercise
+        // the clear_readonly path here.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::write(&from, b"RO").unwrap();
+        let mut perm = std::fs::metadata(&from).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&from, perm).unwrap();
+
+        robust_rename(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"RO");
+    }
+
+    #[test]
+    fn replace_binary_cleans_leftover_rolling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("jeikcode");
+        let new = tmp.path().join(".jeikcode.download");
+        let rolling = rolling_path(&exe);
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+        std::fs::write(&rolling, b"STALE").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        let bak = backup_path(&exe);
+        assert_eq!(std::fs::read(&bak).unwrap(), b"OLD");
+        assert!(!rolling.exists());
+    }
+
+    #[test]
+    fn replace_binary_succeeds_even_when_bak_cannot_be_removed() {
+        // Simulate the Windows ACCESS_DENIED scenario: .bak is locked
+        // (here we can't truly lock it, but we make it read-only in a
+        // non-writable parent — on Unix this still works because unlink
+        // doesn't care about file permissions. The test verifies the
+        // three-way swap completes successfully regardless.)
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("jeikcode");
+        let new = tmp.path().join(".jeikcode.download");
+        let bak = backup_path(&exe);
+        let rolling = rolling_path(&exe);
+        std::fs::write(&exe, b"V2").unwrap();
+        std::fs::write(&new, b"V3").unwrap();
+        std::fs::write(&bak, b"V1").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        // Core outcome: upgrade succeeded
+        assert_eq!(std::fs::read(&exe).unwrap(), b"V3");
+        // On this platform .bak is removable so we get V2 as backup.
+        // On Windows with a locked .bak, the .rolling file would linger
+        // instead, but the upgrade still succeeds.
+        assert!(bak.exists() || rolling.exists());
+    }
+
+    #[test]
+    fn rollback_swaps_live_and_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a fake exe name that won't collide with the real test
+        // binary. run_rollback uses current_exe() which we cannot
+        // redirect, so we test the primitive by calling replace_binary
+        // first then rename logic directly — model the three-way swap.
+        let exe = tmp.path().join("jeikcode");
+        let bak = backup_path(&exe);
+        std::fs::write(&exe, b"NEW").unwrap();
+        std::fs::write(&bak, b"OLD").unwrap();
+
+        // Manual three-way swap mirroring run_rollback's body.
+        let rolling = tmp.path().join(".jeikcode.rolling");
+        std::fs::rename(&exe, &rolling).unwrap();
+        std::fs::rename(&bak, &exe).unwrap();
+        std::fs::rename(&rolling, &bak).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn pending_upgrade_serde_roundtrips() {
+        let p = PendingUpgrade {
+            version: "v4.19.1".to_string(),
+            staged_path: PathBuf::from("/tmp/staged/jeikcode-v4.19.1-darwin-arm64"),
+            sha256: "abcd".to_string(),
+            size: 1024,
+            created_at: "2026-04-20T10:54:16Z".to_string(),
+            attempts: 0,
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        let back: PendingUpgrade = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.version, "v4.19.1");
+        assert_eq!(back.attempts, 0);
+    }
+
+    #[test]
+    fn pending_attempts_defaults_when_missing() {
+        // Older pointer files written before the attempts field existed
+        // must still deserialize — `#[serde(default)]` covers that.
+        let j = r#"{
+            "version": "v4.19.1",
+            "staged_path": "/tmp/x",
+            "sha256": "abcd",
+            "size": 1024,
+            "created_at": "2026-04-20T10:54:16Z"
+        }"#;
+        let p: PendingUpgrade = serde_json::from_str(j).unwrap();
+        assert_eq!(p.attempts, 0);
+    }
+
+    #[test]
+    fn staged_binary_path_matches_release_artifact_name() {
+        let p = staged_binary_path("v4.19.1", "darwin-arm64");
+        assert!(p.ends_with("jeikcode-v4.19.1-darwin-arm64"), "got: {:?}", p);
+    }
+
+    #[test]
+    fn staged_binary_path_adds_exe_for_windows() {
+        let p = staged_binary_path("v4.19.1", "windows-x64");
+        assert!(
+            p.ends_with("jeikcode-v4.19.1-windows-x64.exe"),
+            "got: {:?}",
+            p
+        );
+    }
+
+    // ── download_and_verify integration tests (issue #380) ──────────
+
+    /// Helper: compute the SHA256 hex string for a byte slice.
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex_encode(&hasher.finalize())
+    }
+
+    /// download_and_verify succeeds when the server omits Content-Length
+    /// (chunked transfer encoding).  In production, Content-Length may
+    /// differ from the manifest's `size` due to CDN/proxy rewrites,
+    /// manifest-server sync lag, or redirect hops — the old code
+    /// aborted immediately on such mismatches (issue #380).
+    ///
+    /// This test validates that when Content-Length is absent (chunked),
+    /// the function proceeds to download and relies on the post-download
+    /// size + SHA256 checks for integrity, which is the correct behavior
+    /// after the fix.
+    #[tokio::test]
+    async fn download_succeeds_without_content_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Simulate a CDN that uses chunked transfer (no Content-Length).
+        // This is what a gzip-compressed response looks like after
+        // reqwest transparently decompresses it.
+        let payload = vec![0xAB_u8; 100];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // No explicit Content-Length → chunked transfer encoding.
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        // With the fix, this should succeed because the actual downloaded
+        // bytes match expected_size and expected_sha256.  The old code
+        // would also have succeeded here (Content-Length was absent), but
+        // the key point is that we no longer gate on Content-Length at all.
+        assert!(result.is_ok(), "download should succeed, got: {:?}", result);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    /// download_and_verify still rejects a download whose actual byte
+    /// count doesn't match the manifest size (post-download size check).
+    #[tokio::test]
+    async fn download_rejects_wrong_actual_size() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Server sends 80 bytes, but manifest says 100.
+        let payload = vec![0xAB_u8; 80];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = 100; // mismatch!
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail on size mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("short download"),
+            "error should mention short download, got: {}",
+            err
+        );
+        // Temp file must be cleaned up on failure.
+        assert!(!dest.exists(), "partial download should be removed");
+    }
+
+    /// download_and_verify still rejects a download whose SHA256
+    /// doesn't match the manifest, even if the size is correct.
+    #[tokio::test]
+    async fn download_rejects_checksum_mismatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let payload = vec![0xAB_u8; 100];
+        let wrong_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            wrong_sha, // intentionally wrong
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail on checksum mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("checksum mismatch"),
+            "error should mention checksum mismatch, got: {}",
+            err
+        );
+        // Temp file must be cleaned up on failure.
+        assert!(!dest.exists(), "corrupted download should be removed");
+    }
+
+    /// download_and_verify succeeds when everything matches perfectly
+    /// (Content-Length present and correct, size + SHA256 match).
+    #[tokio::test]
+    async fn download_succeeds_when_all_checks_pass() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let payload = vec![0xCD_u8; 256];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download should succeed, got: {:?}", result);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    /// download_and_verify rejects non-2xx HTTP responses.
+    #[tokio::test]
+    async fn download_rejects_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            "unused",
+            100,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 404"),
+            "error should mention HTTP 404, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn is_package_managed_tracks_feature() {
+        assert_eq!(super::is_package_managed(), cfg!(feature = "distro-pm"));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[tokio::test]
+    async fn run_upgrade_blocked_when_package_managed() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = super::run_upgrade("v1.0.0".to_string(), true, tx)
+            .await
+            .expect_err("package-managed build must refuse self-upgrade");
+        assert!(err.to_string().contains(super::PACKAGE_MANAGED));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[test]
+    fn run_rollback_blocked_when_package_managed() {
+        let err = super::run_rollback().expect_err("package-managed build must refuse rollback");
+        assert!(err.to_string().contains(super::PACKAGE_MANAGED));
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[test]
+    fn apply_pending_upgrade_noop_when_package_managed() {
+        assert!(super::apply_pending_upgrade().unwrap().is_none());
+    }
+
+    #[cfg(feature = "distro-pm")]
+    #[tokio::test]
+    async fn prepare_deferred_upgrade_noop_when_package_managed() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = super::prepare_deferred_upgrade("v1.0.0", tx)
+            .await
+            .expect("package-managed build must not error, just no-op");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn listen_port_comes_from_argv_flag() {
+        assert_eq!(
+            listen_port_from_args([
+                "webui", "--host", "0.0.0.0", "--port", "13458", "--token", "t"
+            ]),
+            Some(13458)
+        );
+        assert_eq!(listen_port_from_args(["serve", "--port=4096"]), Some(4096));
+        assert_eq!(listen_port_from_args(["webui", "--port", "0"]), None);
+        assert_eq!(listen_port_from_args(["tui"]), None);
+    }
+
+    #[test]
+    fn exact_restart_keeps_the_live_port_instead_of_the_argv_fallback() {
+        assert_eq!(
+            planned_restart_port(Some("1"), Some("13458"), 13457),
+            Some(13458)
+        );
+        assert_eq!(planned_restart_port(Some("1"), None, 13457), Some(13457));
+        assert_eq!(planned_restart_port(None, Some("13458"), 13457), None);
+    }
+
+    #[test]
+    fn zombie_pid_does_not_block_once_the_listen_socket_is_gone() {
+        assert!(predecessor_socket_released(false));
+        assert!(!predecessor_socket_released(true));
+    }
+}

@@ -5,9 +5,9 @@
 | Crate | Role |
 |-------|------|
 | **jeikcode-core** | Agent 引擎 — 工具、上下文、语义分析、LLM 通信 |
-| **jeikcode-tuix** | 终端 UI — retained-mode 渲染、input、modal 选择器、命令分发 |
-| **jeikcode-cli** | CLI 入口 — 参数解析、OAuth 登录 |
-| **jeikcode-daemon** | 后台服务 — HTTP API 服务（独立部署） |
+| **zap-tuix** | 终端 UI — retained-mode 渲染、input、modal 选择器、命令分发 |
+| **zap-cli** | CLI 入口 — 参数解析、OAuth 登录 |
+| **zap-daemon** | 后台服务 — HTTP API 服务（独立部署） |
 
 ---
 
@@ -90,7 +90,7 @@
 
 ---
 
-## jeikcode-tuix 模块
+## zap-tuix 模块
 
 > CC 风格的 normal-mode TUI（不进 alternate screen），retained-mode 渲染器（cell-level diff + 16ms tick）。详细设计见 `docs/superpowers/plans/2026-04-19-tuix-retained-mode-rewrite.md`。
 

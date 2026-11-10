@@ -17,7 +17,7 @@ JeikCode comes equipped with an industrial-grade suite of native tools covering 
 | `code_explore` | Semantic code graph & symbol exploration | Bilingual thesaurus matching for deep symbol definitions and call graph resolution |
 | `todo_write` | Maintain structured multi-step task checklists | Canonical `todo_write` (alias `todo`); plans, tracks, and merges action batches |
 | `request_user_input` | Interactive user clarification and questions | Single/multiple choice and text collection for architectural decisions or missing tokens |
-| `jeikcode_config` | Global & workspace configuration management | Query module guides (`guide`) or hot-reload configurations in active sessions (`reload`) |
+| `zap_config` | Global & workspace configuration management | Query module guides (`guide`) or hot-reload configurations in active sessions (`reload`) |
 | `task` | Dispatch parallel subagents | Read-only `explore` and path-scoped `worker` subagents |
 
 ---

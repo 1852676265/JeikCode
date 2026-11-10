@@ -29,7 +29,7 @@ cargo build --release --bin jeikcode --locked
 - **可执行文件**：`target/release/jeikcode.exe`
 
 ### 3. 底层机制与注意事项
-- **打包内嵌原理**：`crates/jeikcode-cli` 使用了 `rust-embed`，在 Rust 编译期会将 `webui/dist/` 目录下的所有 HTML/JS/CSS 资源直接压缩内嵌进生成的 `jeikcode.exe` 单一二进制文件中，运行时由 Axum 本地 Web 服务直接在内存中提供。
+- **打包内嵌原理**：`crates/zap-cli` 使用了 `rust-embed`，在 Rust 编译期会将 `webui/dist/` 目录下的所有 HTML/JS/CSS 资源直接压缩内嵌进生成的 `jeikcode.exe` 单一二进制文件中，运行时由 Axum 本地 Web 服务直接在内存中提供。
 - **为什么必须先 `npm ci && npm run build`**：`npm ci` 严格使用仓库中的 `webui/package-lock.json`，依赖与 CI 保持一致；随后生成新的 `dist`，避免 RustEmbed 打包旧前端。
 - **构建不再读取开发者 `~/.jeikcode` 回写源码树**：仓库资产是唯一构建输入。构建保持纯净与确定性输入。
 
@@ -37,7 +37,7 @@ cargo build --release --bin jeikcode --locked
 
 ## 场景二：没改前端 (仅后端/核心逻辑) 时，如何快速复用缓存秒级编译
 
-当你只修改了 Rust 后端代码（例如 `jeikcode-coding`、`jeikcode-capabilities`、`jeikcode-kernel` 等），没有动 `webui/` 前端时：
+当你只修改了 Rust 后端代码（例如 `zap-coding`、`zap-capabilities`、`zap-kernel` 等），没有动 `webui/` 前端时：
 
 ### 1. 执行命令
 
@@ -55,7 +55,7 @@ cargo build --release --bin jeikcode --locked
 - **Debug 模式**：`target/debug/jeikcode.exe`
 
 ### 3. 底层机制
-- **无需构建前端**：Rust 编译器在编译 `crates/jeikcode-cli` 时，会自动复用已经存在的 `webui/dist` 资源。
+- **无需构建前端**：Rust 编译器在编译 `crates/zap-cli` 时，会自动复用已经存在的 `webui/dist` 资源。
 - **Cargo 增量构建缓存**：未变动的 crate、中间构件以及第三方依赖全部直接命中 `target/` 缓存，仅重新编译有代码变动的 crate，通常 5~15 秒即可快速产出最新程序。
 
 ---

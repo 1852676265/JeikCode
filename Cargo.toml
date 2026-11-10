@@ -4,10 +4,10 @@ resolver = "2"
 members = ["crates/*"]
 exclude = ["desktop/src-tauri"]
 default-members = [
-    "crates/jeikcode-cli",
-    "crates/jeikcode-daemon",
-    "crates/jeikcode-telemetry",
-    "crates/jeikcode-tuix",
+    "crates/zap-cli",
+    "crates/zap-daemon",
+    "crates/zap-telemetry",
+    "crates/zap-tuix",
 ]
 
 [profile.release]
@@ -22,9 +22,9 @@ incremental = true
 [profile.test]
 debug = "line-tables-only" # Smaller binaries, faster linker
 
-# Full-product debugging (the `jeikcode` / `jeikcode` binary), not unit tests.
-#   cargo build -p jeikcode --bin jeikcode --profile dbg
-# Output: target/dbg/jeikcode  (Windows: target/dbg/jeikcode.exe)
+# Full-product debugging (the `zap` binary), not unit tests.
+#   cargo build -p zap --bin zap --profile dbg
+# Output: target/dbg/zap  (Windows: target/dbg/zap.exe)
 #
 # Isolated from `target/debug` (tests) and `target/release` (stripped).
 # debug=1 = line tables + function/var names, not debug=2's huge DWARF.

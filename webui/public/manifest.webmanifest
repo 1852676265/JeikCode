@@ -1,6 +1,6 @@
 {
-  "name": "JeikCode AI",
-  "short_name": "JeikCode",
+  "name": "Zap AI",
+  "short_name": "Zap",
   "description": "High-performance AI Coding Agent driven by CodeExplore semantic graphs",
   "start_url": "./",
   "scope": "./",

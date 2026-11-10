@@ -8,7 +8,7 @@
 
 ### 1. 核心模块
 
-**文件**: `crates/jeikcode-core/src/hook/webhook.rs` (~748 行)
+**文件**: `crates/zap-core/src/hook/webhook.rs` (~748 行)
 
 #### 主要结构
 
@@ -74,7 +74,7 @@ pub struct WebhookHook {
 
 ### 2. 配置加载
 
-**文件**: `crates/jeikcode-core/src/hook/config_loader.rs` (更新)
+**文件**: `crates/zap-core/src/hook/config_loader.rs` (更新)
 
 #### hooks.toml 格式
 

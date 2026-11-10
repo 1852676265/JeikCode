@@ -1,0 +1,179 @@
+//! `long_bash_keyword_actions`.
+//!
+//! `action=add` with `global=false` (default) writes the session sidecar
+//! (`<id>.bashkw.json`) so a JeikCode restart + `/resume` still sees it.
+//! `global=true` also appends `[tools.bash] long_bash_command_keyword`.
+//!
+//! The background-task START MESSAGE is where a task's stop recipe is printed
+//! (`bash.rs` reports the workload's WinPID + MSYS pid), so this module stays
+//! keyword-only — no extra kill tool on the model surface.
+
+use super::bash_runtime::{legacy_bash_runtime_state, BashRuntimeState};
+use super::{err, ok};
+use async_trait::async_trait;
+use zap_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct LongBashKeywordActionsTool {
+    runtime: Option<Arc<BashRuntimeState>>,
+}
+
+#[allow(non_upper_case_globals)]
+pub const LongBashKeywordActionsTool: LongBashKeywordActionsTool =
+    LongBashKeywordActionsTool { runtime: None };
+
+impl Default for LongBashKeywordActionsTool {
+    fn default() -> Self {
+        Self { runtime: None }
+    }
+}
+
+impl LongBashKeywordActionsTool {
+    pub fn with_runtime_state(runtime: Arc<BashRuntimeState>) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    fn runtime_state(&self) -> Arc<BashRuntimeState> {
+        self.runtime
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(legacy_bash_runtime_state)
+    }
+}
+
+#[derive(Deserialize)]
+struct ActionsArgs {
+    action: String,
+    #[serde(alias = "bashkeyword")]
+    keyword: String,
+    #[serde(default, alias = "persist")]
+    global: bool,
+}
+
+#[async_trait]
+impl Tool for LongBashKeywordActionsTool {
+    fn name(&self) -> &str {
+        "long_bash_keyword_actions"
+    }
+    fn description(&self) -> &str {
+        "Add or remove long-running command keywords to prevent idle timeouts. Use to whitelist slow build or test commands. Resident services and daemons are not supported."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "delete"],
+                    "description": "Action to perform: 'add' to register a keyword, 'delete' to remove it."
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "Command keyword token (e.g. 'mvn', 'cargo', 'ninja')."
+                },
+                "global": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Persist in config.toml for all future sessions (default false, current session only)."
+                }
+            },
+            "required": ["action", "keyword"]
+        })
+    }
+    fn risk(&self, _args: &str) -> RiskLevel {
+        RiskLevel::Safe
+    }
+    fn parallel_safe(&self, _args: &str) -> bool {
+        true
+    }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let runtime = self.runtime_state();
+        let a: ActionsArgs = match serde_json::from_str(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return err(format!(
+                    "long_bash_keyword_actions: invalid arguments: {e}. \
+                     Expected {{\"action\":\"add|delete\",\"keyword\":\"<token>\"}}."
+                ))
+            }
+        };
+        let action = a.action.trim().to_ascii_lowercase();
+        let keyword = a.keyword.trim();
+        if keyword.is_empty() {
+            return err("long_bash_keyword_actions: keyword must not be empty");
+        }
+        match action.as_str() {
+            "add" => execute_add(runtime.as_ref(), keyword, a.global),
+            "delete" | "remove" => execute_delete(runtime.as_ref(), keyword, a.global),
+            other => err(format!(
+                "long_bash_keyword_actions: unknown action `{other}`. Use add or delete."
+            )),
+        }
+    }
+}
+
+fn execute_add(runtime: &BashRuntimeState, keyword: &str, global: bool) -> ToolResult {
+    runtime.add_live_long_keyword(keyword);
+    let promoted = runtime.promote_matching(keyword);
+    if global {
+        match zap_config::config::append_long_bash_command_keyword(keyword) {
+            Ok(inserted) => ok(format!(
+                "session keyword `{keyword}` on; global={} (new on disk); \
+                 promoted {promoted} live bash task(s). Original pane keeps streaming. \
+                 Session list: {}",
+                if inserted {
+                    "written"
+                } else {
+                    "already in config"
+                },
+                session_list_preview(runtime)
+            )),
+            Err(e) => err(format!(
+                "session keyword `{keyword}` on and promoted {promoted} task(s), \
+                 but failed to persist config: {e}"
+            )),
+        }
+    } else {
+        ok(format!(
+            "session keyword `{keyword}` on (not written to config.toml; \
+             kept with this session across JeikCode restart). \
+             promoted {promoted} live bash task(s). Pass global=true to keep it for every session. \
+             Original pane keeps streaming. Keywords now: {}",
+            runtime.live_long_keywords().join(", ")
+        ))
+    }
+}
+
+fn execute_delete(runtime: &BashRuntimeState, keyword: &str, global: bool) -> ToolResult {
+    let session = runtime.remove_live_long_keyword(keyword);
+    if global {
+        match zap_config::config::remove_long_bash_command_keyword(keyword) {
+            Ok(disk) => ok(format!(
+                "removed `{keyword}` from session={session} config={disk}."
+            )),
+            Err(e) => err(format!(
+                "removed `{keyword}` from session={session}, but config write failed: {e}"
+            )),
+        }
+    } else {
+        ok(format!(
+            "removed `{keyword}` from session overlay={session}. \
+             Pass global=true to also edit config.toml. Session list: {}",
+            session_list_preview(runtime)
+        ))
+    }
+}
+
+fn session_list_preview(runtime: &BashRuntimeState) -> String {
+    let v = runtime.session_long_keywords();
+    if v.is_empty() {
+        "(empty)".to_string()
+    } else {
+        v.join("、")
+    }
+}

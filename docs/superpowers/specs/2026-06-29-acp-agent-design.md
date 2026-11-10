@@ -58,8 +58,8 @@ Out of scope (future phases, each its own spec):
 
 ## Architecture
 
-New crate **`jeikcode-acp`**, depending on `jeikcode-kernel`,
-`jeikcode-coding`, `jeikcode-capabilities`, the official `agent-client-protocol`
+New crate **`jeikcode-acp`**, depending on `zap-kernel`,
+`zap-coding`, `zap-capabilities`, the official `agent-client-protocol`
 crate, plus `serde_json` / `tokio`.
 
 Single public entry point:
@@ -73,7 +73,7 @@ and the resolved jeikcode config. The working directory is NOT fixed here — th
 client supplies it per session via `session/new`.
 
 CLI: add an `Acp` variant to the `Commands` enum in
-`crates/jeikcode-cli/src/main.rs`. The handler resolves config (reusing the
+`crates/zap-cli/src/main.rs`. The handler resolves config (reusing the
 existing provider/model resolution the headless path uses) and calls
 `jeikcode_acp::serve_stdio`. The subcommand reuses the existing global
 `--provider` / `--model` flags; cwd comes from the client.
@@ -149,11 +149,11 @@ ACP `stopReason`). The primary unit-test target (table-driven).
 
 Per session:
 1. `prepare(&cfg, PrepareOptions { cwd, ... }).await` → `CodingParts`
-   (`jeikcode-coding`; handles MCP connect, skill loading, session binding)
+   (`zap-coding`; handles MCP connect, skill loading, session binding)
 2. `assemble(&mut parts, &cfg, provider).await` → kernel-native `Agent`
-   (`crates/jeikcode-coding/src/parts.rs:396`)
+   (`crates/zap-coding/src/parts.rs:396`)
 3. `agent.spawn()` → `AgentHandle { commands, events, task }`
-   (`crates/jeikcode-kernel/src/agent.rs:366`)
+   (`crates/zap-kernel/src/agent.rs:366`)
 4. pump loop: drain `events` → `session/update`; route inbound prompt/cancel →
    `commands`
 5. on session end / shutdown: `AgentCommand::Shutdown`, await `task`
@@ -190,7 +190,7 @@ old_text, new_text }` so the client renders a diff.
 ## Permission flow
 
 The kernel approval request carries `ApprovalRequest { call_id, tool, args }`
-(`jeikcode-capabilities/src/tools/approval.rs`); the response it expects is
+(`zap-capabilities/src/tools/approval.rs`); the response it expects is
 `ApprovalResponse { decision: "allow"|"allow_always"|"deny", remember: bool }`
 (fail-closed to `deny`).
 
@@ -252,13 +252,13 @@ Echo the client's `protocol_version` back (clamped to a version we support;
 
 ## File touch list (anticipated)
 
-- `crates/jeikcode-acp/` — new crate (`Cargo.toml`, `src/lib.rs`,
+- `crates/zap-acp/` — new crate (`Cargo.toml`, `src/lib.rs`,
   `src/protocol.rs`, `src/dispatch.rs`, `src/translate.rs`, `src/engine.rs`,
   tests)
-- `crates/jeikcode-cli/src/main.rs` — `Acp` command variant + handler
+- `crates/zap-cli/src/main.rs` — `Acp` command variant + handler
 - `Cargo.toml` (workspace) — `agent-client-protocol` + `agent-client-protocol-schema`
   in `[workspace.dependencies]` (pinned `=1.0.1` / matching schema)
-- `crates/jeikcode-cli/Cargo.toml` — depend on `jeikcode-acp`
+- `crates/zap-cli/Cargo.toml` — depend on `jeikcode-acp`
 
 ## Build notes
 

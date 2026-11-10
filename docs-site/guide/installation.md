@@ -72,7 +72,7 @@ git clone https://github.com/jeikl/JeikCode.git
 cd JeikCode
 
 # 2. Build the Daemon image
-docker build -t jeikcode-daemon -f docker/Dockerfile-Daemon .
+docker build -t zap-daemon -f docker/Dockerfile-Daemon .
 
 # 3. Run container mounting your workspace and configurations
 docker run -d \
@@ -81,7 +81,7 @@ docker run -d \
   -e JEIKCODE_SERVER_TOKEN="sk-your-secret-token" \
   -v ~/.jeikcode:/root/.jeikcode \
   -v /path/to/your/projects:/workspace \
-  jeikcode-daemon
+  zap-daemon
 ```
 
 Access the WebUI directly at `http://<SERVER_IP>:13457/?token=sk-your-secret-token`.
@@ -110,5 +110,5 @@ If you have a Rust toolchain installed (Rust 1.80+ recommended):
 git clone https://github.com/jeikl/JeikCode.git
 cd JeikCode
 cd webui && npm run build && cd ..
-cargo install --path crates/jeikcode-cli --bin jeikcode --locked
+cargo install --path crates/zap-cli --bin jeikcode --locked
 ```

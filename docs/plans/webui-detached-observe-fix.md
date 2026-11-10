@@ -8,7 +8,7 @@
 | WebUI/TUI 自己发起的 turn | 原生交互（审批、用户输入模态照常） |
 | `--yolo` | 所有入口都走 yolo（Auto + 无模态） |
 
-`crates/jeikcode-daemon/src/lib.rs` 的 `ChatTurnPolicy::resolve` 已按此实现；本修复不动 daemon 策略层。
+`crates/zap-daemon/src/lib.rs` 的 `ChatTurnPolicy::resolve` 已按此实现；本修复不动 daemon 策略层。
 
 ---
 
@@ -241,7 +241,7 @@ Auto/YOLO/无 responder（`perm_rx=None`）仍走 fallback，不弹卡，行为�
 
 daemon 已支持 `ToolChoice::Required`（`openai_compat.rs:984-1019`，调用方主动指定时生效）。新增 config 项，让 API/yolo 路径对指定弱模型强制 `tool_choice=required`：
 
-- `jeikcode-config`：新增 `[automation] force_tool_choice_models = ["newnew/auto"]`（或全局开关，仅作用于 api/yolo origin）。
+- `zap-config`：新增 `[automation] force_tool_choice_models = ["newnew/auto"]`（或全局开关，仅作用于 api/yolo origin）。
 - `compat_api.rs`：turn 准入后若 origin=Api/yolo 且模型匹配，注入 `tool_choice=required`。
 - **风险**：强制 required 会让模型每回合必须调工具、不能纯文本回答 → 仅对边界弱模型 opt-in，不默认开。
 

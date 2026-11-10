@@ -79,7 +79,7 @@ test('required bundling copies all supplied platform fixtures and metadata', (t)
   assert.equal(result.status, 0, result.stderr);
   const bin = path.join(f.root, 'resources', 'bin');
   for (const target of ['darwin-arm64', 'darwin-x64', 'linux-x64', 'linux-arm64', 'win32-x64']) {
-    const exe = target === 'win32-x64' ? 'jeikcode-daemon.exe' : 'jeikcode-daemon';
+    const exe = target === 'win32-x64' ? 'zap-daemon.exe' : 'zap-daemon';
     assert.equal(fs.readFileSync(path.join(bin, target, exe), 'utf8'), fs.readFileSync(source, 'utf8'));
   }
   assert.equal(fs.readFileSync(path.join(bin, 'daemon-version.txt'), 'utf8'), '7.2.1-beta.5');

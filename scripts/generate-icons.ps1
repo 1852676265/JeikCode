@@ -170,4 +170,18 @@ $fs.Close()
 
 $icoLen = (Get-Item $icoFile).Length
 Write-Host "Windows icon.ico generated: $icoFile ($icoLen bytes)"
-Write-Host "All Zap desktop and Web icons successfully refreshed!"
+
+# Sync Windows .ico across CLI and root assets
+$cliIco = Join-Path $workspace "crates/jeikcode-cli/assets/zap.ico"
+$cliLegacyIco = Join-Path $workspace "crates/jeikcode-cli/assets/jeikcode.ico"
+$rootZapIco = Join-Path $workspace "assets/zap.ico"
+$rootLegacyIco = Join-Path $workspace "assets/jeikcode.ico"
+$docsIco = Join-Path $workspace "docs-site/public/favicon.ico"
+
+Copy-Item $icoFile $cliIco -Force
+Copy-Item $icoFile $cliLegacyIco -Force
+Copy-Item $icoFile $rootZapIco -Force
+Copy-Item $icoFile $rootLegacyIco -Force
+Copy-Item $icoFile $docsIco -Force
+
+Write-Host "All Zap desktop, CLI, and Web icons successfully refreshed!"

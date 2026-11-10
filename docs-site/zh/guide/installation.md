@@ -75,7 +75,7 @@ git clone https://github.com/jeikl/JeikCode.git
 cd JeikCode
 
 # 2. 构建 Daemon 服务端镜像
-docker build -t jeikcode-daemon -f docker/Dockerfile-Daemon .
+docker build -t zap-daemon -f docker/Dockerfile-Daemon .
 
 # 3. 运行容器并挂载项目工作区和本地配置
 docker run -d \
@@ -84,7 +84,7 @@ docker run -d \
   -e JEIKCODE_SERVER_TOKEN="sk-your-secret-token" \
   -v ~/.jeikcode:/root/.jeikcode \
   -v /path/to/your/projects:/workspace \
-  jeikcode-daemon
+  zap-daemon
 ```
 
 启动完成后，即可直接通过浏览器访问 `http://<服务器IP>:13457/?token=sk-your-secret-token` 进入 WebUI 进行开发管理。
@@ -113,5 +113,5 @@ docker run -d \
 git clone https://github.com/jeikl/JeikCode.git
 cd JeikCode
 cd webui && npm run build && cd ..
-cargo install --path crates/jeikcode-cli --bin jeikcode --locked
+cargo install --path crates/zap-cli --bin jeikcode --locked
 ```

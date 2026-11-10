@@ -1199,6 +1199,23 @@ export function App() {
                 </div>
               )}
             </div>
+          ) : activeWorkbenchView !== 'chat' &&
+            zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView) ? (
+            /* 桌面端插件工作台标题：当前切到外部扩展工作台（如 DevOrbit）时，顶栏直接联动展示插件名称 */
+            <button
+              type="button"
+              class="session-title-btn active"
+              title={
+                zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView)?.title ||
+                '扩展工作台'
+              }
+              onClick={() => {}}
+            >
+              <span class="session-title-text">
+                {zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView)?.title ||
+                  '扩展工作台'}
+              </span>
+            </button>
           ) : activeSession?.name &&
             (!activeSession.id.startsWith('optimistic-') ||
               !isLanding ||
@@ -1720,7 +1737,7 @@ export function App() {
           zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView) ? (
             <div
               class="workbench-plugin-container"
-              style="flex: 1; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-primary, #0c1017);"
+              style="flex: 1; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-primary, transparent);"
             >
               {(() => {
                 const currentView = zapPluginKernel

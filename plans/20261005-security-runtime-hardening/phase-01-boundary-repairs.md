@@ -27,16 +27,16 @@ Repair the three confirmed high-severity trust-boundary defects with the smalles
 
 ## Files expected to change
 
-- `crates/jeikcode-daemon/src/auth_token.rs`
-- `crates/jeikcode-daemon/src/main.rs`
-- `crates/jeikcode-daemon/src/api_config.rs`
-- `crates/jeikcode-daemon/src/api_git.rs`
-- `crates/jeikcode-daemon/README.md`
-- `crates/jeikcode-cli/src/main.rs`
-- `crates/jeikcode-capabilities/src/tools/sensitive_path.rs`
-- `crates/jeikcode-capabilities/src/tools/write_approval.rs`
-- `crates/jeikcode-capabilities/src/tools/glob.rs`
-- `crates/jeikcode-coding/src/parts.rs`
+- `crates/zap-daemon/src/auth_token.rs`
+- `crates/zap-daemon/src/main.rs`
+- `crates/zap-daemon/src/api_config.rs`
+- `crates/zap-daemon/src/api_git.rs`
+- `crates/zap-daemon/README.md`
+- `crates/zap-cli/src/main.rs`
+- `crates/zap-capabilities/src/tools/sensitive_path.rs`
+- `crates/zap-capabilities/src/tools/write_approval.rs`
+- `crates/zap-capabilities/src/tools/glob.rs`
+- `crates/zap-coding/src/parts.rs`
 - Tests colocated with the owning modules; avoid new test-only abstractions unless needed.
 
 ## Success criteria

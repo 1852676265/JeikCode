@@ -2,7 +2,7 @@
 
 - 日期：2026-07-31
 - 分支：release/v5.0.3
-- 范围：`crates/jeikcode-capabilities/src/memory/store.rs`（+ 配置文档一条）
+- 范围：`crates/zap-capabilities/src/memory/store.rs`（+ 配置文档一条）
 - 类型：新增环境变量覆盖入口，默认行为完全不变、向后兼容
 
 ## 背景与问题(用户反馈)
@@ -15,8 +15,8 @@ memory 工具的 global scope 由 `MemoryStore::global()` 经 `super::config_dir
 
 - `MemoryStore::new(path)` 本就以完整路径参数化；`global()` 走 `config_dir()`（尊重 `JEIKCODE_HOME`）；唯 `project(project_root)` 硬编码 `.jeikcode`。
 - **⚠️ 存在两份 `MemoryStore`，两份都在生产用、`project()` 都硬编码 `.jeikcode`**（计划期 grep 发现，spec 初稿曾漏）：
-  1. `jeikcode-capabilities/src/memory/store.rs`（用户点的，L1 端口）：被 tuix `event_loop/commands.rs`（`/memory`/`/remember`/prompt 组装）、`jeikcode-clix/src/code.rs`、`jeikcode-capabilities/src/tools/memory.rs:40`（`remember` 工具）、以及 **prompt 注入 hook `memory/hook.rs:49`（`MemoryStore::project(project_root)`）** 使用。
-  2. `jeikcode-config/src/config/memory.rs`（原版；store.rs 是它的 VERBATIM 端口，两者字节兼容）：被 **daemon（webui）`jeikcode-daemon/src/commands.rs:527/531`（`MemoryStore::global()`/`project()`）** 使用。
+  1. `zap-capabilities/src/memory/store.rs`（用户点的，L1 端口）：被 tuix `event_loop/commands.rs`（`/memory`/`/remember`/prompt 组装）、`zap-clix/src/code.rs`、`zap-capabilities/src/tools/memory.rs:40`（`remember` 工具）、以及 **prompt 注入 hook `memory/hook.rs:49`（`MemoryStore::project(project_root)`）** 使用。
+  2. `zap-config/src/config/memory.rs`（原版；store.rs 是它的 VERBATIM 端口，两者字节兼容）：被 **daemon（webui）`zap-daemon/src/commands.rs:527/531`（`MemoryStore::global()`/`project()`）** 使用。
 - 结论：**两份 `project()` 必须同样修，否则另一条路径（TUI 或 daemon/webui）仍落回 `.jeikcode`，宿主 bug 只修一半**。每份内部读/写/注入都经各自 `project()`，故各改一处即覆盖该 crate 的全部路径，无调用点 churn。
 - `.jeikcode` 每项目目录名在全仓另有约 8 处硬编码（skills/commands/hooks/setup/lock/sensitive_path 等），无统一解析器——**本设计不触碰它们**（见"范围决策"）。
 
@@ -30,7 +30,7 @@ memory 工具的 global scope 由 `MemoryStore::global()` 经 `super::config_dir
 
 ## 具体设计
 
-**两份 `MemoryStore` 各自施加同一改动**（`jeikcode-capabilities/src/memory/store.rs` 与 `jeikcode-config/src/config/memory.rs`），保持二者字节兼容。下述以 store.rs 为例，config/memory.rs 逐字镜像。
+**两份 `MemoryStore` 各自施加同一改动**（`zap-capabilities/src/memory/store.rs` 与 `zap-config/src/config/memory.rs`），保持二者字节兼容。下述以 store.rs 为例，config/memory.rs 逐字镜像。
 
 ### 改动 —— `MemoryStore::project` 读环境变量(每份 store 各一处)
 
@@ -75,7 +75,7 @@ pub fn project(project_root: &Path) -> Self {
   - `(root, Some(""))` → 回退默认 `.jeikcode`
 - **env 集成一条(自设自清,避免并行泄漏)**：设 `JEIKCODE_PROJECT_MEMORY_DIR` 后 `project(root).path()` 落到自定义目录；`remove_var` 后回默认。（同文件内串行、测尾清理。）
 - **两份 store 各自加上述纯函数测试 + 一条 env 测试**（capabilities 与 config 各一套）。
-- **回归**：`cargo test -p jeikcode-capabilities`（含 memory store + `remember_writes_project_entry`）与 `cargo test -p jeikcode-config`（含 config/memory.rs 既有测试）全绿。
+- **回归**：`cargo test -p zap-capabilities`（含 memory store + `remember_writes_project_entry`）与 `cargo test -p zap-config`（含 config/memory.rs 既有测试）全绿。
 
 ## 文档
 

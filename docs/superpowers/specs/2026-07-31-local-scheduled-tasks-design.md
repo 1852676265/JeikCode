@@ -40,11 +40,11 @@ jeikcode schedule run <id>                          ← 执行入口(手动 / �
 
 ## 组件与文件结构
 
-- **`ScheduleTask` 模型 + store**（新模块 `crates/jeikcode-config/src/schedule.rs`——config-dir 属主、配置性数据，且 `Config::config_dir()` 就在此 crate）：serde 结构 + `~/.jeikcode/schedules/<id>.json` 的 load/save/list/remove（一任务一文件，避免并发 clobber，与 sessions 目录同风格）。纯 I/O + serde，可单测。
+- **`ScheduleTask` 模型 + store**（新模块 `crates/zap-config/src/schedule.rs`——config-dir 属主、配置性数据，且 `Config::config_dir()` 就在此 crate）：serde 结构 + `~/.jeikcode/schedules/<id>.json` 的 load/save/list/remove（一任务一文件，避免并发 clobber，与 sessions 目录同风格）。纯 I/O + serde，可单测。
 - **下次运行时间计算**（纯函数）：`next_run(schedule, now) -> Option<DateTime>`，供 `schedule list` 显示"下次运行"。纯函数，单测。
-- **CLI 子命令 `schedule`**（`crates/jeikcode-cli`）：clap 子命令 add/list/remove/enable/disable/run。
+- **CLI 子命令 `schedule`**（`crates/zap-cli`）：clap 子命令 add/list/remove/enable/disable/run。
 - **执行器**（CLI 内，`schedule run <id>`）：复用现有 headless 路径（`run_headless` 及其 completion/notify 机制），注入任务的 `cwd` / `permission_mode` / `prompt`，运行前把新 session 标 `origin=scheduled` + `schedule_id`，运行后按 `notify` 级别发通知、回写 `last_run_at`/`last_status`。
-- **SessionMeta 加 `origin` 字段**（`jeikcode-capabilities` / session manager）：`enum SessionOrigin { Manual, Scheduled }`，`#[serde(default)]` 默认 Manual（向后兼容旧会话）。
+- **SessionMeta 加 `origin` 字段**（`zap-capabilities` / session manager）：`enum SessionOrigin { Manual, Scheduled }`，`#[serde(default)]` 默认 Manual（向后兼容旧会话）。
 - **会话列表默认过滤**：session catalog 的列举路径（/resume 选择器数据源 + webui 侧栏数据源）默认排除 `origin=Scheduled`（提供一个包含参数以便"定时任务视图"取用）。
 
 ## 任务数据模型
@@ -89,7 +89,7 @@ last_status: Option<"ok" | "error" | "cancelled">
 - **store 单测**：临时目录下 save→load→list→remove 往返；损坏文件被 list 跳过。
 - **session 标记**：`schedule run` 后新 session 的 `origin=Scheduled` + `schedule_id` 正确；catalog 默认列举**不含**该 session、带包含参数时**含**。
 - **执行器**：复用既有 headless 测试脚手架，断言 last_run/last_status 回写 + notify 触发（mock notify）。
-- 回归：`cargo test -p jeikcode-cli -p jeikcode-config -p jeikcode-capabilities` 全绿；既有 session 无 origin 字段仍反序列化为 Manual。
+- 回归：`cargo test -p zap-cli -p zap-config -p zap-capabilities` 全绿；既有 session 无 origin 字段仍反序列化为 Manual。
 
 ## 范围
 

@@ -1507,7 +1507,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-desktop"
+name = "zap-desktop"
 version = "1.0.8"
 dependencies = [
  "serde",

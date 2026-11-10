@@ -36,19 +36,19 @@ The `is_codingplan_provider_name` helper (already in `setup.rs`) is the precise 
 
 | File | Action | Responsibility |
 |---|---|---|
-| `crates/jeikcode-core/src/provider/mod.rs` | **Modify** | Extend `model_name_suggests_vision` to match `ocr` substring + tests |
-| `crates/jeikcode-core/src/coding_plan/setup.rs` | **Modify** | Auto-set logic in `step_models_and_register`; new field on `ModelsInfo`; render line in `SetupReport::render` + tests |
+| `crates/zap-core/src/provider/mod.rs` | **Modify** | Extend `model_name_suggests_vision` to match `ocr` substring + tests |
+| `crates/zap-core/src/coding_plan/setup.rs` | **Modify** | Auto-set logic in `step_models_and_register`; new field on `ModelsInfo`; render line in `SetupReport::render` + tests |
 
 ---
 
 ## Task 7: Extend `model_name_suggests_vision` to recognize OCR
 
 **Files:**
-- Modify: `crates/jeikcode-core/src/provider/mod.rs:298-336` (the `model_name_suggests_vision` function and its tests)
+- Modify: `crates/zap-core/src/provider/mod.rs:298-336` (the `model_name_suggests_vision` function and its tests)
 
 - [ ] **Step 1: Update the heuristic body**
 
-In `crates/jeikcode-core/src/provider/mod.rs`, locate `pub fn model_name_suggests_vision(name: &str) -> bool` (around line 312) and add an `ocr` clause. The function currently has a chain of `||`. Add this clause anywhere in the chain (before the closing `}`):
+In `crates/zap-core/src/provider/mod.rs`, locate `pub fn model_name_suggests_vision(name: &str) -> bool` (around line 312) and add an `ocr` clause. The function currently has a chain of `||`. Add this clause anywhere in the chain (before the closing `}`):
 
 ```rust
         || n.contains("ocr")
@@ -167,8 +167,8 @@ preprocessor short-circuit, and /codingplan auto-detection (next commit).
 EOF
 
 cd /Users/theo/Documents/workspace/jeikcode/
-git add crates/jeikcode-core/src/provider/mod.rs
-git commit -F /tmp/jeikcode-task7-msg.txt -- crates/jeikcode-core/src/provider/mod.rs
+git add crates/zap-core/src/provider/mod.rs
+git commit -F /tmp/jeikcode-task7-msg.txt -- crates/zap-core/src/provider/mod.rs
 ```
 
 ---
@@ -176,7 +176,7 @@ git commit -F /tmp/jeikcode-task7-msg.txt -- crates/jeikcode-core/src/provider/m
 ## Task 8: Auto-set `vision_preprocessor_provider` in `/codingplan`
 
 **Files:**
-- Modify: `crates/jeikcode-core/src/coding_plan/setup.rs` — function `step_models_and_register` (around line 422-469) and `ModelsInfo` struct (around line 257-265)
+- Modify: `crates/zap-core/src/coding_plan/setup.rs` — function `step_models_and_register` (around line 422-469) and `ModelsInfo` struct (around line 257-265)
 
 - [ ] **Step 1: Add a new variant enum to communicate the outcome**
 
@@ -349,7 +349,7 @@ Run:
 
 ```bash
 cd /Users/theo/Documents/workspace/jeikcode/
-grep -n "ModelsInfo {" crates/jeikcode-core/src/coding_plan/setup.rs
+grep -n "ModelsInfo {" crates/zap-core/src/coding_plan/setup.rs
 ```
 
 For each `ModelsInfo {` literal that's `StepResult::Ok(ModelsInfo { ... })` in a test fixture, add `vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,` (the no-op variant — keeps test output unchanged). Example:
@@ -717,8 +717,8 @@ UnchangedNone is silent to keep output identical for setups without VL.
 EOF
 
 cd /Users/theo/Documents/workspace/jeikcode/
-git add crates/jeikcode-core/src/coding_plan/setup.rs
-git commit -F /tmp/jeikcode-task8-msg.txt -- crates/jeikcode-core/src/coding_plan/setup.rs
+git add crates/zap-core/src/coding_plan/setup.rs
+git commit -F /tmp/jeikcode-task8-msg.txt -- crates/zap-core/src/coding_plan/setup.rs
 ```
 
 ---
@@ -779,7 +779,7 @@ If no fixups needed, skip this step.
 
 1. Save current `~/.jeikcode/config.toml`.
 2. Edit it to remove the `vision_preprocessor_provider = ...` line so the field becomes None.
-3. Run `cargo run -p jeikcode-cli --release -- /codingplan` (or invoke `/codingplan` from inside the TUI).
+3. Run `cargo run -p zap-cli --release -- /codingplan` (or invoke `/codingplan` from inside the TUI).
 4. Inspect the `/codingplan` output: expect a `✔ Vision preprocessor → JeikCode-...  (auto-detected)` line if the API returned a VL model in the list.
 5. Confirm `~/.jeikcode/config.toml` now contains `vision_preprocessor_provider = "JeikCode-..."`.
 6. Set the field to your own non-JeikCode value (e.g. `Qwen3-VL-32B-Instruct` from your SiliconFlow setup), re-run /codingplan, and verify it stays untouched + the report says `(user setting kept)`.

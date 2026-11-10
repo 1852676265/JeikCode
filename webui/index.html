@@ -9,7 +9,7 @@
     <script>
       (function() {
         try {
-          var t = localStorage.getItem('jeikcode.theme');
+          var t = localStorage.getItem('zap.theme') || localStorage.getItem('jeikcode.theme');
           if (t === 'light' || t === 'dark' || t === 'system') {
             document.documentElement.setAttribute('data-theme', t);
           } else {

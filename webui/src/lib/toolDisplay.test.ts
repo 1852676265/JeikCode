@@ -150,7 +150,7 @@ test('resolveToolDiffPreview does NOT tag successful edit as diagnostic even if 
   const output = [
     '> ⏱️ **Cost Time**: 107ms',
     '',
-    'Edited crates/jeikcode-capabilities/src/tools/edit.rs (3 replacements (3 hunks: exact, exact, exact))',
+    'Edited crates/zap-capabilities/src/tools/edit.rs (3 replacements (3 hunks: exact, exact, exact))',
     '@@ -355,8 +355,16 @@',
     '- old line',
     '+ [Content Mismatch]: Closest matching block found around lines',
@@ -404,25 +404,25 @@ test('formatToolCompactJson formats multi-param read_file as single-line JSON', 
   const args = JSON.stringify({
     offset: 1,
     limit: 30,
-    file_path: 'crates/jeikcode-config/src/endpoints.rs',
+    file_path: 'crates/zap-config/src/endpoints.rs',
   });
   const detail = formatToolDetail('read_file', args);
   assert.equal(
     detail,
-    '{"file_path": "crates/jeikcode-config/src/endpoints.rs", "offset": 1, "limit": 30}',
+    '{"file_path": "crates/zap-config/src/endpoints.rs", "offset": 1, "limit": 30}',
   );
 
   // Consecutive calls with different offsets produce distinct header summaries
   const nextArgs = JSON.stringify({
     offset: 31,
     limit: 30,
-    file_path: 'crates/jeikcode-config/src/endpoints.rs',
+    file_path: 'crates/zap-config/src/endpoints.rs',
   });
   const nextDetail = formatToolDetail('read_file', nextArgs);
   assert.notEqual(detail, nextDetail);
   assert.equal(
     nextDetail,
-    '{"file_path": "crates/jeikcode-config/src/endpoints.rs", "offset": 31, "limit": 30}',
+    '{"file_path": "crates/zap-config/src/endpoints.rs", "offset": 31, "limit": 30}',
   );
 });
 
@@ -443,12 +443,12 @@ test('formatToolCompactJson abbreviates long content / code strings with ellipsi
 
 test('formatToolCompactJson keeps path and query identifiers visible for search tools', () => {
   const grepArgs = JSON.stringify({
-    path: 'crates/jeikcode-config',
+    path: 'crates/zap-config',
     pattern: 'endpoints',
   });
   assert.equal(
     formatToolDetail('grep', grepArgs),
-    '{"pattern": "endpoints", "path": "crates/jeikcode-config"}',
+    '{"pattern": "endpoints", "path": "crates/zap-config"}',
   );
 });
 
@@ -485,12 +485,12 @@ test('formatToolCompactJson puts important fields before short ones', () => {
   const invertedOrderArgs = JSON.stringify({
     limit: 30,
     offset: 1,
-    file_path: 'crates/jeikcode-config/src/endpoints.rs',
+    file_path: 'crates/zap-config/src/endpoints.rs',
   });
   const detail = formatToolDetail('read_file', invertedOrderArgs);
   assert.equal(
     detail,
-    '{"file_path": "crates/jeikcode-config/src/endpoints.rs", "offset": 1, "limit": 30}',
+    '{"file_path": "crates/zap-config/src/endpoints.rs", "offset": 1, "limit": 30}',
   );
 
   const editArgs = JSON.stringify({

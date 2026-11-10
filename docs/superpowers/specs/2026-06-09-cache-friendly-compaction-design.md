@@ -4,7 +4,7 @@
 - **分支**: `release/v4.25.1`(worktree:`jeikcode-v4.25.1`)
 - **状态**: 设计已评审通过,待写实现计划
 - **范围**: 公共底座(①)。`summary 折叠最老轮`(②)列为后续可选,不在本次。
-- **目标文件**: `crates/jeikcode-core/src/ctx/render.rs`(主),`crates/jeikcode-core/src/agent/mod.rs`(渲染调用点)
+- **目标文件**: `crates/zap-core/src/ctx/render.rs`(主),`crates/zap-core/src/agent/mod.rs`(渲染调用点)
 
 ---
 

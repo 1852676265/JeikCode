@@ -55,7 +55,7 @@ df = pd.read_csv("data.csv")
 This notebook analyzes...
 ```
 
-Files: `crates/jeikcode-core/src/tool/read.rs` (add ipynb handler before binary fallback)
+Files: `crates/zap-core/src/tool/read.rs` (add ipynb handler before binary fallback)
 
 ## 4. TodoWrite tool
 
@@ -81,4 +81,4 @@ Actions: `add`, `update`, `complete`, `list`
 
 LLM uses this to track multi-step tasks. `/todo` slash command shows current list.
 
-Files: `crates/jeikcode-core/src/tool/todo.rs` (new), `tool/mod.rs`, `cli/main.rs` (register), `commands.rs` (slash /todo)
+Files: `crates/zap-core/src/tool/todo.rs` (new), `tool/mod.rs`, `cli/main.rs` (register), `commands.rs` (slash /todo)

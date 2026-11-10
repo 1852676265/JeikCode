@@ -22,7 +22,7 @@ runtime operation, not a TUI-side combination of filesystem writes and `/undo`.
 The TUI lists targets, selects a scope, submits one request, and waits for one
 success or failure terminal.
 
-Conversation checkpoint metadata belongs to `jeikcode-capabilities::session`. It
+Conversation checkpoint metadata belongs to `zap-capabilities::session`. It
 uses the existing `SnapshotHook::turn_start` and `turn_complete` seams, so no
 second per-turn state machine is introduced. The kernel remains neutral and
 unchanged.

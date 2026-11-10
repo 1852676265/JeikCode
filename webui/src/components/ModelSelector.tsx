@@ -170,7 +170,7 @@ export function ModelSelector({
     // 冷启动拉取一次模型列表
     fetchLatest();
 
-    // 联动：当 jeikcode_config (reload) 或外部触发重载时静默刷新一次，彻底杜绝无脑 2s 轮询！
+    // 联动：当 zap_config (reload) 或外部触发重载时静默刷新一次，彻底杜绝无脑 2s 轮询！
     const onReload = () => fetchLatest();
     window.addEventListener('jeikcode:config-reloaded', onReload);
     window.addEventListener('jeikcode:reload-models', onReload);

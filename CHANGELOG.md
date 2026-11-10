@@ -49,7 +49,7 @@
   - 增加 250ms 划词拖拽时间窗口防误触保护，防止用户选择复制文本时意外触发文件预览或外链跳转。
 
 - **[守护进程与文件上传] 全局上传目录容错与自动降级创建**:
-  - 完善 `crates/jeikcode-daemon` 上传机制，当工作区路径缺省或为 `__global__` 时，自动降级至 `~/.zap/global_uploads` 并自动递归建目录，确保上传零报错。
+  - 完善 `crates/zap-daemon` 上传机制，当工作区路径缺省或为 `__global__` 时，自动降级至 `~/.zap/global_uploads` 并自动递归建目录，确保上传零报错。
 
 ## v1.0.7 (2026-11-09)
 
@@ -76,14 +76,14 @@
 - **[Updater & Daemon] Rate-limit-free updates, multi-mirror download fallback, and silent NSIS desktop installer**:
   - Eliminated GitHub REST API 403 Rate Limit (60 req/hour) bottlenecks by prioritizing static `latest.json` manifests via release CDN assets, with automatic API fallback.
   - Added environment proxy detection (`HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY`) and automatic domestic mirror retry fallbacks (`ghfast.top`, `ghproxy.net`) for seamless asset downloads in restricted networks.
-  - Hardened desktop self-update on Windows by terminating active `jeikcode-desktop.exe` instances before applying updates to eliminate file locking collisions, and triggering NSIS in silent mode (`/S`) with automated relaunch.
+  - Hardened desktop self-update on Windows by terminating active `zap-desktop.exe` instances before applying updates to eliminate file locking collisions, and triggering NSIS in silent mode (`/S`) with automated relaunch.
 
 ---
 
 - **[软件更新与守护进程] 免 GitHub API 频控静态清单、国内镜像自动加速与 Windows 静默自更新**:
   - 彻底规避 GitHub REST API 每小时 60 次的未认证频控死穴（403 错误），版本检测优先拉取发布在 Release 资产上的静态 `latest.json` 清单，保留 API 作为后备探测。
   - 智能继承系统与终端环境变量代理（`HTTPS_PROXY`、`ALL_PROXY` 等），并在直连受限或断流时自动按候选镜像源（如 `ghfast.top`、`ghproxy.net`）轮换重试，大幅提升国内下载稳定性。
-  - 完善 Windows 桌面端安装覆盖流程，更新启动前精准终止 `jeikcode-desktop.exe` 进程根除文件锁死冲突，并以标准 `/S` 静默参数拉起安装包，实现零弹窗无感覆盖与自动重新拉起。
+  - 完善 Windows 桌面端安装覆盖流程，更新启动前精准终止 `zap-desktop.exe` 进程根除文件锁死冲突，并以标准 `/S` 静默参数拉起安装包，实现零弹窗无感覆盖与自动重新拉起。
 
 ## v1.0.5 (2026-11-08)
 
@@ -606,7 +606,7 @@
   - Introduced a real recursive directory walk for `fs locate`, replacing mock responses and significantly improving file search accuracy.
   - Added critical security warnings in the CLI when starting unauthenticated network servers exposed to external interfaces.
 - **[Knowledge Base & i18n] Full English teaches knowledge base and catalog harmonization**:
-  - Provided a complete English Teaches knowledge base covering all nine core topics, with locale-aware guide loading in `jeikcode_config`.
+  - Provided a complete English Teaches knowledge base covering all nine core topics, with locale-aware guide loading in `zap_config`.
   - Harmonized Chinese, English, and Vietnamese i18n catalogs for terminal guidance, remote access copy, and webhook badges.
 
 ---
@@ -1225,7 +1225,7 @@
   - **Implementation Mechanism**: 
     1. Continuous monotonic sequence counter: Daemon's `live_stream` now tags all live events with monotonically increasing `seq` values (`AtomicU64`), ensuring client cursors advance in real time and reconnects only pull unreceived suffixes.
     2. Global content idempotency: In `sessionProjection.ts`, `mergeReasoningIntoParts` and `mergeTextIntoParts` now globally search existing parts: if content is already present or identical, it is cleanly discarded; if it is a prefix extension, it updates in place.
-  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p zap-daemon`), and TypeScript checks clean (`tsc --noEmit`).
 
 ---
 
@@ -1243,7 +1243,7 @@
 - **[WebUI Live Stream / Canvas] Unify thinking blocks and eliminate reasoning duplication across tool rounds**:
   - **Technical Root Cause / Detail**: During stream reconnection or focus changes, `appendReasoningPart` checked `tail.id !== id` and `mergeReasoningIntoParts` returned early when part ids diverged. Consequently, replayed or newly arriving thinking deltas failed part-id matching against existing elements and bypassed whole-text deduplication (`existing.includes(content)`), creating consecutive duplicated thinking blocks on screen.
   - **Implementation Mechanism**: Restored the fundamental rule for reasoning streams in `appendReasoningPart`: as long as the trailing part is a reasoning block, incoming thinking chunks unconditionally append in place (`tail.text += delta`), strictly preventing multiple consecutive thinking blocks. Restored full-text deduplication in `mergeReasoningIntoParts` across all part-id checks.
-  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p zap-daemon`), and TypeScript checks clean (`tsc --noEmit`).
 
 ---
 
@@ -1261,7 +1261,7 @@
   - **Implementation Mechanism**: 
     1. Guard active user prompts in replay: Daemon's `subscribe_live_with_replay` now explicitly preserves `ChatEvent::User` at the head of `replay_head` regardless of `after_seq` filtering. Front-end `paintUserMessage` idempotently restores missing user prompts while deduplicating existing ones. In `Chat.tsx`, active sessions strictly skip `saveSessionCache` overwrites from incomplete disk state.
     2. Seamless text and reasoning streaming: `appendReasoningPart` and `mergeTextIntoParts` now unconditionally append incoming streaming chunks to the trailing part of the same kind unless a distinct part-id boundary is explicitly encountered, eliminating streaming text/thinking splitting.
-  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p zap-daemon`), and TypeScript checks clean (`tsc --noEmit`).
 
 ---
 
@@ -1279,14 +1279,14 @@
 - **[WebUI / Daemon Streaming] Session-level resume cursor and identity-idempotent canvas**:
   - **Technical Root Cause / Detail**: The canvas is fed by a single event bus (`/chat/watch`) that carries BOTH replayed buffer frames and live deltas. The client hard-coded "this frame may already be painted" for the whole stream, so `mayPaintUnroutedDelta` rejected every round after the first tool call whenever the session already had an earlier turn — thinking and body text after tool execution never appeared until a manual refresh re-read the disk. Replay de-duplication additionally compared a frame against the concatenation of ALL text parts of a message, so re-sent mid-segments were re-appended (the whole in-flight turn was re-typed) and cross-round frames were glued into the previous round's parts (thinking split in two, body text swallowed).
   - **Implementation Mechanism**: `/chat/watch` now takes `after_seq` (`-1` = brand-new session → no replay, only a `session_start` handshake carrying the starting cursor; `N` = replay only frames with `seq >= N`; absent = full replay). Replayed frames carry `seq`, live frames do not; the cursor is a strictly increasing SESSION-level counter that survives turn boundaries, context compaction, and history rewrites. Tool boundaries open a new streaming part id (`end_streaming_part`). The WebUI stores the cursor per session and per stream (`streamCursor.ts`), dispatches by WHAT THE CONNECTION REQUESTED instead of guessing per frame, merges replay frames by part id (idempotent), deletes the legacy gate, never merges cross-round frames into the previous round's parts, writes the canvas back to the L1/L2 session cache (debounced 800ms plus forced writes at turn end and on mutations), keeps display monotonic under compaction, and invalidates the cursor (clearing the stale turn buffer server-side) on session mutations.
-  - **Verification & Testing**: `tsc --noEmit` clean; 477 WebUI unit tests pass; 401 daemon lib tests pass; `cargo check --lib -p jeikcode-daemon` clean.
+  - **Verification & Testing**: `tsc --noEmit` clean; 477 WebUI unit tests pass; 401 daemon lib tests pass; `cargo check --lib -p zap-daemon` clean.
 
 ---
 
 - **[WebUI / Daemon 流式传输] 会话级断点续传游标与纯身份幂等画布**:
   - **技术机理 / 现象溯源**: 画布由单事件总线（`/chat/watch`）推进，而这条流同时搬运回放帧与实时增量。前端对整条流硬编码「这帧可能已经画过」，于是只要会话已有历史回合，`mayPaintUnroutedDelta` 就会拦掉第一轮工具调用之后的每一轮思考与正文 —— 只有手动刷新才出现。回放去重还拿「整条消息所有正文的拼接」当基线：从中间重发的片段被再次追加（整个在途回合被逐帧重打一遍），跨轮的帧还会被粘进上一轮的部件里（思考被拆成两段、正文被吞掉开头）。
   - **实现防线 / 核心改动**: `/chat/watch` 支持 `after_seq`（`-1` = 新会话 → 不补发，只回一条携带起始游标的 `session_start` 握手帧；`N` = 只补 `seq >= N` 的回放帧；缺省 = 全量补发）。回放帧带 `seq`，实时帧不带；游标为会话级严格递增计数器，跨回合、跨上下文压缩、跨历史改写都成立。工具调用处闭合当前流式部件（`end_streaming_part`），工具前后的正文各自拥有独立段编号。前端新增 `streamCursor.ts` 按会话、按流分别存游标，按「本次连接请求了什么」分发，回放帧按段编号幂等合并，删除旧守卫，跨轮帧绝不并进上一轮，画布反哺 L1/L2 缓存（防抖 800ms + 回合收尾与变更时强制写入），压缩时显示只增不减，会话变更即时作废游标并清空服务端失效缓冲。
-  - **验证与交付**: `tsc --noEmit` 干净；webui 477 项单测全过；daemon 401 项 lib 测试全过；`cargo check --lib -p jeikcode-daemon` 通过。
+  - **验证与交付**: `tsc --noEmit` 干净；webui 477 项单测全过；daemon 401 项 lib 测试全过；`cargo check --lib -p zap-daemon` 通过。
 
 ## v7.2.2-beta.3 (2026-10-12)
 
@@ -1307,7 +1307,7 @@
 - **[WebUI & Daemon Interaction] Robust send-now, idempotent turn replay, and todolist replay dedup**:
   - **Technical Root Cause / Detail**: Three replay/stop consistency defects. (1) "Send now" never stopped the running turn: `handleSendImmediately` only tried `requestIdRef.current`, which is cleared as soon as POST /chat is admitted, so the stop was skipped entirely and the immediate delivery hit 409 session_busy — the card flashed and bounced back into the queue. (2) The canvas projection appended any replay frame whose `message_id` was missing from the canvas to the LAST assistant row; a mid-turn steer splits a turn into several assistant rows, so old body/reasoning was repainted into the newest bubble on every reconnect — the background session cache had dropped the wire id when painting, and the id-less row was later adopted as the canvas and persisted to IndexedDB. (3) `todowrite` is stateless and a full plan / batch add replaces the whole list, so re-folding a replayed call restored the statuses frozen in that call's arguments; the idempotency key was deleted exactly when the list completed, was not persisted across refresh, and was seeded by overwriting (visible window only) — which is why a fully checked list reverted after a refresh.
   - **Implementation Mechanism**: `stopRunningTurn` becomes the single stop channel shared with the stop button (session id + request id aliases); `POST /chat/stop` reports an authoritative `released` verdict and waits for the real release (no 2.5 s cap, false while a native-runtime turn still occupies the session). Queue cards are dequeued only when the message actually becomes content (`dispatchQueuedCard`), and every queue mutation goes through `persistSessionQueue` / `updateQueuedForSession` so the in-memory map, localStorage and the backend `/chat/queue` stay identical. Every canvas writer stamps the wire identity (background cache via `paintCachedAssistantDelta`, tool rows via `withAssistantIdentity`), `mayPaintUnroutedDelta` refuses to paint an unrouted frame when the trailing assistant row already owns another identity so replays stay byte-identical, and a healthy `/chat/watch` is no longer torn down on every focus/visibility change. New `todoAppliedIds` persists the applied call-id set per session (localStorage, synchronous hydration, merge-only seeds, never cleared on completion).
-  - **Verification & Testing**: webui 472 unit tests pass (new regression tests for stop aliases and the programmatic stop mark, projection idempotency, background-cache identity stamping, and the replayed-plan revert); `tsc --noEmit` clean; `npm run build` succeeds; `cargo check --lib -p jeikcode-daemon` and the two targeted `stop_and_wait` tests pass.
+  - **Verification & Testing**: webui 472 unit tests pass (new regression tests for stop aliases and the programmatic stop mark, projection idempotency, background-cache identity stamping, and the replayed-plan revert); `tsc --noEmit` clean; `npm run build` succeeds; `cargo check --lib -p zap-daemon` and the two targeted `stop_and_wait` tests pass.
 
 - **[Repository Hygiene] Pinned LF line endings via `.gitattributes` + `.editorconfig`**:
   - **Technical Root Cause / Detail**: Line endings were unpinned (no `.gitattributes`, `core.autocrlf=true`), so the working tree was checked out as CRLF while the index stored LF; any tool rewriting a file with its own EOL style left *mixed* endings behind, and the next save produced a whole-file whitespace diff with zero content change.
@@ -1324,7 +1324,7 @@
 - **[WebUI 与 Daemon 交互] 立即发送可靠化、回合重放幂等与 todolist 重放去重**:
   - **技术机理 / 现象溯源**: 三类停止/重放一致性缺陷：（1）“立即发送”从未真正停止运行中的回合——`handleSendImmediately` 只尝试 `requestIdRef.current`，而它在 POST /chat 被 admit（202）之后即被清空，停止被整体跳过，紧接着的投递必然撞上 409 session_busy，卡片闪一下又弹回队列；（2）画布投影会把“`message_id` 在画布上找不到”的重放帧追加到最后一条 assistant 上，而中途 steer 会把一个 turn 劈成多条 assistant 行，于是旧正文/思考每次重连都被画进最新气泡——根源是后台会话缓存落笔时丢掉了 wire 身份，缺 id 的行随后被采用为画布并写入 IndexedDB；（3）`todowrite` 无状态，全量 plan / 批量 add 是整表替换，重复折叠重放帧就会把清单打回该调用参数里冻结的状态，而幂等键恰好在清单全完成时被删除、不跨刷新持久化、种子是覆盖式（只看得到当前窗口），所以“全部打钩”的清单刷新后会回退。
   - **实现防线 / 核心改动**: `stopRunningTurn` 成为与“停止”按钮共用的唯一停止通道（会话 id + request id 双别名）；`POST /chat/stop` 返回权威 `released` 结论并等待真正离场（去掉 2.5s 上限，native runtime 仍占用时保持 false）。队列卡片只在消息真正成为正文时才出队（`dispatchQueuedCard`），所有队列变更统一走 `persistSessionQueue` / `updateQueuedForSession`，保证内存映射、localStorage 与后端 `/chat/queue` 三处一致。所有画布写入者统一盖章 wire 身份（后台缓存经 `paintCachedAssistantDelta`，工具行经 `withAssistantIdentity`），新增 `mayPaintUnroutedDelta` 在末行已属别轮时拒绝落笔（同一帧重放任意多次，画布一字不变），健康中的 `/chat/watch` 不再在每次失焦/可见性变化时被拆除。新增 `todoAppliedIds`：按会话持久化“已消费的调用 id”（localStorage、同步水合、种子只并入、全完成不清空）。
-  - **验证与交付**: webui 472 项单测全绿（新增停止别名/程序化停止标记、投影幂等、后台缓存身份盖章、重放 plan 不得回退的回归测试）；`tsc --noEmit` 干净；`npm run build` 成功；`cargo check --lib -p jeikcode-daemon` 与两个 `stop_and_wait` 定向单测通过。
+  - **验证与交付**: webui 472 项单测全绿（新增停止别名/程序化停止标记、投影幂等、后台缓存身份盖章、重放 plan 不得回退的回归测试）；`tsc --noEmit` 干净；`npm run build` 成功；`cargo check --lib -p zap-daemon` 与两个 `stop_and_wait` 定向单测通过。
 
 - **[仓库卫生] 行尾约定钉死：`.gitattributes` + `.editorconfig`**:
   - **技术机理 / 现象溯源**: 行尾此前未被钉死（无 `.gitattributes` 且 `core.autocrlf=true`）：索引存 LF、工作区检出为 CRLF，任何工具按自己的行尾风格重写文件都会留下 mixed 行尾，下一次保存就产出“整片空白 diff、内容零变化”的噪音。
@@ -1347,7 +1347,7 @@
   - **Watermark Budget**: `[models.X] max_tokens` is a capability declaration and per-protocol output budget — never context math. `effective_input_limit` is replaced by `input_watermark_budget` = window − min(20K, window/4); the wire sends the declared value verbatim; auto-compaction, the pre-send guard and `CompactionView` share one denominator; `compact_threshold` moves to 0.9 of the watermark, killing the "warns every turn but never compacts" gap (the reported 491K warning at 49% on a 1M window). The model editor offers 32K/64K/128K/256K/384K tiers + custom.
   - **Tool-Name Retirement**: `read_file`→`read` (now also lists directories), `list_directory` dropped, `write_file`→`write`, `edit_file`→`edit`; legacy names remain dispatch aliases only. Real defects fixed with it: compaction's "never stub file reads" exemption compared the literal `read_file` (now `is_file_read_tool`), the wander meter missed `read`, goal summaries only collected legacy names, the reviewer mounted the purged `list_directory`, tuix/daemon file-class arms lacked canonical names, and model-facing prose was aligned.
   - **MCP Child Lifecycle**: the last `SessionMcpLease` drop parked the process for an async TTL reaper that lives ON the runtime — a host that tears its runtime down (tests / one-shot CLI / embedded SDK) could never run it, leaking the npx/cmd/node tree while `Runtime::drop` waited forever on the child's still-open stdout. Added `McpClient::kill_now` / `StdioClient::kill_now`, `McpRegistry::kill_all_children_now` and a process-global weak registry; the last owner now reaps synchronously unless the host's idle reaper has proven itself.
-  - **Verification & Testing**: `cargo check --lib -p jeikcode-daemon`; kernel 131 lib + integration; capabilities 927 lib + compaction_cache/tools_integration; coding 366 lib + full_assembly (un-ignored, ~2.4s) / plan_mode / sensitive_path / tool_args_repair / system_context; review 67+1; tuix display/format 30; webui build.
+  - **Verification & Testing**: `cargo check --lib -p zap-daemon`; kernel 131 lib + integration; capabilities 927 lib + compaction_cache/tools_integration; coding 366 lib + full_assembly (un-ignored, ~2.4s) / plan_mode / sensitive_path / tool_args_repair / system_context; review 67+1; tuix display/format 30; webui build.
 
 - **[Git-Bash/MSYS Reliability: Paths, Background PIDs & Mixed-Encoding]**:
   - **Technical Root Cause / Detail**: Git-Bash/MSYS integration made tool paths and background tasks unreliable on Windows: POSIX-polluted `TMP`/`TEMP` reached child shells, `$VAR`/`%VAR%` handling was inconsistent, background reports carried the wrapper PID only, and a single GBK line garbled neighbouring UTF-8 lines.
@@ -1395,7 +1395,7 @@
   - **Theming**: circular IEC 5009 power-key switches (energised green micro-glow / red standby glow, press-scale micro-interactions, spinning busy glyph) and a low-glare matte-slate light palette (#f4f5f7 / #eaecee) with deepened borders, darker typography, deep forest-green success/JSON tones, a deep-amber reasoning accent, and light-mode overrides for settings surfaces.
 
 - **[CI & Suite Hygiene]**:
-  - **TUI suite gated**: `ci.yml` / `portability.yml` now run `cargo test -p jeikcode-tuix --lib -- --test-threads=1` (1,700+ tests previously only exercised locally), and `retained_small_frame_single_write` pins the Unix DA1 parser query separately (adapted from PR #44).
+  - **TUI suite gated**: `ci.yml` / `portability.yml` now run `cargo test -p zap-tuix --lib -- --test-threads=1` (1,700+ tests previously only exercised locally), and `retained_small_frame_single_write` pins the Unix DA1 parser query separately (adapted from PR #44).
   - **Hermetic all-features suite**: isolated-home guard lifetime fixed (an unsafe-block-bound guard dropped immediately, reading the developer's real `~/.jeikcode/mcp.json`), plugin fixtures built with `serde_json`, trusted-domain expectations gated on the live list, the glob hidden-file test serialized, the explore workspace-root test bounded + ignored; rustfmt passes folded in for files CI's check-only policy left unformatted.
   - **Coding integration convergence**: `full_assembly` asserts prompt layout by shape (60s bounded drive loop, phase-labelled panics); `permission_grants` encodes correct allow-always semantics and canonical `write` (the fixture's `../..` path is an unresolved parent traversal that is deliberately never remembered).
   - **Portability gate**: the native-temp assertion in `special_dirs` is platform-gated — a leading `/` is POSIX pollution only on Windows; on Unix it IS the native form, so the slash/drive checks run under `cfg!(windows)` (the first real cross-platform run of this batch caught it).
@@ -1412,7 +1412,7 @@
   - **水位预算**: `[models.X] max_tokens` 是能力声明与各协议输出预算，绝不进入上下文计算；`effective_input_limit` 改为 `input_watermark_budget` = 窗口 − min(20K, 窗口/4)，wire 按声明值原样下发；自动压缩、发前守卫与 `CompactionView` 共用同一分母；`compact_threshold` 提到水位 0.9，消除「每轮报警但从不压缩」死区（即 1M 窗口上的 491K / 49% 误报）。模型面板提供 32K/64K/128K/256K/384K 档 + 自定义。
   - **工具名退役**: `read_file`→`read`（兼列目录）、`list_directory` 删除、`write_file`→`write`、`edit_file`→`edit`，旧名仅作分发别名。随之修复的真实缺陷：压缩的「不打桩文件读取」豁免对 `read` 静默失效（改用 `is_file_read_tool`）、wander 漏数 `read`、goal 摘要清单恒空、review 挂载已删工具、tuix/daemon 文件类分支缺 canonical、模型可见文案全面对齐。
   - **MCP 生命周期**: 最后一个租约 drop 只把进程「停放」给活在运行时上的异步 reaper —— 销毁运行时的宿主（测试 / 一次性 CLI / 嵌入式 SDK）永远跑不到它，npx/cmd/node 进程树泄漏且 `Runtime::drop` 永久等待子进程未关闭的 stdout。新增 `McpClient::kill_now` / `StdioClient::kill_now`、`McpRegistry::kill_all_children_now` 与进程级弱登记表；最后一个 owner 在宿主 reaper 未证明可用时同步回收。
-  - **验证与交付**: `cargo check --lib -p jeikcode-daemon`；kernel 131 lib + 集成；capabilities 927 lib + compaction_cache/tools_integration；coding 366 lib + full_assembly（解禁，~2.4s）/ plan_mode / sensitive_path / tool_args_repair / system_context；review 67+1；tuix 30；webui build。
+  - **验证与交付**: `cargo check --lib -p zap-daemon`；kernel 131 lib + 集成；capabilities 927 lib + compaction_cache/tools_integration；coding 366 lib + full_assembly（解禁，~2.4s）/ plan_mode / sensitive_path / tool_args_repair / system_context；review 67+1；tuix 30；webui build。
 
 - **[Git-Bash/MSYS 可靠性：路径、后台 PID 与混合编码]**:
   - **技术机理 / 现象溯源**: Windows 上 Git-Bash/MSYS 集成让工具路径与后台任务不可靠：被 POSIX 污染的 `TMP`/`TEMP` 进入子 shell、`$VAR`/`%VAR%` 处理不一致、后台只报包装进程 PID、一行 GBK 污染相邻 UTF-8 行。
@@ -1460,7 +1460,7 @@
   - **主题**: 圆形 IEC 5009 电源按键（通电绿色微光 / 红色待机辉光、按压缩放微交互、忙碌旋转）与低眩光哑光石板亮色配色（#f4f5f7 / #eaecee），加深描边与文字、成功/JSON 深森林绿、思考深琥珀色，并为设置面板补亮色覆盖。
 
 - **[CI 与测试套件治理]**:
-  - **TUI 套件门禁**: `ci.yml` / `portability.yml` 现跑 `cargo test -p jeikcode-tuix --lib -- --test-threads=1`（1700+ 单测此前只在本地被跑到）；`retained_small_frame_single_write` 单独钉住 Unix DA1 查询（改自 PR #44）。
+  - **TUI 套件门禁**: `ci.yml` / `portability.yml` 现跑 `cargo test -p zap-tuix --lib -- --test-threads=1`（1700+ 单测此前只在本地被跑到）；`retained_small_frame_single_write` 单独钉住 Unix DA1 查询（改自 PR #44）。
   - **all-features 套件密闭化**: 修复 unsafe 块内即析构的 isolated-home guard（此前读开发机真实 `~/.jeikcode/mcp.json`）、插件夹具改用 `serde_json`、信任域期望按实时表 gate、glob 隐藏文件测试串行化、explore workspace-root 测试加有界护栏并 `#[ignore]`；并入 CI 只 check 未 fmt 文件的 rustfmt 收敛。
   - **coding 集成收敛**: `full_assembly` 按形状断言提示布局（60s 有界 drive、按阶段 panic）；`permission_grants` 采用正确的始终允许语义与规范 `write`（夹具的 `../..` 属设计上「每次问、不记住」的未解析父级穿越）。
   - **Portability 门禁**: `special_dirs` 的原生 temp 断言改为按平台判定 —— 前导 `/` 只在 Windows 上属于 POSIX 污染，Unix 上它就是原生形态；斜杠/盘符检查现仅在 `cfg!(windows)` 下执行（本批提交的首次真实跨平台运行抓到了它）。
@@ -1606,7 +1606,7 @@
 
 - **[Polling Storm Elimination & CPU Relief] Complete Eradication of Background Polling, Event-Driven Architecture, and Model Refresh Button**:
   - **Eradication of Aggressive Polling Storms**: Thoroughly eliminated `pollNotifyFocus` (500ms polling in `app.tsx`), stripped `getApprovalMode` and `listSessions` (`refreshNames`) out of `NotificationDock.tsx`'s periodic timer, and completely abolished the 5000ms polling timer in `Sidebar.tsx`. Network traffic in idle state drops to zero requests, completely extinguishing CPU spikes and memory churning.
-  - **ModelSelector Manual Refresh Button & Reload Bus Sync**: Added an ergonomic physical refresh button (↻) in the model picker header next to the search box with smooth spinning animation feedback. Bound global event listeners (`jeikcode:config-reloaded` and `jeikcode:reload-models`) to silently re-fetch the model catalog whenever `jeikcode_config(action="reload")` is triggered, eliminating the 2000ms loop that repeatedly fetched an 18.6KB payload.
+  - **ModelSelector Manual Refresh Button & Reload Bus Sync**: Added an ergonomic physical refresh button (↻) in the model picker header next to the search box with smooth spinning animation feedback. Bound global event listeners (`jeikcode:config-reloaded` and `jeikcode:reload-models`) to silently re-fetch the model catalog whenever `zap_config(action="reload")` is triggered, eliminating the 2000ms loop that repeatedly fetched an 18.6KB payload.
   - **Atomic Persistence & Inflight Cleanup for Bubble Mutations**: Fixed a critical issue where "Rewrite History", "Rollback & Submit", and "Delete Message" failed to take effect on disk after page refresh. Solved the physical index offset drift between compressed frontend bubbles and the underlying kernel message array by prioritizing `expected_text` reverse matching. Added automatic `manager.clear_inflight_snapshot(&id)` across mutation APIs (`truncate`, `patch`, `delete`) to prevent stale checkpoints from resurrecting deleted turns.
   - **Stop Button Optimistic Recovery & Anti-Bounce Guard**: Implemented immediate UI reset on clicking the stop square (`setBusyAndClock(false)`, `busyRef = false`, `transitionChatRecovery({ type: 'stop_succeeded' })`). Introduced a 2.5-second `manualStopGuardUntilRef` barrier preventing standby watch re-connections from misinterpreting daemon replay events during task termination as new turns.
   - **Long-Running Turn Clock Resume & Turn-Duplication Prevention**: Replaced `transcriptHasOpenUserTurn` gating in `startTurnClock` with `lastUserTs` epoch extraction, ensuring active turns spanning multiple minutes retain their real elapsed duration after reconnect/refresh instead of resetting to 0s. Refined `reconcileRunningTranscript` so existing turns are merged in place rather than erroneously appended to the bottom.
@@ -1616,7 +1616,7 @@
 
 - **[轮询风暴清零与降温减负] 彻底拔除无脑高频轮询、事件驱动架构收敛与模型物理刷新按钮**:
   - **彻底清除多源恶性轮询风暴**: 坚决拔除 `app.tsx` 中每 500ms 一次的 `pollNotifyFocus` 死循环轮询；将 `NotificationDock.tsx` 中的审批模式与会话名拉取移出定时器；彻底删除 `Sidebar.tsx` 中每 5 秒跑 5 个接口的无脑轮询，全线切换为纯事件驱动与按需触发。空闲态网络请求直接清零，彻底平息守护进程与浏览器端 CPU 尖刺与发热。
-  - **ModelSelector 物理刷新按钮与配置热重载联动**: 在模型选择弹窗顶部搜索框右侧新增物理刷新小按钮（↻），提供优雅的旋转反馈；彻底废除每 2 秒拉取 18.6KB 大包的死定时器，联动监听 `jeikcode:config-reloaded` 与 `jeikcode:reload-models`，在 `jeikcode_config(action="reload")` 热重载时静默对齐。
+  - **ModelSelector 物理刷新按钮与配置热重载联动**: 在模型选择弹窗顶部搜索框右侧新增物理刷新小按钮（↻），提供优雅的旋转反馈；彻底废除每 2 秒拉取 18.6KB 大包的死定时器，联动监听 `jeikcode:config-reloaded` 与 `jeikcode:reload-models`，在 `zap_config(action="reload")` 热重载时静默对齐。
   - **气泡编辑/回溯提交/删除消息物理对齐与断点清理**: 修复了气泡历史改写、回溯并提交、删除消息仅在画布生效而刷新或重新提问后全盘失效的致命 Bug。解决了前端折叠展示气泡与底层物理消息数组物理索引偏移脱节（Offset Drift）的问题，全面强化 `expected_text` 逆向精准定位；在后端 `truncate`、`patch`、`delete` 接口落盘后无条件调用 `manager.clear_inflight_snapshot(&id)` 清理未决检查点，杜绝旧消息死而复生。
   - **停止按钮乐观秒回与防反弹屏障**: 点击红色停止方块时立即乐观复位（`setBusyAndClock(false)`、`transitionChatRecovery`），按钮零延迟变回白蓝色发送箭头；设立 2.5 秒的手动停止保护屏障（`manualStopGuardUntilRef`），杜绝待机监听重连将后端退出期间的重放事件误当新轮次弹回繁忙态。
   - **长任务断联刷新秒表防清零与防重复追加**: `startTurnClock` 修复为优先继承末尾用户提问的真实发送时间戳 `lastUserTs`，长任务断联刷新后秒表准确接续累积时间（绝不清零）；优化 `reconcileRunningTranscript` 对齐逻辑，已存在轮次就地合入 tail，坚决禁止将历史 1 2 3 轮次二次追加到画布最下方。
@@ -1642,7 +1642,7 @@
 ## v7.2.1-beta.5 (2026-10-09)
 
 - **[Performance & Cold-Start Acceleration] Static Asset HTTP Cache-Control, Dynamic Code Splitting, and Deferred Initialization**:
-  - **Tiered HTTP Cache-Control for Embedded Assets**: Introduced standard Cache-Control headers in `crates/jeikcode-daemon/src/webui.rs`. Static hashed bundle assets under `/assets/*` are now marked with `Cache-Control: public, max-age=31536000, immutable`, enabling 0ms instant disk cache loading for both Tauri desktop shell (WebView2) and remote browser clients. Entry `index.html` strictly enforces `Cache-Control: no-cache` to guarantee atomic and immediate version updates without stale cache retention.
+  - **Tiered HTTP Cache-Control for Embedded Assets**: Introduced standard Cache-Control headers in `crates/zap-daemon/src/webui.rs`. Static hashed bundle assets under `/assets/*` are now marked with `Cache-Control: public, max-age=31536000, immutable`, enabling 0ms instant disk cache loading for both Tauri desktop shell (WebView2) and remote browser clients. Entry `index.html` strictly enforces `Cache-Control: no-cache` to guarantee atomic and immediate version updates without stale cache retention.
   - **Dynamic Lazy Loading & Code Splitting**: Extracted heavy secondary panels and dialogs (`GitPanel`, `DiffViewer`, `SettingsDialogs`, `UpdateDialog`, `ConfigSyncModal`, `OnboardingWizard`) into independent asynchronous chunks via `preact/compat` `lazy()` with smooth `<Suspense>` fallbacks, reducing the initial JavaScript main bundle from 894 kB down to 824 kB (over 70 kB core bundle reduction).
   - **Non-Critical Startup Deferred Execution**: Shifted post-upgrade configuration diff checks (`fetchUpgradeDiffs`) and update polling away from initial render frames, deferring them by 1.5 seconds to eliminate CPU and network contention during cold start first-paint.
   - **Remote Chunk Resilience**: Registered a global `vite:preloadError` listener in `webui/src/main.tsx` to automatically self-heal and refresh remote or LAN clients when server daemon upgrades invalidate stale chunk hashes.
@@ -1650,7 +1650,7 @@
 ---
 
 - **[性能优化与冷启动加速] 嵌入式静态资源 HTTP 强缓存、前端动态按需分包与启动错峰调度**:
-  - **嵌入式资源动静分级 HTTP 强缓存**: 在 `crates/jeikcode-daemon/src/webui.rs` 中为内嵌静态资源注入工业级 Cache-Control 响应头。`/assets/*` 目录下带内容哈希的静态文件（JS/CSS/字体）配置 `public, max-age=31536000, immutable`，实现桌面外壳（WebView2）与远程浏览器二次冷启动 0 毫秒磁盘直出；入口 `index.html` 强制 `no-cache`，确保发版更新时原子级无缝生效，绝不残留旧缓存。
+  - **嵌入式资源动静分级 HTTP 强缓存**: 在 `crates/zap-daemon/src/webui.rs` 中为内嵌静态资源注入工业级 Cache-Control 响应头。`/assets/*` 目录下带内容哈希的静态文件（JS/CSS/字体）配置 `public, max-age=31536000, immutable`，实现桌面外壳（WebView2）与远程浏览器二次冷启动 0 毫秒磁盘直出；入口 `index.html` 强制 `no-cache`，确保发版更新时原子级无缝生效，绝不残留旧缓存。
   - **核心主包瘦身与模态框动态懒加载**: 将非首屏必需的重量级面板与弹窗（`GitPanel`、`DiffViewer`、`SettingsDialogs`、`UpdateDialog`、`ConfigSyncModal`、`OnboardingWizard`）全面重构为 `lazy()` 动态按需加载并配置平滑 `<Suspense>` 兜底，首屏 JS 主包由 894 kB 压缩至 824 kB（削减逾 70 kB 纯核心代码），显著加快 V8 编译与首帧挂载速度。
   - **首屏非核心检测错峰延迟**: 将升级配置覆盖比对 (`fetchUpgradeDiffs`) 移出首帧生命周期，推迟 1.5 秒与版本检测合并执行，消除冷启动初期本地线程与请求争抢，集中算力优先保障聊天主视图与历史记录瞬间呈现。
   - **异地与局域网版本自愈监听**: 在 `webui/src/main.tsx` 挂载 `vite:preloadError` 监听器，异地客户端或手机开着旧标签页经历服务端重启发版时自动自愈刷新，杜绝动态 chunk 404 脚本加载异常。
@@ -1697,7 +1697,7 @@
 ## v7.2.1-beta.2 (2026-10-08)
 
 - **[WebUI & Kernel Steer Control] Steer Cancellation Lifecycle, Monotonic Turn Deduplication, Composer Input History, and Auto-Follow Scrolling**:
-  - **Steer Cancellation & Buffer Purge**: Introduced `AgentCommand::CancelSteer` in `jeikcode-kernel` and `cancel_steer` in `CodingRuntimeHandle` to purge unconsumed steer messages from the per-turn buffer and pending fallback queue. Added daemon `POST/DELETE /chat/steer/cancel` endpoints and WebUI `cancelChatSteer` API, ensuring that cancelling a queued steer card or clicking stop immediately clears the kernel buffer and prevents unexpected subsequent execution.
+  - **Steer Cancellation & Buffer Purge**: Introduced `AgentCommand::CancelSteer` in `zap-kernel` and `cancel_steer` in `CodingRuntimeHandle` to purge unconsumed steer messages from the per-turn buffer and pending fallback queue. Added daemon `POST/DELETE /chat/steer/cancel` endpoints and WebUI `cancelChatSteer` API, ensuring that cancelling a queued steer card or clicking stop immediately clears the kernel buffer and prevents unexpected subsequent execution.
   - **Turn Replay Deduplication**: Replaced fragile greedy heuristics with a global monotonic match-pairs algorithm across `messages` and session cache using normalized `userTextsMatch`, preventing duplicate prompt insertion and freezing queue drain during session load. Fixed multiline regex bleeding in diff stats.
   - **Composer Input History**: Added bounded per-session/project in-memory composer history navigation via `Up`/`Down` arrow keys (`inputHistory.ts`), preserving multiline caret editing while deferring to autocomplete, IME, and modified keystrokes.
   - **Timeline Auto-Follow**: Introduced `timelineFollow.ts` to automatically pin scrolling to newest messages while preserving manual inspection positions when browsing older history.
@@ -1715,7 +1715,7 @@
 ---
 
 - **[WebUI 与内核转向控制] 转向取消闭环与内核缓冲清除、单调轮次防重、输入历史回溯与平滑跟屏**:
-  - **转向撤回与内核缓冲清理**: 在 `jeikcode-kernel` 中引入 `AgentCommand::CancelSteer`，在 `CodingRuntimeHandle` 中暴露 `cancel_steer` 控制方法，精准清除未消耗的每轮转向缓冲区与 fallback 队列。在守护进程中增加 `POST/DELETE /chat/steer/cancel` 端点，并在前端实现 `cancelChatSteer` API，使得用户点击取消转向卡片或点击停止键时立即清除内核缓冲区，彻底根绝下一小步被意外触发的问题。
+  - **转向撤回与内核缓冲清理**: 在 `zap-kernel` 中引入 `AgentCommand::CancelSteer`，在 `CodingRuntimeHandle` 中暴露 `cancel_steer` 控制方法，精准清除未消耗的每轮转向缓冲区与 fallback 队列。在守护进程中增加 `POST/DELETE /chat/steer/cancel` 端点，并在前端实现 `cancelChatSteer` API，使得用户点击取消转向卡片或点击停止键时立即清除内核缓冲区，彻底根绝下一小步被意外触发的问题。
   - **会话防重放与单调匹配**: 使用全局单调匹配对算法替换脆弱的贪心双指针比对，结合 `userTextsMatch` 规范化比对当前会话与全局缓存，杜绝重复提问气泡并在会话加载过渡期间冻结排队发送。修复 diff 统计中的多行正则穿透问题。
   - **输入框历史回溯**: 在 `inputHistory.ts` 中实现基于内存的会话级/项目级输入历史（支持方向键 `Up`/`Down` 快速召回历史输入），保留多行光标编辑并对齐自动补全与 IME 输入法行为。
   - **时间线自适应跟屏**: 引入 `timelineFollow.ts`，在有新输出时自动平滑滚动触底，而在用户手动回滚查阅历史记录时保持视口稳定不跳动。
@@ -1775,7 +1775,7 @@
 ## v7.2.0 (2026-10-08)
 
 - **[Core Tools Overhaul & Robustness] Unified and Streamlined Tool Architecture, Enhanced `read` & `grep`, Deterministic Shell Execution, and LLM Glob Normalization**:
-  - Streamlined the built-in toolset into canonical primitives, retiring fragmented helpers and consolidating all configuration guide and reload actions under `jeikcode_config`.
+  - Streamlined the built-in toolset into canonical primitives, retiring fragmented helpers and consolidating all configuration guide and reload actions under `zap_config`.
   - Unified codebase exploration into a modern, all-in-one `read` tool, permanently retiring the legacy `codeintel::repo_map` module. The new `read` tool seamlessly handles multi-hundred-line safe reads, directory trees, images, and centered keyword matching (`key_string`) with customizable upward and downward contexts.
   - Enhanced `grep` with multi-mode outputs (`content`, `files_with_matches`, `count`), dedicated context lines control (`context`, `before_context`, `after_context`), unified regex parsing, and word-boundary matching.
   - Hardened `glob` pattern matching with automatic `./` and `././` prefix stripping, backslash-to-slash normalization on Windows, empty pattern fallback to `*`, and strict subdirectory confinement.
@@ -1836,7 +1836,7 @@
 ---
 
 - **[核心工具体系大精简与鲁棒性全面加固] 工具链收敛规范化、全能 `read` 与高级 `grep`、确定性命令执行与大模型 Glob 模式高容错适配**:
-  - 全面精简核心内置工具链：废除碎片化的冗余辅助工具，将配置指引与配置热重载功能统一收敛至 `jeikcode_config` 工具下。
+  - 全面精简核心内置工具链：废除碎片化的冗余辅助工具，将配置指引与配置热重载功能统一收敛至 `zap_config` 工具下。
   - `read` 工具全能化统一：彻底淘汰旧式独立的 `codeintel::repo_map` 模块，将大范围安全读文件、目录树探查、多模态图片阅读全量收敛至 `read` 工具；新增 `key_string` 关键字居中匹配与上下文透视（`upward`/`downward`），格式全面对齐纯文本以极度节省大模型 Token 开销。
   - `grep` 工具全面增强：支持多模式输出（`content` 包含行号与上下文、`files_with_matches` 仅文件路径、`count` 统计匹配行数），支持独立的上下文行数控制（`context`、`before_context`、`after_context`），统一正则表达式与单词边界匹配机制。
   - `glob` 路径匹配兼容性防线：自动循环剥离大模型习惯性生成的 `./` 与 `././` 相对前缀；无条件规范化 Windows 反斜杠 `\` 为 `/`，规避正则转义歧义；空匹配模式（如纯 `./`）自动安全回退为 `*` 通配符；严格限定子目录匹配作用域，防止意外泄露根目录同名文件。
@@ -1854,7 +1854,7 @@
   - 解绑粗暴拦截裸 `bin/` 的规则，完整放行各语言生态可执行源码：保留 Rust 二进制 crate 源码（`src/bin/*.rs`）、Ruby 命令行脚本（`bin/rails`）和 Node/npm 入口脚本（`bin/cli.js`）。
   - MSBuild 产物路径上下文感知过滤：仅当 `Debug`、`Release`、`RelWithDebInfo`、`MinSizeRel` 位于 `bin/` 或 `obj/` 层级下时才执行剪枝；解禁 ASP.NET/Blazor 的 `wwwroot` 静态源码；精准保留手写 `Properties/AssemblyInfo.cs`，仅过滤自动生成的 `*.AssemblyAttributes.cs`。
   - 全生态构建忽略规则库全面扩充：在 `.codegraphignore` 中原生补齐 .NET SDK artifacts、Elixir/Erlang（`_build`, `deps`）、Flutter（`.dart_tool`）、Zig（`zig-cache`, `zig-out`）、Haskell（`.stack-work`）、Swift/Xcode（`.build`, `DerivedData`）、Unreal Engine（`Binaries`, `Intermediate`）、CocoaPods 及根目录 Unity 编辑器缓存（`/Library/`）。
-  - 单仓自适应索引与配置差异比对：单工程工作区无需额外干预即可自动构建图谱索引；内置 `.codegraphignore` 模板种子更新接入 `scan_jeikcode_config_diffs`，供用户透明审查同步。
+  - 单仓自适应索引与配置差异比对：单工程工作区无需额外干预即可自动构建图谱索引；内置 `.codegraphignore` 模板种子更新接入 `scan_zap_config_diffs`，供用户透明审查同步。
 
 - **[WebUI 颜值重构与深色交互美学] 灵感源自 Gemini 的高级炭灰调色板、极简单行输入框、交互式 Mermaid 图表与 VSCode 风格 Git 检视器**:
   - 深度重构 WebUI 调色板：汲取 Gemini 界面质感，默认启用护眼且沉浸的高级炭灰深色美学（eye-friendly charcoal canvas）。
@@ -1898,21 +1898,21 @@
 - **[WebUI / Node Test Imports] Give `api.ts` an explicit `.ts` import for `displayPath` so `node --test` can load the module**:
   - **Technical Root Cause / Detail**: `api.ts` imported `./lib/displayPath` without an extension. Vite resolves that form, but the WebUI CI job runs `node --test`, which requires a resolvable ESM specifier. All 25 `api.test.ts` cases failed with `ERR_MODULE_NOT_FOUND` and blocked the beta.10 CI gate.
   - **Implementation Mechanism**: Changed the import to `./lib/displayPath.ts`, matching the rest of the Node-tested library modules under `webui/src/lib/`.
-  - **Verification & Testing**: `node --test src/api.test.ts src/lib/displayPath.test.ts` — 34 passed. `cargo check --lib -p jeikcode-daemon` succeeded.
+  - **Verification & Testing**: `node --test src/api.test.ts src/lib/displayPath.test.ts` — 34 passed. `cargo check --lib -p zap-daemon` succeeded.
 
 ---
 
 - **[网页 / Node 单测导入] 给 `api.ts` 的 `displayPath` 补上 `.ts` 后缀，让 `node --test` 能加载模块**:
   - **技术机理 / 现象溯源**: `api.ts` 写成了无后缀的 `./lib/displayPath`。Vite 能解析，但 WebUI CI 用的 `node --test` 不行，导致 `api.test.ts` 25 条全部 `ERR_MODULE_NOT_FOUND`，beta.10 CI 被拦住。
   - **实现防线 / 核心改动**: 改为 `./lib/displayPath.ts`，与 `webui/src/lib/` 下其他 Node 单测模块一致。
-  - **验证与交付**: `api.test.ts` 与 `displayPath.test.ts` 共 34 条通过；`cargo check --lib -p jeikcode-daemon` 通过。
+  - **验证与交付**: `api.test.ts` 与 `displayPath.test.ts` 共 34 条通过；`cargo check --lib -p zap-daemon` 通过。
 
 ## v7.2.0-beta.10 (2026-10-08)
 
 - **[WebUI & Daemon / Sidebar Projects] Confirm project removal, sync the list across observers, and bring a running project back**:
   - **Technical Root Cause / Detail**: The sidebar trash control wrote a browser-local hide set and removed the row immediately, so other tabs and machines never saw the change. Clicking add-folder called the daemon native folder dialog, which blocks the HTTP request on the instance; a remote browser waited on a dialog it could not see. After a folder was chosen, the client only opened a blank chat and left a previously hidden project off the list, so historical sessions never returned. Windows extended paths (`\\?\`, `//?/`, `/?/`) were split into a literal `?` breadcrumb and could hash into a different session bucket.
   - **Implementation Mechanism**: `POST /projects/sidebar/hide|show|reveal` plus `GET /projects/sidebar` persist pin and hide state beside the session catalog. Hiding asks for confirmation and keeps session files. A live turn unhides that project on the next sidebar read and on the client that sees `/chat/active` or optimistic output; the row expands, its sessions reload, and running sessions stay pinned with the spinner. Loopback pages still use the native picker; any other host opens the in-page directory browser. `strip_verbatim` and the webui path helpers collapse extended prefixes before breadcrumbs, joins, and `/cd`.
-  - **Verification & Testing**: `node --test webui/src/lib/displayPath.test.ts` covers `E:/`, `D:/`, `\\?\`, `//?/`, and `/?/`. `cargo test -p jeikcode-capabilities --lib pathnorm::tests` passed. Sidebar hide/show unit tests live in `sidebar_projects`; the webui production build and a live remote-browser pass were not run in this workspace.
+  - **Verification & Testing**: `node --test webui/src/lib/displayPath.test.ts` covers `E:/`, `D:/`, `\\?\`, `//?/`, and `/?/`. `cargo test -p zap-capabilities --lib pathnorm::tests` passed. Sidebar hide/show unit tests live in `sidebar_projects`; the webui production build and a live remote-browser pass were not run in this workspace.
 
 ---
 
@@ -1925,7 +1925,7 @@
 
 - **[Tools & Capabilities / Glob Input Normalization & Pattern Compatibility] Harden `glob` pattern normalization for LLM path prefixes, Windows delimiters, and empty fallback semantics**:
   - **Technical Root Cause / Detail**: Large Language Models habitually formulate file glob queries with leading relative path prefixes (e.g., `./*.rs`, `./src/**/*.ts`) or Windows native separators (`.\\src\\*.rs`). In previous implementations, `GlobBuilder` evaluated patterns with `literal_separator(true)` strictly against walkdir relative paths (which do not contain `./` prefixes). This mismatch led to silent empty result sets for common model queries. Furthermore, Windows backslashes (`\`) were vulnerable to being misinterpreted as regex/glob escaping characters rather than directory delimiters.
-  - **Implementation Mechanism**: Introduced `normalize_match_pattern` in `crates/jeikcode-capabilities/src/tools/glob.rs`:
+  - **Implementation Mechanism**: Introduced `normalize_match_pattern` in `crates/zap-capabilities/src/tools/glob.rs`:
     1. Unconditionally normalizes backslashes (`\`) to forward slashes (`/`) to eliminate Windows path escaping hazards;
     2. Repeatedly strips leading `./` path components (`strip_prefix("./")`), harmonizing relative model queries (such as `./*.toml` or `./nested/*.rs`) with canonical directory walk paths;
     3. Gracefully maps empty stripped queries (e.g., `./`) to `*` to safely enumerate base directories without triggering matcher errors or empty responses.
@@ -1937,19 +1937,19 @@
     1. **Context-Aware MSBuild Pruning**: Pruned bare `"bin"` and configuration names (`"Debug"`, `"Release"`) from `SKIP_DIR_NAMES`. Replaced them with context-aware `should_prune_index_dir` and `parent_name_is_bin_or_obj`, specifically targeting `Debug`, `Release`, `RelWithDebInfo`, and `MinSizeRel` only when situated under `bin/` or `obj/` hierarchies (supporting multi-target/architecture outputs like `App/bin/x64/Release`), while keeping top-level and source-level `bin/` trees intact;
     2. **Source Asset Reclamation**: Removed `wwwroot` from `SKIP_DIR_NAMES` to retain ASP.NET web sources, and narrowed generated C# filtering in `is_generated_source` from all `assemblyinfo.cs` to `*.AssemblyAttributes.cs`, preserving hand-written `Properties/AssemblyInfo.cs`;
     3. **Multi-Ecosystem Ignore Hardening**: Expanded `.codegraphignore` to cover .NET SDK artifacts (`**/artifacts/bin/`, `**/artifacts/obj/`), Elixir/Erlang (`_build/`, `deps/`), Flutter (`.dart_tool/`), Zig (`zig-cache/`, `zig-out/`), Haskell (`.stack-work/`, `dist-newstyle/`), Swift (`.build/`, `DerivedData/`), Unreal Engine (`Binaries/`, `Intermediate/`, `DerivedDataCache/`), CocoaPods (`Pods/`), and root-anchored Unity editor cache (`/Library/`);
-    4. **Config Sync Diff Tracking**: Clarified `CodeExploreTool::seed_fork_defaults` asset seeding lifecycle so updates to bundled ignore assets (`.codegraphignore`) are exposed through `scan_jeikcode_config_diffs` for safe, transparent user-reviewed synchronization.
+    4. **Config Sync Diff Tracking**: Clarified `CodeExploreTool::seed_fork_defaults` asset seeding lifecycle so updates to bundled ignore assets (`.codegraphignore`) are exposed through `scan_zap_config_diffs` for safe, transparent user-reviewed synchronization.
   - **Verification & Testing**: Validated with `codeintel::index::tests::skips_msbuild_output_but_keeps_source_bins` asserting that Rust `src/bin`, npm `bin/`, ASP.NET `wwwroot`, and `AssemblyInfo.cs` are indexed while `App/bin/Debug` and `App/bin/x64/Release` remain pruned.
 
 - **[WebUI & TUI Architecture / Direct Session Binding & Deprecated Sync Stream Retirement] Pass current session to WebUI launcher, consolidate canvas streaming to `/chat` and `/chat/watch`, and eliminate obsolete `/sync` commands**:
   - **Technical Root Cause / Detail**: Previously, the `/webui` command opened a generic browser window without session binding, requiring users to locate their active session manually. Meanwhile, a legacy dual-stream sync architecture (`/sync`, `?sync=1`, `postLiveSwitchSession`, background disk polling) created race conditions and UI flickering against the unified SSE stream.
-  - **Implementation Mechanism**: Updated `ensure_server_and_open` in `crates/jeikcode-daemon` to accept `session_id: Option<&str>` and append `&session=<short_id>` so TUI's `/webui` command immediately opens the user's active session. Permanently removed the obsolete `/sync` slash command, its i18n entries, and `CreateSessionRequest.sync` broadcast logic; prioritized `/sessions` over `/setup` in TUI completion prefix matching. Unified WebUI canvas streaming onto `/chat` and `/chat/watch`, cleaning up leftover `?sync=1` URL parameters upon mounting, and refined `paintUserMessage` in `sessionProjection.ts` to ensure Working placeholders render correctly during watch mode while preventing duplicate user message echoes.
-  - **Verification & Testing**: Verified `cargo check --lib -p jeikcode-daemon`, `cargo check --bin jeikcode`, passed `commands::tests::s_prefix_lists_sessions_before_setup`, executed full webui suite (323 tests passed via `npm test`), and built production assets via `npm run build`.
+  - **Implementation Mechanism**: Updated `ensure_server_and_open` in `crates/zap-daemon` to accept `session_id: Option<&str>` and append `&session=<short_id>` so TUI's `/webui` command immediately opens the user's active session. Permanently removed the obsolete `/sync` slash command, its i18n entries, and `CreateSessionRequest.sync` broadcast logic; prioritized `/sessions` over `/setup` in TUI completion prefix matching. Unified WebUI canvas streaming onto `/chat` and `/chat/watch`, cleaning up leftover `?sync=1` URL parameters upon mounting, and refined `paintUserMessage` in `sessionProjection.ts` to ensure Working placeholders render correctly during watch mode while preventing duplicate user message echoes.
+  - **Verification & Testing**: Verified `cargo check --lib -p zap-daemon`, `cargo check --bin jeikcode`, passed `commands::tests::s_prefix_lists_sessions_before_setup`, executed full webui suite (323 tests passed via `npm test`), and built production assets via `npm run build`.
 
 ---
 
 - **[工具与能力层 / Glob 输入规范化与路径匹配兼容性防线] 强化 `glob` 模式规范化，消除大模型路径前缀漏匹配、Windows 分隔符转义与空模式异常**:
   - **技术机理 / 现象溯源**: 大模型在生成文件匹配模式时极常携带相对路径前缀（如 `./*.rs`、`./src/**/*.ts`）或 Windows 反斜杠（如 `.\\src\\*.rs`）。在原有实现中，`GlobBuilder` 开启了 `literal_separator(true)`，且遍历文件系统产生的相对路径不包含 `./` 前缀，导致该类模式与实际相对路径字面不匹配而静默返回空结果；同时，Windows 反斜杠 `\` 易被底层构建器误判为正则/glob 转义字符，导致匹配行为偏离预期。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/glob.rs` 中实现 `normalize_match_pattern` 路径规范化机制：
+  - **实现防线 / 核心改动**: 在 `crates/zap-capabilities/src/tools/glob.rs` 中实现 `normalize_match_pattern` 路径规范化机制：
     1. 无条件将反斜杠 `\` 转换为正斜杠 `/`，彻底消除 Windows 路径下的分隔符转义歧义；
     2. 循环剥离模式开头的 `./`（`strip_prefix("./")`），使大模型生成的 `./*.toml`、`./nested/*.rs` 等模式与标准相对路径完美对齐；
     3. 针对剥离后为空的边界情况（例如纯 `./` 查询），安全回退为 `*` 通配模式，保证稳定列出当前目录项而非报错或返回空集合。
@@ -1961,13 +1961,13 @@
     1. **MSBuild 路径上下文感知过滤**: 从 `SKIP_DIR_NAMES` 中移除裸 `"bin"` 与配置目录名（`"Debug"`, `"Release"`），改由 `should_prune_index_dir` 与 `parent_name_is_bin_or_obj` 依据父级路径动态判定，仅当配置目录位于 `bin/` 或 `obj/` 层级下时（支持 `App/bin/x64/Release` 等多目标架构）执行剪枝，并扩充识别 `RelWithDebInfo` 与 `MinSizeRel`；
     2. **源码资产回收与精准放行**: 从 `SKIP_DIR_NAMES` 中解禁 `wwwroot`，保留 Web 静态源码索引；在 `is_generated_source` 中将 `assemblyinfo.cs` 粗暴拦截收敛为精准过滤 `*.AssemblyAttributes.cs`，手写 `Properties/AssemblyInfo.cs` 得以正常参与索引；
     3. **多生态构建忽略规则库扩充**: 在 `.codegraphignore` 中全面补齐 .NET SDK artifacts（`**/artifacts/bin/`, `**/artifacts/obj/`）、Elixir/Erlang（`_build/`, `deps/`）、Flutter（`.dart_tool/`）、Zig（`zig-cache/`, `zig-out/`）、Haskell（`.stack-work/`, `dist-newstyle/`）、Swift/Xcode（`.build/`, `DerivedData/`）、Unreal Engine（`Binaries/`, `Intermediate/`, `DerivedDataCache/`）、CocoaPods（`Pods/`）以及严格锚定项目根目录的 Unity 编辑器缓存（`/Library/`，杜绝误伤名为 Library 的源码目录）；
-    4. **内置忽略规则配置同步比对闭环**: 在 `CodeExploreTool::seed_fork_defaults` 中确立资产种子生命周期，更新后的 `.codegraphignore` 不强制无感覆盖，而是接入 `scan_jeikcode_config_diffs` 配置比对链路，供用户透明审查并勾选同步。
+    4. **内置忽略规则配置同步比对闭环**: 在 `CodeExploreTool::seed_fork_defaults` 中确立资产种子生命周期，更新后的 `.codegraphignore` 不强制无感覆盖，而是接入 `scan_zap_config_diffs` 配置比对链路，供用户透明审查并勾选同步。
   - **验证与交付**: 补充并运行 `codeintel::index::tests::skips_msbuild_output_but_keeps_source_bins` 专项测试，断言验证 Rust `src/bin`、npm `bin/`、ASP.NET `wwwroot` 及手写 `AssemblyInfo.cs` 均能被正常索引，而 MSBuild 构建产物被严格拦截。
 
 - **[WebUI 与 TUI 架构 / 会话直连打通与废弃同步流收敛] TUI `/webui` 直开当前会话，统一收敛为 `/chat` + `/chat/watch` 画布链路并彻底移除冗余 `/sync` 机制**:
   - **技术机理 / 现象溯源**: 原先 TUI `/webui` 命令打开浏览器时未携带会话锚定，用户需在侧边栏手动寻找当前会话；同时，历史遗留的独立同步机制（`/sync` 命令、`?sync=1` 参数、`postLiveSwitchSession` 与磁盘后台轮询）与标准的 `/chat` / `/chat/watch` 流产生竞争，引发双流冲突、多端新建会话误广播及画布跳变。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-daemon` 的 `ensure_server_and_open` 中引入 `session_id` 参数，向打开的 URL 自动追加 `&session=<前8位短ID>`，实现 TUI `/webui` 无缝直达当前会话；彻底移除 `/sync` 斜杠命令及其国际化文案与后端的 `CreateSessionRequest.sync` 广播逻辑，并在 TUI 命令前缀匹配中将 `sessions` 优先级前置于 `setup`；WebUI 画布全面收敛至 `/chat` 与 `/chat/watch` 单一链路，挂载时自动净化旧 URL 中的 `?sync` 参数；增强 `sessionProjection.ts` 的 `paintUserMessage` 状态机，保证 watch 观察者模式下准确保留 Working 占位符且避免已结算轮次的文本回放抖动。
-  - **验证与交付**: 通过 `cargo check --lib -p jeikcode-daemon` 与 `cargo check --bin jeikcode` 编译，通过 `s_prefix_lists_sessions_before_setup` 命令单测，前端 323 项单元测试全部通过 (`npm test`)，`webui` 构建生产包成功。
+  - **实现防线 / 核心改动**: 在 `crates/zap-daemon` 的 `ensure_server_and_open` 中引入 `session_id` 参数，向打开的 URL 自动追加 `&session=<前8位短ID>`，实现 TUI `/webui` 无缝直达当前会话；彻底移除 `/sync` 斜杠命令及其国际化文案与后端的 `CreateSessionRequest.sync` 广播逻辑，并在 TUI 命令前缀匹配中将 `sessions` 优先级前置于 `setup`；WebUI 画布全面收敛至 `/chat` 与 `/chat/watch` 单一链路，挂载时自动净化旧 URL 中的 `?sync` 参数；增强 `sessionProjection.ts` 的 `paintUserMessage` 状态机，保证 watch 观察者模式下准确保留 Working 占位符且避免已结算轮次的文本回放抖动。
+  - **验证与交付**: 通过 `cargo check --lib -p zap-daemon` 与 `cargo check --bin jeikcode` 编译，通过 `s_prefix_lists_sessions_before_setup` 命令单测，前端 323 项单元测试全部通过 (`npm test`)，`webui` 构建生产包成功。
 
 ## v7.2.0-beta.8 (2026-10-07)
 
@@ -1993,7 +1993,7 @@
 - **[Capabilities & Engine / Directory Reading Budgeting & Git Panel Real-Time Fingerprinting] Enhance `read` directory pagination budgeting and real-time Git status tracking in WebUI**:
   - **Technical Root Cause / Detail**: Large directory listings could breach payload byte limits or leave ambiguous continuation footers; additionally, WebUI Git panel polling lacked stable fingerprinting to avoid unnecessary DOM redraws or dropped turn replays during live reconnections.
   - **Implementation Mechanism**: Refactored `ReadFileTool` directory rendering with strict output budgeting reserve (`DIR_CHROME_RESERVE`) and comprehensive pagination continuation footers recommending `glob`, `grep`, and `code_explore`; added `gitPanelFingerprint` to track worktree status and commit history immutably; introduced `idleReplayAlreadyPainted` to prevent stale journal playback while gracefully streaming live assistant thinking and tool results.
-  - **Verification & Testing**: Executed `cargo check --lib -p jeikcode-daemon`, `cargo test` on read tools, `node --test` across 61 webui test suites (all 61 passed), and `npm run build` in `webui`.
+  - **Verification & Testing**: Executed `cargo check --lib -p zap-daemon`, `cargo test` on read tools, `node --test` across 61 webui test suites (all 61 passed), and `npm run build` in `webui`.
 
 ---
 
@@ -2005,14 +2005,14 @@
 - **[运行时与交互引擎 / 目录读取预算控制与 WebUI Git 面板指纹监听] 增强目录列表分段读取与自适应引导，健全 Git 面板状态指纹与重放去重**:
   - **技术机理 / 现象溯源**: 大目录读取容易超出单次响应字节预算且缺乏直观指引；WebUI Git 面板在并发工具执行与重连时缺乏稳定指纹机制以避免不必要的界面抖动与重放文本冗余。
   - **实现防线 / 核心改动**: 在 `ReadFileTool` 目录输出中引入字节预留预算与引导尾注（推荐使用 `glob`/`grep`/`code_explore`）；在 WebUI 中实现 `gitPanelFingerprint` 实时监听工作区变更，增加 `idleReplayAlreadyPainted` 状态门控精准识别已渲染推理流与工具执行状态。
-  - **验证与交付**: 运行 `cargo check --lib -p jeikcode-daemon`，执行 WebUI 61 项单元测试全量通过，`webui` 构建成功。
+  - **验证与交付**: 运行 `cargo check --lib -p zap-daemon`，执行 WebUI 61 项单元测试全量通过，`webui` 构建成功。
 
 ## v7.2.0-beta.6 (2026-10-07)
 
-- **[Tools & Capabilities / Config Action Unification & Obsolete Tool Purge] Consolidate `jeikcode_config_reload` into `jeikcode_config` and cleanly eliminate deprecated tools**:
-  - **Technical Root Cause / Detail**: Configuration management tools were historically fragmented across separate implementations (`jeikcode_config_guide` and `jeikcode_config_reload`), and internal prompts/documents still retained obsolete tools (`list_directory`, `bash_kill_by_id`, `open_file`, `global_search_replace`) and stale tool names (`read_file`, `bash`).
-  - **Implementation Mechanism**: Unified configuration operations under `jeikcode_config` with `action: "guide" | "reload"`, adding `#[serde(default, alias = "actions")]` to gracefully tolerate alias serialization and removing the dead `jeikcode_config_reload` module. Purged all traces of defunct tools from `root_docs_内置工具.yaml`, `builtin-tools.txt`, and modular `teaches/` guides without writing noisy deprecation warnings. Canonized `read` with its strict schema (`path`, `offset`, `limit`, `key_string`, `upward`, `downward`, `max_matches`), verified plain text responses with dynamic footers for markdown and edit safety, and updated `run_command` documentation to detail native OS PID and port inspection.
-  - **Verification & Testing**: Executed `cargo test -p jeikcode-capabilities --lib tools::jeikcode_config_guide::` (9 passed), `tools::read::` (38 passed), and verified schema integrity via `ci_check_keywords_and_constants_integrity`.
+- **[Tools & Capabilities / Config Action Unification & Obsolete Tool Purge] Consolidate `zap_config_reload` into `zap_config` and cleanly eliminate deprecated tools**:
+  - **Technical Root Cause / Detail**: Configuration management tools were historically fragmented across separate implementations (`zap_config_guide` and `zap_config_reload`), and internal prompts/documents still retained obsolete tools (`list_directory`, `bash_kill_by_id`, `open_file`, `global_search_replace`) and stale tool names (`read_file`, `bash`).
+  - **Implementation Mechanism**: Unified configuration operations under `zap_config` with `action: "guide" | "reload"`, adding `#[serde(default, alias = "actions")]` to gracefully tolerate alias serialization and removing the dead `zap_config_reload` module. Purged all traces of defunct tools from `root_docs_内置工具.yaml`, `builtin-tools.txt`, and modular `teaches/` guides without writing noisy deprecation warnings. Canonized `read` with its strict schema (`path`, `offset`, `limit`, `key_string`, `upward`, `downward`, `max_matches`), verified plain text responses with dynamic footers for markdown and edit safety, and updated `run_command` documentation to detail native OS PID and port inspection.
+  - **Verification & Testing**: Executed `cargo test -p zap-capabilities --lib tools::zap_config_guide::` (9 passed), `tools::read::` (38 passed), and verified schema integrity via `ci_check_keywords_and_constants_integrity`.
 
 - **[WebUI & Canvas Engine / Truncated Thinking Stream In-Place Extension] Fix duplicate reasoning block generation during watch replay under display truncation**:
   - **Technical Root Cause / Detail**: When the daemon replayed streaming transcript events over `/chat/watch`, reasoning tokens that underwent display truncation carried `DISPLAY_TRUNCATION_MARK` (`\n… [truncated for display]`). Strict prefix matching treated the truncated block as distinct, causing the UI to paint a second, disconnected thinking block.
@@ -2021,10 +2021,10 @@
 
 ---
 
-- **[工具与能力层 / 配置工具动作收敛与废弃工具彻底清理] 将配置重载工具并入 `jeikcode_config`，彻底清理历史废弃工具与文档命名偏差**:
-  - **技术机理 / 现象溯源**: 历史版本中配置管理分散在独立工具 `jeikcode_config_reload` 与 `jeikcode_config_guide`，且内置文档与提示词存在已废弃工具（`list_directory`、`bash_kill_by_id`、`open_file`、`global_search_replace`）残留与旧工具名（`read_file`、`bash`）混用问题。
-  - **实现防线 / 核心改动**: 将配置管理功能统一收敛至 `jeikcode_config(action="reload"|"guide")`，通过 `#[serde(default, alias = "actions")]` 支持 `actions` 别名字段无缝兼容，并彻底物理移除 `jeikcode_config_reload` 冗余模块；在 `root_docs_内置工具.yaml`、`builtin-tools.txt` 与全部 9 篇 `teaches/` 文档中彻底剔除废除工具，不添加任何陈旧废弃声明；全面对齐权威工具命名（`read`、`write`、`edit`、`run_command`），确保 `read` 文本响应与动态尾注机制兼容语法高亮与局部编辑，完善 `run_command` 后台任务返回 PID 与端口的原生管理说明。
-  - **验证与交付**: 运行 `jeikcode_config_guide`（9 项通过）、`read` 全量测试（38 项通过）及 `ci_check_keywords_and_constants_integrity` 确保契约一致。
+- **[工具与能力层 / 配置工具动作收敛与废弃工具彻底清理] 将配置重载工具并入 `zap_config`，彻底清理历史废弃工具与文档命名偏差**:
+  - **技术机理 / 现象溯源**: 历史版本中配置管理分散在独立工具 `zap_config_reload` 与 `zap_config_guide`，且内置文档与提示词存在已废弃工具（`list_directory`、`bash_kill_by_id`、`open_file`、`global_search_replace`）残留与旧工具名（`read_file`、`bash`）混用问题。
+  - **实现防线 / 核心改动**: 将配置管理功能统一收敛至 `zap_config(action="reload"|"guide")`，通过 `#[serde(default, alias = "actions")]` 支持 `actions` 别名字段无缝兼容，并彻底物理移除 `zap_config_reload` 冗余模块；在 `root_docs_内置工具.yaml`、`builtin-tools.txt` 与全部 9 篇 `teaches/` 文档中彻底剔除废除工具，不添加任何陈旧废弃声明；全面对齐权威工具命名（`read`、`write`、`edit`、`run_command`），确保 `read` 文本响应与动态尾注机制兼容语法高亮与局部编辑，完善 `run_command` 后台任务返回 PID 与端口的原生管理说明。
+  - **验证与交付**: 运行 `zap_config_guide`（9 项通过）、`read` 全量测试（38 项通过）及 `ci_check_keywords_and_constants_integrity` 确保契约一致。
 
 - **[WebUI 与会话投影 / 截断思考流平滑原地扩展] 修复前端在重放截断推理流时产生重复思考气泡的渲染缺陷**:
   - **技术机理 / 现象溯源**: 当 `/chat/watch` 流重放包含 `DISPLAY_TRUNCATION_MARK`（`\n… [truncated for display]`）的截断思考块时，严格前缀匹配误判新旧内容不连续，导致前端在会话画布中额外追加一个新的断裂思考卡片。
@@ -2040,13 +2040,13 @@
 
 - **[Knowledge Base & System / Modular Teaches Streamlining & Subtle Parameter Hardening] Distill full modular `teaches` guides into crisp configuration tutorials, eliminate architectural theory bloat, and document critical subtle parameter behaviors**:
   - **Technical Root Cause / Detail**: Modular teaches documents (`teaches/*.md`) were cluttered with hundreds of lines of internal architectural narratives, theoretical justifications (Topological Reordering, VersionRing, 3-Way Auto-Rebase, Linux ETXTBSY lock mechanics), diluting high-density signal needed by models and developers.
-  - **Implementation Mechanism**: Refactored all 9 documents across `crates/jeikcode-capabilities/assets/teaches/` down to a strict four-element model: exact configuration paths, precise snippet syntax, hot-reload behavior (mtime automatic vs explicit trigger), and direct operational effects. Restrainedly clarified subtle parameter distinctions, including `scope: "session"` MCP process reclamation after 10 minutes of inactivity (`idle_ttl_secs`), `maxConcurrentCalls` UI tool concurrency gating, `reasoning_history` ("exclude" vs "include") multi-turn trace transmission, `coalesce_system`, and the 3-tier bash timeout hierarchy.
-  - **Verification & Testing**: Passed all 8 `jeikcode_config_guide` tests with zero regressions.
+  - **Implementation Mechanism**: Refactored all 9 documents across `crates/zap-capabilities/assets/teaches/` down to a strict four-element model: exact configuration paths, precise snippet syntax, hot-reload behavior (mtime automatic vs explicit trigger), and direct operational effects. Restrainedly clarified subtle parameter distinctions, including `scope: "session"` MCP process reclamation after 10 minutes of inactivity (`idle_ttl_secs`), `maxConcurrentCalls` UI tool concurrency gating, `reasoning_history` ("exclude" vs "include") multi-turn trace transmission, `coalesce_system`, and the 3-tier bash timeout hierarchy.
+  - **Verification & Testing**: Passed all 8 `zap_config_guide` tests with zero regressions.
 
 - **[CI Pipeline & Quality Engineering / Capabilities Integration Test Suite Activation] Fix legacy tool assertions in `tools_integration.rs` and officially integrate the 35-test integration suite into CI**:
-  - **Technical Root Cause / Detail**: The 11 integration test files under `crates/jeikcode-capabilities/tests/` were compiled via `cargo check --all-targets` but never actually executed in CI pipelines. Furthermore, `tools_integration.rs` retained stale assertions referencing pre-unification tool names (`read_file`, `write_file`, `edit_file`, `list_directory`), causing it to fail if run.
-  - **Implementation Mechanism**: Modernized core tool assertions in `crates/jeikcode-capabilities/tests/tools_integration.rs` to match authoritative unified tools (`read`, `write`, `edit`, `run_command`, `grep`, `glob`). Updated `.github/workflows/ci.yml` in the `rust-quality` job to run the comprehensive capabilities integration suite (`tools_integration`, `http_mock`, `anthropic_mock`, `ollama_mock`, `compaction_cache`, `session_fixture_invariants`), transforming dormant integration tests into an active gating defense.
-  - **Verification & Testing**: Ran the full 35-test suite locally in under 2 seconds with 100% pass rate, and verified end-to-end compilation with `cargo check --lib -p jeikcode-daemon`.
+  - **Technical Root Cause / Detail**: The 11 integration test files under `crates/zap-capabilities/tests/` were compiled via `cargo check --all-targets` but never actually executed in CI pipelines. Furthermore, `tools_integration.rs` retained stale assertions referencing pre-unification tool names (`read_file`, `write_file`, `edit_file`, `list_directory`), causing it to fail if run.
+  - **Implementation Mechanism**: Modernized core tool assertions in `crates/zap-capabilities/tests/tools_integration.rs` to match authoritative unified tools (`read`, `write`, `edit`, `run_command`, `grep`, `glob`). Updated `.github/workflows/ci.yml` in the `rust-quality` job to run the comprehensive capabilities integration suite (`tools_integration`, `http_mock`, `anthropic_mock`, `ollama_mock`, `compaction_cache`, `session_fixture_invariants`), transforming dormant integration tests into an active gating defense.
+  - **Verification & Testing**: Ran the full 35-test suite locally in under 2 seconds with 100% pass rate, and verified end-to-end compilation with `cargo check --lib -p zap-daemon`.
 
 - **[WebUI & Canvas Engine / Multi-Stream Projection & Session State Reconciliation] Introduce dedicated `sessionProjection` canvas pipeline, prevent watch-replay duplicate turns, and synchronize live TodoList baseline**:
   - **Technical Root Cause / Detail**: During active turns, concurrent `/chat/watch` events, background disk polling, tab switching, and page reloads could fight over the React messages canvas. A fixed lookback limit in `userMessageAlreadyOnCanvas` risked duplicate user bubble appends in long sessions. When watch streams replayed coalesced deltas, text was often duplicated, and incremental `todowrite` events dispatched before React state hydration folded against empty arrays, dropping prior task items.
@@ -2062,13 +2062,13 @@
 
 - **[知识库与系统指南 / 内置 Teaches 文档全面治理与精简] 彻底剔除底层机理与长篇理论描述，收敛为极简配置教程并讲透微小参数细微差异**:
   - **技术机理 / 现象溯源**: 原 `teaches/*.md` 知识库包含大量底层算法原理解析（如 Topological Reordering、VersionRing 历史快照环、3-Way 变基算法、Linux ETXTBSY 内核锁机制），信息密度低且冗余，不符合指南知识源的高信噪比需求。
-  - **实现防线 / 核心改动**: 重构并精简 `crates/jeikcode-capabilities/assets/teaches/` 下全部 9 篇文档，收敛为统一的“文件在哪 + 改动什么 + 是否自动热生效 + 触发方式”四要素结构；以克制精准的语言讲透关键微小参数的行为差异，涵盖 `scope: "session"` 模式下 10 分钟闲置自动回收机制（`idle_ttl_secs`）、`maxConcurrentCalls` 独占保护、`reasoning_history` 思考过程多轮回传策略、`coalesce_system` 缓存控制及 `[tools.bash]` 三档超时判定阶梯。
-  - **验证与交付**: `jeikcode_config_guide` 8 项测试全量通过，文档体积缩减逾 50%。
+  - **实现防线 / 核心改动**: 重构并精简 `crates/zap-capabilities/assets/teaches/` 下全部 9 篇文档，收敛为统一的“文件在哪 + 改动什么 + 是否自动热生效 + 触发方式”四要素结构；以克制精准的语言讲透关键微小参数的行为差异，涵盖 `scope: "session"` 模式下 10 分钟闲置自动回收机制（`idle_ttl_secs`）、`maxConcurrentCalls` 独占保护、`reasoning_history` 思考过程多轮回传策略、`coalesce_system` 缓存控制及 `[tools.bash]` 三档超时判定阶梯。
+  - **验证与交付**: `zap_config_guide` 8 项测试全量通过，文档体积缩减逾 50%。
 
 - **[CI 流水线与质量工程 / Capabilities 集成测试套件正式纳管] 修复 `tools_integration.rs` 历史工具名断言，将 35 项端到端集成测试接入 CI 必跑防线**:
-  - **技术机理 / 现象溯源**: `crates/jeikcode-capabilities/tests/` 下的 11 个集成测试文件此前仅在 CI 中参与类型编译检查，从未真正执行；且 `tools_integration.rs` 内部断言仍匹配历史旧工具名（`read_file`, `write_file`, `edit_file`, `list_directory`），导致集成测试一旦执行便会报错挂掉。
+  - **技术机理 / 现象溯源**: `crates/zap-capabilities/tests/` 下的 11 个集成测试文件此前仅在 CI 中参与类型编译检查，从未真正执行；且 `tools_integration.rs` 内部断言仍匹配历史旧工具名（`read_file`, `write_file`, `edit_file`, `list_directory`），导致集成测试一旦执行便会报错挂掉。
   - **实现防线 / 核心改动**: 将 `tools_integration.rs` 的核心工具断言更新为当前权威统一的 `read`、`write`、`edit`、`run_command`、`grep`、`glob`；在 `.github/workflows/ci.yml` 的 `rust-quality` 任务中增加集成测试套件执行步骤（覆盖 `tools_integration`, `http_mock`, `anthropic_mock`, `ollama_mock`, `compaction_cache`, `session_fixture_invariants`），使 35 项关键集成测试成为流水线每次触发的真实防线。
-  - **验证与交付**: 35 项跨模块集成测试本地 1.3 秒极速通过，`cargo check --lib -p jeikcode-daemon` 编译校验通过。
+  - **验证与交付**: 35 项跨模块集成测试本地 1.3 秒极速通过，`cargo check --lib -p zap-daemon` 编译校验通过。
 
 - **[WebUI 与画布状态引擎 / 多流投影重合与会话状态调和] 重构引入独立 `sessionProjection` 状态管道，杜绝 Watch 重放气泡错位倒置与重复追加，并端到端同步实时任务清单基线**:
   - **技术机理 / 现象溯源**: 在活跃轮次中，并发的 `/chat/watch` 流、后台磁盘轮询、多标签页切换及页面刷新容易在 React 消息状态上产生竞争冲突。原画布检测窗口仍有边界限制，极长会话中用户提问仍可能被当作新消息置底追加；watch 重放的聚合增量容易导致文本与思考重复渲染；且在 React 状态未水合前到达的增量 `todowrite` 动作容易基于空数组 `[]` 折叠，导致已有任务清单被冲刷覆盖。
@@ -2079,20 +2079,20 @@
 
 - **[Capabilities & Tools / Codebase Tools Streamlining] Retire standalone `repo_map` from model-facing tools catalog, consolidating all structural tree capability into `read`**:
   - **Technical Root Cause / Detail**: With `read` natively adopting index-backed 2-level architectural directory mapping and single-level fallbacks, keeping `repo_map` in the model-facing tool catalog introduced redundant cognitive tool-choice overhead and conflicting prompt guidance.
-  - **Implementation Mechanism**: Removed `repo_map` from `codeintel_tool_names()` and `register_codeintel_tools_with_mode()` in `crates/jeikcode-capabilities/src/codeintel/mod.rs`, leaving `code_explore` as the sole specialized code-intelligence tool. Purged `repo_map` from `default_no_fold_tools` across `config/mod.rs`, `default-config.toml`, and builtin tool catalogs. Updated `crates/jeikcode-coding/src/assemble.rs` test suite to assert `repo_map` is cleanly retired.
-  - **Verification & Testing**: Passed all `assemble::tests` and `codeintel` test suites, and verified with `cargo check --lib -p jeikcode-daemon`.
+  - **Implementation Mechanism**: Removed `repo_map` from `codeintel_tool_names()` and `register_codeintel_tools_with_mode()` in `crates/zap-capabilities/src/codeintel/mod.rs`, leaving `code_explore` as the sole specialized code-intelligence tool. Purged `repo_map` from `default_no_fold_tools` across `config/mod.rs`, `default-config.toml`, and builtin tool catalogs. Updated `crates/zap-coding/src/assemble.rs` test suite to assert `repo_map` is cleanly retired.
+  - **Verification & Testing**: Passed all `assemble::tests` and `codeintel` test suites, and verified with `cargo check --lib -p zap-daemon`.
 
 - **[WebUI & Task Engine / Mobile Reconnect Resilience & TodoList State Sync] Fix mobile background disconnects, prevent user message bubble displacement after reload, and synchronize authoritative TodoList state**:
   - **Technical Root Cause / Detail**: Mobile browsers freeze background tabs, silently breaking long-lived SSE connections. Upon foreground switch, `refreshOnFocus` failed to detect severed sockets, leaving the UI deadlocked in a broken state. When users refreshed or re-entered via incognito, a narrow 8-message deduplication window (`userMessageAlreadyOnCanvas`) caused existing user questions to slip past detection and get erroneously re-appended to the very bottom, causing AI tokens to stream below the user bubble. Furthermore, incremental `todo_write` calls during detached reattach reduced against an empty baseline when the initial full plan fell outside the message history window, shrinking multi-task checklists into a single card.
-  - **Implementation Mechanism**: Enhanced `userMessageAlreadyOnCanvas` in `webui/src/lib/chatTerminal.ts` to scan across a deep 100-message canvas window, completely preventing misplaced user echo appends. Added automatic active-session reconnection and freshness catch-up to `refreshOnFocus` in `Chat.tsx` on `visibilitychange`. Extended backend `SessionDetail` in `crates/jeikcode-daemon/src/lib.rs` to derive and deliver authoritative `todos` from the full session transcript, and updated `reduceTodosFromCalls` in `webui/src/lib/todos.ts` to fold incremental actions against prior baseline stashes rather than empty arrays. Uncollapsed `SessionTodoPanel` by default to display the full multi-step task list.
+  - **Implementation Mechanism**: Enhanced `userMessageAlreadyOnCanvas` in `webui/src/lib/chatTerminal.ts` to scan across a deep 100-message canvas window, completely preventing misplaced user echo appends. Added automatic active-session reconnection and freshness catch-up to `refreshOnFocus` in `Chat.tsx` on `visibilitychange`. Extended backend `SessionDetail` in `crates/zap-daemon/src/lib.rs` to derive and deliver authoritative `todos` from the full session transcript, and updated `reduceTodosFromCalls` in `webui/src/lib/todos.ts` to fold incremental actions against prior baseline stashes rather than empty arrays. Uncollapsed `SessionTodoPanel` by default to display the full multi-step task list.
   - **Verification & Testing**: Passed all 25 `todos.test.ts` tests, 36 `chatTerminal.test.ts` tests, 63 backend `tools::todo::tests`, and executed `npm run build` in `webui` cleanly.
 
 ---
 
 - **[能力层与工具系统 / 核心工具集精简化] 正式从面向模型的工具集中退役 `repo_map` 工具，代码全览能力完全归一至 `read`**:
   - **技术机理 / 现象溯源**: 鉴于 `read` 工具已在底层全面接管基于代码图谱的 2 层架构树全览与单层自适应降级，继续在模型工具集中挂载独立的 `repo_map` 工具会导致模型在工具选择上产生认知困扰，且提示词出现冗余分支。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/codeintel/mod.rs` 中将 `repo_map` 从 `codeintel_tool_names()` 和挂载注册中彻底移除，代码智能核心工具统一收敛为唯一主角 `code_explore`；从全局配置与各端资产的 `default_no_fold_tools` 白名单中移除 `repo_map`；同步更新 `crates/jeikcode-coding/src/assemble.rs` 单元测试，将 `repo_map` 纳入已退役工具断言列表。
-  - **验证与交付**: `assemble::tests` 及 `codeintel` 单元测试全绿通过，`cargo check --lib -p jeikcode-daemon` 编译校验通过。
+  - **实现防线 / 核心改动**: 在 `crates/zap-capabilities/src/codeintel/mod.rs` 中将 `repo_map` 从 `codeintel_tool_names()` 和挂载注册中彻底移除，代码智能核心工具统一收敛为唯一主角 `code_explore`；从全局配置与各端资产的 `default_no_fold_tools` 白名单中移除 `repo_map`；同步更新 `crates/zap-coding/src/assemble.rs` 单元测试，将 `repo_map` 纳入已退役工具断言列表。
+  - **验证与交付**: `assemble::tests` 及 `codeintel` 单元测试全绿通过，`cargo check --lib -p zap-daemon` 编译校验通过。
 
 - **[WebUI 与任务状态机 / 移动端重连韧性与任务清单状态同步] 根治移动端退后台断开、修复大退刷新后用户气泡错位倒置、并端到端同步权威 TodoList 状态**:
   - **技术机理 / 现象溯源**: 移动端切后台后系统挂起导致 SSE 长连接中断，切回前台时原 `refreshOnFocus` 缺乏重连机制导致连接假死；大退或断线刷新后，因前端回溯窗口硬编码为 8 条，导致长回合中的用户提问滑出检测范围，在 watch 重放时被错误重新追加到画布最末尾，使得后续 AI 回复从该气泡下方吐出；此外，当最初的全量 plan 处于历史分页之外时，重连后的增量 `todo_write` 动作由于缺乏基准状态而退化为从空数组 `[]` 开始计算，导致前端多任务清单诡异消失仅剩 1 张卡片。
@@ -2103,8 +2103,8 @@
 
 - **[Capabilities & Tools / Codebase Exploration & Adaptive Reading] Consolidate `repo_map` architectural overview into `read`, eliminate negative offset prompt steering, remove file size noise from directory listings, purge symbol extraction bloat, and introduce project-level `.codegraphignore`**:
   - **Technical Root Cause / Detail**: Previously, the `read` tool's schema carried negative prompting ("Only provide if the file is too large to read at once"), misleading LLMs into omitting `offset` during initial reads and file paging. Directory listings performed unnecessary file-metadata lookups and appended noisy size tags (`(60.9 KB)`), diluting context tokens. The standalone `repo_map` tool suffered from scope leakage (leaking unrelated project symbols into scoped paths) and symbol bloat (extracting low-signal HTML tags).
-  - **Implementation Mechanism**: Upgraded `read` in `crates/jeikcode-capabilities/src/tools/read.rs` to automatically render an index-backed 2-level architectural tree when reading directories without explicit pagination, seamlessly falling back to clean single-level listings when unindexed. Removed negative phrasing from `offset` parameter schema and eliminated file-size formatting from directory entries. Streamlined `repo_map.rs` by removing legacy symbol extraction and obsolete `full`/`symbols` modes. Purged legacy `repo_map` references across system prompts (`rules.yaml`, `root_docs_内置工具.yaml`, `persona.rs`, `code_tools_first.rs`) and Teaches documents. Added project-level `.codegraphignore` rules ignoring static sites, caches, and test artifacts.
-  - **Verification & Testing**: Passed all 35 `tools::read` tests, 2 `repo_map` tests, 42 `persona` tests, and 11 `code_tools_first` tests. Validated with `cargo fmt` and `cargo check --lib -p jeikcode-daemon`.
+  - **Implementation Mechanism**: Upgraded `read` in `crates/zap-capabilities/src/tools/read.rs` to automatically render an index-backed 2-level architectural tree when reading directories without explicit pagination, seamlessly falling back to clean single-level listings when unindexed. Removed negative phrasing from `offset` parameter schema and eliminated file-size formatting from directory entries. Streamlined `repo_map.rs` by removing legacy symbol extraction and obsolete `full`/`symbols` modes. Purged legacy `repo_map` references across system prompts (`rules.yaml`, `root_docs_内置工具.yaml`, `persona.rs`, `code_tools_first.rs`) and Teaches documents. Added project-level `.codegraphignore` rules ignoring static sites, caches, and test artifacts.
+  - **Verification & Testing**: Passed all 35 `tools::read` tests, 2 `repo_map` tests, 42 `persona` tests, and 11 `code_tools_first` tests. Validated with `cargo fmt` and `cargo check --lib -p zap-daemon`.
 
 - **[WebUI & Streaming Engine / Watch Conflict Isolation & Local Turn Protection] Protect local in-flight turns from premature state resets and isolate streaming from idle watch conflicts**:
   - **Technical Root Cause / Detail**: During active turns initiated by the local web client, background watch polling or slight synchronisation delays in active session lists could prematurely drop the busy state or attach duplicate watch connections, risking dual-stream race conditions and transcript fragmentation.
@@ -2115,8 +2115,8 @@
 
 - **[能力层与工具系统 / 代码库全览与自适应阅读] 将 `repo_map` 架构全览能力收敛至 `read` 工具、彻底消除 offset 负向诱导与目录文件大小杂余、移除符号提取噪音并配置项目级 `.codegraphignore`**:
   - **技术机理 / 现象溯源**: 此前 `read` 工具参数 schema 存在“只有文件过大才提供”的负向暗示，导致模型在初次调用或需要分页时本能偷懒不传 `offset`；目录展示对每个文件执行元数据系统调用并追加冗余的大小标记（如 `(60.9 KB)`），浪费 Token 并分散注意力；独立 `repo_map` 工具存在子目录查询时泄露全局不相关符号的作用域 Bug，且符号大纲提取中充斥无意义的纯 HTML 原生标签（如 `ui div`、`ui span`）。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/read.rs` 中将 `repo_map` 的全览能力融合接入：在读取目录且未传分页参数时优先自动渲染紧凑的 2 层架构树，无索引时平滑降级为纯净单层展示；彻底剔除 `offset` schema 中的负向诱导描述，并在截断尾注中提供显式动作指引；去除目录列表中的文件大小拼接；重构 `repo_map.rs`，彻底废弃冗余的 `full`/`symbols` 模式与符号打分杂余；地毯式清理全仓提示词（`rules.yaml`、内置工具字典、`persona.rs`、`code_tools_first.rs`）及 Teaches 知识库中关于 `repo_map` 的残留唠叨；在 `.jeikcode/.codegraphignore` 中配置项目级站点产物与缓存过滤。
-  - **验证与交付**: `tools::read` 的 35 项单测、`repo_map` 2 项单测、`persona` 42 项单测、`code_tools_first` 11 项单测全部绿灯通过，`cargo fmt` 格式化规范检查通过，`cargo check --lib -p jeikcode-daemon` 编译校验通过。
+  - **实现防线 / 核心改动**: 在 `crates/zap-capabilities/src/tools/read.rs` 中将 `repo_map` 的全览能力融合接入：在读取目录且未传分页参数时优先自动渲染紧凑的 2 层架构树，无索引时平滑降级为纯净单层展示；彻底剔除 `offset` schema 中的负向诱导描述，并在截断尾注中提供显式动作指引；去除目录列表中的文件大小拼接；重构 `repo_map.rs`，彻底废弃冗余的 `full`/`symbols` 模式与符号打分杂余；地毯式清理全仓提示词（`rules.yaml`、内置工具字典、`persona.rs`、`code_tools_first.rs`）及 Teaches 知识库中关于 `repo_map` 的残留唠叨；在 `.jeikcode/.codegraphignore` 中配置项目级站点产物与缓存过滤。
+  - **验证与交付**: `tools::read` 的 35 项单测、`repo_map` 2 项单测、`persona` 42 项单测、`code_tools_first` 11 项单测全部绿灯通过，`cargo fmt` 格式化规范检查通过，`cargo check --lib -p zap-daemon` 编译校验通过。
 
 - **[WebUI 与流式引擎 / 待机冲突隔离与本地轮次守护] 守护本地活跃生成状态免遭提前重置，并杜绝待机监听流与主流冲突**:
   - **技术机理 / 现象溯源**: 当 Web 端正在发起本地流式生成时，后端会话活跃列表的微秒级同步滞后或超过 2.5 秒的耗时可能会导致忙碌状态被意外解除；同时待机监听流（idle watch）的不当连接可能产生双流竞争与正文撕裂隐患。
@@ -2127,8 +2127,8 @@
 
 - **[Capabilities & Tools / Shell Hardening & Precision Reading] Fix Windows WSL bash hijacking in `run_command`, enhance `read` with anchor matching, and modernize notification audio**:
   - **Technical Root Cause / Detail**: On Windows environments with WSL enabled, running scripts with `#!/usr/bin/env bash` shebangs (such as Node.js `npm`/`npx` wrappers) through `run_command` previously triggered exit code 127 (`No such file or directory`) because Windows `System32\bash.exe` shadowed Git Bash's `/usr/bin/bash` in `PATH` and failed to resolve MSYS2 drive paths (`/d/...`). Furthermore, inspecting symbols in large files previously required reading entire pages or manual offset guessing, OS desktop toasts suffered from unstackable popup spam, and leftover database paths lingered in `index_db.rs`.
-  - **Implementation Mechanism**: Hardened Windows shell execution in `crates/jeikcode-capabilities/src/tools/bash.rs` by prepending a dedicated `/tmp/.jeikcode_shims` directory containing Git Bash `bash`/`sh` symlinks to `PATH`, completely eliminating WSL binary shadowing while preserving native Windows compiler precedence. Upgraded `read` tool with `key_string`, `upward`, `downward`, and `max_matches` arguments supporting 4-tier fuzzy matching and centered inspection windows with line numbers. Replaced OS popup toasts with pure platform alert sounds (`MessageBeep`, `afplay`, `paplay`) protected by an 800ms atomic debounce lock in `notify.rs`. Purged a leftover path fallback in `index_db.rs`.
-  - **Verification & Testing**: Passed all 34 read tool unit tests in `jeikcode-capabilities`, verified `npm` execution via the new shim mechanism, and passed `cargo check --lib -p jeikcode-daemon`.
+  - **Implementation Mechanism**: Hardened Windows shell execution in `crates/zap-capabilities/src/tools/bash.rs` by prepending a dedicated `/tmp/.jeikcode_shims` directory containing Git Bash `bash`/`sh` symlinks to `PATH`, completely eliminating WSL binary shadowing while preserving native Windows compiler precedence. Upgraded `read` tool with `key_string`, `upward`, `downward`, and `max_matches` arguments supporting 4-tier fuzzy matching and centered inspection windows with line numbers. Replaced OS popup toasts with pure platform alert sounds (`MessageBeep`, `afplay`, `paplay`) protected by an 800ms atomic debounce lock in `notify.rs`. Purged a leftover path fallback in `index_db.rs`.
+  - **Verification & Testing**: Passed all 34 read tool unit tests in `zap-capabilities`, verified `npm` execution via the new shim mechanism, and passed `cargo check --lib -p zap-daemon`.
 
 - **[WebUI & Chat Interface / Stream Integrity & Multi-Repo Navigation] Shield active streaming against watch stream tearing, eliminate scroll jitter, and add multi-repo Git switching**:
   - **Technical Root Cause / Detail**: During active agent generation, watch stream reattachment could race with local streams and pop typing message bubbles, resulting in truncated or shredded assistant transcripts. In addition, browser scroll anchoring caused visual jitter during rapid streaming, user steering envelopes leaked into the session outline rail, and multi-repo workspaces lacked Git panel switching.
@@ -2139,8 +2139,8 @@
 
 - **[能力层与工具系统 / Shell 加固与精准阅读] 根治 Windows WSL bash 路径劫持、强化 `read` 锚点定位并升级轻量系统通知音**:
   - **技术机理 / 现象溯源**: 在启用了 WSL 的 Windows 机器上，`run_command` 执行带 `#!/usr/bin/env bash` Shebang 的脚本（如 Node.js 自带的 `npm`/`npx` 包装器）时，因系统 `System32\bash.exe` 在 PATH 中先于 Git Bash 被 `env` 检索，导致 WSL 的 Linux bash 被误唤起并因无法识别 MSYS2 盘符路径（如 `/d/...`）报出 127 错误；同时大文件符号检视缺乏精准锚点窗口支持、系统级 Toast 弹窗存在无法堆叠的弹窗轰炸问题，且 `index_db.rs` 存在历史遗留路径。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/bash.rs` 的 Windows bash 初始化逻辑中，注入最高优先级的 `/tmp/.jeikcode_shims` 目录并建立指向当前 Git Bash `bash`/`sh` 的软链接，彻底杜绝 WSL `System32\bash.exe` 劫持 `env bash`，同时严密保护宿主原生编译工具链（Cargo/MSVC/Python）的优先级；为 `read` 工具引入 `key_string`、`upward`、`downward` 与 `max_matches`，支持四级容错匹配、居中行窗口与精确定位；在 `notify.rs` 中全面移除 OS 弹窗，改为纯系统提示音（`MessageBeep`/`afplay`/`paplay`）并配合 800ms 原子防抖锁；清理 `index_db.rs` 中已废弃的路径。
-  - **验证与交付**: `jeikcode-capabilities` 的 34 项 read 工具单测全绿通过，实测 Git Bash 下 `npm` 顺利执行，`cargo check --lib -p jeikcode-daemon` 编译校验通过。
+  - **实现防线 / 核心改动**: 在 `crates/zap-capabilities/src/tools/bash.rs` 的 Windows bash 初始化逻辑中，注入最高优先级的 `/tmp/.jeikcode_shims` 目录并建立指向当前 Git Bash `bash`/`sh` 的软链接，彻底杜绝 WSL `System32\bash.exe` 劫持 `env bash`，同时严密保护宿主原生编译工具链（Cargo/MSVC/Python）的优先级；为 `read` 工具引入 `key_string`、`upward`、`downward` 与 `max_matches`，支持四级容错匹配、居中行窗口与精确定位；在 `notify.rs` 中全面移除 OS 弹窗，改为纯系统提示音（`MessageBeep`/`afplay`/`paplay`）并配合 800ms 原子防抖锁；清理 `index_db.rs` 中已废弃的路径。
+  - **验证与交付**: `zap-capabilities` 的 34 项 read 工具单测全绿通过，实测 Git Bash 下 `npm` 顺利执行，`cargo check --lib -p zap-daemon` 编译校验通过。
 
 - **[WebUI 与交互界面 / 流式防撕裂与多仓库支持] 阻断流式会话被重放撕裂、消除滚动锚定抖动并支持多仓 Git 切换**:
   - **技术机理 / 现象溯源**: 当本地前端正持有活跃流式输出时，watch stream 的重连与快照重放可能与主流冲突，并错误地将正在打字的消息气泡弹栈截断，造成正文吞字或撕裂；浏览器默认的 `overflow-anchor` 机制在密集吐字时易引发视图抖动与跳动；会话中途插话转向（Steer）信封结构会泄露至右侧大纲导航栏；包含多个 Git 仓库的工作区缺乏仓库切换能力。
@@ -2152,29 +2152,29 @@
 - **[Prompts & Workflow Rules / Steer & Execution Discipline] Upgrade mid-turn steer prompt guidance and enforce architectural root-cause workflow rules**:
   - **Technical Root Cause / Detail**: Previously, mid-turn steer requests lacked explicit safeguards against accidental task cancellation or dropping pending TodoLists, causing models to prematurely abort ongoing user goals upon receiving follow-up input. Furthermore, workflow prompt instructions lacked clear multi-task scope boundaries, objective technical review discipline, and concurrent commit isolation constraints, while redundant `doing_tasks` blocks in prompt configurations caused cognitive duplication.
   - **Implementation Mechanism**: Overhauled `steer_prompt.rs` with a robust 4-pillar guidance framework: non-destructive default retention (`Acknowledge and Retain by Default`), safe-checkpoint transition with automatic resumption (`TodoList Priority Injection and Safe Transition`), testing phase fast-path (`Testing Phase Fast-path`), and surgical conflict replacement (`Surgical Conflict Replacement`). Upgraded `rules.yaml` system prompts with imperative, non-prohibitive task scope awareness, architectural root-cause problem solving (pattern matching, normalization, strategy/adapter patterns, dynamic upstream fallbacks), objective technical review against sycophancy and architectural debt, and commit scope discipline to prevent multi-session collision. Purged redundant `doing_tasks` blocks from prompt templates to ensure a single source of truth under `raw`.
-  - **Verification & Testing**: Updated and passed prompt unit tests and integration tests in `crates/jeikcode-coding`, formatted modified Rust code with `cargo fmt`, synchronized user prompts under `~/.jeikcode/prompts/`, and validated version consistency across manifests.
+  - **Verification & Testing**: Updated and passed prompt unit tests and integration tests in `crates/zap-coding`, formatted modified Rust code with `cargo fmt`, synchronized user prompts under `~/.jeikcode/prompts/`, and validated version consistency across manifests.
 
 ---
 
 - **[提示词工程与工作流规范 / 转向机制与工程执行纪律] 升级会话中途转向 (Steer) 提示词引导架构，并确立架构级根因治理工作流规约**:
   - **技术机理 / 现象溯源**: 此前会话在执行中途接收插话转向请求（Steer）时，缺乏对既有任务及待办清单（TodoList）的明确保留与断点续做约束，导致模型在处理新输入时极易误将新需求当成覆盖指令，从而提前清空或放弃原任务；同时系统工作流提示词缺乏多任务讨论时的执行边界确认、技术方案客观审视准则以及并发提交隔离纪律，且提示词配置文件中存在 `raw` 与 `doing_tasks` 双重冗余。
   - **实现防线 / 核心改动**: 彻底重构 `steer_prompt.rs`，确立四维健壮转向准则：默认保留原任务及清单（非显式指令绝不丢弃）、在语法合规与自洽的检查点安全切换并于新任务完成后自动回跳续做、单测阶段快速暂停并待新老需求合并统一验证、局部冲突仅外科手术式精准置换（A $\to$ B）而不干扰其余不冲突项；在 `rules.yaml` 中以纯祈使避免句式重构任务执行规范，确立任务范围意识（指定任务完成即停机交付，避免擅自扩大范围）、架构级治本原则（倡导模式匹配、归一化、适配器/策略模式与动态兜底，替代死代码与硬编码穷举）、客观技术审视（拒绝盲从讨好与吹毛求疵，主动识别并优化架构隐患）以及严格的提交范围纪律（仅提交自己改动的文件以保障并发安全）；彻底移除 `doing_tasks` 冗余块，统一收敛为单一事实来源。
-  - **验证与交付**: 同步更新并验证了 `jeikcode-coding` 模块下的转向提示词单元测试及集成测试断言，执行 `cargo fmt` 确保格式合规，完成本地 `~/.jeikcode/prompts/` 实时配置同步与热重载验证，全仓版本号一致性校验通过。
+  - **验证与交付**: 同步更新并验证了 `zap-coding` 模块下的转向提示词单元测试及集成测试断言，执行 `cargo fmt` 确保格式合规，完成本地 `~/.jeikcode/prompts/` 实时配置同步与热重载验证，全仓版本号一致性校验通过。
 
 
 ## v7.2.0-beta.0 (2026-10-07)
 
 - **[Capabilities & Tools / Core Coding Suite] Streamline core coding tools, upgrade file inspection resilience, and direct-pass shell execution**:
   - **Technical Root Cause / Detail**: Previous tool proliferation introduced cognitive confusion and fragmentation across file operations (`list_directory`, `open_file`, `global_search_replace`), prompt bloat with negative nagging, fragile file reading under Windows/CRLF and escaped newlines, and unnecessary wrapper abstractions over bash background processes (`bashid`). Furthermore, `code_explore` and `repo_map` required more precise identifier prioritization and accurate subdirectory scope boundaries.
-  - **Implementation Mechanism**: Upgraded the `read` tool into a unified file and directory inspector with negative-offset tail reads, asymmetric anchor slicing, backward keyword search, and 4-tier escape/newline fault tolerance; enhanced `grep` with `word_match` and compact grouped outputs; unchained `run_command` with full flags and pipeline passthrough to native shells; replaced pseudo-bashid with real OS process PID and port reporting; consolidated configuration actions under `jeikcode_config` (guide and reload); purged redundant tools (`list_directory`, `open_file`, `global_search_replace`, `bash_kill_by_id`); hardened WebUI session switching against 409 concurrency conflicts; and modernized GitPanel commit details with responsive layouts and compact action menus.
-  - **Verification & Testing**: Executed Rust capability unit test suites (`cargo check --lib -p jeikcode-daemon`), verified version consistency, and tested WebUI builds.
+  - **Implementation Mechanism**: Upgraded the `read` tool into a unified file and directory inspector with negative-offset tail reads, asymmetric anchor slicing, backward keyword search, and 4-tier escape/newline fault tolerance; enhanced `grep` with `word_match` and compact grouped outputs; unchained `run_command` with full flags and pipeline passthrough to native shells; replaced pseudo-bashid with real OS process PID and port reporting; consolidated configuration actions under `zap_config` (guide and reload); purged redundant tools (`list_directory`, `open_file`, `global_search_replace`, `bash_kill_by_id`); hardened WebUI session switching against 409 concurrency conflicts; and modernized GitPanel commit details with responsive layouts and compact action menus.
+  - **Verification & Testing**: Executed Rust capability unit test suites (`cargo check --lib -p zap-daemon`), verified version consistency, and tested WebUI builds.
 
 ---
 
 - **[能力层与工具系统 / 核心编码工具栈] 全面精简核心编码工具集、强化多层容错文件检查并直通原生 Shell 执行**:
   - **技术机理 / 现象溯源**: 此前核心文件操作存在工具膨胀与认知分歧（`list_directory`、`open_file`、`global_search_replace` 职责重叠），提示词存在负面唠叨（negative nagging）与内部别名噪音；在 Windows CRLF 及跨平台换行转义场景下文件截取存在脆弱性；后台进程过度封装虚拟 `bashid` 掩盖了系统原生进程管控能力；同时 `code_explore` 与 `repo_map` 在子目录过滤与符号精确匹配上仍有优化空间。
-  - **实现防线 / 核心改动**: 彻底升级 `read` 工具，统一文件与目录浏览能力，原生支持负数 offset 尾部切片读取、非对称锚点上下切片、反向关键字定位及四级跨平台转义/换行容错；强化 `grep` 支持整词匹配（`word_match`）与紧凑分组输出；直通 `run_command` 支持任意标志位（如 `ls -la`）与复杂管道，废除 `bashid` 改由系统真实 PID 与端口接管后台任务；收敛配置工具为单一 `jeikcode_config`；剔除冗余工具；加固 WebUI 会话并发切换防止 409 竞态，重构 Git 面板响应式提交详情卡片。
-  - **验证与交付**: 运行 `cargo check --lib -p jeikcode-daemon` 校验通过，运行版本一致性检查无漂移，WebUI 构建通过。
+  - **实现防线 / 核心改动**: 彻底升级 `read` 工具，统一文件与目录浏览能力，原生支持负数 offset 尾部切片读取、非对称锚点上下切片、反向关键字定位及四级跨平台转义/换行容错；强化 `grep` 支持整词匹配（`word_match`）与紧凑分组输出；直通 `run_command` 支持任意标志位（如 `ls -la`）与复杂管道，废除 `bashid` 改由系统真实 PID 与端口接管后台任务；收敛配置工具为单一 `zap_config`；剔除冗余工具；加固 WebUI 会话并发切换防止 409 竞态，重构 Git 面板响应式提交详情卡片。
+  - **验证与交付**: 运行 `cargo check --lib -p zap-daemon` 校验通过，运行版本一致性检查无漂移，WebUI 构建通过。
 
 
 ## v7.1.53-beta.13 (2026-10-06)
@@ -2240,7 +2240,7 @@
 
 - **[Datalog & Disk Protection] Disable per-turn datalog by default, enforce hard disk quotas, and migrate legacy configurations**:
   - **Technical Root Cause / Detail**: Datalog dumps raw per-turn requests and responses into `~/.jeikcode/datalog/` for offline model training/debugging without size caps or retention policies, causing long-term sessions to accumulate up to 26+ GB of dump files and fill user system disks; default configs previously shipped with `enabled = true`.
-  - **Implementation Mechanism**: Switched default initialization of `datalog.enabled` to `false` in `DatalogConfig` and all bundled templates (`default-config.toml`); introduced `max_total_mb` (512 MB) and `max_days` (7 days) bounds with automatic FIFO pruning in `crates/jeikcode-capabilities/src/datalog.rs`; updated `merge_user_config_preserving_models` in `crates/jeikcode-coding/src/config_sync.rs` so template sync diff checks actively detect and flip legacy enabled datalogs to `false`.
+  - **Implementation Mechanism**: Switched default initialization of `datalog.enabled` to `false` in `DatalogConfig` and all bundled templates (`default-config.toml`); introduced `max_total_mb` (512 MB) and `max_days` (7 days) bounds with automatic FIFO pruning in `crates/zap-capabilities/src/datalog.rs`; updated `merge_user_config_preserving_models` in `crates/zap-coding/src/config_sync.rs` so template sync diff checks actively detect and flip legacy enabled datalogs to `false`.
   - **Verification & Testing**: Passed `prune_datalog_directory_cleans_excess_files` and config roundtrip tests, formatted with `cargo fmt`, and passed full WebUI build gate.
 
 ---
@@ -2254,14 +2254,14 @@
 
 - **[Daemon & Session Switch] Prevent duplicate approval toast prompts when switching sessions during tool execution**:
   - **Technical Root Cause / Detail**: In `pending_interactive_from_replay` and `replay_resolves_call` within the daemon, only `ToolCallResult` and `ToolOutputChunk` marked a tool call as resolved, omitting `ChatEvent::ToolCallStarted`. During long-running or silent tool executions (such as `run_command`), `GET /chat/pending` incorrectly classified the running tool as waiting for approval. In WebUI, `transcriptToolCallIsResolved` returned false for in-flight tools with `status === 'pending'`, causing `restorePendingInteractive` to falsely demote executing tools to `waiting_approval` upon session switching and repeatedly trigger OS approval toasts.
-  - **Implementation Mechanism**: Added `ChatEvent::ToolCallStarted` to `resolved_call_ids` and `replay_resolves_call` in `crates/jeikcode-daemon/src/lib.rs` to recognize started tools as resolved; updated `transcriptToolCallIsResolved` in `webui/src/lib/chatTerminal.ts` so that tools not in `waiting_approval` (i.e. `pending`, `done`, `error`, `incomplete`) are treated as resolved, preventing resurrecting approval cards or firing desktop notifications when switching sessions.
+  - **Implementation Mechanism**: Added `ChatEvent::ToolCallStarted` to `resolved_call_ids` and `replay_resolves_call` in `crates/zap-daemon/src/lib.rs` to recognize started tools as resolved; updated `transcriptToolCallIsResolved` in `webui/src/lib/chatTerminal.ts` so that tools not in `waiting_approval` (i.e. `pending`, `done`, `error`, `incomplete`) are treated as resolved, preventing resurrecting approval cards or firing desktop notifications when switching sessions.
   - **Verification & Testing**: Passed 36/36 unit tests in `chatTerminal.test.ts` including tests verifying `pending` in-flight tools are resolved, and verified clean TypeScript build.
 
 ---
 
 - **[守护进程与会话切换] 彻底修复工具执行期间来回切换会话反复触发审批通知的缺陷**:
   - **技术机理 / 现象溯源**: 后端守护进程中的 `pending_interactive_from_replay` 与 `replay_resolves_call` 在判断某个 `call_id` 是否已解决时仅匹配了 `ToolCallResult` 和 `ToolOutputChunk`，漏掉了 `ChatEvent::ToolCallStarted`，导致耗时或无输出的正在运行中工具在 `GET /chat/pending` 中被误判为未审批；前端 `transcriptToolCallIsResolved` 对处于 `'pending'` 执行中的工具返回了 false，导致用户来回切换 session 时 `restorePendingInteractive` 将正在运行的工具误改回 `waiting_approval` 并反复调用 `dispatchSystemNotification` 触发系统 Toast 弹窗通知。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-daemon/src/lib.rs` 中为 `resolved_call_ids` 及 `replay_resolves_call` 增加对 `ChatEvent::ToolCallStarted` 的匹配，工具一旦启动即标记为已解决；重构 `webui/src/lib/chatTerminal.ts` 中的 `transcriptToolCallIsResolved`，只要工具状态不为 `waiting_approval`（即处于 `pending` 运行中或已完成）均判定为已处理，彻底杜绝切换会话时卡片复活与重复弹窗。
+  - **实现防线 / 核心改动**: 在 `crates/zap-daemon/src/lib.rs` 中为 `resolved_call_ids` 及 `replay_resolves_call` 增加对 `ChatEvent::ToolCallStarted` 的匹配，工具一旦启动即标记为已解决；重构 `webui/src/lib/chatTerminal.ts` 中的 `transcriptToolCallIsResolved`，只要工具状态不为 `waiting_approval`（即处于 `pending` 运行中或已完成）均判定为已处理，彻底杜绝切换会话时卡片复活与重复弹窗。
   - **验证与交付**: `chatTerminal.test.ts` 36 项单测全绿，涵盖运行中状态判定用例，前端全量构建通过。
 
 ## v7.1.53-beta.7 (2026-10-06)
@@ -2278,7 +2278,7 @@
 
 - **[Localization & Action Buttons] Pure language notifications and eliminate bilingual button mixing**:
   - **Technical Root Cause / Detail**: Toast action buttons previously displayed mixed bilingual text ("Approve / 同意", "Deny / 拒绝", "Answer / 作答") and hardcoded a Chinese "会话:" prefix regardless of the active language setting.
-  - **Implementation Mechanism**: Refactored Windows Toast XML and Linux `notify-send` scripts in `crates/jeikcode-capabilities/src/notify.rs` to dynamically detect language context; enforced pure English ("Approve", "Deny", "Answer", "Session:") and pure Chinese ("同意", "拒绝", "作答", "会话:") with zero bilingual mixing; expanded `i18n.ts` with localized notification action keys.
+  - **Implementation Mechanism**: Refactored Windows Toast XML and Linux `notify-send` scripts in `crates/zap-capabilities/src/notify.rs` to dynamically detect language context; enforced pure English ("Approve", "Deny", "Answer", "Session:") and pure Chinese ("同意", "拒绝", "作答", "会话:") with zero bilingual mixing; expanded `i18n.ts` with localized notification action keys.
   - **Verification & Testing**: Executed `cargo fmt` and updated unit tests in `notify.rs` verifying strict unilingual button content.
 
 - **[Theme & Visual System] Refine dark canvas background to eye-friendly charcoal and preserve message bubble contrast**:
@@ -2300,7 +2300,7 @@
 
 - **[国际化与通知操作] 纯英文/纯中文系统通知与审批按钮，杜绝中英混杂**:
   - **技术机理 / 现象溯源**: Windows Toast 与桌面通知按钮此前采用 "Approve / 同意"、"Deny / 拒绝" 等中英混排，且会话行强行硬编码中文“会话:”，在英文语言模式下弹出体验割裂。
-  - **实现防线 / 核心改动**: 重构 `crates/jeikcode-capabilities/src/notify.rs` 中的 Windows Toast XML 与桌面通知脚本生成逻辑，按标题语言上下文精准路由：英文语言下输出纯英文（`Approve` / `Deny` / `Answer` / `Session:`），中文语言下输出纯中文（`同意` / `拒绝` / `作答` / `会话:`），严禁中英交叉混排；在 `i18n.ts` 中补全通知操作的中英文字典。
+  - **实现防线 / 核心改动**: 重构 `crates/zap-capabilities/src/notify.rs` 中的 Windows Toast XML 与桌面通知脚本生成逻辑，按标题语言上下文精准路由：英文语言下输出纯英文（`Approve` / `Deny` / `Answer` / `Session:`），中文语言下输出纯中文（`同意` / `拒绝` / `作答` / `会话:`），严禁中英交叉混排；在 `i18n.ts` 中补全通知操作的中英文字典。
   - **验证与交付**: 执行 `cargo fmt` 代码格式化，更新 `notify.rs` 单元测试并通过断言验证。
 
 - **[主题视觉与护眼调色] 会话面板告别刺眼纯黑，对齐左侧炭灰质感并强化气泡层级**:
@@ -2443,7 +2443,7 @@
 ## v7.1.53-beta.2 (2026-10-05)
 
 - **[OS Notification Defense] Prevent terminal notifications from mistakenly adding Approve/Deny action buttons**:
-  - **Technical Root Cause / Detail**: In `crates/jeikcode-capabilities/src/notify.rs`, any notification whose body contained review keywords (e.g. session titled "JeikCode PR 5 审核") was misclassified as an approval prompt, inappropriately attaching Approve/Deny buttons to finished turn toasts. Clicking them had no effect because the turn was already done.
+  - **Technical Root Cause / Detail**: In `crates/zap-capabilities/src/notify.rs`, any notification whose body contained review keywords (e.g. session titled "JeikCode PR 5 审核") was misclassified as an approval prompt, inappropriately attaching Approve/Deny buttons to finished turn toasts. Clicking them had no effect because the turn was already done.
   - **Implementation Mechanism**: Updated `windows_toast_xml` to inspect the title rather than body for review keywords, and strictly exclude terminal notifications (`done`, `finished`, `completed`, `stopped`, `failed`) from attaching action buttons.
   - **Verification & Testing**: Automated unit test `test windows_toast_approval_includes_action_buttons` passed.
 
@@ -2461,7 +2461,7 @@
 
 - **[系统通知防线] 彻底根除已完成通知误带 Approve/Deny 按钮与点击无响应缺陷**：
   - **技术机理 / 现象溯源**: 守护进程通知模块原先依据消息正文（`body`）模糊匹配审核关键字。当会话标题包含“审核”字样时，回合结束（`JeikCode done`）的完成通知会被错误判定为待审批通知，从而附加了无效的 Approve / Deny 动作按钮。
-  - **实现防线 / 核心改动**: 重构 `crates/jeikcode-capabilities/src/notify.rs` 中的判断逻辑，严禁使用 `body` 判定审批，严格依据通知标题且无条件排除已完成/停止终态通知。
+  - **实现防线 / 核心改动**: 重构 `crates/zap-capabilities/src/notify.rs` 中的判断逻辑，严禁使用 `body` 判定审批，严格依据通知标题且无条件排除已完成/停止终态通知。
   - **验证与交付**: 运行 `windows_toast_approval_includes_action_buttons` 单元测试通过。
 
 - **[Git 提交图谱与大纲优化] 默认首选 Git 面板，收起导轨按钮加大加显，移动端底抽屉自适应**：
@@ -2520,7 +2520,7 @@
 
 - **[预览版更新检测] Beta 预览通道优先匹配最新预发布版，正确展示预览版版本号**：
   - **技术机理 / 现象溯源**: 原更新检测逻辑因 SemVer 规范将同版本的正式版权重置于预发布版之上，导致用户切换到 Beta 预览通道时版本号被正式版覆盖。
-  - **实现防线 / 核心改动**: 优化 `crates/jeikcode-daemon/src/api_update.rs`，在 Beta 通道下优先抓取标记为 `prerelease: true` 的最新版本，确保预览版版本号精准呈现。
+  - **实现防线 / 核心改动**: 优化 `crates/zap-daemon/src/api_update.rs`，在 Beta 通道下优先抓取标记为 `prerelease: true` 的最新版本，确保预览版版本号精准呈现。
   - **验证与交付**: 编译并运行后端 `test_compare_versions` 单元测试通过。
 
 - **[多媒体图片灯箱] 全屏大图预览新增触控友好关闭按钮 (✕ 按钮)**：
@@ -2577,7 +2577,7 @@
 - **[Prompt Discipline] One verification rule, no DeepSeek extra execution block, and no test ritual on review or tiny copy edits**:
   - **Technical Root Cause / Detail**: DeepSeek's `EXECUTION DISCIPLINE` restated verify/finish-the-job as hard rules, and fallback `RULES` still said batch compile/test was mandatory unless the user forbade it. Models ran formatters and checks on PR checkout, code review, and every small edit.
   - **Implementation Mechanism**: Drop `FIRM_EXECUTION_DISCIPLINE` for all models. Keep a single Modification Closure in live `rules.yaml` and fallback `RULES`: one complete check covering the code you changed this request after those edits are in, rather than testing after every small edit. Code review, read-only, checkout, and a few copy/comment/literal edits finish without a test run. WORKFLOW / CARRY IT THROUGH say deliver instead of verify.
-  - **Verification & Testing**: `cargo test -p jeikcode-coding --lib persona::` (42 tests). `cargo test -p jeikcode-config --test unified_prompt`.
+  - **Verification & Testing**: `cargo test -p zap-coding --lib persona::` (42 tests). `cargo test -p zap-config --test unified_prompt`.
 
 ---
 
@@ -2596,7 +2596,7 @@
 - **[Coding Agent Reminders] Open with a `code_explore` tail, nudge wander searches on tool results, and put Plan Mode on the same user message**:
   - **Technical Root Cause / Detail**: `code_explore` was under-triggered. Independent synthetic User blocks stole recency or looked user-authored. A DeepSeek-only skill-first block and an edit-then-verify continuation (`You made code edits but have not verified them…`) added extra loop turns.
   - **Implementation Mechanism**: First real user query gets a stored `<system-reminder>` tail (with the date). A per-session meter counts `grep`+`glob`+`read_file`; the 8th combined call in a window of 10 appends a wander reminder to that tool result; a full window or one `code_explore` resets the count. Plan Mode appends to the current user block after the date. `SkillFirstHook` and `VerifyCadenceHook` are removed. Claude Code `SessionStart` additional context is `synthetic_user`.
-  - **Verification & Testing**: `cargo test -p jeikcode-coding --lib` for `code_tools_first`, `plan_mode`, and `todo`. `cargo test -p jeikcode-capabilities --lib --features cc-hooks session_start_injects_synthetic`.
+  - **Verification & Testing**: `cargo test -p zap-coding --lib` for `code_tools_first`, `plan_mode`, and `todo`. `cargo test -p zap-capabilities --lib --features cc-hooks session_start_injects_synthetic`.
 
 - **[Prompt Discipline] Safe CLIs run as the install/login check; irreversible steps get one cheap exists/login probe**:
   - **Technical Root Cause / Detail**: Models often ran `which` / `gh auth status` / `npm whoami` before a harmless command.
@@ -2634,21 +2634,21 @@
 
 - **[Desktop Model Configuration Loading] Treat empty 401 as missing token rather than JSON syntax error, reporting genuine status even with existing configuration**:
   - **Manifestation of Empty 401**: When launching the desktop app and opening model settings, the modal displayed `加载失败: Failed to execute 'json' on 'Response': Unexpected end of JSON input`. Users already had `~/.jeikcode/config.toml` configured. The root cause was `GET /config` routed through webui token middleware; missing or invalid tokens made `require_webui_token` return `Err(StatusCode::UNAUTHORIZED)` with an empty HTTP body. The frontend `getConfig()` called `resp.json()` directly, throwing SyntaxError on empty responses.
-  - **Authentication Failure JSON Response**: Added `unauthorized_payload()` in `crates/jeikcode-daemon/src/auth_token.rs`, responding with `{"success":false,"error":"Unauthorized: missing or invalid access token"}` instead of an empty status code across `require_webui_token` and `require_app_user_id`.
+  - **Authentication Failure JSON Response**: Added `unauthorized_payload()` in `crates/zap-daemon/src/auth_token.rs`, responding with `{"success":false,"error":"Unauthorized: missing or invalid access token"}` instead of an empty status code across `require_webui_token` and `require_app_user_id`.
   - **Resilient Frontend Parsing**: Added `readApiJson()` in `webui/src/api.ts` to inspect body text before parsing. Empty 401 raises explicit Unauthorized, preventing `Unexpected end of JSON input`. Model settings modal maps 401/unauthorized errors to an informative message instructing users to reopen the desktop app.
   - **Robust Token Persistence in Desktop WebView**: URL query param `?token=` is written to both `sessionStorage` and `localStorage`, then scrubbed from address bar once persisted (CWE-598). Retains `?token=` if storage is unavailable. `authHeaders()` dynamically reads token per request rather than static module load constants.
   - **Onboarding Safeguard**: On `desktop=1`, failure in `getModels()` no longer forces first-time onboarding. Empty model list triggers onboarding only when request succeeded with zero models.
-  - **Verification**: `cargo test -p jeikcode-daemon unauthorized_payload` passed. WebUI `npm test` passed 281 test suites including empty 401, JSON 401, and successful `GET /config`.
+  - **Verification**: `cargo test -p zap-daemon unauthorized_payload` passed. WebUI `npm test` passed 281 test suites including empty 401, JSON 401, and successful `GET /config`.
 
 ---
 
 - **[桌面模型配置加载] 打开模型配置时不再把空 401 当成 JSON 解析失败，配置文件还在也能显示真实原因**：
   - **空 401 的表象**：桌面启动后打开模型配置，弹窗显示 `加载失败: Failed to execute 'json' on 'Response': Unexpected end of JSON input`。用户本机已有 `~/.jeikcode/config.toml`（新 schema 的 `[models.*]` / `[provider_accounts.*]`）。根因是 `GET /config` 走 webui token 中间件；缺 token 或 token 无效时，`require_webui_token` 返回 `Err(StatusCode::UNAUTHORIZED)`，Axum 给出**空 body**。前端 `getConfig()` 直接 `resp.json()`，浏览器对空响应抛出该 SyntaxError。
-  - **鉴权失败返回 JSON**：`crates/jeikcode-daemon/src/auth_token.rs` 增加 `unauthorized_payload()`，401 正文为 `{"success":false,"error":"Unauthorized: missing or invalid access token"}`。`require_webui_token` 与 `require_app_user_id` 都走这条响应，不再返回空状态码。
+  - **鉴权失败返回 JSON**：`crates/zap-daemon/src/auth_token.rs` 增加 `unauthorized_payload()`，401 正文为 `{"success":false,"error":"Unauthorized: missing or invalid access token"}`。`require_webui_token` 与 `require_app_user_id` 都走这条响应，不再返回空状态码。
   - **前端安全解析**：`webui/src/api.ts` 新增 `readApiJson()`。`getConfig()` 先读文本再解析；空 401 抛出明确的 Unauthorized，不再触发 `Unexpected end of JSON input`。模型配置弹窗把 401 / unauthorized / access token 映射为「访问令牌无效或缺失。配置文件还在，请关闭后重新打开桌面端。」
   - **token 在桌面 WebView 里更稳**：URL 里的 `?token=` 同时写入 `sessionStorage` 和 `localStorage`。存成功后再从地址栏去掉 token（CWE-598）。存储不可用时保留 `?token=`，避免刷新后所有 API 401。`authHeaders()` 每次请求现读 token，不再用模块加载时的一次性常量。
   - **首次向导不再把鉴权失败当成没配模型**：`desktop=1` 时 `getModels()` 失败不再弹出 onboarding。空模型列表（请求成功且长度为 0）才进入向导。
-  - **验证**：`cargo test -p jeikcode-daemon unauthorized_payload` 通过。`webui` `npm test` 281 项通过，含空 401、带 JSON 的 401、以及成功 `GET /config`。已执行 `webui` `npm run build`。未在已安装的桌面窗口里再点一次。
+  - **验证**：`cargo test -p zap-daemon unauthorized_payload` 通过。`webui` `npm test` 281 项通过，含空 401、带 JSON 的 401、以及成功 `GET /config`。已执行 `webui` `npm run build`。未在已安装的桌面窗口里再点一次。
 
 ## v7.1.48 (2026-10-04)
 
@@ -2668,7 +2668,7 @@
   - **无 token 不落盘**：勾选无 token 只对这一次进程调用 `apply_remote_auth(true)`。文件不写 `no_token`，也不清掉已保存的 token。同时改了端口时只更新端口，沿用文件里原来的 token。下次启动仍带 token。
   - **面板不再另开第二个监听**：请求带 `apply_launch: true` 时走上述保存逻辑，不碰 `extra_remote`。主监听已是非回环地址时地球图标为绿色。关闭按钮去掉，因为这一个端口就是桌面窗口自己的服务。未带 `apply_launch` 的调用仍走原来的额外监听。打开面板时，只有额外监听还开着才查 Windows 防火墙，避免主监听为 `0.0.0.0` 时弹出放行提示。
   - **修复 CI 编译错误**：`firewall_rule_matches` 在返回 `bool` 的函数里对 `netsh_text` 的 `Option` 使用了 `?`。改为匹配不到规则文本时直接返回 `false`。
-  - **验证**：`cargo check -p jeikcode-daemon --lib` 通过。`cargo test -p jeikcode-daemon --lib api_config::tests` 9 项通过，覆盖同端口立即生效、改端口只落盘、无 token 不落盘。桌面 `parse_webui_listen` 单测通过。
+  - **验证**：`cargo check -p zap-daemon --lib` 通过。`cargo test -p zap-daemon --lib api_config::tests` 9 项通过，覆盖同端口立即生效、改端口只落盘、无 token 不落盘。桌面 `parse_webui_listen` 单测通过。
 
 ## v7.1.46 (2026-10-04)
 
@@ -2682,38 +2682,38 @@
 
 - **[会话切换与通知点击] 切会话不再丢掉未落盘的回答，通知点击不再闪出命令行窗口**：
   - **切会话以磁盘上真实的助手消息为准**：`Chat.tsx` 不再把「还没有助手消息」当成已经结算，避免离开再回来时用空结果盖掉内存里的进行中内容。进行中的会话继续走 `/chat/watch`，不再改成只轮询磁盘。
-  - **Windows 通知点击不再弹出控制台**：`jeikcode-focus:` 改为由 `notify-focus.vbs` 经 `wscript` 隐藏启动 PowerShell。聚焦时优先找桌面进程 `jeikcode-desktop`，并跳过浏览器窗口；最小化窗口会先还原再置前。
+  - **Windows 通知点击不再弹出控制台**：`jeikcode-focus:` 改为由 `notify-focus.vbs` 经 `wscript` 隐藏启动 PowerShell。聚焦时优先找桌面进程 `zap-desktop`，并跳过浏览器窗口；最小化窗口会先还原再置前。
   - **多页面不会抢掉同一次点击**：`/notify-focus` 改为带单调 `version` 的状态，GET 不再把待跳转会话取走。WebUI 记下已见版本，只有更新的点击才派发 `jeikcode:focus-session`。
 
 ## v7.1.45 (2026-10-04)
 
 - **[临时远程访问与安全鉴权深度治理] 彻底根除 WebUI 临时远程监听鉴权失效与局域网不可达缺陷，全面支持双栈绑定与动态原子 Token 保护**：
   - **动态原子鉴权开关与 Token 强制执行**：针对守护进程以免鉴权模式启动后 `enforce_token` 静态写死导致临时暴露局域网时鉴权完全形同虚设的安全漏洞，将 `AppState.enforce_token` 升级为 `Arc<AtomicBool>` 动态原子控制，并在开启临时远程访问时即时激活 Token 强校验，坚决拦截无凭证请求返回 401 Unauthorized；
-  - **全链路双栈监听与 CORS 放行修复**：在 `crates/jeikcode-daemon/src/api_config.rs` 中补齐 IPv6 `[::]:port` 双栈监听与多任务生命周期管理，并在 `is_allowed_cors_origin` 中放宽对客户端直连 Host 与公网双栈 IPv6 的校验，彻底打通局域网跨设备直连；
+  - **全链路双栈监听与 CORS 放行修复**：在 `crates/zap-daemon/src/api_config.rs` 中补齐 IPv6 `[::]:port` 双栈监听与多任务生命周期管理，并在 `is_allowed_cors_origin` 中放宽对客户端直连 Host 与公网双栈 IPv6 的校验，彻底打通局域网跨设备直连；
   - **状态持久化与 URL 完整回显**：解除了 `already` 状态死锁判定，在 `ExtraRemoteBind` 中持久化记录当前绑定的活跃 Token，保证 GET/POST 状态接口生成的访问链接 100% 完整携带 `?token=...`，支持随时热更新参数。
 
 - **[跨平台桌面通知体系全面重构与交互动作升级] 消除双重通知重叠与窗口闪烁缩放顽疾，打通 Windows/macOS/Linux 原生交互通知与一键审批**：
   - **单通道通知收敛与消除双重重叠**：完全移除 Web 前端重复触发的浏览器内置 Web Notification，统一收敛至操作系统原生桌面通知（Windows Toast / macOS UserNotifications / Linux notify-send），彻底解决右下角多弹窗叠层遮挡问题；
-  - **Windows WinRT Toast 原生交互按钮支持**：在 `crates/jeikcode-capabilities/src/notify.rs` 中升级 Toast XML 模板，当触发工具审批（`permission_request`）时原生注入 `[ Approve ]` 与 `[ Deny ]` 操作按钮，用户无需切换前台窗口即可在 Windows 屏幕右下角点击按钮秒级完成权限审批；提问（`request_user_input`）通知自动注入 `[ Answer / 作答 ]` 快捷按钮直达问题；
+  - **Windows WinRT Toast 原生交互按钮支持**：在 `crates/zap-capabilities/src/notify.rs` 中升级 Toast XML 模板，当触发工具审批（`permission_request`）时原生注入 `[ Approve ]` 与 `[ Deny ]` 操作按钮，用户无需切换前台窗口即可在 Windows 屏幕右下角点击按钮秒级完成权限审批；提问（`request_user_input`）通知自动注入 `[ Answer / 作答 ]` 快捷按钮直达问题；
   - **Win32 窗口前台穿透激活与尺寸保护 (ForceActivate)**：彻底重构 `notify-focus.ps1` 窗口聚焦脚本，引入 Alt 键微秒级按键事件挂起 Windows 内核的 `ForegroundLockTimeout` 超时限制，结合 `AttachThreadInput` 与 `SwitchToThisWindow` 实现 100% 稳定置顶前台激活；未最小化时绝不调用 ShowWindow，彻底消除多次重绘引起的闪烁，100% 保护最大化与 Windows 11 Aero Snap 贴靠尺寸不缩水；
   - **macOS 与 Linux 提问与审批通知全支持**：在 `notify-focus.sh` 脚本中增加动作解析，Linux 下通过 `notify-send -A` 原生支持 Approve/Deny 按钮点击提交，macOS 下原生调用 `UNUserNotificationCenter` 弹窗提醒，点击秒级无损激活置顶前台会话。
 
 ## v7.1.44 (2026-10-04)
 
 - **[Windows 桌面 Toast 通知协议唤醒与焦点穿透 (Windows Toast Protocol Activation & Session Focus)] 攻克 WinRT 原生通知点击无法唤醒应用与会话定位问题，建立完整系统 Protocol Scheme 与守护进程鉴权通知总线**：
-  - **WinRT Toast 注册 AUMID 方案重构与 Banner 显示修复**：在 `crates/jeikcode-capabilities/src/notify.rs` 中排除无响应的未注册裸 `JeikCode` AUMID，优先使用标准 Windows PowerShell AUMID (`{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe`) 触发 Toast 弹窗，根除 `Show()` 假成功但不弹出横幅通知缺陷；Toast 悬留时间延长至 `duration="long"`，并完善 XML 实体转义机制。
+  - **WinRT Toast 注册 AUMID 方案重构与 Banner 显示修复**：在 `crates/zap-capabilities/src/notify.rs` 中排除无响应的未注册裸 `JeikCode` AUMID，优先使用标准 Windows PowerShell AUMID (`{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe`) 触发 Toast 弹窗，根除 `Show()` 假成功但不弹出横幅通知缺陷；Toast 悬留时间延长至 `duration="long"`，并完善 XML 实体转义机制。
   - **注册 Windows 自定义 URI 协议 (`jeikcode-focus:`)**：在 `notify.rs` 中新增 `install_windows_focus_protocol`，自动注册 `HKCU\Software\Classes\jeikcode-focus` 协议，动态生成 `~/.jeikcode/notify-focus.ps1` 唤醒脚本；点击 Toast 通知时通过 Win32 API (`SetForegroundWindow`/`ShowWindow`/`BringWindowToTop`) 将最小化或后台的 JeikCode 窗口平滑置顶。
-  - **守护进程安全通知通道与会话跳转**：在 `crates/jeikcode-daemon/src/lib.rs` 中新增 `/notify-focus` POST/GET 端点，基于 32 位 Hex 进程安全秘钥防护攻击；前端 `webui/src/api.ts` 与 `app.tsx` 引入轻量轮询探针，接收点击回调时自动触发 `jeikcode:focus-session` 全局事件并精准无缝跳转至对应会话。
+  - **守护进程安全通知通道与会话跳转**：在 `crates/zap-daemon/src/lib.rs` 中新增 `/notify-focus` POST/GET 端点，基于 32 位 Hex 进程安全秘钥防护攻击；前端 `webui/src/api.ts` 与 `app.tsx` 引入轻量轮询探针，接收点击回调时自动触发 `jeikcode:focus-session` 全局事件并精准无缝跳转至对应会话。
   - **全量 OS 通知响应策略**：更新 `webui/src/lib/sessionNotify.ts` 与 `Chat.tsx`，将 `shouldOsNotifyTerminal` 优化为全量触发模式，保证无论前后台状态，回合完成时系统通知中心均能准确捕获，实现无遗漏的离线完成追溯。
 
 
 ## v7.1.43 (2026-10-04)
 
 - **[桌面端通知系统深度治理与抗休眠加固] 根除 WebUI 套壳/桌面端窗口最小化与失焦时通知失效缺陷，打通系统原生通知与点击唤醒会话跳转闭环**：
-  - **新建会话 Terminal 事件镜像修复**：修复 `crates/jeikcode-daemon/src/lib.rs` 的 `fanout_chat_events_for_session` 中因新建会话初始 `session_id` 为 `None` 导致 `ChatEvent::Done` 事件被静默跳过、未记录进全局会话运行时注册表（`SessionRuntimeRegistry`）的严重缺陷，动态提取权威会话 ID，保证第一轮消息完成时 `last_terminal` 与 `terminal_seq` 100% 递增生效。
+  - **新建会话 Terminal 事件镜像修复**：修复 `crates/zap-daemon/src/lib.rs` 的 `fanout_chat_events_for_session` 中因新建会话初始 `session_id` 为 `None` 导致 `ChatEvent::Done` 事件被静默跳过、未记录进全局会话运行时注册表（`SessionRuntimeRegistry`）的严重缺陷，动态提取权威会话 ID，保证第一轮消息完成时 `last_terminal` 与 `terminal_seq` 100% 递增生效。
   - **前端抗休眠零延迟直接通知通道**：针对 Chromium/WebView2 桌面套壳在窗口最小化或后台失焦时对 `setInterval` 定时器进行强制节流与冻结（Timer Throttling/Freeze）导致通知被阻断的问题，在 `webui/src/components/Chat.tsx` 的 SSE `case 'done'` 完成事件处理处建立零延迟直达通道，失焦时直接触发操作系统桌面通知，彻底绕过前端轮询休眠限制。
   - **点击通知唤醒置顶并自动定位会话 (Click-to-Focus & Auto-Navigate)**：在 `webui/src/lib/sessionNotify.ts` 中封装 `dispatchSystemNotification`，绑定 Web Notification 的 `onclick` 回调，在 `webui/src/app.tsx` 中建立 `jeikcode:focus-session` 全局事件响应总线；用户在桌面右下角点击系统通知或应用内卡片时，窗口自动还原置顶唤醒，并瞬时平滑跳转切换至对应会话的时间线。
-  - **Windows Toast AUMID 通用兼容扩充**：在 `crates/jeikcode-capabilities/src/notify.rs` 的 PowerShell WinRT 脚本中扩充 Windows 常见系统级应用标识符（`JeikCode`、`Microsoft.Windows.Explorer`、`Microsoft.WindowsTerminal` 等），确保独立便携版与打包安装版均能 100% 成功唤起 Windows 系统的右下角横幅 Toast 通知。
+  - **Windows Toast AUMID 通用兼容扩充**：在 `crates/zap-capabilities/src/notify.rs` 的 PowerShell WinRT 脚本中扩充 Windows 常见系统级应用标识符（`JeikCode`、`Microsoft.Windows.Explorer`、`Microsoft.WindowsTerminal` 等），确保独立便携版与打包安装版均能 100% 成功唤起 Windows 系统的右下角横幅 Toast 通知。
   - **前台焦点智能免打扰**：在 `webui/src/lib/sessionNotify.ts` 与 `NotificationDock.tsx` 中新增智能免打扰判定，当用户正处于当前前台会话窗口亲眼看着 Agent 回复结束时，自动抑制多余的右下角应用内卡片与系统提示，实现“前台专注无打扰，后台离开准时报”。
 
 - **[多项目会话树状归属与视觉层级重构] 彻底根治左侧栏会话字号倒挂与层级扁平错觉，建立工业级树形结构引导线与对话节点语义**：
@@ -2724,12 +2724,12 @@
 ## v7.1.42 (2026-10-04)
 
 - **[会话落盘与状态快速探测] 新增轻量级会话新鲜度端点与前端轮询减负，消除多余反序列化与频繁磁盘 I/O**：
-  - **轻量会话新鲜度探针 (`/freshness`)**：在 `crates/jeikcode-daemon/src/lib.rs` 中新增 `GET /projects/:hash/sessions/:id/freshness` 路由，仅通过对 snapshot、jsonl 与 presentation 三个底层文件的 `fs::metadata` 快速 stat 聚合总字节数和最大 mtime（`bytes:mtime_ms`），不读取、不反序列化庞大消息体；结合服务端实时会话池返回当前会话 running 活跃状态。
+  - **轻量会话新鲜度探针 (`/freshness`)**：在 `crates/zap-daemon/src/lib.rs` 中新增 `GET /projects/:hash/sessions/:id/freshness` 路由，仅通过对 snapshot、jsonl 与 presentation 三个底层文件的 `fs::metadata` 快速 stat 聚合总字节数和最大 mtime（`bytes:mtime_ms`），不读取、不反序列化庞大消息体；结合服务端实时会话池返回当前会话 running 活跃状态。
   - **前端智能落盘感知与降频轮询**：`webui/src/components/Chat.tsx` 引入 `catchUpFromDisk` 机制，在途流式期间免触碰磁盘，仅在静默期通过签名比对探测真实落盘变化；将脱机轮询间隔平滑优化至 2000ms，在落盘终结后原子收敛至 `authoritative_terminal`，大幅降低前端重绘与系统 I/O 开销。
 
 - **[会话完成通知与通知坞站系统] 引入全局通知坞站组件，跨平台支持事件捕获与系统通知**：
   - **通知坞站组件 (NotificationDock)**：新增 `webui/src/components/NotificationDock.tsx`，集中挂载并展示长耗时任务完成提醒、权限卡片审批及用户交互输入（UserInputCard）通知，支持状态机无缝闭环与桌面 Native 通知分发。
-  - **底层能力与路由调度支持**：在 `crates/jeikcode-capabilities/src/notify.rs` 及 daemon 核心路由中打通通知事件流，并在前端 `webui/src/lib/sessionNotify.ts` 提供完备的状态管理与单元测试防线。
+  - **底层能力与路由调度支持**：在 `crates/zap-capabilities/src/notify.rs` 及 daemon 核心路由中打通通知事件流，并在前端 `webui/src/lib/sessionNotify.ts` 提供完备的状态管理与单元测试防线。
 
 - **[自动化发版流水线与多分支演进] 引入自动 Bump 脚本、独立 Beta 预发布通道与英文优先规范**：
   - **跨生态版本号一键同步 (`npm run bump`)**：新增 `scripts/bump-version.js`，支持 `npm run bump:beta`、`bump:patch`、`bump:minor`、`bump:major`，一键联动同步 `Cargo.toml`、`webui/package.json`、`desktop/src-tauri` 及 `package.json` 版本声明。
@@ -2748,7 +2748,7 @@
 ## v7.1.41 (2026-10-03)
 
 - **[全局语言开关与英文默认] 未初始化时界面、安装文档与 `--host` 提示统一为英文，语言选择写回同一份配置**：
-  - **配置种子与升级保护**：`crates/jeikcode-cli/assets/default-config.toml` 与 `crates/jeikcode-coding/assets/default-config.toml` 的 `language` 改为 `en`。`merge_user_config_preserving_models` 将 `language` 列入保留键，升级不会把用户已选的语言盖回模板。缺失该字段时，WebUI 与 daemon 按英文处理。
+  - **配置种子与升级保护**：`crates/zap-cli/assets/default-config.toml` 与 `crates/zap-coding/assets/default-config.toml` 的 `language` 改为 `en`。`merge_user_config_preserving_models` 将 `language` 列入保留键，升级不会把用户已选的语言盖回模板。缺失该字段时，WebUI 与 daemon 按英文处理。
   - **WebUI / 桌面跟随同一开关**：`webui/src/settings.tsx` 启动时读取 `GET /config` 的 `language`，右上角切换调用 `POST /config/language` 写回 `config.toml`，并立刻 `set_locale`。桌面壳打开的是同一套 WebUI。
   - **`--host` 启动文案**：`host_service.rs`、`systemd.rs`、`server_cmd.rs` 的登录自启提问与结果说明按当前 locale 输出，不再写死中文。
   - **升级配置提示**：`config_sync.rs` 的差异说明与应用结果按当前语言生成；WebUI `ConfigSyncModal` 的已选计数走 i18n。
@@ -2772,14 +2772,14 @@
 - **[多项目会话隔离与端到端目录穿透根治] 彻底消除 WebUI 在多项目间新建聊天与快速切换会话时的并发竞态与工作目录污染，草稿权威绑定与状态机原子化收敛**：
   - **前端导航序列号屏障与过期响应熔断 (NavSeq Cancellation & Race Guard)**：针对用户在项目 B 点击 `+`（新建聊天）异步请求 `createSession` 在途期间快速切换至项目 A 会话的并发竞态，在 `webui/src/app.tsx` 中引入单调递增导航序列号 `navSeqRef`。当用户在响应返回前切换会话、切换项目或重新新建时，递增序列号使在途请求立即失效；`createSession.then` 严格校验序列一致性，主动丢弃过期响应，坚决杜绝旧项目的延迟回调暴力覆盖当前视图的会话 ID 与元数据。
   - **前端会话权威工作目录原子收敛 (Authoritative Session Cwd Binding)**：在 `webui/src/components/Chat.tsx` 中建立以当前活跃会话自身为最高真理的 `effectiveWorkingDir` 计算模型（`activeSession.working_dir ?? cwd`），并将 `/chat` 流式会话、`/fs/upload` 附件上传、`/compact` 会话压缩、Git 状态面板以及 `@` 目录自动补全全面收敛绑定至会话专属目录；同时在 `openNewSession` 发起前立即预先同步 `cwd`，并在有效响应回调中原子补齐 `setCwd(data.working_dir)`，彻底根除前后端目录状态分裂与丢失。
-  - **后端草稿目录绝对权威性校验与防篡改 (Session Draft Absolute Directory Authority)**：在 `crates/jeikcode-daemon/src/lib.rs` 的核心对话路由 `process_chat_request` 中，针对客户端请求携带的草稿 `session_id`，强制以 `crate::native_live::session_draft_working_dir` 在内存中登记的原初目录为绝对权威；无论客户端由于并发竞态或其他异常传入何种外层 `req.working_dir`，后端强行校正其 `working_dir` 与计算出的 `project_bucket`，彻底根除将草稿会话错误落盘至其他项目目录与 bucket 的安全漏洞，从根本上消除了会话“穿透跑到其他项目列表”的隐患。
-  - **跨项目已落盘会话自动寻址校准 (Cross-Project Resolved Catalog Healing)**：在会话未命中当前请求目录所对应的 `project_bucket` 时，通过 `resolve_session_by_id` 自动跨项目扫描定位该会话真正的归属项目与权威目录，并在 `process_chat_request` 中自动对齐 `working_dir`；同时升级 `crates/jeikcode-daemon/src/live_api.rs` 的 `live_message` 路由，针对多项目并发调用优先解析草稿与已落盘会话目录，杜绝误用全局 `state.project`。
-  - **自动化测试防线与多项目状态验证 (Full Test Coverage & Verification)**：在前端 `webui/src/lib/sessionList.test.ts` 中新增异步时序竞态单元测试，模拟高频点击切换与网络乱序返回，验证过期响应被精准丢弃；在后端 `crates/jeikcode-daemon/src/lib.rs` 中新增 `session_draft_working_dir_guards_against_cross_project_penetration` 跨项目隔离测试，验证在伪造恶意或竞态 working_dir 场景下后端权威目录与 bucket hash 的绝对物理隔离；全套 268 项前端测试及工作区 `cargo check` 100% 绿灯通过。
+  - **后端草稿目录绝对权威性校验与防篡改 (Session Draft Absolute Directory Authority)**：在 `crates/zap-daemon/src/lib.rs` 的核心对话路由 `process_chat_request` 中，针对客户端请求携带的草稿 `session_id`，强制以 `crate::native_live::session_draft_working_dir` 在内存中登记的原初目录为绝对权威；无论客户端由于并发竞态或其他异常传入何种外层 `req.working_dir`，后端强行校正其 `working_dir` 与计算出的 `project_bucket`，彻底根除将草稿会话错误落盘至其他项目目录与 bucket 的安全漏洞，从根本上消除了会话“穿透跑到其他项目列表”的隐患。
+  - **跨项目已落盘会话自动寻址校准 (Cross-Project Resolved Catalog Healing)**：在会话未命中当前请求目录所对应的 `project_bucket` 时，通过 `resolve_session_by_id` 自动跨项目扫描定位该会话真正的归属项目与权威目录，并在 `process_chat_request` 中自动对齐 `working_dir`；同时升级 `crates/zap-daemon/src/live_api.rs` 的 `live_message` 路由，针对多项目并发调用优先解析草稿与已落盘会话目录，杜绝误用全局 `state.project`。
+  - **自动化测试防线与多项目状态验证 (Full Test Coverage & Verification)**：在前端 `webui/src/lib/sessionList.test.ts` 中新增异步时序竞态单元测试，模拟高频点击切换与网络乱序返回，验证过期响应被精准丢弃；在后端 `crates/zap-daemon/src/lib.rs` 中新增 `session_draft_working_dir_guards_against_cross_project_penetration` 跨项目隔离测试，验证在伪造恶意或竞态 working_dir 场景下后端权威目录与 bucket hash 的绝对物理隔离；全套 268 项前端测试及工作区 `cargo check` 100% 绿灯通过。
 
 - **[Session 级 MCP 隔离与多会话环境注入] 为会话作用域 stdio MCP 子进程注入会话身份，并发 Schema 探测双重检查锁治理**：
-  - **会话级环境变量安全注入 (`JEIKCODE_SESSION_ID`)**：在 `crates/jeikcode-capabilities/src/mcp/transport_stdio.rs` 中为 `StdioClient` 增加会话身份标识；在启动会话级 MCP 子进程时完成安全校验，并将 `JEIKCODE_SESSION_ID` 正式注入子进程运行环境变量，使下游 MCP 服务可原生感知并区分会话上下文。
+  - **会话级环境变量安全注入 (`JEIKCODE_SESSION_ID`)**：在 `crates/zap-capabilities/src/mcp/transport_stdio.rs` 中为 `StdioClient` 增加会话身份标识；在启动会话级 MCP 子进程时完成安全校验，并将 `JEIKCODE_SESSION_ID` 正式注入子进程运行环境变量，使下游 MCP 服务可原生感知并区分会话上下文。
   - **断线自愈重连状态保全**：升级 `clone_for_recovery` 机制，在 stdio 管道异常重连时完整继承会话 ID 与作用域身份，防止自愈后丢失会话上下文；沿 `McpRegistry` 与 `SessionMcpPool` 调用链路完整透传 `session_id`，严格仅对声明了 `scope: "session"` 的服务执行隔离。
-  - **并发 Schema 探测双重检查锁 (Double-Checked Locking)**：在 `crates/jeikcode-capabilities/src/mcp/schema_cache.rs` 的 `ensure_session_mcp_schema` 中引入双重检查锁，根治多会话并发冷启动时重复拉起探测子进程的资源竞争，测试等待时序与后台异步探测稳定性大幅增强。
+  - **并发 Schema 探测双重检查锁 (Double-Checked Locking)**：在 `crates/zap-capabilities/src/mcp/schema_cache.rs` 的 `ensure_session_mcp_schema` 中引入双重检查锁，根治多会话并发冷启动时重复拉起探测子进程的资源竞争，测试等待时序与后台异步探测稳定性大幅增强。
 
 - **[WebUI 乐观会话集合与首发切走防丢] 乐观会话字典级去重保护，转圈动效即刻反馈与前后端状态无缝衔接**：
   - **会话集合级乐观持久化 (`optimisticSessions`)**：全面重构会话挂载机制，支持跨会话切换的多条乐观记录集合。用户在新建会话首发消息后立即切换至其他会话时，侧栏完整保留该正在进行中的新建会话，彻底解决因等待落盘而在侧栏瞬间消失的严重体验缺陷。

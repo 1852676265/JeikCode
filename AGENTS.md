@@ -4,8 +4,8 @@
 
 ## 1. Core Mechanics & Knowledge Base Maintenance
 
-- **Prompt Lifecycle**: User directory `~/.jeikcode/prompts/` supports hot-reloading. Production baseline prompts are maintained exclusively in `crates/jeikcode-coding/assets/prompts/` and distributed via binaries.
-- **Teaches Sync**: `crates/jeikcode-capabilities/assets/teaches/` serves as the authoritative source for `jeikcode_config` (`action="guide"`). Always sync documentation here when adjusting model configuration logic or tool parameters.
+- **Prompt Lifecycle**: User directory `~/.jeikcode/prompts/` supports hot-reloading. Production baseline prompts are maintained exclusively in `crates/zap-coding/assets/prompts/` and distributed via binaries.
+- **Teaches Sync**: `crates/zap-capabilities/assets/teaches/` serves as the authoritative source for `zap_config` (`action="guide"`). Always sync documentation here when adjusting model configuration logic or tool parameters.
 
 ---
 
@@ -65,7 +65,7 @@
 Prefer CI for every command below; run locally only under the CI-first exceptions above.
 
 - **Frontend (`webui/`)**: `cd webui && npm run build`.
-- **Rust (`crates/`)**: `cargo check --lib -p jeikcode-daemon`.
+- **Rust (`crates/`)**: `cargo check --lib -p zap-daemon`.
 - **Static / Lightweight**: Constants, copy, prompts, and minor configs may be committed directly without compilation.
 - **Targeted Unit Tests**: Dedicated tests (e.g., `node --test webui/src/lib/xxx.test.ts`).
 - **Missing Toolchains**: When a required toolchain is absent, skip the local run, keep the change minimal, and explicitly report what remains unverified for GitHub Actions CI.

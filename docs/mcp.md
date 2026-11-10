@@ -2,7 +2,7 @@
 
 > JeikCode 实现了 **MCP（Model Context Protocol）客户端**：通过 `.mcp.json` / `~/.jeikcode/mcp.json` 连接外部 MCP server，把它们的 **tools** 暴露成与内建工具一致的可调用工具（含审批链路）。
 >
-> 实现位于 **`crates/jeikcode-capabilities/src/mcp/`**（L1 能力层，`mcp` Cargo feature，非 default），零 `jeikcode-core` 依赖。
+> 实现位于 **`crates/zap-capabilities/src/mcp/`**（L1 能力层，`mcp` Cargo feature，非 default），零 `jeikcode-core` 依赖。
 
 ---
 
@@ -113,16 +113,16 @@ TUI 里等价的是 `/mcp login <server>` / `/mcp logout <server>`。token 存 `
 
 ## 3. 运行时行为
 
-**单一装配路径**：TUI / 无头 / clix 都走 `McpRegistry::from_config_background_with_events`（`jeikcode-coding/src/parts.rs:490`）——后台并行连接，不阻塞启动。区别只在要不要等：
+**单一装配路径**：TUI / 无头 / clix 都走 `McpRegistry::from_config_background_with_events`（`zap-coding/src/parts.rs:490`）——后台并行连接，不阻塞启动。区别只在要不要等：
 
 | 模式 | 是否等待 |
 |---|---|
 | TUI | 不等。每个 server `initialize` 成功后，`mount()` 原子发布该 server 的工具供下一轮使用 |
-| 无头 / clix | `runtime.wait_mcp_ready(CONNECT_TIMEOUT)`（30s，`jeikcode-cli/src/main.rs:2251`）等到初次连接尝试全部落定 |
+| 无头 / clix | `runtime.wait_mcp_ready(CONNECT_TIMEOUT)`（30s，`zap-cli/src/main.rs:2251`）等到初次连接尝试全部落定 |
 
 单个 server 失败不拖垮进程；失败通过 `McpConnectEvent::Failed` 进入会话区，并保留在 `/mcp` 列表里显示为 `failed: <error>`。
 
-MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`jeikcode-clix` 提供 `--no-mcp`。主 CLI 没有全局关闭开关，按 server 用 `"disabled": true`。
+MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`zap-clix` 提供 `--no-mcp`。主 CLI 没有全局关闭开关，按 server 用 `"disabled": true`。
 
 `scope=session` 的工具目录来自短生命周期只读探测缓存（启动 / `/mcp reload` / WebUI 刷新）。未 spawn 的会话读探测缓存，已 spawn 的会话以活连接 `tools/list` 为准。每个会话在第一次 `call_tool` 时才起独立进程。正在执行的调用（含后台仍在跑的 Agent）不杀。会话仍挂着 runtime lease 时不回收。切走（`owners == 0`）且距上次 `call_tool` 超过 `config.toml` `[mcp.session] idle_ttl_secs`（默认 600 秒，滑动窗口：仅工具调用 begin/end 刷新；schema 探测、`tools/list`、连接不刷新）后回收该会话进程，下次 `call_tool` 再懒启动；`0` 关闭闲置回收。删除会话或 JeikCode 退出仍立即回收全部 session MCP。热重载按 server 做 config diff：command/args/env/url 等没变则保留活进程，变了只回收那一台。默认 `scope=project` 仍是无状态单例，随进程退出回收。浏览器类 MCP（`chrome-devtools-mcp` / `js-reverse-mcp` 等）默认共用 `~/.cache/chrome-devtools-mcp/chrome-profile`，多 session 并行时请在 `args` 里自行加上 `--isolated` 或独立 `--userDataDir`。
 
@@ -143,7 +143,7 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`jeikcode-clix` 提供
 
 ## 5. `/mcp` 与命令行
 
-**TUI / WebUI 斜杠命令**（TUI：`jeikcode-tuix`；WebUI：`webui/src/lib/slashCommands.ts`）：
+**TUI / WebUI 斜杠命令**（TUI：`zap-tuix`；WebUI：`webui/src/lib/slashCommands.ts`）：
 
 | 命令 | TUI | WebUI | 作用 |
 |---|---|---|---|
@@ -153,11 +153,11 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`jeikcode-clix` 提供
 | `/mcp login <server>` / `/mcp logout <server>` | ✅ | CLI | OAuth 登录 / 清除凭证 |
 | `/mcp trust` / `/mcp untrust` | ✅ | `/mcp trust` | 信任 / 取消信任当前项目 |
 | 侧栏 MCP 刷新按钮 | — | ✅ | 等价 `/mcp reload` |
-| 工具 `jeikcode_config_reload` | ✅ | ✅ | Agent 写完配置后重挂；当前回合结束后生效 |
+| 工具 `zap_config_reload` | ✅ | ✅ | Agent 写完配置后重挂；当前回合结束后生效 |
 
 **CLI 子命令**：`jeikcode mcp add`、`add-github-oauth`、`login`、`logout`（二进制名 `jeikcode` 等价）。
 
-写完配置后调用 `/mcp reload`、WebUI 刷新按钮或 `jeikcode_config_reload`，**不用重启**。
+写完配置后调用 `/mcp reload`、WebUI 刷新按钮或 `zap_config_reload`，**不用重启**。
 
 **daemon HTTP 端点**：`GET /mcp/status`、`POST /mcp/reload`、`POST /live/mcp/trust`。
 
@@ -193,7 +193,7 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`jeikcode-clix` 提供
 
 ## 8. 代码布局
 
-`crates/jeikcode-capabilities/src/mcp/`（feature `mcp`）：
+`crates/zap-capabilities/src/mcp/`（feature `mcp`）：
 
 | 文件 | 职责 |
 |---|---|
@@ -209,7 +209,7 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`jeikcode-clix` 提供
 | `tool.rs` | `McpToolAdapter`：远端工具 → kernel `Tool`，风险等级与审批 |
 | `util.rs` | 本地 home/config-dir 与控制台辅助 |
 
-消费侧：装配在 `jeikcode-coding/src/parts.rs`；`/mcp` 斜杠命令在 `jeikcode-tuix/src/event_loop/commands.rs`；CLI 子命令在 `jeikcode-cli/src/main.rs`；daemon 端点在 `jeikcode-daemon/src/lib.rs`。
+消费侧：装配在 `zap-coding/src/parts.rs`；`/mcp` 斜杠命令在 `zap-tuix/src/event_loop/commands.rs`；CLI 子命令在 `zap-cli/src/main.rs`；daemon 端点在 `zap-daemon/src/lib.rs`。
 
 ---
 
@@ -217,10 +217,10 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`；`jeikcode-clix` 提供
 
 ### 9.1 内置 `mcp-test-server`
 
-源码 `crates/jeikcode-capabilities/src/bin/mcp-test-server.rs`，提供 `echo` 工具（参数 `message`）。**需要 `mcp` feature**（`required-features = ["mcp"]`）：
+源码 `crates/zap-capabilities/src/bin/mcp-test-server.rs`，提供 `echo` 工具（参数 `message`）。**需要 `mcp` feature**（`required-features = ["mcp"]`）：
 
 ```bash
-cargo build --release -p jeikcode-capabilities --features mcp --bin mcp-test-server
+cargo build --release -p zap-capabilities --features mcp --bin mcp-test-server
 ```
 
 产物：`target/release/mcp-test-server`。最小配置：
@@ -241,7 +241,7 @@ cargo build --release -p jeikcode-capabilities --features mcp --bin mcp-test-ser
 ### 9.2 自动化测试
 
 ```bash
-cargo test -p jeikcode-capabilities --features mcp
+cargo test -p zap-capabilities --features mcp
 ```
 
 `tests/mcp.rs` 用上面这个真实子进程覆盖连接/发现/调用、状态检测、重连与并发失败路径；各模块另有内联单测。

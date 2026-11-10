@@ -3,7 +3,7 @@
 ## Step 1: Add a lease-protected repair seam
 
 - Add native session inspection and missing-presentation repair types to
-  `jeikcode-capabilities::session`.
+  `zap-capabilities::session`.
 - Validate native metadata and snapshot before mutation.
 - Create only an absent presentation sidecar, atomically, under the active lease.
 - Reload the strict native aggregate after repair.

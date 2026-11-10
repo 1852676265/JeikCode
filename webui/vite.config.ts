@@ -58,7 +58,7 @@ function autoAuthPlugin(): Plugin {
       if (auth?.token) {
         return html.replace(
           '<head>',
-          `<head><script>try{sessionStorage.setItem('jeikcode_webui_token',${JSON.stringify(auth.token)});}catch(e){}</script>`
+          `<head><script>try{sessionStorage.setItem('zap_webui_token',${JSON.stringify(auth.token)});sessionStorage.setItem('jeikcode_webui_token',${JSON.stringify(auth.token)});}catch(e){}</script>`
         );
       }
       return html;

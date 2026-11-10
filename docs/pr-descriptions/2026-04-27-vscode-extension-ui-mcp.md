@@ -56,7 +56,7 @@ N/A
 ```bash
 # 1. 编译 daemon（Rust 后端）
 cd /Users/liguanchen/Desktop/jeikcode
-cargo build -p jeikcode-daemon --release
+cargo build -p zap-daemon --release
 
 # 2. 编译 VS Code 扩展（TypeScript Extension Host + React Webview）
 cd extensions/vscode
@@ -69,11 +69,11 @@ node webview-ui/esbuild.js         # 编译 Webview UI (webview-ui/src/ → webv
 
 ```bash
 # 启动 daemon（后台运行，监听 0.0.0.0:13456）
-nohup ./target/release/jeikcode-daemon > /tmp/jeikcode-daemon.log 2>&1 &
+nohup ./target/release/zap-daemon > /tmp/zap-daemon.log 2>&1 &
 
 # 验证 daemon 运行状态
 curl http://127.0.0.1:13456/health
-# 期望输出: {"status":"ok","version":"4.20.4","service":"jeikcode-daemon"}
+# 期望输出: {"status":"ok","version":"4.20.4","service":"zap-daemon"}
 
 # 验证 MCP 连接状态
 curl http://127.0.0.1:13456/mcp/status | python3 -m json.tool
@@ -174,12 +174,12 @@ curl http://127.0.0.1:13456/mcp/status | python3 -m json.tool
 | 问题 | 排查方法 |
 |------|---------|
 | 侧边栏空白/不加载 | 检查 daemon 是否运行：`curl http://127.0.0.1:13456/health` |
-| 发送消息无响应 | 查看 daemon 日志：`tail -f /tmp/jeikcode-daemon.log` |
+| 发送消息无响应 | 查看 daemon 日志：`tail -f /tmp/zap-daemon.log` |
 | MCP 工具不可用 | 检查连接：`curl http://127.0.0.1:13456/mcp/status` |
 | webview 样式异常 | 重新构建：`node webview-ui/esbuild.js` 后 Reload Webviews |
 | TypeScript 编译错误 | `npx tsc --noEmit` 查看具体错误 |
 | Tab 模式打不开 | 确认 `npx tsc` 已编译，然后 Reload Window |
-| daemon 端口被占用 | `lsof -i :13456` 查看占用进程，`pkill -f jeikcode-daemon` 停止旧进程 |
+| daemon 端口被占用 | `lsof -i :13456` 查看占用进程，`pkill -f zap-daemon` 停止旧进程 |
 
 ### 七、关键文件速查
 
@@ -200,6 +200,6 @@ extensions/vscode/
 ├── webview/                      # esbuild 编译产物（webview.js/css）
 └── out/                          # tsc 编译产物（extension host）
 
-crates/jeikcode-daemon/src/
+crates/zap-daemon/src/
 └── main.rs                       # HTTP API 服务（含 MCP 集成）
 ```

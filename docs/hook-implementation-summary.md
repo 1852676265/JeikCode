@@ -12,21 +12,21 @@ JeikCode Hook 系统基于 **HookEngine** 统一引擎架构，支持 13 个 tra
 
 | 文件 | 行数 | 说明 |
 |------|:----:|------|
-| `crates/jeikcode-core/src/hook/mod.rs` | ~680 | 13 个 trait 定义、12 个 context 结构体、HookResult/HookEvent 枚举 |
-| `crates/jeikcode-core/src/hook/engine.rs` | ~1284 | **HookEngine** — 统一注册/触发引擎、ShellCommandHook 实现、12 个注册槽位 + 12 个触发方法 |
-| `crates/jeikcode-core/src/hook/script_runner.rs` | ~449 | **ScriptHook** — TOML 配置加载的外部脚本执行（stdin JSON 协议） |
-| `crates/jeikcode-core/src/hook/webhook.rs` | ~748 | **WebhookHook** — HTTP 远程调用，实现 12 个 trait |
-| `crates/jeikcode-core/src/hook/async_batcher.rs` | ~534 | **AsyncWebhookBatcher** — 异步批量发送（mpsc 通道 + tokio 后台任务） |
-| `crates/jeikcode-core/src/hook/built_in.rs` | ~572 | **6 个内置 Hook** — ToolAuditLogHook、TurnStatsHook、AutoCommitHook 等 |
-| `crates/jeikcode-core/src/hook/config_loader.rs` | ~501 | **HooksConfig** — TOML 配置文件加载、Webhook/AsyncWebhook 注册 |
-| `crates/jeikcode-core/src/hook/json_config.rs` | ~561 | **JSON 配置加载** — CC 兼容 `.hooks.json` 加载 |
-| `crates/jeikcode-core/src/hook/config.rs` | ~175 | 工具名匹配工具函数 |
-| `crates/jeikcode-core/src/hook/executor.rs` | ~1115 | ⚠️ **旧 HookExecutor**（已废弃，不再使用，待清理） |
+| `crates/zap-core/src/hook/mod.rs` | ~680 | 13 个 trait 定义、12 个 context 结构体、HookResult/HookEvent 枚举 |
+| `crates/zap-core/src/hook/engine.rs` | ~1284 | **HookEngine** — 统一注册/触发引擎、ShellCommandHook 实现、12 个注册槽位 + 12 个触发方法 |
+| `crates/zap-core/src/hook/script_runner.rs` | ~449 | **ScriptHook** — TOML 配置加载的外部脚本执行（stdin JSON 协议） |
+| `crates/zap-core/src/hook/webhook.rs` | ~748 | **WebhookHook** — HTTP 远程调用，实现 12 个 trait |
+| `crates/zap-core/src/hook/async_batcher.rs` | ~534 | **AsyncWebhookBatcher** — 异步批量发送（mpsc 通道 + tokio 后台任务） |
+| `crates/zap-core/src/hook/built_in.rs` | ~572 | **6 个内置 Hook** — ToolAuditLogHook、TurnStatsHook、AutoCommitHook 等 |
+| `crates/zap-core/src/hook/config_loader.rs` | ~501 | **HooksConfig** — TOML 配置文件加载、Webhook/AsyncWebhook 注册 |
+| `crates/zap-core/src/hook/json_config.rs` | ~561 | **JSON 配置加载** — CC 兼容 `.hooks.json` 加载 |
+| `crates/zap-core/src/hook/config.rs` | ~175 | 工具名匹配工具函数 |
+| `crates/zap-core/src/hook/executor.rs` | ~1115 | ⚠️ **旧 HookExecutor**（已废弃，不再使用，待清理） |
 
 ### 调用侧集成
 
-- `crates/jeikcode-core/src/agent/mod.rs` — AgentLoop 初始化时调用 `HookEngine::load_all()`
-- `crates/jeikcode-core/src/turn/runner.rs` — TurnRunner 在各阶段触发 hook
+- `crates/zap-core/src/agent/mod.rs` — AgentLoop 初始化时调用 `HookEngine::load_all()`
+- `crates/zap-core/src/turn/runner.rs` — TurnRunner 在各阶段触发 hook
 
 ## 架构概览
 

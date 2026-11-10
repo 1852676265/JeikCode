@@ -50,9 +50,9 @@ Close the highest-confidence local/remote security boundary defects found in the
 
 | Contract | Lowest reliable check | Whole-scope check |
 | --- | --- | --- |
-| Non-loopback auth | daemon unit/integration tests around server auth policy | `cargo test -p jeikcode-daemon --lib --locked` |
-| Git discard containment | `api_git` unit tests for descendant/traversal/symlink cases | `cargo test -p jeikcode-daemon --lib --locked` |
-| Sensitive resolved target | `sensitive_path` middleware tests | `cargo test -p jeikcode-capabilities --lib --locked` |
+| Non-loopback auth | daemon unit/integration tests around server auth policy | `cargo test -p zap-daemon --lib --locked` |
+| Git discard containment | `api_git` unit tests for descendant/traversal/symlink cases | `cargo test -p zap-daemon --lib --locked` |
+| Sensitive resolved target | `sensitive_path` middleware tests | `cargo test -p zap-capabilities --lib --locked` |
 | Cross-crate compatibility | targeted coding/daemon tests | `cargo check --workspace --all-targets --locked` |
 
 ## Verification evidence
@@ -61,7 +61,7 @@ Close the highest-confidence local/remote security boundary defects found in the
 - Final targeted security/runtime batch: **11 command groups PASS**, covering standalone auth, runtime remote-access guard, literal Git discard, sensitive read/write approval, Bash runtime isolation/status reminder, CLI token parsing, and CodingRuntime reprepare state reuse.
 - WebUI embedding: initial worktree-only failures were traced to ignored `webui/dist/` assets and a cached empty RustEmbed binary. Re-running the two WebUI tests from a fresh `CARGO_TARGET_DIR` with the same-base generated assets produced **2/2 PASS**.
 - The pre-existing telemetry integration test expected stale wording (`JEIKCODE_TELEMETRY=0`). The exact test fails on `main`; this branch updates only that assertion to the current `reason: env:TELEMETRY=0` output and the exact test now **PASS**.
-- Full `cargo test --workspace --locked` progresses through the telemetry fix and reaches `jeikcode-capabilities`: **1537 pass / 31 fail**. Full-feature baseline filters on unmodified `main` reproduce the unrelated hook, codeintel, plugin, and skill-render failures. Previously compared capability/coding failures are also baseline-equivalent; the timeout helper is timing-sensitive and passes in isolation. The one new full-suite snapshot failure (`pending_code_rewind_restores_workspace_after_interrupted_transaction`) passes exact on both `main` and this branch, so it is order-sensitive rather than a demonstrated regression.
+- Full `cargo test --workspace --locked` progresses through the telemetry fix and reaches `zap-capabilities`: **1537 pass / 31 fail**. Full-feature baseline filters on unmodified `main` reproduce the unrelated hook, codeintel, plugin, and skill-render failures. Previously compared capability/coding failures are also baseline-equivalent; the timeout helper is timing-sensitive and passes in isolation. The one new full-suite snapshot failure (`pending_code_rewind_restores_workspace_after_interrupted_transaction`) passes exact on both `main` and this branch, so it is order-sensitive rather than a demonstrated regression.
 - Independent final architecture and security reviews: **0 Critical / 0 Important unresolved**.
 - Local validation host is Windows. Real symlink regression tests guarded by `#[cfg(unix)]` were not executed locally; Linux CI remains required for that platform-specific path-resolution evidence.
 

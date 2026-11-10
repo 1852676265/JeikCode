@@ -12,7 +12,7 @@ JeikCode 的 Hook 系统经历了从 `HookRegistry + HookExecutor` 到 `HookEngi
 
 ---
 
-## 二、代码真相（以 `crates/jeikcode-core/src/hook/` 为准）
+## 二、代码真相（以 `crates/zap-core/src/hook/` 为准）
 
 ### 2.1 架构概览
 

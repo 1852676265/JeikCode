@@ -368,7 +368,7 @@ export async function pingServer(
       ok: true,
       latencyMs,
       version: data.version || 'unknown',
-      service: data.service || 'jeikcode-daemon',
+      service: data.service || 'zap-daemon',
     };
   } catch (err: any) {
     clearTimeout(timer);

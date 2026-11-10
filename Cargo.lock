@@ -1850,7 +1850,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
-name = "jeikcode"
+name = "zap"
 version = "1.0.8"
 dependencies = [
  "agent-client-protocol",
@@ -1863,15 +1863,15 @@ dependencies = [
  "ctor",
  "dirs",
  "is-terminal",
- "jeikcode-auth",
- "jeikcode-capabilities",
- "jeikcode-coding",
- "jeikcode-config",
- "jeikcode-daemon",
- "jeikcode-kernel",
- "jeikcode-telemetry",
- "jeikcode-tuix",
- "jeikcode-updater",
+ "zap-auth",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-daemon",
+ "zap-kernel",
+ "zap-telemetry",
+ "zap-tuix",
+ "zap-updater",
  "libc",
  "mimalloc",
  "predicates",
@@ -1895,13 +1895,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-auth"
+name = "zap-auth"
 version = "1.0.8"
 dependencies = [
  "anyhow",
  "fs2",
- "jeikcode-config",
- "jeikcode-telemetry",
+ "zap-config",
+ "zap-telemetry",
  "libc",
  "reqwest",
  "serde",
@@ -1916,7 +1916,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-capabilities"
+name = "zap-capabilities"
 version = "1.0.8"
 dependencies = [
  "anyhow",
@@ -1938,9 +1938,9 @@ dependencies = [
  "httpdate",
  "hyper",
  "ignore",
- "jeikcode-auth",
- "jeikcode-config",
- "jeikcode-kernel",
+ "zap-auth",
+ "zap-config",
+ "zap-kernel",
  "libc",
  "rayon",
  "regex",
@@ -1985,19 +1985,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-clix"
+name = "zap-clix"
 version = "1.0.8"
 dependencies = [
  "anyhow",
  "async-trait",
  "clap",
  "futures",
- "jeikcode-capabilities",
- "jeikcode-coding",
- "jeikcode-config",
- "jeikcode-kernel",
- "jeikcode-review",
- "jeikcode-telemetry",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-kernel",
+ "zap-review",
+ "zap-telemetry",
  "serde",
  "serde_json",
  "tempfile",
@@ -2006,7 +2006,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-coding"
+name = "zap-coding"
 version = "1.0.8"
 dependencies = [
  "anyhow",
@@ -2015,11 +2015,11 @@ dependencies = [
  "ctor",
  "dirs",
  "futures",
- "jeikcode-capabilities",
- "jeikcode-config",
- "jeikcode-kernel",
- "jeikcode-review",
- "jeikcode-telemetry",
+ "zap-capabilities",
+ "zap-config",
+ "zap-kernel",
+ "zap-review",
+ "zap-telemetry",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2033,13 +2033,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-config"
+name = "zap-config"
 version = "1.0.8"
 dependencies = [
  "anyhow",
  "dirs",
  "fs2",
- "jeikcode-telemetry",
+ "zap-telemetry",
  "libc",
  "serde",
  "serde_json",
@@ -2052,7 +2052,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-daemon"
+name = "zap-daemon"
 version = "1.0.8"
 dependencies = [
  "anyhow",
@@ -2061,13 +2061,13 @@ dependencies = [
  "base64",
  "ctor",
  "futures",
- "jeikcode-auth",
- "jeikcode-capabilities",
- "jeikcode-coding",
- "jeikcode-config",
- "jeikcode-kernel",
- "jeikcode-telemetry",
- "jeikcode-updater",
+ "zap-auth",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-kernel",
+ "zap-telemetry",
+ "zap-updater",
  "jsonwebtoken",
  "mime_guess",
  "portable-pty",
@@ -2093,7 +2093,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-kernel"
+name = "zap-kernel"
 version = "1.0.8"
 dependencies = [
  "async-trait",
@@ -2106,13 +2106,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-review"
+name = "zap-review"
 version = "1.0.8"
 dependencies = [
  "async-trait",
  "futures",
- "jeikcode-capabilities",
- "jeikcode-kernel",
+ "zap-capabilities",
+ "zap-kernel",
  "serde",
  "serde_json",
  "tempfile",
@@ -2121,7 +2121,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-telemetry"
+name = "zap-telemetry"
 version = "1.0.8"
 dependencies = [
  "anyhow",
@@ -2143,7 +2143,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-tuix"
+name = "zap-tuix"
 version = "1.0.8"
 dependencies = [
  "anyhow",
@@ -2157,14 +2157,14 @@ dependencies = [
  "futures",
  "ignore",
  "image",
- "jeikcode-auth",
- "jeikcode-capabilities",
- "jeikcode-coding",
- "jeikcode-config",
- "jeikcode-daemon",
- "jeikcode-kernel",
- "jeikcode-telemetry",
- "jeikcode-updater",
+ "zap-auth",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-daemon",
+ "zap-kernel",
+ "zap-telemetry",
+ "zap-updater",
  "libc",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2189,13 +2189,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "jeikcode-updater"
+name = "zap-updater"
 version = "1.0.8"
 dependencies = [
  "anyhow",
  "chrono",
  "futures",
- "jeikcode-config",
+ "zap-config",
  "reqwest",
  "serde",
  "serde_json",
