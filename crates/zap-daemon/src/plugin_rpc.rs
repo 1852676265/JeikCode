@@ -85,9 +85,10 @@ fn parse_task_folder(task_dir: &StdPath, fallback_year: &str) -> Option<Value> {
     let inferred_year = meta
         .get("year")
         .and_then(|v| v.as_str())
-        .unwrap_or(fallback_year);
+        .unwrap_or(fallback_year)
+        .to_string();
     let final_year = if inferred_year.is_empty() {
-        "2026"
+        "2026".to_string()
     } else {
         inferred_year
     };
@@ -129,7 +130,12 @@ pub async fn handle_plugin_rpc(
                     }
                 }
                 if ws.is_empty() {
-                    ws = state.current_dir.read().await.clone();
+                    ws = state.bind_working_dir.to_string_lossy().to_string();
+                }
+                if ws.is_empty() {
+                    if let Ok(cd) = std::env::current_dir() {
+                        ws = cd.to_string_lossy().to_string();
+                    }
                 }
             }
             Json(json!({ "workspacePath": ws })).into_response()
@@ -159,7 +165,12 @@ pub async fn handle_plugin_rpc(
                     }
                 }
                 if ws.is_empty() {
-                    ws = state.current_dir.read().await.clone();
+                    ws = state.bind_working_dir.to_string_lossy().to_string();
+                }
+                if ws.is_empty() {
+                    if let Ok(cd) = std::env::current_dir() {
+                        ws = cd.to_string_lossy().to_string();
+                    }
                 }
             }
 
