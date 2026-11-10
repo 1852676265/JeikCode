@@ -196,6 +196,7 @@ pub fn prompt_host_service_setup(opts: &HostServiceSetupOptions<'_>) -> Result<b
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[allow(dead_code)]
 fn read_prompt_line(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     io::stderr().flush().ok();
@@ -249,6 +250,7 @@ fn serve_args(opts: &HostServiceSetupOptions<'_>) -> Vec<String> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[allow(dead_code)]
 fn print_banner(banner: &str) {
     print!("{banner}");
     if !banner.ends_with('\n') {

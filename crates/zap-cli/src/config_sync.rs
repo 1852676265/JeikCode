@@ -62,7 +62,7 @@ pub fn prompt_interactive_config_sync(mut items: Vec<ConfigDiffItem>) -> Result<
 
     render(&mut stdout, &items, cursor)?;
 
-    let mut confirmed = false;
+    let confirmed;
 
     loop {
         if let Event::Key(key_event) = event::read()? {
@@ -110,7 +110,7 @@ pub fn prompt_interactive_config_sync(mut items: Vec<ConfigDiffItem>) -> Result<
                     confirmed = false;
                     break;
                 }
-                _ => {}
+                _ => continue,
             }
         }
     }
