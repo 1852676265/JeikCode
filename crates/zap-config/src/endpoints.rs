@@ -73,9 +73,12 @@ const HOSTED_CODINGPLAN_API_BASE: &str = "";
 const HOSTED_CODINGPLAN_LLM_BASE_URL: &str = "";
 /// Release asset, same idea as Antigravity's `updater.json`. Not a file on
 /// `main`, so publishing does not add a commit downstream must pull.
+#[allow(dead_code)]
 const HOSTED_UPDATE_MANIFEST_URL: &str =
     "https://github.com/1852676265/JeikCode/releases/latest/download/latest.json";
+#[allow(dead_code)]
 const HOSTED_UPDATE_DOWNLOAD_BASE: &str = "https://github.com/1852676265/JeikCode/releases/download";
+#[allow(dead_code)]
 const HOSTED_DESKTOP_DOWNLOAD_URL: &str = "https://github.com/1852676265/JeikCode/releases";
 const HOSTED_RELAY_URL: &str = "";
 const HOSTED_MARKETPLACES: &[&str] = &[];

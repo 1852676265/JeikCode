@@ -21,7 +21,7 @@ use zap_kernel::event::{AgentCommand, AgentEvent};
 use zap_kernel::stream::StreamEvent;
 use zap_kernel::testkit::{
     ApprovalMiddleware, EchoTool, MockProvider, RecorderHook, RiskyWriteTool, ScriptedProvider,
-    SilentStreamProvider, StallThenProvider,
+    StallThenProvider,
 };
 use zap_kernel::tool::{ToolCall, ToolRegistry};
 use std::sync::Arc;

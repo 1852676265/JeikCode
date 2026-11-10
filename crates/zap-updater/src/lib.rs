@@ -1079,6 +1079,7 @@ pub async fn fetch_manifest_from_url(url: &str) -> Result<Manifest> {
     Err(last_err.unwrap_or_else(|| anyhow!("failed to fetch manifest from all candidate URLs")))
 }
 
+#[allow(dead_code)]
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
