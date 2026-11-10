@@ -391,6 +391,7 @@
 .dsh-settings-content-body {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px 28px;
   box-sizing: border-box;
 }
@@ -468,19 +469,22 @@
   align-items: center;
   justify-content: space-between;
   gap: 18px;
+  flex-wrap: wrap;
 }
 
 .dsh-banner-main {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  flex: 1;
+  flex: 1 1 260px;
+  min-width: 0;
 }
 
 .dsh-banner-title {
   font-size: 14.5px;
   font-weight: 600;
   color: var(--dsh-text-title);
+  word-break: break-word;
 }
 
 .dsh-banner-sub {
@@ -493,6 +497,101 @@
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-shrink: 0;
+}
+
+.dsh-banner-card.dsh-banner-card-dual {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 13px;
+}
+
+.dsh-banner-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.dsh-banner-row .dsh-banner-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.dsh-banner-row .dsh-banner-actions {
+  flex-shrink: 0;
+}
+
+.dsh-banner-title-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dsh-banner-title-line .dsh-banner-title {
+  white-space: nowrap;
+}
+
+.dsh-banner-model-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2.5px 10px;
+  border-radius: 999px;
+  background: var(--dsh-accent-bg);
+  border: 1px solid var(--dsh-accent-border);
+  color: var(--dsh-accent);
+  font-size: 12px;
+  max-width: min(380px, 100%);
+  box-sizing: border-box;
+}
+
+.dsh-banner-model-provider {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dsh-banner-model-code {
+  opacity: 0.8;
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dsh-banner-inner-divider {
+  height: 1px;
+  background: var(--dsh-divider);
+  width: 100%;
+}
+
+.dsh-banner-switch-row {
+  padding-top: 1px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.dsh-banner-switch-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dsh-text-title);
+  flex-shrink: 0;
+}
+
+.dsh-switch-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsh-accent);
+  box-shadow: 0 0 6px var(--dsh-accent);
   flex-shrink: 0;
 }
 
@@ -539,6 +638,23 @@
   gap: 10px;
   flex-wrap: wrap;
   flex-shrink: 0;
+  max-width: 100%;
+}
+
+.dsh-settings-model-controls .dsh-btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.dsh-settings-model-controls .model-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+
+.dsh-settings-model-controls .model-selector:not(.effort-selector) .model-capsule-trigger {
+  max-width: min(280px, 45vw) !important;
 }
 
 /* 宿主连接药丸按钮 */
@@ -774,6 +890,55 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dsh-inv-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.dsh-provider-select-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.dsh-provider-select-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--dsh-text-desc);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.dsh-provider-select {
+  height: 34px;
+  padding: 0 32px 0 11px;
+  font-size: 12.5px;
+  max-width: 230px;
+}
+
+.dsh-inv-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.dsh-models-count-badge {
+  font-size: 11.5px;
+  color: var(--dsh-text-muted);
+  white-space: nowrap;
+  user-select: none;
 }
 
 .dsh-search-box {
@@ -787,7 +952,8 @@
   border: 1px solid var(--dsh-input-border);
   color: var(--dsh-text-desc);
   flex: 1;
-  max-width: 360px;
+  min-width: 160px;
+  max-width: 320px;
   transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
@@ -823,6 +989,10 @@
 .dsh-item-card {
   padding: 14px 18px;
   cursor: pointer;
+}
+
+.dsh-item-card.dsh-model-spec-card {
+  cursor: default;
 }
 
 .dsh-item-card.is-active {
@@ -1043,278 +1213,61 @@
   line-height: 1.5;
 }
 
-/* ─── dsh-boot-animation 全屏片头开机动画 ─── */
-.dsh-boot-anim-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 999999;
-  background: #020617;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  user-select: none;
-  cursor: pointer;
-  transition: opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1), filter 0.8s ease;
+/* ─── 底部悬浮输入框：去除外层底座背景、顶部分割线与阴影 ─── */
+.input-container,
+.chat-stage .input-container {
+  background: transparent !important;
+  border-top: none !important;
+  box-shadow: none !important;
 }
 
-.dsh-boot-anim-overlay.is-fading {
-  opacity: 0;
-  filter: blur(12px);
-  pointer-events: none;
-}
-
-.dsh-boot-anim-backdrop {
-  position: absolute;
-  inset: 0;
-  background: radial-gradient(circle at 50% 45%, rgba(14, 165, 233, 0.15) 0%, rgba(2, 6, 23, 0.95) 75%);
-  pointer-events: none;
-}
-
-.dsh-boot-anim-center-stage {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  z-index: 1;
-}
-
-.dsh-boot-anim-pulse-halo {
-  position: absolute;
-  width: 180px;
-  height: 180px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(56, 189, 248, 0.25) 0%, transparent 70%);
-  animation: dshBootHalo 3s ease-in-out infinite alternate;
-}
-
-@keyframes dshBootHalo {
-  from { transform: scale(0.9); opacity: 0.5; }
-  to { transform: scale(1.25); opacity: 0.9; }
-}
-
-.dsh-boot-anim-logo-badge {
-  position: relative;
-  z-index: 2;
-  margin-bottom: 24px;
-  filter: drop-shadow(0 0 20px rgba(56, 189, 248, 0.6));
-}
-
-.dsh-boot-anim-brand-title {
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: 0.28em;
-  color: #f8fafc;
-  text-shadow: 0 0 24px rgba(56, 189, 248, 0.4);
-  margin-bottom: 8px;
-}
-
-.dsh-boot-anim-kernel-subtitle {
-  font-size: 11px;
-  letter-spacing: 0.22em;
-  color: #38bdf8;
-  font-weight: 600;
-  opacity: 0.85;
-}
-
-.dsh-boot-anim-footer {
-  position: absolute;
-  bottom: 48px;
-  left: 10%;
-  right: 10%;
-  max-width: 680px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  z-index: 2;
-}
-
-.dsh-boot-anim-progress-track {
-  width: 100%;
-  height: 2px;
-  background: rgba(148, 163, 184, 0.18);
-  border-radius: 999px;
-  overflow: hidden;
-}
-
-.dsh-boot-anim-progress-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #0284c7, #38bdf8, #a855f7);
-  box-shadow: 0 0 10px #38bdf8;
-  transition: width 0.22s ease-out;
-}
-
-.dsh-boot-anim-status-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 12px;
-  color: #94a3b8;
-}
-
-.dsh-boot-anim-status-text {
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  color: #64748b;
-}
-
-.dsh-boot-anim-skip-hint {
-  font-size: 11px;
-  color: rgba(148, 163, 184, 0.6);
-  transition: color 0.15s ease;
-}
-
-.dsh-boot-anim-overlay:hover .dsh-boot-anim-skip-hint {
-  color: #38bdf8;
-}
-
-/* ─── DSH Startup Screen 1:1 配置面板样式 (__ss_*) ─── */
-.__ss_root {
-  max-width: 640px;
+/* ─── 扩展插件中心设计令牌与样式 (Plugins Manager Tokens) ─── */
+.dsh-plugin-import-banner {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  font-size: 13px;
-  color: var(--dsw-alias-label-primary, #e2e8f0);
 }
-.__ss_version {
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  color: var(--dsw-alias-label-tertiary, #94a3b8);
-}
-.__ss_group {
-  border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.08));
-  border-radius: 10px;
-  padding: 14px 16px;
+
+.dsh-plugin-import-header {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.02));
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
 }
-.__ss_groupTitle {
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--dsw-alias-label-tertiary, #94a3b8);
-}
-.__ss_field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.__ss_label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--dsw-alias-label-primary, #f1f5f9);
-}
-.__ss_hint {
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--dsw-alias-label-tertiary, #94a3b8);
-}
-.__ss_row {
+
+.dsh-plugin-import-row {
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-wrap: wrap;
 }
-.__ss_input {
-  border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.12));
-  background: var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.04));
-  font: inherit;
-  color: inherit;
+
+.dsh-plugin-import-msg {
+  font-size: 12.5px;
+  padding: 8px 12px;
   border-radius: 8px;
-  padding: 7px 10px;
-  font-size: 13px;
-  box-sizing: border-box;
-  width: 100%;
-  outline: none;
+  line-height: 1.4;
 }
-.__ss_input:focus {
-  border-color: #3b82f6;
+
+.dsh-plugin-import-msg.tone-ok {
+  background: rgba(34, 197, 94, 0.1);
+  color: #16a34a;
+  border: 1px solid rgba(34, 197, 94, 0.22);
 }
-.__ss_select {
-  border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.12));
-  background: var(--dsw-alias-bg-layer-3, #1e293b);
-  color: inherit;
-  border-radius: 8px;
-  padding: 7px 10px;
-  font: inherit;
-  font-size: 13px;
-  min-width: 180px;
-  outline: none;
+
+:root[data-theme='dark'] .dsh-plugin-import-msg.tone-ok {
+  color: #4ade80;
 }
-.__ss_select:focus {
-  border-color: #3b82f6;
+
+.dsh-plugin-import-msg.tone-err {
+  background: rgba(239, 68, 68, 0.1);
+  color: #dc2626;
+  border: 1px solid rgba(239, 68, 68, 0.22);
 }
-.__ss_check {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 13px;
+
+:root[data-theme='dark'] .dsh-plugin-import-msg.tone-err {
+  color: #f87171;
 }
-.__ss_check input {
-  margin-top: 2px;
-  accent-color: #3b82f6;
-}
-.__ss_checkText {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.__ss_two {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.__ss_actions {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.__ss_btn {
-  border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.15));
-  background: var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.06));
-  color: inherit;
-  border-radius: 8px;
-  padding: 6px 14px;
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  transition: all 0.15s ease;
-}
-.__ss_btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.3);
-}
-.__ss_btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.__ss_btnPrimary {
-  border-color: #3b82f6;
-  background: #3b82f6;
-  color: #fff;
-  font-weight: 500;
-}
-.__ss_btnPrimary:hover:not(:disabled) {
-  background: #2563eb;
-  border-color: #2563eb;
-}
-.__ss_status {
-  font-size: 12px;
-  color: var(--dsw-alias-label-tertiary, #94a3b8);
-}
-.__ss_ok {
-  font-size: 12px;
-  color: #10b981;
-}
+
+
+

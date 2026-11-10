@@ -74,6 +74,8 @@ interface SidebarProps {
   onOpenUpdate?: () => void;
   /** 更新状态信息 */
   updateInfo?: UpdateCheckResponse | null;
+  activeWorkbenchView?: string;
+  onSwitchWorkbenchView?: (viewId: string) => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -442,6 +444,8 @@ export function Sidebar({
   activeFilePath,
   onOpenUpdate,
   updateInfo,
+  activeWorkbenchView = 'chat',
+  onSwitchWorkbenchView,
 }: SidebarProps) {
   const [isMobile, setIsMobile] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
@@ -542,7 +546,7 @@ export function Sidebar({
   // auto-confirm an untrusted project (no prompt is rendered).
   const [mcpReloading, setMcpReloading] = useState(false);
 
-  // 订阅插件内核侧边栏预留插槽 (`sidebar.nav`)，如未来挂载 DevOrbit 等外部扩展时自动渲染
+  // 订阅插件内核侧边栏插槽 (`sidebar.nav`)，外部扩展挂载后自动渲染
   const [, setPluginNavTick] = useState(0);
   useEffect(() => {
     return zapPluginKernel.subscribe(() => {
@@ -2175,6 +2179,25 @@ export function Sidebar({
           >
             <FolderRailIcon />
           </button>
+          {sidebarPluginNavItems.map((item) => {
+            const isActive = item.active || (Boolean(item.viewId) && activeWorkbenchView === item.viewId);
+            return (
+              <button
+                key={item.id}
+                class={'rail-btn' + (isActive ? ' active' : '')}
+                onClick={() => {
+                  if (item.viewId && onSwitchWorkbenchView) {
+                    onSwitchWorkbenchView(item.viewId);
+                  }
+                  item.onClick?.();
+                }}
+                title={item.label}
+                aria-label={item.label}
+              >
+                {item.icon || <PluginIcon />}
+              </button>
+            );
+          })}
         </nav>
         <div class="sidebar-rail-bottom">
           <button
@@ -2278,15 +2301,17 @@ export function Sidebar({
               try {
                 localStorage.setItem('sidebar_recents_expanded', 'true');
               } catch {}
+              onSwitchWorkbenchView?.('chat');
               onNew();
             }}>
               <span class="sidebar-action-icon"><PlusIcon /></span>
               <span class="sidebar-action-label">{t('sidebar.newChat')}</span>
             </button>
-            {/* 侧边栏插件扩展预留区 (`sidebar.nav`)：后续如 DevOrbit 等插件挂载后在此区域显示 */}
+            {/* 侧边栏插件扩展插槽 (`sidebar.nav`) */}
             <div class="sidebar-plugin-nav-slot" data-plugin-slot="sidebar.nav">
-              {sidebarPluginNavItems.map((item) =>
-                item.render ? (
+              {sidebarPluginNavItems.map((item) => {
+                const isActive = item.active || (Boolean(item.viewId) && activeWorkbenchView === item.viewId);
+                return item.render ? (
                   <div key={item.id} class="sidebar-plugin-nav-custom">
                     {item.render()}
                   </div>
@@ -2294,8 +2319,13 @@ export function Sidebar({
                   <button
                     key={item.id}
                     type="button"
-                    class={'sidebar-action sidebar-plugin-nav-btn' + (item.active ? ' open' : '')}
-                    onClick={() => item.onClick?.()}
+                    class={'sidebar-action sidebar-plugin-nav-btn' + (isActive ? ' active open' : '')}
+                    onClick={() => {
+                      if (item.viewId && onSwitchWorkbenchView) {
+                        onSwitchWorkbenchView(item.viewId);
+                      }
+                      item.onClick?.();
+                    }}
                     title={item.label}
                   >
                     <span class="sidebar-action-icon">{item.icon || <PluginIcon />}</span>
@@ -2304,8 +2334,8 @@ export function Sidebar({
                       <span class="sidebar-action-badge">{item.badge}</span>
                     )}
                   </button>
-                ),
-              )}
+                );
+              })}
             </div>
           </div>
 

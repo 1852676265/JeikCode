@@ -2,7 +2,7 @@
 
 [package]
 name = "jeikcode-desktop"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 description = "Zap desktop shell"
 publish = false

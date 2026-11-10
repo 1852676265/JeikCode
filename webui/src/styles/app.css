@@ -4710,68 +4710,103 @@ body {
   white-space: nowrap;
 }
 
-/* === Reasoning / thinking block (OpenCode: amber header, left accent) === */
+/* === Reasoning / thinking block (DeepSeek style: clean, understated disclosure) === */
 .reasoning-block {
-  margin: 12px 0 10px;
+  margin: 6px 0 8px;
   border: none;
-  border-left: 3px solid var(--app-warning-accent);
-  border-radius: 0;
+  border-radius: var(--corner-radius-small, 6px);
   background: transparent;
   overflow: hidden;
-  opacity: 0.92;
+  max-width: 100%;
 }
 .reasoning-block:first-child {
   margin-top: 0;
 }
 .markdown-root + .reasoning-block {
-  margin-top: 14px;
+  margin-top: 10px;
 }
 .reasoning-toggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  padding: 4px 10px;
+  max-width: 100%;
+  padding: 3px 8px;
+  min-height: 26px;
   border: 0;
+  border-radius: var(--corner-radius-small, 6px);
   background: transparent;
-  color: var(--app-warning-accent);
+  color: var(--app-muted-foreground, #8a8f98);
   font-size: 12px;
   cursor: pointer;
   text-align: left;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  user-select: none;
 }
-.reasoning-toggle:hover { color: var(--app-primary-foreground); opacity: 1; }
-.reasoning-icon { opacity: 0.85; }
-.reasoning-label { font-weight: 600; letter-spacing: 0.01em; color: var(--app-warning-accent); }
+.reasoning-toggle:hover {
+  background: var(--app-list-hover-background, rgba(127, 127, 127, 0.08));
+  color: var(--app-primary-foreground, #e5e7eb);
+}
+.reasoning-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+.reasoning-label {
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: inherit;
+  flex-shrink: 0;
+}
+.reasoning-separator {
+  margin: 0 1px;
+  opacity: 0.45;
+  flex-shrink: 0;
+}
+.reasoning-summary {
+  display: inline-block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: min(480px, 50vw);
+  font-size: 11.5px;
+  opacity: 0.65;
+  font-weight: 400;
+}
 .reasoning-chevron {
-  margin-left: auto;
+  margin-left: 4px;
   font-size: 10px;
-  transition: transform 0.15s ease;
+  opacity: 0.7;
+  flex-shrink: 0;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.reasoning-chevron.expanded { transform: rotate(180deg); }
+.reasoning-chevron.expanded {
+  transform: rotate(180deg);
+}
 .reasoning-body {
-  padding: 0 12px 10px 28px;
-  color: var(--app-secondary-foreground);
-  font-size: 12.5px;
-  line-height: 1.55;
+  margin: 4px 0 6px 6px;
+  padding: 6px 14px 8px 14px;
+  border-left: 2px solid var(--app-border-color, rgba(127, 127, 127, 0.25));
+  color: var(--app-muted-foreground, #8a8f98);
+  font-size: 12px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 280px;
-  overflow: auto;
-}
-:root[data-theme='light'] .reasoning-block {
-  border-left: 3px solid var(--app-warning-accent, #b45309);
-  background: rgba(180, 83, 9, 0.04);
-  border-radius: 0 6px 6px 0;
+  max-height: 380px;
+  overflow-y: auto;
 }
 :root[data-theme='light'] .reasoning-toggle {
-  color: var(--app-warning-accent, #b45309);
+  color: #6b7280;
 }
-:root[data-theme='light'] .reasoning-label {
-  color: var(--app-warning-accent, #b45309);
-  font-weight: 700;
+:root[data-theme='light'] .reasoning-toggle:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: #111827;
 }
-:root[data-theme='light'] .reasoning-icon {
-  color: var(--app-warning-accent, #b45309);
+:root[data-theme='light'] .reasoning-body {
+  color: #4b5563;
+  border-left-color: rgba(0, 0, 0, 0.12);
 }
 
 /* === Parallel sub-agent (task fan-out) panel — TUI SubtaskProgress parity === */
@@ -5107,6 +5142,10 @@ body {
   display: inline-block;
   vertical-align: baseline;
   cursor: pointer;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  user-drag: none;
+  -webkit-user-drag: none;
   transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1),
               box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
               background 0.18s ease,
@@ -17584,9 +17623,11 @@ body {
   color: var(--app-primary-foreground);
 }
 
-/* 底部悬浮毛玻璃输入框（完整保留多行输入与底部工具栏控件） */
+/* 底部悬浮毛玻璃输入框（完整保留多行输入与底部工具栏控件，移除底栏硬背景、顶部分割线与阴影） */
 .input-container {
-  background: transparent;
+  background: transparent !important;
+  border-top: none !important;
+  box-shadow: none !important;
 }
 
 .input-box {

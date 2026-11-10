@@ -13,6 +13,7 @@ import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { ServerSwitcherModal } from './components/ServerSwitcherModal';
 import { PluginCenterHostApp } from './custom/custom-registry';
+import { zapPluginKernel } from './custom/plugin-kernel';
 import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
@@ -76,6 +77,28 @@ export function App() {
   const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [liveReview, setLiveReview] = useState<LiveReviewState | null>(null);
+  // 主工作区视图状态（'chat' 为默认 AI 对话工作区，其他 ID 为插件贡献的独立主视图）
+  const [activeWorkbenchView, setActiveWorkbenchView] = useState<string>('chat');
+  const [, setPluginViewsTick] = useState(0);
+
+  useEffect(() => {
+    const unsub = zapPluginKernel.subscribe(() => {
+      setPluginViewsTick((v) => v + 1);
+    });
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ viewId?: string }>).detail;
+      if (detail?.viewId) {
+        setActiveWorkbenchView(detail.viewId);
+      } else {
+        setActiveWorkbenchView('chat');
+      }
+    };
+    window.addEventListener('zap:switch-workbench-view', handler);
+    return () => {
+      unsub();
+      window.removeEventListener('zap:switch-workbench-view', handler);
+    };
+  }, []);
   // 跨实例增量流（每实例一条）：侧栏/通知 dock 各自订阅自己需要的增量，
   // 全程按 id 就地 upsert/remove，无周期性轮询、无整表重拉。
   useEffect(() => startGlobalEventStream(), []);
@@ -121,7 +144,18 @@ export function App() {
   const [showCwd, setShowCwd] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // 记录右侧面板初始是否处于展开状态（!collapsed）
+  const initialRightPanelOpen = (() => {
+    try {
+      return localStorage.getItem('jeikcode:right-panel-collapsed') === 'false';
+    } catch {
+      return false;
+    }
+  })();
+  // 若初始右侧面板处于展开状态，为了让中间主区域正常显示，自动缩小左侧栏
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => initialRightPanelOpen);
+  // 记录左侧栏当前是否是由右侧面板展开而自动缩小的，便于后续右侧面板关闭时自动恢复展开
+  const autoCollapsedByRightPanelRef = useRef<boolean>(initialRightPanelOpen);
   const [sessionListVersion, setSessionListVersion] = useState(0);
   const [liveRunningIds, setLiveRunningIds] = useState<Set<string>>(() => new Set());
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
@@ -304,6 +338,43 @@ export function App() {
       return { collapsed: true, width: 260 };
     }
   });
+
+  // 记录上一次右侧面板折叠状态，用于感知展开/收起的边沿切换
+  const prevRightPanelCollapsedRef = useRef<boolean>(!initialRightPanelOpen);
+
+  const handleToggleSidebarCollapse = useCallback(() => {
+    // 用户主动点击切换左侧折叠，清除由右侧面板触发的自动联动标记，尊重用户意愿
+    autoCollapsedByRightPanelRef.current = false;
+    setSidebarCollapsed((c) => !c);
+  }, []);
+
+  const handleRightPanelLayoutChange = useCallback((layout: { collapsed: boolean; width: number }) => {
+    setRightPanelLayout(layout);
+    const wasCollapsed = prevRightPanelCollapsedRef.current;
+    const isNowCollapsed = layout.collapsed;
+    prevRightPanelCollapsedRef.current = isNowCollapsed;
+
+    if (wasCollapsed && !isNowCollapsed) {
+      // 右侧面板由折叠变为展开（右侧出来了）：
+      // 为了让中间主工作区正常显示，自动缩小左侧栏
+      setSidebarCollapsed((currentCollapsed) => {
+        if (!currentCollapsed) {
+          autoCollapsedByRightPanelRef.current = true;
+          return true;
+        }
+        return currentCollapsed;
+      });
+      // 窄屏/移动端抽屉若打开也自动收起
+      setSidebarOpen(false);
+    } else if (!wasCollapsed && isNowCollapsed) {
+      // 右侧面板由展开变为折叠（右侧收起）：
+      // 若左侧栏此前是因为右侧面板展开而自动缩小的，则恢复展开左侧
+      if (autoCollapsedByRightPanelRef.current) {
+        autoCollapsedByRightPanelRef.current = false;
+        setSidebarCollapsed(false);
+      }
+    }
+  }, []);
 
   // 桌面端/Web 原生通知权限：在用户首次交互后温和请求，保障失焦通知能调起系统原生弹窗
   useEffect(() => {
@@ -821,6 +892,7 @@ export function App() {
   }
 
   function handleNewSession(targetDir?: string, initialPrompt?: string) {
+    setActiveWorkbenchView('chat');
     setSidebarOpen(false);
     setActiveMainTabId('chat');
     if (initialPrompt) {
@@ -834,6 +906,7 @@ export function App() {
   }
 
   function applySessionSelection(session: SessionMetaWithProject) {
+    setActiveWorkbenchView('chat');
     navSeqRef.current++;
     setSessionId(session.id);
     setActiveSession(session);
@@ -958,7 +1031,7 @@ export function App() {
         open={sidebarOpen}
         onCloseDrawer={() => setSidebarOpen(false)}
         collapsed={sidebarCollapsed}
-        onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
+        onToggleCollapse={handleToggleSidebarCollapse}
         onOpenSettings={(section) => setSettingsSection(section)}
         reloadKey={sessionListVersion}
         optimisticSessions={optimisticSessions}
@@ -975,6 +1048,8 @@ export function App() {
         activeFilePath={diffTabs.find((t) => t.id === activeMainTabId)?.filePath}
         onOpenUpdate={openUpdateDialogWithFreshCheck}
         updateInfo={updateInfo}
+        activeWorkbenchView={activeWorkbenchView}
+        onSwitchWorkbenchView={(v) => setActiveWorkbenchView(v)}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -1641,72 +1716,97 @@ export function App() {
             } catch {}
           }}
         >
-          <Chat
-            sessionId={sessionId}
-            onSessionId={handleSessionAssigned}
-            cwd={cwd}
-            pendingPrompt={pendingPrompt}
-            onConsumedPendingPrompt={() => setPendingPrompt(null)}
-            onPermission={setPending}
-            onPermissionResolved={(callId) =>
-              setPending((cur: any) =>
-                callId === null ? null : resolvePendingAfterDecision(cur, callId),
-              )}
-            activeSession={activeSession}
-            restoring={restoring}
-            onLiveTurnDone={() => {
-              setSessionListVersion((v) => v + 1);
-              // 回合完成时，立即主动校准本地 liveRunningIds，确保清除残留的旋转菊花
-              getActiveChatSessions()
-                .then((ids) => {
-                  setLiveRunningIds((prev) => {
-                    const next = new Set<string>();
-                    for (const id of prev) {
-                      if (ids.includes(id)) next.add(id);
-                    }
-                    return next;
-                  });
-                })
-                .catch(() => {});
-            }}
-            onLiveRunningChange={(id, running) => {
-              if (!id) return;
-              setLiveRunningIds((prev) => {
-                const next = new Set(prev);
-                if (running) next.add(id);
-                else next.delete(id);
-                return next;
-              });
-            }}
-            onOptimisticSession={handleOptimisticSession}
-            onOpenCwd={() => setShowCwd(true)}
-            onCwdChanged={handleCwdChanged}
-            onLanding={setIsLanding}
-            skillInsert={skillInsert}
-            onSessionRenamed={(name) => {
-              setActiveSession((prev) => (prev ? { ...prev, name } : prev));
-              setOptimisticSessions((prev) => {
-                const curId = activeSession?.id ?? sessionId;
-                if (!curId || !prev[curId]) return prev;
-                return {
-                  ...prev,
-                  [curId]: { ...prev[curId], name },
-                };
-              });
-              setSessionListVersion((v) => v + 1);
-            }}
-            onOpenSidebar={() => setSidebarOpen(true)}
-            onNewSession={handleNewSession}
-            diffTabs={diffTabs}
-            setDiffTabs={setDiffTabs}
-            activeMainTabId={activeMainTabId}
-            setActiveMainTabId={setActiveMainTabId}
-            onRightPanelLayoutChange={setRightPanelLayout}
-            topModelSlot={topModelSlot}
-            onOpenModelConfig={() => setSettingsSection('model')}
-            onLiveReview={onLiveReview}
-            onBindReviewDismiss={onBindReviewDismiss}
-          />
+          {activeWorkbenchView !== 'chat' &&
+          zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView) ? (
+            <div
+              class="workbench-plugin-container"
+              style="flex: 1; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-primary, #0c1017);"
+            >
+              {(() => {
+                const currentView = zapPluginKernel
+                  .getSlotEntries('workbench.view')
+                  .find((v) => v.id === activeWorkbenchView);
+                if (!currentView) return null;
+                if (currentView.render) return currentView.render();
+                return (
+                  <iframe
+                    src={currentView.src}
+                    title={currentView.title}
+                    class="workbench-plugin-iframe"
+                    style="width: 100%; height: 100%; border: none; flex: 1; background: transparent;"
+                    allow="clipboard-read; clipboard-write;"
+                  />
+                );
+              })()}
+            </div>
+          ) : (
+            <Chat
+              sessionId={sessionId}
+              onSessionId={handleSessionAssigned}
+              cwd={cwd}
+              pendingPrompt={pendingPrompt}
+              onConsumedPendingPrompt={() => setPendingPrompt(null)}
+              onPermission={setPending}
+              onPermissionResolved={(callId) =>
+                setPending((cur: any) =>
+                  callId === null ? null : resolvePendingAfterDecision(cur, callId),
+                )}
+              activeSession={activeSession}
+              restoring={restoring}
+              onLiveTurnDone={() => {
+                setSessionListVersion((v) => v + 1);
+                // 回合完成时，立即主动校准本地 liveRunningIds，确保清除残留的旋转菊花
+                getActiveChatSessions()
+                  .then((ids) => {
+                    setLiveRunningIds((prev) => {
+                      const next = new Set<string>();
+                      for (const id of prev) {
+                        if (ids.includes(id)) next.add(id);
+                      }
+                      return next;
+                    });
+                  })
+                  .catch(() => {});
+              }}
+              onLiveRunningChange={(id, running) => {
+                if (!id) return;
+                setLiveRunningIds((prev) => {
+                  const next = new Set(prev);
+                  if (running) next.add(id);
+                  else next.delete(id);
+                  return next;
+                });
+              }}
+              onOptimisticSession={handleOptimisticSession}
+              onOpenCwd={() => setShowCwd(true)}
+              onCwdChanged={handleCwdChanged}
+              onLanding={setIsLanding}
+              skillInsert={skillInsert}
+              onSessionRenamed={(name) => {
+                setActiveSession((prev) => (prev ? { ...prev, name } : prev));
+                setOptimisticSessions((prev) => {
+                  const curId = activeSession?.id ?? sessionId;
+                  if (!curId || !prev[curId]) return prev;
+                  return {
+                    ...prev,
+                    [curId]: { ...prev[curId], name },
+                  };
+                });
+                setSessionListVersion((v) => v + 1);
+              }}
+              onOpenSidebar={() => setSidebarOpen(true)}
+              onNewSession={handleNewSession}
+              diffTabs={diffTabs}
+              setDiffTabs={setDiffTabs}
+              activeMainTabId={activeMainTabId}
+              setActiveMainTabId={setActiveMainTabId}
+              onRightPanelLayoutChange={handleRightPanelLayoutChange}
+              topModelSlot={topModelSlot}
+              onOpenModelConfig={() => setSettingsSection('model')}
+              onLiveReview={onLiveReview}
+              onBindReviewDismiss={onBindReviewDismiss}
+            />
+          )}
         </div>
       </div>
 

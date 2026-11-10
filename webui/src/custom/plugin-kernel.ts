@@ -15,6 +15,7 @@
 
 import { ComponentChildren, h } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { fetchFsRead } from '../api';
 
 // =============================================================================
 // 1. Typed Slot Contracts (Aligned with @deepseek-ai/dsh-client-ui-slots)
@@ -82,7 +83,19 @@ export interface SidebarNavContribution {
   badge?: string | number;
   active?: boolean;
   pluginPackage?: string;
+  viewId?: string;
   onClick?: () => void;
+  render?: () => ComponentChildren;
+}
+
+export interface WorkbenchViewContribution {
+  id: string;
+  order: number;
+  title: string;
+  icon?: ComponentChildren;
+  pluginPackage?: string;
+  type?: 'component' | 'iframe';
+  src?: string;
   render?: () => ComponentChildren;
 }
 
@@ -94,6 +107,7 @@ export interface SlotMap {
   'plugins.tab': PluginsManagerTabContribution;
   'shell.overlay': ShellOverlayContribution;
   'sidebar.nav': SidebarNavContribution;
+  'workbench.view': WorkbenchViewContribution;
 }
 
 export type SlotKey = keyof SlotMap;
@@ -187,9 +201,69 @@ export interface ExternalPluginPackage {
     label: string;
     badge?: string | number;
     order?: number;
+    viewId?: string;
     eventName?: string;
     sectionId?: string;
   };
+  contributesWorkbenchView?: {
+    id: string;
+    title?: string;
+    order?: number;
+    type?: 'component' | 'iframe';
+    src?: string;
+  };
+  contributesSettingsSection?: {
+    id: string;
+    label: string;
+    title?: string;
+    description?: string;
+  };
+  entry?: string;
+  entryDir?: string;
+}
+
+export interface ZapPluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  title?: string;
+  description?: string;
+  author?: string;
+  icon?: string;
+  entry?: string;
+  contributes?: {
+    sidebarNav?: {
+      id?: string;
+      label: string;
+      badge?: string | number;
+      order?: number;
+      viewId?: string;
+      sectionId?: string;
+      eventName?: string;
+    };
+    workbenchView?: {
+      id: string;
+      title?: string;
+      order?: number;
+      type?: 'iframe' | 'component';
+      src?: string;
+    };
+    settingsSection?: {
+      id?: string;
+      label: string;
+      title?: string;
+      description?: string;
+      schema?: {
+        key: string;
+        label: string;
+        description?: string;
+        type: 'boolean' | 'string' | 'number' | 'select';
+        options?: { label: string; value: string }[];
+        default?: any;
+      }[];
+    };
+  };
+  defaultConfig?: Record<string, any>;
 }
 
 export interface MarketListingVersion {
@@ -542,104 +616,6 @@ const DEFAULT_EXTERNAL_PACKAGES: ExternalPluginPackage[] = [
 
 export const MARKET_CATALOG: MarketListingEntry[] = [
   {
-    name: 'dsh-boot-suite',
-    title: 'dsh-boot-suite 双幕开机动画与全景壁纸',
-    description: '1:1 移植 DeepSeek Harness 官方两幕冷启动动效（档案授权 + 2K 鲸鱼娘睁眼）与毛玻璃聊天室壁纸套件。',
-    author: 'Zap Community / LeeRolling',
-    category: 'appearance',
-    labels: ['featured', 'slot:shell.overlay', 'standalone-plugin'],
-    defaultVersion: '1.0.0',
-    versions: [
-      { version: '1.0.0', publishTimestamp: 1775300000, compatible: true, runtimeRequirement: '>=0.2.0' },
-    ],
-    repository: 'https://github.com/LeeRolling/dsh-boot-suite',
-    registry: 'github:LeeRolling/dsh-boot-suite',
-    readmeMarkdown: `### dsh-boot-suite 1:1 双幕开机动效与壁纸套件\n\n- **第一幕**：暖白技术档案认证与准星扫描\n- **第二幕**：2K 鲸鱼娘睁眼扫描短片（whale-girl-scan.mp4）\n- **聊天背景**：全屏毛玻璃与大字横幅\n- **控制台**：输入 \`/boot replay\` 随时重播`,
-    contributesSettingsSection: {
-      id: 'ext-dsh-boot-suite',
-      label: '双幕动效',
-      title: 'dsh-boot-suite 开机动画与壁纸',
-      description: '配置两幕动效、声音开关与聊天室全景背景图。',
-    },
-    defaultConfig: {
-      playOnLaunch: true,
-      enableAudio: true,
-      clickToDismiss: true,
-      fadeDurationSec: '1',
-    },
-  },
-  {
-    name: 'dsh-boot-animation',
-    title: 'dsh-boot-animation 开机启动动画与片库',
-    description: '打开新对话或每次启动应用时播放一段全窗口开机短片，支持点击跳过、声音开关、淡入淡出及自定义片库。',
-    author: 'NativeDog1 / Alice-Marx',
-    category: 'appearance',
-    labels: ['featured', 'slot:shell.overlay', 'slot:settings.section'],
-    defaultVersion: '0.4.2',
-    versions: [
-      { version: '0.4.2', publishTimestamp: 1775200000, compatible: true, runtimeRequirement: '>=0.2.0' },
-      { version: '0.4.0', publishTimestamp: 1774000000, compatible: true, runtimeRequirement: '>=0.2.0' },
-    ],
-    repository: 'https://github.com/NativeDog1/dsh-boot-animation',
-    registry: 'github:NativeDog1/dsh-boot-animation',
-    readmeMarkdown: `### dsh-boot-animation 开机动画\n\n给 Zap / DSH 换一段**开机动画**：每次打开应用或新建会话时播放一段全屏片头短片，随后交叉溶解进工作区。\n\n- **全屏铺满窗口**：视效沉浸，支持静音自动播放与点击启用声音\n- **即时跳过**：点击任意区域或按 Esc / 空格 / 回车即可直接进入界面\n- **片库切换**：内置 DeepSeek 品牌、赛博朋克与数字苏醒片头\n- **无侵入接入**：通过 Cordis 微内核 \`shell.overlay\` 插槽无侵入式注入，不改动本体源码`,
-    contributesSettingsSection: {
-      id: 'ext-dsh-boot-animation',
-      label: '开机动画',
-      title: 'dsh-boot-animation 开机动画配置',
-      description: '配置启动全屏动画播放模式、声音开关、淡入时长与片库选择。',
-    },
-    configSchema: [
-      {
-        key: 'playOnLaunch',
-        label: '每次打开应用时播放一次',
-        description: '开启后每次打开工作台播一次；关闭后仅在新建会话时播一次',
-        type: 'boolean',
-      },
-      {
-        key: 'enableAudio',
-        label: '开启影片原声音频',
-        description: '默认以静音启动（浏览器自动播放安全策略要求），点击画面或该开关可解锁声音',
-        type: 'boolean',
-      },
-      {
-        key: 'clickToDismiss',
-        label: '点击画面直接跳过进入',
-        description: '在播放过程中点击屏幕任意位置或按 Esc 立刻淡入工作台界面',
-        type: 'boolean',
-      },
-      {
-        key: 'fadeDurationSec',
-        label: '进场淡出溶解时间 (秒)',
-        description: '片尾画面交叉溶解进工作区的过渡时长',
-        type: 'select',
-        options: [
-          { label: '1 秒 (极速)', value: '1' },
-          { label: '2 秒 (平滑推荐)', value: '2' },
-          { label: '3 秒 (影院慢速)', value: '3' },
-        ],
-      },
-      {
-        key: 'clipTheme',
-        label: '默认播放片头',
-        description: '选择开机动画的视觉主题',
-        type: 'select',
-        options: [
-          { label: 'DeepSeek 品牌官方片头 (Cyber Wave)', value: 'brand' },
-          { label: 'DeepSeek 赛博朋克流光 (Neon Grid)', value: 'cyber' },
-          { label: 'DeepSeek 神经元苏醒 (Neural Awakening)', value: 'neural' },
-        ],
-      },
-    ],
-    defaultConfig: {
-      playOnLaunch: true,
-      enableAudio: false,
-      clickToDismiss: true,
-      fadeDurationSec: '2',
-      clipTheme: 'brand',
-    },
-  },
-  {
     name: '@dsh-community/prompt-vault',
     title: 'Prompt Vault 提示词资产库',
     description: '在设置中心注入专属「提示词库」面板，支持分类管理常用架构指令、系统级角色模板与一键变量替换。',
@@ -839,6 +815,7 @@ export class ZapPluginKernel {
     'plugins.tab': new Map(),
     'shell.overlay': new Map(),
     'sidebar.nav': new Map(),
+    'workbench.view': new Map(),
   };
 
   private builtinPlugins: BuiltinPluginEntry[] = [];
@@ -928,6 +905,24 @@ export class ZapPluginKernel {
       }
     } catch {
       /* ignore */
+    }
+
+    // 清理可能遗留的孤儿插件背景（当壁纸插件未启用或已被卸载时）
+    if (typeof document !== 'undefined') {
+      const hasWallpaper = this.externalPackages.some((p) => p.name.includes('wallpaper') && p.enabled);
+      if (!hasWallpaper) {
+        const bg = document.getElementById('zap-wallpaper-bg-container');
+        if (bg) {
+          const v = bg.querySelector('video') as HTMLVideoElement | null;
+          if (v) { v.pause(); v.src = ''; }
+          bg.remove();
+        }
+        document.getElementById('zap-wallpaper-drawer')?.remove();
+        document.getElementById('zap-wallpaper-injected-styles')?.remove();
+        if (typeof window !== 'undefined') {
+          (window as any).__ZAP_WALLPAPER_ENGINE_INITIALIZED__ = false;
+        }
+      }
     }
   }
 
@@ -1136,6 +1131,17 @@ export class ZapPluginKernel {
     return this.externalPackages;
   }
 
+  public getPackage(packageName: string): ExternalPluginPackage | undefined {
+    return this.externalPackages.find((p) => p.name === packageName);
+  }
+
+  public togglePackage(packageName: string): boolean {
+    const pkg = this.getPackage(packageName);
+    if (!pkg) return false;
+    this.setPackageEnabled(packageName, !pkg.enabled);
+    return !pkg.enabled;
+  }
+
   public setPackageEnabled(packageName: string, enabled: boolean) {
     this.externalPackages = this.externalPackages.map((pkg) => {
       if (pkg.name !== packageName) return pkg;
@@ -1197,16 +1203,21 @@ export class ZapPluginKernel {
     if (typeof document !== 'undefined') {
       const cleanId = packageName.replace(/^@/, '').replace(/\//g, '-');
       document.querySelectorAll(`script[src*="${cleanId}"]`).forEach((s) => s.remove());
-      if (packageName === 'dsh-boot-suite') {
-        document.getElementById('dsh-startup-root')?.remove();
-        document.querySelectorAll('.dsu-root, .dsh-wallpaper-container').forEach((el) => el.remove());
-        try {
-          delete (window as any).__DSH_BOOT_SUITE_API__;
-          delete (window as any).__ZAP_BOOT_SUITE_API__;
-          delete (window as any).__DSH_STARTUP__;
-          delete (window as any).__DSH_STARTUP_API__;
-          sessionStorage.removeItem('dsh-boot-animation:played');
-        } catch {}
+
+      // 派发插件卸载事件，驱动插件自洁
+      window.dispatchEvent(new CustomEvent('zap:plugin-uninstalled', { detail: { package: packageName } }));
+
+      // 强保障清理动态壁纸残留 DOM
+      if (packageName.includes('wallpaper')) {
+        const bg = document.getElementById('zap-wallpaper-bg-container');
+        if (bg) {
+          const v = bg.querySelector('video') as HTMLVideoElement | null;
+          if (v) { v.pause(); v.src = ''; }
+          bg.remove();
+        }
+        document.getElementById('zap-wallpaper-drawer')?.remove();
+        document.getElementById('zap-wallpaper-injected-styles')?.remove();
+        (window as any).__ZAP_WALLPAPER_ENGINE_INITIALIZED__ = false;
       }
     }
     this.externalPackages = this.externalPackages.filter((pkg) => pkg.name !== packageName || !pkg.removable);
@@ -1339,6 +1350,95 @@ export class ZapPluginKernel {
     return newPkg;
   }
 
+  public installFromManifest(manifest: ZapPluginManifest, source?: string): ExternalPluginPackage {
+    const rawId = manifest.id || manifest.name;
+    const cleanId = rawId.toLowerCase().replace(/[^a-z0-9-_]/g, '-');
+    const pkgName = manifest.name.startsWith('@') || manifest.name.includes('/')
+      ? manifest.name
+      : `@plugins/${cleanId}`;
+    const sectionId = manifest.contributes?.settingsSection?.id || `ext-${cleanId}`;
+
+    const newPkg: ExternalPluginPackage = {
+      name: pkgName,
+      title: manifest.title || manifest.name,
+      description: manifest.description || '外部扩展插件包',
+      version: manifest.version || '1.0.0',
+      author: manifest.author || 'Plugin Contributor',
+      official: false,
+      installed: true,
+      enabled: true,
+      removable: true,
+      updatable: false,
+      source: source || `manifest:${cleanId}`,
+      installDir: `~/.zap/plugins/${cleanId}`,
+      entry: manifest.entry,
+      entryDir: source && (source.startsWith('/') || /^[A-Za-z]:/.test(source))
+        ? source.replace(/[\\/]+[^\\/]*\.json$/, '').replace(/[\\/]+$/, '')
+        : undefined,
+      readmeMarkdown: `### ${manifest.title || manifest.name}\n\n${manifest.description || ''}`,
+      versions: [manifest.version || '1.0.0'],
+      configSchema: manifest.contributes?.settingsSection?.schema?.map((s) => ({
+        key: s.key,
+        label: s.label,
+        description: s.description || '',
+        type: s.type,
+        options: s.options,
+      })) || [],
+      configValues: { ...(manifest.defaultConfig || {}) },
+      contributesSidebarNav: manifest.contributes?.sidebarNav
+        ? {
+            id: manifest.contributes.sidebarNav.id || `sidebar-nav-${cleanId}`,
+            label: manifest.contributes.sidebarNav.label,
+            badge: manifest.contributes.sidebarNav.badge,
+            order: manifest.contributes.sidebarNav.order,
+            viewId: manifest.contributes.sidebarNav.viewId || manifest.contributes.workbenchView?.id,
+            sectionId: manifest.contributes.sidebarNav.sectionId || sectionId,
+            eventName: manifest.contributes.sidebarNav.eventName,
+          }
+        : undefined,
+      contributesWorkbenchView: manifest.contributes?.workbenchView
+        ? {
+            id: manifest.contributes.workbenchView.id,
+            title: manifest.contributes.workbenchView.title || manifest.title,
+            order: manifest.contributes.workbenchView.order,
+            type: manifest.contributes.workbenchView.type || 'iframe',
+            src: manifest.contributes.workbenchView.src,
+          }
+        : undefined,
+      contributesSettingsSection: manifest.contributes?.settingsSection
+        ? {
+            id: sectionId,
+            label: manifest.contributes.settingsSection.label,
+            title: manifest.contributes.settingsSection.title,
+            description: manifest.contributes.settingsSection.description,
+          }
+        : undefined,
+      rows: [
+        {
+          rowId: `${cleanId}-main`,
+          title: manifest.title || manifest.name,
+          description: manifest.description || '插件核心功能与工作台插槽',
+          moduleName: `${pkgName}/index.js`,
+          enabled: true,
+          phase: 'active',
+          hasConfig: Boolean(manifest.contributes?.settingsSection?.schema?.length),
+          sectionId,
+        },
+      ],
+    };
+
+    const existsInList = this.externalPackages.some((p) => p.name === pkgName);
+    if (existsInList) {
+      this.externalPackages = this.externalPackages.map((p) => (p.name === pkgName ? newPkg : p));
+    } else {
+      this.externalPackages = [...this.externalPackages, newPkg];
+    }
+    this.persistPackages();
+    this.syncPackageRuntimeEffects(newPkg.name);
+    this.notify();
+    return newPkg;
+  }
+
   public async installPackageWithBackend(
     spec: string,
     customTitle?: string,
@@ -1404,7 +1504,23 @@ export class ZapPluginKernel {
     }
 
     const pkg = this.externalPackages.find((p) => p.name === packageName);
-    if (!pkg || !pkg.enabled) return;
+    if (!pkg || !pkg.enabled) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('zap:plugin-deactivated', { detail: { package: packageName } }));
+        if (packageName.includes('wallpaper')) {
+          const bg = document.getElementById('zap-wallpaper-bg-container');
+          if (bg) {
+            const v = bg.querySelector('video') as HTMLVideoElement | null;
+            if (v) { v.pause(); v.src = ''; }
+            bg.remove();
+          }
+          document.getElementById('zap-wallpaper-drawer')?.remove();
+          document.getElementById('zap-wallpaper-injected-styles')?.remove();
+          (window as any).__ZAP_WALLPAPER_ENGINE_INITIALIZED__ = false;
+        }
+      }
+      return;
+    }
 
     const cleanups: (() => void)[] = [];
 
@@ -1424,54 +1540,40 @@ export class ZapPluginKernel {
       cleanups.push(this.insertStyle('plugin:theme-customizer', css));
     }
 
-    // Apply boot animation overlay if `dsh-boot-animation` is enabled
-    if (pkg.name === 'dsh-boot-animation' || pkg.name.includes('boot-animation')) {
-      const cfg = pkg.configValues || {};
-      const playOnLaunch = cfg.playOnLaunch !== false;
-      let alreadyPlayed = false;
-      try {
-        alreadyPlayed = sessionStorage.getItem('dsh-boot-animation:played') === '1';
-      } catch {
-        /* ignore */
-      }
-
-      if (playOnLaunch && !alreadyPlayed && !gBootAnimSessionPlayed) {
-        const overlayId = `boot-anim-${pkg.name}`;
-        let unregSlot: (() => void) | null = null;
-        unregSlot = this.registerSlot('shell.overlay', {
-          id: overlayId,
-          order: 10,
-          pluginPackage: pkg.name,
-          render: () =>
-            h(BootAnimationOverlay, {
-              pkg,
-              onDismiss: () => {
-                gBootAnimSessionPlayed = true;
-                if (unregSlot) {
-                  unregSlot();
-                  unregSlot = null;
-                }
-              },
-            }),
-        });
-        cleanups.push(() => {
-          if (unregSlot) unregSlot();
-        });
-      }
+    // If plugin contributes a workbench view, register into `workbench.view`
+    if (pkg.contributesWorkbenchView && pkg.contributesWorkbenchView.id) {
+      const wb = pkg.contributesWorkbenchView;
+      const unregWb = this.registerSlot('workbench.view', {
+        id: wb.id,
+        order: wb.order ?? 50,
+        title: wb.title || pkg.title,
+        pluginPackage: pkg.name,
+        type: wb.type || 'iframe',
+        src: wb.src,
+      });
+      cleanups.push(unregWb);
     }
 
-    // If plugin declares a sidebar navigation entry (e.g. future DevOrbit plugin), mount into `sidebar.nav`
+    // If plugin declares a sidebar navigation entry, mount into `sidebar.nav`
     if (pkg.contributesSidebarNav && pkg.contributesSidebarNav.label) {
       const navCfg = pkg.contributesSidebarNav;
       const navId = navCfg.id || `sidebar-nav-${pkg.name}`;
+      const targetViewId = navCfg.viewId || pkg.contributesWorkbenchView?.id;
       const unregNav = this.registerSlot('sidebar.nav', {
         id: navId,
         order: navCfg.order ?? 50,
         label: navCfg.label,
         badge: navCfg.badge,
         pluginPackage: pkg.name,
+        viewId: targetViewId,
         onClick: () => {
-          if (navCfg.eventName) {
+          if (targetViewId) {
+            window.dispatchEvent(
+              new CustomEvent('zap:switch-workbench-view', {
+                detail: { viewId: targetViewId, pluginPackage: pkg.name },
+              }),
+            );
+          } else if (navCfg.eventName) {
             window.dispatchEvent(new CustomEvent(navCfg.eventName, { detail: { pkg } }));
           } else if (navCfg.sectionId) {
             window.dispatchEvent(
@@ -1485,18 +1587,52 @@ export class ZapPluginKernel {
       cleanups.push(unregNav);
     }
 
+    // If plugin declares a settings section or has configSchema, mount into `settings.section`
+    if (pkg.contributesSettingsSection || (pkg.configSchema && pkg.configSchema.length > 0)) {
+      const secCfg = pkg.contributesSettingsSection;
+      const secId = secCfg?.id || `ext-${pkg.name.replace(/^@/, '').replace(/\//g, '-')}`;
+      const unregSec = this.registerSlot('settings.section', {
+        id: secId,
+        order: 85,
+        icon: null,
+        label: secCfg?.label || pkg.title || pkg.name,
+        title: secCfg?.title || `${pkg.title || pkg.name} 配置`,
+        description: secCfg?.description || pkg.description,
+        pluginPackage: pkg.name,
+        render: () => null,
+      });
+      cleanups.push(unregSec);
+    }
+
     // Attempt to dynamically load plugin bundle script if present
-    const cleanId = pkg.name.replace(/^@/, '').replace(/\//g, '-');
-    const scriptUrl = `/api/plugins/assets/${cleanId}/lib/index.js`;
-    const scriptEl = document.createElement('script');
-    scriptEl.type = 'module';
-    scriptEl.src = scriptUrl;
-    scriptEl.onerror = () => {
-      // 外部脚本未找到时无需阻断，插槽已具备自愈沙箱适配
-      scriptEl.remove();
-    };
-    document.head.appendChild(scriptEl);
-    cleanups.push(() => scriptEl.remove());
+    if (pkg.entry && pkg.entryDir) {
+      const normalizedDir = pkg.entryDir.replace(/\\/g, '/');
+      const normalizedEntry = pkg.entry.replace(/\\/g, '/').replace(/^\.\//, '');
+      const fullEntryPath = `${normalizedDir}/${normalizedEntry}`;
+      fetchFsRead(fullEntryPath)
+        .then((res) => {
+          if (res.success && res.content) {
+            const scriptEl = document.createElement('script');
+            scriptEl.type = 'module';
+            scriptEl.textContent = res.content;
+            document.head.appendChild(scriptEl);
+            cleanups.push(() => scriptEl.remove());
+          }
+        })
+        .catch(() => {});
+    } else {
+      const cleanId = pkg.name.replace(/^@/, '').replace(/\//g, '-');
+      const scriptUrl = `/api/plugins/assets/${cleanId}/lib/index.js`;
+      const scriptEl = document.createElement('script');
+      scriptEl.type = 'module';
+      scriptEl.src = scriptUrl;
+      scriptEl.onerror = () => {
+        // 外部脚本未找到时无需阻断，插槽已具备自愈沙箱适配
+        scriptEl.remove();
+      };
+      document.head.appendChild(scriptEl);
+      cleanups.push(() => scriptEl.remove());
+    }
 
     this.dynamicDisposers.set(packageName, () => {
       for (const fn of cleanups) fn();
@@ -1505,141 +1641,6 @@ export class ZapPluginKernel {
 }
 
 export const zapPluginKernel = new ZapPluginKernel();
-
-// =============================================================================
-// 5. dsh-boot-animation 客户端插槽全屏开机动画组件
-// =============================================================================
-
-let gBootAnimSessionPlayed = false;
-
-function BootAnimationOverlay({
-  pkg,
-  onDismiss,
-}: {
-  pkg: ExternalPluginPackage;
-  onDismiss: () => void;
-}) {
-  const cfg = pkg.configValues || {};
-  const [visible, setVisible] = useState(() => {
-    if (gBootAnimSessionPlayed) return false;
-    try {
-      if (sessionStorage.getItem('dsh-boot-animation:played') === '1') {
-        gBootAnimSessionPlayed = true;
-        return false;
-      }
-    } catch {
-      /* ignore */
-    }
-    return true;
-  });
-  const [fading, setFading] = useState(false);
-  const [progress, setProgress] = useState(15);
-  const dismissedRef = useRef(false);
-
-  const triggerDismiss = () => {
-    if (dismissedRef.current) return;
-    dismissedRef.current = true;
-    setFading(true);
-    gBootAnimSessionPlayed = true;
-    try {
-      sessionStorage.setItem('dsh-boot-animation:played', '1');
-    } catch {
-      /* ignore */
-    }
-    const fadeSec = Number(cfg.fadeDurationSec) || 1;
-    setTimeout(() => {
-      setVisible(false);
-      onDismiss();
-    }, Math.min(600, Math.max(150, fadeSec * 250)));
-  };
-
-  useEffect(() => {
-    if (!visible) {
-      onDismiss();
-      return;
-    }
-
-    const progressTimer = setInterval(() => {
-      setProgress((p) => {
-        if (p >= 100) {
-          clearInterval(progressTimer);
-          return 100;
-        }
-        const delta = Math.random() * 20 + 12;
-        const next = Math.min(100, Math.floor(p + delta));
-        if (next >= 100) {
-          setTimeout(triggerDismiss, 200);
-        }
-        return next;
-      });
-    }, 160);
-
-    const fadeTimer = setTimeout(() => {
-      triggerDismiss();
-    }, 3200);
-
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' || e.key === ' ' || e.key === 'Enter') {
-        triggerDismiss();
-      }
-    };
-    window.addEventListener('keydown', handleKey);
-
-    return () => {
-      clearInterval(progressTimer);
-      clearTimeout(fadeTimer);
-      window.removeEventListener('keydown', handleKey);
-    };
-  }, [visible]);
-
-  if (!visible) return null;
-
-  return h(
-    'div',
-    {
-      class: `dsh-boot-anim-overlay ${fading ? 'is-fading' : ''}`,
-      onClick: () => {
-        if (cfg.clickToDismiss !== false) triggerDismiss();
-      },
-    },
-    h('div', { class: 'dsh-boot-anim-backdrop' }),
-    h(
-      'div',
-      { class: 'dsh-boot-anim-center-stage' },
-      h('div', { class: 'dsh-boot-anim-pulse-halo' }),
-      h(
-        'div',
-        { class: 'dsh-boot-anim-logo-badge' },
-        h(
-          'svg',
-          { width: 68, height: 68, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6 },
-          h('path', { d: 'M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5', stroke: '#38bdf8' }),
-        ),
-      ),
-      h('div', { class: 'dsh-boot-anim-brand-title' }, 'DEEPSEEK HARNESS'),
-      h('div', { class: 'dsh-boot-anim-kernel-subtitle' }, 'CORDIS KERNEL // SYSTEM INITIALIZING'),
-    ),
-    h(
-      'div',
-      { class: 'dsh-boot-anim-footer' },
-      h(
-        'div',
-        { class: 'dsh-boot-anim-progress-track' },
-        h('div', { class: 'dsh-boot-anim-progress-fill', style: { width: `${progress}%` } }),
-      ),
-      h(
-        'div',
-        { class: 'dsh-boot-anim-status-row' },
-        h(
-          'span',
-          { class: 'dsh-boot-anim-status-text' },
-          progress < 100 ? `正在加载内核插槽与环境资产... ${progress}%` : '内核已就绪，正在呈现工作区...',
-        ),
-        h('span', { class: 'dsh-boot-anim-skip-hint' }, '点击任意区域或按 [Esc] 跳过'),
-      ),
-    ),
-  );
-}
 
 // Expose global runtime hook for external user scripts
 if (typeof window !== 'undefined') {

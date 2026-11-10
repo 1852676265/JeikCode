@@ -21,6 +21,36 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.8 (2026-11-10)
+
+- **[Workbench & Plugin Ecosystem] Introduce Multi-View Workbench architecture and plugin extension slots**:
+  - Added support for independent workbench views via `workbench.view` plugin slot, enabling seamless switching between AI Chat and third-party plugin workspaces.
+  - Enhanced plugin kernel with dynamic sidebar navigation buttons, view-specific routing, and local plugin RPC bridges for workspace data synchronization.
+  - Added local static asset serving and RPC endpoints in Vite dev server to streamline external plugin development.
+
+- **[Chat & Markdown UX] DeepSeek-style reasoning previews, link context menus, and drag-selection guard**:
+  - Introduced concise first-line summary badges for collapsed reasoning blocks, providing instant insights aligned with DeepSeek interaction patterns.
+  - Added smart URL detection in Markdown text alongside a context menu for external browser opening, link copying, and text copying.
+  - Implemented drag-selection protection to prevent accidental file or URL triggers during text selection.
+
+- **[Daemon & File Upload] Global upload storage fallback and directory auto-creation**:
+  - Enhanced daemon file upload handler to gracefully fallback to `~/.zap/global_uploads` when working directory is omitted or specified as `__global__`, with automatic directory creation and error resilience.
+
+---
+
+- **[主工作区与插件生态] 引入多视图工作区架构与插件扩展插槽**:
+  - 新增 `workbench.view` 插件扩展插槽与独立主视图管理，支持在 AI 对话工作区与第三方扩展工作区（如任务看板、画板等）之间无缝自由切换。
+  - 增强 Zap 插件内核，支持侧边栏动态导航按钮、视图路由分发以及本地插件 RPC 桥接，实现本地工作区数据动态同步。
+  - 在 Vite 配置中新增本地插件静态资源托管与 RPC 代理中间件，大幅简化外部独立插件本地联调与接入流程。
+
+- **[会话与阅读体验] DeepSeek 风格思考折叠摘要、链接右键菜单与划词保护**:
+  - 在折叠的思考展开块中自动提取首行有效文本生成精炼摘要标签，深度对齐 DeepSeek 思考流洞察体验。
+  - 优化 Markdown 行内网址智能识别，提供右键上下文菜单（在浏览器中打开、复制链接、复制文本）。
+  - 增加 250ms 划词拖拽时间窗口防误触保护，防止用户选择复制文本时意外触发文件预览或外链跳转。
+
+- **[守护进程与文件上传] 全局上传目录容错与自动降级创建**:
+  - 完善 `crates/jeikcode-daemon` 上传机制，当工作区路径缺省或为 `__global__` 时，自动降级至 `~/.zap/global_uploads` 并自动递归建目录，确保上传零报错。
+
 ## v1.0.7 (2026-11-09)
 
 - **[Settings & UI Refactoring] Modern glassmorphism redesign and redundant item cleanup**:

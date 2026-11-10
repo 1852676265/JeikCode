@@ -644,6 +644,19 @@ function estimateMessageTokens(m: Message): { prompt: number; completion: number
   return { prompt, completion, reasoning };
 }
 
+/** 过滤“已折叠工具输出 / Folded tool output”等工具压缩噪声通知（用户明确反馈“这些也没有必要”） */
+function isIgnoredChatNotice(text?: string | null): boolean {
+  if (!text) return false;
+  const s = text.trim();
+  return (
+    s.includes('已折叠工具输出') ||
+    s.includes('Folded tool output') ||
+    s.includes('Đã thu gọn đầu ra công cụ') ||
+    (s.includes('已折叠') && s.includes('tok')) ||
+    (s.includes('Folded') && s.includes('tok'))
+  );
+}
+
 /** Estimate total token usage across all messages in a session. */
 function estimateAllMessagesTokens(messages: Message[]): TokenUsage {
   let prompt = 0;
@@ -3891,7 +3904,7 @@ export function Chat({
         const origin = msg.internal_origin ?? msg.internalOrigin;
         if (origin === 'turn_diagnostic') {
           const text = (msg.content ?? '').trim();
-          if (text) {
+          if (text && !isIgnoredChatNotice(text)) {
             loaded.push({
               role: 'assistant',
               parts: [{ kind: 'notice', text }],
@@ -5702,6 +5715,9 @@ export function Chat({
       return;
     }
     if (event.type === 'warning') {
+      if (isIgnoredChatNotice(event.message)) {
+        return;
+      }
       messageCacheRef.current.set(
         targetSid,
         paintAssistantNotice(msgs, t('chat.warning', { msg: event.message }), event.message_id)
@@ -6532,6 +6548,9 @@ export function Chat({
       case 'warning':
         // 非致命提示（如"已自动压缩上下文"）：渲染成淡色 notice 行 —— 不染红、不并进
         // 回复文本、不结束回合（任务继续）。对齐 TUI 的黄色 "!" 提示。
+        if (isIgnoredChatNotice(event.message)) {
+          break;
+        }
         pushNoticeToLastAssistant(t('chat.warning', { msg: event.message }), event.message_id);
         break;
 
@@ -7223,10 +7242,8 @@ export function Chat({
 
     let messageText = text;
     if (files.length > 0) {
-      if (!effectiveWorkingDir) {
-        setAttachError(t('attach.noCwd'));
-        return;
-      }
+      // 目标工作目录：优先使用绑定的有效工程目录；若处于无项目/全局自由会话，自动 fallback 到 '__global__'，不再弹窗阻断
+      const uploadTargetDir = effectiveWorkingDir || rawWorkingDir || '__global__';
       setAttachError(null);
       setInput('');
       setPendingAttach([]);
@@ -7236,7 +7253,7 @@ export function Chat({
       setUploading(true);
       try {
         const paths = await uploadSessionFiles(
-          effectiveWorkingDir,
+          uploadTargetDir,
           files.map((item) => item.file),
           setUploadProgress,
         );
@@ -9389,16 +9406,20 @@ export function Chat({
           // 计算每个回合的文本（区分最后回答与全部正文），供复制按钮使用。
           const turnLastTexts = new Map<number, string>();
           const turnAllTexts = new Map<number, string>();
+          const turnReasoningMap = new Map<number, string>();
           {
             let start = -1;
             let textParts: string[] = [];
             let fallbackParts: string[] = [];
+            let reasoningParts: string[] = [];
             for (let i = 0; i < messages.length; i++) {
               if (messages[i].role === 'assistant') {
                 if (start < 0) start = i;
                 for (const p of messages[i].parts) {
                   if (p.kind === 'text' && p.text.trim()) {
                     textParts.push(p.text);
+                  } else if (p.kind === 'reasoning' && p.text.trim()) {
+                    reasoningParts.push(p.text.trim());
                   }
                 }
                 const raw = messageFullText(messages[i]);
@@ -9409,13 +9430,16 @@ export function Chat({
                   const targetList = textParts.length > 0 ? textParts : fallbackParts;
                   const lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
                   const allText = targetList.join('\n\n');
+                  const allReasoning = reasoningParts.join('\n\n---\n\n');
                   for (let j = start; j < i; j++) {
                     turnLastTexts.set(j, lastText);
                     turnAllTexts.set(j, allText);
+                    turnReasoningMap.set(j, allReasoning);
                   }
                   start = -1;
                   textParts = [];
                   fallbackParts = [];
+                  reasoningParts = [];
                 }
               }
               // role === 'system': transparent — do not flush the turn.
@@ -9425,9 +9449,11 @@ export function Chat({
               const targetList = textParts.length > 0 ? textParts : fallbackParts;
               const lastText = targetList.length > 0 ? targetList[targetList.length - 1] : '';
               const allText = targetList.join('\n\n');
+              const allReasoning = reasoningParts.join('\n\n---\n\n');
               for (let j = start; j < messages.length; j++) {
                 turnLastTexts.set(j, lastText);
                 turnAllTexts.set(j, allText);
+                turnReasoningMap.set(j, allReasoning);
               }
             }
           }
@@ -9508,6 +9534,9 @@ export function Chat({
             // no turn grouping, no streaming cursor).
             if (msg.role === 'system') {
               const fullText = msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('');
+              if (isIgnoredChatNotice(fullText)) {
+                return null;
+              }
               const sysCls = 'msg-notice command-output' + (isActiveSearchMatch ? ' is-active-search-match' : '');
               return (
                 <div class={sysCls} key={msg.id ?? origIdx} ref={setMatchRef}>
@@ -9545,6 +9574,7 @@ export function Chat({
                 isLastInTurn={isLastInTurn}
                 turnLastText={turnLastTexts.get(origIdx) ?? ''}
                 turnAllText={turnAllTexts.get(origIdx) ?? ''}
+                turnReasoning={turnReasoningMap.get(origIdx) ?? ''}
                 searchRef={setMatchRef}
                 timeLabel={isLastInTurn ? timeLabel : undefined}
                 timeFull={isLastInTurn ? timeFull : undefined}
@@ -9945,6 +9975,7 @@ function AssistantMessageView({
   isLastInTurn,
   turnLastText,
   turnAllText,
+  turnReasoning,
   searchRef,
   timeLabel,
   timeFull,
@@ -9964,6 +9995,7 @@ function AssistantMessageView({
   isLastInTurn: boolean;
   turnLastText: string;
   turnAllText: string;
+  turnReasoning?: string;
   searchRef?: (el: HTMLElement | null) => void;
   timeLabel?: string;
   timeFull?: string;
@@ -10105,9 +10137,26 @@ function AssistantMessageView({
     </div>
   ) : null;
 
-  const hasContent = msg.parts.some(
-    (p) => (p.kind === 'text' && p.text.trim().length > 0) || p.kind === 'tool' || p.kind === 'reasoning',
-  );
+  const effectiveReasoning = isLastInTurn ? (turnReasoning || '') : '';
+  const hasContent =
+    effectiveReasoning.trim().length > 0 ||
+    msg.parts.some(
+      (p) =>
+        (p.kind === 'text' && p.text.trim().length > 0) ||
+        (p.kind === 'reasoning' && p.text.trim().length > 0) ||
+        (p.kind === 'notice' && p.text.trim().length > 0 && !isIgnoredChatNotice(p.text)) ||
+        (p.kind === 'rate_limited' && p.text.trim().length > 0) ||
+        (p.kind === 'todo_list' && p.items && p.items.length > 0),
+    );
+
+  // 纯工具调用或无可见内容的消息在结束后不渲染多余气泡，彻底消除空卡片堆叠；
+  // 若整轮思考已经汇入最后一条消息，非终条无正文的中间助手消息直接跳过，避免重复气泡。
+  if (!isLastInTurn && !streaming && !msg.parts.some((p) => p.kind === 'text' && p.text.trim())) {
+    return null;
+  }
+  if (!hasContent && !streaming) {
+    return null;
+  }
 
   return (
     <div class={cls} ref={searchRef}>
@@ -10123,9 +10172,9 @@ function AssistantMessageView({
         </div>
       ) : (
         <>
-          {/* Segments in chronological order: text→tool→text→tool,
-              matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts, search, cwd)}
+          {/* Segments in chronological order: text→reasoning→text,
+              matching clean DeepSeek layout. Tools are hidden from chat timeline. */}
+          {renderAssistantParts(msg.parts, search, cwd, isLastInTurn ? turnReasoning : undefined)}
           {streaming && !hasContent && (
             <span class="codex-shimmer-status" aria-live="polite">
               {isCompacting ? 'Compacting...' : 'Working...'}
@@ -10170,40 +10219,51 @@ function AssistantMessageView({
   );
 }
 
-function renderAssistantParts(parts: MsgPart[], search: string, cwd?: string): VNode[] {
+function renderAssistantParts(
+  parts: MsgPart[],
+  search: string,
+  cwd?: string,
+  overrideReasoning?: string,
+): VNode[] {
   const out: VNode[] = [];
   let trailingTodos: { kind: 'todo_list'; items: TodoItem[] } | null = null;
+
+  // 1. 深度对齐 DeepSeek：整轮所有的思考过程聚合为一个单一思考块，杜绝多行堆叠！
+  let combinedReasoning = (overrideReasoning || '').trim();
+  if (!combinedReasoning) {
+    const list: string[] = [];
+    for (const part of parts) {
+      if (part.kind === 'reasoning' && part.text && part.text.trim()) {
+        list.push(part.text.trim());
+      }
+    }
+    combinedReasoning = list.join('\n\n---\n\n');
+  }
+
+  if (combinedReasoning) {
+    out.push(
+      <ReasoningBlock key="rs-combined" text={combinedReasoning} search={search} />,
+    );
+  }
+
+  // 2. 渲染其他内容（正文文本、通知等）
   let i = 0;
   while (i < parts.length) {
     const p = parts[i];
+    if (p.kind === 'reasoning' || p.kind === 'tool') {
+      // reasoning 已统一聚合在顶部渲染，tool 已彻底隐藏，直接跳过
+      i++;
+      continue;
+    }
     if (p.kind === 'todo_list') {
       trailingTodos = p;
       i++;
       continue;
-    }
-    if (p.kind === 'tool') {
-      const groupKey = i;
-      const tools: ToolRow[] = [];
-      while (i < parts.length) {
-        const q = parts[i];
-        if (q.kind === 'todo_list') {
-          trailingTodos = q;
-          i++;
-          continue;
-        }
-        if (q.kind !== 'tool') break;
-        tools.push(q.tool);
-        i++;
-      }
-      if (tools.length > 0) {
-        out.push(
-          <ToolGroupView key={`tg-${groupKey}`} tools={tools} />
-        );
-      }
-    } else if (p.kind === 'reasoning') {
-      out.push(<ReasoningBlock key={`rs-${i}`} text={p.text} search={search} />);
-      i++;
     } else if (p.kind === 'notice') {
+      if (isIgnoredChatNotice(p.text)) {
+        i++;
+        continue;
+      }
       out.push(
         <div class="msg-notice" key={`nt-${i}`}>
           {highlightText(p.text, search)}
@@ -10218,15 +10278,19 @@ function renderAssistantParts(parts: MsgPart[], search: string, cwd?: string): V
       );
       i++;
     } else if (p.kind === 'text') {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} cwd={cwd} targetContext="chat" />);
+      if (p.text) {
+        out.push(
+          <Markdown key={`tx-${i}`} content={p.text} search={search} cwd={cwd} targetContext="chat" />,
+        );
+      }
       i++;
     } else {
       i++;
     }
   }
 
-  // 待办清单是整轮任务的最终成果核对单，始终且必然沉淀在助手回复的最末尾（所有思考、工具卡片、最终文本的最下方）！
-  if (trailingTodos && trailingTodos.items.length > 0) {
+  // 待办清单是整轮任务的最终成果核对单，沉淀在助手回复最下方
+  if (trailingTodos && trailingTodos.items && trailingTodos.items.length > 0) {
     out.push(
       <SessionTodoPanel key="td-trailing" items={trailingTodos.items} embedded />,
     );
@@ -10235,7 +10299,7 @@ function renderAssistantParts(parts: MsgPart[], search: string, cwd?: string): V
   return out;
 }
 
-/** Collapsible thinking / reasoning block (chain-of-thought stream). */
+/** Collapsible thinking / reasoning block (DeepSeek-style disclosure). */
 function ReasoningBlock({ text, search }: { text: string; search: string }) {
   const t = useT();
   // Default expanded while streaming (short / growing); collapse once settled
@@ -10258,6 +10322,20 @@ function ReasoningBlock({ text, search }: { text: string; search: string }) {
     if (!el || !followBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
   }, [text, open]);
+
+  // 提取思考过程的第一行有效文本作为未展开时的摘要预览（深度对齐 DeepSeek）
+  const summary = useMemo(() => {
+    if (!text) return '';
+    const lines = text.split('\n');
+    for (const rawLine of lines) {
+      const line = rawLine.trim().replace(/^([#*>-]|\d+\.)\s*/, '').replace(/[*_`]/g, '').trim();
+      if (line) {
+        return line;
+      }
+    }
+    return '';
+  }, [text]);
+
   if (!text.trim()) return null;
   return (
     <div class={'reasoning-block' + (open ? ' is-open' : '')}>
@@ -10271,6 +10349,12 @@ function ReasoningBlock({ text, search }: { text: string; search: string }) {
           ✦
         </span>
         <span class="reasoning-label">{t('chat.thinking')}</span>
+        {!open && summary && (
+          <>
+            <span class="reasoning-separator" aria-hidden="true">·</span>
+            <span class="reasoning-summary" title={summary}>{summary}</span>
+          </>
+        )}
         <span class={'reasoning-chevron' + (open ? ' expanded' : '')}>▾</span>
       </button>
       {open && (

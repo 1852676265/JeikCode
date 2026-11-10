@@ -93,19 +93,38 @@ fn upload_err(status: StatusCode, message: impl Into<String>) -> UploadError {
 }
 
 fn prepare_store(working_dir: &str) -> Result<PathBuf, UploadError> {
-    if working_dir.trim().is_empty() {
-        return Err(upload_err(
-            StatusCode::BAD_REQUEST,
-            "working_dir is required",
-        ));
-    }
-    let cwd = normalize_dir_arg(working_dir);
-    if !cwd.is_dir() {
-        return Err(upload_err(
-            StatusCode::BAD_REQUEST,
-            format!("working_dir is not a directory: {}", cwd.display()),
-        ));
-    }
+    let trimmed = working_dir.trim();
+    let cwd = if trimmed.is_empty() || trimmed == "__global__" {
+        let base = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+        let global_dir = base.join(".zap").join("global_uploads");
+        std::fs::create_dir_all(&global_dir).map_err(|e| {
+            upload_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create global_uploads directory: {e}"),
+            )
+        })?;
+        global_dir
+    } else {
+        let candidate = normalize_dir_arg(trimmed);
+        if !candidate.is_dir() {
+            if std::fs::create_dir_all(&candidate).is_err() {
+                let base = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+                let global_dir = base.join(".zap").join("global_uploads");
+                std::fs::create_dir_all(&global_dir).map_err(|e| {
+                    upload_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to create global_uploads directory: {e}"),
+                    )
+                })?;
+                global_dir
+            } else {
+                candidate
+            }
+        } else {
+            candidate
+        }
+    };
+
     let store = cwd.join(USER_UPLOAD_STORE_DIR);
     std::fs::create_dir_all(&store).map_err(|e| {
         upload_err(
@@ -113,12 +132,7 @@ fn prepare_store(working_dir: &str) -> Result<PathBuf, UploadError> {
             format!("failed to create {USER_UPLOAD_STORE_DIR}: {e}"),
         )
     })?;
-    ensure_gitignore_store_entry(&cwd).map_err(|e| {
-        upload_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to update .gitignore: {e}"),
-        )
-    })?;
+    let _ = ensure_gitignore_store_entry(&cwd);
     Ok(store)
 }
 
