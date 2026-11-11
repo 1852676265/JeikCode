@@ -21,6 +21,32 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.10 (2026-11-11)
+
+- **[Plugin Management & Desktop Pet] Full plugin HTTP lifecycle APIs and expanded local workspace RPCs**:
+  - Added native plugin management HTTP endpoints (`/api/plugins/installed`, `install`, `uninstall`, `marketplaces`, `storage`) for listing, installing, uninstalling, and managing plugin storage and marketplaces.
+  - Extended local plugin RPC capabilities to support key-value storage, app configuration persistence, quick notes, memos, server credential metadata, and native folder/explorer pickers.
+  - Added WebUI desktop pet (`@dsh-community/pet`) settings panel, AI turn state/completion events, and `webm`/`wav` media support.
+
+- **[Terminal Experience] Fix Windows ConPTY character swallowing on startup and replay**:
+  - Handled ConPTY startup cursor position probes and filtered terminal query sequences during session replay so reconnecting or typing immediately in the integrated terminal no longer drops the first input character.
+
+- **[Chat & Turn Navigator] In-progress turn token display**:
+  - Displayed an explicit in-progress status in TurnNavigator for running AI turns across Chinese, English, and Vietnamese locales before token statistics finalize.
+
+---
+
+- **[插件生态与桌面宠物] 完善插件 HTTP 生命周期接口与扩展本地 RPC 能力**:
+  - 新增原生插件管理 HTTP 接口（`/api/plugins/installed`、`install`、`uninstall`、`marketplaces`、`storage`），支持插件安装、卸载、市场管理与本地状态持久化。
+  - 扩展插件本地 RPC 能力，支持键值存储、应用配置读写、快速便签、备忘录、服务器凭据元数据及原生目录选择/文件管理器定位。
+  - 新增 WebUI 桌面宠物（`@dsh-community/pet`）专属设置中心、AI 回合状态与完成事件通知，并支持 `webm`/`wav` 音频资源加载。
+
+- **[集成终端体验] 修复 Windows ConPTY 启动与回放首字符吞字问题**:
+  - 拦截并应答 ConPTY 启动时的光标位置探测序列，同时在终端会话回放时过滤查询指令，解决打开或切换终端后首次输入命令丢首字符的问题。
+
+- **[对话与回合导航] 生成中回合的 Token 状态显示**:
+  - 为尚未返回 Token 统计的进行中 AI 回合补充多语言状态提示（中文、英文、越南语），让对话进度反馈更直观。
+
 ## v1.0.9 (2026-11-11)
 
 - **[Plugin System & DevOrbit Integration] Native plugin asset hosting and local RPC engine**:
