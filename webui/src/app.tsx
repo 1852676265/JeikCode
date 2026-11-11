@@ -1772,6 +1772,9 @@ export function App() {
               restoring={restoring}
               onLiveTurnDone={() => {
                 setSessionListVersion((v) => v + 1);
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(new CustomEvent('zap:ai-turn-done', { detail: { sessionId } }));
+                }
                 // 回合完成时，立即主动校准本地 liveRunningIds，确保清除残留的旋转菊花
                 getActiveChatSessions()
                   .then((ids) => {
@@ -1793,6 +1796,11 @@ export function App() {
                   else next.delete(id);
                   return next;
                 });
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(
+                    new CustomEvent('zap:ai-state', { detail: { running, sessionId: id } })
+                  );
+                }
               }}
               onOptimisticSession={handleOptimisticSession}
               onOpenCwd={() => setShowCwd(true)}

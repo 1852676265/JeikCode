@@ -20,6 +20,88 @@ pub struct PluginRpcRequest {
     pub payload: Value,
 }
 
+fn get_devorbit_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = PathBuf::from(&appdata).join("dev-orbit").join("devorbit_config.json");
+            if p.is_file() {
+                return p;
+            }
+            let legacy = PathBuf::from(&appdata).join("dev-task-hub").join("devtaskhub_config.json");
+            if legacy.is_file() {
+                return legacy;
+            }
+            return p;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join("Library/Application Support/dev-orbit/devorbit_config.json");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".config/dev-orbit/devorbit_config.json");
+        }
+    }
+    PathBuf::from("devorbit_config.json")
+}
+
+fn get_devorbit_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("dev-orbit");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join("Library/Application Support/dev-orbit");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".config/dev-orbit");
+        }
+    }
+    PathBuf::from(".")
+}
+
+fn get_quick_notes_file(ws: &str, file_name: &str) -> PathBuf {
+    let base = if ws.trim().is_empty() { "D:\\工作" } else { ws.trim() };
+    PathBuf::from(base).join("_quick_notes").join(file_name)
+}
+
+fn read_quick_notes_json(ws: &str, file_name: &str, default_val: Value) -> Value {
+    let p = get_quick_notes_file(ws, file_name);
+    if p.is_file() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            let clean = if s.starts_with('\u{feff}') { &s[3..] } else { &s };
+            if let Ok(v) = serde_json::from_str::<Value>(clean) {
+                return v;
+            }
+        }
+    }
+    default_val
+}
+
+fn write_quick_notes_json(ws: &str, file_name: &str, val: &Value) -> bool {
+    let p = get_quick_notes_file(ws, file_name);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(pretty) = serde_json::to_string_pretty(val) {
+        return std::fs::write(&p, pretty).is_ok();
+    }
+    false
+}
+
 /// 解析单个任务文件夹的资产与元信息
 fn parse_task_folder(task_dir: &StdPath, fallback_year: &str) -> Option<Value> {
     if !task_dir.is_dir() {
@@ -115,6 +197,60 @@ pub async fn handle_plugin_rpc(
     let payload = req.payload;
 
     match action {
+        "storage:get" => {
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let base = if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(home)
+            } else if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                PathBuf::from(userprofile)
+            } else {
+                PathBuf::from(".")
+            };
+            let p = base.join(".zap").join("plugin-storage").join(&plugin_id).join("storage.json");
+            if !p.is_file() {
+                return Json(json!({ "success": true, "value": Value::Null })).into_response();
+            }
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                if let Ok(map) = serde_json::from_str::<Value>(&s) {
+                    let val = map.get(key).cloned().unwrap_or(Value::Null);
+                    return Json(json!({ "success": true, "value": val })).into_response();
+                }
+            }
+            Json(json!({ "success": true, "value": Value::Null })).into_response()
+        }
+
+        "storage:set" => {
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let val = payload.get("value").cloned().unwrap_or(Value::Null);
+            let base = if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(home)
+            } else if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                PathBuf::from(userprofile)
+            } else {
+                PathBuf::from(".")
+            };
+            let p = base.join(".zap").join("plugin-storage").join(&plugin_id).join("storage.json");
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut map = if p.is_file() {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+            if !map.is_object() {
+                map = json!({});
+            }
+            map[key] = val;
+            if let Ok(s) = serde_json::to_string_pretty(&map) {
+                let _ = std::fs::write(&p, s);
+            }
+            Json(json!({ "success": true })).into_response()
+        }
+
         "get-workspace-path" => {
             let mut ws = payload
                 .get("workspacePath")
@@ -516,7 +652,10 @@ pub async fn handle_plugin_rpc(
         }
 
         "open-in-explorer" => {
-            let target_path = payload.get("targetPath").and_then(|v| v.as_str()).unwrap_or("");
+            let mut target_path = payload.get("targetPath").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if target_path.is_empty() {
+                target_path = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作").to_string();
+            }
             if !target_path.is_empty() {
                 #[cfg(windows)]
                 {
@@ -528,16 +667,230 @@ pub async fn handle_plugin_rpc(
                 #[cfg(target_os = "macos")]
                 {
                     let _ = std::process::Command::new("open")
-                        .arg(target_path)
+                        .arg(&target_path)
                         .spawn();
                 }
                 #[cfg(target_os = "linux")]
                 {
                     let _ = std::process::Command::new("xdg-open")
-                        .arg(target_path)
+                        .arg(&target_path)
                         .spawn();
                 }
             }
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "get-app-config" => {
+            let config_path = get_devorbit_config_path();
+            let mut cfg: Value = if config_path.is_file() {
+                std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|s| {
+                        let clean = if s.starts_with('\u{feff}') { &s[3..] } else { &s };
+                        serde_json::from_str::<Value>(clean).ok()
+                    })
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+
+            if cfg.get("workspacePath").and_then(|v| v.as_str()).map_or(true, |s| s.is_empty()) {
+                cfg["workspacePath"] = json!("D:\\工作");
+            }
+            if cfg.get("defaultYear").is_none() {
+                cfg["defaultYear"] = json!("2026");
+            }
+            if cfg.get("defaultProject").is_none() {
+                cfg["defaultProject"] = json!("MZ");
+            }
+            if cfg.get("developerName").is_none() {
+                cfg["developerName"] = json!("LiSB");
+            }
+
+            Json(cfg).into_response()
+        }
+
+        "save-app-config" => {
+            let config_path = get_devorbit_config_path();
+            if let Some(parent) = config_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut current: Value = if config_path.is_file() {
+                std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|s| {
+                        let clean = if s.starts_with('\u{feff}') { &s[3..] } else { &s };
+                        serde_json::from_str::<Value>(clean).ok()
+                    })
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+
+            if let Some(new_map) = payload.as_object() {
+                if let Some(curr_map) = current.as_object_mut() {
+                    for (k, v) in new_map {
+                        curr_map.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    current = payload.clone();
+                }
+            }
+
+            if let Ok(pretty) = serde_json::to_string_pretty(&current) {
+                let _ = std::fs::write(&config_path, pretty);
+            }
+            Json(current).into_response()
+        }
+
+        "open-config-folder" => {
+            let config_dir = get_devorbit_config_dir();
+            let _ = std::fs::create_dir_all(&config_dir);
+            #[cfg(windows)]
+            {
+                let win_path = config_dir.to_string_lossy().to_string().replace('/', "\\");
+                let _ = std::process::Command::new("explorer.exe")
+                    .arg(&win_path)
+                    .spawn();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg(&config_dir)
+                    .spawn();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&config_dir)
+                    .spawn();
+            }
+            Json(json!({ "success": true, "path": config_dir.to_string_lossy().to_string() })).into_response()
+        }
+
+        "select-workspace-dir" => {
+            #[allow(unused_mut)]
+            let mut selected_path: Option<String> = None;
+            #[cfg(windows)]
+            {
+                let script = r#"
+                    Add-Type -AssemblyName System.Windows.Forms
+                    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+                    $dialog.Description = '选择你的开发工作区根目录'
+                    $dialog.ShowNewFolderButton = $true
+                    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                        Write-Output $dialog.SelectedPath
+                    }
+                "#;
+                if let Ok(output) = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", script])
+                    .output()
+                {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !text.is_empty() && StdPath::new(&text).is_dir() {
+                        selected_path = Some(text);
+                    }
+                }
+            }
+            Json(json!({ "workspacePath": selected_path })).into_response()
+        }
+
+        "get-quick-notes" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let data = read_quick_notes_json(ws, "notes.json", json!([]));
+            Json(data).into_response()
+        }
+
+        "save-quick-notes-batch" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let notes = payload.get("notes").cloned().unwrap_or_else(|| json!([]));
+            write_quick_notes_json(ws, "notes.json", &notes);
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "save-quick-note" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let note = payload.get("note").cloned().unwrap_or_else(|| json!({}));
+            let mut list = read_quick_notes_json(ws, "notes.json", json!([]));
+            if let Some(arr) = list.as_array_mut() {
+                let id = note.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(idx) = arr.iter().position(|item| item.get("id").and_then(|v| v.as_str()) == Some(id)) {
+                    arr[idx] = note;
+                } else {
+                    arr.insert(0, note);
+                }
+            }
+            write_quick_notes_json(ws, "notes.json", &list);
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "delete-quick-note" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let mut list = read_quick_notes_json(ws, "notes.json", json!([]));
+            if let Some(arr) = list.as_array_mut() {
+                arr.retain(|item| item.get("id").and_then(|v| v.as_str()) != Some(id));
+            }
+            write_quick_notes_json(ws, "notes.json", &list);
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "get-memos" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let data = read_quick_notes_json(ws, "memos.json", json!([]));
+            Json(data).into_response()
+        }
+
+        "save-memo" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let memo = payload.get("memo").cloned().unwrap_or_else(|| json!({}));
+            let mut list = read_quick_notes_json(ws, "memos.json", json!([]));
+            if let Some(arr) = list.as_array_mut() {
+                let id = memo.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(idx) = arr.iter().position(|item| item.get("id").and_then(|v| v.as_str()) == Some(id)) {
+                    arr[idx] = memo;
+                } else {
+                    arr.insert(0, memo);
+                }
+            }
+            write_quick_notes_json(ws, "memos.json", &list);
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "delete-memo" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let mut list = read_quick_notes_json(ws, "memos.json", json!([]));
+            if let Some(arr) = list.as_array_mut() {
+                arr.retain(|item| item.get("id").and_then(|v| v.as_str()) != Some(id));
+            }
+            write_quick_notes_json(ws, "memos.json", &list);
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "get-server-credentials" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let data = read_quick_notes_json(ws, "server_credentials.json", json!([]));
+            Json(data).into_response()
+        }
+
+        "save-server-credentials" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let creds = payload.get("credentials").cloned().unwrap_or_else(|| json!([]));
+            write_quick_notes_json(ws, "server_credentials.json", &creds);
+            Json(json!({ "success": true })).into_response()
+        }
+
+        "get-credentials-meta" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let data = read_quick_notes_json(ws, "credentials_meta.json", json!({ "lastSync": "刚刚" }));
+            Json(data).into_response()
+        }
+
+        "save-credentials-meta" => {
+            let ws = payload.get("workspacePath").and_then(|v| v.as_str()).unwrap_or("D:\\工作");
+            let meta = payload.get("meta").cloned().unwrap_or_else(|| json!({}));
+            write_quick_notes_json(ws, "credentials_meta.json", &meta);
             Json(json!({ "success": true })).into_response()
         }
 

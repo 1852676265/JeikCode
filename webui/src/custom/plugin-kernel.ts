@@ -18,6 +18,83 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { fetchFsRead } from '../api';
 
 // =============================================================================
+// 0. Generic Contribution System & Standard Host SDK (DSH / Cordis Aligned)
+// =============================================================================
+
+export interface ActionContribution<TContext = any> {
+  id: string;
+  order: number;
+  title: string;
+  icon?: string | ComponentChildren;
+  pluginPackage?: string;
+  when?: (ctx: TContext) => boolean;
+  execute: (ctx: TContext, host: ZapHostSDK) => void | Promise<void>;
+  render?: (props: { ctx: TContext; host: ZapHostSDK; action: ActionContribution<TContext> }) => ComponentChildren;
+}
+
+export type ActionScope =
+  | 'chat.message:actions'
+  | 'chat.turn:actions'
+  | 'chat.input:actions'
+  | 'chat.selection:actions'
+  | string;
+
+export interface InspectorContribution<TTarget = any> {
+  id: string;
+  title: string;
+  icon?: string | ComponentChildren;
+  order?: number;
+  pluginPackage?: string;
+  supports?: (target: TTarget) => boolean;
+  render: (props: { target: TTarget; onClose: () => void; host: ZapHostSDK }) => ComponentChildren;
+}
+
+export type InspectorScope =
+  | 'chat.turn:inspectors'
+  | 'chat.message:inspectors'
+  | 'workbench:inspectors'
+  | string;
+
+export interface ZapHostSDK {
+  session: {
+    getActiveSessionId(): string | null;
+    create(options?: { prefillPrompt?: string; autoSend?: boolean }): Promise<string | null>;
+    rollback(turnIndex: number, options?: { promptOverride?: string }): Promise<void>;
+    send(text: string): Promise<void>;
+  };
+  history: {
+    getTurn(turnIndex: number): Promise<any | null>;
+    getRawPrompt(turnIndex: number): Promise<{ system: string; user: string } | null>;
+  };
+  storage: {
+    get<T = any>(key: string): Promise<T | null>;
+    set<T = any>(key: string, value: T): Promise<void>;
+    delete(key: string): Promise<void>;
+  };
+  ui: {
+    toast(message: string, type?: 'info' | 'success' | 'warn' | 'error'): void;
+    copy(text: string): Promise<boolean>;
+    openInspector(inspectorId: string, targetPayload: any, scope?: InspectorScope): void;
+    closeInspector(): void;
+  };
+  events: {
+    on(event: string, handler: (data: any) => void): () => void;
+    emit(event: string, data?: any): void;
+  };
+}
+
+export interface ZapHostDriver {
+  getActiveSessionId?: () => string | null;
+  createSession?: (options?: { prefillPrompt?: string; autoSend?: boolean }) => Promise<string | null>;
+  rollbackTurn?: (turnIndex: number, options?: { promptOverride?: string }) => Promise<void>;
+  sendMessage?: (text: string) => Promise<void>;
+  getTurnSnapshot?: (turnIndex: number) => Promise<any | null>;
+  getRawPromptSnapshot?: (turnIndex: number) => Promise<{ system: string; user: string } | null>;
+  showToast?: (message: string, type?: 'info' | 'success' | 'warn' | 'error') => void;
+  copyText?: (text: string) => Promise<boolean>;
+}
+
+// =============================================================================
 // 1. Typed Slot Contracts (Aligned with @deepseek-ai/dsh-client-ui-slots)
 // =============================================================================
 
@@ -194,6 +271,7 @@ export interface ExternalPluginPackage {
     label: string;
     description: string;
     type: 'boolean' | 'string' | 'number' | 'select';
+    default?: any;
     options?: { label: string; value: string }[];
   }[];
   contributesSidebarNav?: {
@@ -612,6 +690,84 @@ const DEFAULT_EXTERNAL_PACKAGES: ExternalPluginPackage[] = [
       },
     ],
   },
+  {
+    name: '@dsh-community/pet',
+    title: '桌宠伴侣 (Desktop Pet)',
+    description: '基于透明 WebM 骨骼动效与物理引擎的萌系伴侣宠，感知 AI 推理与打字状态，支持自由拖拽抛掷、投喂白饭互动、趣味碎碎念。',
+    version: '0.4.7',
+    author: 'PC2005-cloud & Zap Team',
+    official: false,
+    pinnedByDefault: true,
+    installed: true,
+    enabled: true,
+    removable: true,
+    updatable: false,
+    source: 'local:D:/插件/dsh-pet',
+    installDir: 'D:/插件/dsh-pet',
+    entry: 'dist/entry.js',
+    entryDir: 'D:/插件/dsh-pet',
+    readmeMarkdown: `### 桌宠伴侣 (Desktop Pet)\n\n基于透明 WebM 骨骼动效与物理引擎的萌系伴侣宠，感知 AI 推理与打字状态，支持自由拖拽抛掷、投喂白饭互动、趣味碎碎念。\n\n- **智能状态感知**：AI 编写代码时桌宠同步敲键盘，完工时雀跃庆祝\n- **全自由拖拽抛掷**：具备重力、反弹与挤压弹性\n- **右键动作直通**：投喂白饭、玩魔方、宅舞、睡觉一键切换`,
+    versions: ['0.4.7'],
+    contributesSidebarNav: {
+      id: 'sidebar-nav-dsh-pet',
+      label: '桌宠互动',
+      badge: 'PET',
+      order: 55,
+      eventName: 'zap:toggle-pet-drawer',
+    },
+    contributesSettingsSection: {
+      id: 'ext-dsh-pet',
+      label: '桌宠伴侣',
+      title: '桌宠伴侣设置',
+      description: '自定义桌宠大小、互动频率、音效与物理拖拽特性。',
+    },
+    configSchema: [
+      {
+        key: 'petScale',
+        label: '桌宠缩放比例',
+        description: '调整桌宠显示大小（0.5 ~ 1.5，默认 1.0）',
+        type: 'string',
+        default: '1.0',
+      },
+      {
+        key: 'soundEnabled',
+        label: '点击与动作音效',
+        description: '开启后点击或特定动作触发可爱音效',
+        type: 'boolean',
+        default: true,
+      },
+      {
+        key: 'physicsEnabled',
+        label: '窗口边缘碰撞与重力抛掷',
+        description: '开启后拖拽扔出桌宠具备物理惯性与屏幕反弹',
+        type: 'boolean',
+        default: true,
+      },
+      {
+        key: 'whisperEnabled',
+        label: '定时碎碎念与气泡',
+        description: '桌宠在闲置时随机展示趣味碎碎念气泡',
+        type: 'boolean',
+        default: true,
+      },
+    ],
+    configValues: {
+      petScale: '1.0',
+      soundEnabled: true,
+      physicsEnabled: true,
+      whisperEnabled: true,
+    },
+    rows: [
+      {
+        rowId: 'pet-companion',
+        title: '透明动画舞台与物理引擎 (Stage & Physics)',
+        description: '在界面层挂载 60fps 透明 WebM 伴侣宠与鼠标碰撞物理系统',
+        moduleName: '@dsh-community/pet/companion',
+        enabled: true,
+        phase: 'active',
+      },
+    ],
+  },
 ];
 
 export const MARKET_CATALOG: MarketListingEntry[] = [
@@ -798,6 +954,63 @@ export const MARKET_CATALOG: MarketListingEntry[] = [
       notifyOnApproval: true,
     },
   },
+  {
+    name: '@dsh-community/pet',
+    title: '桌宠伴侣 (Desktop Pet)',
+    description: '基于透明 WebM 骨骼动效与物理引擎的萌系伴侣宠，感知 AI 推理与打字状态，支持自由拖拽抛掷、投喂白饭互动、趣味碎碎念。',
+    author: 'PC2005-cloud & Zap Team',
+    category: 'appearance',
+    labels: ['featured', 'companion', 'slot:sidebar.nav', 'slot:settings.section'],
+    defaultVersion: '0.4.7',
+    versions: [
+      { version: '0.4.7', publishTimestamp: 1776000000, compatible: true, runtimeRequirement: '>=0.2.0' },
+    ],
+    repository: 'https://github.com/PC2005-cloud/dsh-pet',
+    registry: 'https://registry.npmmirror.com',
+    readmeMarkdown: `### 桌宠伴侣 (Desktop Pet)\n\n基于透明 WebM 骨骼动效与物理引擎的萌系伴侣宠，感知 AI 推理与打字状态，支持自由拖拽抛掷、投喂白饭互动、趣味碎碎念。\n\n- **智能状态感知**：AI 编写代码时桌宠同步敲键盘，完工时雀跃庆祝\n- **全自由拖拽抛掷**：具备重力、反弹与挤压弹性\n- **右键动作直通**：投喂白饭、玩魔方、宅舞、睡觉一键切换`,
+    contributesSettingsSection: {
+      id: 'ext-dsh-pet',
+      label: '桌宠伴侣',
+      title: '桌宠伴侣设置',
+      description: '自定义桌宠大小、互动频率、音效与物理拖拽特性。',
+    },
+    configSchema: [
+      {
+        key: 'petScale',
+        label: '桌宠缩放比例',
+        description: '调整桌宠显示大小（0.5 ~ 1.5，默认 1.0）',
+        type: 'string',
+        default: '1.0',
+      },
+      {
+        key: 'soundEnabled',
+        label: '点击与动作音效',
+        description: '开启后点击或特定动作触发可爱音效',
+        type: 'boolean',
+        default: true,
+      },
+      {
+        key: 'physicsEnabled',
+        label: '窗口边缘碰撞与重力抛掷',
+        description: '开启后拖拽扔出桌宠具备物理惯性与屏幕反弹',
+        type: 'boolean',
+        default: true,
+      },
+      {
+        key: 'whisperEnabled',
+        label: '定时碎碎念与气泡',
+        description: '桌宠在闲置时随机展示趣味碎碎念气泡',
+        type: 'boolean',
+        default: true,
+      },
+    ],
+    defaultConfig: {
+      petScale: '1.0',
+      soundEnabled: true,
+      physicsEnabled: true,
+      whisperEnabled: true,
+    },
+  },
 ];
 
 // =============================================================================
@@ -833,7 +1046,16 @@ export class ZapPluginKernel {
   private dynamicDisposers = new Map<string, () => void>();
   private styleElements = new Map<string, HTMLStyleElement>();
 
+  // Generic Extension Registries (DSH / Cordis Action & Inspector models)
+  private actionRegistries = new Map<string, Map<string, ActionContribution>>();
+  private inspectorRegistries = new Map<string, Map<string, InspectorContribution>>();
+  private activeInspectorState: { scope: string; id: string; target: any } | null = null;
+  private hostDriver: ZapHostDriver = {};
+  private hostEventListeners = new Map<string, Set<(data: any) => void>>();
+  public readonly hostSDK: ZapHostSDK;
+
   constructor() {
+    this.hostSDK = this.createHostSDK();
     this.loadPersistedState();
   }
 
@@ -907,7 +1129,7 @@ export class ZapPluginKernel {
       /* ignore */
     }
 
-    // 清理可能遗留的孤儿插件背景（当壁纸插件未启用或已被卸载时）
+    // 清理可能遗留的孤儿插件（当壁纸/桌宠插件未启用或已被卸载时）
     if (typeof document !== 'undefined') {
       const hasWallpaper = this.externalPackages.some((p) => p.name.includes('wallpaper') && p.enabled);
       if (!hasWallpaper) {
@@ -921,6 +1143,16 @@ export class ZapPluginKernel {
         document.getElementById('zap-wallpaper-injected-styles')?.remove();
         if (typeof window !== 'undefined') {
           (window as any).__ZAP_WALLPAPER_ENGINE_INITIALIZED__ = false;
+        }
+      }
+
+      const hasPet = this.externalPackages.some((p) => p.name.includes('pet') && p.enabled);
+      if (!hasPet) {
+        document.getElementById('zap-pet-companion-container')?.remove();
+        document.getElementById('zap-pet-injected-styles')?.remove();
+        document.getElementById('zap-pet-drawer')?.remove();
+        if (typeof window !== 'undefined') {
+          (window as any).__ZAP_PET_INITIALIZED__ = false;
         }
       }
     }
@@ -992,6 +1224,242 @@ export class ZapPluginKernel {
   public getSlotEntries<K extends SlotKey>(slotName: K): SlotMap[K][] {
     const list = Array.from(this.slots[slotName].values());
     return list.sort((a, b) => a.order - b.order);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Generic Action Provider API (DSH `actions.register` Aligned)
+  // ---------------------------------------------------------------------------
+
+  public registerAction<TContext = any>(
+    scope: ActionScope,
+    action: ActionContribution<TContext>,
+  ): () => void {
+    let registry = this.actionRegistries.get(scope);
+    if (!registry) {
+      registry = new Map();
+      this.actionRegistries.set(scope, registry);
+    }
+    registry.set(action.id, action);
+    this.notify();
+    return () => {
+      const reg = this.actionRegistries.get(scope);
+      if (reg && reg.get(action.id) === action) {
+        reg.delete(action.id);
+        this.notify();
+      }
+    };
+  }
+
+  public getActions<TContext = any>(
+    scope: ActionScope,
+    context?: TContext,
+  ): ActionContribution<TContext>[] {
+    const registry = this.actionRegistries.get(scope);
+    if (!registry) return [];
+    const list = Array.from(registry.values()) as ActionContribution<TContext>[];
+    const filtered = context !== undefined
+      ? list.filter((act) => !act.when || act.when(context))
+      : list;
+    return filtered.sort((a, b) => a.order - b.order);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Generic Inspector & View Drawer API (DSH `inspectors.register` Aligned)
+  // ---------------------------------------------------------------------------
+
+  public registerInspector<TTarget = any>(
+    scope: InspectorScope,
+    inspector: InspectorContribution<TTarget>,
+  ): () => void {
+    let registry = this.inspectorRegistries.get(scope);
+    if (!registry) {
+      registry = new Map();
+      this.inspectorRegistries.set(scope, registry);
+    }
+    registry.set(inspector.id, inspector);
+    this.notify();
+    return () => {
+      const reg = this.inspectorRegistries.get(scope);
+      if (reg && reg.get(inspector.id) === inspector) {
+        reg.delete(inspector.id);
+        if (this.activeInspectorState?.id === inspector.id) {
+          this.activeInspectorState = null;
+        }
+        this.notify();
+      }
+    };
+  }
+
+  public getInspectors<TTarget = any>(
+    scope: InspectorScope,
+    target?: TTarget,
+  ): InspectorContribution<TTarget>[] {
+    const registry = this.inspectorRegistries.get(scope);
+    if (!registry) return [];
+    const list = Array.from(registry.values()) as InspectorContribution<TTarget>[];
+    const filtered = target !== undefined
+      ? list.filter((ins) => !ins.supports || ins.supports(target))
+      : list;
+    return filtered.sort((a, b) => (a.order ?? 50) - (b.order ?? 50));
+  }
+
+  public openInspector(inspectorId: string, targetPayload: any, scope: InspectorScope = 'chat.turn:inspectors') {
+    const registry = this.inspectorRegistries.get(scope);
+    const item = registry?.get(inspectorId);
+    if (!item) {
+      console.warn(`[ZapPluginKernel] Inspector "${inspectorId}" not found in scope "${scope}"`);
+      return;
+    }
+    this.activeInspectorState = { scope, id: inspectorId, target: targetPayload };
+    this.notify();
+  }
+
+  public closeInspector() {
+    if (this.activeInspectorState) {
+      this.activeInspectorState = null;
+      this.notify();
+    }
+  }
+
+  public getActiveInspector(): {
+    scope: string;
+    id: string;
+    target: any;
+    inspector: InspectorContribution;
+  } | null {
+    if (!this.activeInspectorState) return null;
+    const { scope, id, target } = this.activeInspectorState;
+    const reg = this.inspectorRegistries.get(scope);
+    const inspector = reg?.get(id);
+    if (!inspector) return null;
+    return { scope, id, target, inspector };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host Driver Binding & Standard Host SDK
+  // ---------------------------------------------------------------------------
+
+  public bindHostDriver(driver: Partial<ZapHostDriver>) {
+    this.hostDriver = { ...this.hostDriver, ...driver };
+  }
+
+  private createHostSDK(): ZapHostSDK {
+    const self = this;
+    return {
+      session: {
+        getActiveSessionId: () => self.hostDriver.getActiveSessionId?.() ?? null,
+        create: async (options) => {
+          if (self.hostDriver.createSession) {
+            return await self.hostDriver.createSession(options);
+          }
+          console.warn('[ZapHostSDK] createSession handler is not bound yet');
+          return null;
+        },
+        rollback: async (turnIndex, options) => {
+          if (self.hostDriver.rollbackTurn) {
+            await self.hostDriver.rollbackTurn(turnIndex, options);
+            return;
+          }
+          console.warn('[ZapHostSDK] rollbackTurn handler is not bound yet');
+        },
+        send: async (text) => {
+          if (self.hostDriver.sendMessage) {
+            await self.hostDriver.sendMessage(text);
+            return;
+          }
+          console.warn('[ZapHostSDK] sendMessage handler is not bound yet');
+        },
+      },
+      history: {
+        getTurn: async (turnIndex) => {
+          if (self.hostDriver.getTurnSnapshot) {
+            return await self.hostDriver.getTurnSnapshot(turnIndex);
+          }
+          return null;
+        },
+        getRawPrompt: async (turnIndex) => {
+          if (self.hostDriver.getRawPromptSnapshot) {
+            return await self.hostDriver.getRawPromptSnapshot(turnIndex);
+          }
+          return null;
+        },
+      },
+      storage: {
+        get: async <T = any>(key: string): Promise<T | null> => {
+          try {
+            const raw = localStorage.getItem(`zap.plugin_storage.${key}`);
+            return raw ? JSON.parse(raw) : null;
+          } catch {
+            return null;
+          }
+        },
+        set: async <T = any>(key: string, value: T): Promise<void> => {
+          try {
+            localStorage.setItem(`zap.plugin_storage.${key}`, JSON.stringify(value));
+          } catch (e) {
+            console.error('[ZapHostSDK] storage set error:', e);
+          }
+        },
+        delete: async (key: string): Promise<void> => {
+          try {
+            localStorage.removeItem(`zap.plugin_storage.${key}`);
+          } catch {
+            /* ignore */
+          }
+        },
+      },
+      ui: {
+        toast: (message, type = 'info') => {
+          if (self.hostDriver.showToast) {
+            self.hostDriver.showToast(message, type);
+            return;
+          }
+          console.log(`[Toast ${type.toUpperCase()}]: ${message}`);
+        },
+        copy: async (text) => {
+          if (self.hostDriver.copyText) {
+            return await self.hostDriver.copyText(text);
+          }
+          if (typeof navigator !== 'undefined' && navigator.clipboard) {
+            await navigator.clipboard.writeText(text);
+            return true;
+          }
+          return false;
+        },
+        openInspector: (id, target, scope) => {
+          self.openInspector(id, target, scope);
+        },
+        closeInspector: () => {
+          self.closeInspector();
+        },
+      },
+      events: {
+        on: (event, handler) => {
+          let set = self.hostEventListeners.get(event);
+          if (!set) {
+            set = new Set();
+            self.hostEventListeners.set(event, set);
+          }
+          set.add(handler);
+          return () => {
+            const s = self.hostEventListeners.get(event);
+            if (s) s.delete(handler);
+          };
+        },
+        emit: (event, data) => {
+          const s = self.hostEventListeners.get(event);
+          if (s) {
+            for (const h of s) {
+              try {
+                h(data);
+              } catch (e) {
+                console.error(`[ZapHostSDK] event ${event} error:`, e);
+              }
+            }
+          }
+        },
+      },
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -1218,6 +1686,12 @@ export class ZapPluginKernel {
         document.getElementById('zap-wallpaper-drawer')?.remove();
         document.getElementById('zap-wallpaper-injected-styles')?.remove();
         (window as any).__ZAP_WALLPAPER_ENGINE_INITIALIZED__ = false;
+      }
+      if (packageName.includes('pet')) {
+        document.getElementById('zap-pet-companion-container')?.remove();
+        document.getElementById('zap-pet-injected-styles')?.remove();
+        document.getElementById('zap-pet-drawer')?.remove();
+        (window as any).__ZAP_PET_INITIALIZED__ = false;
       }
     }
     this.externalPackages = this.externalPackages.filter((pkg) => pkg.name !== packageName || !pkg.removable);
@@ -1518,6 +1992,12 @@ export class ZapPluginKernel {
           document.getElementById('zap-wallpaper-injected-styles')?.remove();
           (window as any).__ZAP_WALLPAPER_ENGINE_INITIALIZED__ = false;
         }
+        if (packageName.includes('pet')) {
+          document.getElementById('zap-pet-companion-container')?.remove();
+          document.getElementById('zap-pet-injected-styles')?.remove();
+          document.getElementById('zap-pet-drawer')?.remove();
+          (window as any).__ZAP_PET_INITIALIZED__ = false;
+        }
       }
       return;
     }
@@ -1641,8 +2121,66 @@ export class ZapPluginKernel {
 }
 
 export const zapPluginKernel = new ZapPluginKernel();
+export const zapHostSDK = zapPluginKernel.hostSDK;
 
-// Expose global runtime hook for external user scripts
+// =============================================================================
+// React Hooks for Plugin System Consumption
+// =============================================================================
+
+export function usePluginActions<TContext = any>(
+  scope: ActionScope,
+  context?: TContext,
+): ActionContribution<TContext>[] {
+  const [actions, setActions] = useState<ActionContribution<TContext>[]>(() =>
+    zapPluginKernel.getActions(scope, context),
+  );
+
+  useEffect(() => {
+    setActions(zapPluginKernel.getActions(scope, context));
+    return zapPluginKernel.subscribe(() => {
+      setActions(zapPluginKernel.getActions(scope, context));
+    });
+  }, [scope, context]);
+
+  return actions;
+}
+
+export function usePluginInspectors<TTarget = any>(
+  scope: InspectorScope,
+  target?: TTarget,
+): InspectorContribution<TTarget>[] {
+  const [inspectors, setInspectors] = useState<InspectorContribution<TTarget>[]>(() =>
+    zapPluginKernel.getInspectors(scope, target),
+  );
+
+  useEffect(() => {
+    setInspectors(zapPluginKernel.getInspectors(scope, target));
+    return zapPluginKernel.subscribe(() => {
+      setInspectors(zapPluginKernel.getInspectors(scope, target));
+    });
+  }, [scope, target]);
+
+  return inspectors;
+}
+
+export function useActiveInspector() {
+  const [active, setActive] = useState(() => zapPluginKernel.getActiveInspector());
+
+  useEffect(() => {
+    return zapPluginKernel.subscribe(() => {
+      setActive(zapPluginKernel.getActiveInspector());
+    });
+  }, []);
+
+  return active;
+}
+
+export function useZapHostSDK(): ZapHostSDK {
+  return zapPluginKernel.hostSDK;
+}
+
+// Expose global runtime hooks for external user scripts & plugins
 if (typeof window !== 'undefined') {
   (window as any).__ZAP_PLUGIN_KERNEL__ = zapPluginKernel;
+  (window as any).__ZAP_HOST_SDK__ = zapPluginKernel.hostSDK;
 }

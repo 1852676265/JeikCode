@@ -334,11 +334,210 @@ function localPluginsServePlugin(): Plugin {
               }
 
               if (action === 'open-in-explorer') {
-                const targetPath = payload.targetPath;
-                if (targetPath && fs.existsSync(targetPath)) {
+                const targetPath = payload.targetPath || payload.workspacePath || 'D:/工作';
+                if (targetPath) {
                   const cp = await import('child_process');
                   cp.exec(`explorer.exe "${targetPath.replace(/\//g, '\\')}"`);
                 }
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              const appData = process.env.APPDATA || '';
+              const devOrbitConfigPath = path.join(appData, 'dev-orbit', 'devorbit_config.json');
+              const legacyConfigPath = path.join(appData, 'dev-task-hub', 'devtaskhub_config.json');
+
+              const getResolvedConfigPath = () => {
+                if (fs.existsSync(devOrbitConfigPath)) return devOrbitConfigPath;
+                if (fs.existsSync(legacyConfigPath)) return legacyConfigPath;
+                return devOrbitConfigPath;
+              };
+
+              const readQuickNotesFile = (wsDir: string, fileName: string, defaultVal: any) => {
+                const target = path.join(wsDir || 'D:/工作', '_quick_notes', fileName);
+                if (fs.existsSync(target)) {
+                  try {
+                    let raw = fs.readFileSync(target, 'utf-8');
+                    if (raw && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+                    return JSON.parse(raw);
+                  } catch (e) {}
+                }
+                return defaultVal;
+              };
+
+              const writeQuickNotesFile = (wsDir: string, fileName: string, data: any) => {
+                const target = path.join(wsDir || 'D:/工作', '_quick_notes', fileName);
+                const parentDir = path.dirname(target);
+                if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
+                fs.writeFileSync(target, JSON.stringify(data, null, 2), 'utf-8');
+                return true;
+              };
+
+              if (action === 'get-app-config') {
+                const cPath = getResolvedConfigPath();
+                let cfg: any = {};
+                if (fs.existsSync(cPath)) {
+                  try {
+                    let raw = fs.readFileSync(cPath, 'utf-8');
+                    if (raw && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+                    cfg = JSON.parse(raw);
+                  } catch (e) {}
+                }
+                if (!cfg.workspacePath) cfg.workspacePath = 'D:\\工作';
+                if (!cfg.defaultYear) cfg.defaultYear = '2026';
+                if (!cfg.defaultProject) cfg.defaultProject = 'MZ';
+                if (!cfg.developerName) cfg.developerName = 'LiSB';
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify(cfg));
+                return;
+              }
+
+              if (action === 'save-app-config') {
+                const cPath = getResolvedConfigPath();
+                const parentDir = path.dirname(cPath);
+                if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
+                let current: any = {};
+                if (fs.existsSync(cPath)) {
+                  try {
+                    let raw = fs.readFileSync(cPath, 'utf-8');
+                    if (raw && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+                    current = JSON.parse(raw);
+                  } catch (e) {}
+                }
+                const merged = { ...current, ...payload };
+                fs.writeFileSync(cPath, JSON.stringify(merged, null, 2), 'utf-8');
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify(merged));
+                return;
+              }
+
+              if (action === 'open-config-folder') {
+                const cDir = path.join(appData, 'dev-orbit');
+                if (!fs.existsSync(cDir)) fs.mkdirSync(cDir, { recursive: true });
+                const cp = await import('child_process');
+                cp.exec(`explorer.exe "${cDir.replace(/\//g, '\\')}"`);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true, path: cDir }));
+                return;
+              }
+
+              if (action === 'select-workspace-dir') {
+                const cp = await import('child_process');
+                const script = `
+                  Add-Type -AssemblyName System.Windows.Forms
+                  $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+                  $dialog.Description = '选择你的开发工作区根目录'
+                  $dialog.ShowNewFolderButton = $true
+                  if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                      Write-Output $dialog.SelectedPath
+                  }
+                `;
+                cp.exec(`powershell -NoProfile -Command "${script.replace(/\r?\n/g, ' ')}"`, (err, stdout) => {
+                  const selectedPath = (stdout || '').trim();
+                  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                  res.end(JSON.stringify({ workspacePath: selectedPath || null }));
+                });
+                return;
+              }
+
+              if (action === 'get-quick-notes') {
+                const targetWs = payload.workspacePath || ws;
+                const data = readQuickNotesFile(targetWs, 'notes.json', []);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify(data));
+                return;
+              }
+
+              if (action === 'save-quick-notes-batch') {
+                const targetWs = payload.workspacePath || ws;
+                writeQuickNotesFile(targetWs, 'notes.json', payload.notes || []);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              if (action === 'save-quick-note') {
+                const targetWs = payload.workspacePath || ws;
+                const list = readQuickNotesFile(targetWs, 'notes.json', []);
+                const note = payload.note || {};
+                const idx = list.findIndex((n: any) => n.id === note.id);
+                if (idx !== -1) list[idx] = note;
+                else list.unshift(note);
+                writeQuickNotesFile(targetWs, 'notes.json', list);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              if (action === 'delete-quick-note') {
+                const targetWs = payload.workspacePath || ws;
+                let list = readQuickNotesFile(targetWs, 'notes.json', []);
+                list = list.filter((n: any) => n.id !== payload.id);
+                writeQuickNotesFile(targetWs, 'notes.json', list);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              if (action === 'get-memos') {
+                const targetWs = payload.workspacePath || ws;
+                const data = readQuickNotesFile(targetWs, 'memos.json', []);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify(data));
+                return;
+              }
+
+              if (action === 'save-memo') {
+                const targetWs = payload.workspacePath || ws;
+                const list = readQuickNotesFile(targetWs, 'memos.json', []);
+                const memo = payload.memo || {};
+                const idx = list.findIndex((m: any) => m.id === memo.id);
+                if (idx !== -1) list[idx] = memo;
+                else list.unshift(memo);
+                writeQuickNotesFile(targetWs, 'memos.json', list);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              if (action === 'delete-memo') {
+                const targetWs = payload.workspacePath || ws;
+                let list = readQuickNotesFile(targetWs, 'memos.json', []);
+                list = list.filter((m: any) => m.id !== payload.id);
+                writeQuickNotesFile(targetWs, 'memos.json', list);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              if (action === 'get-server-credentials') {
+                const targetWs = payload.workspacePath || ws;
+                const data = readQuickNotesFile(targetWs, 'server_credentials.json', []);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify(data));
+                return;
+              }
+
+              if (action === 'save-server-credentials') {
+                const targetWs = payload.workspacePath || ws;
+                writeQuickNotesFile(targetWs, 'server_credentials.json', payload.credentials || []);
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify({ success: true }));
+                return;
+              }
+
+              if (action === 'get-credentials-meta') {
+                const targetWs = payload.workspacePath || ws;
+                const data = readQuickNotesFile(targetWs, 'credentials_meta.json', { lastSync: '刚刚' });
+                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                res.end(JSON.stringify(data));
+                return;
+              }
+
+              if (action === 'save-credentials-meta') {
+                const targetWs = payload.workspacePath || ws;
+                writeQuickNotesFile(targetWs, 'credentials_meta.json', payload.meta || {});
                 res.setHeader('Content-Type', 'application/json; charset=utf-8');
                 res.end(JSON.stringify({ success: true }));
                 return;

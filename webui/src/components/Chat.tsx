@@ -27,6 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { usePluginActions, useActiveInspector, zapPluginKernel, zapHostSDK } from '../custom/plugin-kernel';
 import { InputHistory, canNavigateInputHistory, inputHistoryKey } from '../lib/inputHistory';
 import { createTimelineFollow } from '../lib/timelineFollow';
 
@@ -1049,6 +1050,7 @@ export function Chat({
   onBindReviewDismiss,
 }: ChatProps) {
   const t = useT();
+  const activeInspector = useActiveInspector();
   const [messages, setMessages] = useState<Message[]>([]);
   const initialDraft = loadComposerDraft(sessionId);
   const [input, setInput] = useState(() => initialDraft?.text ?? '');
@@ -7764,6 +7766,59 @@ export function Chat({
     });
   }
 
+  // Bind Standard Host SDK drivers for generic plugin contributions
+  useEffect(() => {
+    zapPluginKernel.bindHostDriver({
+      getActiveSessionId: () => activeIdRef.current || sessionId || activeSession?.id || null,
+      createSession: async (opts) => {
+        if (onNewSession) {
+          onNewSession();
+        }
+        if (opts?.prefillPrompt) {
+          setInput(opts.prefillPrompt);
+          if (opts.autoSend) {
+            window.setTimeout(() => {
+              void sendMessage(opts.prefillPrompt);
+            }, 120);
+          }
+        }
+        return null;
+      },
+      rollbackTurn: async (turnIndex, opts) => {
+        const targetTurn = turnNavItems.find((it) => it.turn === turnIndex);
+        const targetMsg = messagesRef.current.find((m) =>
+          (targetTurn?.id && m.id === targetTurn.id) ||
+          (m.turnNavOrdinal === turnIndex && m.role === 'user') ||
+          (m.sourceIndex === turnIndex && m.role === 'user'),
+        );
+        const sourceIdx = targetMsg?.sourceIndex ?? targetTurn?.turn ?? turnIndex;
+        const newPrompt = opts?.promptOverride ?? (targetMsg ? messageText(targetMsg) : '');
+        handleRollbackSubmit(sourceIdx, newPrompt, targetMsg?.images || []);
+      },
+      sendMessage: async (text) => {
+        setInput(text);
+        window.setTimeout(() => {
+          void sendMessage(text);
+        }, 60);
+      },
+      getTurnSnapshot: async (turnIndex) => {
+        return turnNavItems.find((it) => it.turn === turnIndex) || null;
+      },
+      getRawPromptSnapshot: async (turnIndex) => {
+        const turn = turnNavItems.find((it) => it.turn === turnIndex);
+        return {
+          system: "You are Zap AI coding Agent by Zap running on your underlying model.",
+          user: turn?.prompt || "",
+        };
+      },
+      showToast: (msg, type) => {
+        const mappedType = type === 'warn' ? 'warning' : type;
+        showToast(msg, mappedType);
+      },
+      copyText: async (text) => copyTextToClipboard(text),
+    });
+  }, [sessionId, activeSession?.id, onNewSession, sendMessage, turnNavItems, showToast]);
+
   function handleDeleteUserMessage(sourceIndex: number, expectedText?: string) {
     const sid = activeIdRef.current || sessionId || activeSession?.id;
     const effectiveHash =
@@ -9237,9 +9292,10 @@ export function Chat({
             </div>
           </div>
 
-          {/* Right Inspector Multi-Tab Panel (Landing 页独立悬浮毛玻璃卡片，平级挂载至 .app 顶层容器) */}
-          {renderRightInspector(true)}
         </div>
+
+        {/* Right Inspector Multi-Tab Panel (Landing 页独立悬浮毛玻璃卡片，平级挂载至 .app 顶层容器) */}
+        {renderRightInspector(true)}
 
         {/* 落地页常驻折叠悬浮游标（已隐藏展示，保留完整功能与代码） */}
         {false && rightPanelCollapsed && (
@@ -9683,6 +9739,7 @@ export function Chat({
         activeId={activeTurnId}
         busyId={busyTurnId}
         sessionTotalTokens={tokens?.total}
+        activeTurnDeltaTokens={lastUserTokensRef.current > 0 ? lastUserTokensRef.current : undefined}
         onNavigate={(item) => jumpToTurn(item.id)}
       />
 
@@ -9959,6 +10016,33 @@ export function Chat({
           onClose={() => setConfirmModal((prev) => ({ ...prev, open: false }))}
         />
       )}
+      {activeInspector && (
+        <div class="zap-inspector-drawer-overlay" onClick={() => zapPluginKernel.closeInspector()}>
+          <div class="zap-inspector-drawer" onClick={(e) => e.stopPropagation()}>
+            <div class="zap-inspector-drawer-header">
+              <div class="zap-inspector-title">
+                {activeInspector.inspector.icon && <span class="zap-inspector-icon">{activeInspector.inspector.icon}</span>}
+                <span>{activeInspector.inspector.title}</span>
+              </div>
+              <button
+                type="button"
+                class="zap-inspector-close-btn"
+                aria-label="Close"
+                onClick={() => zapPluginKernel.closeInspector()}
+              >
+                ×
+              </button>
+            </div>
+            <div class="zap-inspector-drawer-body">
+              {activeInspector.inspector.render({
+                target: activeInspector.target,
+                onClose: () => zapPluginKernel.closeInspector(),
+                host: zapHostSDK,
+              })}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -10011,6 +10095,7 @@ function AssistantMessageView({
 }) {
   const t = useT();
   const text = messageText(msg);
+  const pluginActions = usePluginActions('chat.message:actions', { message: msg, isLast, isLastInTurn, text: turnLastText || turnAllText || text });
   const trimmed = text.trim();
   const isError =
     !messageHasTools(msg) &&
@@ -10134,6 +10219,18 @@ function AssistantMessageView({
           </svg>
         </button>
       )}
+      {pluginActions.map((act) => (
+        <button
+          key={act.id}
+          type="button"
+          class="msg-action-btn plugin-msg-action-btn"
+          onClick={() => void act.execute({ message: msg, isLast, isLastInTurn, text: turnLastText || turnAllText || text }, zapHostSDK)}
+          title={act.title}
+          aria-label={act.title}
+        >
+          {act.icon || act.title}
+        </button>
+      ))}
     </div>
   ) : null;
 

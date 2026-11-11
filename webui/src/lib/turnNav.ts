@@ -4,6 +4,20 @@ import {
   stripSteerEnvelopeForDisplay,
 } from './historyMessages.ts';
 
+/** Token status for the turn state machine. */
+export type TurnTokenStatus = 'settled' | 'in_progress' | 'pending';
+
+export interface TurnTokenState {
+  /** 轮次状态：settled 已结算, in_progress 进行中/流式中, pending 等待处理 */
+  status: TurnTokenStatus;
+  /** 本轮 Token 消耗量（若未开始或仍在等待则为 undefined） */
+  turnTokens?: number;
+  /** 截止到该轮结束或当前的累计上下文 Token */
+  cumulativeTokens?: number;
+  /** 缓存命中的 Token 数量（可选拓展） */
+  cachedTokens?: number;
+}
+
 /** One user question in the session outline (DeepSeek-style right rail). */
 export interface TurnNavItem {
   /** Stable DOM id on the user message wrapper. */
@@ -28,6 +42,8 @@ export interface TurnNavItem {
   tokens?: number;
   /** Cumulative tokens from start of session up to the end of this turn. */
   cumulativeTokens?: number;
+  /** 完整的轮次 Token 状态机对象 */
+  tokenState?: TurnTokenState;
 }
 
 export function formatTokenMetric(num: number | undefined | null): string {
@@ -36,6 +52,53 @@ export function formatTokenMetric(num: number | undefined | null): string {
   if (num >= 10_000) return `${(num / 1_000).toFixed(0)}k`;
   if (num >= 1_000) return `${(num / 1_000).toFixed(1)}k`;
   return String(num);
+}
+
+export interface ResolveTurnTokenOptions {
+  item: TurnNavItem;
+  isLastTurn?: boolean;
+  isBusy?: boolean;
+  sessionTotalTokens?: number | null;
+  activeTurnDeltaTokens?: number | null;
+}
+
+/**
+ * 状态机纯函数：将轮次导航项、当前活跃运行状态及会话级总量归一化为统一的 TurnTokenState。
+ */
+export function resolveTurnTokenState(options: ResolveTurnTokenOptions): TurnTokenState {
+  const { item, isLastTurn = false, isBusy = false, sessionTotalTokens, activeTurnDeltaTokens } = options;
+
+  // 1. 如果该轮处于活跃执行中（正在进行中/生成中/执行工具）
+  if (isBusy) {
+    const liveTurn =
+      typeof activeTurnDeltaTokens === 'number' && activeTurnDeltaTokens > 0
+        ? activeTurnDeltaTokens
+        : item.tokens;
+    const liveCumulative = sessionTotalTokens ?? item.cumulativeTokens;
+    return {
+      status: 'in_progress',
+      turnTokens: liveTurn,
+      cumulativeTokens: liveCumulative != null ? liveCumulative : undefined,
+    };
+  }
+
+  // 2. 如果是最后一轮且尚未结算出本轮 Token
+  if (isLastTurn && item.tokens == null) {
+    return {
+      status: 'pending',
+      turnTokens: undefined,
+      cumulativeTokens: sessionTotalTokens ?? item.cumulativeTokens,
+    };
+  }
+
+  // 3. 常规已结算或具有估算值的轮次
+  const status: TurnTokenStatus = item.tokens != null ? 'settled' : 'pending';
+  return {
+    status,
+    turnTokens: item.tokens,
+    cumulativeTokens: item.cumulativeTokens,
+    cachedTokens: item.tokenState?.cachedTokens,
+  };
 }
 
 const DEFAULT_MAX_LABEL = 28;
@@ -60,6 +123,7 @@ export interface TurnStatLike {
   turn_id?: number;
   total_tokens?: number;
   used_tokens?: number;
+  round_count?: number;
   model_usage?: Array<{
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -75,6 +139,7 @@ export function buildTurnNavItemsFromOutline(
   const items: TurnNavItem[] = [];
   const loadedByOrdinal = new Map(loadedItems?.map((it) => [it.ordinal, it]));
   let runningCumulativeTokens = 0;
+  let prevContextTokens = 0;
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
@@ -93,6 +158,8 @@ export function buildTurnNavItemsFromOutline(
     const loaded = loadedByOrdinal.get(ordinal);
 
     let statTokens: number | undefined;
+    let statCumulative: number | undefined;
+    let turnCached: number | undefined;
 
     if (turnStats && turnStats.length > 0) {
       // 精准匹配当前轮次统计：优先基于 turn_id 匹配，仅当 turnStats 与大纲轮次完全一对一时才按下标回退
@@ -102,19 +169,54 @@ export function buildTurnNavItemsFromOutline(
         (turnStats.length === turns.length ? turnStats[i] : undefined);
 
       if (stat) {
-        // 优先累加本轮所有 tool_call 产生的实际模型输入与输出 Token 总额
+        const total = stat.total_tokens || stat.used_tokens || 0;
+        if (total > 0) {
+          statCumulative = total;
+        }
+
+        // 计算本轮消耗：优先累加本轮产生的实际模型新增计算与生成输出
         if (stat.model_usage && stat.model_usage.length > 0) {
           let roundSum = 0;
+          let cachedSum = 0;
           for (const mu of stat.model_usage) {
-            const inTok = mu.prompt_tokens ?? mu.tokens?.input ?? 0;
             const outTok = mu.completion_tokens ?? mu.tokens?.output ?? 0;
+            let inTok = 0;
+            if (typeof mu.prompt_tokens === 'number') {
+              inTok = mu.prompt_tokens;
+            } else if (mu.tokens) {
+              const uncachedInput = mu.tokens.input ?? 0;
+              const cachedInput = mu.tokens.cached_input ?? 0;
+              cachedSum += cachedInput;
+              // 关键修复：在多轮工具调用（tool calls）中，cached_input 是每次请求命中的历史 KV 缓存，
+              // 在几十轮工具循环中会被重复累加导致数百万的虚假膨胀（例如 40 次调用累加 5.8M）。
+              // 仅在完全没有 total_tokens 且为首轮时，才将 cached_input 算入初次载入总额；
+              // 正常对话及多轮工具执行中，本轮实际新增计算量严格为 uncachedInput + outTok。
+              if (!total && items.length === 0) {
+                inTok = uncachedInput + cachedInput;
+              } else {
+                inTok = uncachedInput;
+              }
+            }
             roundSum += inTok + outTok;
           }
           if (roundSum > 0) statTokens = roundSum;
+          if (cachedSum > 0) turnCached = cachedSum;
         }
-        // 若无 model_usage 细项，回退到该轮请求所报告的 total_tokens
-        if (!statTokens && stat.total_tokens && stat.total_tokens > 0) {
-          statTokens = stat.total_tokens;
+
+        // 首轮在具备 total_tokens 时直接以 total_tokens 作为该轮基线
+        if (items.length === 0 && total > 0) {
+          statTokens = total;
+        } else if (!statTokens && total > 0) {
+          // 后续轮次若无 model_usage 细项，取上下文净增量作为本轮消耗
+          if (prevContextTokens > 0 && total >= prevContextTokens) {
+            statTokens = total - prevContextTokens;
+          } else {
+            statTokens = total;
+          }
+        }
+
+        if (total > 0) {
+          prevContextTokens = total;
         }
       }
     }
@@ -125,9 +227,30 @@ export function buildTurnNavItemsFromOutline(
       runningCumulativeTokens += finalTokens;
     }
 
-    // 累计 Token：严格基于各轮真实消耗单调累加，杜绝“累计比单轮还小”或数值来回跳变的倒挂 Bug
-    const finalCumulative =
-      runningCumulativeTokens > 0 ? runningCumulativeTokens : loaded?.cumulativeTokens;
+    // 累计 Token：
+    // 1. 如果有后端报告的 authoritative total_tokens (statCumulative)，优先以此为基准；
+    // 2. 同时结合 runningCumulativeTokens 保证累计值单调递增且不倒挂小于单轮消耗；
+    // 3. 若无 statCumulative 则回退到 runningCumulativeTokens 或 loaded?.cumulativeTokens。
+    let finalCumulative = statCumulative;
+    if (finalCumulative != null && finalCumulative > 0) {
+      if (runningCumulativeTokens > finalCumulative) {
+        finalCumulative = Math.max(finalCumulative, runningCumulativeTokens);
+      }
+    } else {
+      finalCumulative =
+        runningCumulativeTokens > 0 ? runningCumulativeTokens : loaded?.cumulativeTokens;
+    }
+
+    if (
+      typeof finalTokens === 'number' &&
+      typeof finalCumulative === 'number' &&
+      finalCumulative < finalTokens
+    ) {
+      finalCumulative = finalTokens;
+    }
+
+    const status: TurnTokenStatus =
+      statTokens != null || (loaded?.tokens != null && !loaded?.unloaded) ? 'settled' : 'pending';
 
     items.push({
       id: turnNavId(ordinal),
@@ -141,6 +264,12 @@ export function buildTurnNavItemsFromOutline(
       unloaded: !loaded,
       tokens: finalTokens,
       cumulativeTokens: finalCumulative,
+      tokenState: {
+        status,
+        turnTokens: finalTokens,
+        cumulativeTokens: finalCumulative,
+        cachedTokens: turnCached,
+      },
     });
   }
   return items;
@@ -207,6 +336,11 @@ export function buildTurnNavItems(
       unloaded: false,
       tokens: turnTokens > 0 ? turnTokens : undefined,
       cumulativeTokens: runningTotalTokens > 0 ? runningTotalTokens : undefined,
+      tokenState: {
+        status: turnTokens > 0 ? 'settled' : 'pending',
+        turnTokens: turnTokens > 0 ? turnTokens : undefined,
+        cumulativeTokens: runningTotalTokens > 0 ? runningTotalTokens : undefined,
+      },
     });
   }
   return items;

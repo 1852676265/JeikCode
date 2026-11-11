@@ -42,6 +42,7 @@ pub mod native_live;
 mod runtime_host;
 mod sidebar_projects;
 mod steer_prompt;
+pub mod plugins_api;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `JEIKCODE_TUIX_LOG`.
 /// Moved here from the retired `jeikcode-core` (daemon is its only consumer;
 /// `zap_tuix::trace` keeps its own copy targeting the same append file).
@@ -9821,7 +9822,9 @@ async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
                 "bmp" => "image/bmp",
                 "pdf" => "application/pdf",
                 "mp4" => "video/mp4",
+                "webm" => "video/webm",
                 "mp3" => "audio/mpeg",
+                "wav" => "audio/wav",
                 _ => "application/octet-stream",
             };
             let mut headers = axum::http::HeaderMap::new();
@@ -13405,6 +13408,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/api/plugins-rpc/:plugin_id",
             post(plugin_rpc::handle_plugin_rpc),
         )
+        // 插件市场、插件安装卸载与隔离存储 API
+        .merge(plugins_api::router())
         // WebUI static assets + SPA fallback (Task 3/4). The `/` route
         // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the
         // fallback serves SPA routes/assets and never carries a token.

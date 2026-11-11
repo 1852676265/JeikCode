@@ -2,13 +2,15 @@ import { memo } from 'preact/compat';
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'preact/hooks';
 import { useT } from '../settings';
 import type { TurnNavItem } from '../lib/turnNav';
-import { formatTokenMetric } from '../lib/turnNav';
+import { formatTokenMetric, resolveTurnTokenState } from '../lib/turnNav';
+import { usePluginActions, zapHostSDK } from '../custom/plugin-kernel';
 
 export interface TurnNavigatorProps {
   readonly items: readonly TurnNavItem[];
   readonly activeId: string | null;
   readonly busyId?: string | null;
   readonly sessionTotalTokens?: number | null;
+  readonly activeTurnDeltaTokens?: number | null;
   readonly onNavigate: (item: TurnNavItem) => void;
 }
 
@@ -22,6 +24,7 @@ export const TurnNavigator = memo(function TurnNavigator({
   activeId,
   busyId,
   sessionTotalTokens,
+  activeTurnDeltaTokens,
   onNavigate,
 }: TurnNavigatorProps) {
   const t = useT();
@@ -92,6 +95,8 @@ export const TurnNavigator = memo(function TurnNavigator({
     ? items[previewIndex]
     : undefined;
 
+  const turnActions = usePluginActions('chat.turn:actions', preview);
+
   const previewCenterY = previewIndex !== null
     ? previewIndex * TURN_SPACING_PX + RAIL_INSET_PX - scrollTop
     : 0;
@@ -154,9 +159,17 @@ export const TurnNavigator = memo(function TurnNavigator({
 
         {preview && (() => {
           const isLastTurn = previewIndex === items.length - 1;
-          const turnTokens = preview.tokens;
-          const cumulativeTokens =
-            preview.cumulativeTokens ?? (isLastTurn ? (sessionTotalTokens ?? undefined) : undefined);
+          const isBusy = preview.id === busyId;
+          const tokenState = resolveTurnTokenState({
+            item: preview,
+            isLastTurn,
+            isBusy,
+            sessionTotalTokens,
+            activeTurnDeltaTokens,
+          });
+
+          const turnTokens = tokenState.turnTokens;
+          const cumulativeTokens = tokenState.cumulativeTokens;
           const hasTokens = turnTokens != null || cumulativeTokens != null;
 
           return (
@@ -173,7 +186,14 @@ export const TurnNavigator = memo(function TurnNavigator({
                   {t('chat.turnNavigation.turn', { turn: String(preview.turn) })}
                 </span>
                 {hasTokens && (
-                  <span class="turn-navigator-preview-tokens" title={t('chat.turnNavigation.tokensTooltip')}>
+                  <span
+                    class={`turn-navigator-preview-tokens turn-status-${tokenState.status}`}
+                    title={
+                      tokenState.status === 'in_progress'
+                        ? `${t('chat.turnNavigation.inProgress')} · ${t('chat.turnNavigation.tokensTooltip')}`
+                        : t('chat.turnNavigation.tokensTooltip')
+                    }
+                  >
                     <span class="turn-tokens-icon">⚡</span>
                     {turnTokens != null && cumulativeTokens != null && turnTokens !== cumulativeTokens ? (
                       <>
@@ -184,17 +204,39 @@ export const TurnNavigator = memo(function TurnNavigator({
                           ({t('chat.turnNavigation.totalPrefix')}{formatTokenMetric(cumulativeTokens)})
                         </span>
                       </>
-                    ) : (
+                    ) : turnTokens != null ? (
                       <span class="turn-tokens-val">
-                        {t('chat.turnNavigation.turnPrefix')}{formatTokenMetric(turnTokens ?? cumulativeTokens)}
+                        {t('chat.turnNavigation.turnPrefix')}{formatTokenMetric(turnTokens)}
                       </span>
-                    )}
+                    ) : cumulativeTokens != null ? (
+                      <span class="turn-tokens-val">
+                        {t('chat.turnNavigation.totalPrefix')}{formatTokenMetric(cumulativeTokens)}
+                      </span>
+                    ) : null}
                   </span>
                 )}
               </div>
               <div class="turn-navigator-preview-prompt">
                 {preview.prompt || t('chat.turnNavigation.turn', { turn: String(preview.turn) })}
               </div>
+              {turnActions.length > 0 && (
+                <div class="turn-navigator-preview-actions">
+                  {turnActions.map((act) => (
+                    <button
+                      key={act.id}
+                      type="button"
+                      class="turn-action-btn"
+                      title={act.title}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void act.execute(preview, zapHostSDK);
+                      }}
+                    >
+                      {act.icon || act.title}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           );
         })()}

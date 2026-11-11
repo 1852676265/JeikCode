@@ -9,6 +9,7 @@ import { h } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useEffect, useMemo, useState, useRef } from 'preact/hooks';
 import { GlassThemeSettingsPanel } from './glass-theme-settings-panel';
+import { DshPetSettingsView } from './dsh-pet-settings';
 import {
   CapabilityItem,
   getCapabilities,
@@ -848,6 +849,9 @@ export function DeepSeekSettingsCenterModal({
         title: slot.title || slot.label,
         description: slot.description || '',
         render: (props: any) => {
+          if (slot.id === 'ext-dsh-pet' || slot.id === 'pet-config' || slot.pluginPackage === '@dsh-community/pet') {
+            return <DshPetSettingsView />;
+          }
           const res = slot.render ? slot.render(props) : null;
           if (res) return res;
           if (pkg) return <DynamicPluginConfigForm pkg={pkg} />;

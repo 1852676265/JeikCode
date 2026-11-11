@@ -6,6 +6,7 @@ import {
   filterTurnNavItems,
   formatTokenMetric,
   resolveActiveTurnId,
+  resolveTurnTokenState,
   truncateTurnNavLabel,
   turnNavId,
   turnNavScrollTop,
@@ -294,4 +295,107 @@ test('buildTurnNavItemsFromOutline ensures cumulativeTokens is monotonically inc
   assert.equal(items[3].tokens, 83000);
   assert.equal(items[3].cumulativeTokens, 228000);
   assert.ok(items[3].cumulativeTokens! > items[2].cumulativeTokens!);
+});
+
+test('buildTurnNavItemsFromOutline handles model_usage with cached_input correctly', () => {
+  const outline = [
+    { ordinal: 0, index: 0, text: '第一问' },
+  ];
+  const turnStats = [
+    {
+      turn_id: 1,
+      model_usage: [
+        {
+          tokens: { input: 12000, output: 2000, cached_input: 18000 },
+        },
+      ],
+    },
+  ];
+  const items = buildTurnNavItemsFromOutline(outline, undefined, turnStats);
+  assert.equal(items.length, 1);
+  // input (12k) + cached_input (18k) + output (2k) = 32k
+  assert.equal(items[0].tokens, 32000);
+  assert.equal(items[0].cumulativeTokens, 32000);
+});
+
+test('buildTurnNavItemsFromOutline does not stack cached_input across multi-round tool calls into millions', () => {
+  const outline = [
+    { ordinal: 0, index: 0, text: '第一问' },
+    { ordinal: 1, index: 10, text: '第二问（执行了40次工具调用）' },
+  ];
+  const turnStats = [
+    {
+      turn_id: 1,
+      total_tokens: 85000,
+      model_usage: [{ tokens: { input: 15000, output: 5000, cached_input: 65000 } }],
+    },
+    {
+      turn_id: 2,
+      total_tokens: 132000,
+      round_count: 40,
+      model_usage: [{ tokens: { input: 35000, output: 15000, cached_input: 5800000 } }],
+    },
+  ];
+  const items = buildTurnNavItemsFromOutline(outline, undefined, turnStats);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].tokens, 85000);
+  assert.equal(items[0].cumulativeTokens, 85000);
+
+  // 第 2 轮单轮消耗应为新增 uncached input (35k) + output (15k) = 50k，绝不能是 5.8M！
+  assert.equal(items[1].tokens, 50000);
+  // 累计应在 132k~135k 左右，绝不能是 11.8M！
+  assert.equal(items[1].cumulativeTokens, 135000);
+  assert.ok(items[1].tokens! < 100000);
+  assert.ok(items[1].cumulativeTokens! < 200000);
+});
+
+test('resolveTurnTokenState accurately manages pending, in_progress and settled states', () => {
+  const dummyItem = {
+    id: 'turn-nav-2',
+    ordinal: 2,
+    index: 5,
+    label: '第三问',
+    text: '那我现在的把ds宠物的...',
+    turn: 3,
+    prompt: '第三问',
+    response: '',
+  };
+
+  // 1. 用户刚发出的第 3 轮（isLastTurn = true, tokens = undefined），必须是 pending，且绝不将累计 132k 当成本轮！
+  const pendingState = resolveTurnTokenState({
+    item: dummyItem,
+    isLastTurn: true,
+    isBusy: false,
+    sessionTotalTokens: 132000,
+  });
+  assert.equal(pendingState.status, 'pending');
+  assert.equal(pendingState.turnTokens, undefined);
+  assert.equal(pendingState.cumulativeTokens, 132000);
+
+  // 2. 正在进行中的第 3 轮（isBusy = true）
+  const inProgressState = resolveTurnTokenState({
+    item: dummyItem,
+    isLastTurn: true,
+    isBusy: true,
+    sessionTotalTokens: 132000,
+    activeTurnDeltaTokens: 45,
+  });
+  assert.equal(inProgressState.status, 'in_progress');
+  assert.equal(inProgressState.turnTokens, 45);
+  assert.equal(inProgressState.cumulativeTokens, 132000);
+
+  // 3. 已结算的轮次
+  const settledItem = {
+    ...dummyItem,
+    tokens: 2800,
+    cumulativeTokens: 35000,
+  };
+  const settledState = resolveTurnTokenState({
+    item: settledItem,
+    isLastTurn: false,
+    isBusy: false,
+  });
+  assert.equal(settledState.status, 'settled');
+  assert.equal(settledState.turnTokens, 2800);
+  assert.equal(settledState.cumulativeTokens, 35000);
 });

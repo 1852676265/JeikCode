@@ -52,6 +52,7 @@ export const vi: Record<keyof typeof en, string> = {
   'chat.turnNavigation.turnPrefix': 'Lượt ',
   'chat.turnNavigation.totalPrefix': 'Tích lũy ',
   'chat.turnNavigation.tokensTooltip': 'Tiêu thụ lượt này / Tích lũy phiên đến lượt này',
+  'chat.turnNavigation.inProgress': 'Đang tính',
   'common.retry': 'Thử lại',
   'common.loadError': 'Không thể tải tệp',
   'panel.questions': 'Câu hỏi',
