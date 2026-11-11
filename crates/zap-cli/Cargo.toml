@@ -9,6 +9,10 @@ default-run = "zap"
 name = "zap"
 path = "src/main.rs"
 
+[[bin]]
+name = "jeikcode"
+path = "src/main.rs"
+
 # Thin lib target so integration tests (and the bin) can reach testable
 # modules like `uninstall`.
 [lib]

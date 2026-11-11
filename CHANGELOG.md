@@ -21,6 +21,34 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.9 (2026-11-11)
+
+- **[Plugin System & DevOrbit Integration] Native plugin asset hosting and local RPC engine**:
+  - Implemented native `try_serve_plugin_asset` in `zap-daemon` to host external workbench plugin static assets directly from `~/.zap/plugins/`, completely eliminating blank screen loading failures.
+  - Built a high-performance native RPC engine (`zap-daemon/src/plugin_rpc.rs`) supporting local task state queries, persistent storage, and workspace SQL metadata exploration.
+  - Refined plugin container layout with responsive viewport sizing and coordinated top-bar title synchronization.
+
+- **[Architecture & Workspace Refactoring] Complete namespace and crate rebranding from JeikCode to Zap**:
+  - Migrated all 12 workspace crates to the unified `zap-*` architecture namespace (`zap`, `zap-auth`, `zap-capabilities`, `zap-coding`, `zap-config`, `zap-daemon`, `zap-kernel`, `zap-review`, `zap-telemetry`, `zap-tuix`, `zap-updater`).
+  - Maintained full backward compatibility for legacy commands and binary invocations.
+
+- **[Build & CI Resilience] Cross-platform build target alignment and toolchain integrity**:
+  - Realigned tool exports, integration test harnesses, and target names to ensure seamless continuous integration across platforms.
+
+---
+
+- **[插件体系与 DevOrbit 原生集成] 原生插件静态资源托管与本地 RPC 数据交互引擎**:
+  - 在 `zap-daemon` 中原生实现 `try_serve_plugin_asset`，直接安全托管 `~/.zap/plugins/` 下的独立前端静态构件，彻底解决插件白屏与黑屏问题，终端用户无需安装 Node 即可闭环运行扩展。
+  - 实现高性能本地 RPC 引擎（`plugin_rpc.rs`），支持插件任务看板查询更新、本地持久化与工作区 SQL 元数据探索。
+  - 优化独立主视图 iframe 容器全屏响应式布局，实现顶栏标题与活动视图状态的精准联动。
+
+- **[架构收敛与工程更名] 全库 12 个 Rust Crate 统一更名为 Zap 架构命名空间**:
+  - 将工作区全部 12 个基础与核心库全面收敛迁移至 `zap-*` 规范命名空间（`zap`, `zap-auth`, `zap-capabilities`, `zap-coding`, `zap-config`, `zap-daemon`, `zap-kernel`, `zap-review`, `zap-telemetry`, `zap-tuix`, `zap-updater`）。
+  - 保留对旧版命令行与二进制名称的平滑兼容支持。
+
+- **[构建与 CI 健壮性] 跨平台编译目标对齐与自动化流水线加固**:
+  - 修复工具模块命名与测试集成环境变量，保证跨平台流水线构建环境零中断全绿通过。
+
 ## v1.0.8 (2026-11-10)
 
 - **[Workbench & Plugin Ecosystem] Introduce Multi-View Workbench architecture and plugin extension slots**:
