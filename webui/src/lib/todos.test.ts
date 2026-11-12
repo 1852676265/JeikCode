@@ -10,6 +10,7 @@ import {
   placeArchivedTodos,
   reduceLiveTodo,
   reduceTodosFromCalls,
+  resolveRenderedTodos,
   restoreStickyTodos,
   settleLiveTodo,
   stickyFromDiskCatchUp,
@@ -1039,6 +1040,67 @@ test('archived tool output does not resurrect the live panel', () => {
   assert.equal(placed[0]!.parts.some((part) => part.kind === 'todo_list'), false);
   assert.equal(placed[2]!.parts.some((part) => part.kind === 'todo_list'), true);
   assert.equal(placed[2]!.parts.filter((part) => part.kind === 'todo_list').length, 1);
+});
+
+test('resolveRenderedTodos never leaks previous session todos before effect syncs', () => {
+  const sessionATodos = [
+    { content: 'Proxy step 1', status: 'completed' as const },
+    { content: 'Proxy step 2', status: 'in_progress' as const },
+  ];
+  const sessionBTodos = [
+    { content: 'Orbit step 1', status: 'pending' as const },
+  ];
+
+  // Steady state on session A
+  assert.deepEqual(
+    resolveRenderedTodos({
+      viewedSessionId: 'session-a',
+      slot: { sessionId: 'session-a', items: sessionATodos },
+    }),
+    sessionATodos,
+  );
+
+  // Immediately after switching to session B (which has no todos), React state
+  // slot still holds session A until useEffect runs — must immediately hide A's todos
+  assert.equal(
+    resolveRenderedTodos({
+      viewedSessionId: 'session-b',
+      slot: { sessionId: 'session-a', items: sessionATodos },
+      liveDoc: null,
+      cachedItems: null,
+    }),
+    null,
+  );
+
+  // Immediately after switching to session B (which has its own live/cached todos),
+  // must render B's todos instead of A's
+  assert.deepEqual(
+    resolveRenderedTodos({
+      viewedSessionId: 'session-b',
+      slot: { sessionId: 'session-a', items: sessionATodos },
+      liveDoc: { items: sessionBTodos, revision: 'call_b', resultApplied: true },
+    }),
+    sessionBTodos,
+  );
+
+  assert.deepEqual(
+    resolveRenderedTodos({
+      viewedSessionId: 'session-b',
+      slot: { sessionId: 'session-a', items: sessionATodos },
+      liveDoc: null,
+      cachedItems: sessionBTodos,
+    }),
+    sessionBTodos,
+  );
+
+  // Switching to a brand-new session (null) must never inherit session A's todos
+  assert.equal(
+    resolveRenderedTodos({
+      viewedSessionId: null,
+      slot: { sessionId: 'session-a', items: sessionATodos },
+    }),
+    null,
+  );
 });
 
 

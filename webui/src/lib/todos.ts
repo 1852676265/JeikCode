@@ -529,6 +529,38 @@ export type LiveTodoEvent =
   | { type: 'hydrate'; items: TodoItem[] }
   | { type: 'clear' };
 
+export interface SessionTodoSlot {
+  sessionId: string | null;
+  items: TodoItem[] | null;
+}
+
+/**
+ * 根据当前展示的会话 ID 解析应渲染的待办清单。
+ * 当 sessionId 已切换但 useEffect 尚未刷新 React state 时，立即拒绝显示旧会话的待办，
+ * 并在目标会话存在本地实时/缓存清单时直接切换过去，消除切会话残留一帧或漏切的问题。
+ */
+export function resolveRenderedTodos(input: {
+  viewedSessionId: string | null;
+  slot: SessionTodoSlot;
+  liveDoc?: LiveTodoDocument | null;
+  cachedItems?: TodoItem[] | null;
+}): TodoItem[] | null {
+  const sid = input.viewedSessionId;
+  if (!sid) {
+    return input.slot.sessionId === null ? input.slot.items : null;
+  }
+  if (input.slot.sessionId === sid) {
+    return input.slot.items;
+  }
+  if (input.liveDoc && input.liveDoc.items.length > 0) {
+    return input.liveDoc.items;
+  }
+  if (input.cachedItems && input.cachedItems.length > 0) {
+    return input.cachedItems;
+  }
+  return null;
+}
+
 /** Bus/hydrate transition. Returns the same document when the event is a replay. */
 export function reduceLiveTodo(
   doc: LiveTodoDocument | null,

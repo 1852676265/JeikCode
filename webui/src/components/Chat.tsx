@@ -160,10 +160,12 @@ import {
   parseTodosFromOutput,
   placeArchivedTodos,
   reduceLiveTodo,
+  resolveRenderedTodos,
   settleLiveTodo,
   todoCallIdsFromMessages,
   todoCounts,
   type LiveTodoDocument,
+  type SessionTodoSlot,
   type TodoItem,
 } from '../lib/todos';
 import { displayPath, pathBasename, getRelativePathToProject, isUserHomeDir } from '../lib/displayPath';
@@ -1494,12 +1496,19 @@ export function Chat({
   const [isCompacting, setIsCompacting] = useState(false);
   const isCompactingRef = useRef(false);
   isCompactingRef.current = isCompacting;
-  const [activeTodos, setActiveTodos] = useState<TodoItem[] | null>(null);
+  const [activeTodoSlot, setActiveTodoSlot] = useState<SessionTodoSlot>({
+    sessionId: null,
+    items: null,
+  });
+  const activeTodoSlotRef = useRef<SessionTodoSlot>({ sessionId: null, items: null });
   const activeTodosRef = useRef<TodoItem[] | null>(null);
-  activeTodosRef.current = activeTodos;
+  const assignedNewSessionIdRef = useRef<string | null>(null);
   const activeTodosBySessionRef = useRef<Map<string, TodoItem[]>>(new Map());
   // 每个会话一份实时清单。revision 是总线上最后一次 todo 调用，重放同一调用不会改文档。
   const todoLiveBySessionRef = useRef<Map<string, LiveTodoDocument>>(new Map());
+  // 标记哪些会话的实时清单已由实时事件流（tool_start / tool_result）驱动，
+  // 避免异步 getSession / IDB 缓存覆盖正在进行中的实时待办。
+  const todoFromLiveStreamRef = useRef<Set<string>>(new Set());
   // 幂等键必须跨刷新存活：/chat/watch 会重放整轮事件，而 todowrite 的 plan/批量 add 是
   // 整表替换（todos.ts），重复折叠会把最新清单打回旧状态。直接从 localStorage 水合恢复。
   const todoAppliedCallIdsRef = useRef<Map<string, Set<string>>>(loadAppliedTodoCallIds());
@@ -1523,57 +1532,73 @@ export function Chat({
     }
     if (changed) persistAppliedTodoIds();
   }
-  function applySessionStickyTodos(sessionId: string | null | undefined, items: TodoItem[] | null) {
+  function applySessionStickyTodos(targetSessionId: string | null | undefined, items: TodoItem[] | null) {
     const sticky = items && items.length > 0 ? items : null;
-    setActiveTodos(sticky);
-    activeTodosRef.current = sticky;
-    if (!sessionId) return;
-    if (sticky) activeTodosBySessionRef.current.set(sessionId, sticky);
-    else {
-      // 关键防线：清单全完成时**绝不能**清空幂等键。那正是最容易被重放覆盖的时刻
-      // （旧 plan 一重折就把打钩状态打回原形并定格）。新计划自带新 callId，无需清空。
-      activeTodosBySessionRef.current.delete(sessionId);
+    if (targetSessionId) {
+      if (sticky) activeTodosBySessionRef.current.set(targetSessionId, sticky);
+      else {
+        // 关键防线：清单全完成时**绝不能**清空幂等键。那正是最容易被重放覆盖的时刻
+        // （旧 plan 一重折就把打钩状态打回原形并定格）。新计划自带新 callId，无需清空。
+        activeTodosBySessionRef.current.delete(targetSessionId);
+      }
+    }
+    const curSid = activeIdRef.current;
+    if (!targetSessionId || targetSessionId === curSid) {
+      const owner = targetSessionId ?? curSid ?? null;
+      const nextSlot: SessionTodoSlot = { sessionId: owner, items: sticky };
+      activeTodoSlotRef.current = nextSlot;
+      activeTodosRef.current = sticky;
+      setActiveTodoSlot(nextSlot);
     }
   }
   function adoptStickyFromMessages(
-    sessionId: string | null | undefined,
+    targetSessionId: string | null | undefined,
     messages: Message[],
     stashed?: TodoItem[] | null,
     authoritativeTodos?: TodoItem[] | null,
   ) {
     const surface = hydrateSession(messages, authoritativeTodos, stashed);
-    applySessionStickyTodos(sessionId, surface.todos);
-    if (sessionId) {
+    applySessionStickyTodos(targetSessionId, surface.todos);
+    if (targetSessionId) {
       const hydrated = reduceLiveTodo(null, { type: 'hydrate', items: surface.todos ?? [] });
-      if (hydrated) todoLiveBySessionRef.current.set(sessionId, hydrated);
-      else todoLiveBySessionRef.current.delete(sessionId);
+      if (hydrated) todoLiveBySessionRef.current.set(targetSessionId, hydrated);
+      else todoLiveBySessionRef.current.delete(targetSessionId);
+      todoFromLiveStreamRef.current.delete(targetSessionId);
     }
-    if (!sessionId) return;
-    seedAppliedTodoIds(sessionId, surface.appliedTodoIds);
+    if (!targetSessionId) return;
+    seedAppliedTodoIds(targetSessionId, surface.appliedTodoIds);
   }
-  function liveTodoDoc(sessionId: string | null | undefined): LiveTodoDocument | null {
-    if (sessionId) {
-      const stored = todoLiveBySessionRef.current.get(sessionId);
+  function liveTodoDoc(targetSessionId: string | null | undefined): LiveTodoDocument | null {
+    if (targetSessionId) {
+      const stored = todoLiveBySessionRef.current.get(targetSessionId);
       if (stored) return stored;
     }
-    const items = sessionId
-      ? activeTodosBySessionRef.current.get(sessionId) ?? null
-      : activeTodosRef.current;
+    const items = targetSessionId
+      ? activeTodosBySessionRef.current.get(targetSessionId) ??
+        (activeTodoSlotRef.current.sessionId === targetSessionId ? activeTodoSlotRef.current.items : null)
+      : activeTodoSlotRef.current.sessionId === null
+        ? activeTodoSlotRef.current.items
+        : null;
     if (!items || items.length === 0) return null;
     return { items, revision: null, resultApplied: false };
   }
-  function writeLiveTodo(sessionId: string | null | undefined, doc: LiveTodoDocument | null) {
-    if (sessionId) {
-      if (doc) todoLiveBySessionRef.current.set(sessionId, doc);
-      else todoLiveBySessionRef.current.delete(sessionId);
+  function writeLiveTodo(targetSessionId: string | null | undefined, doc: LiveTodoDocument | null) {
+    if (targetSessionId) {
+      if (doc) todoLiveBySessionRef.current.set(targetSessionId, doc);
+      else {
+        todoLiveBySessionRef.current.delete(targetSessionId);
+        todoFromLiveStreamRef.current.delete(targetSessionId);
+      }
     }
     const items = doc?.items ?? null;
-    if (!sessionId || sessionId === activeIdRef.current) {
-      applySessionStickyTodos(sessionId, items);
-      return;
-    }
-    if (items && items.length > 0) activeTodosBySessionRef.current.set(sessionId, items);
-    else activeTodosBySessionRef.current.delete(sessionId);
+    applySessionStickyTodos(targetSessionId, items);
+  }
+  function todosForSessionCache(targetSessionId: string | null | undefined): TodoItem[] | null {
+    if (!targetSessionId) return null;
+    const doc = todoLiveBySessionRef.current.get(targetSessionId);
+    if (doc) return doc.items;
+    if (activeTodoSlotRef.current.sessionId === targetSessionId) return activeTodoSlotRef.current.items;
+    return activeTodosBySessionRef.current.get(targetSessionId) ?? null;
   }
   /** 最终停止且正文已经落地。只有全部勾完才贴到最后一条助手消息，然后清掉实时清单。 */
   function commitActiveTodosIntoLastAssistant() {
@@ -1824,8 +1849,17 @@ export function Chat({
     // An accepted first-turn `done` pre-binds activeIdRef to its new id, so that
     // normal null -> canonical-id prop update does not invalidate its own tail.
     if (activeIdRef.current !== sessionId) sessionGenerationRef.current += 1;
+    assignedNewSessionIdRef.current = null;
     renderedSessionIdRef.current = sessionId;
   }
+  const viewedTodoSessionId = sessionId ?? assignedNewSessionIdRef.current;
+  const activeTodos = resolveRenderedTodos({
+    viewedSessionId: viewedTodoSessionId,
+    slot: activeTodoSlot,
+    liveDoc: viewedTodoSessionId ? todoLiveBySessionRef.current.get(viewedTodoSessionId) ?? null : null,
+    cachedItems: viewedTodoSessionId ? activeTodosBySessionRef.current.get(viewedTodoSessionId) ?? null : null,
+  });
+  activeTodosRef.current = activeTodos;
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
@@ -2046,12 +2080,14 @@ export function Chat({
 
     // 活跃会话切回对账：异步向后端校验一次权威待办清单，一旦发现本地活跃缓存与后端不一致，
     // 立即以服务端真源（Rust TodoTool）就地自愈对齐，彻底清除未刷新的脏内存缓存。
+    todoFromLiveStreamRef.current.delete(loadId);
     if (effectiveProjectHash) {
       getSession(effectiveProjectHash, loadId, { tail: HISTORY_PAGE }).then((detail) => {
         if (
           activeIdRef.current === loadId &&
           sessionGenerationRef.current === loadGeneration &&
           Array.isArray(detail?.todos) &&
+          !todoFromLiveStreamRef.current.has(loadId) &&
           (busyRef.current ||
             backgroundRunningSessionsRef.current.has(loadId) ||
             localTurnSessionsRef.current.has(loadId))
@@ -2111,6 +2147,7 @@ export function Chat({
                 // parks (Build / AcceptEdits / Plan). Must restore those modals or the
                 // turn deadlocks in WaitingApproval with a blinking cursor.
                 handleEvent(event, {
+                  sourceSessionId: loadId,
                   requireReplayDedup: attachNeedsDedup,
                   repeatUserAfterSettled: false,
                 });
@@ -2317,7 +2354,7 @@ export function Chat({
           setBusyAndClock(false);
           busyRef.current = false;
         }
-        applySessionStickyTodos(sid, null);
+        writeLiveTodo(sid, reduceLiveTodo(null, { type: 'hydrate', items: detail.todos ?? [] }));
       }
       return true;
     } catch {
@@ -2526,7 +2563,7 @@ export function Chat({
               // 关键防线：该用户提问早已存在于当前画布上，纯属后端重放的旧提问帧，坚决不能误激活为新轮次！
               return;
             }
-            handleEvent(event);
+            handleEvent(event, { sourceSessionId: loadId });
             skipSecondHandle = true;
           } else if (!isWatchTurnActivationEvent(event.type)) {
             return;
@@ -2555,7 +2592,7 @@ export function Chat({
           return;
         }
         // Restore permission/user-input for every non-Auto mode that parks.
-        handleEvent(event, { requireReplayDedup: idleNeedsDedup });
+        handleEvent(event, { sourceSessionId: loadId, requireReplayDedup: idleNeedsDedup });
         // Keep the main scroller pinned while we are following (user can scroll
         // up mid-turn to release follow).
         timelineFollow.changed();
@@ -2774,22 +2811,41 @@ export function Chat({
       ) {
         projectHashBySessionRef.current.set(prevId, activeSession.project_hash);
       }
+      if (canvasCacheTimerRef.current != null) {
+        window.clearTimeout(canvasCacheTimerRef.current);
+        canvasCacheTimerRef.current = null;
+      }
       if (prevId && leavingMessages.length > 0) {
-        const sticky = activeTodosRef.current;
+        const sticky =
+          activeTodoSlotRef.current.sessionId === prevId
+            ? activeTodoSlotRef.current.items
+            : todoLiveBySessionRef.current.get(prevId)?.items ??
+              activeTodosBySessionRef.current.get(prevId) ??
+              null;
         const allDone = !!(sticky && sticky.length > 0 && sticky.every((t) => t.status === 'completed'));
         let cached: Message[];
         if (sticky && sticky.length > 0 && prevWasRunning) {
           // 回合还在跑：勾完也不归档，切回来画板还在。
           activeTodosBySessionRef.current.set(prevId, sticky);
+          if (!todoLiveBySessionRef.current.has(prevId)) {
+            todoLiveBySessionRef.current.set(prevId, { items: sticky, revision: null, resultApplied: false });
+          }
           cached = detachUnfinishedTodoFromLatestAssistant(leavingMessages);
         } else if (allDone && sticky) {
           const doc = liveTodoDoc(prevId);
           cached = placeArchivedTodos(leavingMessages, sticky, doc?.revision ?? null);
-          writeLiveTodo(prevId, null);
+          todoLiveBySessionRef.current.delete(prevId);
+          todoFromLiveStreamRef.current.delete(prevId);
+          activeTodosBySessionRef.current.delete(prevId);
         } else if (sticky && sticky.length > 0) {
           activeTodosBySessionRef.current.set(prevId, sticky);
+          if (!todoLiveBySessionRef.current.has(prevId)) {
+            todoLiveBySessionRef.current.set(prevId, { items: sticky, revision: null, resultApplied: false });
+          }
           cached = detachUnfinishedTodoFromLatestAssistant(leavingMessages);
         } else {
+          todoLiveBySessionRef.current.delete(prevId);
+          todoFromLiveStreamRef.current.delete(prevId);
           activeTodosBySessionRef.current.delete(prevId);
           cached = detachUnfinishedTodoFromLatestAssistant(leavingMessages);
         }
@@ -2805,9 +2861,21 @@ export function Chat({
         if (turnStartedAtRef.current != null) {
           turnStartedAtBySessionRef.current.set(prevId, turnStartedAtRef.current);
         }
-        const sticky = activeTodosRef.current;
+        const sticky =
+          activeTodoSlotRef.current.sessionId === prevId
+            ? activeTodoSlotRef.current.items
+            : todoLiveBySessionRef.current.get(prevId)?.items ??
+              activeTodosBySessionRef.current.get(prevId) ??
+              null;
         if (sticky && sticky.length > 0 && (prevWasRunning || sticky.some((t) => t.status !== 'completed'))) {
           activeTodosBySessionRef.current.set(prevId, sticky);
+          if (!todoLiveBySessionRef.current.has(prevId)) {
+            todoLiveBySessionRef.current.set(prevId, { items: sticky, revision: null, resultApplied: false });
+          }
+        } else {
+          todoLiveBySessionRef.current.delete(prevId);
+          todoFromLiveStreamRef.current.delete(prevId);
+          activeTodosBySessionRef.current.delete(prevId);
         }
       }
 
@@ -2985,10 +3053,12 @@ export function Chat({
       setLivePending(null);
       setUserInputReq(null);
       onPermissionResolved?.(null);
-      applySessionStickyTodos(
-        sessionId,
-        sessionId ? activeTodosBySessionRef.current.get(sessionId) ?? null : null,
-      );
+      const destStickyTodos = sessionId
+        ? todoLiveBySessionRef.current.get(sessionId)?.items ??
+          activeTodosBySessionRef.current.get(sessionId) ??
+          null
+        : null;
+      applySessionStickyTodos(sessionId, destStickyTodos);
       timelineFollow.reset();
       if (cached && cached.length > 0) {
         messagesRef.current = cached;
@@ -3114,9 +3184,27 @@ export function Chat({
         requestIdRef.current = sessionId;
         if (!sessionWatchersRef.current.has(sessionId)) {
           startDetachedHistoryPoll(effectiveHash, sessionId, sessionGenerationRef.current);
+        } else if (effectiveHash && !todoFromLiveStreamRef.current.has(sessionId)) {
+          const switchGen = sessionGenerationRef.current;
+          void getSession(effectiveHash, sessionId, { tail: HISTORY_PAGE }).then((detail) => {
+            if (
+              activeIdRef.current === sessionId &&
+              sessionGenerationRef.current === switchGen &&
+              Array.isArray(detail?.todos) &&
+              !todoFromLiveStreamRef.current.has(sessionId) &&
+              (busyRef.current ||
+                backgroundRunningSessionsRef.current.has(sessionId) ||
+                localTurnSessionsRef.current.has(sessionId))
+            ) {
+              writeLiveTodo(sessionId, reduceLiveTodo(null, { type: 'hydrate', items: detail.todos }));
+            }
+          }).catch(() => {});
         }
-        const cachedTodos = activeTodosBySessionRef.current.get(sessionId);
-        applySessionStickyTodos(sessionId, cachedTodos ?? null);
+        const cachedTodos =
+          todoLiveBySessionRef.current.get(sessionId)?.items ??
+          activeTodosBySessionRef.current.get(sessionId) ??
+          null;
+        applySessionStickyTodos(sessionId, cachedTodos);
       } else {
         setBusyAndClock(false);
         busyRef.current = false;
@@ -3420,13 +3508,13 @@ export function Chat({
               serverActive === true ||
               localTurnSessionsRef.current.has(loadId) ||
               backgroundRunningSessionsRef.current.has(loadId);
-            const backendTodos = sessionResult.value.todos;
+            const backendTodos = sessionResult.value.todos ?? [];
             if (turnStillRunning) {
-              if (!liveTodoDoc(loadId) && backendTodos && backendTodos.length > 0) {
+              if (!todoFromLiveStreamRef.current.has(loadId)) {
                 writeLiveTodo(loadId, reduceLiveTodo(null, { type: 'hydrate', items: backendTodos }));
               }
             } else {
-              writeLiveTodo(loadId, reduceLiveTodo(null, { type: 'hydrate', items: backendTodos ?? [] }));
+              writeLiveTodo(loadId, reduceLiveTodo(null, { type: 'hydrate', items: backendTodos }));
               seedAppliedTodoIds(loadId, todoCallIdsFromMessages(displayMessages));
             }
             applySessionTokens(loadId, displayMessages, sessionResult.value.token_usage ?? undefined);
@@ -5747,6 +5835,7 @@ export function Chat({
     if (event.type === 'tool_result' && isTodoTool(event.name)) {
       const fromOutput = parseTodosFromOutput(event.output);
       if (fromOutput && fromOutput.length > 0) {
+        todoFromLiveStreamRef.current.add(targetSid);
         writeLiveTodo(
           targetSid,
           reduceLiveTodo(liveTodoDoc(targetSid), { type: 'result', callId: event.id, items: fromOutput }),
@@ -5755,8 +5844,9 @@ export function Chat({
     } else if (event.type === 'tool_start' && isTodoTool(event.name)) {
       const argsStr = formatArgs(event.arguments);
       if (argsStr) {
+        todoFromLiveStreamRef.current.add(targetSid);
         const appliedIds = appliedTodoIdsFor(targetSid);
-        const curTodos = activeTodosBySessionRef.current.get(targetSid) ?? null;
+        const curTodos = liveTodoDoc(targetSid)?.items ?? activeTodosBySessionRef.current.get(targetSid) ?? null;
         const nextTodos = foldLiveTodo({
           state: curTodos,
           remembered: curTodos,
@@ -5969,7 +6059,7 @@ export function Chat({
         hash,
         target,
         messagesRef.current,
-        activeTodosRef.current,
+        todosForSessionCache(target),
         undefined,
         outline,
         tokensAuthoritativeRef.current,
@@ -5980,9 +6070,18 @@ export function Chat({
   /** @param opts.observerOnly Reserved for pure third-party observers that must
    *  not own interactive modals. /chat/watch reattach after refresh MUST call
    *  without this flag so Build-mode permission_request is restored. */
-  function handleEvent(event: SSEEvent, opts?: { observerOnly?: boolean; requireReplayDedup?: boolean; repeatUserAfterSettled?: boolean }) {
+  function handleEvent(
+    event: SSEEvent,
+    opts?: {
+      sourceSessionId?: string | null;
+      observerOnly?: boolean;
+      requireReplayDedup?: boolean;
+      repeatUserAfterSettled?: boolean;
+    },
+  ) {
     const observerOnly = opts?.observerOnly === true;
     const requireReplayDedup = opts?.requireReplayDedup === true;
+    const eventSessionId = opts?.sourceSessionId ?? activeIdRef.current;
     switch (event.type) {
       case 'runtime_info':
         setProvider(event.provider);
@@ -6009,6 +6108,17 @@ export function Chat({
             if (cached) messageCacheRef.current.set(event.session_id, cached);
           }
           if (claim) localTurnSessionsRef.current.add(event.session_id);
+        }
+        if (!activeIdRef.current) {
+          assignedNewSessionIdRef.current = event.session_id;
+          if (activeTodoSlotRef.current.sessionId === null && activeTodoSlotRef.current.items) {
+            const nextSlot: SessionTodoSlot = {
+              sessionId: event.session_id,
+              items: activeTodoSlotRef.current.items,
+            };
+            activeTodoSlotRef.current = nextSlot;
+            setActiveTodoSlot(nextSlot);
+          }
         }
         activeIdRef.current = event.session_id;
         loadedForRef.current = event.session_id;
@@ -6150,34 +6260,28 @@ export function Chat({
           ...(subtasks ? { subtasks } : {}),
         }, event.message_id, streamSeq, insertBeforeMessageId);
         if (isTodoTool(event.name)) {
-          const appliedIds = appliedTodoIdsFor(activeIdRef.current);
-          setActiveTodos((cur) => {
-            const next = foldLiveTodo({
-              state: cur,
-              remembered: activeTodosRef.current,
-              name: event.name,
-              args: argsStr,
-              callId: event.id,
-              appliedIds,
-            });
-            // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
-            persistAppliedTodoIds();
-            const sid = activeIdRef.current;
-            const doc = reduceLiveTodo(
-              liveTodoDoc(sid),
-              next && next.length > 0
-                ? { type: 'preview', callId: event.id, items: next }
-                : { type: 'clear' },
-            );
-            if (sid) {
-              if (doc) todoLiveBySessionRef.current.set(sid, doc);
-              else todoLiveBySessionRef.current.delete(sid);
-              if (doc) activeTodosBySessionRef.current.set(sid, doc.items);
-              else activeTodosBySessionRef.current.delete(sid);
-            }
-            activeTodosRef.current = doc?.items ?? null;
-            return doc?.items ?? null;
+          const todoSid = eventSessionId ?? activeIdRef.current;
+          if (todoSid) todoFromLiveStreamRef.current.add(todoSid);
+          const appliedIds = appliedTodoIdsFor(todoSid);
+          const curDoc = liveTodoDoc(todoSid);
+          const curItems = curDoc?.items ?? null;
+          const next = foldLiveTodo({
+            state: curItems,
+            remembered: curItems,
+            name: event.name,
+            args: argsStr,
+            callId: event.id,
+            appliedIds,
           });
+          // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
+          persistAppliedTodoIds();
+          const doc = reduceLiveTodo(
+            curDoc,
+            next && next.length > 0
+              ? { type: 'preview', callId: event.id, items: next }
+              : { type: 'clear' },
+          );
+          writeLiveTodo(todoSid, doc);
         }
         break;
       }
@@ -6265,11 +6369,13 @@ export function Chat({
           progress: undefined,
         });
         if (isTodoTool(event.name)) {
+          const todoSid = eventSessionId ?? activeIdRef.current;
+          if (todoSid) todoFromLiveStreamRef.current.add(todoSid);
           const authoritativeFromOutput = parseTodosFromOutput(event.output);
           if (authoritativeFromOutput && authoritativeFromOutput.length > 0) {
             writeLiveTodo(
-              activeIdRef.current,
-              reduceLiveTodo(liveTodoDoc(activeIdRef.current), {
+              todoSid,
+              reduceLiveTodo(liveTodoDoc(todoSid), {
                 type: 'result',
                 callId: event.id,
                 items: authoritativeFromOutput,
@@ -6290,34 +6396,26 @@ export function Chat({
             }
             if (foundToolPart?.args) {
               const toolArgs = foundToolPart.args;
-              const appliedIds = appliedTodoIdsFor(activeIdRef.current);
-              setActiveTodos((cur) => {
-                const next = foldLiveTodo({
-                  state: cur,
-                  remembered: activeTodosRef.current,
-                  name: event.name,
-                  args: toolArgs,
-                  callId: event.id,
-                  appliedIds,
-                });
-                // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
-                persistAppliedTodoIds();
-                const sid = activeIdRef.current;
-                const doc = reduceLiveTodo(
-                  liveTodoDoc(sid),
-                  next && next.length > 0
-                    ? { type: 'result', callId: event.id, items: next }
-                    : { type: 'clear' },
-                );
-                if (sid) {
-                  if (doc) todoLiveBySessionRef.current.set(sid, doc);
-                  else todoLiveBySessionRef.current.delete(sid);
-                  if (doc) activeTodosBySessionRef.current.set(sid, doc.items);
-                  else activeTodosBySessionRef.current.delete(sid);
-                }
-                activeTodosRef.current = doc?.items ?? null;
-                return doc?.items ?? null;
+              const appliedIds = appliedTodoIdsFor(todoSid);
+              const curDoc = liveTodoDoc(todoSid);
+              const curItems = curDoc?.items ?? null;
+              const next = foldLiveTodo({
+                state: curItems,
+                remembered: curItems,
+                name: event.name,
+                args: toolArgs,
+                callId: event.id,
+                appliedIds,
               });
+              // 折叠消费了 callId → 立即落盘，刷新后仍能挡住同一帧的重放。
+              persistAppliedTodoIds();
+              const doc = reduceLiveTodo(
+                curDoc,
+                next && next.length > 0
+                  ? { type: 'result', callId: event.id, items: next }
+                  : { type: 'clear' },
+              );
+              writeLiveTodo(todoSid, doc);
             }
           }
         }
@@ -6413,6 +6511,7 @@ export function Chat({
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         if (event.session_id) {
+          if (!activeIdRef.current) assignedNewSessionIdRef.current = event.session_id;
           activeIdRef.current = event.session_id;
           loadedForRef.current = event.session_id;
           onSessionId(event.session_id);
@@ -6489,7 +6588,7 @@ export function Chat({
         const donePh = activeSession?.project_hash || (doneSid ? projectHashBySessionRef.current.get(doneSid) : '') || '';
         if (doneSid && donePh) {
           const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(doneSid) ?? []);
-          void saveSessionCache(donePh, doneSid, messagesRef.current, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+          void saveSessionCache(donePh, doneSid, messagesRef.current, todosForSessionCache(doneSid), undefined, currentOutline, tokensAuthoritativeRef.current);
         }
         onPermissionResolved?.(null); // 回合结束：兜底清掉任何残留审批卡片
         setUserInputReq(null);
@@ -6801,7 +6900,7 @@ export function Chat({
               ph,
               mutation.session_id,
               updatedCached,
-              activeTodosRef.current,
+              todosForSessionCache(mutation.session_id),
               undefined,
               currentOutline,
               tokensAuthoritativeRef.current,
@@ -6916,7 +7015,7 @@ export function Chat({
           const targetPh = activeSession?.project_hash || projectHashBySessionRef.current.get(currentSid) || '';
           if (targetPh) {
             const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(currentSid) ?? []);
-            void saveSessionCache(targetPh, currentSid, next, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+            void saveSessionCache(targetPh, currentSid, next, todosForSessionCache(currentSid), undefined, currentOutline, tokensAuthoritativeRef.current);
           }
         }
         return next;
@@ -7028,7 +7127,7 @@ export function Chat({
         const targetPh = activeSession?.project_hash || projectHashBySessionRef.current.get(targetSid) || '';
         if (targetPh) {
           const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(targetSid) ?? []);
-          void saveSessionCache(targetPh, targetSid, next, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+          void saveSessionCache(targetPh, targetSid, next, todosForSessionCache(targetSid), undefined, currentOutline, tokensAuthoritativeRef.current);
         }
       }
       return next;
@@ -7070,6 +7169,7 @@ export function Chat({
       const effectiveSid = ack.session_id || boundSessionId || turnOwnerSid;
       if (effectiveSid) {
         boundSessionId = effectiveSid;
+        if (!activeIdRef.current) assignedNewSessionIdRef.current = effectiveSid;
         activeIdRef.current = effectiveSid;
         loadedForRef.current = effectiveSid;
         localTurnSessionsRef.current.add(effectiveSid);
@@ -7154,7 +7254,7 @@ export function Chat({
               const ph = activeSession?.project_hash || projectHashBySessionRef.current.get(currentSid) || '';
               if (ph) {
                 const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(currentSid) ?? []);
-                void saveSessionCache(ph, currentSid, next, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+                void saveSessionCache(ph, currentSid, next, todosForSessionCache(currentSid), undefined, currentOutline, tokensAuthoritativeRef.current);
               }
             }
             return next;
@@ -9409,7 +9509,9 @@ export function Chat({
   }
 
   const stickyTodoPanel =
-    activeTodos && activeTodos.length > 0 ? <SessionTodoPanel items={activeTodos} /> : null;
+    activeTodos && activeTodos.length > 0 ? (
+      <SessionTodoPanel key={viewedTodoSessionId ?? 'new'} items={activeTodos} />
+    ) : null;
 
   return (
     <>
