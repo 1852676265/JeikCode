@@ -130,7 +130,7 @@ pub fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MarketplaceInfo {
     pub name: String,
     pub source: String,

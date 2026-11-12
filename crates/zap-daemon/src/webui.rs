@@ -130,13 +130,13 @@ pub async fn try_serve_plugin_asset(path: &str) -> Option<Response> {
     Some((StatusCode::NOT_FOUND, format!("plugin '{plugin_id}' asset '{clean_subpath}' not found")).into_response())
 }
 
-//! 嵌入式 webui 静态资源服务。
-//!
-//! 编译期把 `webui/dist/` 打进二进制；运行期 `GET /` 与未匹配的非 API 路径
-//! 都回退到 `index.html`，交给前端 SPA 路由。
-//!
-//! dev 模式（设置 `JEIKCODE_WEBUI_DEV=http://localhost:5173`）下应改为反代/
-//! 重定向到 vite dev server——后续任务实现。
+// 嵌入式 webui 静态资源服务。
+//
+// 编译期把 `webui/dist/` 打进二进制；运行期 `GET /` 与未匹配的非 API 路径
+// 都回退到 `index.html`，交给前端 SPA 路由。
+//
+// dev 模式（设置 `JEIKCODE_WEBUI_DEV=http://localhost:5173`）下应改为反代/
+// 重定向到 vite dev server——后续任务实现。
 
 use axum::{
     http::{header, StatusCode, Uri},

@@ -6926,8 +6926,9 @@ fn is_private_network_authority(authority: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
                 let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
-            v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified() || is_cgnat
+                v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified() || is_cgnat
             }
             std::net::IpAddr::V6(v6) => {
                 let seg0 = v6.segments()[0];

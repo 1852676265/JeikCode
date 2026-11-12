@@ -31,7 +31,7 @@ use super::state::{
 };
 use super::url::validate_git_url;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct InstalledPluginInfo {
     pub plugin: String,
     pub marketplace: String,
