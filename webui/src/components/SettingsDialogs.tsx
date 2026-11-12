@@ -16,31 +16,23 @@ import {
   setDefaultProvider,
   deleteProvider,
   fetchUpstreamModels,
-  probeUpstreamModel,
 } from '../api';
 import { useSettings, Theme } from '../settings';
 import { languageOptions, Lang } from '../i18n';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './Select';
-import { useBackdropDismiss } from '../lib/backdropDismiss';
 
-// 上下文窗口预设（计算机标准二进制 1024 进制：256K / 512K / 1M / 2M）。
-const CONTEXT_WINDOW_PRESETS = [262144, 524288, 1048576, 2097152];
+// 上下文窗口预设（数值与配置一致，显示时按 /1000 换算为「k tokens」）。
+// 上下文窗口预设（淘汰 256K 以下选项，保留 256K 及以上主流长窗口）。
+const CONTEXT_WINDOW_PRESETS = [256000, 512000, 1000000, 2000000];
 
-/** 最大输出预算预设档位（计算机标准二进制 1024 进制）：32K / 64K / 128K / 256K / 384K / 512K + 自定义。
- * 该值作为各协议的 max_tokens / max budget 原样下发。 */
-const MAX_OUTPUT_PRESETS = [32768, 65536, 131072, 262144, 393216, 524288];
+/** 最大输出预算预设档位：32K / 64K / 128K / 256K / 384K + 自定义。
+ * 该值只是「模型输出能力声明」，会作为各协议的 max budget 原样下发；
+ * 它不参与上下文统计与压缩水位计算（水位 = 窗口 − 20K 固定缓冲）。 */
+const MAX_OUTPUT_PRESETS = [32000, 64000, 128000, 256000, 384000];
 
 function fmtMaxTokens(v: number): string {
-  if (v <= 0) return String(v);
-  if (v >= 1048576 && v % 1048576 === 0) {
-    return `${v / 1048576}M (${v.toLocaleString()})`;
-  }
-  if (v >= 1024) {
-    const k = v % 1024 === 0 ? v / 1024 : v % 1000 === 0 ? v / 1000 : Math.round(v / 1024);
-    return `${k}K (${v.toLocaleString()})`;
-  }
-  return String(v);
+  return v >= 1000 ? `${Math.round(v / 1000)}K (${v.toLocaleString()})` : String(v);
 }
 
 /** 与 TUI `/provider` 对齐的可自定义协议 + ollama。 */
@@ -71,26 +63,9 @@ function toPresetProviderId(type: string | undefined): string {
   return wire;
 }
 
-/** 把 context_window 数值格式化为标准计算机 M/K 标签（杜绝 1.048576M 异常）：1048576 → "1M"，262144 → "256K"。 */
+/** 把 context_window 数值格式化为下拉标签：1000000 → "1M"，其余 → "<n>K"。 */
 function fmtContextWindow(v: number): string {
-  if (v <= 0) return String(v);
-  if (v >= 1048576 && v % 1048576 === 0) {
-    return `${v / 1048576}M`;
-  }
-  if (v >= 1000000 && v % 1000000 === 0) {
-    return `${v / 1000000}M`;
-  }
-  if (v >= 950000 && v <= 1100000) {
-    return '1M';
-  }
-  if (v >= 1900000 && v <= 2200000) {
-    return '2M';
-  }
-  if (v >= 1024) {
-    const k = v % 1024 === 0 ? v / 1024 : v % 1000 === 0 ? v / 1000 : Math.round(v / 1024);
-    return `${k}K`;
-  }
-  return String(v);
+  return v >= 1000000 ? `${v / 1000000}M` : `${Math.round(v / 1000)}K`;
 }
 
 /** Shared modal chrome for the settings dialogs. */
@@ -114,13 +89,6 @@ function SettingsModal({
 }) {
   const { t } = useSettings();
   const mountTimeRef = useRef(Date.now());
-
-  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
-  // 挂载前 150ms 忽略外部点击，防双层弹窗点击穿透。
-  const backdropDismiss = useBackdropDismiss(() => {
-    if (Date.now() - mountTimeRef.current < 150) return;
-    onClose();
-  });
   const sizeClass = extraLarge
     ? ' modal-card-xl'
     : large
@@ -131,7 +99,11 @@ function SettingsModal({
   const modalContent = (
     <div
       class="modal-overlay"
-      {...backdropDismiss}
+      onClick={(e) => {
+        // 防双层弹窗点击穿透：挂载前 150ms 忽略外部点击误关
+        if (Date.now() - mountTimeRef.current < 150) return;
+        if (e.target === e.currentTarget) onClose();
+      }}
       style={{ zIndex: 99999 }}
     >
       <div class={'modal-card' + sizeClass} onClick={(e) => e.stopPropagation()}>
@@ -206,17 +178,16 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
     <SettingsModal title={t('settings.menuLang')} onClose={onClose}>
       <div class="field-group">
         <span class="modal-label">{t('settings.language')}</span>
-        <div class="segmented-language-grid">
+        <div class="segmented">
           {options.map((o) => (
             <button
               key={o.value}
-              class={'segmented-language-btn' + (lang === o.value ? ' active' : '')}
+              class={'segmented-btn' + (lang === o.value ? ' active' : '')}
               onClick={() => void chooseLanguage(o.value)}
               disabled={saving}
               type="button"
             >
-              <span class="lang-btn-name">{o.label}</span>
-              {lang === o.value && <span class="lang-btn-check">✓</span>}
+              {o.label}
             </button>
           ))}
         </div>
@@ -349,14 +320,7 @@ function AccountFormDialog({
   );
 }
 
-function notifyConfigChange() {
-  if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('jeikcode:config-reloaded'));
-    window.dispatchEvent(new CustomEvent('jeikcode:reload-models'));
-  }
-}
-
-export function ModelConfigView({ onDone }: { onDone?: () => void }) {
+export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
   const { t } = useSettings();
   const [config, setConfig] = useState<ConfigInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -374,14 +338,9 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [deleteAccountTarget, setDeleteAccountTarget] = useState<string | null>(null);
 
-  const reload = (notify = false) =>
+  const reload = () =>
     getConfig()
-      .then((cfg) => {
-        setConfig(cfg);
-        if (notify) {
-          notifyConfigChange();
-        }
-      })
+      .then(setConfig)
       .catch((e: unknown) => {
         const raw = e instanceof Error ? e.message : String(e);
         const auth = /401|unauthorized|access token/i.test(raw);
@@ -485,6 +444,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
 
   return (
     <>
+    <SettingsModal title={t('settings.menuModel')} extraLarge onClose={onClose}>
       <div class="field-group" style={{ gap: '14px' }}>
         {loadError && <div class="modal-error">{t('settings.loadFailed')}: {loadError}</div>}
         {!config && !loadError && <div class="modal-loading">{t('settings.loading')}</div>}
@@ -696,7 +656,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
                                         type="button"
                                         onClick={async () => {
                                           await setDefaultProvider(p.name);
-                                          reload(true);
+                                          reload();
                                         }}
                                         title={t('settings.setAsDefault')}
                                       >
@@ -726,7 +686,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
                                   {p.context_window && (
                                     <div class="model-card-meta-item">
                                       <span class="pk">⚡ {t('settings.contextWindow')}:</span>
-                                      <span class="pv">{fmtContextWindow(p.context_window)}</span>
+                                      <span class="pv">{(p.context_window / 1000).toFixed(0)}k</span>
                                     </div>
                                   )}
                                   <div class="model-card-meta-item">
@@ -759,6 +719,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
           </>
         )}
       </div>
+    </SettingsModal>
 
     {showAddModel && (
       <ProviderFormDialog
@@ -772,7 +733,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
         onSaved={() => {
           setShowAddModel(false);
           setAddModelDefaultAccount(undefined);
-          reload(true);
+          reload();
         }}
       />
     )}
@@ -785,7 +746,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
         onClose={() => setEditModelTarget(null)}
         onSaved={() => {
           setEditModelTarget(null);
-          reload(true);
+          reload();
         }}
       />
     )}
@@ -796,7 +757,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
         onClose={() => setShowAddAccount(false)}
         onSaved={() => {
           setShowAddAccount(false);
-          reload(true);
+          reload();
         }}
       />
     )}
@@ -808,7 +769,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
         onClose={() => setEditAccountTarget(null)}
         onSaved={() => {
           setEditAccountTarget(null);
-          reload(true);
+          reload();
         }}
       />
     )}
@@ -821,7 +782,7 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
         cancelLabel={t('common.cancel')}
         onConfirm={async () => {
           await deleteProvider(deleteModelTarget);
-          reload(true);
+          reload();
         }}
         onClose={() => setDeleteModelTarget(null)}
       />
@@ -835,21 +796,12 @@ export function ModelConfigView({ onDone }: { onDone?: () => void }) {
         cancelLabel={t('common.cancel')}
         onConfirm={async () => {
           await deleteAccount(deleteAccountTarget);
-          reload(true);
+          reload();
         }}
         onClose={() => setDeleteAccountTarget(null)}
       />
     )}
     </>
-  );
-}
-
-export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
-  const { t } = useSettings();
-  return (
-    <SettingsModal title={t('settings.menuModel')} extraLarge onClose={onClose}>
-      <ModelConfigView onDone={onClose} />
-    </SettingsModal>
   );
 }
 
@@ -896,11 +848,11 @@ function ProviderFormDialog({
   const [name] = useState(editing?.name ?? '');
   const [nameInput, setNameInput] = useState(editing?.name ?? '');
   const [model, setModel] = useState(editing?.model ?? '');
-  const [contextWindow, setContextWindow] = useState<number | ''>(
-    editing?.context_window ?? 262144,
+  const [contextWindow, setContextWindow] = useState<number>(
+    editing?.context_window ?? 256000,
   );
   const [maxTokens, setMaxTokens] = useState<number | ''>(
-    editing?.max_tokens ?? 65536,
+    editing?.max_tokens ?? 64000,
   );
   const [supportsVision, setSupportsVision] = useState(Boolean(editing?.supports_vision));
   const [reasoningModel, setReasoningModel] = useState(Boolean(editing?.reasoning_model));
@@ -922,15 +874,12 @@ function ProviderFormDialog({
   const [fetching, setFetching] = useState(false);
   const [fetchStatus, setFetchStatus] = useState<string | null>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  // 探活：用当前账号 key/url 按协议发一次极小「Hi」，展示 OK+延迟 / Failed。
-  const [probing, setProbing] = useState(false);
-  const [probeResult, setProbeResult] = useState<{
-    ok: boolean;
-    latencyMs: number;
-    error?: string;
-  } | null>(null);
   const [highlight, setHighlight] = useState(0);
   const modelWrapRef = useRef<HTMLDivElement | null>(null);
+
+  const cwOptions = CONTEXT_WINDOW_PRESETS.includes(contextWindow)
+    ? CONTEXT_WINDOW_PRESETS
+    : [contextWindow, ...CONTEXT_WINDOW_PRESETS];
 
   const accountOptions = useMemo(
     () =>
@@ -992,33 +941,6 @@ function ProviderFormDialog({
     }
   };
 
-  const runProbe = async () => {
-    if (!selectedAccount) {
-      setFetchStatus(t('settings.needAccountFirst'));
-      return;
-    }
-    const id = model.trim();
-    if (!id) {
-      setFetchStatus(t('settings.allRequired'));
-      return;
-    }
-    setProbing(true);
-    setProbeResult(null);
-    try {
-      const res = await probeUpstreamModel({
-        account: selectedAccount.id,
-        provider_name: isEdit ? name : undefined,
-        skip_tls_verify: selectedAccount.skip_tls_verify,
-        model: id,
-      });
-      setProbeResult({ ok: res.ok, latencyMs: res.latency_ms, error: res.error });
-    } catch (e: unknown) {
-      setProbeResult({ ok: false, latencyMs: 0, error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setProbing(false);
-    }
-  };
-
   const pickModel = (id: string) => {
     setModel(id);
     if (!nameInput.trim()) {
@@ -1054,17 +976,11 @@ function ProviderFormDialog({
       reasoning_effort: reasoningModel && reasoningEffort ? reasoningEffort : null,
       reasoning_history: reasoningModel ? reasoningHistory : null,
       thinking_enabled: reasoningModel ? !isOff : undefined,
-      // Only write an explicit disabled marker. "enabled" is protocol-specific
-      // (Claude legacy budget, Kimi K2, ...), so the adapters decide the mode
-      // from the model generation instead of this dialog forcing one.
-      thinking_type: isOff ? 'disabled' : undefined,
+      thinking_type: isOff ? 'disabled' : (reasoningModel ? 'enabled' : undefined),
       thinking_budget: isOff
         ? 0
-        : (reasoningModel && budgetEnabled && thinkingBudget !== ''
-            ? Math.max(1024, Number(thinkingBudget))
-            : null),
+        : (reasoningModel && budgetEnabled && thinkingBudget !== '' ? Number(thinkingBudget) : null),
     };
-    const cwVal = contextWindow !== '' && Number(contextWindow) > 0 ? Number(contextWindow) : 262144;
     const maxTokensVal = maxTokens !== '' && Number(maxTokens) > 0 ? Number(maxTokens) : null;
     const accountType = normalizeProviderType(selectedAccount.type);
     try {
@@ -1073,7 +989,7 @@ function ProviderFormDialog({
           ...(newName !== name ? { name: newName } : {}),
           model: model.trim(),
           account: selectedAccount.id,
-          context_window: cwVal,
+          context_window: contextWindow,
           max_tokens: maxTokensVal,
           clear_max_tokens: maxTokensVal === null,
           ...advanced,
@@ -1087,7 +1003,7 @@ function ProviderFormDialog({
           type: accountType,
           model: model.trim(),
           account: selectedAccount.id,
-          context_window: cwVal,
+          context_window: contextWindow,
           max_tokens: maxTokensVal,
           set_default: setDefault || undefined,
           ...advanced,
@@ -1122,7 +1038,6 @@ function ProviderFormDialog({
                   setAccount(v);
                   setCandidates([]);
                   setFetchStatus(null);
-                  setProbeResult(null);
                 }}
               />
               <span class="field-hint">{t('settings.inheritAccountCreds')}</span>
@@ -1153,7 +1068,6 @@ function ProviderFormDialog({
               onInput={(e) => {
                 setModel((e.target as HTMLInputElement).value);
                 setModelMenuOpen(true);
-                setProbeResult(null);
               }}
               onKeyDown={(e) => {
                 if (!modelMenuOpen || filtered.length === 0) return;
@@ -1180,23 +1094,6 @@ function ProviderFormDialog({
             >
               {fetching ? '…' : '↻'}
             </button>
-            <button
-              type="button"
-              class="btn model-id-probe"
-              disabled={probing || !selectedAccount || !model.trim()}
-              title={t('settings.probeHint')}
-              onClick={() => void runProbe()}
-            >
-              {probing ? '…' : t('settings.probe')}
-            </button>
-            {probeResult && (
-              <span
-                class={'model-probe-status ' + (probeResult.ok ? 'ok' : 'bad')}
-                title={probeResult.error || ''}
-              >
-                {probeResult.ok ? `OK · ${probeResult.latencyMs} ms` : 'Failed'}
-              </span>
-            )}
           </div>
           {fetchStatus && <span class="field-hint">{fetchStatus}</span>}
           {modelMenuOpen && filtered.length > 0 && (
@@ -1219,53 +1116,20 @@ function ProviderFormDialog({
           )}
         </div>
 
-        {/* 输入与输出控制区（均支持标准计算机 K/M 预设档位与自由自定义输入） */}
+        {/* 输入与输出控制区（无冗余胶囊，简洁直观） */}
         <div class="add-model-io-grid">
           <div class="add-model-field">
             <label class="add-model-label">
               {t('settings.contextWindowInput')}
             </label>
-            <div class="max-tokens-control-row">
-              <div style={{ flex: 1 }}>
-                <Select
-                  value={
-                    contextWindow === ''
-                      ? 'custom'
-                      : CONTEXT_WINDOW_PRESETS.includes(Number(contextWindow))
-                        ? String(contextWindow)
-                        : 'custom'
-                  }
-                  options={[
-                    ...CONTEXT_WINDOW_PRESETS.map((v) => ({
-                      value: String(v),
-                      label: `${fmtContextWindow(v)} tokens`,
-                    })),
-                    { value: 'custom', label: t('settings.customTokens') },
-                  ]}
-                  onChange={(v) => {
-                    if (v === 'custom') {
-                      if (contextWindow === '' || CONTEXT_WINDOW_PRESETS.includes(Number(contextWindow))) {
-                        setContextWindow(262144);
-                      }
-                    } else {
-                      setContextWindow(Number(v));
-                    }
-                  }}
-                />
-              </div>
-              <input
-                type="number"
-                class="menu-input max-tokens-input"
-                min="1"
-                step="1024"
-                placeholder="Tokens"
-                value={contextWindow}
-                onInput={(e) => {
-                  const val = parseInt((e.target as HTMLInputElement).value, 10);
-                  setContextWindow(isNaN(val) || val <= 0 ? '' : val);
-                }}
-              />
-            </div>
+            <Select
+              value={String(contextWindow)}
+              options={cwOptions.map((v) => ({
+                value: String(v),
+                label: `${fmtContextWindow(v)} tokens`,
+              }))}
+              onChange={(v) => setContextWindow(Number(v))}
+            />
           </div>
 
           <div class="add-model-field">
@@ -1292,7 +1156,7 @@ function ProviderFormDialog({
                   onChange={(v) => {
                     if (v === 'custom') {
                       if (maxTokens === '' || MAX_OUTPUT_PRESETS.includes(Number(maxTokens))) {
-                        setMaxTokens(65536);
+                        setMaxTokens(64000);
                       }
                     } else {
                       setMaxTokens(Number(v));
@@ -1342,13 +1206,7 @@ function ProviderFormDialog({
           <button
             type="button"
             class={'capsule-toggle-pill' + (reasoningModel ? ' active' : '')}
-            onClick={() => {
-              const next = !reasoningModel;
-              setReasoningModel(next);
-              if (next) {
-                setReasoningHistory('include');
-              }
-            }}
+            onClick={() => setReasoningModel((v) => !v)}
           >
             <span class="pill-dot" />
             <span class="pill-icon">🧠</span>
@@ -1374,11 +1232,10 @@ function ProviderFormDialog({
                         setReasoningEffort(v);
                         if (v === 'off') {
                           setBudgetEnabled(false);
-                          setThinkingBudget('');
-                        } else if (budgetEnabled) {
+                        } else if (v && !thinkingBudget) {
                           const defaults: Record<string, number> = {
                             low: 2048,
-                            medium: 8192,
+                            medium: 5120,
                             high: 16384,
                             xhigh: 32768,
                             max: 65536,
@@ -1395,17 +1252,15 @@ function ProviderFormDialog({
                       onClick={() => {
                         const next = !budgetEnabled;
                         setBudgetEnabled(next);
-                        if (next) {
+                        if (next && !thinkingBudget) {
                           const defaults: Record<string, number> = {
                             low: 2048,
-                            medium: 8192,
+                            medium: 5120,
                             high: 16384,
                             xhigh: 32768,
                             max: 65536,
                           };
-                          setThinkingBudget(thinkingBudget || defaults[reasoningEffort] || 16384);
-                        } else {
-                          setThinkingBudget('');
+                          setThinkingBudget(defaults[reasoningEffort] || 2048);
                         }
                       }}
                     >
@@ -1417,7 +1272,7 @@ function ProviderFormDialog({
                     <input
                       type="number"
                       class="menu-input reasoning-budget-input"
-                      min="1024"
+                      min="0"
                       step="1024"
                       placeholder="Tokens"
                       value={thinkingBudget}

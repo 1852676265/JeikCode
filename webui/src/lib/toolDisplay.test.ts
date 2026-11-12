@@ -150,7 +150,7 @@ test('resolveToolDiffPreview does NOT tag successful edit as diagnostic even if 
   const output = [
     '> ⏱️ **Cost Time**: 107ms',
     '',
-    'Edited crates/jeikcode-capabilities/src/tools/edit.rs (3 replacements (3 hunks: exact, exact, exact))',
+    'Edited crates/zap-capabilities/src/tools/edit.rs (3 replacements (3 hunks: exact, exact, exact))',
     '@@ -355,8 +355,16 @@',
     '- old line',
     '+ [Content Mismatch]: Closest matching block found around lines',
@@ -404,29 +404,29 @@ test('formatToolCompactJson formats multi-param read_file as single-line JSON', 
   const args = JSON.stringify({
     offset: 1,
     limit: 30,
-    file_path: 'crates/jeikcode-config/src/endpoints.rs',
+    file_path: 'crates/zap-config/src/endpoints.rs',
   });
   const detail = formatToolDetail('read_file', args);
   assert.equal(
     detail,
-    '{"file_path": "crates/jeikcode-config/src/endpoints.rs", "offset": 1, "limit": 30}',
+    '{"file_path": "crates/zap-config/src/endpoints.rs", "offset": 1, "limit": 30}',
   );
 
   // Consecutive calls with different offsets produce distinct header summaries
   const nextArgs = JSON.stringify({
     offset: 31,
     limit: 30,
-    file_path: 'crates/jeikcode-config/src/endpoints.rs',
+    file_path: 'crates/zap-config/src/endpoints.rs',
   });
   const nextDetail = formatToolDetail('read_file', nextArgs);
   assert.notEqual(detail, nextDetail);
   assert.equal(
     nextDetail,
-    '{"file_path": "crates/jeikcode-config/src/endpoints.rs", "offset": 31, "limit": 30}',
+    '{"file_path": "crates/zap-config/src/endpoints.rs", "offset": 31, "limit": 30}',
   );
 });
 
-test('formatToolCompactJson keeps long content / code strings intact', () => {
+test('formatToolCompactJson abbreviates long content / code strings with ellipsis', () => {
   const args = JSON.stringify({
     file_path: 'src/auth.rs',
     old_string: 'pub fn verify() {\n    let token = get_token();\n    println!("debug: {}", token);\n    return check(token);\n}',
@@ -435,22 +435,20 @@ test('formatToolCompactJson keeps long content / code strings intact', () => {
   const detail = formatToolDetail('edit_file', args);
   // Must be a single line without raw newlines
   assert.ok(!detail.includes('\n'), 'must not contain literal newlines');
-  // No character truncation: the full payload survives.
-  assert.ok(!detail.includes('…'), 'must not truncate with ellipsis');
-  assert.ok(detail.includes('println!'));
-  assert.ok(detail.includes('return check(get_token())'));
+  // Must abbreviate long payload with ellipsis
+  assert.ok(detail.includes('…'), 'must abbreviate with ellipsis');
   // Must preserve key identifier file_path
   assert.ok(detail.includes('"file_path": "src/auth.rs"'));
 });
 
 test('formatToolCompactJson keeps path and query identifiers visible for search tools', () => {
   const grepArgs = JSON.stringify({
-    path: 'crates/jeikcode-config',
+    path: 'crates/zap-config',
     pattern: 'endpoints',
   });
   assert.equal(
     formatToolDetail('grep', grepArgs),
-    '{"pattern": "endpoints", "path": "crates/jeikcode-config"}',
+    '{"pattern": "endpoints", "path": "crates/zap-config"}',
   );
 });
 
@@ -459,17 +457,17 @@ test('formatToolCompactJson handles arrays, empty args, and non-JSON fallbacks',
   assert.equal(formatToolDetail('read_file', '{}'), '');
   assert.equal(formatToolDetail('read_file', ''), '');
 
-  // Arrays keep every element; no "+N more" truncation.
+  // Truncating arrays with > 3 items
   const arrayArgs = JSON.stringify({
     files: ['a.rs', 'b.rs', 'c.rs', 'd.rs', 'e.rs'],
   });
   const arrayDetail = formatToolCompactJson(arrayArgs);
   assert.equal(
     arrayDetail,
-    '{"files": ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]}',
+    '{"files": ["a.rs", "b.rs", "c.rs", "+2 more"]}',
   );
 
-  // Non-JSON fallback stays complete.
+  // Non-JSON fallback
   assert.equal(formatToolDetail('custom', 'plain text string'), 'plain text string');
 });
 
@@ -487,12 +485,12 @@ test('formatToolCompactJson puts important fields before short ones', () => {
   const invertedOrderArgs = JSON.stringify({
     limit: 30,
     offset: 1,
-    file_path: 'crates/jeikcode-config/src/endpoints.rs',
+    file_path: 'crates/zap-config/src/endpoints.rs',
   });
   const detail = formatToolDetail('read_file', invertedOrderArgs);
   assert.equal(
     detail,
-    '{"file_path": "crates/jeikcode-config/src/endpoints.rs", "offset": 1, "limit": 30}',
+    '{"file_path": "crates/zap-config/src/endpoints.rs", "offset": 1, "limit": 30}',
   );
 
   const editArgs = JSON.stringify({

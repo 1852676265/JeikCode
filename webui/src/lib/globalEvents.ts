@@ -32,31 +32,13 @@ export function emitGlobalEvent(event: GlobalWireEvent): void {
   if (event.type === 'git_updated') {
     try {
       import('./gitStore').then((m) => {
-        m.gitStore.handleRemoteUpdate({ cwd: event.cwd, force: true, fetch: event.fetch });
+        m.gitStore.handleRemoteUpdate({ cwd: event.cwd, force: true });
       });
     } catch {}
   }
   if (event.type === 'terminal_updated') {
     try {
       window.dispatchEvent(new CustomEvent('jeikcode:terminal:remote_updated', { detail: { cwd: event.cwd } }));
-    } catch {}
-  }
-  if (event.type === 'session_mode') {
-    try {
-      window.dispatchEvent(
-        new CustomEvent('jeikcode:session_mode_changed', {
-          detail: { session_id: event.session_id, mode: event.mode },
-        }),
-      );
-    } catch {}
-  }
-  if (event.type === 'mode_global') {
-    try {
-      window.dispatchEvent(
-        new CustomEvent('jeikcode:mode_global_changed', {
-          detail: { enabled: event.enabled, mode: event.mode },
-        }),
-      );
     } catch {}
   }
   for (const listener of [...listeners]) {
@@ -81,11 +63,8 @@ export function startGlobalEventStream(): () => void {
         const { streamGlobalEvents } = await import('../api');
         await streamGlobalEvents(emitGlobalEvent, abort.signal);
         attempt = 0;
-      } catch (err) {
+      } catch {
         if (stopped || abort.signal.aborted) return;
-        // 凭据已被服务端拒绝：重连只会无限 401，交给认证遮罩引导用户换 token，
-        // 用户重新连接成功后会整页重载并重新启动本事件流。
-        if ((err as { name?: string } | null)?.name === 'AuthExpiredError') return;
       }
       if (stopped) return;
       attempt = Math.min(attempt + 1, 6);

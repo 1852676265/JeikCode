@@ -3,8 +3,6 @@
 
 import { createPortal } from 'preact/compat';
 import { useEffect, useState, useRef } from 'preact/hooks';
-import { useT } from '../settings';
-import { useBackdropDismiss } from '../lib/backdropDismiss';
 
 export interface ConfirmDialogProps {
   title: string;
@@ -34,8 +32,8 @@ export interface ConfirmDialogProps {
 export function ConfirmDialog({
   title,
   body,
-  confirmLabel,
-  cancelLabel,
+  confirmLabel = '确定',
+  cancelLabel = '取消',
   icon,
   danger = true,
   alertOnly = false,
@@ -43,9 +41,6 @@ export function ConfirmDialog({
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
-  const t = useT();
-  const effectiveConfirm = confirmLabel || t('common.confirm') || 'Confirm';
-  const effectiveCancel = cancelLabel || t('common.cancel') || 'Cancel';
   const displayIcon = icon ?? (danger ? '🗑' : '💡');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -54,11 +49,6 @@ export function ConfirmDialog({
   const cancelBtnRef = useRef<HTMLButtonElement>(null);
   const confirmBtnRef = useRef<HTMLButtonElement>(null);
   const [selectedOption, setSelectedOption] = useState<'cancel' | 'confirm'>('confirm');
-
-  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
-  const backdropDismiss = useBackdropDismiss(() => {
-    if (!busy) onClose();
-  });
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -133,7 +123,9 @@ export function ConfirmDialog({
   const overlay = (
     <div
       class="modal-overlay confirm-modal-overlay"
-      {...backdropDismiss}
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
     >
       <div class="modal-card modal-card-sm" role="dialog" aria-modal="true">
         <div class="modal-header">
@@ -176,7 +168,7 @@ export function ConfirmDialog({
               disabled={busy}
               style={selectedOption === 'cancel' ? { outline: '2px solid var(--app-primary, #3b82f6)', outlineOffset: '2px' } : undefined}
             >
-              {effectiveCancel}
+              {cancelLabel}
             </button>
           )}
           <button
@@ -187,7 +179,7 @@ export function ConfirmDialog({
             disabled={busy}
             style={selectedOption === 'confirm' ? { outline: '2px solid var(--app-primary, #3b82f6)', outlineOffset: '2px' } : undefined}
           >
-            {effectiveConfirm}
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -271,7 +263,7 @@ export function modalPrompt(options: {
     }
     setGlobalModalState({
       props: {
-        title: options.title || '',
+        title: options.title || '请输入',
         body: options.body || '',
         icon: options.icon || '✏️',
         danger: false,

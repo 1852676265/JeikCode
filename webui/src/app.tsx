@@ -3,46 +3,30 @@
 
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { lazy, Suspense } from 'preact/compat';
-import type { ComponentChildren } from 'preact';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
-import { LegacyMigrationModal } from './components/LegacyMigrationModal';
-import { DesktopClosePromptDialog } from './components/DesktopClosePromptDialog';
 import { onboardingDone } from './lib/onboarding';
 import { LiveReviewState, NotificationDock } from './components/NotificationDock';
 import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
-import { clearCompletedBadgeIds, isUserDrivenScroll, nextCompletedBadgeIds } from './lib/completedBadge';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
-import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { ToastHost, showToast } from './components/Toast';
-import { ConfirmModalHost } from './components/ConfirmDialog';
 import { ServerSwitcherModal } from './components/ServerSwitcherModal';
 import { PluginCenterHostApp } from './custom/custom-registry';
 import { zapPluginKernel } from './custom/plugin-kernel';
-import { parseFilePathAndLines } from './lib/displayPath';
-import { dropEditorTabSnapshot, mainEditorStateKey } from './lib/editorTabState';
-import { languageOptions } from './i18n';
+import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
+import { resolvePendingAfterDecision } from './lib/pendingPermission';
+import { ToastHost, showToast } from './components/Toast';
+import { ConfirmModalHost } from './components/ConfirmDialog';
+import { isUserHomeDir, parseFilePathAndLines } from './lib/displayPath';
 
-// 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销。
-// 注意：**每次启动都会渲染**的弹窗绝不能放进这里——懒加载它们没有收益，
-// 反而会在启动时和同一边界内的其它 lazy 组件竞争，Preact 可能把被抛出的
-// Suspense Promise 记成 Uncaught (in promise)。这两个组件改为静态导入。
+// 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销
 const ThemeDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ThemeDialog })));
 const LanguageDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.LanguageDialog })));
 const ModelConfigDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ModelConfigDialog })));
 const OnboardingWizard = lazy(() => import('./components/OnboardingWizard').then((m) => ({ default: m.OnboardingWizard })));
 const UpdateDialog = lazy(() => import('./components/UpdateDialog').then((m) => ({ default: m.UpdateDialog })));
 const ConfigSyncModal = lazy(() => import('./components/ConfigSyncModal').then((m) => ({ default: m.ConfigSyncModal })));
-const SystemSettingsDialog = lazy(() => import('./components/SystemSettingsDialog').then((m) => ({ default: m.SystemSettingsDialog })));
-
-/** 每个懒加载弹窗独占一个 Suspense 边界：共享边界时，一次 import 解析后的
- *  retry 会连带重渲染仍 pending 的兄弟 lazy 组件，Preact 在分离子树上可能把
- *  抛出的 Promise 变成 unhandled rejection（控制台 “Uncaught (in promise) Promise”）。 */
-function LazyBoundary({ children }: { children: ComponentChildren }) {
-  return <Suspense fallback={null}>{children}</Suspense>;
-}
 import {
   getProject,
   getConfig,
@@ -52,26 +36,14 @@ import {
   createSession,
   getSession,
   getActiveChatSessions,
-  getChatPending,
-  getHealth,
   checkUpdate,
   fetchUpgradeDiffs,
-  postSessionSeen,
   UpdateCheckResponse,
   ConfigDiffItem,
   SessionMetaWithProject,
 } from './api';
 import { useT, useSettings, SettingsSection } from './settings';
-import { setStreamEpoch } from './lib/streamCursor';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
-import { onSoftRefresh, requestSoftRefresh } from './lib/appRefresh';
-import {
-  buildRestoreCandidates,
-  forgetRememberedSession,
-  readRememberedSession,
-  rememberSession,
-  type RememberedSession,
-} from './lib/navState';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
@@ -87,172 +59,62 @@ function shortSessionId(id: string): string {
   return id.slice(0, 8);
 }
 
-/** 用本地记忆拼一个首帧元数据，避免刷新时标题头闪成“新建对话”并让历史加载立即有项目桶。 */
-function rememberedSessionToMeta(
-  remembered: RememberedSession | null,
-): SessionMetaWithProject | null {
-  if (!remembered?.id) return null;
-  return {
-    id: remembered.id,
-    name: remembered.name ?? remembered.id.slice(0, 8),
-    working_dir: remembered.working_dir ?? '',
-    created_at: 0,
-    updated_at: remembered.updated_at ?? 0,
-    message_count: remembered.message_count ?? 0,
-    project_hash: remembered.project_hash ?? '',
-  };
-}
-
 export function App() {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
-  // 刷新恢复优先级：URL 里的短 id（可分享/可直达）> 本浏览器上次选中的完整会话 id。
-  // 跨设备/无痕冷启动两者都没有，才真正回到新建落地页。
-  const urlSessionRef = useRef<string | null>(readSessionIdFromUrl());
-  const rememberedSessionRef = useRef<RememberedSession | null>(readRememberedSession());
-  // URL 指向的就是本地记忆里的同一条会话时，首帧直接复用它的标题/项目桶；
-  // 若 URL 指向别的会话，则以 URL 为准，等 resolve 后用真实元数据覆盖。
-  const rememberedPreviewRef = useRef<SessionMetaWithProject | null>(null);
-  const rememberedPreviewReadyRef = useRef(false);
-  if (!rememberedPreviewReadyRef.current) {
-    rememberedPreviewReadyRef.current = true;
-    const remembered = rememberedSessionRef.current;
-    const urlId = urlSessionRef.current;
-    if (remembered?.id && (!urlId || remembered.id.startsWith(urlId))) {
-      rememberedPreviewRef.current = rememberedSessionToMeta(remembered);
-    }
-  }
-  const restoreCandidatesRef = useRef<string[]>([]);
-  const restoreTargetsReadyRef = useRef(false);
-  if (!restoreTargetsReadyRef.current) {
-    restoreTargetsReadyRef.current = true;
-    restoreCandidatesRef.current = buildRestoreCandidates(
-      urlSessionRef.current,
-      rememberedSessionRef.current?.id ?? null,
-    );
-  }
-  const firstUrlSync = useRef(true);
-  const [restoring, setRestoring] = useState<boolean>(
-    () => restoreCandidatesRef.current.length > 0,
-  );
-  // URL 里是短 id，必须等 resolve 成完整 id 后再进会话；但若 URL 与本地记忆
-  // 指向同一条会话，可以直接用完整 id 先挂载，让侧栏首帧就高亮选中的那一行，
-  // 由 restoring 抑制落地页，等 resolve 回来再校准元数据。
-  const [sessionId, setSessionId] = useState<string | null>(() =>
-    rememberedPreviewRef.current?.id ?? null,
-  );
-  const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(
-    () => rememberedPreviewRef.current,
-  );
+  // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 乐观会话集合：让新创建/首条消息发出的会话即时出现在侧栏（即使切到其他会话也不丢失）。
   // 当后端列表出现同 id 的真实会话后，Sidebar 的 mergeOptimisticSessions 会自动以落盘条目为准去重。
   const [optimisticSessions, setOptimisticSessions] = useState<Record<string, SessionMetaWithProject>>({});
-  const [serverSwitcherOpen, setServerSwitcherOpen] = useState(false);
-  const [activeWorkbenchView, setActiveWorkbenchView] = useState<string>('chat');
-  const [, setPluginViewsTick] = useState(0);
-
-  useEffect(() => {
-    return zapPluginKernel.subscribe(() => {
-      setPluginViewsTick((v) => v + 1);
-    });
-  }, []);
-
-  useEffect(() => {
-    const handler = () => setServerSwitcherOpen(true);
-    window.addEventListener('jeikcode:open_server_switcher', handler);
-    window.addEventListener('zap:open_server_switcher', handler);
-    return () => {
-      window.removeEventListener('jeikcode:open_server_switcher', handler);
-      window.removeEventListener('zap:open_server_switcher', handler);
-    };
-  }, []);
-  const [cwd, setCwd] = useState(() => rememberedPreviewRef.current?.working_dir ?? '');
+  const [cwd, setCwd] = useState('');
   // Physical session-bucket hash of the current project. The sidebar scopes its
   // list by this (see Sidebar `projectHash`), not by the `cwd` string, so a
   // session whose stored `working_dir` was restamped by the daemon's global
   // working_dir can't leak into the wrong project. Tracked alongside `cwd`.
-  const [projectHash, setProjectHash] = useState(
-    () => rememberedPreviewRef.current?.project_hash ?? '',
-  );
+  const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [liveReview, setLiveReview] = useState<LiveReviewState | null>(null);
+  // 主工作区视图状态（'chat' 为默认 AI 对话工作区，其他 ID 为插件贡献的独立主视图）
+  const [activeWorkbenchView, setActiveWorkbenchView] = useState<string>('chat');
+  const [, setPluginViewsTick] = useState(0);
+
+  useEffect(() => {
+    const unsub = zapPluginKernel.subscribe(() => {
+      setPluginViewsTick((v) => v + 1);
+    });
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ viewId?: string }>).detail;
+      if (detail?.viewId) {
+        setActiveWorkbenchView(detail.viewId);
+      } else {
+        setActiveWorkbenchView('chat');
+      }
+    };
+    window.addEventListener('zap:switch-workbench-view', handler);
+    return () => {
+      unsub();
+      window.removeEventListener('zap:switch-workbench-view', handler);
+    };
+  }, []);
   // 跨实例增量流（每实例一条）：侧栏/通知 dock 各自订阅自己需要的增量，
   // 全程按 id 就地 upsert/remove，无周期性轮询、无整表重拉。
   useEffect(() => startGlobalEventStream(), []);
-  // 待交互卡在别处被解决时，同步清掉本实例正在展示的卡片状态；重连 sync 时对齐当前会话状态。
+  // 待交互卡在别处被解决时，同步清掉本实例正在展示的卡片状态。
   useEffect(
     () =>
       onGlobalEvent((event) => {
-        if (event.type === 'sync') {
-          if (sessionId) {
-            void getChatPending(sessionId)
-              .then((p: any) => {
-                setPending((cur: any | null) => {
-                  if (!cur || cur.session_id !== sessionId) return cur;
-                  if (!p.permission || p.permission.approval_id !== cur.approval_id) {
-                    return null;
-                  }
-                  return cur;
-                });
-              })
-              .catch(() => {});
-          }
-          return;
-        }
-        if (event.type === 'session_mode') {
-          if (event.session_id && sessionId === event.session_id) {
-            setActiveSession((prev) => (prev ? { ...prev, approval_mode: event.mode } : prev));
-          }
-          return;
-        }
-        // 跨实例删除：任意端删了当前会话，本端必须回落地页。
-        // （本地侧栏删除走 onSessionDeleted；这里补齐异地/其它标签页的路径。）
-        if (event.type === 'session_deleted') {
-          handleSessionDeleted(event.session_id);
-          return;
-        }
-        // 运行圈圈 / 完成对勾同源：全局 activity 广播携带内核权威终态。
-        if (event.type === 'activity') {
-          setJustCompletedIds((prev) =>
-            nextCompletedBadgeIds(prev, {
-              sessionId: event.session_id,
-              running: event.running,
-              terminal: event.terminal,
-            }),
-          );
-          return;
-        }
-        // 任意实例打开/查看过该会话：所有实例一起熄灭这个一次性徽标。
-        if (event.type === 'session_seen') {
-          clearJustCompleted(event.session_id);
-          return;
-        }
         if (event.type !== 'review_resolved') return;
-        setPending((cur: any | null) => {
-          if (!cur) return cur;
-          if (event.approval_id && cur.approval_id === event.approval_id) return null;
-          if (event.request_id != null && cur.request_id === event.request_id) return null;
-          return cur;
-        });
-        setLiveReview((cur) => {
-          if (!cur) return cur;
-          if (!event.session_id || cur.sessionId !== event.session_id) return cur;
-          // 审批卡（permission）与提问卡（user input）都必须能被异地解决事件关掉；
-          // 否则另一实例已放行的卡片会在此永久停留，形成幽灵审批。
-          if (!cur.userInput) {
-            // 审批卡的解析事件带 approval_id；带 request_id 时按调用方请求号精确匹配。
-            if (event.approval_id) return null;
-            if (event.request_id != null && cur.permission?.request_id !== event.request_id) {
-              return cur;
-            }
-            return null;
-          }
-          const rid = (cur.userInput as any)?.request_id;
-          if (event.request_id != null && rid !== event.request_id) return cur;
-          return null;
-        });
+        setPending((cur: any | null) =>
+          cur && event.approval_id && cur.approval_id === event.approval_id ? null : cur,
+        );
+        setLiveReview((cur) =>
+          cur && cur.sessionId === event.session_id && !cur.userInput ? null : cur,
+        );
       }),
-    [sessionId],
+    [],
   );
   const dismissLiveReview = useRef({
     permission: (_runtimeInstanceId: string, _generation: number, _requestId: number, _callId: string) => {},
@@ -282,74 +144,38 @@ export function App() {
   const [showCwd, setShowCwd] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // 记录右侧面板初始是否处于展开状态（!collapsed）
+  const initialRightPanelOpen = (() => {
+    try {
+      return localStorage.getItem('jeikcode:right-panel-collapsed') === 'false';
+    } catch {
+      return false;
+    }
+  })();
+  // 若初始右侧面板处于展开状态，为了让中间主区域正常显示，自动缩小左侧栏
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => initialRightPanelOpen);
+  // 记录左侧栏当前是否是由右侧面板展开而自动缩小的，便于后续右侧面板关闭时自动恢复展开
+  const autoCollapsedByRightPanelRef = useRef<boolean>(initialRightPanelOpen);
   const [sessionListVersion, setSessionListVersion] = useState(0);
   const [liveRunningIds, setLiveRunningIds] = useState<Set<string>>(() => new Set());
-  /**
-   * 刚完成、还没被点开看过的会话（侧栏绿色对勾）。
-   *
-   * 与蓝圈圈同源：都由全局 `activity` 广播驱动，所以多端/多标签页同步。
-   * 只有内核权威终态 `terminal === 'completed'`（计时器真正停止的完成）才点亮，
-   * 用户停止 / 失败（`stopped` / `failed`）绝不点亮；点进该会话或它再次开跑即消失，
-   * 只显示一次，不做持久化。
-   */
-  const [justCompletedIds, setJustCompletedIds] = useState<Set<string>>(() => new Set());
-
-  // 正在观察的会话完成时也会亮勾：只要窗口重新获得焦点，或用户真正滚动/拖动它，
-  // 就视为「已看过」——本实例熄灭并广播给其它实例。
-  // 只认用户手势（滚轮 / 触摸 / 拖动滚动条 / 键盘）之后的滚动：回合收尾自身的
-  // “跟随到底”属于程序化滚动，绝不能把刚亮起的勾瞬间吞掉。
-  useEffect(() => {
-    const sid = sessionId;
-    if (!sid || !justCompletedIds.has(sid)) return;
-    let dismissed = false;
-    const dismiss = () => {
-      if (dismissed) return;
-      dismissed = true;
-      markSessionSeen(sid);
-    };
-
-    const timeline = document.querySelector('.messages-container');
-    let lastUserInputAt = 0;
-    let pointerDown = false;
-    const noteUserInput = () => {
-      lastUserInputAt = Date.now();
-    };
-    const onPointerDown = () => {
-      pointerDown = true;
-      noteUserInput();
-    };
-    const onPointerUp = () => {
-      pointerDown = false;
-    };
-    const onScroll = (e: Event) => {
-      const target = e.target as Node | null;
-      if (!timeline || !target || !timeline.contains(target)) return;
-      if (!isUserDrivenScroll({ now: Date.now(), lastUserInputAt, pointerDown })) return;
-      dismiss();
-    };
-
-    window.addEventListener('focus', dismiss);
-    window.addEventListener('pointerup', onPointerUp);
-    window.addEventListener('keydown', noteUserInput);
-    timeline?.addEventListener('wheel', noteUserInput, { passive: true });
-    timeline?.addEventListener('touchmove', noteUserInput, { passive: true });
-    timeline?.addEventListener('pointerdown', onPointerDown);
-    timeline?.addEventListener('focusin', dismiss);
-    // scroll 不冒泡，必须在捕获阶段监听（拖动滚动条也只发 scroll）。
-    document.addEventListener('scroll', onScroll, true);
-    return () => {
-      window.removeEventListener('focus', dismiss);
-      window.removeEventListener('pointerup', onPointerUp);
-      window.removeEventListener('keydown', noteUserInput);
-      timeline?.removeEventListener('wheel', noteUserInput);
-      timeline?.removeEventListener('touchmove', noteUserInput);
-      timeline?.removeEventListener('pointerdown', onPointerDown);
-      timeline?.removeEventListener('focusin', dismiss);
-      document.removeEventListener('scroll', onScroll, true);
-    };
-  }, [sessionId, justCompletedIds]);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [serverSwitcherOpen, setServerSwitcherOpen] = useState(false);
+  const [activeServer, setActiveServer] = useState(() => getActiveServerProfile());
+  const activeServerName = activeServer.name;
+  const isDirectMode = isDirectLlmProfile(activeServer);
+
+  useEffect(() => {
+    const onProfilesChange = () => {
+      setActiveServer(getActiveServerProfile());
+    };
+    const onOpenSwitcher = () => setServerSwitcherOpen(true);
+    window.addEventListener(PROFILES_CHANGE_EVENT, onProfilesChange);
+    window.addEventListener('jeikcode:open_server_switcher', onOpenSwitcher);
+    return () => {
+      window.removeEventListener(PROFILES_CHANGE_EVENT, onProfilesChange);
+      window.removeEventListener('jeikcode:open_server_switcher', onOpenSwitcher);
+    };
+  }, []);
   // 表头会话菜单改用 fixed 定位，避免被祖先 overflow/层叠裁剪；记录锚点坐标。
   const [headerMenuPos, setHeaderMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [headerDialog, setHeaderDialog] = useState<'rename' | 'delete' | null>(null);
@@ -362,23 +188,6 @@ export function App() {
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [configDiffs, setConfigDiffs] = useState<ConfigDiffItem[] | null>(null);
-
-  useEffect(() => {
-    // 软刷新：不重挂任何组件，只让侧栏/运行态重新对账；
-    // 焦点、滚动位置、展开状态与终端连接全部原地保留。
-    return onSoftRefresh(() => {
-      setSessionListVersion((v) => v + 1);
-      getActiveChatSessions()
-        .then((ids) => {
-          setLiveRunningIds((prev) => {
-            const next = new Set(ids);
-            if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
-            return next;
-          });
-        })
-        .catch(() => {});
-    });
-  }, []);
 
   // 右上角工具栏收纳菜单（更多操作：刷新、远程访问、更新、主题切换）
   const [topNavMoreOpen, setTopNavMoreOpen] = useState(false);
@@ -434,40 +243,6 @@ export function App() {
     };
   }, []);
 
-  // 断点续传游标的纪元 = daemon 实例身份。重启后 `session_seq` 从 0 重算，
-  // 旧游标必须作废，否则新一轮长过旧游标后，服务端只补 `seq > 旧游标` 的帧，
-  // 当前回合前半段（开场提问、最初思考与工具）被静默跳过。
-  // 静默重启（崩溃 / 重启机器）不会触发升级弹层的 reload，所以这里持续轮询：
-  // 纪元一变，旧游标立即失效，下一次重连走全量幂等补发。
-  useEffect(() => {
-    let cancelled = false;
-    const syncEpoch = () => {
-      getHealth()
-        .then((info) => {
-          if (!cancelled) setStreamEpoch(info.instance_id ?? null);
-        })
-        .catch(() => {
-          /* health 不可用：保持上一个已知纪元；从未拿到过则游标一律视为无效 */
-        });
-    };
-    syncEpoch();
-    const timer = window.setInterval(syncEpoch, 15000);
-    // 手机回前台 / 网络恢复往往正是重连前一瞬：先校准纪元，避免带着旧游标发起补发。
-    const onVisible = () => {
-      if (!document.hidden) syncEpoch();
-    };
-    window.addEventListener('focus', syncEpoch);
-    window.addEventListener('online', syncEpoch);
-    document.addEventListener('visibilitychange', onVisible);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      window.removeEventListener('focus', syncEpoch);
-      window.removeEventListener('online', syncEpoch);
-      document.removeEventListener('visibilitychange', onVisible);
-    };
-  }, []);
-
   useEffect(() => {
     if (!headerMenuRef.current) return;
     const updateWidth = () => {
@@ -498,10 +273,6 @@ export function App() {
   useEffect(() => {
     if (!topNavMoreOpen) return;
     const onClickOutside = (e: MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (target?.closest?.('.modal-overlay, .modal-card, .remote-access-modal-overlay, .remote-access-modal-card, .confirm-modal-overlay, .confirm-dialog-card')) {
-        return;
-      }
       if (topNavMoreRef.current && !topNavMoreRef.current.contains(e.target as Node)) {
         setTopNavMoreOpen(false);
       }
@@ -555,6 +326,56 @@ export function App() {
     };
   }, [mobileTabsDropdownOpen]);
 
+  // 右侧检视面板（提问记录 / Git面板）折叠与宽度布局状态，用于自适应避让右上角快捷工具栏
+  const [rightPanelLayout, setRightPanelLayout] = useState<{ collapsed: boolean; width: number }>(() => {
+    try {
+      const saved = localStorage.getItem('jeikcode:right-panel-collapsed');
+      const collapsed = saved !== 'false';
+      const savedWidth = localStorage.getItem('jeikcode:right-panel-width');
+      const width = savedWidth ? parseInt(savedWidth, 10) : 260;
+      return { collapsed, width: Number.isFinite(width) ? width : 260 };
+    } catch {
+      return { collapsed: true, width: 260 };
+    }
+  });
+
+  // 记录上一次右侧面板折叠状态，用于感知展开/收起的边沿切换
+  const prevRightPanelCollapsedRef = useRef<boolean>(!initialRightPanelOpen);
+
+  const handleToggleSidebarCollapse = useCallback(() => {
+    // 用户主动点击切换左侧折叠，清除由右侧面板触发的自动联动标记，尊重用户意愿
+    autoCollapsedByRightPanelRef.current = false;
+    setSidebarCollapsed((c) => !c);
+  }, []);
+
+  const handleRightPanelLayoutChange = useCallback((layout: { collapsed: boolean; width: number }) => {
+    setRightPanelLayout(layout);
+    const wasCollapsed = prevRightPanelCollapsedRef.current;
+    const isNowCollapsed = layout.collapsed;
+    prevRightPanelCollapsedRef.current = isNowCollapsed;
+
+    if (wasCollapsed && !isNowCollapsed) {
+      // 右侧面板由折叠变为展开（右侧出来了）：
+      // 为了让中间主工作区正常显示，自动缩小左侧栏
+      setSidebarCollapsed((currentCollapsed) => {
+        if (!currentCollapsed) {
+          autoCollapsedByRightPanelRef.current = true;
+          return true;
+        }
+        return currentCollapsed;
+      });
+      // 窄屏/移动端抽屉若打开也自动收起
+      setSidebarOpen(false);
+    } else if (!wasCollapsed && isNowCollapsed) {
+      // 右侧面板由展开变为折叠（右侧收起）：
+      // 若左侧栏此前是因为右侧面板展开而自动缩小的，则恢复展开左侧
+      if (autoCollapsedByRightPanelRef.current) {
+        autoCollapsedByRightPanelRef.current = false;
+        setSidebarCollapsed(false);
+      }
+    }
+  }, []);
+
   // 桌面端/Web 原生通知权限：在用户首次交互后温和请求，保障失焦通知能调起系统原生弹窗
   useEffect(() => {
     if (typeof window !== 'undefined' && 'Notification' in window) {
@@ -574,10 +395,6 @@ export function App() {
   const [topModelSlot, setTopModelSlot] = useState<HTMLElement | null>(null);
 
   const handleCloseDiffTab = (tabId: string) => {
-    const closing = diffTabs.find((t) => t.id === tabId);
-    if (closing?.type === 'editor' && closing.filePath) {
-      dropEditorTabSnapshot(mainEditorStateKey(closing.filePath));
-    }
     setDiffTabs((prev) => {
       const next = prev.filter((t) => t.id !== tabId);
       if (activeMainTabId === tabId) {
@@ -610,13 +427,9 @@ export function App() {
       const base = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
       normPath = `${base}/${normPath.replace(/^\.?\/+/, '')}`;
     }
-    if (/^[a-z]:\//.test(normPath)) {
-      normPath = normPath[0].toUpperCase() + normPath.slice(1);
-    }
     const tabId = `editor_${normPath}`;
-    const existingIdx = diffTabs.findIndex((t) => t.id === tabId || (t.type === 'editor' && t.filePath === normPath));
+    const existingIdx = diffTabs.findIndex((t) => t.id === tabId || t.filePath === normPath);
     if (existingIdx !== -1) {
-      const targetTabId = diffTabs[existingIdx]?.id || tabId;
       const next = [...diffTabs];
       if (next[existingIdx]) {
         next[existingIdx] = {
@@ -631,7 +444,7 @@ export function App() {
         }
         setDiffTabs(next);
       }
-      setActiveMainTabId(targetTabId);
+      setActiveMainTabId(tabId);
       return;
     }
     const fileName = normPath.split(/[\\/]/).pop() || normPath;
@@ -701,11 +514,6 @@ export function App() {
     const handleGlobalDrop = (e: DragEvent) => {
       e.preventDefault();
       try {
-        // `.chat-stage` 内部有自己的落点：主会话区开主标签、右侧预览区开预览标签。
-        // 全局兜底只处理舞台之外的拖放，否则同一份文件会被两边同时打开
-        //（这就是 .md 同时出现在右侧预览和主会话区的根因之一）。
-        const target = e.target as HTMLElement | null;
-        if (target?.closest?.('.chat-stage')) return;
         const raw = e.dataTransfer?.getData('application/jeikcode-tab');
         const data = raw ? JSON.parse(raw) : (window as any).__jeikcode_dragged_tab;
         const targetPath = data?.filePath || e.dataTransfer?.getData('text/plain');
@@ -754,6 +562,17 @@ export function App() {
   const [isLanding, setIsLanding] = useState(true);
 
   useEffect(() => {
+    const onOpenModelConfig = () => setSettingsSection('model');
+    const onOpenUpdateModal = () => setShowUpdateDialog(true);
+    window.addEventListener('jeikcode:open-model-config', onOpenModelConfig);
+    window.addEventListener('jeikcode:open-update-modal', onOpenUpdateModal);
+    return () => {
+      window.removeEventListener('jeikcode:open-model-config', onOpenModelConfig);
+      window.removeEventListener('jeikcode:open-update-modal', onOpenUpdateModal);
+    };
+  }, []);
+
+  useEffect(() => {
     let desktop = false;
     try {
       desktop = new URLSearchParams(window.location.search).get('desktop') === '1';
@@ -773,6 +592,13 @@ export function App() {
   }, []);
   // Skills picked from the sidebar Skills menu → bumped so Chat inserts `/name `.
   const [skillInsert, setSkillInsert] = useState<{ name: string; seq: number } | null>(null);
+  // 挂载时 URL 里的（短）session id；用 ref 暂存，避免被 URL 同步 effect 清掉。
+  const urlSessionRef = useRef<string | null>(readSessionIdFromUrl());
+  // 跳过首次 URL 同步：此时可能正等待把短 id 还原成完整会话，别先清掉参数。
+  const firstUrlSync = useRef(true);
+  // 刷新时若 URL 带 session id，先进入「恢复中」态：在按短 id 还原出会话前，
+  // 抑制 Chat 的新建落地页，避免「先闪一下新建页再跳到历史」的体验。
+  const [restoring, setRestoring] = useState<boolean>(() => readSessionIdFromUrl() != null);
   // 导航序列号：递增标记每次用户发起的会话/目录/新建切换。
   // 用于使网络飞行中已过期的异步操作（如 openNewSession 的 createSession）直接作废，
   // 彻底杜绝「在一个项目点新建后立即切到另一个项目会话，前一个异步请求晚到覆盖当前视图导致工作目录错乱与穿透」的竞态 BUG。
@@ -798,24 +624,21 @@ export function App() {
   }, [headerMenuOpen]);
 
   // Chat 完成首条消息后会回传它创建的 session id；刷新侧栏列表。
-  // `claimView=false`：只对齐侧栏/列表，绝不切换当前视图（用户在发送飞行期间已切走）。
-  function handleSessionAssigned(id: string, opts?: { claimView?: boolean }) {
+  function handleSessionAssigned(id: string) {
     // 把乐观条目的临时 id 对齐到后端真实 id（落地页发送时乐观条目用的是临时 id），
     // 这样接下来的列表刷新能按 id 去重，用真实条目（含自动命名）覆盖乐观条目。
     setOptimisticSessions((prev) => {
-      const next: Record<string, SessionMetaWithProject> = { ...prev };
+      const next = { ...prev };
       for (const key of Object.keys(next)) {
         if (key.startsWith('optimistic-') || key === id) {
           const item = next[key];
           delete next[key];
-          if (item) next[id] = { ...item, id };
+          next[id] = { ...item, id };
         }
       }
       return next;
     });
-    // 只有仍在看这条 turn 归属的会话（或落地页）才把视图切过去；已切走时保持用户选择，
-    // 新会话由侧栏列表与 /events 的 session_upsert 自行出现。
-    if (id !== sessionId && opts?.claimView !== false) {
+    if (id !== sessionId) {
       setSessionId(id);
     }
     // 关键触发：一旦服务端确认会话分配，立即刷新侧栏，确保切换会话后该会话稳固展示
@@ -861,7 +684,11 @@ export function App() {
   // 用真实标题覆盖顶部标题头的临时标题（前 10 字）。仅在仍是同一会话且标题有变时更新。
   function handleActiveSessionMeta(s: SessionMetaWithProject) {
     setActiveSession((prev) =>
-      prev && prev.id === s.id && prev.name !== s.name ? { ...prev, name: s.name } : prev,
+      !prev ||
+      (prev.id === s.id &&
+        (prev.name !== s.name || prev.message_count !== s.message_count))
+        ? { ...(prev || s), ...s }
+        : prev,
     );
     // 当真实会话已经从后端拉出且已拥有消息时，才从乐观池移除对应的临时记录，杜绝首轮执行中断档消失
     setOptimisticSessions((prev) => {
@@ -884,8 +711,11 @@ export function App() {
     getProject()
       .then((p) => {
         if (cancelled) return;
-        if (p.working_dir) setCwd((c) => c || p.working_dir);
-        if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+        // 只有当服务端返回的不是操作系统用户主目录时，才作为工程项目 seed
+        if (p.working_dir && !isUserHomeDir(p.working_dir)) {
+          setCwd((c) => c || p.working_dir);
+          if (p.project_hash) setProjectHash((h) => h || p.project_hash!);
+        }
       })
       .catch(() => {
         // Ignore; cwd stays empty
@@ -965,106 +795,42 @@ export function App() {
 
   // 把当前 session id（取前 8 位）同步进 URL，刷新后可恢复。
   useEffect(() => {
-    const url = new URL(window.location.href);
-    // 首次执行只负责“认领”首帧：若 URL 带短 id 而 sessionId 尚未还原，
-    // 绝不能先把参数清掉；但标记必须消耗掉，否则之后新建会话时永远不会清 URL。
-    const firstRun = firstUrlSync.current;
-    firstUrlSync.current = false;
-    if (sessionId) {
-      const shortId = shortSessionId(sessionId);
-      if (url.searchParams.get('session') !== shortId) {
-        url.searchParams.set('session', shortId);
-        window.history.replaceState(null, '', url.pathname + url.search + url.hash);
-      }
+    // 跳过首次：挂载时若 URL 已带短 id 而 sessionId 尚未还原，别先把参数清掉。
+    if (firstUrlSync.current) {
+      firstUrlSync.current = false;
       return;
     }
-    if (firstRun) return;
-    if (url.searchParams.has('session')) {
+    const url = new URL(window.location.href);
+    if (sessionId) {
+      url.searchParams.set('session', shortSessionId(sessionId));
+    } else {
       url.searchParams.delete('session');
-      window.history.replaceState(null, '', url.pathname + url.search + url.hash);
     }
+    window.history.replaceState(null, '', url.pathname + url.search + url.hash);
   }, [sessionId]);
 
-  // 同一浏览器刷新必须记住“当前选中哪个会话”，而不是每次当作冷启动。
-  // 记住完整 id 与项目桶：下次挂载时 Sidebar 可立即展开对应项目，Chat 也可直接加载。
-  useEffect(() => {
-    if (!sessionId) return;
-    if (activeSession?.id === sessionId) {
-      const remembered: RememberedSession = {
-        id: activeSession.id,
-        project_hash: activeSession.project_hash,
-        working_dir: activeSession.working_dir,
-        name: activeSession.name,
-        message_count: activeSession.message_count,
-        updated_at: activeSession.updated_at,
-      };
-      rememberedSessionRef.current = remembered;
-      rememberSession(remembered);
-      return;
-    }
-    // 新分配的会话 id 还没拿到元数据：先记住 id，项目桶等 resolve 后补。
-    if (rememberedSessionRef.current?.id !== sessionId) {
-      const remembered: RememberedSession = { id: sessionId };
-      rememberedSessionRef.current = remembered;
-      rememberSession(remembered);
-    }
-  }, [sessionId, activeSession]);
-
-  // 刷新后用 URL 短 id 或本地记忆的完整 id 还原会话（完整 id + project_hash + working_dir），
+  // 刷新后用 URL 里的短 id 还原成完整记录（完整 id + project_hash + working_dir），
   // 再交给 Chat 加载历史。用 resolveSession（跨所有桶按 id 定位，不受 /sessions 的
   // 50 条上限影响），否则较旧的会话刷新后会找不到、回落到新建页。仅在挂载时执行一次。
   useEffect(() => {
-    const candidates = restoreCandidatesRef.current;
-    if (candidates.length === 0) return;
+    const urlSid = urlSessionRef.current;
+    if (!urlSid) return;
     let cancelled = false;
-    void (async () => {
-      let found: SessionMetaWithProject | null = null;
-      // 只有所有候选都明确返回 404 才能判定“会话已不存在”。网络/daemon 500
-      // 属于瞬时故障，绝不能顺手抹掉用户的导航记忆，否则下一次刷新也回不来。
-      let transientError = false;
-      for (const candidate of candidates) {
-        try {
-          found = await resolveSession(candidate);
-        } catch {
-          transientError = true;
-          found = null;
-        }
-        if (cancelled) return;
-        if (found) break;
-      }
-      if (cancelled) return;
-      if (found) {
+    resolveSession(urlSid)
+      .then((found) => {
+        if (cancelled || !found) return;
         setSessionId(found.id);
         setActiveSession(found);
-        rememberedSessionRef.current = {
-          id: found.id,
-          project_hash: found.project_hash,
-          working_dir: found.working_dir,
-          name: found.name,
-          message_count: found.message_count,
-          updated_at: found.updated_at,
-        };
-        rememberSession(rememberedSessionRef.current);
         if (found.working_dir) setCwd(found.working_dir);
         if (found.project_hash) setProjectHash(found.project_hash);
-        // URL 直达也是“已查看”：让其它实例的完成徽标一起熄灭。
-        markSessionSeen(found.id);
-      } else if (!transientError) {
-        // 本地记忆确实已经失效（会话被删除 / 迁移）：同时清掉记忆和 URL 里的死参数，
-        // 否则下一次刷新还会拿同一个 id 解析，再次落回落地页。
-        rememberedSessionRef.current = null;
-        forgetRememberedSession();
-        const url = new URL(window.location.href);
-        if (url.searchParams.has('session')) {
-          url.searchParams.delete('session');
-          window.history.replaceState(null, '', url.pathname + url.search + url.hash);
-        }
-        setSessionId(null);
-        setActiveSession(null);
-      }
-    })().finally(() => {
-      if (!cancelled) setRestoring(false);
-    });
+      })
+      .catch(() => {
+        /* 找不到就维持现状（回到新建页） */
+      })
+      .finally(() => {
+        // 无论找没找到，恢复流程结束：解除抑制（找到→历史页，没找到→新建页）。
+        if (!cancelled) setRestoring(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -1115,52 +881,43 @@ export function App() {
   // 在指定目录下开启一个新建会话视图（草稿态，首条用户消息前绝不调用后端预创建，不占位不写盘）。
   function openNewSession(targetCwd: string | undefined) {
     navSeqRef.current++;
-    // 用户明确点了“新建会话”：这是新的导航意图，必须同时清掉本浏览器的选中记忆，
-    // 否则刷新会把旧会话又恢复出来。
-    rememberedSessionRef.current = null;
-    forgetRememberedSession();
     setSessionId(null);
     setActiveSession(null);
-    if (targetCwd && targetCwd !== '~') {
+    if (!targetCwd || targetCwd === '__global__' || isUserHomeDir(targetCwd)) {
+      setCwd('');
+      setProjectHash('');
+    } else if (targetCwd && targetCwd !== '~') {
       setCwd(targetCwd);
     }
   }
 
-  function handleNewSession(targetDir?: string) {
+  function handleNewSession(targetDir?: string, initialPrompt?: string) {
+    setActiveWorkbenchView('chat');
     setSidebarOpen(false);
     setActiveMainTabId('chat');
-    // Top-level 「新建对话」 stays in the current/serve workspace.
-    openNewSession(targetDir || cwd || undefined);
-  }
-
-  /** 完成对勾是一次性提示：进入该会话即熄灭，绝不再重复出现。 */
-  function clearJustCompleted(id: string) {
-    setJustCompletedIds((prev) => clearCompletedBadgeIds(prev, id));
-  }
-
-  /**
-   * 本实例打开了该会话：先本地熄灭，再广播给其它标签页 / 浏览器。
-   * 徽标由全局 `activity` 点亮，熄灭必须走同一条全局总线，否则其它实例会残留幽灵勾。
-   */
-  function markSessionSeen(id: string) {
-    if (!id) return;
-    clearJustCompleted(id);
-    void postSessionSeen(id).catch(() => {
-      /* 旧 daemon / 离线：本实例已熄灭，下一次打开会再广播。 */
-    });
+    if (initialPrompt) {
+      setPendingPrompt(initialPrompt);
+    }
+    // 采用类似 DeepSeek 的解耦设计：
+    // 若显式传入 targetDir（如在项目卡片或右键中点击「+」），则绑定指定工程；
+    // 若未传入 targetDir（即用户点击顶栏或侧栏全局「+ 新建对话」）：
+    // 默认创建纯净独立的全局新对话（空工作区），绝不强行绑定操作系统主目录或非明确工程！
+    openNewSession(targetDir !== undefined ? targetDir : '');
   }
 
   function applySessionSelection(session: SessionMetaWithProject) {
+    setActiveWorkbenchView('chat');
     navSeqRef.current++;
     setSessionId(session.id);
     setActiveSession(session);
     setActiveMainTabId('chat');
-    if (session.working_dir) {
+    if (session.working_dir && session.working_dir !== '__global__' && !isUserHomeDir(session.working_dir)) {
       setCwd(session.working_dir);
+    } else {
+      setCwd('');
     }
-    if (session.project_hash) setProjectHash(session.project_hash);
+    setProjectHash(session.project_hash || '');
     setSidebarOpen(false);
-    markSessionSeen(session.id);
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
@@ -1219,11 +976,8 @@ export function App() {
 
   // 删除会话：若删的是当前打开的会话，回到空白新对话。
   function handleSessionDeleted(id: string) {
-    clearJustCompleted(id);
     if (id === sessionId) {
       navSeqRef.current++;
-      rememberedSessionRef.current = null;
-      forgetRememberedSession();
       setSessionId(null);
       setActiveSession(null);
     }
@@ -1267,28 +1021,17 @@ export function App() {
     }
   }
 
-  // 刷新首帧 activeSession 可能还未 resolve 完成：用本地记忆的项目桶让 Sidebar
-  // 立即展开正确分组，避免先折叠再展开的闪动。
-  const rememberedNavSession = rememberedSessionRef.current;
-  const activeProjectHash =
-    activeSession?.id === sessionId
-      ? activeSession.project_hash
-      : rememberedNavSession?.id === sessionId
-        ? rememberedNavSession.project_hash
-        : undefined;
-
   return (
-    <div class="app">
+    <div class="app" id="app-root">
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
       <Sidebar
         activeSessionId={sessionId}
-        activeProjectHash={activeProjectHash}
         onSelect={handleSelectSession}
         onNew={handleNewSession}
         open={sidebarOpen}
         onCloseDrawer={() => setSidebarOpen(false)}
         collapsed={sidebarCollapsed}
-        onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
+        onToggleCollapse={handleToggleSidebarCollapse}
         onOpenSettings={(section) => setSettingsSection(section)}
         reloadKey={sessionListVersion}
         optimisticSessions={optimisticSessions}
@@ -1301,9 +1044,10 @@ export function App() {
         onOpenCwd={() => setShowCwd(true)}
         onSwitchProject={handlePickCwd}
         extraRunningIds={Array.from(liveRunningIds)}
-        completedIds={Array.from(justCompletedIds)}
         onOpenFile={handleOpenFile}
         activeFilePath={diffTabs.find((t) => t.id === activeMainTabId)?.filePath}
+        onOpenUpdate={openUpdateDialogWithFreshCheck}
+        updateInfo={updateInfo}
         activeWorkbenchView={activeWorkbenchView}
         onSwitchWorkbenchView={(v) => setActiveWorkbenchView(v)}
       />
@@ -1355,7 +1099,7 @@ export function App() {
                   e.stopPropagation();
                   setMobileTabsDropdownOpen((v) => !v);
                 }}
-                aria-label={t('header.tabsMenu')}
+                aria-label="Tabs menu"
               >
                 {liveRunningIds.has(activeSession.id) ? (
                   <span
@@ -1444,7 +1188,7 @@ export function App() {
                               e.stopPropagation();
                               handleCloseDiffTab(tab.id);
                             }}
-                            title={t('preview.closeTab')}
+                            title="Close tab"
                           >
                             ×
                           </button>
@@ -1455,8 +1199,28 @@ export function App() {
                 </div>
               )}
             </div>
-          ) : activeSession?.name && (activeSession.message_count ?? 0) > 0 ? (
-            /* 桌面端会话标题：只有当该会话真实拥有消息时才展示其标题 */
+          ) : activeWorkbenchView !== 'chat' &&
+            zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView) ? (
+            /* 桌面端插件工作台标题：当前切到外部扩展工作台（如 DevOrbit）时，顶栏直接联动展示插件名称 */
+            <button
+              type="button"
+              class="session-title-btn active"
+              title={
+                zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView)?.title ||
+                '扩展工作台'
+              }
+              onClick={() => {}}
+            >
+              <span class="session-title-text">
+                {zapPluginKernel.getSlotEntries('workbench.view').find((v) => v.id === activeWorkbenchView)?.title ||
+                  '扩展工作台'}
+              </span>
+            </button>
+          ) : activeSession?.name &&
+            (!activeSession.id.startsWith('optimistic-') ||
+              !isLanding ||
+              (activeSession.message_count ?? 0) > 0) ? (
+            /* 桌面端会话标题：选中真实会话或会话已有消息时直接展示会话名称 */
             <button
               type="button"
               class={
@@ -1483,8 +1247,8 @@ export function App() {
                 'session-title-btn session-new-cloud-btn' +
                 (activeMainTabId === 'chat' ? ' active' : ' clickable-nav')
               }
-              title={t('sidebar.newChat')}
-              aria-label={t('sidebar.newChat')}
+              title={t('sidebar.newChat') || '新建对话'}
+              aria-label={t('sidebar.newChat') || '新建对话'}
               onClick={() => {
                 setActiveMainTabId('chat');
                 handleNewSession();
@@ -1493,7 +1257,7 @@ export function App() {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
               </svg>
-              <span class="session-title-text">{t('sidebar.newChat')}</span>
+              <span class="session-title-text">{t('sidebar.newChat') || '新建对话'}</span>
             </button>
           )}
 
@@ -1556,7 +1320,7 @@ export function App() {
                       e.stopPropagation();
                       handleCloseDiffTab(tab.id);
                     }}
-                    title={`${tab.filePath}${tab.commitShortHash ? ` (${tab.commitShortHash})` : ''} (${t('header.doubleClickClose')})`}
+                    title={`${tab.filePath}${tab.commitShortHash ? ` (${tab.commitShortHash})` : ''} (双击关闭标签)`}
                     draggable={true}
                     onDragStart={(e) => {
                       setMainTabDragIdx(idx);
@@ -1631,7 +1395,7 @@ export function App() {
                         e.stopPropagation();
                         handleCloseDiffTab(tab.id);
                       }}
-                      title={t('preview.closeTab')}
+                      title="Close tab"
                     >
                       ×
                     </button>
@@ -1645,13 +1409,13 @@ export function App() {
           <div
             class="top-nav-actions"
             role="toolbar"
-            aria-label={t('header.quickSettings')}
+            aria-label="Quick settings"
           >
             {/* 桌面端外显：刷新当前会话 */}
             <button
               type="button"
               class="top-nav-btn top-nav-desktop-action top-nav-refresh-btn"
-              onClick={requestSoftRefresh}
+              onClick={() => window.location.reload()}
               title={t('header.refresh')}
               aria-label={t('header.refresh')}
             >
@@ -1661,6 +1425,20 @@ export function App() {
                 <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
                 <path d="M21 3v5h-5" />
               </svg>
+            </button>
+
+            {/* 顶栏多主机快速切换入口 (手机/桌面均可秒级切换) */}
+            <button
+              type="button"
+              class="top-nav-server-switcher-btn"
+              onClick={() => setServerSwitcherOpen(true)}
+              title="切换连接模式 (工位电脑 / 家里主机 / 随身大模型直连)"
+            >
+              <span
+                class="top-nav-server-switcher-dot"
+                style={isDirectMode ? { background: '#d29922', boxShadow: '0 0 6px rgba(210, 153, 34, 0.6)' } : undefined}
+              />
+              <span>{isDirectMode ? `⚡ ${activeServerName}` : (activeServerName || '主机切换')}</span>
             </button>
 
             {/* 桌面端外显：远程访问控制 */}
@@ -1676,10 +1454,14 @@ export function App() {
               title={updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : t('update.modalTitle')}
               aria-label={t('update.modalTitle')}
             >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <line x1="12" y1="19" x2="12" y2="5" />
-                <polyline points="5 12 12 5 19 12" />
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                <path d="M16 16h5v5" />
               </svg>
+              <span class="top-nav-update-text">{updateInfo?.has_update ? t('update.btnUpdate') : t('update.modalTitle')}</span>
+              {updateInfo?.has_update && <span class="update-badge-dot" />}
             </button>
 
             {/* 主题切换（桌面外显，极窄或手机收纳） */}
@@ -1738,39 +1520,44 @@ export function App() {
                 aria-label={t('settings.menuLang')}
                 aria-expanded={langMenuOpen}
               >
-                <span>{(() => {
-                  switch (lang) {
-                    case 'zh': return '简';
-                    case 'zh-TW': return '繁';
-                    case 'ja': return 'JA';
-                    case 'ko': return 'KO';
-                    case 'ru': return 'RU';
-                    case 'fr': return 'FR';
-                    case 'es': return 'ES';
-                    case 'de': return 'DE';
-                    case 'ar': return 'AR';
-                    case 'vi': return 'VI';
-                    default: return 'EN';
-                  }
-                })()}</span>
+                <span>{lang === 'zh' ? '简' : lang === 'vi' ? 'VI' : 'EN'}</span>
               </button>
 
               {langMenuOpen && (
                 <div class="top-nav-lang-menu" role="menu">
-                  {languageOptions.map(({ value: v, label }) => (
-                    <button
-                      key={v}
-                      type="button"
-                      class={'lang-menu-item' + (lang === v ? ' active' : '')}
-                      onClick={() => {
-                        setLang(v);
-                        setLangMenuOpen(false);
-                      }}
-                    >
-                      <span class="lang-item-name">{label}</span>
-                      {lang === v && <span class="lang-item-check">✓</span>}
-                    </button>
-                  ))}
+                  <button
+                    type="button"
+                    class={'lang-menu-item' + (lang === 'zh' ? ' active' : '')}
+                    onClick={() => {
+                      setLang('zh');
+                      setLangMenuOpen(false);
+                    }}
+                  >
+                    <span class="lang-item-name">简体中文</span>
+                    {lang === 'zh' && <span class="lang-item-check">✓</span>}
+                  </button>
+                  <button
+                    type="button"
+                    class={'lang-menu-item' + (lang === 'en' ? ' active' : '')}
+                    onClick={() => {
+                      setLang('en');
+                      setLangMenuOpen(false);
+                    }}
+                  >
+                    <span class="lang-item-name">English</span>
+                    {lang === 'en' && <span class="lang-item-check">✓</span>}
+                  </button>
+                  <button
+                    type="button"
+                    class={'lang-menu-item' + (lang === 'vi' ? ' active' : '')}
+                    onClick={() => {
+                      setLang('vi');
+                      setLangMenuOpen(false);
+                    }}
+                  >
+                    <span class="lang-item-name">Tiếng Việt</span>
+                    {lang === 'vi' && <span class="lang-item-check">✓</span>}
+                  </button>
                 </div>
               )}
             </div>
@@ -1801,7 +1588,7 @@ export function App() {
                     class="top-nav-more-item"
                     onClick={() => {
                       setTopNavMoreOpen(false);
-                      requestSoftRefresh();
+                      window.location.reload();
                     }}
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1822,12 +1609,30 @@ export function App() {
                     class="top-nav-more-item"
                     onClick={() => {
                       setTopNavMoreOpen(false);
+                      setServerSwitcherOpen(true);
+                    }}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                      <line x1="8" y1="21" x2="16" y2="21" />
+                      <line x1="12" y1="17" x2="12" y2="21" />
+                    </svg>
+                    <span>切换节点 ({isDirectMode ? `⚡ ${activeServerName}` : (activeServerName || '当前')})</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    class="top-nav-more-item"
+                    onClick={() => {
+                      setTopNavMoreOpen(false);
                       openUpdateDialogWithFreshCheck();
                     }}
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <line x1="12" y1="19" x2="12" y2="5" />
-                      <polyline points="5 12 12 5 19 12" />
+                      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                      <path d="M3 3v5h5" />
+                      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                      <path d="M16 16h5v5" />
                     </svg>
                     <span>{updateInfo?.has_update ? t('update.hasUpdate', { version: updateInfo.latest_version }) : t('update.modalTitle')}</span>
                     {updateInfo?.has_update && <span class="update-more-badge">NEW</span>}
@@ -1845,7 +1650,7 @@ export function App() {
                       <path d="M12 3a15 15 0 0 0 0 18" />
                     </svg>
                     <span>{t('header.language')}</span>
-                    <span class="top-nav-more-trailing">{languageOptions.find((o) => o.value === lang)?.label ?? 'English'}</span>
+                    <span class="top-nav-more-trailing">{lang === 'zh' ? '简体中文' : lang === 'vi' ? 'Tiếng Việt' : 'English'}</span>
                   </button>
 
                   <button
@@ -1886,6 +1691,25 @@ export function App() {
               )}
             </div>
           </div>
+
+          {/* 右上角展开/收起右侧面板按钮 */}
+          <div class="header-right-actions">
+            <button
+              type="button"
+              class={'top-nav-btn right-panel-toggle-btn' + (!rightPanelLayout.collapsed ? ' active' : '')}
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('jeikcode:toggle_right_panel'));
+              }}
+              title={rightPanelLayout.collapsed ? (t('panel.expand') || '展开面板') : (t('panel.collapse') || '收起面板')}
+              aria-label={rightPanelLayout.collapsed ? (t('panel.expand') || '展开面板') : (t('panel.collapse') || '收起面板')}
+              aria-pressed={!rightPanelLayout.collapsed}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2" y="2" width="12" height="12" rx="2" />
+                <path d="M10.5 2v12" />
+              </svg>
+            </button>
+          </div>
         </header>
 
         <div
@@ -1924,146 +1748,145 @@ export function App() {
                 return (
                   <iframe
                     src={currentView.src}
-                    style="width: 100%; height: 100%; border: none; background: transparent;"
+                    title={currentView.title}
+                    class="workbench-plugin-iframe"
+                    style="width: 100%; height: 100%; border: none; flex: 1; background: transparent;"
+                    allow="clipboard-read; clipboard-write;"
                   />
                 );
               })()}
             </div>
           ) : (
             <Chat
-            sessionId={sessionId}
-            onSessionId={handleSessionAssigned}
-            cwd={cwd}
-            onPermission={setPending}
-            onPermissionResolved={(callId) =>
-              setPending((cur: any) =>
-                callId === null ? null : resolvePendingAfterDecision(cur, callId),
-              )}
-            activeSession={activeSession}
-            restoring={restoring}
-            onTurnDone={() => {
-              setSessionListVersion((v) => v + 1);
-              // 回合完成时，立即主动校准本地 liveRunningIds，确保清除残留的旋转菊花
-              getActiveChatSessions()
-                .then((ids) => {
-                  setLiveRunningIds((prev) => {
-                    const next = new Set<string>();
-                    for (const id of prev) {
-                      if (ids.includes(id)) next.add(id);
-                    }
-                    return next;
-                  });
-                })
-                .catch(() => {});
-            }}
-            onTurnRunningChange={(id, running) => {
-              if (!id) return;
-              setLiveRunningIds((prev) => {
-                const next = new Set(prev);
-                if (running) next.add(id);
-                else next.delete(id);
-                return next;
-              });
-            }}
-            onOptimisticSession={handleOptimisticSession}
-            onOpenCwd={() => setShowCwd(true)}
-            onCwdChanged={handleCwdChanged}
-            onLanding={setIsLanding}
-            skillInsert={skillInsert}
-            onSessionRenamed={(name) => {
-              setActiveSession((prev) => (prev ? { ...prev, name } : prev));
-              setOptimisticSessions((prev) => {
-                const curId = activeSession?.id ?? sessionId;
-                if (!curId || !prev[curId]) return prev;
-                return {
-                  ...prev,
-                  [curId]: { ...prev[curId], name },
-                };
-              });
-              setSessionListVersion((v) => v + 1);
-            }}
-            onOpenSidebar={() => setSidebarOpen(true)}
-            onNewSession={handleNewSession}
-            diffTabs={diffTabs}
-            setDiffTabs={setDiffTabs}
-            activeMainTabId={activeMainTabId}
-            setActiveMainTabId={setActiveMainTabId}
-            topModelSlot={topModelSlot}
-            onOpenModelConfig={() => setSettingsSection('model')}
-            onLiveReview={onLiveReview}
-            onBindReviewDismiss={onBindReviewDismiss}
-          />
+              sessionId={sessionId}
+              onSessionId={handleSessionAssigned}
+              cwd={cwd}
+              pendingPrompt={pendingPrompt}
+              onConsumedPendingPrompt={() => setPendingPrompt(null)}
+              onPermission={setPending}
+              onPermissionResolved={(callId) =>
+                setPending((cur: any) =>
+                  callId === null ? null : resolvePendingAfterDecision(cur, callId),
+                )}
+              activeSession={activeSession}
+              restoring={restoring}
+              onLiveTurnDone={() => {
+                setSessionListVersion((v) => v + 1);
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(new CustomEvent('zap:ai-turn-done', { detail: { sessionId } }));
+                }
+                // 回合完成时，立即主动校准本地 liveRunningIds，确保清除残留的旋转菊花
+                getActiveChatSessions()
+                  .then((ids) => {
+                    setLiveRunningIds((prev) => {
+                      const next = new Set<string>();
+                      for (const id of prev) {
+                        if (ids.includes(id)) next.add(id);
+                      }
+                      return next;
+                    });
+                  })
+                  .catch(() => {});
+              }}
+              onLiveRunningChange={(id, running) => {
+                if (!id) return;
+                setLiveRunningIds((prev) => {
+                  const next = new Set(prev);
+                  if (running) next.add(id);
+                  else next.delete(id);
+                  return next;
+                });
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(
+                    new CustomEvent('zap:ai-state', { detail: { running, sessionId: id } })
+                  );
+                }
+              }}
+              onOptimisticSession={handleOptimisticSession}
+              onOpenCwd={() => setShowCwd(true)}
+              onCwdChanged={handleCwdChanged}
+              onLanding={setIsLanding}
+              skillInsert={skillInsert}
+              onSessionRenamed={(name) => {
+                setActiveSession((prev) => (prev ? { ...prev, name } : prev));
+                setOptimisticSessions((prev) => {
+                  const curId = activeSession?.id ?? sessionId;
+                  if (!curId || !prev[curId]) return prev;
+                  return {
+                    ...prev,
+                    [curId]: { ...prev[curId], name },
+                  };
+                });
+                setSessionListVersion((v) => v + 1);
+              }}
+              onOpenSidebar={() => setSidebarOpen(true)}
+              onNewSession={handleNewSession}
+              diffTabs={diffTabs}
+              setDiffTabs={setDiffTabs}
+              activeMainTabId={activeMainTabId}
+              setActiveMainTabId={setActiveMainTabId}
+              onRightPanelLayoutChange={handleRightPanelLayoutChange}
+              topModelSlot={topModelSlot}
+              onOpenModelConfig={() => setSettingsSection('model')}
+              onLiveReview={onLiveReview}
+              onBindReviewDismiss={onBindReviewDismiss}
+            />
           )}
         </div>
       </div>
 
       {/* ===== Modals ===== */}
-      {showCwd && (
-        <CwdPicker
-          current={cwd}
-          onPick={handlePickCwd}
-          onClose={() => setShowCwd(false)}
-        />
-      )}
-      {settingsSection === 'theme' && (
-        <LazyBoundary>
+      <Suspense fallback={null}>
+        {showCwd && (
+          <CwdPicker
+            current={cwd}
+            onPick={handlePickCwd}
+            onClose={() => setShowCwd(false)}
+          />
+        )}
+        {settingsSection === 'theme' && (
           <ThemeDialog onClose={() => setSettingsSection(null)} />
-        </LazyBoundary>
-      )}
-      {settingsSection === 'language' && (
-        <LazyBoundary>
+        )}
+        {settingsSection === 'language' && (
           <LanguageDialog onClose={() => setSettingsSection(null)} />
-        </LazyBoundary>
-      )}
-      {settingsSection === 'model' && (
-        <LazyBoundary>
-          <SystemSettingsDialog initialTab="models" onClose={() => setSettingsSection(null)} />
-        </LazyBoundary>
-      )}
-      {settingsSection === 'system' && (
-        <LazyBoundary>
-          <SystemSettingsDialog initialTab="models" onClose={() => setSettingsSection(null)} />
-        </LazyBoundary>
-      )}
-      {headerDialog === 'rename' && activeSession && (
-        <RenameDialog
-          session={activeSession}
-          onClose={() => setHeaderDialog(null)}
-          onDone={(name) => {
-            handleSessionRenamed(activeSession.id, name);
-            setSessionListVersion((v) => v + 1);
-          }}
-        />
-      )}
-      {headerDialog === 'delete' && activeSession && (
-        <DeleteDialog
-          sessions={[activeSession]}
-          onClose={() => setHeaderDialog(null)}
-          onDone={(ids) => {
-            for (const id of ids) handleSessionDeleted(id);
-            setSessionListVersion((v) => v + 1);
-          }}
-        />
-      )}
-      {showUpdateDialog && (
-        <LazyBoundary>
+        )}
+        {settingsSection === 'model' && (
+          <ModelConfigDialog onClose={() => setSettingsSection(null)} />
+        )}
+        {headerDialog === 'rename' && activeSession && (
+          <RenameDialog
+            session={activeSession}
+            onClose={() => setHeaderDialog(null)}
+            onDone={(name) => {
+              handleSessionRenamed(activeSession.id, name);
+              setSessionListVersion((v) => v + 1);
+            }}
+          />
+        )}
+        {headerDialog === 'delete' && activeSession && (
+          <DeleteDialog
+            sessions={[activeSession]}
+            onClose={() => setHeaderDialog(null)}
+            onDone={(ids) => {
+              for (const id of ids) handleSessionDeleted(id);
+              setSessionListVersion((v) => v + 1);
+            }}
+          />
+        )}
+        {showUpdateDialog && (
           <UpdateDialog
             info={updateInfo}
             onClose={() => setShowUpdateDialog(false)}
             onUpdateInfoChange={(newInfo) => setUpdateInfo(newInfo)}
           />
-        </LazyBoundary>
-      )}
-      {showOnboarding && (
-        <LazyBoundary>
+        )}
+        {showOnboarding && (
           <OnboardingWizard
             onClose={() => setShowOnboarding(false)}
             onConfigureModel={() => setSettingsSection('model')}
           />
-        </LazyBoundary>
-      )}
-      {configDiffs && configDiffs.length > 0 && (
-        <LazyBoundary>
+        )}
+        {configDiffs && configDiffs.length > 0 && (
           <ConfigSyncModal
             diffs={configDiffs}
             onDone={(count) => {
@@ -2077,10 +1900,8 @@ export function App() {
               setConfigDiffs(null);
             }}
           />
-        </LazyBoundary>
-      )}
-      <LegacyMigrationModal />
-      <DesktopClosePromptDialog />
+        )}
+      </Suspense>
       <ConfirmModalHost />
       <ToastHost />
       <ServerSwitcherModal

@@ -22,8 +22,6 @@ export interface InlineBubbleEditorProps {
   onCancel: () => void;
   onDraftChange?: (text: string, images: ImageData[], selectedModel?: string) => void;
   disabled?: boolean;
-  /** When false, ESC must not cancel the edit. Click-outside still cancels. */
-  escCancelEdit?: boolean;
 }
 
 function imagesToPending(images: ImageData[]): PendingAttach[] {
@@ -50,7 +48,6 @@ export function InlineBubbleEditor({
   onCancel,
   onDraftChange,
   disabled = false,
-  escCancelEdit = true,
 }: InlineBubbleEditorProps) {
   const t = useT();
   const [text, setText] = useState(initialText);
@@ -91,24 +88,31 @@ export function InlineBubbleEditor({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Keep the editor viewport stable. Auto-growing the textarea on every
-  // keystroke shifted the toolbar and the scroll thumb; long edits scroll
-  // inside the fixed-height textarea instead.
+  // Auto-resize textarea to fit content up to 260px
+  const adjustHeight = () => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 260)}px`;
+    }
+  };
+
   useEffect(() => {
+    adjustHeight();
     if (textareaRef.current) {
       textareaRef.current.focus();
       textareaRef.current.selectionStart = textareaRef.current.value.length;
       textareaRef.current.selectionEnd = textareaRef.current.value.length;
     }
-    // The bubble may be partially under the fixed composer; bring the whole
-    // editor into view once, without re-scrolling on every keystroke.
-    containerRef.current?.scrollIntoView({ block: 'nearest' });
   }, []);
+
+  useEffect(() => {
+    adjustHeight();
+  }, [text]);
 
   // Click Outside & Escape listener
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && escCancelEdit) {
+      if (e.key === 'Escape') {
         e.preventDefault();
         onCancel();
       }
@@ -132,13 +136,12 @@ export function InlineBubbleEditor({
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('pointerdown', handlePointerDown);
     };
-  }, [onCancel, escCancelEdit]);
+  }, [onCancel]);
 
   async function handleAddFiles(files: FileList | File[]) {
     const list = Array.from(files);
     const counts = countPending(pendingAttach);
     const added: PendingAttach[] = [];
-    const undecodable: string[] = [];
     setUploading(true);
     for (const file of list) {
       if (counts.images >= MAX_IMAGES) break;
@@ -151,16 +154,10 @@ export function InlineBubbleEditor({
             kind: 'image',
             image: img,
           });
-        } else {
-          // 浏览器解不开的格式（HEIC/TIFF 等）不会静默丢失，明确提示用户先转格式
-          undecodable.push(file.name);
         }
       }
     }
     setUploading(false);
-    if (undecodable.length > 0) {
-      showToast(t('attach.undecodable', { name: undecodable[0] }), 'error');
-    }
     if (added.length) {
       setPendingAttach((prev) => [...prev, ...added]);
     }
@@ -270,11 +267,6 @@ export function InlineBubbleEditor({
                   src={`data:${item.image.media_type};base64,${item.image.data}`}
                   alt="thumbnail"
                   class="inline-bubble-thumb-img"
-                  style={{ cursor: 'zoom-in' }}
-                  onClick={() => {
-                    const src = `data:${item.image.media_type};base64,${item.image.data}`;
-                    window.dispatchEvent(new CustomEvent('jeikcode:preview:image', { detail: { src } }));
-                  }}
                 />
               )}
               <button
@@ -318,7 +310,7 @@ export function InlineBubbleEditor({
             }
           }}
           placeholder={t('chat.editPlaceholder')}
-          rows={5}
+          rows={1}
           disabled={disabled}
         />
       </div>

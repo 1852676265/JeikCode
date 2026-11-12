@@ -116,23 +116,6 @@ export function fenceClose(line: string, state: FenceState): boolean {
 }
 
 /**
- * info 串是否是一个「像语言标签」的 token（rust / diff / json / c++ / c# / mermaid-streaming / toml / rust,no_run …）。
- *
- * ★ 关键防御：围栏正文里经常出现以 ``` 开头的散文行（如 ` ``` + 【执行铁律】… `、` ``` 这是示例 `）。
- * 按 CommonMark 它们确实是「带 info 串的开围栏」，但在一个已开启的围栏内部属于普通内容。
- * 若不加甄别而把这行当成「嵌套子围栏」，promoteNestedCodeFences 会错误提升外层围栏长度、
- * 并把错误的行改写为闭合，导致围栏长度 desync → 后续正文被吞进代码块（渲染成一片乱码画布）。
- * ★ 输入形态：调用方传入的是 `fenceOpen` 已按空白切分后的**首个 token**（`rust,no_run` 整体、
- * `js title="x"` 只取 `js`），并非整条多词 info 串。因此判定只需满足「以 ASCII 字母开头」，
- * 其后允许字母数字与常见语言/属性符号（`+ # . , : @ / = _ -`）；中文、空白、反引号等散文特征
- * 一律排除（`+ ...`、`这是示例` 被拒，`rust,no_run` 放行）。
- */
-const LANGUAGE_INFO_RE = /^[a-z][a-z0-9_+.#,\-:/@=]*$/;
-export function isLanguageLikeInfo(lang: string | undefined): boolean {
-  return LANGUAGE_INFO_RE.test((lang ?? '').trim().toLowerCase());
-}
-
-/**
  * 探测从 start 行开始，是否存在匹配当前围栏的合法闭合标记。
  * 如果在遇到匹配的闭合标记之前，遇到了另一个明确带语言的新代码块开启：
  * - 对于 Markdown 容器或文本/提示词语言：支持嵌套子代码块栈深度，避免内层闭合误伤外层。
@@ -150,14 +133,9 @@ export function findMatchingFenceClose(
     const raw = stripLineBreak(lines[k]);
     const trimmed = raw.trim();
 
-    // 遇到带语言标签的代码块开启行（★ 必须是「像语言标签」的 info 串，散文行不算，否则会误判嵌套）
+    // 遇到带语言标签的代码块开启行
     const nextOpen = fenceOpen(lines[k]);
-    if (
-      nextOpen &&
-      nextOpen.marker === fence.marker &&
-      isLanguageLikeInfo(nextOpen.lang) &&
-      trimmed.length > nextOpen.length
-    ) {
+    if (nextOpen && trimmed.length > nextOpen.length && nextOpen.marker === fence.marker) {
       // 关键防御：如果内部围栏长度严格小于外层围栏长度（例如 4 反引号包裹 3 反引号），
       // 内部围栏在 CommonMark 规范下纯属普通内容，绝不构成断裂！放行继续查找！
       if (nextOpen.length < fence.length) {
@@ -219,10 +197,8 @@ export function promoteNestedCodeFences(raw: string): string {
       const line = lines[k];
       const nextOpen = fenceOpen(line);
 
-      // 若内部出现「像语言标签」的代码块开启（通用支持所有编程语言与 diff 内部的嵌套保护）
-      // ★ 关键防御：围栏正文里的散文行（如 ` ``` + 【执行铁律】… `）info 串不是语言，
-      // 绝不能当作子围栏，否则会错误提升外层围栏长度并错位改写闭合行，导致围栏 desync。
-      if (nextOpen && nextOpen.marker === open.marker && isLanguageLikeInfo(nextOpen.lang)) {
+      // 若内部出现带语言的代码块开启（通用支持所有编程语言与 diff 内部的嵌套保护）
+      if (nextOpen && nextOpen.marker === open.marker && nextOpen.lang) {
         foundSubFence = true;
         maxInnerLen = Math.max(maxInnerLen, nextOpen.length);
         depth += 1;
@@ -409,32 +385,26 @@ export function isStructuralTerminator(line: string, currentFence: FenceState): 
   // 核心原则：只有当新代码块的围栏长度大于等于当前代码块时，才构成外部代码块的断裂开启！
   // 若新代码块围栏长度小于外层（如 4 反引号代码块内部包含了 3 反引号的示例文档），内部围栏纯属合法内容，绝不提前腰斩
   const opening = fenceOpen(line);
-  if (
-    opening &&
-    isLanguageLikeInfo(opening.lang) &&
-    opening.length >= currentFence.length &&
-    trimmed.length > opening.length
-  ) {
+  if (opening && opening.length >= currentFence.length && trimmed.length > opening.length) {
     return true;
   }
 
-  // 4. 代码块内以 `#` 开头的内容绝大多数是注释。
-  //
-  // 但模型确实会“漏写闭合围栏、直接接大纲标题”，所以保留一个**极窄**的自愈。
-  // 关键区分不是标题文案（`# 1. xxx` 与 `#### 3. xxx` 完全同构），而是**级别**：
-  // - 语言注释普遍是**单个** `#`（python/bash/ruby/yaml/toml，C 的 `#include`）；
-  // - 大纲标题才是 `##`/`###`/`####` 多级。
-  // 因此 `##` 及以上的 ATX 标题在代码块内才算结构性终结；单个 `#` 一律当注释。
-  // 这条同时修掉了两个真实误伤：
-  //   `# 1. 底层数字串运算工具`（编号注释）
-  //   `# 从最低位 (bit 0) 逐级…`（带括号注释）
-  const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+  // 4. 对于以 # 作为注释的语言，普通注释绝不能当作 ATX 标题中断代码块
+  // ★ 优化：但是如果出现明确的外部大纲结构（例如中文大纲章节标题：`### 第二步`、`### 1. `、`### 总结` 等），
+  // 即使在 bash/python 中，它也绝不是脚本代码注释，必须自愈闭合代码块！
+  const headingMatch = trimmed.match(/^#{1,6}\s+(.+)$/);
   if (headingMatch) {
-    const level = headingMatch[1].length;
-    const indent = line.length - line.trimStart().length;
-    // 单个 `#` 或缩进行：注释 / 代码体，不中断。
-    if (level >= 2 && indent === 0) return true;
-    return false;
+    const headingText = headingMatch[1].trim();
+    if (HASH_COMMENT_LANGS.has(lang)) {
+      const isDocumentHeading =
+        /^(?:第[一二三四五六七八九十0-9]+[步章节部分点项]|步骤\s*\d+|[一二三四五六七八九十]+[、.：:]|\d+[、.：:]\s*[\u4e00-\u9fa5]|为什么|如何|总结|结论|注意事项|核心结论|方案\s*[A-Za-z0-9\u4e00-\u9fa5]|step\s*\d+|summary|conclusion|overview|solution|option)/i.test(headingText) ||
+        (/[\u4e00-\u9fa5]/.test(headingText) && /[？?！!：:（）()]/.test(headingText));
+      if (isDocumentHeading) {
+        return true;
+      }
+      return false;
+    }
+    return true;
   }
 
   return false;
@@ -553,10 +523,6 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
-function escapeHtmlPreservingBreaks(text: string): string {
-  return escapeHtml(text).replace(/&lt;(\s*br\s*\/?\s*)&gt;/gi, '<$1>');
-}
-
 /** Unicode punctuation — CommonMark flanking rules treat these like ASCII punct. */
 function isUnicodePunctuation(ch: string): boolean {
   return /\p{P}/u.test(ch);
@@ -623,7 +589,7 @@ export function repairCjkPunctuationEmphasis(text: string): string {
         !isUnicodeWhitespace(next) &&
         !isUnicodePunctuation(next);
       if (openBroken || closeBroken) {
-        out.push(`<strong>${escapeHtmlPreservingBreaks(inner)}</strong>`);
+        out.push(`<strong>${escapeHtml(inner)}</strong>`);
       } else {
         out.push(source.slice(start, end + marker.length));
       }
@@ -690,37 +656,13 @@ function applyInlineMarkdown(source: string, footnoteIds: Map<string, number>): 
       }
       // ==高亮==：GFM 没有，但模型经常输出。避开 === 标题线。
       text = text.replace(/==([^=\n]+?)==/g, (_m, inner: string) => {
-        return `<mark class="md-highlight">${escapeHtmlPreservingBreaks(inner)}</mark>`;
+        return `<mark class="md-highlight">${escapeHtml(inner)}</mark>`;
       });
       // 中文弯引号等标点紧贴 **…** 时 CommonMark 不认强调，预转成 <strong>。
       text = repairCjkPunctuationEmphasis(text);
       return text;
     });
   }).join('\n');
-}
-
-/**
- * 规范化各类变体换行标签为标准 HTML `<br>`：
- * 针对模型常在表格单元格或正文中输出的转义/实体变体（如 `&lt;br&gt;`、`\<br>`、`\\<br>`、全角 `＜br＞` 等），
- * 统一在代码围栏和行内代码反引号之外将其规范化为标准 `<br>`，
- * 使得 marked 与 WebUI 能够正确将其渲染为真实折行，避免向用户暴露裸露字符。
- */
-export function normalizeBreakTags(line: string): string {
-  if (!line) return '';
-  const lower = line.toLowerCase();
-  if (
-    !lower.includes('<br') &&
-    !lower.includes('&lt;br') &&
-    !lower.includes('＜br')
-  ) {
-    return line;
-  }
-  return mapInlineOutsideBackticks(line, (chunk) => {
-    return chunk
-      .replace(/\\*&lt;\s*br\s*\/?\s*&gt;/gi, '<br>')
-      .replace(/\\+<\s*br\s*\/?\s*>/gi, '<br>')
-      .replace(/＜\s*br\s*\/?\s*＞/gi, '<br>');
-  });
 }
 
 export function repairUnclosedFences(source: string): string {
@@ -782,30 +724,9 @@ export function shouldShowCodeLanguage(lang: string): boolean {
  * 5. 未闭合围栏自动补闭合；
  * 6. 脚注、==高亮==。
  */
-/**
- * 智能折叠或清洗上游代理/模型意外在正文输出的加密思考签名块（Anthropic Redacted Thinking）。
- * 形如：
- * [Redacted Thinking: EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+...]
- * 或被网页自动翻译插件翻出的：
- * [已遮挡思考：EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+...】
- */
-export function cleanRedactedThinkingBlocks(source: string): string {
-  if (!source || (!source.includes('Redacted Thinking') && !source.includes('已遮挡思考'))) {
-    return source;
-  }
-  return source.replace(
-    /\[(?:Redacted Thinking|已遮挡思考)[:：]\s*([A-Za-z0-9+/=_\-\s]{20,})\s*[\]】]/g,
-    (_match, data) => {
-      const cleanData = String(data).replace(/\s+/g, '');
-      return `\n\n<details class="redacted-thinking-box notranslate" translate="no"><summary>💭 <i>[Redacted Thinking]</i></summary>\n\n\`\`\`text\n${cleanData}\n\`\`\`\n</details>\n\n`;
-    },
-  );
-}
-
 export function preprocessMarkdown(raw: string): string {
   if (!raw) return '';
-  const sanitized = cleanRedactedThinkingBlocks(raw);
-  const prepared = promoteNestedCodeFences(sanitized);
+  const prepared = promoteNestedCodeFences(raw);
   const lines = prepared.replace(/\r\n/g, '\n').split('\n');
   const result: string[] = [];
   let inFence: FenceState | null = null;
@@ -832,7 +753,7 @@ export function preprocessMarkdown(raw: string): string {
         if (/^(?: {4}|\t)(?:#{1,6}\s+|[-*_]{3,}\s*$)/.test(line)) {
           line = line.replace(/^(?: {4}|\t)/, '');
         }
-      } else if (/^(?: {4}|\t)(?:`{3,}|~{3,})/.test(line)) {
+      } else if (/^(?: {4}|\t)(?:```|~~~)/.test(line)) {
         lastListIndent = -1;
         line = line.replace(/^(?: {4}|\t)/, '');
       } else {
@@ -856,10 +777,7 @@ export function preprocessMarkdown(raw: string): string {
     // 进而导致代码块容器失效，内部内容直接被外泄渲染为大号标题和普通正文，或导致闭合 ``` 反向误判吞噬后续文本！
     // 自动将其拆解为独立两行（前置文本行 + 纯净代码块开启行）。
     if (!inFence) {
-      const isPureFenceLine = /^\s*(?:>{1,}\s*)*(`{3,}|~{3,})/.test(line);
-      const gluedFence = !isPureFenceLine
-        ? line.match(/^(\s*[^`~].*?[^`~\s])\s*((?:`{3,}|~{3,})[a-zA-Z0-9_-]*\s*)$/)
-        : null;
+      const gluedFence = line.match(/^(\s*[^`~].*?)\s*((?:```|~~~)[a-zA-Z0-9_-]*\s*)$/);
       if (
         gluedFence &&
         gluedFence[1].trim() &&
@@ -939,7 +857,6 @@ export function preprocessMarkdown(raw: string): string {
     line = replaceFullwidthPipes(line);
     line = fixAtxHeading(line);
     line = normalizeTaskCheckboxes(line);
-    line = normalizeBreakTags(line);
     const trimmed = line.trim();
 
     const footnoteDef = trimmed.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
@@ -981,16 +898,9 @@ export function preprocessMarkdown(raw: string): string {
 
     const isHeading = /^\s*#{1,6}\s+/.test(line);
     const openingNow = fenceOpen(line);
-    const isNonOneOrderedList = /^\s*([2-9]|\d{2,})[\.\)]\s+/.test(line);
     if ((isHeading || openingNow) && result.length > 0) {
       const prevLine = result[result.length - 1].trim();
       if (prevLine !== '' && !prevLine.startsWith('#')) {
-        result.push('');
-      }
-    } else if (isNonOneOrderedList && result.length > 0) {
-      const prevLine = result[result.length - 1].trim();
-      const prevIsList = /^(?:[-*+]|\d+[\.\)])\s+/.test(prevLine);
-      if (prevLine !== '' && !prevIsList) {
         result.push('');
       }
     }

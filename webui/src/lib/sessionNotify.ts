@@ -15,6 +15,12 @@ export type NotifyApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 export type TerminalKind = 'completed' | 'stopped' | 'failed';
 
+export interface TerminalEdge {
+  sessionId: string;
+  seq: number;
+  kind: TerminalKind;
+}
+
 const FAILED_REASONS = new Set([
   'provider_error',
   'timeout',
@@ -25,8 +31,7 @@ const FAILED_REASONS = new Set([
 
 /** Tool-approval cards and their OS pings. Auto never parks on these. */
 export function showPermissionNotice(mode: NotifyApprovalMode | null | undefined): boolean {
-  // 模式未知时失败关闭：宁可不响，也不要在切换/冷启动瞬间按“非 Auto”误报。
-  return mode === 'build' || mode === 'accept_edits' || mode === 'plan';
+  return mode !== 'bypass';
 }
 
 /** OS toast for a review. The corner card is the focused UI; the OS toast is for when the window is away. */
@@ -136,6 +141,49 @@ export function terminalKindFromDone(stopReason: string | undefined): TerminalKi
   if (stopReason === 'cancelled') return 'stopped';
   if (FAILED_REASONS.has(stopReason)) return 'failed';
   return 'stopped';
+}
+
+export function isTerminalKind(value: string | null | undefined): value is TerminalKind {
+  return value === 'completed' || value === 'stopped' || value === 'failed';
+}
+
+/**
+ * The first poll is a baseline: record seqs and stay quiet so opening the page
+ * does not replay turns that already finished.
+ * After that, a higher seq emits one edge. A session that appears already
+ * finished (the whole turn landed between polls) emits too.
+ * A jump of several seqs is still one notice, so a done+stopped pair in the
+ * same gap does not double-fire.
+ */
+export function takeTerminalEdges(
+  seen: Map<string, number>,
+  rows: Array<{ sessionId: string; seq: number; kind: string | null | undefined }>,
+  options?: { baseline?: boolean },
+): TerminalEdge[] {
+  const baseline = options?.baseline === true;
+  const edges: TerminalEdge[] = [];
+  const live = new Set<string>();
+  for (const row of rows) {
+    if (!row.sessionId) continue;
+    live.add(row.sessionId);
+    const seq = Number.isFinite(row.seq) ? row.seq : 0;
+    const prev = seen.get(row.sessionId);
+    if (prev === undefined) {
+      seen.set(row.sessionId, seq);
+      if (!baseline && seq > 0 && isTerminalKind(row.kind)) {
+        edges.push({ sessionId: row.sessionId, seq, kind: row.kind });
+      }
+      continue;
+    }
+    if (seq > prev && isTerminalKind(row.kind)) {
+      edges.push({ sessionId: row.sessionId, seq, kind: row.kind });
+    }
+    if (seq !== prev) seen.set(row.sessionId, seq);
+  }
+  for (const id of [...seen.keys()]) {
+    if (!live.has(id)) seen.delete(id);
+  }
+  return edges;
 }
 
 /** Same session and kind inside the window is one toast (poll racing a second seq). */
@@ -269,14 +317,123 @@ export function samePermissionInstance(
   return a.call_id === b.call_id;
 }
 
+let lastCompletionAudioTime = 0;
+
 /**
- * Dispatch an OS notification through the backend system-notify endpoint
- * (Windows WinRT Toast / macOS UserNotifications / Linux notify-send).
- * Browser Web Notifications are deliberately excluded to avoid duplicate toasts.
+ * 播放柔和优雅的高保真双音阶完成提示音（A5-880Hz -> E6-1320Hz），
+ * 纯 Web Audio 原生合成，零外部媒体文件依赖，1 秒内自动防抖。
+ */
+export function playCompletionAudio(): void {
+  if (typeof window === 'undefined') return;
+  const now = Date.now();
+  if (now - lastCompletionAudioTime < 1000) return;
+  lastCompletionAudioTime = now;
+  try {
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const ctx = new AudioContextClass();
+    const startTime = ctx.currentTime;
+
+    const osc1 = ctx.createOscillator();
+    const gain1 = ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(880, startTime);
+    gain1.gain.setValueAtTime(0.08, startTime);
+    gain1.gain.exponentialRampToValueAtTime(0.001, startTime + 0.35);
+    osc1.connect(gain1);
+    gain1.connect(ctx.destination);
+    osc1.start(startTime);
+    osc1.stop(startTime + 0.35);
+
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(1320, startTime + 0.1);
+    gain2.gain.setValueAtTime(0.08, startTime + 0.1);
+    gain2.gain.exponentialRampToValueAtTime(0.001, startTime + 0.6);
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.start(startTime + 0.1);
+    osc2.stop(startTime + 0.6);
+  } catch {}
+}
+
+let originalDocumentTitle: string | null = null;
+let titleResetAttached = false;
+
+/**
+ * 任务在后台完成时，动态闪烁网页标题与任务栏提示，切回页面时自动恢复
+ */
+export function flashDocumentTitle(alertText: string): void {
+  if (typeof document === 'undefined') return;
+  if (!originalDocumentTitle) {
+    originalDocumentTitle = document.title;
+  }
+  document.title = `🔔 【已完成】${alertText}`;
+  if (!titleResetAttached && typeof window !== 'undefined') {
+    titleResetAttached = true;
+    const reset = () => {
+      if (originalDocumentTitle) {
+        document.title = originalDocumentTitle;
+        originalDocumentTitle = null;
+      }
+      titleResetAttached = false;
+    };
+    window.addEventListener('focus', reset, { once: true });
+    document.addEventListener(
+      'visibilitychange',
+      () => {
+        if (!document.hidden) reset();
+      },
+      { once: true },
+    );
+  }
+}
+
+/**
+ * 调起浏览器操作系统级桌面通知（Web Notification），点击时激活并聚焦窗口
+ */
+export function triggerBrowserNotification(title: string, body: string, tag?: string): void {
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  if (window.Notification.permission === 'granted') {
+    try {
+      const n = new window.Notification(title, {
+        body,
+        icon: '/favicon.png',
+        tag: tag || 'zap-notice',
+      });
+      n.onclick = () => {
+        try {
+          window.focus();
+        } catch {}
+        n.close();
+      };
+    } catch {}
+  } else if (window.Notification.permission === 'default') {
+    try {
+      void window.Notification.requestPermission();
+    } catch {}
+  }
+}
+
+/**
+ * 全方位分发系统级外层提示（浏览器桌面通知 + 任务栏动态标题 + 高保真提示音 + 后端 OS 原生 Toast）
  */
 export function dispatchSystemNotification(opts: SystemNotificationOptions): void {
   const { title, body, sessionId, tag, approvalId, postSystemNotifyFn } = opts;
-  // 统一通过后端分发操作系统级原生弹窗通知（Windows / macOS / Linux）
+
+  // 1. 触发浏览器系统桌面通知（系统外部弹窗，即使在纯网页端也支持）
+  triggerBrowserNotification(title, body, tag);
+
+  // 2. 触发 Web Audio 高保真柔和提示音
+  playCompletionAudio();
+
+  // 3. 触发标签页/任务栏标题高亮提示
+  flashDocumentTitle(title);
+
+  // 4. 统一通过后端分发操作系统级原生弹窗通知（Windows WinRT Toast / macOS / Linux）
   if (postSystemNotifyFn) {
     void postSystemNotifyFn({
       title,

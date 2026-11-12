@@ -4,7 +4,6 @@ import {
   appendToolOutput,
   finalizeToolsAfterTurn,
   MAX_LIVE_TOOL_OUTPUT,
-  settleToolRow,
   toolResultStatus,
   updateToolProgress,
   upsertToolPart,
@@ -118,13 +117,6 @@ test('bash await-decision keeps the original row pending', () => {
     toolResultStatus(true, '[bash-await-decision]\nPID: 1001\n', 'bash'),
     'pending',
   );
-  // Canonical tool name is run_command; `bash` is only an alias. A long
-  // foreground command (for example sleep) yields this marker while the
-  // process is still alive, so the canonical name must stay pending too.
-  assert.equal(
-    toolResultStatus(true, '[bash-await-decision]\nPID: 1001\n', 'run_command'),
-    'pending',
-  );
 });
 
 test('quoting [bash-await-decision] in a non-bash tool does not keep it running', () => {
@@ -132,7 +124,7 @@ test('quoting [bash-await-decision] in a non-bash tool does not keep it running'
     '# tools',
     'idle → `[bash-await-decision]`, then the model decides',
   ].join('\n');
-  assert.equal(toolResultStatus(true, guide, 'jeikcode_config_guide'), 'done');
+  assert.equal(toolResultStatus(true, guide, 'zap_config_guide'), 'done');
   assert.equal(toolResultStatus(true, guide), 'done');
 });
 
@@ -141,7 +133,7 @@ test('replaying tool_start after tool_result does not regress status or drop out
     {
       kind: 'tool',
       tool: tool('a', {
-        name: 'jeikcode_config_guide',
+        name: 'zap_config_guide',
         status: 'done',
         output: 'full guide',
         duration_ms: 8,
@@ -150,7 +142,7 @@ test('replaying tool_start after tool_result does not regress status or drop out
   ];
   const next = upsertToolPart(
     parts,
-    tool('a', { name: 'jeikcode_config_guide', status: 'pending' }),
+    tool('a', { name: 'zap_config_guide', status: 'pending' }),
   );
   const row = next[0]!.kind === 'tool' ? next[0].tool : undefined;
   assert.equal(row?.status, 'done');
@@ -158,60 +150,9 @@ test('replaying tool_start after tool_result does not regress status or drop out
   assert.equal(row?.duration_ms, 8);
 });
 
-test('redirected shell heartbeat stays pending until the result arrives', () => {
-  let parts: MsgPart[] = upsertToolPart([], tool('shell-redirect', { name: 'run_command' }));
-  parts = updateToolProgress(
-    parts,
-    'shell-redirect',
-    '[note: stdout is redirected to `probe.log`; live output stays empty until the command exits.]',
-  );
-  parts = updateToolProgress(
-    parts,
-    'shell-redirect',
-    '[still running: 40s total, 40s without output (pid 1234); stdout is redirected to a file]',
-  );
-  const pending = parts[0]!.kind === 'tool' ? parts[0].tool : undefined;
-  assert.equal(pending?.status, 'pending');
-  assert.match(pending?.progress ?? '', /still running/);
-
-  parts = upsertToolPart(
-    parts,
-    tool('shell-redirect', {
-      name: 'run_command',
-      status: toolResultStatus(true, 'done [exit code 0]', 'run_command'),
-      output: 'done [exit code 0]',
-    }),
-  );
-  const settled = parts[0]!.kind === 'tool' ? parts[0].tool : undefined;
-  assert.equal(settled?.status, 'done');
-});
-
-test('finalizeToolsAfterTurn 不把无结果的僵尸工具行假完成（有输出也不行）', () => {
-  // 有输出但从来没收到 tool_result：进程可能是被停掉/杀掉的，不能声称「完成」。
-  const withOutput = finalizeToolsAfterTurn([
-    { kind: 'tool', tool: tool('zombie-with-output', { name: 'run_command', output: '[still running: 80s total (pid 9527)]' }) },
-  ]);
-  assert.equal(
-    withOutput[0]!.kind === 'tool' ? withOutput[0].tool.status : '',
-    'incomplete',
-    '有输出但无结果 ≠ 成功，必须落成未完成',
-  );
-
-  const withoutOutput = finalizeToolsAfterTurn([
-    {
-      kind: 'tool',
-      tool: tool('redirect-no-result', {
-        name: 'run_command',
-        progress: '[note: stdout is redirected to `probe.log`]',
-      }),
-    },
-  ]);
-  assert.equal(withoutOutput[0]!.kind === 'tool' ? withoutOutput[0].tool.status : '', 'incomplete');
-});
-
 test('finalizeToolsAfterTurn settles leftover pending rows except live bash await', () => {
   const parts: MsgPart[] = [
-    { kind: 'tool', tool: tool('guide', { name: 'jeikcode_config_guide', output: 'docs' }) },
+    { kind: 'tool', tool: tool('guide', { name: 'zap_config_guide', output: 'docs' }) },
     {
       kind: 'tool',
       tool: tool('bash', {
@@ -222,53 +163,12 @@ test('finalizeToolsAfterTurn settles leftover pending rows except live bash awai
     { kind: 'tool', tool: tool('empty', { name: 'grep' }) },
   ];
   const next = finalizeToolsAfterTurn(parts);
-  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'incomplete');
+  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'done');
   assert.equal(next[1]!.kind === 'tool' ? next[1].tool.status : '', 'pending');
-  assert.equal(next[2]!.kind === 'tool' ? next[2].tool.status : '', 'incomplete');
-});
-
-test('finalizeToolsAfterTurn keeps canonical run_command await-decision pending', () => {
-  const next = finalizeToolsAfterTurn([
-    {
-      kind: 'tool',
-      tool: tool('run-command', {
-        name: 'run_command',
-        output: '[bash-await-decision]\nPID: 1002\n',
-      }),
-    },
-  ]);
-  assert.equal(next[0]!.kind === 'tool' ? next[0].tool.status : '', 'pending');
+  assert.equal(next[2]!.kind === 'tool' ? next[2].tool.status : '', 'error');
 });
 
 
-test('settleToolRow 让短工具在长工具未完成时先落 √（不动 output/duration）', () => {
-  // tool_finished 只负责状态：权威 tool_result 仍按整批发射顺序到达，
-  // 它才带 output 与 duration_ms。
-  assert.deepEqual(
-    settleToolRow(tool('fast', { output: 'partial', progress: 'working' }), true),
-    { status: 'done', progress: undefined },
-  );
-  assert.deepEqual(
-    settleToolRow(tool('boom', { name: 'bash' }), false),
-    { status: 'error', progress: undefined },
-  );
-});
-
-test('settleToolRow 不把还在等用户决定的 bash 行落成完成', () => {
-  // 进程还活着、在执行里等决定：执行返回 ≠ 完成，交给权威结果帧判定。
-  for (const name of ['bash', 'run_command']) {
-    assert.equal(
-      settleToolRow(tool('await', { name, output: '[bash-await-decision]\nPID: 1001\n' }), true),
-      undefined,
-    );
-  }
-});
-
-test('settleToolRow 幂等：已终态的行不因迟到帧回退', () => {
-  for (const status of ['done', 'error', 'incomplete'] as const) {
-    assert.equal(settleToolRow(tool('t', { status }), false), undefined);
-  }
-});
 
 test('withTrailingTodoList appends or replaces a trailing todo_list part', () => {
   const items = [

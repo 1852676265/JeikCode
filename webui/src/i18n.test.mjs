@@ -18,25 +18,7 @@ function load(file, dependencies = {}, globals = {}) {
   return exports;
 }
 const { vi } = load('./vi.ts');
-const { zhTw } = load('./locales/zh-TW.ts');
-const { ja } = load('./locales/ja.ts');
-const { ko } = load('./locales/ko.ts');
-const { ru } = load('./locales/ru.ts');
-const { fr } = load('./locales/fr.ts');
-const { es } = load('./locales/es.ts');
-const { de } = load('./locales/de.ts');
-const { ar } = load('./locales/ar.ts');
-const { messages, languageOptions } = load('./i18n.ts', {
-  './vi': { vi },
-  './locales/zh-TW': { zhTw },
-  './locales/ja': { ja },
-  './locales/ko': { ko },
-  './locales/ru': { ru },
-  './locales/fr': { fr },
-  './locales/es': { es },
-  './locales/de': { de },
-  './locales/ar': { ar },
-});
+const { messages, languageOptions } = load('./i18n.ts', { './vi': { vi } });
 const placeholders = (text) => [...text.matchAll(/\{(\w+)\}/g)].map(m => m[1]).sort();
 
 test('all three catalogs mirror English keys and placeholder occurrences', () => {
@@ -53,20 +35,15 @@ test('all three catalogs mirror English keys and placeholder occurrences', () =>
 
 test('Chat and diagram accessibility labels use translated catalog keys', () => {
   const chat = readFileSync(new URL('./components/Chat.tsx', import.meta.url), 'utf8');
-  const inspector = readFileSync(new URL('./components/RightInspectorPanel.tsx', import.meta.url), 'utf8');
-  const preview = readFileSync(new URL('./components/PreviewPanel.tsx', import.meta.url), 'utf8');
   const diagram = readFileSync(new URL('./components/MermaidDiagram.tsx', import.meta.url), 'utf8');
   const chatKeys = ['chat.inspectorTabs', 'common.dismiss'];
   const diagramKeys = ['diagram.view', 'diagram.code', 'common.zoomIn', 'common.zoomOut',
     'diagram.reset', 'diagram.exitFullscreen', 'diagram.fullscreen', 'diagram.download', 'diagram.copy'];
-  // 检查器面板已从 Chat 抽出：tablist 的 label 必须在抽出的组件里仍然是翻译键。
-  assert.ok(inspector.includes(`aria-label={t('chat.inspectorTabs')}`), 'chat.inspectorTabs');
-  assert.ok(chat.includes(`aria-label={t('common.dismiss')}`), 'common.dismiss');
+  for (const key of chatKeys) assert.ok(chat.includes(`aria-label={t('${key}')}`), key);
   for (const key of diagramKeys) {
     assert.ok(diagram.split('\n').some(line => line.includes('aria-label=') && line.includes(`t('${key}')`)), key);
   }
-  assert.ok(!/aria-label="(?:Inspector tabs|Dismiss)"/.test(chat + inspector));
-  assert.ok(!/aria-label="(?:Close tab|Refresh|Save|Clear all|Toggle editor\/preview mode)"/.test(preview));
+  assert.ok(!/aria-label="(?:Inspector tabs|Dismiss)"/.test(chat));
   assert.ok(!/aria-label="/.test(diagram));
   for (const lang of ['en', 'vi', 'zh']) {
     for (const key of [...chatKeys, ...diagramKeys]) {
@@ -78,13 +55,10 @@ test('Chat and diagram accessibility labels use translated catalog keys', () => 
 });
 
 test('language selectors share native self-names in English-first order', () => {
-  assert.equal(JSON.stringify(languageOptions.slice(0, 3)), JSON.stringify([
+  assert.equal(JSON.stringify(languageOptions), JSON.stringify([
     { value: 'en', label: 'English' }, { value: 'vi', label: 'Tiếng Việt' },
     { value: 'zh', label: '简体中文' },
   ]));
-  assert.ok(languageOptions.some(o => o.value === 'zh-TW'));
-  assert.ok(languageOptions.some(o => o.value === 'ja'));
-  assert.ok(languageOptions.some(o => o.value === 'ar'));
 });
 
 function deferred() {
@@ -122,7 +96,6 @@ function harness(stored, blocked = false, navigatorLang = undefined, navigatorLa
     preact: { createContext: () => ({ Provider: 'provider' }) },
     'preact/hooks': hooks, './i18n': { messages },
     './api': { getConfig: () => config.promise, postLanguage: async lang => { writes.push(lang); } },
-    './lib/theme': { resolveEffectiveTheme: (t) => t === 'system' ? 'dark' : t },
   }, {
     h: (_type, props) => { context = props.value; },
     document: { documentElement: { setAttribute: (key, value) => { attrs[key] = value; } } },
@@ -152,7 +125,7 @@ test('unconfigured first run without browser language falls back to English', ()
 });
 
 test('unconfigured first run detects supported browser language with English fallback', () => {
-  for (const [nav, expected] of [['zh-CN', 'zh'], ['zh', 'zh'], ['vi-VN', 'vi'], ['vi', 'vi'], ['en-US', 'en'], ['it-IT', 'en'], ['nl', 'en']]) {
+  for (const [nav, expected] of [['zh-CN', 'zh'], ['zh', 'zh'], ['vi-VN', 'vi'], ['vi', 'vi'], ['en-US', 'en'], ['fr-FR', 'en'], ['de', 'en']]) {
     const h = harness(undefined, false, nav);
     assert.equal(h.context().lang, expected);
   }
@@ -160,14 +133,14 @@ test('unconfigured first run detects supported browser language with English fal
 
 test('Google-style navigator.languages chain matching respects first supported candidate', () => {
   // Candidate list has unsupported first, then supported:
-  const hZh = harness(undefined, false, undefined, ['pl', 'zh-TW', 'en']);
-  assert.equal(hZh.context().lang, 'zh-TW');
+  const hZh = harness(undefined, false, undefined, ['ja', 'zh-TW', 'en']);
+  assert.equal(hZh.context().lang, 'zh');
 
   const hVi = harness(undefined, false, undefined, ['ko', 'vi-VN', 'en-US']);
-  assert.equal(hVi.context().lang, 'ko');
+  assert.equal(hVi.context().lang, 'vi');
 
   // Candidate list with only unsupported languages falls back cleanly to English baseline:
-  const hFallback = harness(undefined, false, undefined, ['it', 'pt', 'nl']);
+  const hFallback = harness(undefined, false, undefined, ['de', 'es', 'it']);
   assert.equal(hFallback.context().lang, 'en');
 
   // User explicit storage overrides browser languages:

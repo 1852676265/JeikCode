@@ -14,7 +14,6 @@ const setup = (...entries) => {
   return h;
 };
 const event = (key = 'ArrowUp', value = '', pos = 0, extras = {}) => ({ key, currentTarget: { value, selectionStart: pos, selectionEnd: pos }, ...extras });
-const rangeEvent = (key, value, start, end, extras = {}) => ({ key, currentTarget: { value, selectionStart: start, selectionEnd: end }, ...extras });
 
 test('empty history leaves native arrows alone', () => {
   const h = setup();
@@ -69,36 +68,15 @@ test('history is capped at 100 inputs', () => {
   for (let i = 0; i < 150; i++) value = h.navigate('up', value);
   assert.equal(value, '20');
 });
-test('projects scope the unsaved composer; session ids scope accepted history', () => {
+test('projects and sessions are isolated and revisits reset navigation', () => {
   const h = new InputHistory();
-  const draftA = key('project', null), draftB = key('other', null);
-  const sessionA = key('project', 'one'), sessionB = key('project', 'two');
-  assert.notEqual(draftA, draftB);
-  assert.notEqual(sessionA, sessionB);
-  h.switchContext(draftA); h.record(draftA, 'draft a'); h.navigate('up', 'old draft');
-  h.switchContext(draftB); assert.equal(h.navigate('up', ''), null);
-  h.switchContext(sessionA); h.record(sessionA, 'a'); h.navigate('up', 'old draft');
-  h.switchContext(sessionB); assert.equal(h.navigate('up', ''), null); h.record(sessionB, 'b');
-  h.switchContext(sessionA); assert.equal(h.navigate('down', 'new draft'), null);
+  const a = key('project', 'one'), b = key('project', 'two'), c = key('other', 'one');
+  h.switchContext(a); h.record(a, 'a'); h.navigate('up', 'old draft');
+  h.switchContext(b); assert.equal(h.navigate('up', ''), null); h.record(b, 'b');
+  h.switchContext(c); assert.equal(h.navigate('up', ''), null);
+  h.switchContext(a); assert.equal(h.navigate('down', 'new draft'), null);
   assert.equal(h.navigate('up', 'new draft'), 'a');
   assert.equal(h.navigate('down', 'a'), 'new draft');
-  h.switchContext(draftA); assert.equal(h.navigate('up', 'x'), 'draft a');
-});
-
-test('the first accepted prompt survives the new-session project metadata switch', () => {
-  const h = new InputHistory();
-  const unsaved = key('C:\\Users\\Administrator', null);
-  const bound = key('db0549519e2043fa', 'b256b317-5eda-4bfb-b4b7-edbfe78175f7');
-  // The send path records under the assigned session id while the component
-  // still sees sessionId=null and the draft project key.
-  h.switchContext(unsaved);
-  h.record(bound, 'history-context-test');
-  // Once the session id and project hash arrive, lookup must hit the same bucket.
-  h.switchContext(bound);
-  assert.equal(h.navigate('up', ''), 'history-context-test');
-  // The unsaved bucket must not inherit the accepted session's history.
-  h.switchContext(unsaved);
-  assert.equal(h.navigate('up', ''), null);
 });
 test('late acceptance records only its captured context', () => {
   const h = setup(); h.switchContext('b'); h.record('a', 'late');
@@ -154,36 +132,20 @@ test('actual submit recorder uses assigned session without reading changed input
   h.switchContext(key('project', 'assigned'));
   assert.equal(h.navigate('up', ''), ' original\n ');
 });
-test('context keys cannot collide at delimiters', () => {
-  assert.notEqual(key('a::b', 'c'), key('a', 'b::c'));
-  assert.notEqual(key('a::b', null), key('a', 'b::c'));
+test('context keys cannot collide at delimiters', () => assert.notEqual(key('a::b', 'c'), key('a', 'b::c')));
+test('Up only on first logical line and Down only on last', () => {
+  assert.equal(can(event('ArrowUp', 'abc\ndef', 2)), true);
+  assert.equal(can(event('ArrowUp', 'abc\ndef', 4)), false);
+  assert.equal(can(event('ArrowDown', 'abc\ndef', 2)), false);
+  assert.equal(can(event('ArrowDown', 'abc\ndef', 4)), true);
 });
-test('Up/Down recall only while the composer is empty', () => {
-  assert.equal(can(event('ArrowUp', '', 0)), true);
-  assert.equal(can(event('ArrowDown', '', 0)), true);
-  assert.equal(can(event('ArrowUp', 'abc', 0)), false);
-  assert.equal(can(event('ArrowUp', 'abc', 3)), false);
-  assert.equal(can(event('ArrowDown', 'abc', 0)), false);
-  assert.equal(can(event('ArrowUp', 'abc\ndef', 2)), false);
-  assert.equal(can(event('ArrowDown', 'abc\ndef', 4)), false);
+test('CRLF boundaries and trailing blank lines remain native', () => {
+  assert.equal(can(event('ArrowUp', 'a\r\nb', 3)), false);
+  assert.equal(can(event('ArrowDown', 'a\r\nb', 3)), true);
+  assert.equal(can(event('ArrowDown', 'a\n', 1)), false);
+  assert.equal(can(event('ArrowDown', 'a\n', 2)), true);
 });
-
-test('a fully selected draft enables recall; partial selections stay native', () => {
-  assert.equal(can(rangeEvent('ArrowUp', 'abc', 0, 3)), true);
-  assert.equal(can(rangeEvent('ArrowDown', 'abc', 0, 3)), true);
-  assert.equal(can(rangeEvent('ArrowUp', 'abc', 3, 0)), true, 'reversed full selection is still full');
-  assert.equal(can(rangeEvent('ArrowUp', 'abc', 0, 2)), false);
-  assert.equal(can(rangeEvent('ArrowUp', 'abc', 1, 3)), false);
-  assert.equal(can(rangeEvent('ArrowUp', 'abc', 0, 0)), false);
-  assert.equal(can(rangeEvent('ArrowUp', '', 0, 0)), true, 'empty selection is the empty-composer case');
-});
-
-test('recalled entries are fully selected so consecutive Up/Down keep navigating', async () => {
-  const chat = await readFile(new URL('../components/Chat.tsx', import.meta.url), 'utf8');
-  assert.match(chat, /pendingHistoryCaretRef\.current = \{ context: historyContext, value: next, start: 0, end: next\.length \};/);
-  assert.match(chat, /setSelectionRange\(0, next\.length\)/);
-  assert.match(chat, /setSelectionRange\(pending\.start, pending\.end\)/);
-});
+test('selection must be collapsed', () => assert.equal(can(event('ArrowUp', 'abc', 0, { currentTarget: { value: 'abc', selectionStart: 0, selectionEnd: 2 } })), false));
 for (const flag of ['altKey', 'ctrlKey', 'metaKey', 'shiftKey', 'isComposing', 'defaultPrevented']) {
   test(`${flag} keeps native behavior`, () => assert.equal(can(event('ArrowUp', '', 0, { [flag]: true })), false));
 }
@@ -217,11 +179,7 @@ test('successful submit wiring excludes validation and failed transports', async
   assert.ok(submit.indexOf('if (uploading) return') < submit.indexOf('recordAcceptedInput();'));
   const stream = api.slice(api.indexOf('export async function streamChat('));
   assert.ok(stream.indexOf('if (!resp.ok)') < stream.indexOf('onAccepted?.();'));
-  assert.match(chat, /const ack = await postChatPrompt\([\s\S]*?onAccepted\?\.\(boundSessionId\);/);
-  // Accepted prompts must be recorded for existing sessions too; the old
-  // `!sessionId` gate meant history only ever saw a new session's first send.
-  assert.doesNotMatch(chat, /acceptedWithoutSession/);
-  assert.match(chat, /if \(boundSessionId\) onAccepted\?\.\(boundSessionId\);/);
+  assert.match(chat, /const receipt = await postLiveMessage\([\s\S]*?onAccepted\?\.\(sid \?\? undefined\);/);
   assert.ok(chat.indexOf('if (slashOpen)', chat.indexOf('function handleKeyDown')) < chat.indexOf('if (canNavigateInputHistory'));
   assert.doesNotMatch(source, /localStorage|sessionStorage/);
 });

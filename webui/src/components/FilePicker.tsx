@@ -6,7 +6,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { listDir } from '../api';
 import { fsBreadcrumbs, joinFsChild, stripExtendedPathPrefix } from '../lib/displayPath';
-import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 interface FilePickerProps {
@@ -19,8 +18,6 @@ interface FilePickerProps {
 
 export function FilePicker({ current, onPick, onClose }: FilePickerProps) {
   const t = useT();
-  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
-  const backdropDismiss = useBackdropDismiss(onClose);
   const [browsePath, setBrowsePath] = useState(stripExtendedPathPrefix(current || '~'));
   const [dirs, setDirs] = useState<string[]>([]);
   const [files, setFiles] = useState<string[]>([]);
@@ -62,7 +59,9 @@ export function FilePicker({ current, onPick, onClose }: FilePickerProps) {
   return (
     <div
       class="modal-overlay"
-      {...backdropDismiss}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div class="modal-card file-picker-modal">
         <div class="modal-header">

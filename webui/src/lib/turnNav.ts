@@ -2,49 +2,48 @@ import {
   isInternalHistoryUserMessage,
   stripInjectedRemindersForDisplay,
   stripSteerEnvelopeForDisplay,
-} from './wire/legacy.ts';
+} from './historyMessages.ts';
+
+/** Token status for the turn state machine. */
+export type TurnTokenStatus = 'settled' | 'in_progress' | 'pending';
+
+export interface TurnTokenState {
+  /** 轮次状态：settled 已结算, in_progress 进行中/流式中, pending 等待处理 */
+  status: TurnTokenStatus;
+  /** 本轮 Token 消耗量（若未开始或仍在等待则为 undefined） */
+  turnTokens?: number;
+  /** 截止到该轮结束或当前的累计上下文 Token */
+  cumulativeTokens?: number;
+  /** 缓存命中的 Token 数量（可选拓展） */
+  cachedTokens?: number;
+}
 
 /** One user question in the session outline (DeepSeek-style right rail). */
 export interface TurnNavItem {
-  /** Stable DOM id on the user message wrapper. Derived from `index`. */
+  /** Stable DOM id on the user message wrapper. */
   id: string;
-  /** Session-wide outline ordinal. Display metadata only — never an identity:
-   *  the canvas numbers the *loaded window*, which drifts from the server outline
-   *  as soon as history is paginated or internal rows exist. */
+  /** Stable ordinal among real user questions. */
   ordinal: number;
-  /** Absolute index in the raw persisted transcript, used for history loading
-   *  and as the canonical anchor identity (unique across pages). */
+  /** Absolute index in the raw persisted transcript, used for history loading. */
   index: number;
-  /** Outline label. Kept intact on purpose: the rail is resizable, so the
-   *  visual ellipsis is decided by CSS at the real available width instead of a
-   *  fixed character count. */
+  /** Truncated label shown in the outline. */
   label: string;
-  /** Short compacted display/search text (the server's outline label). */
+  /** Full compacted question text for search. */
   text: string;
-  /** Stable persisted message id; primary dedupe identity when available. */
-  messageId?: string;
-  /** Full question text resolved from the loaded message window, when available.
-   *  The outline itself only carries a short label; the canvas owns the full text. */
-  fullText?: string;
-  /** Admitted but not yet folded/persisted (durable input log). */
-  pending?: boolean;
-  /** Admission sequence from the input log. */
-  seq?: number;
+  /** 1-based turn number (e.g. 1, 2, 3...) */
+  turn: number;
+  /** Bounded prompt preview for navigation card. */
+  prompt: string;
+  /** Bounded response preview for navigation card. */
+  response: string;
+  /** True when the turn is known from the outline but its body is not yet loaded. */
   unloaded?: boolean;
-  turn?: number;
-  prompt?: string;
+  /** Tokens used in this single turn (prompt + completion + reasoning). */
   tokens?: number;
+  /** Cumulative tokens from start of session up to the end of this turn. */
   cumulativeTokens?: number;
+  /** 完整的轮次 Token 状态机对象 */
   tokenState?: TurnTokenState;
-}
-
-export type TurnTokenStatus = 'pending' | 'in_progress' | 'settled';
-
-export interface TurnTokenState {
-  status: TurnTokenStatus;
-  turnTokens?: number;
-  cumulativeTokens?: number;
-  cachedTokens?: number;
 }
 
 export function formatTokenMetric(num: number | undefined | null): string {
@@ -63,9 +62,13 @@ export interface ResolveTurnTokenOptions {
   activeTurnDeltaTokens?: number | null;
 }
 
+/**
+ * 状态机纯函数：将轮次导航项、当前活跃运行状态及会话级总量归一化为统一的 TurnTokenState。
+ */
 export function resolveTurnTokenState(options: ResolveTurnTokenOptions): TurnTokenState {
   const { item, isLastTurn = false, isBusy = false, sessionTotalTokens, activeTurnDeltaTokens } = options;
 
+  // 1. 如果该轮处于活跃执行中（正在进行中/生成中/执行工具）
   if (isBusy) {
     const liveTurn =
       typeof activeTurnDeltaTokens === 'number' && activeTurnDeltaTokens > 0
@@ -79,6 +82,7 @@ export function resolveTurnTokenState(options: ResolveTurnTokenOptions): TurnTok
     };
   }
 
+  // 2. 如果是最后一轮且尚未结算出本轮 Token
   if (isLastTurn && item.tokens == null) {
     return {
       status: 'pending',
@@ -87,6 +91,7 @@ export function resolveTurnTokenState(options: ResolveTurnTokenOptions): TurnTok
     };
   }
 
+  // 3. 常规已结算或具有估算值的轮次
   const status: TurnTokenStatus = item.tokens != null ? 'settled' : 'pending';
   return {
     status,
@@ -96,243 +101,249 @@ export function resolveTurnTokenState(options: ResolveTurnTokenOptions): TurnTok
   };
 }
 
-/**
- * Anchor DOM id for one user turn: identity first, positional index only for
- * legacy rows without a persisted id. The index is a pagination coordinate and
- * must never become the cross-page identity.
- */
-export function turnNavId(messageId: string | undefined, index: number): string {
-  return `turn-nav-${messageId ?? index}`;
+const DEFAULT_MAX_LABEL = 28;
+
+export function turnNavId(ordinal: number): string {
+  return `turn-nav-${ordinal}`;
 }
 
 export function compactTurnNavText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-/**
- * 提问大纲去重与规范化（彻底解决乐观发送/回放对账导致的尾部 2~3 条提问重复问题）。
- *
- * 核心规则：
- * 1. 绝对下标去重（同一 index 只保留一个条目）；
- * 2. 文本语义去重：若两条条目的提问文本完全一致，或其中一条是另一条的截断前缀（例如 steer 提问被信封切掉一截），
- *    合并为单一真实条目，保留更早的权威 index 与更完整的内容；
- * 3. 严格按 index 升序排列。
- */
-type OutlineLike = {
-  index: number;
-  id?: string;
-  label?: string;
-  text?: string;
-  ordinal?: number;
-  pending?: boolean;
-  provisional?: boolean;
-  seq?: number;
-};
-
-function outlineText(t: OutlineLike): string {
-  return t.label ?? t.text ?? '';
+/** Collapse whitespace and truncate for the outline label. */
+export function truncateTurnNavLabel(text: string, max = DEFAULT_MAX_LABEL): string {
+  const compact = compactTurnNavText(text);
+  if (!compact) return '';
+  if (compact.length <= max) return compact;
+  return compact.slice(0, Math.max(1, max - 1)) + '…';
 }
 
-/**
- * 合并服务端大纲与本地在途/乐观大纲条目。
- * 
- * 核心铁律：
- * 当会话还在运行（或最新一条提问刚发出尚未落盘时），本地的大纲可能包含了
- * 服务端磁盘切片里尚未记录的最新用户提问。此时若无脑拿服务端的 detail.turns
- * 覆盖整个 state，正在运行的最新提问就会瞬间从大纲面板中消失！
- * 因此必须以服务端大纲为基石，并将本地更新的尾部提问安全合并进来。
- */
-export function mergeServerWithLocalOutline<T extends OutlineLike>(
-  serverTurns: T[],
-  localTurns: T[],
-): T[] {
-  if (!localTurns || localTurns.length === 0) return serverTurns || [];
-  if (!serverTurns || serverTurns.length === 0) return localTurns;
-
-  const serverIndices = new Set(serverTurns.map((t) => t.index));
-  const serverIds = new Set(serverTurns.map((t) => t.id).filter(Boolean));
-  const maxServerIndex = Math.max(...serverTurns.map((t) => t.index));
-
-  // 筛选出本地更新的、明显在服务端大纲之后或尚未落盘的大纲条目
-  const trailingLocal = localTurns.filter((local) => {
-    if (local.id) {
-      if (serverIds.has(local.id)) return false;
-      // A live steer can collide with another row's stale index; identity wins.
-      return local.provisional === true || local.index > maxServerIndex;
-    }
-    if (serverIndices.has(local.index)) return false;
-    return local.index > maxServerIndex;
-  });
-
-  return dedupeTurnOutline([...serverTurns, ...trailingLocal]);
-}
-
-/** Remove outline rows by stable identity (cancel/rewind must not leave ghosts). */
-export function removeOutlineRowsById<T extends OutlineLike>(
-  turns: T[],
-  ids: ReadonlySet<string>,
-  removable?: (turn: T) => boolean,
-): T[] {
-  if (!turns?.length || ids.size === 0) return turns ?? [];
-  const next = turns.filter((turn) => !(
-    turn.id && ids.has(turn.id) && (!removable || removable(turn))
-  ));
-  return next.length === turns.length ? turns : next;
-}
-
-export function fullerOutline<T extends OutlineLike>(
-  a: T[] | null | undefined,
-  b: T[] | null | undefined,
-): T[] {
-  const left = a ?? [];
-  const right = b ?? [];
-  if (left.length === 0) return right;
-  if (right.length === 0) return left;
-  // Both candidates cover the same session. A tail-window cache has fewer
-  // entries but a HIGHER first index; choosing by length keeps the complete
-  // outline instead of letting a 2-turn slice replace a 30-turn rail.
-  return left.length >= right.length ? left : right;
-}
-
-export function dedupeTurnOutline<T extends OutlineLike>(turns: T[]): T[] {
-  if (!turns || turns.length <= 1) return turns || [];
-  const result: T[] = [];
-  for (const t of turns) {
-    const label = compactTurnNavText(
-      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(outlineText(t))),
-    );
-    if (!label) continue;
-
-    // Identity is the persisted id whenever both rows carry one. `index` is
-    // only a legacy fallback for pre-id rows; it is a coordinate, never an
-    // identity — two different questions can share a provisional index.
-    const matchIdx = result.findIndex((prev) => {
-      if (t.id && prev.id) return t.id === prev.id;
-      return prev.index === t.index;
-    });
-
-    if (matchIdx >= 0) {
-      const existing = result[matchIdx]!;
-      const existingLabel = compactTurnNavText(
-        stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(outlineText(existing))),
-      );
-      // Same row arrived twice: keep the richer label, but never let a
-      // provisional pending index override the persisted row's index. When
-      // both are settled, the first entry is the server/authoritative row.
-      const richer = label.length > existingLabel.length ? t : existing;
-      const preferredIndex =
-        existing.pending === true && t.pending !== true
-          ? t.index
-          : t.pending === true && existing.pending !== true
-            ? existing.index
-            : existing.index;
-      result[matchIdx] = {
-        ...richer,
-        id: existing.id ?? t.id,
-        index: preferredIndex,
-        ordinal: existing.ordinal ?? t.ordinal,
-        // A promoted row supersedes a pending row with the same identity.
-        ...(existing.pending === true && t.pending !== true ? { pending: false } : {}),
-        provisional: existing.provisional === true && t.provisional === true ? true : undefined,
-        seq: existing.seq ?? t.seq,
-      };
-    } else {
-      result.push({ ...t });
-    }
-  }
-  return result.sort((a, b) => a.index - b.index);
+export interface TurnStatLike {
+  turn_id?: number;
+  total_tokens?: number;
+  used_tokens?: number;
+  round_count?: number;
+  model_usage?: Array<{
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    tokens?: { input?: number; output?: number; cached_input?: number };
+  }>;
 }
 
 export function buildTurnNavItemsFromOutline(
-  turns: { ordinal?: number; index: number; id?: string; label: string; pending?: boolean; seq?: number }[],
+  turns: { ordinal?: number; index: number; text: string }[],
+  loadedItems?: TurnNavItem[],
+  turnStats?: TurnStatLike[],
 ): TurnNavItem[] {
   const items: TurnNavItem[] = [];
-  const cleanTurns = dedupeTurnOutline(turns);
-  for (const turn of cleanTurns) {
-    const raw = turn.label ?? '';
-    // 关键修复：先剥离 steer 转向封套与提醒前缀，再判断是否为内部系统行。
-    // 杜绝因 raw 开头携带 '[jeikcode-steer]' 协议前缀而将用户的转向提问在刷新后误删出大纲！
-    const stripped = stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(raw));
-    if (!stripped || isInternalHistoryUserMessage(stripped)) continue;
-    const text = compactTurnNavText(stripped);
-    const label = text;
+  const loadedByOrdinal = new Map(loadedItems?.map((it) => [it.ordinal, it]));
+  let runningCumulativeTokens = 0;
+  let prevContextTokens = 0;
+
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    // Older sessions may not mark injected user rows as synthetic. Keep the
+    // server outline aligned with the same rows history rendering suppresses.
+    if (isInternalHistoryUserMessage(turn.text)) continue;
+    const text = compactTurnNavText(
+      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(turn.text)),
+    );
+    const label = truncateTurnNavLabel(text);
     if (!label) continue;
+    // New daemons provide an ordinal that stays stable when failed turns add
+    // diagnostic rows to the raw transcript. Older daemons fall back to the
+    // visible outline order, which has the same semantics.
     const ordinal = turn.ordinal ?? items.length;
+    const loaded = loadedByOrdinal.get(ordinal);
+
+    let statTokens: number | undefined;
+    let statCumulative: number | undefined;
+    let turnCached: number | undefined;
+
+    if (turnStats && turnStats.length > 0) {
+      // 精准匹配当前轮次统计：优先基于 turn_id 匹配，仅当 turnStats 与大纲轮次完全一对一时才按下标回退
+      const stat =
+        turnStats.find((s) => s.turn_id === ordinal + 1) ??
+        turnStats.find((s) => s.turn_id === i + 1) ??
+        (turnStats.length === turns.length ? turnStats[i] : undefined);
+
+      if (stat) {
+        const total = stat.total_tokens || stat.used_tokens || 0;
+        if (total > 0) {
+          statCumulative = total;
+        }
+
+        // 计算本轮消耗：优先累加本轮产生的实际模型新增计算与生成输出
+        if (stat.model_usage && stat.model_usage.length > 0) {
+          let roundSum = 0;
+          let cachedSum = 0;
+          for (const mu of stat.model_usage) {
+            const outTok = mu.completion_tokens ?? mu.tokens?.output ?? 0;
+            let inTok = 0;
+            if (typeof mu.prompt_tokens === 'number') {
+              inTok = mu.prompt_tokens;
+            } else if (mu.tokens) {
+              const uncachedInput = mu.tokens.input ?? 0;
+              const cachedInput = mu.tokens.cached_input ?? 0;
+              cachedSum += cachedInput;
+              // 关键修复：在多轮工具调用（tool calls）中，cached_input 是每次请求命中的历史 KV 缓存，
+              // 在几十轮工具循环中会被重复累加导致数百万的虚假膨胀（例如 40 次调用累加 5.8M）。
+              // 仅在完全没有 total_tokens 且为首轮时，才将 cached_input 算入初次载入总额；
+              // 正常对话及多轮工具执行中，本轮实际新增计算量严格为 uncachedInput + outTok。
+              if (!total && items.length === 0) {
+                inTok = uncachedInput + cachedInput;
+              } else {
+                inTok = uncachedInput;
+              }
+            }
+            roundSum += inTok + outTok;
+          }
+          if (roundSum > 0) statTokens = roundSum;
+          if (cachedSum > 0) turnCached = cachedSum;
+        }
+
+        // 首轮在具备 total_tokens 时直接以 total_tokens 作为该轮基线
+        if (items.length === 0 && total > 0) {
+          statTokens = total;
+        } else if (!statTokens && total > 0) {
+          // 后续轮次若无 model_usage 细项，取上下文净增量作为本轮消耗
+          if (prevContextTokens > 0 && total >= prevContextTokens) {
+            statTokens = total - prevContextTokens;
+          } else {
+            statTokens = total;
+          }
+        }
+
+        if (total > 0) {
+          prevContextTokens = total;
+        }
+      }
+    }
+
+    // 本轮 Token：优先使用后端精确统计，无统计时回退到消息体估算值
+    const finalTokens = statTokens ?? loaded?.tokens;
+    if (typeof finalTokens === 'number' && finalTokens > 0) {
+      runningCumulativeTokens += finalTokens;
+    }
+
+    // 累计 Token：
+    // 1. 如果有后端报告的 authoritative total_tokens (statCumulative)，优先以此为基准；
+    // 2. 同时结合 runningCumulativeTokens 保证累计值单调递增且不倒挂小于单轮消耗；
+    // 3. 若无 statCumulative 则回退到 runningCumulativeTokens 或 loaded?.cumulativeTokens。
+    let finalCumulative = statCumulative;
+    if (finalCumulative != null && finalCumulative > 0) {
+      if (runningCumulativeTokens > finalCumulative) {
+        finalCumulative = Math.max(finalCumulative, runningCumulativeTokens);
+      }
+    } else {
+      finalCumulative =
+        runningCumulativeTokens > 0 ? runningCumulativeTokens : loaded?.cumulativeTokens;
+    }
+
+    if (
+      typeof finalTokens === 'number' &&
+      typeof finalCumulative === 'number' &&
+      finalCumulative < finalTokens
+    ) {
+      finalCumulative = finalTokens;
+    }
+
+    const status: TurnTokenStatus =
+      statTokens != null || (loaded?.tokens != null && !loaded?.unloaded) ? 'settled' : 'pending';
+
     items.push({
-      id: turnNavId(turn.id, turn.index),
-      messageId: turn.id,
+      id: turnNavId(ordinal),
       ordinal,
       index: turn.index,
       label,
       text,
-      ...(turn.pending ? { pending: true } : {}),
-      ...(typeof turn.seq === 'number' ? { seq: turn.seq } : {}),
+      turn: ordinal + 1,
+      prompt: label,
+      response: loaded?.response ?? '',
+      unloaded: !loaded,
+      tokens: finalTokens,
+      cumulativeTokens: finalCumulative,
+      tokenState: {
+        status,
+        turnTokens: finalTokens,
+        cumulativeTokens: finalCumulative,
+        cachedTokens: turnCached,
+      },
     });
   }
   return items;
 }
 
 export function buildTurnNavItems(
-  messages: { role: string; text: string; id?: string; sourceIndex?: number }[],
+  messages: {
+    role: string;
+    text: string;
+    sourceIndex?: number;
+    turnNavOrdinal?: number;
+    hasImages?: boolean;
+    tokens?: number;
+  }[],
   windowOffset = 0,
 ): TurnNavItem[] {
   const items: TurnNavItem[] = [];
+  let runningTotalTokens = 0;
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role !== 'user') continue;
-    const text = compactTurnNavText(
+    let text = compactTurnNavText(
       stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(msg.text)),
     );
-    const label = text;
+    if (!text && msg.hasImages) {
+      text = '[图片]';
+    }
+    const label = truncateTurnNavLabel(text);
     if (!label) continue;
     // History rendering filters synthetic messages and folds tool-result rows
     // into their assistant. Prefer the raw transcript index carried through
     // conversion; the visible index is only a fallback for live/legacy data.
     const index = msg.sourceIndex ?? windowOffset + i;
-    const ordinal = items.length;
-    // Same contract as the outline path: the id is the absolute index, `ordinal`
-    // is only carried along for display/back-compat.
-    items.push({ id: turnNavId(msg.id, index), messageId: msg.id, ordinal, index, label, text, fullText: text });
+    const ordinal = typeof msg.turnNavOrdinal === 'number' ? msg.turnNavOrdinal : items.length;
+
+    // 寻找随后紧跟的 assistant 回答首段正文并累加当前 turn 的所有消息 token
+    let responseText = '';
+    let turnTokens = msg.tokens || 0;
+    for (let j = i + 1; j < messages.length; j++) {
+      if (messages[j].role === 'user') break;
+      if (typeof messages[j].tokens === 'number') {
+        turnTokens += messages[j].tokens!;
+      }
+      if (messages[j].role === 'assistant' && !responseText) {
+        const full = messages[j].text?.trim() || '';
+        if (full) {
+          responseText = compactTurnNavText(full);
+          if (responseText.length > 120) responseText = responseText.slice(0, 119) + '…';
+        }
+      }
+    }
+
+    runningTotalTokens += turnTokens;
+
+    items.push({
+      id: turnNavId(ordinal),
+      ordinal,
+      index,
+      label,
+      text,
+      turn: ordinal + 1,
+      prompt: label,
+      response: responseText,
+      unloaded: false,
+      tokens: turnTokens > 0 ? turnTokens : undefined,
+      cumulativeTokens: runningTotalTokens > 0 ? runningTotalTokens : undefined,
+      tokenState: {
+        status: turnTokens > 0 ? 'settled' : 'pending',
+        turnTokens: turnTokens > 0 ? turnTokens : undefined,
+        cumulativeTokens: runningTotalTokens > 0 ? runningTotalTokens : undefined,
+      },
+    });
   }
   return items;
-}
-
-/**
- * 画布实际头部对应的分页游标。
- *
- * 游标语义是「连续加载到的头部」，右栏点击只拿它做一次性判定：
- * `index < cursor` 才去拉页。它一旦比画布头部更靠前（权威尾部对账把画布
- * 裁回窗口、缓存被截断等），更早的提问就永远不拉取——点上去只是死链。
- * 因此每次画布被整段替换/裁剪后都要用这个函数重新对齐。
- */
-export function canvasHistoryHead(
-  messages: Array<{ sourceIndex?: number }>,
-): number | null {
-  let head: number | null = null;
-  for (const message of messages) {
-    if (typeof message.sourceIndex !== 'number') continue;
-    if (!Number.isFinite(message.sourceIndex) || message.sourceIndex < 0) continue;
-    if (head === null || message.sourceIndex < head) head = message.sourceIndex;
-  }
-  return head;
-}
-
-/** 画布裁剪后用画布头部重算「还能不能往前加载」。 */
-export function historyCursorFor(
-  messages: Array<{ sourceIndex?: number }>,
-  turns: Array<{ index: number }> | undefined,
-): { offset: number; hasOlder: boolean } | null {
-  const head = canvasHistoryHead(messages);
-  if (head === null) return null;
-  const firstTurnIndex = turns?.[0]?.index ?? 0;
-  const hasOlder = hasOlderVisibleMessages({
-    offset: head,
-    firstTurnIndex,
-    canvasHasFirstTurn: messages.some(
-      (message) => typeof message.sourceIndex === 'number' && message.sourceIndex <= firstTurnIndex,
-    ),
-  });
-  return { offset: head, hasOlder };
 }
 
 /** Convert a target's viewport position into a scrollTop inside its chat root. */
@@ -348,161 +359,7 @@ export function turnNavScrollTop(
 export function filterTurnNavItems(items: TurnNavItem[], query: string): TurnNavItem[] {
   const q = query.trim().toLowerCase();
   if (!q) return items;
-  return items.filter((it) => (it.fullText ?? it.text).toLowerCase().includes(q));
-}
-
-/**
- * 是否还有更早的【可见】历史消息未加载。
- *
- * 核心架构防线：
- * 会话前缀（0..firstTurnIndex）通常全为 System prompts 与 synthetic 技能/MCP 指令（例如前 8 条全不可见）。
- * 此时当 offset 已经抵达或越过首个用户提问（offset <= firstTurnIndex），或者画布顶部已经绘制了
- * 首个提问时，上方剩余的仅为不可见系统指令，绝不能向用户展示「还剩 8 条」幽灵气泡或允许向空展开。
- */
-/**
- * 画布顶部**还有更早的历史没加载**吗？
- *
- * 唯一判据是身份：画布首行的 `seq` 是否大于会话最早的 `seq`。
- *
- * 旧实现对 `offset` 做了过多推断（`offset <= threshold` 就判“到顶”），
- * 结果两点都有 bug：
- * - 用户点过向上展开后 `offset` 被写成缓存游标，刷新时与画布实际内容脱节 →
- *   按钮消失或永远显示；
- * - 窗口首行 `seq` 明明还有更早的行，但因为 `offset` 被裁成 0 就判到顶。
- *
- * `offset` 只作为没有 seq 的旧 daemon 的回退判据。
- */
-export function hasOlderVisibleMessages(input: {
-  offset: number;
-  firstTurnIndex?: number;
-  canvasHasFirstTurn?: boolean;
-  /** Identity-first cursor: when the first loaded row has a server seq, use it. */
-  oldestSeq?: number;
-  /** First visible outline turn's seq, when known. */
-  firstTurnSeq?: number;
-}): boolean {
-  if (typeof input.oldestSeq === 'number') {
-    // 身份优先：首行 seq 就是会话最小 seq（或已经覆盖大纲首问）→ 真的到顶。
-    if (input.oldestSeq <= 0) return false;
-    if (typeof input.firstTurnSeq === 'number' && input.oldestSeq <= input.firstTurnSeq) return false;
-    if (input.canvasHasFirstTurn === true) return false;
-    return true;
-  }
-  if (input.offset <= 0) return false;
-  const threshold = input.firstTurnIndex ?? 0;
-  if (input.offset <= threshold) return false;
-  if (input.canvasHasFirstTurn) return false;
-  return true;
-}
-
-/**
- * 画布是否已经到会话开头。
- *
- * 「向上展开」闪一下就回来，根本原因是画布已经持有全量历史（同步异常后被回灌），
- * 而分页返回的每一行都是重复行 —— 合并不增长、入口却还在。
- * 判据只用服务端身份（offset / seq），绝不按文本猜。
- */
-export function canvasAtVeryBeginning(input: {
-  offset: number;
-  canvasHeadSeq?: number;
-  pageHeadSeq?: number;
-  firstTurnSeq?: number;
-}): boolean {
-  if (input.offset <= 0) return true;
-  const head = input.canvasHeadSeq;
-  if (typeof head !== 'number') return false;
-  // 必须真正到达会话开头的最小 seq（或首个可见提问的 seq），绝不能拿当前视口切片的首行 seq 比对，
-  // 否则在冷启动时尾页首行（例如 seq: 166）会与本地缓存首行（seq: 166）相等而被误判为整篇会话到顶！
-  if (typeof input.firstTurnSeq === 'number' && head <= input.firstTurnSeq) return true;
-  if (head <= 1) return true;
-  return false;
-}
-
-/**
- * 综合判定「向上展开」入口是否可见：同时结合页偏移/最小 seq 与当前画布真实首行身份，
- * 防止画布已持有全量历史时 offset/oldest_seq 仍残留幽灵入口。
- */
-export function computeEffectiveHasOlder(input: {
-  offset: number;
-  firstTurnIndex?: number;
-  canvasHasFirstTurn?: boolean;
-  oldestSeq?: number;
-  firstTurnSeq?: number;
-  canvasHeadSeq?: number;
-  pageHeadSeq?: number;
-  hasCanvasRows?: boolean;
-}): boolean {
-  const olderExists = hasOlderVisibleMessages({
-    offset: input.offset,
-    firstTurnIndex: input.firstTurnIndex,
-    canvasHasFirstTurn: input.canvasHasFirstTurn,
-    oldestSeq: input.oldestSeq,
-    firstTurnSeq: input.firstTurnSeq,
-  });
-  if (!olderExists) return false;
-  if (input.hasCanvasRows === false) return true;
-  return !canvasAtVeryBeginning({
-    offset: input.offset,
-    canvasHeadSeq: input.canvasHeadSeq,
-    pageHeadSeq: input.pageHeadSeq,
-    firstTurnSeq: input.firstTurnSeq,
-  });
-}
-
-/**
- * 「向上展开」是不是一个真能取到更早行的入口。
- *
- * 可见性（`hasOlder`）与动作（`loadOlderMessages`）必须共用这一个判定，否则就会出现
- * 「明明已经在顶部，却还显示向上展开 N 条，点下去什么都不发生」的幽灵卡片。
- * 偏移量归零后仍可用服务端 `seq` 作 `before_seq` 往前翻，所以只看 offset 会误判。
- */
-export function canLoadOlder(input: {
-  hasOlder: boolean;
-  offset: number;
-  headSeq?: number;
-}): boolean {
-  if (!input.hasOlder) return false;
-  // `hasOlder` 已经是身份对账的结果（首行 seq 之后是否还有更早的行）。
-  // 只要它成立，就一定有办法翻页：有 offset 用 offset，没 offset 用 before_seq。
-  if (Number.isFinite(input.offset) && input.offset > 0) return true;
-  return typeof input.headSeq === 'number' && Number.isFinite(input.headSeq) && input.headSeq > 0;
-}
-
-/**
- * 剩余未加载的【可见】消息数量（扣除会话开头的不可见系统指令前缀）。
- */
-export function visibleOlderRemainingCount(offset: number, firstTurnIndex?: number): number {
-  if (offset <= 0) return 0;
-  const threshold = firstTurnIndex ?? 0;
-  return Math.max(0, offset - threshold);
-}
-
-/**
- * 尚未加载到画布上的提问数（按服务端大纲的绝对 index 对账）。
- *
- * 旧计数器用「offset - 首问下标」算原始行数；一个回合往往包含几十上百条
- * tool/tool_result 行，会被误显示成「还剩 568 条消息」。这里只数真正能在
- * 右栏和画布上看到的提问，加载按钮的数字才与用户感知一致。
- */
-export function remainingUnloadedTurns(
-  turns: { index: number; id?: string }[],
-  messages: { role: string; sourceIndex?: number; id?: string; clientInputId?: string }[],
-): number {
-  if (turns.length === 0) return 0;
-  const loadedIndices = new Set<number>();
-  const loadedIds = new Set<string>();
-  for (const message of messages) {
-    if (message.role === 'user') {
-      if (typeof message.sourceIndex === 'number') loadedIndices.add(message.sourceIndex);
-      if (message.id) loadedIds.add(message.id);
-      if (message.clientInputId) loadedIds.add(message.clientInputId);
-    }
-  }
-  return turns.reduce((count, turn) => {
-    if (turn.id && loadedIds.has(turn.id)) return count;
-    if (loadedIndices.has(turn.index)) return count;
-    return count + 1;
-  }, 0);
+  return items.filter((it) => it.text.toLowerCase().includes(q));
 }
 
 export interface TurnNavScrollMetrics {
@@ -524,18 +381,31 @@ export function resolveActiveTurnId(
 ): string | null {
   if (items.length === 0) return null;
   const markerOffsetPx = opts?.markerOffsetPx ?? 24;
-  const bottomSlack = opts?.bottomSlack ?? 32;
+  const bottomSlack = opts?.bottomSlack ?? 96;
   const { scrollTop, clientHeight, scrollHeight } = metrics;
   if (scrollTop + clientHeight >= scrollHeight - bottomSlack) {
     return items[items.length - 1].id;
   }
   const marker = scrollTop + markerOffsetPx;
   let active = items[0].id;
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const top = contentTopById(item.id);
     if (top == null || !Number.isFinite(top)) continue;
-    if (top <= marker) active = item.id;
-    else break;
+    if (top <= marker) {
+      active = item.id;
+    } else {
+      // 最后一轮特殊处理：当且仅当整个线程已滚动接近底端（例如下方无多余高度无法推至视口顶部），
+      // 且最后一轮问题本身已进入视口展现时，保持最后一轮激活
+      if (
+        i === items.length - 1 &&
+        top < scrollTop + clientHeight - 40 &&
+        scrollHeight - (scrollTop + clientHeight) < Math.max(bottomSlack * 2, 160)
+      ) {
+        active = item.id;
+      }
+      break;
+    }
   }
   return active;
 }
