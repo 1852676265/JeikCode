@@ -1,31 +1,20 @@
 // Task 12 — API client for jeikcode webui
 
+import type { Lang } from './i18n';
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
-import { getActiveServerProfile, isDirectLlmProfile, normalizeServerUrl } from './lib/serverProfiles.ts';
-import { bakedAppVersion, compareSemVer } from './lib/appVersion.ts';
-import {
-  DIRECT_LLM_PROJECT_HASH,
-  DIRECT_LLM_PROJECT_NAME,
-  getDirectSessionList,
-  getDirectSessionDetail,
-  createDirectSession,
-  deleteDirectSession,
-  renameDirectSession,
-  enqueueDirectPrompt,
-  runDirectWatch,
-  abortDirectStream,
-} from './lib/directLlmClient.ts';
+import type { PermissionDecisionResult } from './lib/pendingPermission.ts';
+import type { ServerChatRuntime } from './lib/serverRuntime.ts';
+import { normalizeSessionTodoSnapshot } from './lib/todoWire.ts';
 
 // Serve / webui bootstrap: `/?token=<uuid>` is handed off via HttpOnly cookie
 // AND left visible on first paint so we can stash it for Authorization.
 // Remote LAN clients often fail to attach the cookie alone (in-app WebViews,
 // privacy mode) — Bearer from sessionStorage / localStorage is the reliable
-// path. Strip the token from the address bar only after it is stored
-// (CWE-598). If storage is unavailable, keep ?token= so later fetches still
-// authenticate.
-/** Shared sessionStorage key for the webui access token (api + LoginButton). */
-export const WEBUI_TOKEN_STORAGE_KEY = 'zap_webui_token';
-export const LEGACY_WEBUI_TOKEN_STORAGE_KEY = 'jeikcode_webui_token';
+// path. The address-bar token is stripped only after a protected request has
+// accepted it (CWE-598). If storage is unavailable, keep ?token= so later
+// fetches still authenticate.
+/** Shared storage key for the webui access token (api + RemoteAccessControl). */
+export const WEBUI_TOKEN_STORAGE_KEY = 'jeikcode_webui_token';
 
 function persistWebuiToken(value: string) {
   try {
@@ -40,15 +29,20 @@ function persistWebuiToken(value: string) {
   }
 }
 
+/**
+ * localStorage 是跨标签页共享的权威来源：另一个标签页通过新的 `/?token=`
+ * 交接成功后会把新 token 写进 localStorage。若这里优先读 per-tab 的
+ * sessionStorage，旧标签页会永远回放刷新前就该淘汰的旧 token（刷新也无效）。
+ */
 function storedWebuiToken(): string {
   try {
-    const session = sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) || sessionStorage.getItem(LEGACY_WEBUI_TOKEN_STORAGE_KEY);
-    if (session) return session;
+    const shared = localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY);
+    if (shared) return shared;
   } catch {
     /* ignore */
   }
   try {
-    return localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) || localStorage.getItem(LEGACY_WEBUI_TOKEN_STORAGE_KEY) || '';
+    return sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '';
   } catch {
     return '';
   }
@@ -60,6 +54,29 @@ function tokenFromUrl(): string {
   } catch {
     return '';
   }
+}
+
+/** 从非 HttpOnly 的 token cookie 兜底读取（某些异地上网环境存储孤岛）。 */
+function tokenFromDocumentCookie(): string {
+  try {
+    if (typeof document === 'undefined' || !document.cookie) return '';
+    for (const pair of document.cookie.split(';')) {
+      const trimmed = pair.trim();
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) continue;
+      // 只认明确的 webui 令牌 cookie，避免把 csrf_token 之类误当 Bearer，
+      // 反而遮蔽服务端刚下发的有效 HttpOnly cookie。
+      const name = trimmed.slice(0, eq).trim();
+      if (name !== 'token' && name !== 'access_token' && !name.startsWith('jeikcode_webui')) {
+        continue;
+      }
+      const val = trimmed.slice(eq + 1).trim();
+      if (val) return val;
+    }
+  } catch {
+    /* ignore */
+  }
+  return '';
 }
 
 function stripTokenFromAddressBar() {
@@ -74,79 +91,307 @@ function stripTokenFromAddressBar() {
   }
 }
 
-function captureWebuiToken(): string {
-  const fromUrl = tokenFromUrl();
-  if (fromUrl) {
-    persistWebuiToken(fromUrl);
-    // Leave ?token= in the address bar when storage is unavailable (desktop
-    // WebView / private mode). Stripping first would 401 every later fetch.
-    if (storedWebuiToken() === fromUrl) stripTokenFromAddressBar();
-    return fromUrl;
+/** 存储不可用时把 token 写回地址栏，重载后仍能从 URL 完成认证。 */
+function setTokenInAddressBar(token: string) {
+  try {
+    const url = new URL(location.href);
+    url.searchParams.set('token', token);
+    history.replaceState(null, '', url.pathname + '?' + url.searchParams.toString() + url.hash);
+  } catch {
+    /* ignore */
   }
-  return storedWebuiToken();
 }
 
-captureWebuiToken();
+/** 从存储与地址栏中彻底移除一个已被服务端拒绝的 token。 */
+function forgetWebuiToken(value: string) {
+  const token = value.trim();
+  if (!token) return;
+  try {
+    if (sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) === token) {
+      sessionStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) === token) {
+      localStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const url = new URL(location.href);
+    if (url.searchParams.get('token') !== token) return;
+    url.searchParams.delete('token');
+    const q = url.searchParams.toString();
+    history.replaceState(null, '', url.pathname + (q ? `?${q}` : '') + url.hash);
+  } catch {
+    /* ignore */
+  }
+}
 
 function currentWebuiToken(): string {
   const fromUrl = tokenFromUrl();
-  if (fromUrl) {
-    persistWebuiToken(fromUrl);
-    return fromUrl;
-  }
-
-  // 优先从当前激活的主机配置读取专用 Token
-  try {
-    const activeProfile = getActiveServerProfile();
-    if (activeProfile && activeProfile.token && activeProfile.token.trim()) {
-      return activeProfile.token.trim();
-    }
-  } catch {}
-
+  if (fromUrl) return fromUrl;
   const stored = storedWebuiToken();
   if (stored) return stored;
-
-  // 兜底从 document.cookie 读取（解决某些异地浏览器或非隐身页面存储孤岛问题）
-  try {
-    if (typeof document !== 'undefined' && document.cookie) {
-      for (const pair of document.cookie.split(';')) {
-        const trimmed = pair.trim();
-        if (trimmed.startsWith('token=') || trimmed.includes('_token=')) {
-          const val = trimmed.split('=')[1]?.trim();
-          if (val) {
-            persistWebuiToken(val);
-            return val;
-          }
-        }
-      }
-    }
-  } catch {}
-
+  const fromCookie = tokenFromDocumentCookie();
+  if (fromCookie) {
+    persistWebuiToken(fromCookie);
+    return fromCookie;
+  }
   return '';
 }
 
 function authHeaders(): Record<string, string> {
-  // X-Zap-Client & X-JeikCode-Client let the daemon tag telemetry as webui-originated
+  // X-JeikCode-Client lets the daemon tag telemetry as webui-originated
   // (resolve_client_mode → SessionMode::Webui); sent regardless of token.
-  const h: Record<string, string> = {
-    'X-Zap-Client': 'webui',
-    'X-JeikCode-Client': 'webui',
-  };
+  const h: Record<string, string> = { 'X-JeikCode-Client': 'webui' };
   const token = currentWebuiToken();
   if (token) h.Authorization = 'Bearer ' + token;
   return h;
 }
 
-/**
- * 获取当前目标主机的绝对 BaseURL (若为空字符串则代表同源当前主机)
- */
-export function getActiveServerBaseUrl(): string {
-  try {
-    const activeProfile = getActiveServerProfile();
-    return activeProfile && activeProfile.url ? normalizeServerUrl(activeProfile.url) : '';
-  } catch {
-    return '';
+export type AuthExpiredListener = (expired: boolean) => void;
+
+let authExpired = false;
+const authExpiredListeners = new Set<AuthExpiredListener>();
+
+/** 当前页面已知的全部凭据均被服务端拒绝——必须让用户提供新令牌。 */
+export function isAuthExpired(): boolean {
+  return authExpired;
+}
+
+/** 订阅认证失效状态变化；返回取消订阅函数。 */
+export function onAuthExpiredChange(listener: AuthExpiredListener): () => void {
+  authExpiredListeners.add(listener);
+  return () => {
+    authExpiredListeners.delete(listener);
+  };
+}
+
+function setAuthExpired(next: boolean) {
+  if (authExpired === next) return;
+  authExpired = next;
+  for (const listener of [...authExpiredListeners]) {
+    try {
+      listener(next);
+    } catch {
+      /* isolate subscriber failures */
+    }
   }
+}
+
+function clearAuthExpired() {
+  setAuthExpired(false);
+}
+
+/** 测试/重连用的复位入口：清除“凭据已全部失效”的锁存状态。 */
+export function resetAuthExpired(): void {
+  setAuthExpired(false);
+}
+
+// 另一个标签页完成 token 轮换后，localStorage 的 storage 事件会在本标签页触发。
+// 立刻采纳新 token 并解除认证失效锁存，让旧标签页无需刷新即可自愈。
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== WEBUI_TOKEN_STORAGE_KEY || !event.newValue) return;
+    try {
+      sessionStorage.setItem(WEBUI_TOKEN_STORAGE_KEY, event.newValue);
+    } catch {
+      /* ignore */
+    }
+    clearAuthExpired();
+  });
+}
+
+/** 用一个受保护请求确认并采纳新凭据（地址栏 token 只有在确认后才剥离）。 */
+function confirmWebuiToken(value: string) {
+  const token = value.trim();
+  if (!token) return;
+  persistWebuiToken(token);
+  // 存储不可用（桌面 WebView / 隐私模式）时保留地址栏 token，否则后续请求会 401。
+  if (storedWebuiToken() === token) stripTokenFromAddressBar();
+  clearAuthExpired();
+}
+
+function tokenFromAuthorization(value: string | null): string {
+  const raw = (value ?? '').trim();
+  if (!raw) return '';
+  return raw.replace(/^bearer\s+/i, '').trim();
+}
+
+/** 除已拒绝的那个之外，本页还能尝试的其他凭据（按优先级）。 */
+function tokenCandidates(rejected: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (raw: string) => {
+    const token = raw.trim();
+    if (!token || token === rejected || seen.has(token)) return;
+    seen.add(token);
+    out.push(token);
+  };
+  push(tokenFromUrl());
+  try {
+    push(localStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '');
+  } catch {
+    /* ignore */
+  }
+  try {
+    push(sessionStorage.getItem(WEBUI_TOKEN_STORAGE_KEY) ?? '');
+  } catch {
+    /* ignore */
+  }
+  push(tokenFromDocumentCookie());
+  return out;
+}
+
+function isPublicRequest(input: RequestInfo | URL): boolean {
+  const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  try {
+    return new URL(raw, 'http://localhost').pathname === '/health';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 构造请求头。`bearer === undefined` 表示沿用当前凭据；传 `null` 表示本次
+ * 不带 Bearer（只用 HttpOnly cookie 重新协商）；传字符串表示指定候选凭据。
+ */
+function buildHeaders(init: RequestInit, bearer?: string | null): Headers {
+  const headers = new Headers(init.headers);
+  if (!headers.has('X-JeikCode-Client')) headers.set('X-JeikCode-Client', 'webui');
+  if (bearer === undefined) {
+    if (!headers.has('Authorization')) {
+      const token = currentWebuiToken();
+      if (token) headers.set('Authorization', 'Bearer ' + token);
+    }
+  } else {
+    headers.delete('Authorization');
+    if (bearer) headers.set('Authorization', 'Bearer ' + bearer);
+  }
+  return headers;
+}
+
+async function sendWithToken(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  bearer: string | null,
+): Promise<Response> {
+  return fetch(input, { ...init, credentials: 'include', headers: buildHeaders(init, bearer) });
+}
+
+let recoveringUnauthorized = false;
+
+/**
+ * 401 自愈：绝不刷新页面（旧 token 仍会被存储回放，刷新只会无限循环）。
+ *
+ * 顺序：丢弃服务端刚拒绝的 token → 尝试其他已保存的候选 token（另一个
+ * 标签页可能已经轮换成功）→ 最后用 HttpOnly cookie 重试一次。全部失败才
+ * 锁存“认证失效”，交由 UI 让用户粘贴新访问链接/token。
+ */
+async function recoverUnauthorized(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  rejectedToken: string,
+  unauthorized: Response,
+): Promise<Response> {
+  if (authExpired || recoveringUnauthorized) return unauthorized;
+
+  recoveringUnauthorized = true;
+  try {
+    if (rejectedToken) forgetWebuiToken(rejectedToken);
+
+    for (const candidate of tokenCandidates(rejectedToken)) {
+      const retry = await sendWithToken(input, init, candidate);
+      if (retry.ok) {
+        confirmWebuiToken(candidate);
+        return retry;
+      }
+      if (retry.status !== 401) return retry;
+      forgetWebuiToken(candidate);
+    }
+
+    // Cookie 是 `/?token=` 交接后由服务端写入的 HttpOnly 凭据。旧 Bearer 会
+    // 在中间件里优先于 Cookie，把它遮蔽掉；去掉 Bearer 才能让新 Cookie 生效。
+    // 原本就没带 Bearer 说明 Cookie 已经被试过，无需重复请求。
+    if (!rejectedToken) {
+      setAuthExpired(true);
+      return unauthorized;
+    }
+    const cookieRetry = await sendWithToken(input, init, null);
+    if (cookieRetry.ok) {
+      clearAuthExpired();
+      return cookieRetry;
+    }
+    if (cookieRetry.status !== 401) return cookieRetry;
+
+    setAuthExpired(true);
+    return unauthorized;
+  } finally {
+    recoveringUnauthorized = false;
+  }
+}
+
+/**
+ * 校验并采纳用户粘贴的访问链接 / token（401 遮罩使用）。
+ * 校验请求本身必须先于持久化，避免把错误 token 写进共享存储污染其他标签页。
+ */
+export async function applyWebuiToken(raw: string): Promise<void> {
+  const token = parseTokenInput(raw);
+  if (!token) throw new Error('empty token');
+  const resp = await fetch('/config', {
+    credentials: 'include',
+    headers: {
+      'X-JeikCode-Client': 'webui',
+      Authorization: 'Bearer ' + token,
+    },
+  });
+  if (resp.status === 401 || resp.status === 403) throw new Error('invalid token');
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+  // 清掉所有被拒绝的旧值，再写入已验证的新 token（两端存储都覆盖）。
+  try {
+    sessionStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+  try {
+    localStorage.removeItem(WEBUI_TOKEN_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+  persistWebuiToken(token);
+  if (storedWebuiToken() === token) {
+    stripTokenFromAddressBar();
+  } else {
+    // 存储被禁用（隐私模式 / 受限 WebView）：把已验证的 token 留在地址栏，
+    // 否则随后的整页重载会丢失凭据并再次 401。
+    setTokenInAddressBar(token);
+  }
+  clearAuthExpired();
+}
+
+/** 接受裸 token、完整 `/?token=…` 链接或 `?token=…` 查询串。 */
+function parseTokenInput(raw: string): string {
+  const text = raw.trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    return (url.searchParams.get('token') ?? '').trim();
+  } catch {
+    /* not an absolute URL */
+  }
+  if (text.includes('token=')) {
+    try {
+      return (new URLSearchParams(text.replace(/^\?/, '')).get('token') ?? '').trim();
+    } catch {
+      /* not a query string */
+    }
+  }
+  return text;
 }
 
 /**
@@ -154,30 +399,22 @@ export function getActiveServerBaseUrl(): string {
  * and merges auth headers. Remote LAN clients need both cookie + Bearer.
  */
 async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
-  let targetInput = input;
-  const baseUrl = getActiveServerBaseUrl();
-
-  if (baseUrl) {
-    if (typeof input === 'string') {
-      if (input.startsWith('/')) {
-        targetInput = `${baseUrl}${input}`;
-      }
-    } else if (input instanceof URL) {
-      if (typeof window !== 'undefined' && input.origin === window.location.origin) {
-        targetInput = new URL(`${baseUrl}${input.pathname}${input.search}${input.hash}`);
-      }
-    }
-  }
-
-  const headers = new Headers(init.headers);
-  const auth = authHeaders();
-  for (const [k, v] of Object.entries(auth)) {
-    if (!headers.has(k)) headers.set(k, v);
-  }
+  const headers = buildHeaders(init);
+  const sentToken = tokenFromAuthorization(headers.get('Authorization'));
   try {
-    const resp = await fetch(targetInput, { ...init, credentials: 'include', headers });
+    const resp = await fetch(input, { ...init, credentials: 'include', headers });
     if (resp.status === 401) {
-      console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', targetInput);
+      console.warn('[API] 401 Unauthorized: 访问凭据无效或已失效', input);
+      return await recoverUnauthorized(input, init, sentToken, resp);
+    }
+    if (resp.ok && !isPublicRequest(input)) {
+      if (sentToken) {
+        // 用受保护端点的成功响应确认该凭据，再写入存储/剥离地址栏 token。
+        confirmWebuiToken(sentToken);
+      } else {
+        // 无 Bearer 也能成功（Cookie 生效或已切到免 token 模式）：解除认证门。
+        clearAuthExpired();
+      }
     }
     return resp;
   } catch (err: any) {
@@ -244,42 +481,55 @@ export async function getHealth(): Promise<HealthInfo> {
 }
 
 /**
- * 断点续传游标：只有「回放帧」带 `seq`（回合缓冲序号）；实时帧不带。
+ * 断点续传游标：live 与 replay 帧都带同一个 session 级 `seq`；`replay`
+ * 只说明送达路径（live append / replay replace）。
  *
  * 前端把收到的最大 seq 存起来，重连时当作 `after_seq` 带回去，服务器只补之后的
  * 帧 —— 收到的每一帧都是新的，不再需要靠内容猜「这条画过没有」。
  */
 export interface SeqTaggedFrame {
   seq?: number;
+  /** True only for frames read from the turn replay snapshot; live frames use
+   *  the same seq but append instead of replacing. Absent on old daemons, where
+   *  seq presence is the fallback replay marker. */
+  replay?: boolean;
 }
 
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
   /** `after_seq = -1`（新会话）的握手帧：不补发，只告知起始游标。 */
-  | { type: 'session_start'; session_id?: string; cursor: number }
-  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number }
+  | { type: 'session_start'; session_id?: string; cursor: number; caps?: string[] }
+  | { type: 'user'; content: string; display_text?: string; internal?: boolean; editable?: boolean; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number; client_input_id?: string; images?: ImageData[] }
   | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
-  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
-  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number; part_rev?: number }
+  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number; part_rev?: number }
   | { type: 'tool_start'; id: string; name: string; arguments: unknown; message_id?: string }
   | { type: 'tool_output'; id?: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
+  /** 工具执行已返回（权威结果帧仍按发射顺序排队）。客户端用它先把行状态落定，
+   *  避免同一并发批次里耗时长工具未完成时，短工具陪着一起“运行中”。 */
+  | { type: 'tool_finished'; id: string; success: boolean }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number; cached?: number; cached_estimated?: boolean; reasoning?: number }
   | { type: 'permission_request'; session_id: string; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null> }
-  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
-  | { type: 'stopped' }
-  | { type: 'error'; message: string }
-  | { type: 'warning'; message: string; message_id?: string }
+  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null>; timestamps?: Array<number | null>; anchor_message_id?: string }
+  | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string; message_id?: string; operation_id?: string }
+  | { type: 'stopped'; session_id?: string; operation_id?: string }
+  | { type: 'error'; message: string; message_id?: string; operation_id?: string }
+  | { type: 'warning'; message: string; message_id?: string; /** Live path: committed compaction's post-context tokens. */ tokens_after?: number }
+  /** Committed compaction: update the context meter immediately (no usage follows). */
+  | { type: 'context_compacted'; session_id?: string; tokens: number }
+  /** 已落盘的显示通知（如手动压缩边界）：带显示日志的权威 `id`/`display_seq`，
+   *  各端按同一序号摆成独立 system 行。 */
+  | { type: 'display_notice'; session_id?: string; id: string; display_seq: number; text: string; created_at?: number }
   | { type: 'persistence_warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
+  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null; message_id?: string }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
-  // events (see ArtifactDetector in crates/zap-daemon/src/lib.rs). Without handling
+  // events (see ArtifactDetector in crates/jeikcode-daemon/src/lib.rs). Without handling
   // these, code block content is silently lost in the WebUI while the TUI sees it fine.
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null; fence_len?: number | null }
   | { type: 'artifact_content'; id: string; content: string }
@@ -287,6 +537,8 @@ export type SSEEvent =
   | { type: 'session_renamed'; session_id: string; name: string }
   | { type: 'session_status'; session_id?: string; status: string }
   | { type: 'command_output'; text: string }
+  /** 本会话待发卡片队列的权威全量快照（`push_to_session_queue` 等带内来源）。 */
+  | { type: 'queue_updated'; session_id: string; items: QueuedMessageApiItem[] }
   | SessionMutationEvent;
 
 export interface ModelInfo {
@@ -312,20 +564,6 @@ export interface ModelInfo {
 }
 
 export async function getModels(): Promise<ModelInfo[]> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    const profile = getActiveServerProfile();
-    const model = profile.model || 'deepseek-chat';
-    return [
-      {
-        provider: profile.name,
-        model,
-        provider_type: 'direct_llm',
-        is_default: true,
-        effort_applicable: false,
-        reasoning_effort: null,
-      },
-    ];
-  }
   const r = await apiFetch('/models', { headers: authHeaders() });
   if (!r.ok) throw new Error(`list models failed: ${r.status}`);
   const body: unknown = await r.json();
@@ -349,6 +587,7 @@ export interface SessionMutationEvent {
   text?: string;
   images?: ImageData[];
   delete_turn?: boolean;
+  truncate_after?: boolean;
   target_index?: number;
   target_message_id?: string;
   ts?: number;
@@ -381,16 +620,6 @@ export async function postChatPrompt(
   body: StreamChatBody,
   signal?: AbortSignal,
 ): Promise<PromptAck> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    const targetSessionId = body.session_id || createDirectSession().id;
-    enqueueDirectPrompt(targetSessionId, body.message, body.images, signal);
-    return {
-      status: 'admitted',
-      operation_id: targetSessionId,
-      session_id: targetSessionId,
-    };
-  }
-
   const resp = await apiFetch('/chat', {
     method: 'POST',
     headers: {
@@ -442,10 +671,6 @@ export interface StopChatResult {
  * delivers after `released`, which is what removes the 409-then-requeue flash.
  */
 export async function stopChat(requestId: string): Promise<StopChatResult> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    abortDirectStream(requestId);
-    return { success: true, released: true };
-  }
   const resp = await apiFetch('/chat/stop', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -466,14 +691,56 @@ export async function stopChat(requestId: string): Promise<StopChatResult> {
   }
 }
 
+/** Durably reserve the steer intent + steering queue card on the server. */
+export async function admitChatSteer(
+  sessionId: string,
+  message: string,
+  images?: ImageData[],
+  clientInputId?: string,
+  createdAt?: number,
+  approvalMode?: ApprovalMode,
+): Promise<void> {
+  await postChatSteerEndpoint(
+    '/chat/steer/admit',
+    sessionId,
+    message,
+    images,
+    clientInputId,
+    createdAt,
+    approvalMode,
+  );
+}
+
 /** Fold a queued follow-up into the running `/chat` turn at the next step. */
 export async function postChatSteer(
   sessionId: string,
   message: string,
   images?: ImageData[],
   clientInputId?: string,
+  createdAt?: number,
+  approvalMode?: ApprovalMode,
 ): Promise<void> {
-  const resp = await apiFetch('/chat/steer', {
+  await postChatSteerEndpoint(
+    '/chat/steer',
+    sessionId,
+    message,
+    images,
+    clientInputId,
+    createdAt,
+    approvalMode,
+  );
+}
+
+async function postChatSteerEndpoint(
+  path: '/chat/steer' | '/chat/steer/admit',
+  sessionId: string,
+  message: string,
+  images?: ImageData[],
+  clientInputId?: string,
+  createdAt?: number,
+  approvalMode?: ApprovalMode,
+): Promise<void> {
+  const resp = await apiFetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
@@ -481,6 +748,8 @@ export async function postChatSteer(
       message,
       ...(images && images.length ? { images } : {}),
       ...(clientInputId ? { client_input_id: clientInputId } : {}),
+      ...(createdAt ? { created_at: createdAt } : {}),
+      ...(approvalMode ? { approval_mode: approvalMode } : {}),
     }),
   });
   let body: { accepted?: boolean; error?: string } = {};
@@ -498,6 +767,7 @@ export async function postChatSteer(
 export async function cancelChatSteer(
   sessionId: string,
   message?: string,
+  clientInputId?: string,
 ): Promise<void> {
   const resp = await apiFetch('/chat/steer/cancel', {
     method: 'POST',
@@ -505,6 +775,7 @@ export async function cancelChatSteer(
     body: JSON.stringify({
       session_id: sessionId,
       ...(message ? { message } : {}),
+      ...(clientInputId ? { client_input_id: clientInputId } : {}),
     }),
   }).catch(() => null);
   if (!resp || !resp.ok) {
@@ -520,20 +791,30 @@ export async function cancelChatSteer(
   }
 }
 
-export async function revealInFileExplorer(path: string): Promise<void> {
-  await apiFetch('/fs/reveal', {
+export async function revealInFileExplorer(path: string, cwd?: string): Promise<{ success: boolean; is_dir?: boolean }> {
+  const resp = await apiFetch('/fs/reveal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ path }),
-  }).catch(() => {});
+    body: JSON.stringify({ path, cwd }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
-export async function openFileWithOs(path: string): Promise<void> {
-  await apiFetch('/fs/open', {
+export async function openFileWithOs(path: string, cwd?: string): Promise<{ success: boolean }> {
+  const resp = await apiFetch('/fs/open', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ path }),
-  }).catch(() => {});
+    body: JSON.stringify({ path, cwd }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error((err as any).error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
 export function getFsRawUrl(filePath: string): string {
@@ -542,30 +823,105 @@ export function getFsRawUrl(filePath: string): string {
 
 export interface QueuedMessageApiItem {
   id: number | string;
+  /** Stable client correlation id: the atomic queue-claim key and the eventual
+   *  prompt id. Minted when the card is created; absent on legacy cards. */
+  client_input_id?: string;
   text: string;
   images?: ImageData[];
   kind: 'queue' | 'steering' | 'steer';
   approval_mode?: ApprovalMode;
+  /** 卡片创建时间（epoch ms）：跨端 / 刷新恢复保留原始排队时间。 */
+  createdAt?: number;
+  /** 立即发送已画上气泡、但当时投递被退回：drain 必须照发。 */
+  forceSend?: boolean;
 }
 
-export async function getChatQueue(sessionId: string): Promise<QueuedMessageApiItem[]> {
+export interface ChatQueueSnapshot {
+  revision: number;
+  items: QueuedMessageApiItem[];
+}
+
+export async function getChatQueue(sessionId: string): Promise<ChatQueueSnapshot> {
   const resp = await apiFetch(`/chat/queue?session_id=${encodeURIComponent(sessionId)}`, {
     headers: authHeaders(),
   });
-  if (!resp.ok) return [];
+  if (!resp.ok) return { revision: 0, items: [] };
   try {
-    const list = await resp.json();
-    return Array.isArray(list) ? list : [];
+    const data = await resp.json();
+    // New daemons return `{ revision, items }`; accept the legacy bare array too.
+    if (Array.isArray(data)) return { revision: 0, items: data };
+    return {
+      revision: typeof data?.revision === 'number' ? data.revision : 0,
+      items: Array.isArray(data?.items) ? data.items : [],
+    };
   } catch {
-    return [];
+    return { revision: 0, items: [] };
   }
 }
 
-export async function saveChatQueue(sessionId: string, items: QueuedMessageApiItem[]): Promise<void> {
-  await apiFetch('/chat/queue', {
+export async function saveChatQueue(
+  sessionId: string,
+  items: QueuedMessageApiItem[],
+  baseRevision?: number,
+): Promise<{ revision: number; conflict: boolean; items?: QueuedMessageApiItem[] }> {
+  const resp = await apiFetch('/chat/queue', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ session_id: sessionId, items }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      items,
+      ...(typeof baseRevision === 'number' ? { base_revision: baseRevision } : {}),
+    }),
+  }).catch(() => null);
+  if (!resp) return { revision: baseRevision ?? 0, conflict: false };
+  const data = await resp.json().catch(() => null);
+  if (resp.status === 409) {
+    return {
+      revision: typeof data?.revision === 'number' ? data.revision : 0,
+      conflict: true,
+      items: Array.isArray(data?.items) ? data.items : [],
+    };
+  }
+  return {
+    revision: typeof data?.revision === 'number' ? data.revision : (baseRevision ?? 0),
+    conflict: false,
+  };
+}
+
+/** Atomically take ownership of one queued card. Exactly one tab can win. */
+export async function claimChatQueue(
+  sessionId: string,
+  clientInputId: string,
+  item?: QueuedMessageApiItem,
+): Promise<boolean> {
+  const resp = await apiFetch('/chat/queue/claim', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({
+      session_id: sessionId,
+      client_input_id: clientInputId,
+      ...(item ? { item } : {}),
+    }),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const data = (await resp.json().catch(() => ({}))) as { claimed?: boolean };
+  return data.claimed === true;
+}
+
+/** Return a claim when delivery failed; the card is restored for a later drain. */
+export async function releaseChatQueue(
+  sessionId: string,
+  clientInputId: string,
+  item?: QueuedMessageApiItem,
+): Promise<void> {
+  await apiFetch('/chat/queue/release', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({
+      session_id: sessionId,
+      client_input_id: clientInputId,
+      ...(item ? { item } : {}),
+    }),
   }).catch(() => {});
 }
 
@@ -623,9 +979,6 @@ export async function postSystemNotify(input: {
 }
 
 export async function getActiveChatSessions(): Promise<string[]> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return [];
-  }
   const resp = await apiFetch('/chat/active', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`active chats failed: ${resp.status}`);
   const body: unknown = await resp.json();
@@ -633,6 +986,22 @@ export async function getActiveChatSessions(): Promise<string[]> {
     throw new Error('active chats returned an invalid payload');
   }
   return body;
+}
+
+/**
+ * 会话级服务端权威运行态（`chat` / `live` / `loop` / `goal` 并集）。
+ *
+ * `/chat/active` 只是一个 id 列表，且口径只覆盖「有回合在执行」；`/loop` 在两次
+ * 唤醒之间没有执行中的回合，却仍有控制器在续轮。WebUI 的 busy 只认这份快照，
+ * 不再用本地启发式猜「是不是已经停下来了」。
+ */
+export async function getChatRuntime(sessionId: string): Promise<ServerChatRuntime> {
+  const resp = await apiFetch(
+    `/chat/runtime?session_id=${encodeURIComponent(sessionId)}`,
+    { headers: authHeaders() },
+  );
+  if (!resp.ok) throw new Error(`chat runtime failed: ${resp.status}`);
+  return (await resp.json()) as ServerChatRuntime;
 }
 
 /** Unanswered interactive prompts for an active turn (Build / AcceptEdits / Plan).
@@ -653,13 +1022,6 @@ export interface ChatPendingInteractive {
 }
 
 export async function getChatPending(sessionId: string): Promise<ChatPendingInteractive> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return {
-      active: false,
-      permission: null,
-      user_input: null,
-    };
-  }
   const resp = await apiFetch(
     `/chat/pending?session_id=${encodeURIComponent(sessionId)}`,
     { headers: authHeaders() },
@@ -679,6 +1041,24 @@ export async function getChatPending(sessionId: string): Promise<ChatPendingInte
 }
 
 /**
+ * 获取或分配当前浏览器标签页（Window Tab）专属的唯一客户端 ID。
+ * 存放在 sessionStorage 中，单标签页刷新保持不变（防止同端重复注册），多标签页/多设备各具唯一性（避免多端待机互踢）。
+ */
+export function getTabClientId(): string {
+  if (typeof window === 'undefined' || !window.sessionStorage) return 'default_client';
+  try {
+    let id = window.sessionStorage.getItem('jeikcode_tab_client_id');
+    if (!id) {
+      id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `client_${Date.now().toString(36)}`;
+      window.sessionStorage.setItem('jeikcode_tab_client_id', id);
+    }
+    return id;
+  } catch {
+    return 'default_client';
+  }
+}
+
+/**
  * Reattach to a turn started by another client (OpenAI API / another tab).
  * Same SSE `ChatEvent` frames as `POST /chat`.
  */
@@ -687,14 +1067,13 @@ export async function watchChatSession(
   /** 回放帧带 `seq` 游标，调用方据此推进断点续传游标（见 `SeqTaggedFrame`）。 */
   onEvent: (event: SSEEvent & SeqTaggedFrame) => void,
   signal?: AbortSignal,
-  opts?: { standbyOnly?: boolean; afterSeq?: number },
+  opts?: { standbyOnly?: boolean; afterSeq?: number; clientId?: string },
 ): Promise<void> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return runDirectWatch(sessionId, onEvent, signal);
-  }
   const params = new URLSearchParams({ session_id: sessionId });
   if (opts?.standbyOnly) params.set('standby', 'true');
   if (opts?.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
+  const effectiveClientId = opts?.clientId || getTabClientId();
+  if (effectiveClientId) params.set('client_id', effectiveClientId);
   const streamAbort = new AbortController();
   const onParentAbort = () => streamAbort.abort();
   if (signal) {
@@ -892,12 +1271,32 @@ export async function streamChat(
   }
 }
 
+/**
+ * Hard upper bound for a decision POST. Approval delivery is a tiny request, but
+ * the card latches its buttons while it is in flight: a half-open connection
+ * (long-idle NAT/relay drop, suspended desktop webview) that never answers would
+ * otherwise leave the card permanently unclickable with no error.
+ */
+const PERMISSION_DECISION_TIMEOUT_MS = 15_000;
+
+function permissionDecisionSignal(): AbortSignal | undefined {
+  if (typeof AbortSignal === 'undefined') return undefined;
+  const AbortSignalAny = AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal };
+  if (typeof AbortSignalAny.timeout === 'function') {
+    return AbortSignalAny.timeout(PERMISSION_DECISION_TIMEOUT_MS);
+  }
+  if (typeof AbortController === 'undefined') return undefined;
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), PERMISSION_DECISION_TIMEOUT_MS);
+  return controller.signal;
+}
+
 export async function respondPermission(
   sessionId: string,
   approvalId: string,
   decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
   toolName?: string,
-): Promise<{ success: boolean }> {
+): Promise<PermissionDecisionResult> {
   const resp = await apiFetch('/chat/permission', {
     method: 'POST',
     headers: {
@@ -905,8 +1304,39 @@ export async function respondPermission(
       ...authHeaders(),
     },
     body: JSON.stringify({ session_id: sessionId, approval_id: approvalId, decision, tool_name: toolName }),
+    signal: permissionDecisionSignal(),
   });
-  return resp.json();
+  // The daemon answers every decision with a JSON verdict (success / expired /
+  // already_resolved). A non-JSON body is a transport-level surprise, not a
+  // verdict — surface it as a retryable failure instead of guessing.
+  const text = await resp.text();
+  let body: unknown = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+  }
+  if (body && typeof body === 'object') {
+    const verdict = body as {
+      success?: unknown;
+      already_resolved?: unknown;
+      applied?: unknown;
+      expired?: unknown;
+      error?: unknown;
+    };
+    return {
+      success: verdict.success === true,
+      already_resolved: verdict.already_resolved === true,
+      applied: typeof verdict.applied === 'string' ? verdict.applied : undefined,
+      expired: verdict.expired === true,
+      error: typeof verdict.error === 'string' ? verdict.error : undefined,
+    };
+  }
+  throw new Error(
+    resp.ok ? 'permission decision returned an invalid payload' : `permission decision failed: HTTP ${resp.status}`,
+  );
 }
 
 // --- Session types ---
@@ -919,6 +1349,11 @@ export interface SessionMeta {
   updated_at: number;
   message_count: number;
   file_size?: number;
+  approval_mode?: ApprovalMode | null;
+  preferred_model?: string | null;
+  /** Per-session reasoning effort; absent means "inherit the provider default". */
+  reasoning_effort?: string | null;
+  thinking_budget?: number | null;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -945,6 +1380,20 @@ export interface SessionMessage {
   /** Stable per-message identity from the pipeline (`Message.id`). Absent on
    *  older daemons; UI then falls back to positional identity. */
   id?: string;
+  /** Durable client-input correlation id (`SessionInput.id`) for user rows.
+   *  Lets a reloaded bubble match its queued steer card by identity. */
+  client_input_id?: string;
+  /** v4 display order cursor (`seq`). Additive; absent for snapshot-only rows. */
+  seq?: number;
+  /** Server-rendered user-facing text (already unwrapped / stripped). */
+  display_text?: string;
+  /** Server-authored visibility flag: hide this row from the transcript. */
+  internal?: boolean;
+  /** Server-authored mutation permission; false = archive/presentation row. */
+  editable?: boolean;
+  /** Persisted kernel turn id (display/session detail). Absent on older daemons
+   *  and backfilled rows; the timer falls back to steer-root penetration then. */
+  turn_id?: number;
   /** Model reasoning/thinking for assistant messages (persisted losslessly;
    *  previously dropped at the API boundary so a reload lost all earlier
    *  thinking). Rendered as a collapsible thinking block before the text. */
@@ -970,7 +1419,68 @@ export interface SessionTurnOutline {
   ordinal?: number;
   /** Absolute index in the full transcript (not the returned window). */
   index: number;
-  text: string;
+  /** Stable persisted message id; primary dedupe identity when available. */
+  id?: string;
+  /** Short rail label. Full question text comes from the loaded messages. */
+  label: string;
+  /** Admitted but not yet folded/persisted (durable input log). */
+  pending?: boolean;
+  /** Local live row not yet confirmed by the authoritative server outline. */
+  provisional?: boolean;
+  /** Admission sequence from the input log. */
+  seq?: number;
+}
+
+export interface SessionDetail {
+  id: string;
+  name: string;
+  working_dir: string;
+  created_at: number;
+  updated_at: number;
+  /** Total messages on disk (not the returned window size). */
+  message_count: number;
+  /** 会话权威版本（内核 `cache_epoch`）。每次显式变更（编辑/删除/回溯）自增。
+   *  客户端用它给缓存写入设闸门：旧快照永远不能覆盖新快照。旧 daemon 缺省为 0。 */
+  revision?: number;
+  /** Identity-first paging cursor (oldest display seq in this window). */
+  cursor?: { oldest_seq?: number; total: number };
+  /** 本 daemon 的能力集（`id` / `revision` / `seq` / `session_mutated`）。
+   *  声明了 `id` 就关闭客户端所有文本兜底。旧 daemon 缺省为空。 */
+  /** 旧 daemon 的兼容声明字段已废弃；新契约始终身份优先。 */
+  /** Index of `messages[0]` in the full transcript. Absent on older daemons.
+   *  When `pinned_user_index` is set, `messages[0]` is that pinned question and
+   *  `offset` is the index of `messages[1]`. */
+  offset?: number;
+  /** Absolute index of the user question pinned in front of a mid-turn tail page.
+   *  The rows between it and `offset` are not in this page. */
+  pinned_user_index?: number;
+  /** All user questions for the right-rail outline. Independent of the message window. */
+  turns?: SessionTurnOutline[];
+  /** Daemon capability negotiation (`id`, `revision`, `terminal_operation_id`, ...). */
+  caps?: string[];
+  /** Highest durable input-log sequence. Pass back as `after_seq` to fetch only
+   *  newly admitted prompt/steer rows. */
+  input_cursor?: number;
+  messages: SessionMessage[];
+  /** Per-session model selection. Absent on older sessions. */
+  preferred_model?: string | null;
+  /** Per-session approval mode ("build" | "accept_edits" | "bypass" | "plan"). Absent on older sessions. */
+  approval_mode?: ApprovalMode | null;
+  /** Per-session reasoning effort; absent means "inherit the provider default". */
+  reasoning_effort?: string | null;
+  thinking_budget?: number | null;
+  /** Last-request occupancy for the footer (persists across restart). Not turn-cumulative billing. */
+  token_usage?: SessionTokenUsage | null;
+  /** `manual` / `scheduled` / `protocol`. Protocol sessions are observed in Auto. */
+  origin?: 'manual' | 'scheduled' | 'protocol';
+  /** Authoritative active todo list from backend transcript. */
+  todos?: Array<{ id?: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+  /** Monotonic server revision of `todos`; lower revisions must never overwrite higher ones. */
+  todos_revision?: number;
+  /** Process-unique daemon instance. Todo revisions restart with the daemon. */
+  daemon_instance_id?: string;
+  /** Per-turn execution telemetry for turn analysis and token stats. */
+  turn_stats?: TurnStat[];
 }
 
 export interface ModelUsageStat {
@@ -987,35 +1497,15 @@ export interface TurnStat {
   tool_call_count: number;
   duration_ms: number;
   total_tokens: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  model?: string;
+  finish_reason?: string;
   errored?: boolean;
   used_tokens?: number;
   ctx_window?: number;
   model_usage?: ModelUsageStat[];
-}
-
-export interface SessionDetail {
-  id: string;
-  name: string;
-  working_dir: string;
-  created_at: number;
-  updated_at: number;
-  /** Total messages on disk (not the returned window size). */
-  message_count: number;
-  /** Index of `messages[0]` in the full transcript. Absent on older daemons. */
-  offset?: number;
-  /** All user questions for the right-rail outline. Independent of the message window. */
-  turns?: SessionTurnOutline[];
-  messages: SessionMessage[];
-  /** Per-session model selection. Absent on older sessions. */
-  preferred_model?: string | null;
-  /** Last-request occupancy for the footer (persists across restart). Not turn-cumulative billing. */
-  token_usage?: SessionTokenUsage | null;
-  /** `manual` / `scheduled` / `protocol`. Protocol sessions are observed in Auto. */
-  origin?: 'manual' | 'scheduled' | 'protocol';
-  /** Authoritative active todo list from backend transcript. */
-  todos?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
-  /** Per-turn execution telemetry (tokens, duration, tool call count, errors) for turn analysis. */
-  turn_stats?: TurnStat[];
 }
 
 /** Token footer snapshot from session turn_stats (GET /projects/:hash/sessions/:id).
@@ -1034,9 +1524,6 @@ export interface SessionTokenUsage {
 // anywhere use searchSessions. This capped list is only for cross-project
 // lookups where 50 is enough (e.g. URL-restore of a recent session).
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return getDirectSessionList();
-  }
   const resp = await apiFetch('/sessions', { headers: authHeaders() });
   return resp.json();
 }
@@ -1047,9 +1534,6 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
 // The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
 // stamp it back on for the client's project-scoped dedup/filter.
 export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return getDirectSessionList();
-  }
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
     headers: authHeaders(),
   });
@@ -1058,14 +1542,22 @@ export async function listProjectSessions(projectHash: string): Promise<SessionM
   return list.map((m) => ({ ...m, project_hash: projectHash }));
 }
 
+/**
+ * 广播「该会话已被用户打开」：其它标签页 / 浏览器收到 `session_seen` 后
+ * 熄灭该会话的绿色「刚完成」徽标。徽标由全局 `activity` 点亮，
+ * 熄灭必须走同一条全局总线，否则只清当前实例会留下幽灵勾。
+ */
+export async function postSessionSeen(sessionId: string): Promise<void> {
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/seen`, {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`mark session seen failed: ${resp.status}`);
+}
+
 // Cross-project session search by name, UNCAPPED. Backs the search modal so it
 // can find a session in ANY project (the sidebar list itself is per-project).
 export async function searchSessions(q: string): Promise<SessionMetaWithProject[]> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    const list = getDirectSessionList();
-    const lower = q.toLowerCase();
-    return list.filter((s) => (s.name || '').toLowerCase().includes(lower));
-  }
   const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}`, {
     headers: authHeaders(),
   });
@@ -1077,10 +1569,6 @@ export async function searchSessions(q: string): Promise<SessionMetaWithProject[
 // URL-restore only has a short id from the address bar; the capped `/sessions`
 // can't locate an older session. Returns null when nothing matches.
 export async function resolveSession(id: string): Promise<SessionMetaWithProject | null> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    const list = getDirectSessionList();
-    return list.find((s) => s.id === id || s.id.startsWith(id)) || null;
-  }
   const resp = await apiFetch(`/sessions/resolve/${encodeURIComponent(id)}`, {
     headers: authHeaders(),
   });
@@ -1101,16 +1589,6 @@ export async function createSession(
   workingDir?: string,
   title?: string,
 ): Promise<CreateSessionResponse> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    const meta = createDirectSession(title);
-    return {
-      id: meta.id,
-      name: meta.name || '新对话',
-      working_dir: '',
-      project_hash: DIRECT_LLM_PROJECT_HASH,
-      created_at: meta.created_at,
-    };
-  }
   const body: Record<string, string> = {};
   if (workingDir) body.working_dir = workingDir;
   if (title) body.title = title;
@@ -1128,10 +1606,6 @@ export async function renameSession(
   sessionId: string,
   name: string,
 ): Promise<void> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    renameDirectSession(sessionId, name);
-    return;
-  }
   const resp = await apiFetch(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/rename`,
     {
@@ -1157,10 +1631,6 @@ export async function deleteSession(
   projectHash: string,
   sessionId: string,
 ): Promise<void> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    deleteDirectSession(sessionId);
-    return;
-  }
   const resp = await apiFetch(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}`,
     { method: 'DELETE', headers: authHeaders() },
@@ -1196,8 +1666,10 @@ export async function patchSessionMessage(
     expected_text?: string;
     expected_message_id?: string;
     expected_role?: 'user' | 'assistant';
+    /** Edit = rewrite: remove every message after this row from context/disk. */
+    truncate_after?: boolean;
   },
-): Promise<{ success: boolean; revision: number; source_index: number }> {
+): Promise<{ success: boolean; revision: number; source_index: number; message_count?: number; truncated?: boolean }> {
   const resp = await apiFetch(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/messages/${index}`,
     {
@@ -1300,6 +1772,8 @@ export interface ConfigInfo {
   language?: string;
   /** Whether to display the GitHub repository logo in the UI. Defaults to true. */
   github_logo?: boolean;
+  /** Agent 执行完会改动分支/引用/远端的 git 命令后，是否自动向所有会话广播 Git 刷新。默认 true。 */
+  auto_git_sync?: boolean;
 }
 
 export async function getConfig(): Promise<ConfigInfo> {
@@ -1307,9 +1781,16 @@ export async function getConfig(): Promise<ConfigInfo> {
   return readApiJson<ConfigInfo>(resp);
 }
 
-/** Persist the global language switch (`en`, `vi`, or `zh`). */
-export async function postLanguage(lang: 'en' | 'zh' | 'vi'): Promise<void> {
-  const language = lang === 'zh' ? 'zh-CN' : lang === 'vi' ? 'vi-VN' : 'en';
+/** Persist the global language switch. */
+export async function postLanguage(lang: Lang): Promise<void> {
+  const language =
+    lang === 'zh'
+      ? 'zh-CN'
+      : lang === 'zh-TW'
+        ? 'zh-TW'
+        : lang === 'vi'
+          ? 'vi-VN'
+          : lang;
   const resp = await apiFetch('/config/language', {
     method: 'POST',
     headers: {
@@ -1319,6 +1800,16 @@ export async function postLanguage(lang: 'en' | 'zh' | 'vi'): Promise<void> {
     body: JSON.stringify({ language }),
   });
   if (!resp.ok) throw new Error(`set language failed: ${resp.status}`);
+}
+
+/** Persist the "auto git sync" switch (POST /config/auto-git-sync). */
+export async function postAutoGitSync(enabled: boolean): Promise<void> {
+  const resp = await apiFetch('/config/auto-git-sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!resp.ok) throw new Error(`set auto git sync failed: ${resp.status}`);
 }
 
 export interface RemoteAccessStatus {
@@ -1333,6 +1824,10 @@ export interface RemoteAccessStatus {
   firewall?: string | null;
   /** Saved port that differs from the socket listening now. */
   next_port?: number | null;
+  /** Saved host that differs from the socket listening now. */
+  next_host?: string | null;
+  /** `desktop` | `systemd` | `procd` | `launchd` | `windows-logon` | `foreground` */
+  launch_mode?: string;
 }
 
 export async function getRemoteAccess(): Promise<RemoteAccessStatus> {
@@ -1350,6 +1845,8 @@ export async function postRemoteAccess(
     stop?: boolean;
     /** Save port and token for the next 0.0.0.0 launch. Same port updates the token now. */
     apply_launch?: boolean;
+    /** Immediately restart the daemon process to apply new host/port. */
+    restart?: boolean;
   },
   signal?: AbortSignal,
 ): Promise<RemoteAccessStatus> {
@@ -1375,6 +1872,61 @@ export async function postRemoteAccess(
   return resp.json();
 }
 
+export interface ZombieProcessInfo {
+  pid: number;
+  name: string;
+  path?: string | null;
+  reason: string;
+}
+
+export interface LegacyStatusResponse {
+  has_legacy_files: boolean;
+  legacy_files: string[];
+  has_dirty_path: boolean;
+  zombie_count: number;
+  zombies: ZombieProcessInfo[];
+  needs_migration: boolean;
+}
+
+export async function getLegacyStatus(): Promise<LegacyStatusResponse> {
+  const resp = await apiFetch('/api/system/legacy-status', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`failed to get legacy status: ${resp.status}`);
+  return resp.json();
+}
+
+export async function postMigrateLegacy(killZombies: boolean): Promise<{
+  success: boolean;
+  cleaned_files_count: number;
+  killed_zombies_count: number;
+}> {
+  const resp = await apiFetch('/api/system/migrate-legacy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ kill_zombies: killZombies }),
+  });
+  if (!resp.ok) throw new Error(`failed to migrate legacy: ${resp.status}`);
+  return resp.json();
+}
+
+export interface DesktopSettings {
+  close_action: 'ask' | 'tray' | 'quit';
+}
+
+export async function getDesktopSettings(): Promise<DesktopSettings> {
+  const resp = await apiFetch('/api/system/desktop-settings', { headers: authHeaders() });
+  if (!resp.ok) return { close_action: 'ask' };
+  return resp.json();
+}
+
+export async function postDesktopSettings(settings: DesktopSettings): Promise<void> {
+  const resp = await apiFetch('/api/system/desktop-settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(settings),
+  });
+  if (!resp.ok) throw new Error('failed to save desktop settings');
+}
+
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
 export async function postConfigReload(): Promise<void> {
   const resp = await apiFetch('/config/reload', {
@@ -1397,19 +1949,6 @@ export interface ProjectInfo {
 }
 
 export async function getProjects(): Promise<ProjectInfo[]> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return [
-      {
-        hash: DIRECT_LLM_PROJECT_HASH,
-        name: DIRECT_LLM_PROJECT_NAME,
-        working_dir: 'local://direct_llm',
-        description: 'Direct LLM Client',
-        session_count: getDirectSessionList().length,
-        created_at: Date.now(),
-        last_updated: Date.now(),
-      },
-    ];
-  }
   const resp = await apiFetch('/projects', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`list projects failed: ${resp.status}`);
   const body: unknown = await resp.json();
@@ -1516,12 +2055,6 @@ export interface ProjectState {
 }
 
 export async function getProject(): Promise<ProjectState> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return {
-      working_dir: '',
-      project_hash: DIRECT_LLM_PROJECT_HASH,
-    };
-  }
   const resp = await apiFetch('/project', { headers: authHeaders() });
   return resp.json();
 }
@@ -1544,8 +2077,9 @@ export interface McpStatusInfo {
   blocked?: string[];
 }
 
-export async function getMcpStatus(): Promise<McpStatusInfo> {
-  const resp = await apiFetch('/mcp/status', { headers: authHeaders() });
+export async function getMcpStatus(workingDir?: string): Promise<McpStatusInfo> {
+  const q = workingDir ? `?working_dir=${encodeURIComponent(workingDir)}` : '';
+  const resp = await apiFetch(`/mcp/status${q}`, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
   return resp.json();
 }
@@ -1581,6 +2115,21 @@ export async function getSkills(): Promise<SkillInfo[]> {
   return resp.json();
 }
 
+// --- User-invoked slash commands (custom `commands/*.md`) ---
+
+export type CommandArgsRequirement = 'required' | 'optional' | 'none';
+
+export interface CommandInfo {
+  name: string;
+  description: string;
+  args_requirement: CommandArgsRequirement;
+}
+
+export async function getCommands(): Promise<CommandInfo[]> {
+  const resp = await apiFetch('/commands', { headers: authHeaders() });
+  return resp.json();
+}
+
 // --- Unified capabilities (MCP servers + skills, GLOBAL + PROJECT scopes) ---
 
 export type CapKind = 'mcp' | 'skill';
@@ -1605,11 +2154,21 @@ export interface CapabilityItem {
   error?: string;
   /** Skills only: the folder that owns the skill (for "reveal in explorer"). */
   dir?: string;
+  /** Skills only: the project-scope state file IS the global one (home project).
+   *  Both toggles would edit one file, so the project toggle is hidden. */
+  project_scope_shared?: boolean;
 }
 
 /** GET /capabilities — one unified list for the sidebar's MCP + skills menus. */
-export async function getCapabilities(): Promise<CapabilityItem[]> {
-  const resp = await apiFetch('/capabilities', { headers: authHeaders() });
+/**
+ * Unified MCP + skills inventory. `workingDir` asks about the project of the
+ * session being VIEWED — after a restart the daemon's own project may still be
+ * its launch directory, and without this the panel would show (and toggle)
+ * another project's servers and skills.
+ */
+export async function getCapabilities(workingDir?: string): Promise<CapabilityItem[]> {
+  const q = workingDir ? `?working_dir=${encodeURIComponent(workingDir)}` : '';
+  const resp = await apiFetch(`/capabilities${q}`, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`capabilities failed: ${resp.status}`);
   const body = await resp.json() as { items?: CapabilityItem[] };
   return body.items ?? [];
@@ -1624,11 +2183,12 @@ export async function toggleCapability(
   id: string,
   scope: CapScope,
   disabled: boolean,
+  workingDir?: string,
 ): Promise<{ ok: boolean; error?: string; runtime_reloaded?: boolean }> {
   const resp = await apiFetch('/capabilities/toggle', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ kind, id, scope, disabled }),
+    body: JSON.stringify({ kind, id, scope, disabled, working_dir: workingDir }),
   });
   return resp.json();
 }
@@ -1782,6 +2342,39 @@ export async function fetchUpstreamModels(body: {
   return Array.isArray(data?.models) ? data.models.filter((id: unknown) => typeof id === 'string') : [];
 }
 
+export interface UpstreamProbeResult {
+  ok: boolean;
+  latency_ms: number;
+  error?: string;
+}
+
+/** POST /providers/upstream-models {probe:true} — 用当前账号的 key/url 按协议发一次极小「Hi」探活。 */
+export async function probeUpstreamModel(body: {
+  protocol?: string;
+  base_url?: string;
+  api_key?: string;
+  /** 已有提供商账号：服务端继承其 key / base_url / 协议。 */
+  account?: string;
+  provider_name?: string;
+  skip_tls_verify?: boolean;
+  model: string;
+}): Promise<UpstreamProbeResult> {
+  const r = await apiFetch('/providers/upstream-models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ ...body, probe: true }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new Error((data as any)?.error || `HTTP ${r.status}`);
+  }
+  return {
+    ok: data?.ok === true,
+    latency_ms: typeof data?.latency_ms === 'number' ? data.latency_ms : 0,
+    error: typeof data?.error === 'string' ? data.error : undefined,
+  };
+}
+
 /** POST /providers/:name/default —— 设为默认 provider。 */
 export async function setDefaultProvider(name: string): Promise<unknown> {
   const r = await apiFetch(`/providers/${encodeURIComponent(name)}/default`, {
@@ -1856,7 +2449,7 @@ export type UploadProgress = {
   percent: number;
 };
 
-/** POST /fs/upload — save non-image attachments under `{cwd}/.zap_store`.
+/** POST /fs/upload — save non-image attachments under `{cwd}/.jeikcode_store`.
  *  Called only when the user sends, so removed pending files never hit disk.
  *  Large files are streamed one-by-one with upload progress. */
 export async function uploadSessionFiles(
@@ -1979,38 +2572,77 @@ export async function getSessionFreshness(
   return resp.json();
 }
 
+const SESSION_DETAIL_CACHE_MAX = 8;
+const sessionDetailEtagCache = new Map<
+  string,
+  { etag: string; detail: SessionDetail }
+>();
+
 export async function getSession(
   projectHash: string,
   sessionId: string,
-  opts?: { tail?: number; offset?: number; limit?: number; signal?: AbortSignal },
+  opts?: {
+    tail?: number;
+    offset?: number;
+    limit?: number;
+    afterSeq?: number;
+    /** Older-history cursor (exclusive): rows with `seq < beforeSeq`. */
+    beforeSeq?: number;
+    /** Jump to the page containing this record id. */
+    around?: string;
+    /** Outline-only: skip the transcript (server returns turns + metadata). */
+    turnsOnly?: boolean;
+    signal?: AbortSignal;
+  },
 ): Promise<SessionDetail> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    const detail = getDirectSessionDetail(sessionId);
-    if (detail) return detail;
-    return {
-      id: sessionId,
-      name: '随身问答',
-      working_dir: '',
-      created_at: Date.now(),
-      updated_at: Date.now(),
-      message_count: 0,
-      messages: [],
-    };
-  }
   const q = new URLSearchParams();
   if (opts?.tail != null) q.set('tail', String(opts.tail));
   if (opts?.offset != null) q.set('offset', String(opts.offset));
   if (opts?.limit != null) q.set('limit', String(opts.limit));
+  if (opts?.afterSeq != null) q.set('after_seq', String(opts.afterSeq));
+  if (opts?.beforeSeq != null) q.set('before_seq', String(opts.beforeSeq));
+  if (opts?.around != null) q.set('around', opts.around);
+  if (opts?.turnsOnly) q.set('turns_only', 'true');
   const qs = q.toString();
   const path = `/projects/${projectHash}/sessions/${sessionId}`;
-  const resp = await apiFetch(qs ? `${path}?${qs}` : path, {
-    headers: authHeaders(),
+  const requestPath = qs ? `${path}?${qs}` : path;
+  // First paint (`tail`), live deltas (`after_seq`) and the outline-only read must
+  // be FRESH. Reusing a cached detail body via 304 can pin an older outline/window
+  // when the display log changed without bumping the client-visible ETag — the
+  // "only 2-3 turns until I switch sessions" bug. Paged history
+  // (`offset`/`limit`) may still use the conditional cache.
+  const cacheable = opts?.tail == null && opts?.afterSeq == null && opts?.turnsOnly !== true;
+  const cached = cacheable ? sessionDetailEtagCache.get(requestPath) : undefined;
+  const headers = authHeaders();
+  if (cached?.etag) headers['If-None-Match'] = cached.etag;
+  const resp = await apiFetch(requestPath, {
+    headers,
     signal: opts?.signal,
   });
+  // Conditional hit: reuse the exact previous body without re-parsing or
+  // transferring it. The cache is tiny and keyed by the full window query.
+  if (resp.status === 304 && cached) {
+    sessionDetailEtagCache.delete(requestPath);
+    sessionDetailEtagCache.set(requestPath, cached);
+    return normalizeSessionTodoSnapshot(cached.detail);
+  }
   if (!resp.ok) {
     throw new Error(`getSession failed with status ${resp.status}`);
   }
-  return resp.json();
+  const detail = normalizeSessionTodoSnapshot((await resp.json()) as SessionDetail);
+  const etag = resp.headers.get('ETag');
+  if (cacheable && etag) {
+    sessionDetailEtagCache.delete(requestPath);
+    sessionDetailEtagCache.set(requestPath, { etag, detail });
+    while (sessionDetailEtagCache.size > SESSION_DETAIL_CACHE_MAX) {
+      const oldest = sessionDetailEtagCache.keys().next().value;
+      if (!oldest) break;
+      sessionDetailEtagCache.delete(oldest);
+    }
+  } else {
+    sessionDetailEtagCache.delete(requestPath);
+  }
+  return detail;
 }
 
 // --- Live session (multi-tab real-time sync) ---
@@ -2023,6 +2655,8 @@ export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 export interface ApprovalModeResponse {
   ok: boolean;
   mode: ApprovalMode;
+  /** 全局模式开关当前是否开启（所有会话统一跟随 `mode`）。 */
+  global: boolean;
 }
 
 /**
@@ -2035,167 +2669,179 @@ export type GlobalWireEvent =
   | { type: 'sync' }
   | { type: 'session_upsert'; session: SessionMetaWithProject }
   | { type: 'session_deleted'; session_id: string; project_hash: string }
+  /** 某会话已被某个实例打开/查看：其它实例熄灭该会话的「刚完成」徽标。 */
+  | { type: 'session_seen'; session_id: string }
+  /**
+   * 会话转录被显式变更（编辑 / 删除单条 / 回溯 / 压缩）：
+   * 全局失效信号，只带 revision。客户端据此作废本地缓存（低版本）并对
+   * 正在显示的会话做一次定向重取；**绝不**用增量帧套用 mutation。
+   */
+  | { type: 'session_mutated'; session_id: string; revision: number }
+  /** 一条展示记录已落盘（压缩边界/警告）；客户端做一次定向磁盘对账。 */
+  | { type: 'display_appended'; session_id: string }
   | { type: 'activity'; session_id: string; running: boolean; terminal?: 'completed' | 'stopped' | 'failed'; status?: string }
+  /**
+   * 执行态的权威快照（带 revision/owner/phase）。新客户端只按它更新
+   * Compacting/Busy；`activity` 仅作旧客户端兼容与侧栏活动列表。
+   */
+  | {
+      type: 'runtime_activity';
+      session_id: string;
+      revision: number;
+      running: boolean;
+      phase?: string | null;
+      phase_started_at?: number | null;
+      owner?: string | null;
+    }
   /** 该会话弹出了审批/提问卡：对该会话做一次定向 pending 拉取（单会话小请求）。 */
   | { type: 'review_asked'; session_id: string }
   /** 待交互已解决：按 id 就地从所有实例的通知卡片中移除。 */
   | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number }
+  /**
+   * 该会话的待发卡片队列（排队 / 转向中 / 转向已排队）发生变化：
+   * 创建、点转向、取消、被内核消费都算。只带会话 id，客户端对该会话做一次
+   * 定向 `/chat/queue` 拉取并就地更新本地卡片，不做整表重拉。
+   */
+  | { type: 'queue_updated'; session_id: string }
+  /**
+   * 中途转向已被内核 fold（即将在下一轮请求生效）：携带权威输入。
+   * 活跃视图由 `/chat/watch` 的 `steered` 帧落笔（带光标与归位锚点）；
+   * 本事件用于**其它会话/其它客户端**把这条提问提前写进该会话的本地画布缓存，
+   * 保证切过去或冷启动时用户气泡已经在里面。
+   */
+  | {
+      type: 'steer_folded';
+      session_id: string;
+      /** 只带文本/身份：图片本体可能是一整张 base64，绝不进全局通道。 */
+      inputs: Array<{ text: string; message_id?: string; has_images?: boolean }>;
+      client_input_ids?: Array<string | null>;
+      timestamps?: Array<number | null>;
+      anchor_message_id?: string;
+    }
+  /**
+   * 模型配置变更（会话聊天模型 / 提供商 / 模型 id / 思考强度 / 思考预算）。
+   * `effort` 存在时两字段都是快照（`null` = 继承模型默认）；
+   * `deferred` = 本轮仍在跑，参数已落盘、下一轮生效。
+   */
+  | {
+      type: 'model_config';
+      session_id?: string | null;
+      provider?: string;
+      effort?: { reasoning_effort: string | null; thinking_budget: number | null };
+      deferred?: boolean;
+    }
   /** 全局配置热重载信号（如 CLI 执行 jeikcode ghimg 或后台配置更新）。 */
   | { type: 'config_reloaded' }
   /** 侧栏项目可见性（隐藏/钉住/运行中自动恢复），跨实例就地对齐。 */
   | { type: 'sidebar_projects'; hidden: string[]; pinned?: ProjectInfo[] }
   /** Git 仓库变更（discard / stage / commit / pull / fetch 等），跨实例全量广播 */
-  | { type: 'git_updated'; cwd: string }
+  | { type: 'git_updated'; cwd: string; fetch?: boolean }
   /** 终端会话变更（创建 / 关闭 / 清空），跨实例项目级全量广播 */
-  | { type: 'terminal_updated'; cwd: string };
+  | { type: 'terminal_updated'; cwd: string }
+  /** 会话审批模式变更（跨实例全局广播） */
+  | { type: 'session_mode'; session_id?: string | null; mode: ApprovalMode }
+  /** 全局模式开关变更：开启后所有会话统一跟随 `mode`。 */
+  | { type: 'mode_global'; enabled: boolean; mode: ApprovalMode };
+
+const GLOBAL_EVENTS_IDLE_TIMEOUT_MS = 30_000;
 
 /** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
 export async function streamGlobalEvents(
   onEvent: (event: GlobalWireEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const resp = await apiFetch('/events', { headers: authHeaders(), signal });
-  if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  const streamAbort = new AbortController();
+  const onParentAbort = () => streamAbort.abort();
+  if (signal) {
+    if (signal.aborted) streamAbort.abort();
+    else signal.addEventListener('abort', onParentAbort, { once: true });
   }
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
-      if (!dataLine) continue;
-      const jsonStr = dataLine.slice('data:'.length).trim();
-      if (!jsonStr) continue;
-      try {
-        onEvent(JSON.parse(jsonStr) as GlobalWireEvent);
-      } catch {
-        /* keep-alive / malformed frame */
+
+  let lastActivity = Date.now();
+  // 活性看门狗：后端 /events 每 15 秒发送一次 ping 心跳。
+  // 若超过 30 秒没有任何网络数据（含 15s keepalive ping），判定底层 TCP 连接已处于半开假死状态，
+  // 主动 abort 中断当前 reader，促使外部自动重连并触发 Sync 增量校准。
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastActivity > GLOBAL_EVENTS_IDLE_TIMEOUT_MS) {
+      streamAbort.abort();
+    }
+  }, 4000);
+  if (typeof (watchdog as any).unref === 'function') {
+    (watchdog as any).unref();
+  }
+
+  // 视口唤醒自愈：设备从休眠/熄屏恢复时立即检测是否超时，不等下一次 4s interval tick
+  const checkWakeup = () => {
+    if (typeof document !== 'undefined' && !document.hidden) {
+      if (Date.now() - lastActivity > GLOBAL_EVENTS_IDLE_TIMEOUT_MS) {
+        streamAbort.abort();
       }
     }
-  }
-}
-
-export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; session_name?: string; project_hash: string; provider: string; mode: ApprovalMode; working_dir?: string }
-  | { type: 'provider'; provider: string }
-  | { type: 'mode'; mode: ApprovalMode }
-  | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string; message_id?: string }
-  | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
-  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
-  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
-  | { type: 'tool_start'; id: string; name: string; arguments: string; message_id?: string }
-  | { type: 'tool_output'; id: string; chunk: string }
-  | { type: 'tool_progress'; id: string; progress: string }
-  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
-  | { type: 'tokens'; prompt: number; completion: number; total: number; cached?: number }
-  | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
-  | { type: 'error'; message: string }
-  | { type: 'warning'; message: string; message_id?: string }
-  | { type: 'persistence_warning'; message: string }
-  | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
-  | { type: 'permission_request'; session_id?: string; runtime_instance_id: string; generation: number; request_id: number; tool_name: string; reason: string; call_id: string; arguments: string }
-  | { type: 'user_input_request'; session_id?: string; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
-  | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[]; message_id?: string }[]; client_input_ids: Array<string | null> }
-  | { type: 'session_switched'; session_id: string }
-  | { type: 'session_renamed'; session_id: string; name: string }
-  | { type: 'session_status'; session_id?: string; status: string }
-  | { type: 'working_dir'; working_dir: string }
-  | { type: 'command_output'; text: string };
-
-
-export async function postLiveMessage(
-  message: string,
-  images?: ImageData[],
-  provider?: string,
-  sessionId?: string | null,
-  clientInputId?: string,
-): Promise<{ disposition: 'started' | 'steered'; generation: number; turn_id: number }> {
-  const resp = await apiFetch('/live/message', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({
-      message,
-      ...(images && images.length ? { images } : {}),
-      ...(provider ? { provider } : {}),
-      ...(sessionId ? { session_id: sessionId } : {}),
-      ...(clientInputId ? { client_input_id: clientInputId } : {}),
-    }),
-  });
-  if (!resp.ok) throw new Error(`send live message failed: ${resp.status}`);
-  const body = await resp.json() as {
-    accepted?: boolean;
-    disposition?: 'started' | 'steered';
-    generation?: number;
-    turn_id?: number;
-    error?: string;
   };
-  if (!body.accepted) throw new Error(body.error ?? 'live runtime rejected the message');
-  // Compatibility with a daemon from before typed submit receipts. The old
-  // response only said `accepted:true`; treating it as started avoids rolling
-  // back an input the server has already accepted and duplicating it on retry.
-  if (body.disposition === undefined) {
-    return { disposition: 'started', generation: 0, turn_id: 0 };
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', checkWakeup);
   }
-  if (
-    (body.disposition !== 'started' && body.disposition !== 'steered') ||
-    typeof body.generation !== 'number' ||
-    typeof body.turn_id !== 'number'
-  ) {
-    throw new Error('live runtime returned an invalid submit receipt');
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', checkWakeup);
+    window.addEventListener('online', checkWakeup);
   }
-  return {
-    disposition: body.disposition,
-    generation: body.generation,
-    turn_id: body.turn_id,
-  };
-}
 
-export async function postLiveStop(sessionId?: string | null): Promise<void> {
-  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
-  const resp = await apiFetch(`/live/stop${params}`, {
-    method: 'POST',
-    headers: authHeaders(),
-  });
-  if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
-  const body = await resp.json() as { accepted?: boolean };
-  if (!body.accepted) throw new Error('live runtime rejected the stop request');
-}
-
-/** Sync-mode manual compaction: dispatch a compaction against the shared live
- *  runtime. `accepted:false` means no live runtime is bound (nothing to compact). */
-export async function postLiveCompact(): Promise<{ accepted: boolean }> {
-  const resp = await apiFetch('/live/compact', {
-    method: 'POST',
-    headers: authHeaders(),
-  });
-  if (!resp.ok) throw new Error(`live compact failed: ${resp.status}`);
-  const body = await resp.json() as { accepted?: boolean };
-  return { accepted: body.accepted === true };
-}
-
-/** Ask the bound native runtime to resume an existing session. */
-export async function postLiveSwitchSession(
-  sessionId: string,
-): Promise<{ ok: boolean; activeTurn: boolean; error?: string }> {
-  const resp = await apiFetch('/live/switch_session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ session_id: sessionId }),
-  });
-  if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
-  const body = await resp.json() as { ok?: boolean; active_turn?: boolean; error?: string };
-  return {
-    ok: body.ok === true,
-    activeTurn: body.active_turn === true,
-    error: body.error,
-  };
+  let readerCancelHandler: (() => void) | null = null;
+  try {
+    const resp = await apiFetch('/events', { headers: authHeaders(), signal: streamAbort.signal });
+    if (!resp.ok) {
+      const error = new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      // 凭据被拒时重连只会反复 401；交给全局认证遮罩引导用户换 token。
+      if (resp.status === 401) error.name = 'AuthExpiredError';
+      throw error;
+    }
+    const reader = resp.body!.getReader();
+    readerCancelHandler = () => {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+    };
+    streamAbort.signal.addEventListener('abort', readerCancelHandler, { once: true });
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      lastActivity = Date.now();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
+        if (!dataLine) continue;
+        const jsonStr = dataLine.slice('data:'.length).trim();
+        if (!jsonStr) continue;
+        try {
+          onEvent(JSON.parse(jsonStr) as GlobalWireEvent);
+        } catch {
+          /* keep-alive / malformed frame */
+        }
+      }
+    }
+    if (signal?.aborted) {
+      const error = new Error('global events aborted');
+      error.name = 'AbortError';
+      throw error;
+    }
+  } finally {
+    clearInterval(watchdog);
+    if (signal) signal.removeEventListener('abort', onParentAbort);
+    if (readerCancelHandler) {
+      streamAbort.signal.removeEventListener('abort', readerCancelHandler);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', checkWakeup);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', checkWakeup);
+      window.removeEventListener('online', checkWakeup);
+    }
+  }
 }
 
 /** Sync-mode model switch: notify the daemon immediately when the dropdown
@@ -2263,11 +2909,24 @@ function getModeBroadcastChannel(): BroadcastChannel | null {
   return modeBroadcastChannel;
 }
 
-export function broadcastApprovalMode(mode: ApprovalMode): void {
+export function broadcastApprovalMode(
+  mode: ApprovalMode,
+  sessionId?: string | null,
+  global?: boolean,
+): void {
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('jeikcode:approval_mode_changed', { detail: mode }));
+    window.dispatchEvent(
+      new CustomEvent('jeikcode:approval_mode_changed', {
+        detail: { mode, session_id: sessionId ?? undefined, global },
+      }),
+    );
     try {
-      getModeBroadcastChannel()?.postMessage({ type: 'mode', mode });
+      getModeBroadcastChannel()?.postMessage({
+        type: 'mode',
+        mode,
+        session_id: sessionId ?? undefined,
+        global,
+      });
     } catch {
       // ignore
     }
@@ -2276,25 +2935,43 @@ export function broadcastApprovalMode(mode: ApprovalMode): void {
 
 /** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
  *  session state — the next turn's PermissionDecider follows it; broadcast to
- *  other tabs. */
-export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
+ *  other tabs. `global` toggles the cross-session override switch. */
+export async function postLiveMode(
+  mode: ApprovalMode,
+  sessionId?: string | null,
+  global?: boolean,
+): Promise<ApprovalMode> {
   const resp = await apiFetch('/approval_mode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({
+      mode,
+      session_id: sessionId || undefined,
+      global: global === undefined ? undefined : global,
+    }),
   });
   if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
   if (!body.ok) throw new Error('live runtime rejected the mode switch');
-  broadcastApprovalMode(body.mode);
+  broadcastApprovalMode(body.mode, sessionId, body.global);
   return body.mode;
 }
 
-export async function getApprovalMode(): Promise<ApprovalMode> {
-  const resp = await apiFetch('/approval_mode', { headers: authHeaders() });
+export async function getApprovalMode(sessionId?: string | null): Promise<ApprovalMode> {
+  return (await getApprovalModeState(sessionId)).mode;
+}
+
+/** Mode + global-switch state in one round-trip (cold start / focus / switch). */
+export async function getApprovalModeState(
+  sessionId?: string | null,
+): Promise<{ mode: ApprovalMode; global: boolean }> {
+  const url = sessionId
+    ? `/approval_mode?session_id=${encodeURIComponent(sessionId)}`
+    : '/approval_mode';
+  const resp = await apiFetch(url, { headers: authHeaders() });
   if (!resp.ok) throw new Error(`get mode failed: ${resp.status}`);
   const body = (await resp.json()) as ApprovalModeResponse;
-  return body.mode;
+  return { mode: body.mode, global: !!body.global };
 }
 
 /** Set the `reasoning_effort` and optional `thinking_budget` for a provider.
@@ -2320,35 +2997,6 @@ export async function postLiveReasoningEffort(
   if (!resp.ok) throw new Error(`set live reasoning effort failed: ${resp.status}`);
   const body = await resp.json() as { ok?: boolean; error?: string };
   if (!body.ok) throw new Error(body.error ?? 'live runtime rejected reasoning effort');
-}
-
-export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
-  toolName?: string,
-  sessionId?: string | null,
-  runtimeInstanceId?: string | null,
-  generation?: number,
-  requestId?: number,
-): Promise<{ accepted: boolean }> {
-  if (!sessionId || !runtimeInstanceId || generation === undefined || requestId === undefined) {
-    throw new Error('missing live approval identity');
-  }
-  const resp = await apiFetch('/live/permission', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({
-      decision,
-      tool_name: toolName,
-      session_id: sessionId,
-      runtime_instance_id: runtimeInstanceId,
-      generation,
-      request_id: requestId,
-    }),
-  });
-  if (!resp.ok) throw new Error(`answer live permission failed: ${resp.status}`);
-  const body = await resp.json() as { accepted?: boolean };
-  if (!body.accepted) throw new Error('live runtime did not accept permission');
-  return { accepted: true };
 }
 
 export interface UserInputQuestion {
@@ -2779,6 +3427,8 @@ export interface UpdateStatus {
   bytes: number;
   total: number;
   error?: string | null;
+  /** Stable backend failure code; the dialog localizes `update.error.<code>`. */
+  error_code?: string | null;
 }
 
 export interface ConfigDiffItem {
@@ -2796,94 +3446,7 @@ export interface UpgradeDiffsResponse {
   diffs: ConfigDiffItem[];
 }
 
-let directUpdateStatus: UpdateStatus = { status: 'idle', progress: 0, bytes: 0, total: 0 };
-
-async function checkDirectGitHubUpdate(channel?: string): Promise<UpdateCheckResponse> {
-  const targetChannel: 'stable' | 'beta' = channel === 'beta' ? 'beta' : 'stable';
-  const baked = bakedAppVersion();
-  const currentVersion = baked ? `v${baked}` : 'v7.2.7';
-
-  const repos = ['1852676265/JeikCode'];
-  let rawReleases: any[] = [];
-
-  for (const repo of repos) {
-    try {
-      const resp = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=50`, {
-        headers: { Accept: 'application/vnd.github.v3+json' },
-      });
-      if (resp.ok) {
-        const list = await resp.json();
-        if (Array.isArray(list) && list.length > 0) {
-          rawReleases = list;
-          break;
-        }
-      }
-    } catch {}
-  }
-
-  if (rawReleases.length === 0) {
-    return {
-      current_version: currentVersion,
-      latest_version: currentVersion,
-      has_update: false,
-      is_desktop: false,
-      channel: targetChannel,
-      versions: [],
-    };
-  }
-
-  const channelReleases = rawReleases.filter((r) => {
-    const isBeta = r.prerelease || (r.tag_name && r.tag_name.includes('-'));
-    return targetChannel === 'beta' ? isBeta : !isBeta;
-  });
-
-  const targetList = channelReleases.length > 0 ? channelReleases : rawReleases;
-  const latestRel = targetList[0];
-  const latestVersion = latestRel?.tag_name || currentVersion;
-
-  let downloadUrl: string | undefined = undefined;
-  if (latestRel?.assets && Array.isArray(latestRel.assets)) {
-    const isWindows = typeof navigator !== 'undefined' && /win/i.test(navigator.userAgent || '');
-    const isMac = typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent || '');
-    const isArm = typeof navigator !== 'undefined' && (/arm|aarch64/i.test(navigator.userAgent || '') || navigator.userAgent.includes('ARM'));
-
-    const matchAsset = latestRel.assets.find((a: any) => {
-      const name = (a.name || '').toLowerCase();
-      if (isWindows) return name.endsWith('.exe') && (isArm ? name.includes('arm64') : (name.includes('x64') || name.includes('x86_64')));
-      if (isMac) return name.endsWith('.dmg') || (name.includes('darwin') && (isArm ? name.includes('arm64') : name.includes('x64')));
-      return name.includes('linux');
-    }) || latestRel.assets[0];
-
-    downloadUrl = matchAsset?.browser_download_url || latestRel.html_url;
-  } else {
-    downloadUrl = latestRel?.html_url;
-  }
-
-  const versions: UpdateVersionEntry[] = targetList.map((r) => ({
-    version: r.tag_name,
-    notes: r.body || '',
-    released_at: r.published_at,
-  }));
-
-  const hasUpdate = compareSemVer(latestVersion, currentVersion) > 0;
-
-  return {
-    current_version: currentVersion,
-    latest_version: latestVersion,
-    has_update: hasUpdate,
-    is_desktop: false,
-    release_notes: latestRel?.body || '',
-    download_url: downloadUrl,
-    released_at: latestRel?.published_at,
-    channel: targetChannel,
-    versions,
-  };
-}
-
 export async function checkUpdate(channel?: string): Promise<UpdateCheckResponse> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return checkDirectGitHubUpdate(channel);
-  }
   const url = channel ? `/api/update/check?channel=${encodeURIComponent(channel)}` : '/api/update/check';
   const resp = await apiFetch(url, {
     headers: authHeaders(),
@@ -2896,9 +3459,6 @@ export async function checkUpdate(channel?: string): Promise<UpdateCheckResponse
 }
 
 export async function getUpdateStatus(): Promise<UpdateStatus> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    return directUpdateStatus;
-  }
   const resp = await apiFetch('/api/update/status', {
     headers: authHeaders(),
   });
@@ -2915,18 +3475,6 @@ export async function executeUpdate(payload?: {
   download_url?: string;
   force?: boolean;
 }): Promise<{ success: boolean; message: string }> {
-  if (isDirectLlmProfile(getActiveServerProfile())) {
-    directUpdateStatus = { status: 'downloading', progress: 50, bytes: 50, total: 100 };
-    if (payload?.download_url) {
-      if (typeof window !== 'undefined') {
-        window.open(payload.download_url, '_blank');
-      }
-    }
-    setTimeout(() => {
-      directUpdateStatus = { status: 'done', progress: 100, bytes: 100, total: 100 };
-    }, 1200);
-    return { success: true, message: '已为您拉起最新版本安装包，请按引导完成安装' };
-  }
   const resp = await apiFetch('/api/update/execute', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -3012,7 +3560,15 @@ export async function fetchFsTree(path?: string): Promise<FsTreeResponse> {
   return resp.json();
 }
 
-export async function fetchFsRead(path: string, cwd?: string): Promise<{ path: string; content: string; success: boolean }> {
+export interface FsReadResult {
+  path: string;
+  content: string;
+  success: boolean;
+  size?: number;
+  modified_ms?: number | null;
+}
+
+export async function fetchFsRead(path: string, cwd?: string): Promise<FsReadResult> {
   const params = new URLSearchParams({ path });
   if (cwd) params.set('cwd', cwd);
   const resp = await apiFetch(`/fs/read?${params.toString()}`, {
@@ -3025,7 +3581,34 @@ export async function fetchFsRead(path: string, cwd?: string): Promise<{ path: s
   return resp.json();
 }
 
-export async function fetchFsWrite(path: string, content: string): Promise<{ success: boolean; message?: string }> {
+export interface FsStatResult {
+  path: string;
+  exists: boolean;
+  is_file: boolean;
+  size: number;
+  modified_ms: number | null;
+}
+
+/** 轻量文件戳：编辑器轮询它判断磁盘是否变化，变化时才拉全文。 */
+export async function fetchFsStat(
+  path: string,
+  cwd?: string,
+  signal?: AbortSignal,
+): Promise<FsStatResult> {
+  const params = new URLSearchParams({ path });
+  if (cwd) params.set('cwd', cwd);
+  const resp = await apiFetch(`/fs/stat?${params.toString()}`, {
+    headers: authHeaders(),
+    signal,
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
+export async function fetchFsWrite(
+  path: string,
+  content: string,
+): Promise<{ success: boolean; message?: string; size?: number; modified_ms?: number | null }> {
   const resp = await apiFetch('/fs/write', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },

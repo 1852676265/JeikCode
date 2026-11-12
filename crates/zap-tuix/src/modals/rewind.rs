@@ -33,9 +33,9 @@ impl RewindModal {
 
     fn l<'a>(en: &'a str, zh: &'a str, vi: &'a str) -> &'a str {
         match current_locale() {
-            Locale::ZhCn => zh,
+            Locale::ZhCn | Locale::ZhTw => zh,
             Locale::Vi => vi,
-            Locale::En => en,
+            _ => en,
         }
     }
 
@@ -85,9 +85,9 @@ impl RewindModal {
         if start > 0 {
             rows.push(row(
                 match current_locale() {
-                    Locale::ZhCn => format!("↑ 上方还有 {start} 个回退点"),
-                    Locale::En => format!("↑ {start} more above"),
+                    Locale::ZhCn | Locale::ZhTw => format!("↑ 上方还有 {start} 个回退点"),
                     Locale::Vi => format!("↑ còn {start} điểm phía trên"),
+                    _ => format!("↑ {start} more above"),
                 },
                 DiffPanelTone::Muted,
                 false,
@@ -134,9 +134,10 @@ impl RewindModal {
                 format!(
                     "  {}",
                     match current_locale() {
-                        Locale::ZhCn => format!("{} 个文件有变更", point.files.len()),
-                        Locale::En => format!("{} files changed", point.files.len()),
+                        Locale::ZhCn | Locale::ZhTw =>
+                            format!("{} 个文件有变更", point.files.len()),
                         Locale::Vi => format!("{} tệp đã thay đổi", point.files.len()),
+                        _ => format!("{} files changed", point.files.len()),
                     }
                 )
             };
@@ -163,9 +164,9 @@ impl RewindModal {
         } else {
             rows.push(row(
                 match current_locale() {
-                    Locale::ZhCn => format!("↓ 下方还有 {} 个回退点", total - end),
-                    Locale::En => format!("↓ {} more below", total - end),
+                    Locale::ZhCn | Locale::ZhTw => format!("↓ 下方还有 {} 个回退点", total - end),
                     Locale::Vi => format!("↓ còn {} điểm phía dưới", total - end),
+                    _ => format!("↓ {} more below", total - end),
                 },
                 DiffPanelTone::Muted,
                 false,

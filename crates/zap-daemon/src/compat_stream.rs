@@ -628,6 +628,7 @@ impl CompatProjector {
                 message_id: None,
                 part_id: None,
                 part_seq: None,
+                part_rev: None,
             }));
             return out;
         }
@@ -641,6 +642,7 @@ impl CompatProjector {
                     message_id: None,
                     part_id: None,
                     part_seq: None,
+                    part_rev: None,
                 }));
             }
         }
@@ -935,7 +937,7 @@ impl CompatProjector {
                     data: "[DONE]".into(),
                 });
             }
-            ChatEvent::Error { message } => {
+            ChatEvent::Error { message, .. } => {
                 self.ensure_openai_started(&mut out);
                 out.push(self.openai_chunk(
                     json!({
@@ -970,7 +972,7 @@ impl CompatProjector {
                     None,
                 ));
             }
-            ChatEvent::Warning { message } => {
+            ChatEvent::Warning { message, .. } => {
                 self.ensure_openai_started(&mut out);
                 out.push(self.openai_chunk(
                     json!({ "jeikcode": { "type": "warning", "message": message } }),
@@ -1153,7 +1155,7 @@ impl CompatProjector {
                     }),
                 ));
             }
-            ChatEvent::Error { message } => {
+            ChatEvent::Error { message, .. } => {
                 let err_text = format!("\n\n[Error / Upstream Details]\n{message}");
                 let text_item_id = format!("msg_{}", self.next_block);
                 out.push(self.responses_event(
@@ -1470,7 +1472,7 @@ impl CompatProjector {
                     data: json!({ "type": "message_stop" }).to_string(),
                 });
             }
-            ChatEvent::Error { message } => {
+            ChatEvent::Error { message, .. } => {
                 let err_text = format!("\n\n[Error / Upstream Details]\n{message}");
                 if self.text_block.is_none() {
                     let idx = self.next_block;
@@ -1800,6 +1802,7 @@ mod tests {
             message_id: None,
             part_id: None,
             part_seq: None,
+            part_rev: None,
         }));
         all.extend(p.project(ChatEvent::ArtifactStart {
             id: "artifact_1".into(),
@@ -1820,6 +1823,7 @@ mod tests {
             message_id: None,
             part_id: None,
             part_seq: None,
+            part_rev: None,
         }));
         let text = openai_content_deltas(&all);
         assert!(
@@ -1886,6 +1890,7 @@ mod tests {
             message_id: None,
             part_id: None,
             part_seq: None,
+            part_rev: None,
         }));
         for (id, lang, body) in [
             ("a1", "kjson", "{\n  \"a\": 1\n}\n"),
@@ -1921,6 +1926,7 @@ mod tests {
             message_id: None,
             part_id: None,
             part_seq: None,
+            part_rev: None,
         }));
         all.extend(p.project(ChatEvent::ArtifactStart {
             id: "a1".into(),
@@ -1940,6 +1946,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: Some("stopped".into()),
             message: None,
+            message_id: None,
         }));
         let deltas = openai_content_deltas(&all);
         assert!(deltas.contains("# 标题"), "{deltas}");

@@ -63,7 +63,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  指令文件：\n".into(),
         Msg::StatusInstructionScopeGlobal => "用户全局".into(),
         Msg::StatusInstructionScopeProject => "项目共享".into(),
-        Msg::StatusInstructionScopeUser => "用户项目覆盖".into(),
         Msg::StatusInstructionPresent { path, label, scope } =>
             format!("    ✓ {scope}（{label}）：{path}\n").into(),
         Msg::StatusInstructionMissing { path, label, scope } =>
@@ -173,7 +172,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("默认已设为 {name}。").into(),
         Msg::ProviderAdded { name } =>
-            format!("已添加账号 \"{name}\"。已进入其模型列表，按 Ctrl+A 添加模型。").into(),
+            format!("已添加 Provider “{name}”。已进入其模型列表，按 Ctrl+A 添加模型。").into(),
         Msg::ProviderUpdated { name } =>
             format!("已更新 \"{name}\"。").into(),
         Msg::ProviderStepName => "Provider 名称？".into(),
@@ -225,8 +224,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelTabAccounts => "账号".into(),
         Msg::ProviderPanelTabModels => "模型".into(),
         Msg::ProviderPanelEmptyAccounts =>
-            "（尚无 Provider 账号 — 按 Ctrl+A 添加）".into(),
-        Msg::ProviderPanelNoMatchingAccounts => "（无匹配的 Provider 账号）".into(),
+            "（尚无 Provider — 按 Ctrl+A 添加）".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "（无匹配的 Provider）".into(),
         Msg::ProviderPanelEmptyModels =>
             "（尚无模型 — 按 Ctrl+A 添加，将拉取上游 /models）".into(),
         Msg::ProviderPanelNoMatchingModels => "（无匹配的模型）".into(),
@@ -234,23 +233,28 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelDefaultBadge => "默认".into(),
         Msg::ProviderPanelModelCount { count } => format!("{count} 个模型").into(),
         Msg::ProviderPanelAddModelRow => "＋ 添加模型".into(),
+        Msg::ProviderPanelAddProviderRow => "＋ 添加自定义 provider".into(),
         Msg::ProviderPanelAccountsHint =>
             "筛选 · ↑↓选择 · ↵模型 · Ctrl+A添加 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelModelsHint =>
-            "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
+            "筛选 · ↑↓选择 · ↵默认/添加 · Ctrl+A添加模型并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab切换 · Esc关闭".into(),
         Msg::ProviderPanelFilteredModelsHint { account } =>
-            format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A加模型并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
+            format!("〔{account}〕· ↑↓选择 · ↵默认/添加 · Ctrl+A添加模型并拉取上游列表 · Ctrl+E编辑 · Ctrl+Dx2 删除 · Tab全部 · Esc关闭").into(),
         Msg::ProviderPanelModelSaved { model } => format!("已保存模型“{model}”。").into(),
         Msg::ProviderPanelImageDirectWhileVlSet => {
             "贴图将直发本模型；要用 VL 请关闭「支持图片输入」。".into()
         }
-        Msg::ProviderPanelAddTitle => "【添加 Provider 账号】".into(),
+        Msg::ProviderPanelAddTitle => "【添加 Provider】".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
             format!("【编辑账号 {account}】").into(),
         Msg::ProviderPanelAddModelTitle => "【添加模型】".into(),
         Msg::ProviderPanelEditModelTitle => "【编辑模型】".into(),
         Msg::ProviderPanelFieldVendor => "厂商".into(),
         Msg::ProviderPanelFieldAccount => "账号".into(),
+        Msg::ProviderPanelFieldName => "名称".into(),
+        Msg::ProviderPanelFieldProtocol => "协议".into(),
+        Msg::ProviderPanelRequired => "(必填)".into(),
+        Msg::ProviderPanelLocked => "(锁定)".into(),
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API 密钥".into(),
         Msg::ProviderPanelFieldModel => "模型".into(),
@@ -269,6 +273,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelProviderFormHint =>
             "Tab 下一项  ←→ 切厂商  空格 勾选  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelAddAccountHint =>
+            "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回  （名称必填；模型到模型页加）".into(),
+        Msg::ProviderPanelEditAccountLockedHint =>
+            "Tab 下一项  ↵ 保存  Esc 返回  （厂商协议已锁定）".into(),
+        Msg::ProviderPanelEditAccountHint =>
+            "Tab 下一项  ←→ 切协议  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelAccountNeedsKeyHint => "(该 provider 尚未配置)".into(),
         Msg::ProviderPanelModelFormHint =>
             "打开即拉取上游列表  输入筛选  ↑↓选择  Tab/↵填入  ←→切账号（模型框为空时）  空格切换  Esc返回".into(),
         Msg::ProviderPanelModelPlaceholder => "(输入筛选上游列表)".into(),
@@ -281,6 +292,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelUpstreamFailed { error } =>
             format!("上游列表请求失败（{error}），可直接输入模型 id").into(),
         Msg::ProviderPanelUpstreamNoUrl => "无可用上游地址，可直接输入模型 id".into(),
+        // ── Model picker ──
+        Msg::ModelPickerNoModelsConfigured =>
+            "(未配置模型 — 请使用 /provider 添加)".into(),
+        Msg::ModelPickerNoModelsMatch => "(无匹配模型)".into(),
+        Msg::ModelPickerNoModelsMatchQuery { query } =>
+            format!("(无匹配 “{query}” 的模型 — 按 Backspace 清除)").into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),
@@ -588,7 +605,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SkillUnknown { name } =>
             format!("未知技能：{}（输入 /skills 查看列表）", name).into(),
         Msg::SkillsLoaded { names } =>
-            format!("  已加载 skills：{}\n", names).into(),
+            format!("  已请求加载 skills：{}\n", names).into(),
 
         // ── /mcp ──
         Msg::McpReloading { count } =>
@@ -899,7 +916,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::SaveInvalidPath { path } => format!("路径无效——目录不存在：{path}").into(),
         Msg::SaveRefuseOverwrite { path } => format!("目标已存在且非 markdown 文件，已拒绝覆盖（避免误删源码/配置）：{path}。请换个 .md 文件名或新路径。").into(),
         Msg::CodeBlockCopied => "📋 代码块已复制到剪贴板".into(),
-        Msg::CmdDescGuide => "通过 zap_config_guide 查询配置与用法".into(),
+        Msg::CmdDescGuide => "通过 jeikcode_config_guide 查询配置与用法".into(),
         Msg::CmdDescView => "在浮层窗口中查看文件内容".into(),
         Msg::CmdDescApp => "通过中继将当前会话暴露给手机 App（扫码配对；/app stop 断开）".into(),
         Msg::CmdDescReview => "审查当前代码改动（/review · /review staged · /review <基准>）".into(),
@@ -935,7 +952,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
 ".into(),
         Msg::GuideMenuDocUrl => "".into(),
         Msg::CmdGuideFallbackPrompt { question } => format!(
-            "Answer the user's JeikCode usage/config question. FIRST call the `zap_config_guide` tool with the best-matching `topic` (overview, prompts, models, mcp, skills, thesaurus, tools, directories, project, updates, or all). THEN answer concisely in the user's language based only on that tool output. Do not invent settings, and do not promote third-party skill stores.\n\nUser question: {question}"
+            "Answer the user's JeikCode usage/config question. FIRST call the `jeikcode_config_guide` tool with the best-matching `topic` (overview, prompts, models, mcp, skills, thesaurus, tools, directories, project, updates, or all). THEN answer concisely in the user's language based only on that tool output. Do not invent settings, and do not promote third-party skill stores.\n\nUser question: {question}"
         ).into(),
         Msg::CmdGuideInstalling => "正在准备指南回答，请稍候...".into(),
         Msg::CmdGuideAutoInstall => "可选 ask skill 未安装，改用内置指南回答。".into(),
@@ -984,7 +1001,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::OnboardingLanguageOptionZhCn => "简体中文 (Simplified Chinese)".into(),
         Msg::OnboardingSetupTitle => "想怎么开始？".into(),
         Msg::OnboardingNavHint =>
-            "1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过".into(),
+            "↑↓ 选择 · Enter 确认 · ← 返回 · Esc 跳过".into(),
         Msg::OnboardingConfirmClear =>
             "/welcome 会清屏。是否继续？[y/N]".into(),
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
@@ -1275,5 +1292,72 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 .into(),
         Msg::ServeNoTokenSecurityWarning =>
             "【严重安全警告】检测到你未配置访问令牌 (Token)！\n如果你当前未设置对应防火墙，请向 JeikCode 的 AI 询问让其帮忙设立防火墙和白名单 IP，否则你的服务器很容易被黑客入侵！".into(),
+        Msg::AgentRetryEmpty { attempt, max, wait } => if wait > 0 {
+            format!("模型返回空响应，{wait} 秒后重试({attempt}/{max})...")
+        } else {
+            format!("模型返回空响应，正在重试({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryThinking { attempt, max, wait } => if wait > 0 {
+            format!("模型只返回了思考，{wait} 秒后重试({attempt}/{max})...")
+        } else {
+            format!("模型只返回了思考，正在重试({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryMalformed { attempt, max, wait } => if wait > 0 {
+            format!("响应格式异常，{wait} 秒后重试({attempt}/{max})...")
+        } else {
+            format!("响应格式异常，正在重试({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryFirstToken { secs, attempt, max } =>
+            format!("模型延迟高:{secs} 秒内无响应,正在重试({attempt}/{max})…").into(),
+        Msg::AgentRetryApi { reason, wait, attempt, max } =>
+            format!("API error {reason}，{wait} 秒后重试({attempt}/{max})...").into(),
+        Msg::AgentOverWindow { estimate_k, window_k, buffer_k } =>
+            format!(
+                "请求约 {estimate_k}K tokens 已达上下文水位（窗口约 {window_k}K − 水位缓冲 \
+                 {buffer_k}K）：请精简输入或换用更大窗口的模型。"
+            ).into(),
+        Msg::AgentContextOverflow { round, attempt } =>
+            format!("第 {round} 轮上下文溢出（第 {attempt} 次尝试）；正在压缩并重试").into(),
+        Msg::AgentStreamReconnecting { attempt, max } =>
+            format!("流空闲超时 — 正在重连（{attempt}/{max}）").into(),
+        Msg::AgentResponseTruncated => "响应被截断：finish_reason=length".into(),
+        Msg::AgentUnsupportedSnapshot { version, supported } =>
+            format!("不支持的快照版本 {version}（内核支持 {supported}）；以空会话启动").into(),
+        Msg::AgentPreRequestNotAppendOnly { stored } =>
+            format!(
+                "pre_request 不是只追加：出站前缀与已存的 {stored} 条消息不一致 — 这会破坏本次请求的 \
+                 provider 前缀缓存（pre_request hook 只能追加尾部提醒）"
+            ).into(),
+        Msg::AgentEchoLoopNudge => "你死循环了，请你重新思考你的动作。".into(),
+        Msg::AgentEchoLoopWarning => "你死循环了，请你重新思考你的动作。若再重复相同工具和参数，本回合将停止。".into(),
+        Msg::AgentModelHighLatencyTerminal { retries, secs } =>
+            format!("模型延迟过高,请稍后再试(连续 {retries} 次在 {secs} 秒内未收到首token)").into(),
+        Msg::AgentExhaustedMalformed { max } =>
+            format!("模型连续 {max} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。").into(),
+        Msg::AgentExhaustedThinkingOverWindowIntro { max } =>
+            format!("模型连续 {max} 次只返回了思考、未给出正文或工具。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。").into(),
+        Msg::AgentExhaustedThinkingOverWindowSize { max, prompt_k, window_k } =>
+            format!("模型连续 {max} 次只返回了思考、未给出正文或工具。当前请求约 {prompt_k}K tokens，已接近或超过模型上下文窗口（约 {window_k}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。").into(),
+        Msg::AgentExhaustedThinkingGeneric { max } =>
+            format!("模型连续 {max} 次只返回了思考、未给出正文或工具。可直接重试，或稍后再试。").into(),
+        Msg::AgentExhaustedEmptyOverWindowIntro { max } =>
+            format!("模型连续 {max} 次返回空响应。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。").into(),
+        Msg::AgentExhaustedEmptyOverWindowSize { max, prompt_k, window_k } =>
+            format!("模型连续 {max} 次返回空响应。当前请求约 {prompt_k}K tokens，已接近或超过模型上下文窗口（约 {window_k}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。").into(),
+        Msg::AgentExhaustedEmptyGeneric { max } =>
+            format!("模型连续 {max} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。").into(),
+        Msg::AgentStatusRateLimited => "请求过于频繁或额度已用尽".into(),
+        Msg::AgentStatusUpstreamUnavailable => "上游服务暂时不可用".into(),
+        Msg::AgentStatusResponseTimeout => "模型响应超时".into(),
+        Msg::AgentStatusConnectionFailed => "网络连接失败".into(),
+        Msg::AgentStatusInsufficientBalance => "账户余额不足".into(),
+        Msg::AgentStatusUnauthorized => "API key 未授权或已失效".into(),
+        Msg::StreamReadRetryExhausted { attempts } =>
+            format!("网络连接中断:远端关闭或重置了连接,自动重连 {attempts} 次后仍失败,可重试。").into(),
+        Msg::StreamReadPartialResponse =>
+            "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复,可继续。".into(),
+        Msg::StreamReadResetHint =>
+            "此错误常见于公司网络或代理环境,请检查代理/VPN/防火墙设置后重试。".into(),
+        Msg::StreamReadDetailsPrefix => "详情: ".into(),
     }
 }

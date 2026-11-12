@@ -26,11 +26,11 @@ use std::sync::OnceLock;
 
 /// One `/sync` live-wire SSE payload.
 ///
-/// `replay: true` marks a frame from the snapshot/replay head — the WebUI must
-/// merge it idempotently. Live frames stay UNTAGGED because they are true deltas
-/// and must be painted verbatim: a live delta routed through the replay heuristics
-/// gets swallowed, which is how thinking/body after a tool round used to vanish
-/// from the canvas until a manual refresh. Mirrors `chat_watch_frame_json`.
+/// Every frame carries an explicit `replay` boolean. `true` marks a frame from
+/// the snapshot/replay head — the WebUI must merge it idempotently. `false` is
+/// a true live delta and must be painted verbatim. The explicit false matters:
+/// clients must never infer replay from `seq` presence, because live frames now
+/// carry the same session seq (that heuristic moved live steers to an old anchor).
 fn live_wire_frame_json<W: serde::Serialize>(wire: &W, replay: bool) -> String {
     let mut val = match serde_json::to_value(wire) {
         Ok(val) => val,
@@ -45,12 +45,26 @@ fn live_wire_frame_json<W: serde::Serialize>(wire: &W, replay: bool) -> String {
             })
         }
     };
-    if replay {
-        if let serde_json::Value::Object(ref mut map) = val {
-            map.insert("replay".to_string(), serde_json::Value::Bool(true));
-        }
+    if let serde_json::Value::Object(ref mut map) = val {
+        map.insert("replay".to_string(), serde_json::Value::Bool(replay));
     }
     serde_json::to_string(&val).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod live_wire_replay_flag_tests {
+    use super::live_wire_frame_json;
+
+    #[test]
+    fn every_live_frame_carries_an_explicit_replay_boolean() {
+        let wire = serde_json::json!({ "type": "steered", "inputs": [] });
+        let live: serde_json::Value =
+            serde_json::from_str(&live_wire_frame_json(&wire, false)).unwrap();
+        assert_eq!(live["replay"], serde_json::Value::Bool(false));
+        let replay: serde_json::Value =
+            serde_json::from_str(&live_wire_frame_json(&wire, true)).unwrap();
+        assert_eq!(replay["replay"], serde_json::Value::Bool(true));
+    }
 }
 
 /// Truncate a value for the file-sink diagnostic log at a char boundary (CJK-safe).
@@ -86,6 +100,33 @@ static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::
 static SESSION_APPROVAL_MODES: StdMutex<Option<HashMap<String, ApprovalMode>>> =
     StdMutex::new(None);
 
+/// 已知磁盘上也没有持久化模式的会话（负缓存）。避免会话列表逐行渲染时反复
+/// 扫描会话目录做无意义的磁盘回填。`live_set_session_approval_mode` 会清除对应项。
+static SESSION_APPROVAL_MODE_MISSES: std::sync::LazyLock<
+    StdMutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+/// 全局模式开关（默认关闭）。
+///
+/// 开启后 **所有会话** 统一使用 `LIVE_APPROVAL_MODE`，各自记录的会话级模式暂时忽略；
+/// 关闭后各会话恢复自己的模式。只影响交互式会话（WebUI / TUI），
+/// `/v1/*` 等 API 端点始终由 `force_approval_mode` 决定，与本开关无关。
+static GLOBAL_APPROVAL_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 全局模式开关当前是否开启。
+pub(crate) fn live_global_mode_enabled() -> bool {
+    GLOBAL_APPROVAL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// 切换全局模式开关。`mode` 提供时同时把该模式设为全局模式。
+pub(crate) fn live_set_global_mode_enabled(enabled: bool, mode: Option<ApprovalMode>) {
+    GLOBAL_APPROVAL_OVERRIDE.store(enabled, std::sync::atomic::Ordering::Release);
+    if let Some(mode) = mode {
+        *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+}
+
 /// 读取当前全局生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
 pub(crate) fn live_current_approval_mode() -> ApprovalMode {
@@ -93,18 +134,133 @@ pub(crate) fn live_current_approval_mode() -> ApprovalMode {
 }
 
 /// 读取指定 session 的审批模式；若未单独指定则回退到全局默认模式。
+///
+/// 性能：内存命中为 O(1)；磁盘回填只做一次（命中后写入内存，未命中则记入
+/// 负缓存，避免会话列表逐行渲染时反复扫描会话目录）。
 pub(crate) fn live_session_approval_mode(session_id: Option<&str>) -> ApprovalMode {
-    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        let guard = SESSION_APPROVAL_MODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(map) = guard.as_ref() {
-            if let Some(mode) = map.get(sid.trim()) {
-                return *mode;
-            }
+    // 全局开关开启：所有会话统一跟随全局模式，忽略会话级记录。
+    if live_global_mode_enabled() {
+        return live_current_approval_mode();
+    }
+    let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return live_current_approval_mode();
+    };
+    if let Some(mode) = cached_session_approval_mode(sid) {
+        return mode;
+    }
+    if session_approval_mode_known_absent(sid) {
+        return live_current_approval_mode();
+    }
+    // 磁盘回填需要定位会话所属项目桶（仅首次、且不在列表热路径上）。
+    let resolved = crate::resolve_session_by_id(sid).ok().flatten();
+    let Some(resolved) = resolved else {
+        mark_session_approval_mode_absent(sid);
+        return live_current_approval_mode();
+    };
+    let manager =
+        zap_capabilities::session::SessionManager::for_project(&resolved.meta.working_dir);
+    if let Ok(meta) = manager.read_meta(sid) {
+        if let Some(mode) = parse_approval_mode_wire(meta.approval_mode.as_deref()) {
+            remember_session_approval_mode(sid, mode);
+            return mode;
         }
     }
+    mark_session_approval_mode_absent(sid);
     live_current_approval_mode()
+}
+
+pub(crate) fn parse_approval_mode_wire(raw: Option<&str>) -> Option<ApprovalMode> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "build" => Some(ApprovalMode::Build),
+        "accept_edits" => Some(ApprovalMode::AcceptEdits),
+        "bypass" | "auto" => Some(ApprovalMode::Auto),
+        "plan" => Some(ApprovalMode::Plan),
+        _ => None,
+    }
+}
+
+/// 已知 working_dir 时的会话模式解析：只读该会话的 meta，不做任何目录扫描。
+fn live_session_approval_mode_in_dir(working_dir: &Path, session_id: &str) -> ApprovalMode {
+    if live_global_mode_enabled() {
+        return live_current_approval_mode();
+    }
+    if let Some(mode) = cached_session_approval_mode(session_id) {
+        return mode;
+    }
+    if session_approval_mode_known_absent(session_id) {
+        return live_current_approval_mode();
+    }
+    let manager = zap_capabilities::session::SessionManager::for_project(working_dir);
+    if let Ok(meta) = manager.read_meta(session_id) {
+        if let Some(mode) = parse_approval_mode_wire(meta.approval_mode.as_deref()) {
+            remember_session_approval_mode(session_id, mode);
+            return mode;
+        }
+    }
+    mark_session_approval_mode_absent(session_id);
+    live_current_approval_mode()
+}
+
+fn cached_session_approval_mode(sid: &str) -> Option<ApprovalMode> {
+    let guard = SESSION_APPROVAL_MODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|map| map.get(sid).copied())
+}
+
+/// 仅查内存热态（不触及磁盘）：供会话列表/增量行等热路径使用。
+pub(crate) fn live_session_approval_mode_cached(session_id: Option<&str>) -> Option<ApprovalMode> {
+    // 全局开关开启时没有“会话级真相”：返回 None 让调用方落到全局模式，
+    // 否则旧的会话级缓存会反向覆盖全局选择。
+    if live_global_mode_enabled() {
+        return None;
+    }
+    session_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(cached_session_approval_mode)
+}
+
+/// 一个会话在 UI 上应该显示的审批模式线格值。
+///
+/// 全局开关优先：开启时任何会话行/详情都必须报全局值，否则客户端冷启动会
+/// 从磁盘读到**自己原来的旧模式**，短暂闪回后再被广播纠正。
+/// 关闭时：磁盘记录 > 内存热态 > 进程默认。
+pub(crate) fn live_display_approval_mode_wire(session_id: &str, meta_mode: Option<&str>) -> String {
+    if live_global_mode_enabled() {
+        return live_current_approval_mode().wire().to_string();
+    }
+    parse_approval_mode_wire(meta_mode)
+        .or_else(|| live_session_approval_mode_cached(Some(session_id)))
+        .unwrap_or_else(live_current_approval_mode)
+        .wire()
+        .to_string()
+}
+
+fn remember_session_approval_mode(sid: &str, mode: ApprovalMode) {
+    let mut guard = SESSION_APPROVAL_MODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(sid.to_string(), mode);
+    if let Ok(mut misses) = SESSION_APPROVAL_MODE_MISSES.lock() {
+        misses.remove(sid);
+    }
+}
+
+fn session_approval_mode_known_absent(sid: &str) -> bool {
+    SESSION_APPROVAL_MODE_MISSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(sid)
+}
+
+fn mark_session_approval_mode_absent(sid: &str) {
+    SESSION_APPROVAL_MODE_MISSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sid.to_string());
 }
 
 /// Force the process-wide live approval mode (used by `serve --yolo` → Auto).
@@ -115,11 +271,7 @@ pub(crate) fn live_set_approval_mode(mode: ApprovalMode) {
 /// 设置指定 session 的审批模式；若 session_id 为 None 则更新全局默认模式。
 pub(crate) fn live_set_session_approval_mode(session_id: Option<&str>, mode: ApprovalMode) {
     if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        let mut guard = SESSION_APPROVAL_MODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(sid.trim().to_string(), mode);
+        remember_session_approval_mode(sid.trim(), mode);
     } else {
         *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     }
@@ -135,6 +287,11 @@ pub(crate) fn live_clear_session_approval_mode(session_id: &str) {
         if let Some(map) = guard.as_mut() {
             map.remove(sid);
         }
+        drop(guard);
+        SESSION_APPROVAL_MODE_MISSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(sid);
     }
 }
 
@@ -440,11 +597,31 @@ pub fn live_set_mode(mode: ApprovalMode) {
     live_set_mode_for_session(None, mode);
 }
 
-/// 设置 live 视图审批模式（可指定 session_id）；若命中活跃 binding 则下发 `SetMode`。
+/// 设置 live 视图审批模式（可指定 session_id）；若命中活跃 binding 则下发 `SetMode`，
+/// 同时持久化至会话元数据并通过全局事件总线广播给所有异地客户端。
+///
+/// 全局开关开启时，任何切换都被提升为全局切换：不写会话级记录、不落盘、
+/// 广播也不带 session_id（所有实例将整条视线对齐到同一模式）。
 pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
-    live_set_session_approval_mode(session_id, mode);
+    let target: Option<&str> = if live_global_mode_enabled() {
+        None
+    } else {
+        session_id.filter(|s| !s.trim().is_empty())
+    };
+    live_set_session_approval_mode(target, mode);
+    if let Some(sid) = target {
+        let sid = sid.trim();
+        if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
+            let _ = zap_capabilities::session::SessionManager::for_project(
+                &resolved.meta.working_dir,
+            )
+            .update_meta(sid, |meta| {
+                meta.approval_mode = Some(mode.wire().to_string());
+            });
+        }
+    }
     if let Ok(binding) = crate::native_live::binding() {
-        let affects_binding = match session_id {
+        let affects_binding = match target {
             Some(sid) => binding.session_id == sid,
             None => true,
         };
@@ -457,6 +634,10 @@ pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
             );
         }
     }
+    crate::publish_global(crate::GlobalWireEvent::SessionMode {
+        session_id: target.map(str::to_string),
+        mode: mode.wire().to_string(),
+    });
 }
 
 #[cfg(test)]
@@ -472,6 +653,7 @@ impl ScopedApprovalModeForTest {
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        live_set_global_mode_enabled(false, None);
         live_set_mode(ApprovalMode::Build);
         if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
             *map = None;
@@ -483,6 +665,7 @@ impl ScopedApprovalModeForTest {
 #[cfg(test)]
 impl Drop for ScopedApprovalModeForTest {
     fn drop(&mut self) {
+        live_set_global_mode_enabled(false, None);
         live_set_mode(ApprovalMode::Build);
         if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
             *map = None;
@@ -696,7 +879,12 @@ pub(crate) fn chat_runtime_config(
         // Interactive cards park with no deadline once a responder is registered.
         // Headless turns never enter that wait.
         interactive: false,
-        keep_interrupted_context: config.keep_interrupted_context,
+        // HTTP/WebUI turns MUST be resumable: every interruption (manual stop,
+        // steer, send-now, provider error, watchdog) commits the partial
+        // conversation through SnapshotHook/DisplayHook. A rollback would make
+        // the next message lose all prior thinking/tool context. The TUI keeps
+        // the user-configurable knob; this interactive transport does not.
+        keep_interrupted_context: true,
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         loop_max_rounds: zap_coding::resolve_loop_max_rounds(
@@ -758,6 +946,32 @@ pub(crate) fn live_runtime_config(
     let mut runtime = chat_runtime_config(config, provider_name, working_dir, telemetry);
     runtime.interactive = true;
     runtime
+}
+
+/// Overlay this session's own reasoning-effort choice onto its runtime config.
+///
+/// Effort is otherwise provider-wide in `config.toml`; scoping it to the session
+/// keeps two concurrently running sessions on the same provider from silently
+/// rewriting each other's thinking intensity.
+pub(crate) fn apply_session_effort_override(
+    runtime: &mut zap_coding::CodingRuntimeConfig,
+    working_dir: &Path,
+    session_id: Option<&str>,
+) {
+    let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    // 直接读已知项目桶内的 meta：一次小块读，不做会话目录扫描。
+    let manager = zap_capabilities::session::SessionManager::for_project(working_dir);
+    let Ok(meta) = manager.read_meta(sid) else {
+        return;
+    };
+    if meta.reasoning_effort.is_some() {
+        runtime.reasoning_effort = meta.reasoning_effort;
+    }
+    if meta.thinking_budget.is_some() {
+        runtime.thinking_budget = meta.thinking_budget;
+    }
 }
 
 fn send_chat_runtime_error(
@@ -983,6 +1197,8 @@ async fn submit_as_new_turn(
 pub(crate) struct PendingChatSteer {
     pub text: String,
     pub images: Vec<ImageContent>,
+    /// 客户端关联键 = 落盘消息 id（新契约下两者同值）。
+    pub client_input_id: Option<String>,
     pub done: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -991,6 +1207,7 @@ pub(crate) enum ChatSteerSignal {
     Submit(PendingChatSteer),
     Cancel {
         text: Option<String>,
+        message_id: Option<String>,
         done: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
@@ -1002,12 +1219,17 @@ pub(crate) async fn steer_into_running_turn(
     handle: &zap_coding::CodingRuntimeHandle,
     text: String,
     images: Vec<ImageContent>,
+    client_input_id: Option<String>,
 ) -> Result<(), String> {
     if !phase_blocks_new_turn(handle.status().phase) {
         return Err("turn is not running".into());
     }
     match handle
-        .submit(zap_coding::UserInput { text, images })
+        .submit(zap_coding::UserInput {
+            text,
+            images,
+            id: client_input_id,
+        })
         .await
     {
         Ok(zap_coding::SubmitReceipt::Steered { .. }) => Ok(()),
@@ -1048,6 +1270,7 @@ pub(crate) async fn run_chat_turn_v2(
     user_input_responders: Option<crate::permission_bridge::UserInputResponders>,
     approval_mode: ApprovalMode,
     mut steer_rx: mpsc::UnboundedReceiver<ChatSteerSignal>,
+    client_input_id: Option<String>,
 ) {
     use zap_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use zap_coding::TurnCompletion;
@@ -1140,8 +1363,11 @@ pub(crate) async fn run_chat_turn_v2(
     let input = zap_coding::UserInput {
         text: user_text,
         images: user_images,
+        // 身份契约：`/chat` 的 request_id 即落盘消息 id。
+        id: client_input_id,
     };
-    let expected_turn_id = match submit_as_new_turn(&handle, &mut events, input, &cancel).await {
+    let mut expected_turn_id = match submit_as_new_turn(&handle, &mut events, input, &cancel).await
+    {
         Ok(turn_id) => turn_id,
         Err(error) => {
             send_chat_start_failure(&runtime_event_tx, error);
@@ -1155,6 +1381,7 @@ pub(crate) async fn run_chat_turn_v2(
 
     let mut cancelled = false;
     let mut steer_open = true;
+    let unfolded_steers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut persist_after_start: HashMap<String, String> = HashMap::new();
     let final_messages = loop {
         let ev = tokio::select! {
@@ -1169,15 +1396,32 @@ pub(crate) async fn run_chat_turn_v2(
                 match steer {
                     Some(ChatSteerSignal::Submit(req)) => {
                         let handle = handle.clone();
+                        let counter = unfolded_steers.clone();
                         tokio::spawn(async move {
-                            let outcome = steer_into_running_turn(&handle, req.text, req.images).await;
+                            let outcome =
+                                steer_into_running_turn(&handle, req.text, req.images, req.client_input_id)
+                                    .await;
+                            if outcome.is_ok() {
+                                counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            }
                             let _ = req.done.send(outcome);
                         });
                     }
-                    Some(ChatSteerSignal::Cancel { text, done }) => {
+                    Some(ChatSteerSignal::Cancel { text, message_id, done }) => {
                         let handle = handle.clone();
+                        let counter = unfolded_steers.clone();
                         tokio::spawn(async move {
-                            let outcome = handle.cancel_steer(text).await.map_err(|e| e.to_string());
+                            let outcome = handle
+                                .cancel_steer(text, message_id)
+                                .await
+                                .map_err(|e| e.to_string());
+                            if outcome.is_ok() {
+                                let _ = counter.fetch_update(
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Acquire,
+                                    |cur| Some(cur.saturating_sub(1)),
+                                );
+                            }
                             let _ = done.send(outcome);
                         });
                     }
@@ -1198,6 +1442,17 @@ pub(crate) async fn run_chat_turn_v2(
         };
         match ev {
             event @ CodingRuntimeEvent::Agent(_) => {
+                if let CodingRuntimeEvent::Agent(
+                    zap_kernel::event::AgentEvent::Steered { count, .. },
+                ) = &event
+                {
+                    let n = *count;
+                    let _ = unfolded_steers.fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |cur| Some(cur.saturating_sub(n)),
+                    );
+                }
                 if let CodingRuntimeEvent::Agent(
                     zap_kernel::event::AgentEvent::ToolStarted { call },
                 ) = &event
@@ -1256,8 +1511,10 @@ pub(crate) async fn run_chat_turn_v2(
                 // which resolves `rx` below — emitting it after the await would
                 // deadlock every interactive Build turn (busy cursor, no card).
                 // Re-read live mode so a mid-turn switch to Auto skips the card
-                // and unparks a waiter within the poll interval.
-                let current_mode = live_current_approval_mode();
+                // and unparks a waiter within the poll interval. Session-scoped:
+                // another session's Auto must never bypass THIS session's gate.
+                let session_mode = || live_session_approval_mode(Some(&session_id));
+                let current_mode = session_mode();
                 let mut accepted_envelope = None;
                 let (decision, persist_requested) = match &permission_responders {
                     None => (fallback_approval_decision(current_mode), false),
@@ -1318,7 +1575,7 @@ pub(crate) async fn run_chat_turn_v2(
                                                 // alive and ACK only after `handle.respond` succeeds below.
                                                 let submission = envelope.submission();
                                                 accepted_envelope = Some(envelope);
-                                                if live_current_approval_mode() == ApprovalMode::Auto {
+                                                if session_mode() == ApprovalMode::Auto {
                                                     let _ = handle.set_mode(zap_coding::RuntimeMode::Auto).await;
                                                 }
                                                 let persist = submission.persist
@@ -1338,7 +1595,7 @@ pub(crate) async fn run_chat_turn_v2(
                                         }
                                     }
                                     ChatPermissionDriverEvent::ModePoll => {
-                                        if live_current_approval_mode() == ApprovalMode::Auto {
+                                        if session_mode() == ApprovalMode::Auto {
                                             let _ = handle.set_mode(zap_coding::RuntimeMode::Auto).await;
                                             responders.unregister(&session_id, &approval_id);
                                             break (PermissionDecision::AllowOnce, false);
@@ -1385,6 +1642,14 @@ pub(crate) async fn run_chat_turn_v2(
                     }
                     Some(Err(_)) => {
                         persist_after_start.remove(&approval.call_id);
+                        // The runtime refused the queued decision (its request was
+                        // already timed out or the generation was replaced), so the
+                        // approval did NOT take effect. Downgrade the applied
+                        // tombstone: a retried POST must be told "expired", never
+                        // "already applied".
+                        if let Some(responders) = permission_responders.as_ref() {
+                            responders.expire(&session_id, &approval_id);
+                        }
                         // Dropping an unacknowledged envelope closes the HTTP ACK
                         // channel, so `/chat/permission` reports failure instead of
                         // claiming that a rejected/cancelled request was accepted.
@@ -1444,6 +1709,25 @@ pub(crate) async fn run_chat_turn_v2(
                 if turn_completion_id(&completion) != expected_turn_id {
                     continue;
                 }
+                let reason = match &completion {
+                    TurnCompletion::Completed { reason, .. } => *reason,
+                    TurnCompletion::SnapshotUnavailable { .. } => unreachable!(),
+                };
+                if !cancelled
+                    && reason == zap_kernel::event::StopReason::Stopped
+                    && unfolded_steers.load(std::sync::atomic::Ordering::Acquire) > 0
+                {
+                    // A steer arrived right as the turn was finishing and fell into
+                    // the kernel's `drain_pending` as an immediate continuation turn.
+                    // Keep the operation and event pump alive for that follow-up turn.
+                    let _ = unfolded_steers.fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |cur| Some(cur.saturating_sub(1)),
+                    );
+                    expected_turn_id = expected_turn_id.wrapping_add(1);
+                    continue;
+                }
                 let snapshot = match &completion {
                     TurnCompletion::Completed { snapshot, .. } => snapshot.clone(),
                     TurnCompletion::SnapshotUnavailable { .. } => unreachable!(),
@@ -1481,16 +1765,22 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::SessionNameSuggested { name } => {
-                if let Err(error) = crate::legacy_convert::apply_ai_catalog_name_in_project(
+                let applied = match crate::legacy_convert::apply_ai_catalog_name_in_project(
                     &naming_project_bucket,
                     &naming_session_id,
                     &name,
                 ) {
-                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
-                        "session naming failed: {error}"
-                    )));
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                            "session naming failed: {error}"
+                        )));
+                        false
+                    }
+                };
+                if applied {
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::SessionNameSuggested { name });
                 }
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::SessionNameSuggested { name });
             }
             CodingRuntimeEvent::SessionTitleSeeded { name } => {
                 // Disk title was already seeded at publish; forward so live views see the provisional title.
@@ -1538,12 +1828,60 @@ use serde::Serialize;
 // Wire DTO: LiveWireEvent + to_wire
 // ============================================================================
 
+/// `/live` snapshots carry only a bounded presentation window. Older history is
+/// fetched from the gzip/brotli-compressed session-detail endpoint.
+const LIVE_SNAPSHOT_TAIL: usize = 48;
+
+fn snapshot_tail(
+    messages: &[zap_kernel::message::Message],
+) -> (usize, &[zap_kernel::message::Message]) {
+    let start = messages.len().saturating_sub(LIVE_SNAPSHOT_TAIL);
+    (start, &messages[start..])
+}
+
+const LIVE_SNAPSHOT_WARN_BYTES: usize = 1 * 1024 * 1024;
+
+/// Metrics only: never buffers or alters the SSE frame.
+fn log_live_frame_size(wire: &LiveWireEvent, bytes: usize) {
+    if let LiveWireEvent::Snapshot {
+        message_count,
+        offset,
+        ..
+    } = wire
+    {
+        tracing::debug!(
+            target: "jeikcode::http",
+            route = "live_snapshot",
+            bytes,
+            message_count,
+            offset,
+            "response_size"
+        );
+        if bytes > LIVE_SNAPSHOT_WARN_BYTES {
+            tracing::warn!(
+                target: "jeikcode::http",
+                route = "live_snapshot",
+                bytes,
+                message_count,
+                offset,
+                "large_response_body"
+            );
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "snapshot")]
     Snapshot {
         messages: Vec<crate::MessageInfo>,
+        /// Total messages in the full session snapshot.
+        #[serde(default)]
+        message_count: usize,
+        /// Absolute index of `messages[0]` in the full snapshot.
+        #[serde(default)]
+        offset: usize,
         session_id: String,
         /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
         /// 已有会话名,不必等 SessionRenamed 事件(切项目场景才有 loadSession 拉名)。
@@ -1572,6 +1910,9 @@ pub(crate) enum LiveWireEvent {
     UserMessage {
         text: String,
         images: Vec<crate::ImageData>,
+        /// 客户端关联键 = 落盘消息 id（新契约下两者同值）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         client_input_id: Option<String>,
     },
@@ -1642,7 +1983,18 @@ pub(crate) enum LiveWireEvent {
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
-    Warning { message: String },
+    Warning {
+        message: String,
+        /// Committed compaction: post-compaction context tokens. Clients update the
+        /// live context meter immediately (no usage frame follows a compaction).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u32>,
+        /// 提示所属的 assistant / user 消息 id（管线身份），与 `/chat` 的
+        /// `ChatEvent::Warning` 同口径。缺省时客户端只能挂到“最后一条”，
+        /// 于是通知会跟着时间线尾巴逐轮漂移；带上锚点才能冻结在所属回合。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// Auxiliary session persistence failed. Kept distinct from conversational
     /// warnings so browser clients render it outside the message timeline.
     #[serde(rename = "persistence_warning")]
@@ -1689,6 +2041,8 @@ pub(crate) enum LiveWireEvent {
         count: usize,
         inputs: Vec<zap_kernel::event::SteeredInput>,
         client_input_ids: Vec<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_message_id: Option<String>,
     },
     #[serde(rename = "session_switched")]
     SessionSwitched { session_id: String },
@@ -1719,6 +2073,9 @@ pub(crate) enum LiveWireEvent {
         /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
         #[serde(default)]
         server_message: Option<String>,
+        /// 与 `Warning` 相同的回合锚点：限流提示属于发生限流的那一轮。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
 }
 
@@ -1756,6 +2113,14 @@ impl NativeLiveWireProjector {
         self.last_part_kind = None;
     }
 
+    /// Anchor for a non-fatal notice (`warning` / `rate_limited`), mirroring the
+    /// `/chat` projector: the streaming assistant round if one exists, otherwise
+    /// the most recent assistant boundary. An idle manual compaction therefore
+    /// anchors to the turn it drained instead of the timeline tail.
+    fn notice_anchor(&self) -> Option<String> {
+        self.current_message_id.clone()
+    }
+
     #[cfg(test)]
     fn project(&mut self, event: crate::live_hub::LiveViewEvent) -> Option<LiveWireEvent> {
         self.project_at_generation(None, 0, event)
@@ -1789,6 +2154,7 @@ impl NativeLiveWireProjector {
         if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(Kernel::UserMessage {
             message_id,
             turn_ordinal,
+            ..
         })) = &event
         {
             return Some(LiveWireEvent::UserIdentified {
@@ -1815,16 +2181,19 @@ impl NativeLiveWireProjector {
                         missing: false,
                     })
                     .collect(),
+                message_id: client_input_id.clone(),
                 client_input_id,
             },
             crate::live_hub::LiveViewEvent::Steered {
                 count,
                 inputs,
                 client_input_ids,
+                anchor_message_id,
             } => LiveWireEvent::Steered {
                 count,
                 inputs,
                 client_input_ids,
+                anchor_message_id,
             },
             crate::live_hub::LiveViewEvent::RequestResolved { request_id, kind } => {
                 if kind == zap_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
@@ -1914,12 +2283,11 @@ impl NativeLiveWireProjector {
                     committed: true,
                     ..
                 } => {
-                    crate::publish_global(crate::GlobalWireEvent::Activity {
-                        session_id: self.session_id.clone(),
-                        running: true,
-                        terminal: None,
-                        status: None,
-                    });
+                    crate::finish_compaction_phase(
+                        &self.session_id,
+                        crate::COMPACTION_OWNER_LIVE,
+                        true,
+                    );
                     let before_tokens = (bytes_before as f32 / 3.5).ceil() as usize;
                     let after_tokens = (bytes_after as f32 / 3.5).ceil() as usize;
                     let mark = zap_config::i18n::format_compaction_mark(
@@ -1927,33 +2295,50 @@ impl NativeLiveWireProjector {
                         before_tokens,
                         after_tokens,
                     );
-                    LiveWireEvent::Warning { message: mark }
+                    // live 路径也必须落盘：否则刷新/异地端只剩瞬态 Warning，
+                    // 紫色压缩边界会随页面重建而消失。
+                    let _ = crate::persist_session_display_notice(&self.session_id, &mark, None);
+                    LiveWireEvent::Warning {
+                        message: mark,
+                        tokens_after: Some(after_tokens as u32),
+                        message_id: self.notice_anchor(),
+                    }
                 }
                 Kernel::CompactionFailed { error, .. } => {
-                    crate::publish_global(crate::GlobalWireEvent::Activity {
-                        session_id: self.session_id.clone(),
-                        running: true,
-                        terminal: None,
-                        status: None,
-                    });
+                    crate::finish_compaction_phase(
+                        &self.session_id,
+                        crate::COMPACTION_OWNER_LIVE,
+                        true,
+                    );
                     LiveWireEvent::Warning {
                         message: format!("Compaction failed: {error}"),
+                        tokens_after: None,
+                        message_id: self.notice_anchor(),
                     }
                 }
                 Kernel::CompactionStarted { .. } => {
-                    crate::publish_global(crate::GlobalWireEvent::Activity {
-                        session_id: self.session_id.clone(),
-                        running: true,
-                        terminal: None,
-                        status: Some("compacting".to_string()),
-                    });
+                    crate::note_compaction_started(&self.session_id, crate::COMPACTION_OWNER_LIVE);
                     LiveWireEvent::SessionStatus {
                         session_id: self.session_id.clone(),
                         status: "compacting".to_string(),
                     }
                 }
+                Kernel::Compacted { .. } => {
+                    // 空操作压缩同样发出过 CompactionStarted：必须结束阶段，
+                    // 否则 `Compacting…` 会一直挂到回合/运行时结束。
+                    crate::finish_compaction_phase(
+                        &self.session_id,
+                        crate::COMPACTION_OWNER_LIVE,
+                        true,
+                    );
+                    return None;
+                }
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
-                Kernel::Warning(message) => LiveWireEvent::Warning { message },
+                Kernel::Warning(message) => LiveWireEvent::Warning {
+                    message: crate::localize_agent_warning(&message),
+                    tokens_after: None,
+                    message_id: self.notice_anchor(),
+                },
                 Kernel::RateLimited {
                     reset_at_display,
                     reset_label,
@@ -1966,6 +2351,7 @@ impl NativeLiveWireProjector {
                     secs_until_reset,
                     auto_resuming,
                     server_message,
+                    message_id: self.notice_anchor(),
                 },
                 Kernel::ToolCallStreaming { .. }
                 | Kernel::ToolBatchStarted { .. }
@@ -1973,13 +2359,11 @@ impl NativeLiveWireProjector {
                 | Kernel::Request { .. }
                 | Kernel::Snapshot { .. }
                 | Kernel::TurnComplete { .. }
-                | Kernel::Cancelled
-                | Kernel::Compacted { .. } => return None,
-                Kernel::Steered { count, inputs } => LiveWireEvent::Steered {
-                    count,
-                    inputs,
-                    client_input_ids: Vec::new(),
-                },
+                | Kernel::Cancelled => return None,
+                // LiveHub emits a separate enriched `LiveViewEvent::Steered`
+                // immediately after this runtime event. Projecting both creates
+                // an unanchored duplicate first, which can strand the card at tail.
+                Kernel::Steered { .. } => return None,
                 _ => return None,
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Request(request)) => {
@@ -2086,12 +2470,21 @@ impl NativeLiveWireProjector {
                 working_dir: working_dir.to_string_lossy().to_string(),
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
-                LiveWireEvent::Warning { message }
+                LiveWireEvent::Warning {
+                    message: crate::localize_agent_warning(&message),
+                    tokens_after: None,
+                    message_id: self.notice_anchor(),
+                }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::PersistenceWarning(message)) => {
                 LiveWireEvent::PersistenceWarning { message }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::RuntimeStopped(exit)) => {
+                crate::finish_compaction_phase(
+                    &self.session_id,
+                    crate::COMPACTION_OWNER_LIVE,
+                    false,
+                );
                 self.tools.clear();
                 LiveWireEvent::State {
                     running: false,
@@ -2103,20 +2496,55 @@ impl NativeLiveWireProjector {
                     )),
                 }
             }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionStarted { .. }) => {
+                // 内核事件已在 runtime 层换成 CodingRuntimeEvent::CompactionStarted。
+                crate::note_compaction_started(&self.session_id, crate::COMPACTION_OWNER_LIVE);
+                LiveWireEvent::SessionStatus {
+                    session_id: self.session_id.clone(),
+                    status: "compacting".to_string(),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
-            }) if outcome.committed => LiveWireEvent::Warning {
-                message: zap_config::i18n::format_compaction_mark(
+            }) if outcome.committed => {
+                crate::finish_compaction_phase(
+                    &self.session_id,
+                    crate::COMPACTION_OWNER_LIVE,
+                    true,
+                );
+                let mark = zap_config::i18n::format_compaction_mark(
                     outcome.removed_messages,
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
-                ),
-            },
+                );
+                let _ = crate::persist_session_display_notice(&self.session_id, &mark, None);
+                LiveWireEvent::Warning {
+                    message: mark,
+                    tokens_after: Some(outcome.estimated_tokens_after as u32),
+                    message_id: self.notice_anchor(),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Failed { error, .. },
-            }) => LiveWireEvent::Error {
-                message: format!("compact failed: {error}"),
-            },
+            }) => {
+                crate::finish_compaction_phase(
+                    &self.session_id,
+                    crate::COMPACTION_OWNER_LIVE,
+                    true,
+                );
+                LiveWireEvent::Error {
+                    message: format!("compact failed: {error}"),
+                }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished { .. }) => {
+                // 自动压缩的空操作 / 中断：清阶段但不额外刷屏。
+                crate::finish_compaction_phase(
+                    &self.session_id,
+                    crate::COMPACTION_OWNER_LIVE,
+                    true,
+                );
+                return None;
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderUnavailable {
                 reason,
                 ..
@@ -2169,7 +2597,11 @@ fn session_is_established(working_dir: &Path, session_id: &str) -> bool {
         .is_some_and(|meta| meta.message_count > 0 || meta.turn_count > 0)
 }
 
-fn persist_session_preferred_model(working_dir: &Path, session_id: &str, provider: &str) {
+pub(crate) fn persist_session_preferred_model(
+    working_dir: &Path,
+    session_id: &str,
+    provider: &str,
+) {
     let _ = zap_capabilities::session::SessionManager::for_project(working_dir).update_meta(
         session_id,
         |meta| {
@@ -2212,7 +2644,7 @@ pub(crate) async fn live_stream(
         wd.clone(),
         state.telemetry.clone(),
         live_current_provider(),
-        native_runtime_mode(live_current_approval_mode()),
+        native_runtime_mode(live_session_approval_mode(sid.as_deref())),
         sid,
     )
     .await
@@ -2267,10 +2699,12 @@ fn project_registry_event(
                 count,
                 inputs,
                 client_input_ids,
+                anchor_message_id,
             } => crate::live_hub::LiveViewEvent::Steered {
                 count,
                 inputs,
                 client_input_ids,
+                anchor_message_id,
             },
             SessionViewEvent::CommandOutput(text) => {
                 crate::live_hub::LiveViewEvent::CommandOutput(text)
@@ -2294,16 +2728,22 @@ fn live_stream_from_registry(
     working_dir: std::path::PathBuf,
     session_id: String,
 ) -> axum::response::Response {
-    let snapshot = match crate::native_live::registry_session_snapshot(&working_dir, &session_id) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": error })),
-            )
-                .into_response();
-        }
-    };
+    let mut snapshot =
+        match crate::native_live::registry_session_snapshot(&working_dir, &session_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+        };
+    // `/live` is another resume entrypoint: a `/chat` crash checkpoint must be
+    // overlaid here too, before the snapshot becomes the runtime prefix.
+    if let Some(partial) = zap_capabilities::session::partial::load_global(&session_id) {
+        let _ = crate::overlay_partial_stream(&mut snapshot.messages, &partial);
+    }
     let session_name = {
         let bucket = zap_capabilities::session::SessionManager::project_hash(&working_dir);
         match crate::legacy_convert::load_catalog_session_view_in_project(&bucket, &session_id) {
@@ -2324,8 +2764,9 @@ fn live_stream_from_registry(
     // Snapshot + replay head is emitted ahead of the live bus and tagged
     // `replay: true`; only those frames may be de-duplicated client-side.
     let mut head: Vec<LiveWireEvent> = Vec::new();
-    let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot
-        .messages
+    let snapshot_count = snapshot.messages.len();
+    let (snapshot_offset, snapshot_tail) = snapshot_tail(&snapshot.messages);
+    let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot_tail
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
@@ -2333,6 +2774,8 @@ fn live_stream_from_registry(
     crate::attach_display_images(&mut snapshot_messages, &working_dir, &session_id);
     head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
+        message_count: snapshot_count,
+        offset: snapshot_offset,
         session_id: session_id.clone(),
         session_name,
         project_hash,
@@ -2387,7 +2830,9 @@ fn live_stream_from_registry(
     });
 
     let head_stream = futures::stream::iter(head).map(|wire| {
-        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
+        let frame = live_wire_frame_json(&wire, true);
+        log_live_frame_size(&wire, frame.len());
+        Ok::<_, std::convert::Infallible>(Event::default().data(frame))
     });
     let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
         Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
@@ -2411,8 +2856,16 @@ fn live_stream_from_registry(
     resp
 }
 
-fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response::Response {
+fn live_stream_from_hub_join(mut join: crate::live_hub::LiveJoin) -> axum::response::Response {
     let snapshot_wd = join.binding.working_dir.clone();
+    let mut snapshot = (*join.snapshot).clone();
+    // `/live` is another resume entrypoint: overlay any per-token checkpoint from
+    // a crashed `/chat` turn before handing the snapshot to the runtime.
+    if let Some(partial) =
+        zap_capabilities::session::partial::load_global(&join.binding.session_id)
+    {
+        let _ = crate::overlay_partial_stream(&mut snapshot.messages, &partial);
+    }
     let session_name = {
         let bucket = zap_capabilities::session::SessionManager::project_hash(&snapshot_wd);
         match crate::legacy_convert::load_catalog_session_view_in_project(
@@ -2435,9 +2888,9 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     // Snapshot + replay head is emitted ahead of the live bus and tagged
     // `replay: true`; only those frames may be de-duplicated client-side.
     let mut head: Vec<LiveWireEvent> = Vec::new();
-    let mut snapshot_messages: Vec<crate::MessageInfo> = join
-        .snapshot
-        .messages
+    let snapshot_count = snapshot.messages.len();
+    let (snapshot_offset, snapshot_tail) = snapshot_tail(&snapshot.messages);
+    let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot_tail
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
@@ -2452,6 +2905,8 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     );
     head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
+        message_count: snapshot_count,
+        offset: snapshot_offset,
         session_id: join.binding.session_id.clone(),
         session_name,
         project_hash,
@@ -2502,7 +2957,9 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     });
 
     let head_stream = futures::stream::iter(head).map(|wire| {
-        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
+        let frame = live_wire_frame_json(&wire, true);
+        log_live_frame_size(&wire, frame.len());
+        Ok::<_, std::convert::Infallible>(Event::default().data(frame))
     });
     let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
         Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
@@ -2761,7 +3218,7 @@ pub(crate) async fn live_message(
                     wd.clone(),
                     state.telemetry.clone(),
                     bootstrap_provider.clone(),
-                    native_runtime_mode(live_current_approval_mode()),
+                    native_runtime_mode(live_session_approval_mode(Some(&session_id))),
                     session_id.clone(),
                 )
                 .await
@@ -2907,7 +3364,7 @@ pub(crate) async fn live_message(
         live_current_working_dir(&working_dir),
         state.telemetry.clone(),
         bootstrap_provider,
-        native_runtime_mode(live_current_approval_mode()),
+        native_runtime_mode(live_session_approval_mode(sid.as_deref())),
         sid,
     )
     .await
@@ -3052,10 +3509,12 @@ fn split_live_inputs(
         zap_coding::UserInput {
             text: runtime_text,
             images: original_images.clone(),
+            id: None,
         },
         zap_coding::UserInput {
             text: message,
             images: original_images,
+            id: None,
         },
     )
 }
@@ -3124,6 +3583,18 @@ pub(crate) struct LiveProviderReq {
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
 /// 该端点仍是 live runtime 的即时切换接口；TUI `/model` 另会更新新会话默认值。
+///
+/// 同一份选择必须广播到所有实例（`model_config`）：它们各自的下拉框与会话缓存
+/// 都按这一份渲染；本轮仍在跑时按 `deferred` 接受，停止后下一轮自然生效。
+fn model_config_ok(
+    session_id: Option<&str>,
+    provider: &str,
+    deferred: bool,
+) -> Json<serde_json::Value> {
+    crate::publish_model_config(session_id, Some(provider), None, deferred);
+    Json(serde_json::json!({ "ok": true, "deferred": deferred }))
+}
+
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
@@ -3149,9 +3620,14 @@ pub(crate) async fn live_provider(
     let established = requested_session_id
         .as_deref()
         .is_some_and(|id| session_is_established(&working_dir, id));
-    if established {
-        if let Some(session_id) = requested_session_id.as_deref() {
+    if let Some(session_id) = requested_session_id.as_deref() {
+        if established {
             persist_session_preferred_model(&working_dir, session_id, &requested_provider);
+        } else {
+            crate::native_live::set_session_draft_provider(
+                session_id.to_string(),
+                requested_provider.clone(),
+            );
         }
     } else {
         let _ = zap_config::ConfigStore::default_store().update(|cfg| {
@@ -3191,7 +3667,7 @@ pub(crate) async fn live_provider(
             &req.provider,
             &requested_fingerprint,
         ) {
-            return Json(serde_json::json!({ "ok": true }));
+            return model_config_ok(requested_session_id.as_deref(), &requested_provider, false);
         }
         let runtime_config = chat_runtime_config(
             &config,
@@ -3206,16 +3682,14 @@ pub(crate) async fn live_provider(
         )
         .await
         {
-            Ok(_) => return Json(serde_json::json!({ "ok": true })),
+            Ok(_) => {
+                return model_config_ok(requested_session_id.as_deref(), &requested_provider, false)
+            }
             // A turn is running: reassembling the provider would hard-kill it and drop
-            // the interrupted turn's context. Surface a distinct flag so the client can
-            // revert its optimistic selection and tell the user to stop the turn first.
+            // the interrupted turn's context. The selection is already persisted to the
+            // session metadata, so accept it as deferred instead of rolling the UI back.
             Err(crate::live_hub::HubError::ActiveTurn) => {
-                return Json(serde_json::json!({
-                    "ok": false,
-                    "active_turn": true,
-                    "error": "a turn is running; stop it before switching the model",
-                }));
+                return model_config_ok(requested_session_id.as_deref(), &requested_provider, true);
             }
             // View identity drifted from the execution session (e.g. `/webui`
             // landing switched the hub VIEW). Reload the unique handle below.
@@ -3241,24 +3715,20 @@ pub(crate) async fn live_provider(
         .as_deref()
         .and_then(crate::native_live::existing_runner_handle);
     let Some(handle) = unique else {
-        return Json(serde_json::json!({ "ok": true }));
+        return model_config_ok(requested_session_id.as_deref(), &requested_provider, false);
     };
     let cached_fp = requested_session_id.as_deref().and_then(|id| {
         zap_coding::session_runtime_registry::SessionRuntimeRegistry::global()
             .provider_fingerprint(&id.to_string())
     });
     if cached_fp.as_deref() == Some(requested_fingerprint.as_str()) {
-        return Json(serde_json::json!({ "ok": true }));
+        return model_config_ok(requested_session_id.as_deref(), &requested_provider, false);
     }
     match handle.status().phase {
         zap_coding::RuntimePhase::InTurn
         | zap_coding::RuntimePhase::WaitingApproval
         | zap_coding::RuntimePhase::Reconfiguring => {
-            return Json(serde_json::json!({
-                "ok": false,
-                "active_turn": true,
-                "error": "a turn is running; stop it before switching the model",
-            }));
+            return model_config_ok(requested_session_id.as_deref(), &requested_provider, true);
         }
         _ => {}
     }
@@ -3279,13 +3749,11 @@ pub(crate) async fn live_provider(
                 zap_coding::session_runtime_registry::SessionRuntimeRegistry::global()
                     .set_provider_fingerprint(&session_id.to_string(), Some(requested_fingerprint));
             }
-            Json(serde_json::json!({ "ok": true }))
+            model_config_ok(requested_session_id.as_deref(), &requested_provider, false)
         }
-        Err(zap_coding::RuntimeError::Busy) => Json(serde_json::json!({
-            "ok": false,
-            "active_turn": true,
-            "error": "a turn is running; stop it before switching the model",
-        })),
+        Err(zap_coding::RuntimeError::Busy) => {
+            model_config_ok(requested_session_id.as_deref(), &requested_provider, true)
+        }
         Err(error) => Json(serde_json::json!({
             "ok": false,
             "error": format!("provider reload rejected: {error}"),
@@ -3300,6 +3768,10 @@ pub(crate) struct LiveModeReq {
     /// 目标 session id；提供时将模式隔离记录在该会话上，避免污染其他项目/会话。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 全局模式开关。`Some(true/false)` 表示同时切换开关；`None` 表示只改模式。
+    /// 开启后所有会话统一跟随本模式，且不再写会话级记录。
+    #[serde(default)]
+    pub global: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -3313,6 +3785,8 @@ pub(crate) struct ApprovalModeQuery {
 pub(crate) struct ApprovalModeResp {
     pub ok: bool,
     pub mode: ApprovalMode,
+    /// 全局模式开关当前是否开启（前端胶囊状态）。
+    pub global: bool,
 }
 
 pub(crate) async fn approval_mode_get(
@@ -3321,6 +3795,7 @@ pub(crate) async fn approval_mode_get(
     Json(ApprovalModeResp {
         ok: true,
         mode: live_session_approval_mode(query.session_id.as_deref()),
+        global: live_global_mode_enabled(),
     })
 }
 
@@ -3339,6 +3814,25 @@ async fn apply_live_mode_scoped(session_id: Option<&str>, mode: ApprovalMode) ->
             let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
         }
     }
+    // Registry-backed runners (background sessions / detached turns) own their own
+    // `mode` gate. A remote switch must reach the EXACT session's running handle,
+    // even while this daemon's live binding is projecting another transcript.
+    let registry = zap_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+    match session_id.filter(|s| !s.trim().is_empty()) {
+        Some(sid) => {
+            let key = sid.trim().to_string();
+            if let Some(handle) = registry.handle(&key) {
+                let _ = handle.set_mode(native_runtime_mode(mode)).await;
+            }
+        }
+        None => {
+            for entry in registry.list_all() {
+                if let Some(handle) = registry.handle(&entry.session_id) {
+                    let _ = handle.set_mode(native_runtime_mode(mode)).await;
+                }
+            }
+        }
+    }
     true
 }
 
@@ -3347,27 +3841,83 @@ pub(crate) async fn approval_mode_set(
     Json(req): Json<LiveModeReq>,
 ) -> impl IntoResponse {
     let session_id = req.session_id.as_deref();
-    let ok = apply_live_mode_scoped(session_id, req.mode).await;
-    if req.mode == ApprovalMode::Auto {
-        state
-            .pending_permissions
-            .deliver_all(PermissionDecision::AllowOnce);
-        if let Ok(binding) = crate::native_live::binding() {
-            let affects_binding = match session_id {
-                Some(sid) => binding.session_id == sid,
-                None => true,
-            };
-            if affects_binding {
-                zap_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                    &binding.session_id,
-                );
-            }
-        }
-    }
+    let ok = apply_mode_request(&state, &req).await;
     Json(ApprovalModeResp {
         ok,
         mode: live_session_approval_mode(session_id),
+        global: live_global_mode_enabled(),
     })
+}
+
+/// Shared handler body for `/approval_mode` 与 `/live/mode`。
+///
+/// 顺序语义：先切换全局开关（若请求携带），再按“当前是否全局”决定作用域。
+/// 全局开启时，任何模式切换都是全局切换；关闭时恢复各会话自己的模式并重下发给
+/// 正在运行的 runner，保证后台会话不被全局态残留污染。
+async fn apply_mode_request(state: &AppState, req: &LiveModeReq) -> bool {
+    let was_global = live_global_mode_enabled();
+    if let Some(enabled) = req.global {
+        live_set_global_mode_enabled(enabled, Some(req.mode));
+    }
+    let now_global = live_global_mode_enabled();
+    let scope: Option<&str> = if now_global {
+        None
+    } else {
+        req.session_id.as_deref().filter(|s| !s.trim().is_empty())
+    };
+    let ok = apply_live_mode_scoped(scope, req.mode).await;
+
+    if req.global.is_some() && was_global != now_global {
+        if !now_global {
+            // 关闭全局：把每个会话原本记录的模式重新下发给各自的 runner。
+            reapply_per_session_modes().await;
+        }
+        crate::publish_global(crate::GlobalWireEvent::ModeGlobal {
+            enabled: now_global,
+            mode: live_current_approval_mode().wire().to_string(),
+        });
+    }
+
+    if req.mode == ApprovalMode::Auto {
+        match scope {
+            Some(sid) => {
+                state
+                    .pending_permissions
+                    .deliver_all_for_session(sid.trim(), PermissionDecision::AllowOnce);
+                zap_capabilities::session::SessionManager::clear_pending_permission_any_project(
+                    sid.trim(),
+                );
+            }
+            None => {
+                state
+                    .pending_permissions
+                    .deliver_all(PermissionDecision::AllowOnce);
+                if let Ok(binding) = crate::native_live::binding() {
+                    zap_capabilities::session::SessionManager::clear_pending_permission_any_project(
+                        &binding.session_id,
+                    );
+                }
+            }
+        }
+    }
+    ok
+}
+
+/// 关闭全局开关后，把各会话恢复为自己的模式（仅影响正在运行的 runner）。
+/// 复杂度 = O(当前正在运行的 runtime)，与磁盘上的会话总数无关；
+/// 每个会话只读自己已知 working_dir 下的一个小 meta 文件，不做目录扫描。
+async fn reapply_per_session_modes() {
+    let registry = zap_coding::session_runtime_registry::SessionRuntimeRegistry::global();
+    for entry in registry.list_all() {
+        if let Some(handle) = registry.handle(&entry.session_id) {
+            let mode = live_session_approval_mode_in_dir(&entry.working_dir, &entry.session_id);
+            let _ = handle.set_mode(native_runtime_mode(mode)).await;
+        }
+    }
+    if let Ok(binding) = crate::native_live::binding() {
+        let mode = live_session_approval_mode_in_dir(&binding.working_dir, &binding.session_id);
+        let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
+    }
 }
 
 /// POST /live/mode — webui 底栏「模式」pill 切换审批模式
@@ -3383,26 +3933,11 @@ pub(crate) async fn live_mode(
     Json(req): Json<LiveModeReq>,
 ) -> impl IntoResponse {
     let session_id = req.session_id.as_deref();
-    let ok = apply_live_mode_scoped(session_id, req.mode).await;
-    if req.mode == ApprovalMode::Auto {
-        state
-            .pending_permissions
-            .deliver_all(PermissionDecision::AllowOnce);
-        if let Ok(binding) = crate::native_live::binding() {
-            let affects_binding = match session_id {
-                Some(sid) => binding.session_id == sid,
-                None => true,
-            };
-            if affects_binding {
-                zap_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                    &binding.session_id,
-                );
-            }
-        }
-    }
+    let ok = apply_mode_request(&state, &req).await;
     Json(ApprovalModeResp {
         ok,
         mode: live_session_approval_mode(session_id),
+        global: live_global_mode_enabled(),
     })
 }
 
@@ -3464,6 +3999,8 @@ pub(crate) async fn live_reasoning_effort(
     let mut previous_effort = None;
     let mut provider_missing = false;
     let clear_budget = req.clear_thinking_budget;
+    // 本轮仍在跑时的“已接受、下一轮生效”标记（见下方 reload 的 ActiveTurn 分支）。
+    let mut deferred = false;
     let commit = match store.update(|config| {
         target = requested
             .clone()
@@ -3526,14 +4063,35 @@ pub(crate) async fn live_reasoning_effort(
     };
     let config = commit.snapshot.config.clone();
 
-    // 多会话 Registry 模式：若提供了 session_id，立即对该活跃会话执行热重载
+    // Session-scoped intensity: remember this session's own choice so a sibling
+    // session on the same provider cannot silently inherit it.
+    let stored_effort = effort.clone();
+    let stored_budget = if clear_budget { None } else { budget_val };
+    let session_scope = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(sid) = session_scope.as_deref() {
+        if let Ok(Some(resolved)) = crate::resolve_session_by_id(sid) {
+            let _ = zap_capabilities::session::SessionManager::for_project(
+                &resolved.meta.working_dir,
+            )
+            .update_meta(sid, |meta| {
+                meta.reasoning_effort = stored_effort.clone();
+                meta.thinking_budget = stored_budget;
+            });
+        }
+    }
     let registry = zap_coding::session_runtime_registry::SessionRuntimeRegistry::global();
     if let Some(ref sid) = req.session_id {
         if let Some(handle) = registry.handle(sid) {
             let working_dir = { state.project.read().await.working_dir.clone() };
             let wd = live_current_working_dir(&working_dir);
-            let runtime_config =
+            let mut runtime_config =
                 live_runtime_config(&config, &target, &wd, state.telemetry.clone());
+            apply_session_effort_override(&mut runtime_config, &wd, Some(sid));
             let next = crate::kernel_runtime::coding_config_from_runtime(&runtime_config);
             let _ = handle.reassemble_provider(next).await;
             if let Ok(fp) = crate::native_live::provider_fingerprint(&config, &target) {
@@ -3561,34 +4119,50 @@ pub(crate) async fn live_reasoning_effort(
             Err(error) => Err(crate::live_hub::HubError::RuntimeRejected(error)),
         };
         if let Err(error) = reload_result {
-            // Roll back the persisted effort (the reload that would apply it was
-            // refused). Surface the same active_turn flag as /live/provider.
-            let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);
-            let rollback_error =
-                match store.update_if_revision(&commit.snapshot.revision, |config| {
-                    config.update_selection_reasoning(&target, |r| {
-                        *r.reasoning_effort = previous_effort.clone();
-                    });
-                    Ok(())
-                }) {
-                    Ok(Some(_)) | Ok(None) => None,
-                    Err(error) => Some(error.to_string()),
-                };
-            return Json(serde_json::json!({
-                "ok": false,
-                "active_turn": active_turn,
-                "error": match rollback_error {
-                    Some(rollback) => format!(
-                        "provider reload rejected: {error:?}; config rollback failed: {rollback}"
-                    ),
-                    None => format!("provider reload rejected: {error:?}"),
-                },
-            }))
-            .into_response();
+            match error {
+                // 本轮仍在跑：重组 runtime 会把当前回合硬杀。强度已经落盘（provider 配置
+                // + 本会话元数据），用户停止后的下一轮重读即生效，因此按 deferred 接受。
+                crate::live_hub::HubError::ActiveTurn => deferred = true,
+                other => {
+                    // 真正的拒绝（无法稍后生效）：回滚已持久化的强度，如实报错。
+                    let rollback_error =
+                        match store.update_if_revision(&commit.snapshot.revision, |config| {
+                            config.update_selection_reasoning(&target, |r| {
+                                *r.reasoning_effort = previous_effort.clone();
+                            });
+                            Ok(())
+                        }) {
+                            Ok(Some(_)) | Ok(None) => None,
+                            Err(error) => Some(error.to_string()),
+                        };
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": match rollback_error {
+                            Some(rollback) => format!(
+                                "provider reload rejected: {other:?}; config rollback failed: {rollback}"
+                            ),
+                            None => format!("provider reload rejected: {other:?}"),
+                        },
+                    }))
+                    .into_response();
+                }
+            }
         }
     }
 
-    Json(serde_json::json!({ "ok": true })).into_response()
+    // 思考强度/预算是“模型参数”：所有实例的下拉框与会话缓存必须跟着变。
+    crate::publish_model_config(
+        session_scope.as_deref(),
+        Some(&target),
+        Some(crate::ModelEffortWire {
+            reasoning_effort: stored_effort,
+            thinking_budget: stored_budget,
+        }),
+        deferred,
+    );
+    // provider 级默认强度也变了：让各端重读模型列表（默认 effort/预算展示同源）。
+    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+    Json(serde_json::json!({ "ok": true, "deferred": deferred })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -3835,6 +4409,18 @@ mod tests {
     use zap_kernel::message::Message;
 
     #[test]
+    fn live_snapshot_tail_is_bounded_to_48_messages() {
+        let messages: Vec<Message> = (0..100)
+            .map(|index| Message::user(format!("question {index}")))
+            .collect();
+        let (offset, tail) = snapshot_tail(&messages);
+        assert_eq!(offset, 52);
+        assert_eq!(tail.len(), 48);
+        assert_eq!(tail[0].text, "question 52");
+        assert_eq!(tail[47].text, "question 99");
+    }
+
+    #[test]
     fn in_turn_and_approval_block_a_new_submit_until_preempted() {
         assert!(phase_blocks_new_turn(zap_coding::RuntimePhase::InTurn));
         assert!(phase_blocks_new_turn(
@@ -3861,6 +4447,8 @@ mod tests {
     // ORIGINAL bytes were stashed to the display-only sidecar during the turn.
     fn missing_user_msg() -> crate::MessageInfo {
         crate::MessageInfo {
+            turn_id: None,
+            seq: None,
             role: "user".into(),
             content: "识别一下".into(),
             reasoning: None,
@@ -3877,6 +4465,7 @@ mod tests {
             created_at: None,
             elapsed_ms: None,
             id: None,
+            ..Default::default()
         }
     }
 
@@ -4146,7 +4735,10 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&body).expect("approval mode response json");
 
-        assert_eq!(value, serde_json::json!({ "ok": true, "mode": "bypass" }));
+        assert_eq!(
+            value,
+            serde_json::json!({ "ok": true, "mode": "bypass", "global": false })
+        );
     }
 
     #[tokio::test]
@@ -4165,7 +4757,7 @@ mod tests {
         let val_default: serde_json::Value = serde_json::from_slice(&body_default).expect("json");
         assert_eq!(
             val_default,
-            serde_json::json!({ "ok": true, "mode": "build" })
+            serde_json::json!({ "ok": true, "mode": "build", "global": false })
         );
 
         // Scoped query for session-alpha returns isolated Plan mode.
@@ -4178,7 +4770,10 @@ mod tests {
             .await
             .expect("read response body");
         let val_alpha: serde_json::Value = serde_json::from_slice(&body_alpha).expect("json");
-        assert_eq!(val_alpha, serde_json::json!({ "ok": true, "mode": "plan" }));
+        assert_eq!(
+            val_alpha,
+            serde_json::json!({ "ok": true, "mode": "plan", "global": false })
+        );
 
         // Other session without explicit override falls back to global Build mode.
         let resp_beta = approval_mode_get(axum::extract::Query(ApprovalModeQuery {
@@ -4190,7 +4785,10 @@ mod tests {
             .await
             .expect("read response body");
         let val_beta: serde_json::Value = serde_json::from_slice(&body_beta).expect("json");
-        assert_eq!(val_beta, serde_json::json!({ "ok": true, "mode": "build" }));
+        assert_eq!(
+            val_beta,
+            serde_json::json!({ "ok": true, "mode": "build", "global": false })
+        );
 
         // Clearing session-alpha restores fallback to default mode.
         live_clear_session_approval_mode("session-alpha");
@@ -4205,8 +4803,157 @@ mod tests {
         let val_cleared: serde_json::Value = serde_json::from_slice(&body_cleared).expect("json");
         assert_eq!(
             val_cleared,
-            serde_json::json!({ "ok": true, "mode": "build" })
+            serde_json::json!({ "ok": true, "mode": "build", "global": false })
         );
+    }
+
+    #[test]
+    fn global_mode_switch_overrides_every_session_and_reverts_cleanly() {
+        let _guard = ScopedApprovalModeForTest::new();
+        live_set_session_approval_mode(Some("sess-a"), ApprovalMode::Plan);
+        live_set_session_approval_mode(Some("sess-b"), ApprovalMode::AcceptEdits);
+
+        // 默认关闭：各会话独立。
+        assert!(!live_global_mode_enabled());
+        assert_eq!(
+            live_session_approval_mode(Some("sess-a")),
+            ApprovalMode::Plan
+        );
+
+        // 开启全局：所有会话统一跟随全局模式，会话级记录被暂时忽略。
+        live_set_global_mode_enabled(true, Some(ApprovalMode::Auto));
+        assert!(live_global_mode_enabled());
+        assert_eq!(
+            live_session_approval_mode(Some("sess-a")),
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            live_session_approval_mode(Some("sess-b")),
+            ApprovalMode::Auto
+        );
+        // 全局开启时不再暴露会话级真相（避免反向覆盖）。
+        assert!(live_session_approval_mode_cached(Some("sess-a")).is_none());
+
+        // 关闭全局：各会话恢复自己的记录。
+        live_set_global_mode_enabled(false, None);
+        assert!(!live_global_mode_enabled());
+        assert_eq!(
+            live_session_approval_mode(Some("sess-a")),
+            ApprovalMode::Plan
+        );
+        assert_eq!(
+            live_session_approval_mode(Some("sess-b")),
+            ApprovalMode::AcceptEdits
+        );
+    }
+
+    /// Session rows/details must report the GLOBAL mode while the switch is on;
+    /// otherwise a cold start reads the session's stale disk value and flashes
+    /// the old mode before the broadcast corrects it.
+    #[test]
+    fn display_mode_helper_reports_global_while_switch_is_on() {
+        let _guard = ScopedApprovalModeForTest::new();
+        live_set_session_approval_mode(Some("s1"), ApprovalMode::Plan);
+        assert_eq!(live_display_approval_mode_wire("s1", Some("plan")), "plan");
+
+        live_set_global_mode_enabled(true, Some(ApprovalMode::Auto));
+        assert_eq!(
+            live_display_approval_mode_wire("s1", Some("plan")),
+            "bypass",
+            "session row must follow the global switch"
+        );
+        assert_eq!(
+            live_display_approval_mode_wire("never-seen", None),
+            "bypass"
+        );
+
+        live_set_global_mode_enabled(false, None);
+        assert_eq!(live_display_approval_mode_wire("s1", Some("plan")), "plan");
+        // Meta absent → in-memory session cache still wins over the process default.
+        assert_eq!(live_display_approval_mode_wire("s1", None), "plan");
+    }
+
+    #[test]
+    fn mode_global_event_serializes_its_switch_state() {
+        let on = serde_json::to_value(crate::GlobalWireEvent::ModeGlobal {
+            enabled: true,
+            mode: "plan".into(),
+        })
+        .unwrap();
+        assert_eq!(on["type"], "mode_global");
+        assert_eq!(on["enabled"], true);
+        assert_eq!(on["mode"], "plan");
+
+        let off = serde_json::to_value(crate::GlobalWireEvent::ModeGlobal {
+            enabled: false,
+            mode: "build".into(),
+        })
+        .unwrap();
+        assert_eq!(off["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn approval_mode_broadcasts_to_global_bus() {
+        let _mode_guard = ScopedApprovalModeForTest::new();
+        let mut global_rx = crate::global_events().subscribe();
+
+        // 切换 session 专属模式
+        live_set_mode_for_session(Some("session-sync-test"), ApprovalMode::Auto);
+
+        // 验证广播事件
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), global_rx.recv())
+            .await
+            .expect("receive global event in time")
+            .expect("valid event");
+
+        match event {
+            crate::GlobalWireEvent::SessionMode { session_id, mode } => {
+                assert_eq!(session_id, Some("session-sync-test".to_string()));
+                assert_eq!(mode, "bypass");
+            }
+            other => panic!("expected SessionMode event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_provider_scoped_to_session_draft_does_not_mutate_global_config() {
+        let home = crate::tests::ScopedChatHome::new();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "default_provider = \"base-model\"\n",
+        )
+        .unwrap();
+
+        let initial_default = zap_config::ConfigStore::default_store()
+            .read()
+            .unwrap()
+            .config
+            .default_provider
+            .clone();
+
+        crate::native_live::set_session_draft_provider(
+            "draft-provider-test".to_string(),
+            "special-isolated-model".to_string(),
+        );
+
+        assert_eq!(
+            crate::native_live::get_session_draft_provider("draft-provider-test").as_deref(),
+            Some("special-isolated-model")
+        );
+
+        let after_default = zap_config::ConfigStore::default_store()
+            .read()
+            .unwrap()
+            .config
+            .default_provider
+            .clone();
+        assert_eq!(initial_default, after_default);
+
+        assert_eq!(
+            crate::native_live::take_session_draft_provider("draft-provider-test").as_deref(),
+            Some("special-isolated-model")
+        );
+        assert!(crate::native_live::get_session_draft_provider("draft-provider-test").is_none());
     }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
@@ -4714,6 +5461,46 @@ mod tests {
     }
 
     #[test]
+    fn native_live_projector_anchors_notices_to_the_streaming_round() {
+        use zap_kernel::event::AgentEvent as Kernel;
+
+        let mut projector = NativeLiveWireProjector::default();
+        // 回合边界（AssistantMessage）只记录身份，本身不上屏。
+        assert!(projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(Kernel::AssistantMessage {
+                    message_id: "m-round".into(),
+                }),
+            ))
+            .is_none());
+
+        // 黄色提示必须携带该轮的 message_id，否则前端只能挂到“最后一条”，
+        // 压缩标记就会逐轮漂移到时间线尾部。
+        let warning = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(Kernel::Warning("conversation compacted".into())),
+            ))
+            .expect("warning must reach the live wire");
+        let json = serde_json::to_value(&warning).unwrap();
+        assert_eq!(json["type"], "warning");
+        assert_eq!(json["message_id"], "m-round");
+
+        let limited = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(Kernel::RateLimited {
+                    reset_at_display: "18:09".into(),
+                    reset_label: "5h".into(),
+                    secs_until_reset: Some(7200),
+                    auto_resuming: false,
+                    server_message: None,
+                }),
+            ))
+            .expect("rate limit must reach the live wire");
+        let json = serde_json::to_value(&limited).unwrap();
+        assert_eq!(json["message_id"], "m-round");
+    }
+
+    #[test]
     fn native_live_projector_preserves_the_authoritative_stop_reason() {
         for (reason, expected) in [
             (zap_kernel::event::StopReason::MaxRounds, "max_rounds"),
@@ -4882,6 +5669,25 @@ mod tests {
     }
 
     #[test]
+    fn native_live_projector_ignores_raw_steer_runtime_event() {
+        let mut projector = NativeLiveWireProjector::default();
+        assert!(projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                zap_coding::CodingRuntimeEvent::Agent(
+                    zap_kernel::event::AgentEvent::Steered {
+                        count: 1,
+                        inputs: vec![zap_kernel::event::SteeredInput {
+                            text: "unanchored duplicate".into(),
+                            images: Vec::new(),
+                            message_id: Some("m-steer-1".into()),
+                        }],
+                    },
+                ),
+            ))
+            .is_none());
+    }
+
+    #[test]
     fn native_live_projector_exposes_exact_steered_inputs() {
         let mut projector = NativeLiveWireProjector::default();
         let wire = projector
@@ -4893,6 +5699,7 @@ mod tests {
                     message_id: Some("m-steer-1".into()),
                 }],
                 client_input_ids: vec![Some("web-1".into())],
+                anchor_message_id: Some("assistant-before".into()),
             })
             .expect("steer acknowledgement must reach the live wire");
         let json = serde_json::to_value(wire).unwrap();
@@ -4902,6 +5709,7 @@ mod tests {
         assert_eq!(json["inputs"][0]["images"], serde_json::json!([]));
         assert_eq!(json["inputs"][0]["message_id"], "m-steer-1");
         assert_eq!(json["client_input_ids"][0], "web-1");
+        assert_eq!(json["anchor_message_id"], "assistant-before");
     }
 
     #[test]
@@ -4912,6 +5720,7 @@ mod tests {
                 CodingRuntimeEvent::Agent(zap_kernel::event::AgentEvent::UserMessage {
                     message_id: "m-user-1".into(),
                     turn_ordinal: 4,
+                    message_index: 11,
                 }),
             ))
             .expect("the stored user identity must reach the live wire");
@@ -4919,6 +5728,10 @@ mod tests {
         assert_eq!(json["type"], "user_identified");
         assert_eq!(json["message_id"], "m-user-1");
         assert_eq!(json["turn_ordinal"], 4);
+        assert!(
+            json.get("absolute_index").is_none(),
+            "absolute_index 是内核 snapshot 下标，不是 display 下标，不得下发"
+        );
     }
 
     #[test]

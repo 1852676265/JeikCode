@@ -72,6 +72,15 @@ enum PermissionResponderEntry {
     /// per-turn tombstone until normal turn cleanup so a racing late POST is
     /// rejected rather than falling through to another transport.
     Expired,
+    /// This exact approval was already delivered to the runtime. Keep a per-turn
+    /// tombstone so a retried POST is acknowledged as *already applied* instead of
+    /// hard-failing forever: the decision route is consumed before the HTTP reply
+    /// is written, so a lost reply (long-idle half-open connection, a second WebUI
+    /// instance, an app resume) used to turn the approval card into a dead modal
+    /// that every further click bounced off.
+    Resolved {
+        decision: PermissionDecision,
+    },
 }
 
 pub enum PermissionDelivery {
@@ -80,7 +89,23 @@ pub enum PermissionDelivery {
         accepted: oneshot::Receiver<()>,
     },
     Expired,
+    /// The same `(session_id, approval_id)` was already applied in this turn.
+    /// Nothing is delivered again; the caller reports the applied decision.
+    AlreadyResolved {
+        decision: PermissionDecision,
+    },
     Absent,
+}
+
+/// Wire spelling of an applied decision, mirroring [`PermissionDecision::from_value`]
+/// (`/chat/permission` and `/live/permission` payloads). Kept here so the HTTP
+/// layer and the bridge can never drift apart.
+pub fn decision_wire(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::AllowOnce => "allow",
+        PermissionDecision::AllowAlways => "allow_always",
+        PermissionDecision::Deny => "deny",
+    }
 }
 
 /// Stable identity for one persisted pending approval. The runtime writes the
@@ -197,7 +222,9 @@ impl PermissionResponders {
     }
 
     /// Mark one exact approval as expired while preserving a short-lived
-    /// tombstone until turn cleanup.
+    /// tombstone until turn cleanup. A `Resolved` tombstone is downgraded here when
+    /// the runtime rejects the queued decision (stale request / generation gone), so
+    /// a retry is never misreported as applied.
     pub fn expire(&self, session_id: &str, approval_id: &str) {
         let key = (session_id.to_owned(), approval_id.to_owned());
         let mut guard = self.inner.write().unwrap();
@@ -232,6 +259,12 @@ impl PermissionResponders {
                 guard.insert(key, PermissionResponderEntry::Expired);
                 PermissionDelivery::Expired
             }
+            Some(PermissionResponderEntry::Resolved { decision }) => {
+                // Idempotent replay: the effect already happened. Keep the tombstone
+                // and tell the caller which decision actually took effect.
+                guard.insert(key, PermissionResponderEntry::Resolved { decision });
+                PermissionDelivery::AlreadyResolved { decision }
+            }
             Some(PermissionResponderEntry::Pending(pending)) => {
                 // 决策一旦被认领，待交互状态就变了：所有实例就地移除该卡片。
                 crate::publish_global(crate::GlobalWireEvent::ReviewResolved {
@@ -240,14 +273,25 @@ impl PermissionResponders {
                     request_id: None,
                 });
                 let (accepted_tx, accepted_rx) = oneshot::channel();
+                let applied = submission.decision;
                 match pending.tx.send(PermissionSubmissionEnvelope::with_ack(
                     submission,
                     accepted_tx,
                 )) {
-                    Ok(()) => PermissionDelivery::Submitted {
-                        tool_name: pending.tool_name,
-                        accepted: accepted_rx,
-                    },
+                    Ok(()) => {
+                        // Claim the route as APPLIED until turn cleanup. Only the
+                        // runtime can revoke that (see `expire` on a rejected
+                        // decision), so a retry reports the truth instead of the
+                        // permanent "stale or unknown permission request" dead end.
+                        guard.insert(
+                            key,
+                            PermissionResponderEntry::Resolved { decision: applied },
+                        );
+                        PermissionDelivery::Submitted {
+                            tool_name: pending.tool_name,
+                            accepted: accepted_rx,
+                        }
+                    }
                     Err(_) => {
                         guard.insert(key, PermissionResponderEntry::Expired);
                         PermissionDelivery::Expired
@@ -260,11 +304,25 @@ impl PermissionResponders {
     /// Resolve every approval that is pending *now* (used when switching to Auto).
     /// Expired tombstones remain until turn cleanup.
     pub fn deliver_all(&self, decision: PermissionDecision) -> usize {
+        self.deliver_all_scoped(None, decision)
+    }
+
+    /// Resolve pending approvals for ONE session only (used when a remote client
+    /// switches that session to Auto). Other sessions waiting on a human decision
+    /// must stay parked — a process-wide sweep here would silently auto-approve
+    /// unrelated background turns.
+    pub fn deliver_all_for_session(&self, session_id: &str, decision: PermissionDecision) -> usize {
+        self.deliver_all_scoped(Some(session_id), decision)
+    }
+
+    fn deliver_all_scoped(&self, session_id: Option<&str>, decision: PermissionDecision) -> usize {
         let mut guard = self.inner.write().unwrap();
         let keys: Vec<_> = guard
             .iter()
             .filter_map(|(key, value)| {
-                matches!(value, PermissionResponderEntry::Pending(_)).then(|| key.clone())
+                let in_scope = session_id.is_none_or(|sid| key.0 == sid);
+                (in_scope && matches!(value, PermissionResponderEntry::Pending(_)))
+                    .then(|| key.clone())
             })
             .collect();
         let resolved_keys = keys.clone();
@@ -416,10 +474,61 @@ mod tests {
             ),
             PermissionDelivery::Submitted { .. }
         ));
+        // A consumed route is no longer *delivered* again — but it is not a hard
+        // failure either: the decision already took effect, so a retry (lost HTTP
+        // reply / another WebUI instance) must see that truth.
         assert!(matches!(
             reg.deliver(
                 "sess-1",
                 "call-new",
+                PermissionSubmission {
+                    decision: PermissionDecision::AllowOnce,
+                    persist: false,
+                },
+            ),
+            PermissionDelivery::AlreadyResolved {
+                decision: PermissionDecision::Deny
+            }
+        ));
+    }
+
+    #[test]
+    fn resolved_tombstone_downgrades_to_expired_when_the_runtime_rejects() {
+        let reg = PermissionResponders::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        reg.register("sess-1".into(), "call-1".into(), "bash".into(), tx);
+        assert!(matches!(
+            reg.deliver(
+                "sess-1",
+                "call-1",
+                PermissionSubmission {
+                    decision: PermissionDecision::AllowOnce,
+                    persist: false,
+                },
+            ),
+            PermissionDelivery::Submitted { .. }
+        ));
+        // The runtime rejected the queued decision (request already timed out /
+        // generation replaced): the effect did NOT happen, so a retry must not be
+        // told it was applied.
+        reg.expire("sess-1", "call-1");
+        assert!(matches!(
+            reg.deliver(
+                "sess-1",
+                "call-1",
+                PermissionSubmission {
+                    decision: PermissionDecision::AllowOnce,
+                    persist: false,
+                },
+            ),
+            PermissionDelivery::Expired
+        ));
+        // Turn cleanup drops both tombstones.
+        reg.unregister_session("sess-1");
+        assert!(matches!(
+            reg.deliver(
+                "sess-1",
+                "call-1",
                 PermissionSubmission {
                     decision: PermissionDecision::AllowOnce,
                     persist: false,
@@ -471,6 +580,27 @@ mod tests {
             ),
             PermissionDelivery::Absent
         ));
+    }
+
+    #[tokio::test]
+    async fn deliver_all_for_session_leaves_other_sessions_parked() {
+        let reg = PermissionResponders::new();
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        reg.register("sess-1".into(), "call-1".into(), "bash".into(), tx1);
+        reg.register("sess-2".into(), "call-2".into(), "write".into(), tx2);
+
+        // 只放行 sess-1：另一个后台会话必须继续等人决策，绝不能被顺手 auto。
+        let count = reg.deliver_all_for_session("sess-1", PermissionDecision::AllowOnce);
+        assert_eq!(count, 1);
+        assert_eq!(
+            rx1.await.unwrap().accept().decision,
+            PermissionDecision::AllowOnce
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "sess-2 must stay parked after a session-scoped Auto switch"
+        );
     }
 
     #[tokio::test]

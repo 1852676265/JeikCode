@@ -2,7 +2,12 @@
 //! sha256 hash, one directory per session. Conversation carries only previews;
 //! full outputs live on disk, deduplicated by content.
 
+use crate::tools::artifact_watchdog::{ArtifactWatchdog, GLOBAL_MAX_CAPACITY};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,11 +31,29 @@ fn is_valid_id(id: &str) -> bool {
 /// Content-addressed store for full tool outputs, one directory per session.
 pub struct ArtifactStore {
     dir: PathBuf,
+    watchdog: Option<Arc<ArtifactWatchdog>>,
 }
 
 impl ArtifactStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            watchdog: Some(ArtifactWatchdog::global()),
+        }
+    }
+
+    pub fn new_standalone(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            watchdog: None,
+        }
+    }
+
+    pub fn with_watchdog(dir: impl Into<PathBuf>, watchdog: Arc<ArtifactWatchdog>) -> Self {
+        Self {
+            dir: dir.into(),
+            watchdog: Some(watchdog),
+        }
     }
 
     pub fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
@@ -38,12 +61,30 @@ impl ArtifactStore {
         let path = self.dir.join(&id);
         if !path.exists() {
             std::fs::create_dir_all(&self.dir)?;
+            let stored = encode_for_storage(bytes);
             // Write to a temp sibling then rename → readers never see a partial file.
             let tmp = self.dir.join(format!("{id}.tmp"));
-            std::fs::write(&tmp, bytes)?;
+            std::fs::write(&tmp, stored.as_ref())?;
             std::fs::rename(&tmp, &path)?;
+            if let Some(wd) = &self.watchdog {
+                // Capacity is disk capacity: count the compressed bytes actually stored.
+                wd.record_addition(stored.len() as u64);
+            }
         }
         Ok(id)
+    }
+
+    /// Protect an artifact from ROUTINE watchdog eviction (compaction archives).
+    ///
+    /// The marker is a zero-byte `<id>.pin` sibling. The global watchdog skips pinned
+    /// artifacts in its periodic 30% cycle and only considers them last when the hard
+    /// 7 GiB ceiling forces an emergency eviction. Idempotent.
+    pub fn pin(&self, id: &str) -> std::io::Result<()> {
+        if !is_valid_id(id) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.dir.join(format!("{id}.pin")), b"")
     }
 
     pub fn get(&self, id: &str, offset: usize, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
@@ -51,28 +92,101 @@ impl ArtifactStore {
             return Ok(None);
         }
         let path = self.dir.join(id);
-        let bytes = match std::fs::read(&path) {
+        let mut bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+        // Large UTF-8 artifacts use a private header + gzip payload. The header
+        // (not the gzip magic alone) is what makes detection unambiguous: a
+        // binary artifact may legitimately start with `1f 8b`, but it cannot
+        // start with the full JEIKCODE marker by accident in practice.
+        if bytes.len() >= ARTIFACT_GZIP_HEADER_LEN && bytes.starts_with(ARTIFACT_GZIP_MAGIC) {
+            let expected = u64::from_le_bytes(
+                bytes[ARTIFACT_GZIP_MAGIC.len()..ARTIFACT_GZIP_HEADER_LEN]
+                    .try_into()
+                    .expect("fixed 8-byte length"),
+            ) as usize;
+            let mut decoded = Vec::new();
+            GzDecoder::new(&bytes[ARTIFACT_GZIP_HEADER_LEN..]).read_to_end(&mut decoded)?;
+            if decoded.len() != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "artifact gzip length mismatch",
+                ));
+            }
+            bytes = decoded;
+        }
+        // Touch mtime on access so this artifact is marked recently used (true cross-platform LRU).
+        touch_mtime(&path);
+
         let start = offset.min(bytes.len());
         let end = start.saturating_add(limit).min(bytes.len());
         Ok(Some(bytes[start..end].to_vec()))
     }
 
-    /// Byte length of a stored artifact — an O(1) `metadata` stat, so the fetch
-    /// pagination hint doesn't re-read the whole (≤4 MiB) blob just for its size.
-    /// `Ok(None)` for a missing file or an id that isn't `[0-9a-f]{16}`.
+    /// Logical byte length of the stored artifact (the original bytes, before
+    /// any on-disk gzip compression). `Ok(None)` for a missing file or an id
+    /// that isn't `[0-9a-f]{16}`.
     pub fn size(&self, id: &str) -> std::io::Result<Option<u64>> {
         if !is_valid_id(id) {
             return Ok(None);
         }
-        match std::fs::metadata(self.dir.join(id)) {
-            Ok(m) => Ok(Some(m.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let path = self.dir.join(id);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if metadata.len() < ARTIFACT_GZIP_HEADER_LEN as u64 {
+            return Ok(Some(metadata.len()));
         }
+        let mut header = [0u8; ARTIFACT_GZIP_HEADER_LEN];
+        let mut file = std::fs::File::open(&path)?;
+        if file.read_exact(&mut header).is_err() || !header.starts_with(ARTIFACT_GZIP_MAGIC) {
+            return Ok(Some(metadata.len()));
+        }
+        Ok(Some(u64::from_le_bytes(
+            header[ARTIFACT_GZIP_MAGIC.len()..ARTIFACT_GZIP_HEADER_LEN]
+                .try_into()
+                .expect("fixed 8-byte length"),
+        )))
+    }
+}
+
+/// Text artifacts at or above 64 KiB are gzip-compressed on disk. The artifact
+/// id still hashes the original bytes, so ids and dedup stay stable; `get`
+/// transparently restores the original bytes. Binary data is never compressed.
+const ARTIFACT_GZIP_THRESHOLD: usize = 64 * 1024;
+const ARTIFACT_GZIP_MAGIC: &[u8] = b"JEIKCODE-GZIP-V1\0";
+const ARTIFACT_GZIP_HEADER_LEN: usize = ARTIFACT_GZIP_MAGIC.len() + 8;
+
+fn encode_for_storage(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if bytes.len() < ARTIFACT_GZIP_THRESHOLD || std::str::from_utf8(bytes).is_err() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    if encoder.write_all(bytes).is_err() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let Ok(compressed) = encoder.finish() else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    if compressed.len() + ARTIFACT_GZIP_HEADER_LEN >= bytes.len() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut stored = Vec::with_capacity(ARTIFACT_GZIP_HEADER_LEN + compressed.len());
+    stored.extend_from_slice(ARTIFACT_GZIP_MAGIC);
+    stored.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    stored.extend_from_slice(&compressed);
+    std::borrow::Cow::Owned(stored)
+}
+
+/// Touch mtime to current timestamp on access (best effort, zero fail impact).
+fn touch_mtime(path: &std::path::Path) {
+    if let Ok(file) = std::fs::File::options().write(true).open(path) {
+        let times = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
+        let _ = file.set_times(times);
     }
 }
 
@@ -89,14 +203,14 @@ pub const THRESHOLD_BYTES: usize = 32 * 1024;
 /// `[tools.tool_output] terminal_max_bytes` (24 KiB); the effective line is
 /// `min(max_bytes, terminal_max_bytes)` so lowering either tightens the class.
 pub const TERMINAL_THRESHOLD_BYTES: usize = 24 * 1024;
+/// Threshold for external MCP tools — provides dedicated guardrails to protect context windows.
+pub const MCP_THRESHOLD_BYTES: usize = 32 * 1024;
 /// Uniform preview kept from each end of a compressed result (bytes).
 const PREVIEW_HEAD_BYTES: usize = 1500;
 const PREVIEW_TAIL_BYTES: usize = 2200;
-/// Stable prefix embedded in a conversation-visible result when the complete
-/// tool output was replaced by an artifact-backed head/tail preview.
-pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[jeikcode: output truncated";
-/// Max bytes an artifact may store; larger results are inline-truncated only.
-const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+/// Stable marker substring embedded in a conversation-visible result when the complete
+/// tool output was replaced by an artifact-backed preview.
+pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "section of output folded";
 
 /// Detect if a tool result indicates a command failure / error state (exit code != 0).
 fn is_failure_outcome(result: &zap_kernel::tool::ToolResult) -> bool {
@@ -143,6 +257,8 @@ pub struct ArtifactMiddleware {
     /// `[tools.tool_output] terminal_max_bytes`; defaults to
     /// [`TERMINAL_THRESHOLD_BYTES`].
     terminal_threshold_bytes: usize,
+    /// Threshold for MCP tool outputs. Defaults to [`MCP_THRESHOLD_BYTES`].
+    mcp_threshold_bytes: usize,
     /// Tool names whose output must reach the model verbatim (never
     /// compressed), configured via `[tools.tool_output] no_fold_tools`.
     /// Batch-friendly: every listed tool name opts out of compression, on top
@@ -156,6 +272,7 @@ impl ArtifactMiddleware {
             store,
             threshold_bytes: THRESHOLD_BYTES,
             terminal_threshold_bytes: TERMINAL_THRESHOLD_BYTES,
+            mcp_threshold_bytes: MCP_THRESHOLD_BYTES,
             no_fold_tools: std::collections::HashSet::new(),
         }
     }
@@ -171,6 +288,13 @@ impl ArtifactMiddleware {
     /// the early line — terminal tools then follow the general threshold.
     pub fn with_terminal_threshold_bytes(mut self, bytes: usize) -> Self {
         self.terminal_threshold_bytes = bytes;
+        self
+    }
+
+    /// Override the MCP tool threshold for this instance (bytes). `0` drops
+    /// the early line — MCP tools then follow the general threshold.
+    pub fn with_mcp_threshold_bytes(mut self, bytes: usize) -> Self {
+        self.mcp_threshold_bytes = bytes;
         self
     }
 
@@ -217,6 +341,9 @@ impl zap_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
             Some(name) if crate::is_shell_tool_name(name) && self.terminal_threshold_bytes > 0 => {
                 self.threshold_bytes.min(self.terminal_threshold_bytes)
             }
+            Some(name) if name.starts_with("mcp__") && self.mcp_threshold_bytes > 0 => {
+                self.threshold_bytes.min(self.mcp_threshold_bytes)
+            }
             _ => self.threshold_bytes,
         };
 
@@ -224,7 +351,7 @@ impl zap_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
         // Pre-spill original content to the artifact store so the marker can
         // reference the exact artifact ID and guarantee 100% lossless recall.
-        let artifact_id = if total > 1024 && total <= MAX_ARTIFACT_BYTES {
+        let artifact_id = if total > 1024 && (total as u64) <= GLOBAL_MAX_CAPACITY {
             self.store.put(result.content.as_bytes()).ok()
         } else {
             None
@@ -254,31 +381,49 @@ impl zap_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
 
-        if new_total > MAX_ARTIFACT_BYTES {
-            // Too large to store; inline-truncate only.
+        let elided_content = if tail_begin >= head_end {
+            &result.content[head_end..tail_begin]
+        } else {
+            ""
+        };
+        let elided_lines = elided_content.lines().count();
+
+        if (new_total as u64) > GLOBAL_MAX_CAPACITY {
+            // Runaway process exceeding entire 7GB global ceiling: inline-truncate only.
+            let position_desc = if !head.is_empty() && !tail.is_empty() {
+                format!("Middle section of output folded ({elided_lines} lines elided)")
+            } else {
+                format!("Subsequent section of output folded ({elided_lines} lines truncated)")
+            };
             let marker = format!(
-                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
-Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n",
-                head.len(),
-                tail.len()
+                "\n\n[{position_desc}. Full output unavailable (exceeds {GLOBAL_MAX_CAPACITY}-byte artifact ceiling).]\n\n"
             );
             result.content = format!("{head}{marker}{tail}");
             return zap_kernel::middleware::AfterOutcome::Proceed;
         }
 
         let marker = match artifact_id.or_else(|| self.store.put(result.content.as_bytes()).ok()) {
-            Some(id) => format!(
-                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
-Full output saved as artifact {id}. To read more: fetch_output(artifact_id=\"{id}\", offset, limit).]\n\n",
-                head.len(),
-                tail.len()
-            ),
-            None => format!(
-                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
-Full output unavailable (could not be saved).]\n\n",
-                head.len(),
-                tail.len()
-            ),
+            Some(id) => {
+                let position_desc = if !head.is_empty() && !tail.is_empty() {
+                    format!("Middle section of output folded ({elided_lines} lines elided)")
+                } else {
+                    format!("Subsequent section of output folded ({elided_lines} lines truncated)")
+                };
+                format!(
+                    "\n\n[{position_desc}, saved as artifact {id}. \
+If current information is insufficient to resolve the issue, \
+call `read(path=\"artifact://{id}\", keyword=\"<keyword>\")` or `read(path=\"artifact://{id}\", offset=1, limit=200)` to inspect more. \
+Prefer keyword match over sequential reading to quickly retrieve target details.]\n\n"
+                )
+            }
+            None => {
+                let position_desc = if !head.is_empty() && !tail.is_empty() {
+                    format!("Middle section of output folded ({elided_lines} lines elided)")
+                } else {
+                    format!("Subsequent section of output folded ({elided_lines} lines truncated)")
+                };
+                format!("\n\n[{position_desc}. Full output unavailable (could not be saved).]\n\n")
+            }
         };
         result.content = format!("{head}{marker}{tail}");
         zap_kernel::middleware::AfterOutcome::Proceed
@@ -313,6 +458,57 @@ mod tests {
         assert_eq!(store.get(&id, 100, 4).unwrap().unwrap(), b"");
         // limit past end → clamped
         assert_eq!(store.get(&id, 14, 999).unwrap().unwrap(), b"ef");
+    }
+
+    #[test]
+    fn large_text_artifact_is_gzip_compressed_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new_standalone(dir.path());
+        let original = "hello world\n".repeat(20_000);
+        let id = store.put(original.as_bytes()).unwrap();
+
+        let raw = std::fs::read(dir.path().join(&id)).unwrap();
+        assert!(
+            raw.starts_with(super::ARTIFACT_GZIP_MAGIC),
+            "large UTF-8 text must be gzip-compressed on disk"
+        );
+        assert!(
+            raw.len() < original.len(),
+            "compression must reduce disk size"
+        );
+
+        assert_eq!(
+            store.get(&id, 0, usize::MAX).unwrap().unwrap(),
+            original.as_bytes()
+        );
+        assert_eq!(
+            store.get(&id, 10, 5).unwrap().unwrap(),
+            original.as_bytes()[10..15].to_vec()
+        );
+        assert_eq!(store.size(&id).unwrap().unwrap(), original.len() as u64);
+    }
+
+    #[test]
+    fn small_text_and_binary_artifacts_are_stored_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new_standalone(dir.path());
+
+        let small = b"small text".to_vec();
+        let small_id = store.put(&small).unwrap();
+        assert!(!std::fs::read(dir.path().join(&small_id))
+            .unwrap()
+            .starts_with(super::ARTIFACT_GZIP_MAGIC));
+        assert_eq!(store.get(&small_id, 0, usize::MAX).unwrap().unwrap(), small);
+
+        let binary = vec![0xFFu8; 128 * 1024];
+        let binary_id = store.put(&binary).unwrap();
+        assert!(!std::fs::read(dir.path().join(&binary_id))
+            .unwrap()
+            .starts_with(super::ARTIFACT_GZIP_MAGIC));
+        assert_eq!(
+            store.get(&binary_id, 0, usize::MAX).unwrap().unwrap(),
+            binary
+        );
     }
 
     #[test]
@@ -373,9 +569,9 @@ mod tests {
 
         let mut r1 = mk();
         mw.after(&mut r1, None).await;
-        // rewritten: smaller, has head+tail+marker, names fetch_output + the id
+        // rewritten: smaller, has head+tail+marker, names artifact and read
         assert!(r1.content.len() < big.len());
-        assert!(r1.content.contains("fetch_output"));
+        assert!(r1.content.contains("read(path=\"artifact://"));
         let id = super::artifact_id(big.as_bytes());
         assert!(r1.content.contains(&id));
         // artifact holds the FULL original
@@ -392,13 +588,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn over_ceiling_inline_truncates_without_artifact() {
+    async fn five_mb_output_is_saved_as_artifact_losslessly() {
         use zap_kernel::middleware::ToolMiddleware;
         use zap_kernel::tool::ToolResult;
         let dir = tempfile::tempdir().unwrap();
         let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(
             dir.path(),
         )));
+        // 5 MiB output was previously rejected by the 4 MiB ceiling. Now it is preserved losslessly!
         let huge = "y".repeat(5 * 1024 * 1024);
         let mut r = ToolResult {
             call_id: "c".into(),
@@ -407,9 +604,9 @@ mod tests {
             images: vec![],
         };
         mw.after(&mut r, None).await;
-        assert!(r.content.contains("Full output unavailable"));
-        assert!(!r.content.contains("fetch_output"));
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(r.content.contains("saved as artifact"));
+        assert!(!r.content.contains("Full output unavailable"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// A tool that declares `never_truncate_result() == true` (like code_explore).
@@ -487,8 +684,8 @@ mod tests {
             "must fold under a lowered threshold"
         );
         assert!(
-            r.content.contains("fetch_output"),
-            "must carry the fetch hint"
+            r.content.contains("read(path=\"artifact://"),
+            "must carry the read hint"
         );
         // The default instance leaves the same 20 KiB untouched.
         let mw2 = super::ArtifactMiddleware::new(store.clone());
@@ -575,12 +772,14 @@ mod tests {
             };
             mw.after(&mut r, Some(&probe)).await;
             assert!(
-                r.content.contains("output truncated"),
+                r.content.contains("section of output folded"),
                 "{} must compress above the 24 KiB terminal line",
                 probe.0
             );
-            assert!(r.content.contains("showing first 1500 + last 2200"));
-            assert!(r.content.contains("fetch_output"), "must carry the handle");
+            assert!(
+                r.content.contains("read(path=\"artifact://"),
+                "must carry the handle"
+            );
             // The handle resolves: the full text is in the artifact store.
             let id = super::artifact_id(mid.as_bytes());
             assert!(r.content.contains(&id));
@@ -697,201 +896,59 @@ mod tests {
             "terminal line 0 → terminal follows the general line"
         );
     }
-}
-
-pub struct FetchOutputTool {
-    store: Arc<ArtifactStore>,
-}
-
-impl FetchOutputTool {
-    pub fn new(store: Arc<ArtifactStore>) -> Self {
-        Self { store }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct FetchArgs {
-    artifact_id: String,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-const FETCH_MAX_LIMIT: usize = 256 * 1024;
-
-#[async_trait::async_trait]
-impl zap_kernel::tool::Tool for FetchOutputTool {
-    fn name(&self) -> &str {
-        "fetch_output"
-    }
-
-    fn description(&self) -> &str {
-        "Fetch remaining chunks of truncated tool output. \
-         Use when a previous tool result ends with an `artifact_id` truncation marker."
-    }
-
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "artifact_id": {"type": "string", "description": "The artifact_id from the truncation marker."},
-                "offset": {"type": "integer", "description": "Byte offset to start reading from."},
-                "limit": {"type": "integer", "description": "Maximum bytes to return (default/max 262144)."}
-            },
-            "required": ["artifact_id"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        args: &str,
-        _ctx: &zap_kernel::tool::ToolContext,
-    ) -> zap_kernel::tool::ToolResult {
-        let parsed: FetchArgs = match serde_json::from_str(args) {
-            Ok(a) => a,
-            Err(e) => return super::err(format!("invalid fetch_output args: {e}")),
-        };
-
-        let limit = parsed.limit.unwrap_or(FETCH_MAX_LIMIT).min(FETCH_MAX_LIMIT);
-
-        match self.store.get(&parsed.artifact_id, parsed.offset, limit) {
-            Ok(Some(bytes)) => {
-                // Total via an O(1) metadata stat, not a full re-read.
-                let total = self
-                    .store
-                    .size(&parsed.artifact_id)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0) as usize;
-                // Clamp the reported window to the artifact so an offset past the
-                // end yields a coherent "at end" hint (never "5000–5000 of 3000").
-                // `start <= total` holds, so `end` lands in `[start, total]`.
-                let start = parsed.offset.min(total);
-                let end = start.saturating_add(bytes.len()).min(total);
-                let body = String::from_utf8_lossy(&bytes);
-                let hint = if end < total {
-                    format!(
-                        "\n\n[showing bytes {start}–{end} of {total}; omit `limit` and call fetch_output(artifact_id=\"{}\", offset={end}) for more]",
-                        parsed.artifact_id
-                    )
-                } else {
-                    format!("\n\n[showing bytes {start}–{end} of {total} (end)]")
-                };
-                super::ok(format!("{body}{hint}"))
-            }
-            Ok(None) => super::err(format!(
-                "Artifact {} is no longer available (truncated captures don't survive across machines or after cleanup). \
-Re-run the original command to regenerate its output.",
-                parsed.artifact_id
-            )),
-            Err(e) => super::err(format!("fetch_output failed: {e}")),
-        }
-    }
-}
-
-#[cfg(test)]
-mod fetch_output_tests {
-    use super::*;
-    use zap_kernel::tool::{Tool, ToolContext};
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx(dir: &std::path::Path) -> ToolContext {
-        ToolContext {
-            working_dir: dir.to_path_buf(),
-            cancel: CancellationToken::new(),
-            progress: zap_kernel::tool::ProgressSink::noop(),
-            requester: None,
-        }
-    }
 
     #[tokio::test]
-    async fn fetch_slices_paginates_and_reports_missing() {
+    async fn mcp_tools_are_truncated_with_artifact_id_at_mcp_threshold() {
+        use zap_kernel::middleware::ToolMiddleware;
+        use zap_kernel::tool::ToolResult;
         let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(ArtifactStore::new(dir.path()));
-        let id = store.put(&b"A".repeat(100_000)).unwrap();
-        let tool = FetchOutputTool::new(store.clone());
-        let test_ctx = ctx(dir.path());
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let big = "x".repeat(35 * 1024); // 35 KB exceeds 32 KB threshold
 
-        // slice with explicit offset/limit
-        let r = tool
-            .execute(
-                &format!(r#"{{"artifact_id":"{}","offset":0,"limit":10}}"#, id),
-                &test_ctx,
-            )
-            .await;
-        assert!(!r.is_error, "first fetch should succeed: {}", r.content);
-        assert!(
-            r.content.starts_with("AAAAAAAAAA"),
-            "content should start with 10 As: {}",
-            r.content
-        );
-        assert!(
-            r.content.contains("of 100000"),
-            "pagination hint should mention total: {}",
-            r.content
-        );
+        let mw = super::ArtifactMiddleware::new(store.clone())
+            .with_threshold_bytes(64 * 1024)
+            .with_mcp_threshold_bytes(32 * 1024);
 
-        // limit hard-capped at 256 KiB even if bigger requested
-        let r = tool
-            .execute(
-                &format!(r#"{{"artifact_id":"{}","offset":0,"limit":999999}}"#, id),
-                &test_ctx,
-            )
-            .await;
-        assert!(
-            !r.is_error,
-            "fetch with huge limit should succeed (get capped): {}",
-            r.content
-        );
-        assert!(
-            r.content.contains("100000") || r.content.contains(&FETCH_MAX_LIMIT.to_string()),
-            "pagination hint should show the hard cap or total: {}",
-            r.content
-        );
+        let mut r = ToolResult {
+            call_id: "mcp-call".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
 
-        // missing artifact → terminal, actionable error, no "fetch" retry wording
-        let r = tool
-            .execute(
-                r#"{"artifact_id":"0000000000000000","offset":0,"limit":10}"#,
-                &test_ctx,
-            )
+        mw.after(&mut r, Some(&NamedProbe("mcp__brave_search__web_search")))
             .await;
-        assert!(
-            r.is_error,
-            "missing artifact should be an error: {}",
-            r.content
-        );
-        assert!(
-            r.content.to_lowercase().contains("re-run"),
-            "error should tell user to re-run: {}",
-            r.content
-        );
-        assert!(
-            !r.content.to_lowercase().contains("try fetch again"),
-            "error should not suggest fetching again: {}",
-            r.content
-        );
 
-        // offset PAST the end → coherent "at end" hint, not "N–N of <smaller>".
-        let small = std::sync::Arc::new(ArtifactStore::new(dir.path()));
-        let sid = small.put(b"abc").unwrap(); // 3 bytes
-        let tool2 = FetchOutputTool::new(small);
-        let r = tool2
-            .execute(
-                &format!(r#"{{"artifact_id":"{}","offset":5000,"limit":10}}"#, sid),
-                &test_ctx,
-            )
-            .await;
-        assert!(!r.is_error, "past-end fetch is not an error: {}", r.content);
         assert!(
-            r.content.contains("3–3 of 3 (end)"),
-            "past-end window clamps to total, coherent hint: {}",
-            r.content
+            r.content.contains(super::ARTIFACT_TRUNCATION_MARKER_PREFIX),
+            "MCP tool output exceeding 32 KB must generate standard artifact truncation marker"
         );
+        assert!(
+            r.content.contains("read(path=\"artifact://"),
+            "MCP truncation must instruct LLM to use read with the generated artifact ID"
+        );
+    }
+
+    #[test]
+    fn get_touches_and_updates_mtime_for_true_lru() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new_standalone(dir.path());
+        let id = store.put(b"hello lru").unwrap();
+        let path = dir.path().join(&id);
+
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(past))
+            .unwrap();
+        let old_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(old_mtime <= past + std::time::Duration::from_secs(1));
+
+        // Call get - should update mtime to recent
+        let retrieved = store.get(&id, 0, 100).unwrap().unwrap();
+        assert_eq!(retrieved, b"hello lru");
+
+        let new_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(new_mtime > old_mtime);
+        assert!(new_mtime >= std::time::SystemTime::now() - std::time::Duration::from_secs(5));
     }
 }

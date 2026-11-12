@@ -10,7 +10,7 @@
 //!   - `include: ["reasoning.encrypted_content"]` + replay of signed reasoning items
 //!     with stable `id`s;
 //!   - `prompt_cache_key` + `x-session-id` for gateway affinity;
-//!   - consecutive user items are NOT merged;
+//!   - consecutive user items merge into one user entry with discrete content parts (input_text/input_image);
 //!   - `store: false` (full input is resent; cache is prefix-based, not stored-response).
 
 use super::openai_compat::{build_http_client, resolve_wire_effort, SwappableClient};
@@ -52,7 +52,9 @@ pub struct ResponsesConfig {
     /// Override for [`ReasoningPolicy`] from `reasoning_history = include|exclude`.
     /// `None` ⇒ derive from `reasoning_model` then model name / base URL.
     pub reasoning_policy: Option<ReasoningPolicy>,
-    /// Thinking budget in tokens. When present, passed in `reasoning.max_tokens`.
+    /// Thinking budget in tokens. The Responses API has no official numeric
+    /// budget field (`reasoning` only carries `effort`/`summary`), so this is
+    /// retained for config compatibility and ignored by this adapter.
     pub thinking_budget: Option<u32>,
     /// Thinking type override (e.g. "enabled", "disabled", "adaptive").
     pub thinking_type: Option<String>,
@@ -99,18 +101,13 @@ pub struct ResponsesProvider {
 
 impl ResponsesProvider {
     pub fn new(cfg: ResponsesConfig) -> Result<Self, ProviderError> {
-        let policy = cfg
-            .reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
+        let policy = cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        });
         let connect_timeout = cfg.connect_timeout;
         let skip_tls_verify = cfg.skip_tls_verify;
         let user_agent = cfg.user_agent.clone();
@@ -273,10 +270,7 @@ async fn open_responses_stream(
                 req = req.bearer_auth(api_key);
             }
         }
-        if !session_id.is_empty() {
-            req = req.header("x-jeikcode-session-id", session_id);
-            req = req.header("x-session-id", session_id);
-        }
+        req = super::apply_session_affinity(req, session_id);
         let sent = match retry::send_with_ttfb(req, open_timeout).await {
             retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
@@ -352,27 +346,19 @@ fn build_request_body(
     if !session_id.is_empty() {
         body.insert("prompt_cache_key".into(), json!(session_id));
     }
-    let is_effort_off = options.reasoning_effort.as_ref().is_some_and(|e| {
-        matches!(e, ReasoningEffort::Off)
-            || e.as_str().eq_ignore_ascii_case("off")
-            || e.as_str().eq_ignore_ascii_case("none")
-    }) || cfg.thinking_enabled == Some(false)
+    let is_effort_off = super::thinking::is_effort_off(options.reasoning_effort.as_ref())
+        || cfg.thinking_enabled == Some(false)
         || cfg.thinking_type.as_deref() == Some("disabled");
 
-    let effective_budget = if is_effort_off {
-        None
-    } else {
-        cfg.thinking_budget
-    };
-
-    let mut max_output_tokens = options.max_tokens.or(cfg.max_tokens).unwrap_or(65536);
-    // 当思考预算大于等于最大输出时，保留扩充
-    if let Some(budget) = effective_budget {
-        if budget >= max_output_tokens {
-            max_output_tokens =
-                (budget + 8192).min(cfg.context_window.saturating_sub(1024).max(budget + 1));
-        }
-    }
+    // The Responses API supports only `reasoning.effort` (+ optional summary).
+    // There is no official numeric thinking-budget field, so `thinking_budget`
+    // is intentionally ignored for this protocol. `max_output_tokens` is the
+    // kernel-resolved output budget; thinking never expands it.
+    let max_output_tokens = options
+        .max_tokens
+        .or(cfg.max_tokens)
+        .unwrap_or(65536)
+        .max(16);
     body.insert("max_output_tokens".into(), json!(max_output_tokens));
 
     // Per-model custom thinking level (`reasoning.effort`). Independent of
@@ -387,11 +373,6 @@ fn build_request_body(
     if let Some(effort) = &wire_effort {
         reasoning_obj.insert("effort".into(), json!(effort));
     }
-    if let Some(budget) = effective_budget {
-        if budget > 0 {
-            reasoning_obj.insert("max_tokens".into(), json!(budget));
-        }
-    }
     if !reasoning_obj.is_empty() {
         body.insert("reasoning".into(), Value::Object(reasoning_obj));
     }
@@ -400,9 +381,8 @@ fn build_request_body(
     // sampling params. Omit temperature whenever effort rides the wire, or the
     // model is marked as a reasoner — otherwise short auxiliary calls (session
     // title) 400 before any TextDelta arrives.
-    let omit_temperature = wire_effort.as_deref().is_some_and(|e| e != "none")
-        || cfg.reasoning_model == Some(true)
-        || effective_budget.is_some_and(|b| b > 0);
+    let omit_temperature =
+        wire_effort.as_deref().is_some_and(|e| e != "none") || cfg.reasoning_model == Some(true);
     if let Some(t) = options.temperature {
         if !omit_temperature {
             body.insert("temperature".into(), json!(t));
@@ -431,7 +411,15 @@ fn build_request_body(
                     "type": "function",
                     "name": td.name,
                     "description": td.description,
-                    "parameters": super::sanitize_schema_for_wire(&td.parameters),
+                    "parameters": super::tool_schema::project(
+                        super::sanitize_schema_for_wire(&td.parameters),
+                        super::tool_schema::family_for(&cfg.model, None),
+                    ),
+                    // Responses 在省略 `strict` 时会尝试把 schema 自动归一化为 strict：
+                    // 把所有 properties 提升为 required。我们的工具依赖可选字段（例如
+                    // todo_write 用「哪些字段存在」推断动作），必须显式退出 strict，
+                    // 否则模型会被迫把每个可选参数都填上默认值。
+                    "strict": false,
                 })
             })
             .collect();
@@ -440,7 +428,8 @@ fn build_request_body(
     Value::Object(body)
 }
 
-/// Map kernel history onto Responses `input[]`. Consecutive users stay consecutive.
+/// Map kernel history onto Responses `input[]`. Consecutive user items merge into ONE
+/// user message with discrete content parts, aligning with Claude & Gemini.
 fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: bool) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
@@ -498,27 +487,55 @@ fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: boo
                 }
             }
             Role::Assistant => {
+                // Empty model round (failed / interrupted stream that persisted nothing
+                // replayable). Drop it before any reasoning echo: a reasoning-only item
+                // has nothing for the model to continue from, and some gateways reject
+                // an assistant turn without a message/function_call item.
+                if m.text.is_empty() && m.tool_calls.is_empty() {
+                    continue;
+                }
                 if echo_reasoning {
+                    let mut echoed_block = false;
                     for block in &m.reasoning_blocks {
                         if block.provider.as_deref() != Some(RESPONSES_PROVIDER) {
                             continue;
                         }
-                        let Some(enc) = block.opaque.as_deref().filter(|s| !s.is_empty()) else {
-                            continue;
-                        };
                         let mut item = Map::new();
                         item.insert("type".into(), json!("reasoning"));
                         if let Some(id) = block.id.as_deref().filter(|s| !s.is_empty()) {
                             item.insert("id".into(), json!(id));
                         }
-                        item.insert("encrypted_content".into(), json!(enc));
-                        if !block.text.is_empty() {
+                        if let Some(enc) = block.opaque.as_deref().filter(|s| !s.is_empty()) {
+                            // OpenAI / Grok ciphertext replay flow
+                            item.insert("encrypted_content".into(), json!(enc));
+                            if !block.text.is_empty() {
+                                item.insert(
+                                    "summary".into(),
+                                    json!([{ "type": "summary_text", "text": block.text }]),
+                                );
+                            }
+                            out.push(Value::Object(item));
+                            echoed_block = true;
+                        } else if !block.text.is_empty() {
+                            // DeepSeek Responses API plain reasoning_text content parts flow
                             item.insert(
-                                "summary".into(),
-                                json!([{ "type": "summary_text", "text": block.text }]),
+                                "content".into(),
+                                json!([{ "type": "reasoning_text", "text": block.text }]),
                             );
+                            out.push(Value::Object(item));
+                            echoed_block = true;
                         }
-                        out.push(Value::Object(item));
+                    }
+                    if !echoed_block {
+                        if let Some(reasoning) = m.reasoning.as_deref().filter(|s| !s.is_empty()) {
+                            out.push(json!({
+                                "type": "reasoning",
+                                "content": [{
+                                    "type": "reasoning_text",
+                                    "text": reasoning,
+                                }]
+                            }));
+                        }
                     }
                 }
                 if !m.text.is_empty() {
@@ -546,15 +563,51 @@ fn format_input(messages: &[Message], supports_vision: bool, echo_reasoning: boo
                 let Some(id) = m.tool_call_id.as_deref().filter(|s| !s.is_empty()) else {
                     continue;
                 };
+                let model_content = super::strip_tool_result_diff_for_model(&m.text);
                 out.push(json!({
                     "type": "function_call_output",
                     "call_id": id,
-                    "output": m.text,
+                    "output": model_content,
                 }));
             }
         }
     }
+    merge_consecutive_user(out)
+}
+
+/// Merge consecutive `role:"user"` wire entries into ONE with concatenated discrete parts.
+/// Preserves discrete input_text / input_image block boundaries so that frozen synthetic user
+/// prefixes (project instructions, memory, skills) and user prompts stay as distinct parts
+/// within a single initial user turn.
+fn merge_consecutive_user(input: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(input.len());
+    for item in input {
+        let is_user = item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user");
+        let prev_user = out.last().is_some_and(|p| {
+            p.get("type").and_then(Value::as_str) == Some("message")
+                && p.get("role").and_then(Value::as_str) == Some("user")
+        });
+        if is_user && prev_user {
+            let last = out.last_mut().unwrap();
+            let mut last_parts =
+                content_to_parts(last.get("content").cloned().unwrap_or(Value::Null));
+            let item_parts = content_to_parts(item.get("content").cloned().unwrap_or(Value::Null));
+            last_parts.extend(item_parts);
+            last["content"] = Value::Array(last_parts);
+        } else {
+            out.push(item);
+        }
+    }
     out
+}
+
+fn content_to_parts(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(arr) => arr,
+        Value::String(s) if !s.is_empty() => vec![json!({ "type": "input_text", "text": s })],
+        _ => vec![],
+    }
 }
 
 #[derive(Default)]
@@ -921,7 +974,7 @@ mod tests {
     use zap_kernel::provider::ReasoningEffort;
 
     #[test]
-    fn format_input_keeps_consecutive_users_and_native_tool_items() {
+    fn format_input_merges_consecutive_users_as_discrete_parts_and_preserves_native_tool_items() {
         let msgs = vec![
             Message::system("sys"),
             Message::synthetic_user("<system-reminder>\ndate\n</system-reminder>"),
@@ -940,13 +993,27 @@ mod tests {
         assert_eq!(out[0]["type"], "message");
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[2]["role"], "user");
-        assert_eq!(out[2]["content"], "query");
-        assert_eq!(out[3]["type"], "message");
-        assert_eq!(out[4]["type"], "function_call");
+        let content_parts = out[1]["content"]
+            .as_array()
+            .expect("must be array of parts");
+        assert_eq!(
+            content_parts.len(),
+            2,
+            "consecutive users merge into 2 parts"
+        );
+        assert_eq!(content_parts[0]["type"], "input_text");
+        assert_eq!(
+            content_parts[0]["text"],
+            "<system-reminder>\ndate\n</system-reminder>"
+        );
+        assert_eq!(content_parts[1]["type"], "input_text");
+        assert_eq!(content_parts[1]["text"], "query");
+        assert_eq!(out[2]["type"], "message");
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[3]["type"], "function_call");
+        assert_eq!(out[3]["call_id"], "c1");
+        assert_eq!(out[4]["type"], "function_call_output");
         assert_eq!(out[4]["call_id"], "c1");
-        assert_eq!(out[5]["type"], "function_call_output");
-        assert_eq!(out[5]["call_id"], "c1");
     }
 
     #[test]
@@ -964,6 +1031,35 @@ mod tests {
         assert_eq!(out[1]["encrypted_content"], "cipher");
         assert_eq!(out[2]["role"], "assistant");
         assert_eq!(out[2]["content"], "done");
+    }
+
+    #[test]
+    fn format_input_replays_plain_reasoning_text_for_deepseek_responses() {
+        let mut a = Message::assistant("done", vec![]);
+        a.reasoning = Some("deep thinking steps".into());
+        let out = format_input(&[Message::user("q"), a], false, true);
+        assert_eq!(out[1]["type"], "reasoning");
+        assert_eq!(out[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(out[1]["content"][0]["text"], "deep thinking steps");
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[2]["content"], "done");
+    }
+
+    #[test]
+    fn reasoning_only_model_round_is_dropped_before_reasoning_echo() {
+        let mut lost = Message::assistant("", vec![]);
+        lost.reasoning = Some("partial thinking".into());
+        let out = format_input(
+            &[Message::user("first"), lost, Message::user("retry")],
+            false,
+            true,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "no reasoning-only item / assistant turn may reach the wire"
+        );
+        assert_eq!(out[0]["role"], "user");
     }
 
     #[test]
@@ -1099,6 +1195,51 @@ mod tests {
     }
 
     #[test]
+    fn function_tools_opt_out_of_responses_strict_normalization() {
+        // Responses 默认会尝试 strict 化：把 schema 的可选字段全部变成必填。
+        // 显式 `strict: false` 才能保留 best-effort 调用，字段的"可选"语义才生效。
+        let cfg = ResponsesConfig::new("k", "https://api.openai.com/v1", "gpt-5");
+        let tools = vec![ToolDef {
+            name: "todo_write".into(),
+            description: "d".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "content": { "type": "string" } },
+                            "required": []
+                        }
+                    }
+                },
+                "required": ["actions"]
+            }),
+        }];
+        let body = build_request_body(
+            "gpt-5",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Include,
+            "sess-1",
+        );
+        let tool = &body["tools"][0];
+        assert_eq!(
+            tool["strict"],
+            json!(false),
+            "Responses must not auto-strictify optional tool fields"
+        );
+        assert_eq!(
+            tool["parameters"]["properties"]["actions"]["items"]["required"],
+            json!([]),
+            "the nested optional-field declaration must survive sanitization"
+        );
+    }
+
+    #[test]
     fn sse_decoder_emits_text_tool_reasoning_and_usage() {
         let mut dec = ResponsesSseDecoder::default();
         let chunk = concat!(
@@ -1165,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn body_includes_thinking_budget_and_model_max_output_tokens() {
+    fn body_uses_effort_only_and_respects_model_max_output_tokens() {
         let mut cfg = ResponsesConfig::new("k", "https://api.openai.com/v1", "gpt-5");
         cfg.thinking_budget = Some(16384);
         cfg.max_tokens = Some(65536); // Explicit model max tokens
@@ -1183,7 +1324,9 @@ mod tests {
             "sess-1",
         );
         assert_eq!(body["reasoning"]["effort"], "high");
-        assert_eq!(body["reasoning"]["max_tokens"], 16384);
+        // Responses has no official numeric thinking-budget field; the
+        // configured `thinking_budget` is deliberately ignored.
+        assert!(body["reasoning"].get("max_tokens").is_none());
         // directly outputs model's configured max tokens, no auto expansion
         assert_eq!(body["max_output_tokens"].as_u64(), Some(65536));
         assert!(body.get("temperature").is_none());
@@ -1201,7 +1344,7 @@ mod tests {
         );
         assert_eq!(body_default["max_output_tokens"].as_u64(), Some(65536));
 
-        // When budget >= max_tokens, preserve expansion (8192 <= 16384 -> 16384 + 8192 = 24576)
+        // The output budget is never inflated by thinking config.
         cfg.max_tokens = Some(8192);
         let body_expanded = build_request_body(
             "gpt-5",
@@ -1215,7 +1358,7 @@ mod tests {
             ReasoningPolicy::Include,
             "sess-1",
         );
-        assert_eq!(body_expanded["max_output_tokens"].as_u64(), Some(24576));
+        assert_eq!(body_expanded["max_output_tokens"].as_u64(), Some(8192));
     }
 
     #[test]

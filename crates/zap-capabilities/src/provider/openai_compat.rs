@@ -95,6 +95,12 @@ pub struct OpenAiCompatConfig {
     /// enabling prefix prompt caching per block). Set to `true` for older legacy gateways
     /// that only accept a single system message.
     pub coalesce_system: bool,
+    /// Whether the Chat Completions endpoint accepts the `strict` tool field.
+    /// `None` ⇒ auto-detect (OpenCode parity): known-incompatible dialects omit
+    /// it, everything else gets an explicit `strict: false` so a gateway cannot
+    /// silently auto-strictify optional tool properties. `Some(false)` omits the
+    /// field for gateways that reject unknown keys.
+    pub supports_strict_mode: Option<bool>,
 }
 
 /// Canonical native-stack heuristic for whether a model name looks vision-capable.
@@ -154,6 +160,7 @@ impl OpenAiCompatConfig {
             skip_tls_verify: false,
             supports_vision,
             coalesce_system: false,
+            supports_strict_mode: None,
         }
     }
 }
@@ -187,18 +194,13 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn new(cfg: OpenAiCompatConfig) -> Result<Self, ProviderError> {
-        let policy = cfg
-            .reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
+        let policy = cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        });
         // Capture only what the builder needs so the rebuild closure is `'static`
         // and doesn't borrow `cfg` (which moves into `Self`).
         let connect_timeout = cfg.connect_timeout;
@@ -534,7 +536,7 @@ impl LlmProvider for OpenAiCompatProvider {
             // 1 initial open + up to 2 transparent reopens. A gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers, so a single reopen is not enough.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            const MAX_STREAM_ATTEMPTS: u32 = 6;
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -717,11 +719,7 @@ async fn open_stream(
         };
         // Stable session id → lets the forwarding gateway pin this conversation to
         // one upstream for prefix-cache affinity. Empty ⇒ omitted (sub-agent/summary).
-        if !session_id.is_empty() {
-            // Product affinity + industry-common gateway pin (LiteLLM / grok2api).
-            req = req.header("x-jeikcode-session-id", session_id);
-            req = req.header("x-session-id", session_id);
-        }
+        req = super::apply_session_affinity(req, session_id);
         let was_capped = tls12_probe || zap_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
         // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
@@ -948,6 +946,15 @@ fn format_messages(
                 }
             }
             Role::Assistant => {
+                // An empty model round (a failed / interrupted stream that persisted
+                // nothing replayable) must never reach the wire. Strict gateways reject
+                // `content:null` without `tool_calls` ("Invalid assistant message:
+                // content or tool_calls must be set") and the ENTIRE history 400s on
+                // every following turn. Anthropic / Gemini / Ollama already drop it;
+                // dropping keeps the surrounding user turns adjacent.
+                if m.text.is_empty() && m.tool_calls.is_empty() {
+                    continue;
+                }
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("assistant"));
                 // Field must be present (DeepSeek/SiliconFlow 400 if omitted). OpenCode
@@ -1021,7 +1028,8 @@ fn format_messages(
                 };
                 // NOTE: `is_error` has no OpenAI-compatible wire field; the error text
                 // is already inside `content`.
-                out.push(json!({ "role": "tool", "tool_call_id": id, "content": m.text }));
+                let model_content = super::strip_tool_result_diff_for_model(&m.text);
+                out.push(json!({ "role": "tool", "tool_call_id": id, "content": model_content }));
             }
         }
     }
@@ -1060,34 +1068,30 @@ fn build_request_body(
         || m_lower.contains("o1-")
         || m_lower.contains("o3-");
 
-    let is_effort_off = options.reasoning_effort.as_ref().is_some_and(|e| {
-        matches!(e, ReasoningEffort::Off)
-            || e.as_str().eq_ignore_ascii_case("off")
-            || e.as_str().eq_ignore_ascii_case("none")
-    });
+    let is_effort_off = super::thinking::is_effort_off(options.reasoning_effort.as_ref())
+        || cfg.thinking_type.as_deref() == Some("disabled");
 
+    let max_tokens = options.max_tokens.or(cfg.max_tokens);
+    // A thinking budget is a DOWNSTREAM constraint on the output budget. When
+    // no per-call output cap exists, use the remaining context as the ceiling
+    // so an explicit gateway budget still leaves answer room. `max_tokens` is
+    // never inflated here.
+    let budget_ceiling = max_tokens.unwrap_or_else(|| {
+        cfg.context_window
+            .saturating_sub(super::thinking::MIN_ANSWER_TOKENS)
+            .max(1)
+    });
     let effective_budget = if is_effort_off {
         None
     } else {
-        cfg.thinking_budget
+        super::thinking::resolve_budget(
+            super::thinking::ThinkingFamily::OpenAiChat,
+            cfg.thinking_budget,
+            options.reasoning_effort.as_ref(),
+            budget_ceiling,
+        )
+        .map(|plan| plan.tokens)
     };
-
-    let mut max_tokens = options.max_tokens.or(cfg.max_tokens);
-    // When an explicit thinking budget is requested and max_tokens is less than or equal to budget,
-    // automatically expand max_tokens so upstream gateways (e.g. Anthropic-backed) won't 400
-    // on `max_tokens must be greater than budget_tokens`.
-    if let Some(budget) = effective_budget {
-        if let Some(mt) = max_tokens {
-            if budget >= mt {
-                max_tokens = Some(
-                    (budget + 8192).min(cfg.context_window.saturating_sub(1024).max(budget + 1)),
-                );
-            }
-        } else {
-            max_tokens =
-                Some((budget + 8192).min(cfg.context_window.saturating_sub(1024).max(budget + 1)));
-        }
-    }
 
     if let Some(max_tokens) = max_tokens {
         if is_o_series {
@@ -1144,22 +1148,50 @@ fn build_request_body(
         }
     }
     if !tools.is_empty() {
+        let family = super::tool_schema::family_for(model, None);
+        let supports_strict = supports_strict_mode(cfg);
         let t: Vec<Value> = tools
             .iter()
             .map(|td| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": td.name,
-                        "description": td.description,
-                        "parameters": super::sanitize_schema_for_wire(&td.parameters),
-                    }
-                })
+                let mut function = json!({
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": super::tool_schema::project(
+                        super::sanitize_schema_for_wire(&td.parameters),
+                        family,
+                    ),
+                });
+                // OpenCode parity: only send `strict: false` when the endpoint
+                // understands the field. Omitting it lets OpenAI's Chat default
+                // (non-strict) apply; sending it explicitly blocks gateways that
+                // would otherwise normalise optional properties into required.
+                if supports_strict {
+                    function["strict"] = json!(false);
+                }
+                json!({ "type": "function", "function": function })
             })
             .collect();
         body.insert("tools".into(), json!(t));
     }
     Value::Object(body)
+}
+
+/// Whether the Chat Completions endpoint accepts `strict` on a function tool.
+///
+/// OpenCode parity: Moonshot / Together / Cloudflare AI Gateway / NVIDIA reject
+/// the field, so it is omitted there; every other endpoint gets an explicit
+/// `strict: false`. The config can override the heuristic either way.
+fn supports_strict_mode(cfg: &OpenAiCompatConfig) -> bool {
+    cfg.supports_strict_mode.unwrap_or_else(|| {
+        let url = cfg.base_url.to_ascii_lowercase();
+        let model = cfg.model.to_ascii_lowercase();
+        let incompatible = url.contains("api.moonshot.")
+            || model.contains("kimi")
+            || url.contains("api.together.")
+            || url.contains("gateway.ai.cloudflare.com")
+            || url.contains("integrate.api.nvidia.com");
+        !incompatible
+    })
 }
 
 /// DeepSeek V4 thinking models reject the `tool_choice` control parameter while
@@ -2148,6 +2180,48 @@ mod tests {
     }
 
     #[test]
+    fn empty_assistant_turn_is_dropped_instead_of_content_null() {
+        // A cancelled/errored round can persist an assistant message carrying only
+        // reasoning (no text, no tool calls). Sending it as `content:null` makes
+        // strict gateways reject the ENTIRE history with
+        // "Invalid assistant message: content or tool_calls must be set".
+        let mut empty = Message::assistant("", vec![]);
+        empty.reasoning = Some("partial thinking".into());
+        let msgs = vec![Message::user("first"), empty, Message::user("retry")];
+        let out = format_messages(&msgs, ReasoningPolicy::Include, true, false);
+        assert_eq!(
+            out.len(),
+            2,
+            "the empty assistant turn must be dropped: {out:?}"
+        );
+        assert_eq!(out[0], json!({"role":"user","content":"first"}));
+        assert_eq!(out[1], json!({"role":"user","content":"retry"}));
+    }
+
+    #[test]
+    fn tool_call_only_assistant_still_sends_null_content_and_calls() {
+        use zap_kernel::tool::ToolCall;
+
+        let assistant = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"a\"}".into(),
+            }],
+        );
+        let out = format_messages(
+            &[Message::user("go"), assistant],
+            ReasoningPolicy::Exclude,
+            true,
+            false,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["content"], Value::Null);
+        assert_eq!(out[1]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
     fn coalesces_consecutive_system_messages_into_one() {
         let msgs = vec![
             Message::system("persona"),
@@ -2471,6 +2545,101 @@ mod tests {
         assert_eq!(body["tool_choice"]["function"]["name"], "todowrite");
     }
 
+    fn tool_schema_fixture() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "content": { "type": "string" } },
+                        "required": []
+                    }
+                }
+            },
+            "required": ["actions"]
+        })
+    }
+
+    #[test]
+    fn chat_tools_send_strict_false_and_preserve_optional_fields() {
+        let cfg = OpenAiCompatConfig::new("k", "https://api.openai.com/v1", "gpt-5");
+        let tools = vec![ToolDef {
+            name: "todo_write".into(),
+            description: "d".into(),
+            parameters: tool_schema_fixture(),
+        }];
+        let body = build_request_body(
+            "gpt-5",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        let function = &body["tools"][0]["function"];
+        assert_eq!(function["strict"], json!(false));
+        assert_eq!(function["parameters"]["required"], json!(["actions"]));
+        assert_eq!(
+            function["parameters"]["properties"]["actions"]["items"]["required"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn chat_tools_omit_strict_for_moonshot() {
+        let cfg = OpenAiCompatConfig::new("k", "https://api.moonshot.cn/v1", "kimi-k2");
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({ "type": "object" }),
+        }];
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(
+            body["tools"][0]["function"].get("strict").is_none(),
+            "Moonshot rejects the strict tool field"
+        );
+    }
+
+    #[test]
+    fn chat_strict_mode_override_is_honored() {
+        let mut cfg = OpenAiCompatConfig::new("k", "https://api.moonshot.cn/v1", "kimi-k2");
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({ "type": "object" }),
+        }];
+        cfg.supports_strict_mode = Some(true);
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert_eq!(body["tools"][0]["function"]["strict"], json!(false));
+
+        cfg.supports_strict_mode = Some(false);
+        let body = build_request_body(
+            "kimi-k2",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+        );
+        assert!(body["tools"][0]["function"].get("strict").is_none());
+    }
+
     #[test]
     fn official_deepseek_v4_omits_unsupported_tool_choice() {
         let cfg = OpenAiCompatConfig::new("k", "https://api.deepseek.com/v1", "deepseek-v4-flash");
@@ -2696,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_budget_expands_max_tokens_when_smaller() {
+    fn thinking_budget_is_clamped_without_expanding_max_tokens() {
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "gemini-3.8-flash");
         cfg.thinking_budget = Some(16384);
         cfg.max_tokens = Some(4096);
@@ -2712,10 +2881,11 @@ mod tests {
             body["thinking"],
             json!({
                 "type": "enabled",
-                "budget_tokens": 16384
+                "budget_tokens": 3072
             })
         );
-        assert_eq!(body["max_tokens"], 16384 + 8192);
+        // The output budget stays exactly the kernel/cfg value.
+        assert_eq!(body["max_tokens"], 4096);
     }
 
     #[test]
@@ -3453,12 +3623,27 @@ mod tests {
     fn friendly_http_error_wraps_billing_and_auth_codes() {
         // Shared across provider protocols; lives in the parent `provider` module.
         use super::super::friendly_http_error;
-        // 402 欠费: concise actionable headline + the code; raw English detail is
-        // dropped (redundant, and this short form folds into the summary line).
+        // The headline comes from the i18n catalog, so assert the WRAPPING contract
+        // instead of a fixed language: `{headline} (HTTP <code>)` with the raw
+        // upstream detail dropped (it is redundant next to the headline).
+        // Pinning a literal translation here made this test fail whenever the
+        // active locale was not the one the assertion was written in.
+        let balance = zap_config::i18n::format_agent_status_insufficient_balance();
         assert_eq!(
             friendly_http_error(402, "Insufficient Balance"),
-            "账户余额不足（HTTP 402）"
+            format!("{balance} (HTTP 402)")
         );
+        assert!(
+            !friendly_http_error(402, "Insufficient Balance").contains("Insufficient Balance"),
+            "raw upstream detail must be folded away"
+        );
+        // 401 is auth. Headline from the catalog, code preserved.
+        let unauthorized = zap_config::i18n::format_agent_status_unauthorized();
+        assert_eq!(
+            friendly_http_error(401, " nope "),
+            format!("{unauthorized} (HTTP 401)")
+        );
+        assert!(!unauthorized.is_empty());
         // 403 is NOT necessarily auth: JeikCode also uses it for session-concurrency
         // conflicts. Preserve the structured reason instead of inventing an API-key error.
         assert_eq!(
@@ -3468,7 +3653,6 @@ mod tests {
             ),
             "HTTP 403: [jeikcode_session_concurrency_conflict/403] 该模型不支持多窗口同时发起请求"
         );
-        assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
         assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");

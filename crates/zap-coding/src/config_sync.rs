@@ -37,21 +37,6 @@ pub const BUNDLED_ASSETS: &[BundledFileEntry] = &[
         description: "工作流与执行规范 (rules.yaml)",
     },
     BundledFileEntry {
-        relative_path: "prompts/root_docs_prompts.md",
-        content: include_str!("../assets/prompts/root_docs_prompts.md"),
-        description: "提示词指南（不加载进模型） (root_docs_prompts.md)",
-    },
-    BundledFileEntry {
-        relative_path: "prompts/root_docs_内置工具.yaml",
-        content: include_str!("../assets/prompts/root_docs_内置工具.yaml"),
-        description: "内置工具说明文档（不加载进模型） (root_docs_内置工具.yaml)",
-    },
-    BundledFileEntry {
-        relative_path: "prompts/root_docs_内置技能.yaml",
-        content: include_str!("../assets/prompts/root_docs_内置技能.yaml"),
-        description: "内置技能说明文档（不加载进模型） (root_docs_内置技能.yaml)",
-    },
-    BundledFileEntry {
         relative_path: "config.toml",
         content: include_str!("../assets/default-config.toml"),
         description: "系统与工具通用配置 (config.toml — 保留用户模型/账号)",
@@ -79,12 +64,12 @@ pub const BUNDLED_ASSETS: &[BundledFileEntry] = &[
     BundledFileEntry {
         relative_path: ".codegraphignore",
         content: include_str!("../../zap-capabilities/assets/.codegraphignore"),
-        description: "代码图谱忽略规则 (.codegraphignore)",
+        description: "代码图谱 + 搜索默认忽略规则 (.codegraphignore)",
     },
     BundledFileEntry {
         relative_path: ".codegraphignore.graph",
         content: include_str!("../../zap-capabilities/assets/.codegraphignore.graph"),
-        description: "图谱专用敏感凭据忽略规则 (.codegraphignore.graph)",
+        description: "敏感凭据忽略规则（图谱 + 搜索默认排除）(.codegraphignore.graph)",
     },
     BundledFileEntry {
         relative_path: "thesaurus/admin_system.txt",
@@ -198,6 +183,9 @@ pub const STALE_HOME_FILES: &[&str] = &[
     "prompts/prompts.md",
     "prompts/内置工具.yaml",
     "prompts/内置技能.yaml",
+    "prompts/root_docs_内置工具.yaml",
+    "prompts/root_docs_内置技能.yaml",
+    "prompts/root_docs_prompts.md",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,19 +239,14 @@ pub fn localized_asset_description(relative_path: &str, zh_fallback: &str) -> St
     let en = match relative_path {
         "prompts/init.yaml" => "Identity and system prompt prefix (init.yaml)",
         "prompts/rules.yaml" => "Workflow and tool rules (rules.yaml)",
-        "prompts/root_docs_prompts.md" => {
-            "Prompt guide, not loaded into the model (root_docs_prompts.md)"
-        }
-        "prompts/root_docs_内置工具.yaml" => "Built-in tool notes, not loaded into the model",
-        "prompts/root_docs_内置技能.yaml" => "Built-in skill notes, not loaded into the model",
         "config.toml" => "Shared settings (config.toml — your models and accounts stay)",
         "config_teachs.md" => "Config guide for agents (config_teachs.md)",
         "builtin-tools.txt" => "Built-in tool list (builtin-tools.txt)",
         "mcp.json" => "Default MCP servers (mcp.json)",
         "user-wrap.md" => "User prompt wrap template (user-wrap.md, {{input}})",
-        ".codegraphignore" => "Code graph ignore rules (.codegraphignore)",
+        ".codegraphignore" => "Code graph + default search ignore rules (.codegraphignore)",
         ".codegraphignore.graph" => {
-            "Graph-only sensitive-credential ignore rules (.codegraphignore.graph)"
+            "Sensitive-credential ignore rules (graph + default search exclusion) (.codegraphignore.graph)"
         }
         "thesaurus/admin_system.txt" => "Thesaurus: admin systems",
         "thesaurus/agent_core.txt" => "Thesaurus: agent core",
@@ -524,4 +507,70 @@ pub fn apply_all_bundled_assets(jeikcode_home: &Path, force: bool) -> Result<usi
     }
 
     Ok(applied_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subagent_concurrency_default_syncs_over_existing_user_value() {
+        // 存量用户的 [subagent] max_concurrent 必须被新模板覆盖（模型/账号仍保留），
+        // 否则“取消子代理并发上限”这个新默认值永远传不到老用户。
+        let existing = r#"
+default_model = "gpt-5.1"
+language = "zh-CN"
+
+[subagent]
+max_concurrent = 3
+max_rounds = 230
+"#;
+        let template = include_str!("../assets/default-config.toml");
+        let merged = merge_user_config_preserving_models(existing, template);
+        let merged_val: toml::Value = toml::from_str(&merged).unwrap();
+
+        let subagent = merged_val.get("subagent").expect("[subagent] table");
+        assert_eq!(
+            subagent.get("max_concurrent").and_then(|v| v.as_integer()),
+            Some(0),
+            "shipped default must win: 0 = unbounded"
+        );
+        // upgrade 不得回退用户的模型与语言选择。
+        assert_eq!(
+            merged_val.get("default_model").and_then(|v| v.as_str()),
+            Some("gpt-5.1")
+        );
+        assert_eq!(
+            merged_val.get("language").and_then(|v| v.as_str()),
+            Some("zh-CN")
+        );
+    }
+
+    #[test]
+    fn stale_root_docs_are_detected_as_obsolete() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let prompts_dir = home.join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        std::fs::write(prompts_dir.join("root_docs_内置工具.yaml"), "stale").unwrap();
+        std::fs::write(prompts_dir.join("root_docs_内置技能.yaml"), "stale").unwrap();
+        std::fs::write(prompts_dir.join("root_docs_prompts.md"), "stale").unwrap();
+
+        let diffs = scan_zap_config_diffs(home);
+        let obsolete: Vec<&str> = diffs
+            .iter()
+            .filter(|d| d.kind == DiffKind::Obsolete)
+            .map(|d| d.relative_path.as_str())
+            .collect();
+
+        assert!(obsolete.contains(&"prompts/root_docs_内置工具.yaml"));
+        assert!(obsolete.contains(&"prompts/root_docs_内置技能.yaml"));
+        assert!(obsolete.contains(&"prompts/root_docs_prompts.md"));
+
+        remove_stale_home_files(home);
+        assert!(!prompts_dir.join("root_docs_内置工具.yaml").exists());
+        assert!(!prompts_dir.join("root_docs_内置技能.yaml").exists());
+        assert!(!prompts_dir.join("root_docs_prompts.md").exists());
+    }
 }

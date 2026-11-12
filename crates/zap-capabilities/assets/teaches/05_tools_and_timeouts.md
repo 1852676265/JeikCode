@@ -1,6 +1,6 @@
 # 05 - 工具与超时配置教程 (Tools & Timeouts)
 
-配置文件路径：`~/.zap/config.toml`。
+配置文件路径：`~/.jeikcode/config.toml`。
 
 ---
 
@@ -40,6 +40,15 @@ long_bash_command_keyword = []  # 长任务关键词列表（如 ["build", "test
 - 未定义变量**原样保留**（绝不静默删除），因此写错变量名时路径会以相对形式落在工作区内并在
   报错信息中暴露，而不是逃逸到盘根。
 
+### 1.3 grep / glob 搜索可见性
+
+- 默认搜索源码、文档、测试、普通配置；构建产物/缓存/依赖默认忽略。
+- `glob` 默认包含日志路径（只列路径）；`grep` 默认跳过日志内容。
+- `include_ignored=true`：打开构建产物/缓存/依赖。
+- `include_logs=true`：独立打开 grep 的日志内容（默认 false，与 `include_ignored` 独立）；glob 默认包含日志路径。
+- `include_sensitive=true`：打开敏感凭据路径；Build/AcceptEdits/Plan 弹审核，Auto 自动继续。
+- `read` 的显式路径不套 ignore；敏感路径统一走 `SensitivePathGate`。
+
 ---
 
 ## 2. 进程内短超时预算 (`[tools.timeouts]`)
@@ -64,14 +73,13 @@ idle_ttl_secs = 600         # scope="session" 的 MCP 进程闲置回收超时�
 
 ## 3. 工具输出压缩策略 (`[tools.tool_output]`)
 
-防止大输出占满上下文窗口。非豁免工具超过阈值即压缩为「头 1500 + 尾 2200 字节」预览 + `artifact` 钥匙；完整文本落盘，模型按需调用 `fetch_output` 取回：
+防止大输出占满上下文窗口。非豁免工具超过阈值即折叠并存为 `artifact`；完整文本落盘，模型按需调用 `read(path="artifact://<id>")` 按行或关键字取回：
 
 ```toml
 [tools.tool_output]
 max_bytes = 65536               # 通用压缩阈值（字节，默认 65536 = 64KiB；0 完全禁用压缩）
 terminal_max_bytes = 24576      # 终端（run_command/bash）更早的压缩线（字节，默认 24KiB；0 表示跟随 max_bytes）
 no_fold_tools = [               # 白名单工具列表：输出直接原样返回，绝不压缩
-    "fetch_output",
     "code_explore",
     "web_fetch",
     "web_search"
@@ -115,7 +123,7 @@ first_token_timeout_retries = 3 # 首 Token 超时后自动重试次数
 
 ```toml
 [subagent]
-max_concurrent = 3              # 最大并发子代理数（默认 3）
+max_concurrent = 0              # 最大并发子代理数（0 表示不限制，默认；>0 表示上限）
 max_rounds = 230                # 每个子代理最大交互轮次（0 表示无限制）
 ```
 
@@ -136,7 +144,7 @@ mode = "follow_system"          # 模式："follow_system" (跟随系统) | "def
 
 ```toml
 # 顶层标量配置（必须在所有 [table] 之前）
-keep_interrupted_context = true # 按 Ctrl+C 中断时保留已生成上下文，方便无缝续接
+keep_interrupted_context = true # 按 Ctrl+C 中断时保留已生成上下文，方便无缝续接（WebUI / HTTP 回合始终开启）
 
 [ui]
 theme = "auto"                  # 终端主题："auto" | "dark" | "light"
@@ -147,7 +155,7 @@ ai_session_naming = true        # 异步通过 AI 自动生成会话标题
 
 ## 9. 热生效说明与触发方式
 
-- **不会自动热生效**：编辑保存 `~/.zap/config.toml` 后不会自动重载。
+- **不会自动热生效**：编辑保存 `~/.jeikcode/config.toml` 后不会自动重载。
 - **热生效触发方式**：
   1. **Agent 端**：调用内置工具 `zap_config(action="reload")`，当前回合结束后在下一轮对话立即生效。
   2. **用户端**：在 WebUI 或 TUI 终端中输入 `/reload` 命令即刻重新加载。

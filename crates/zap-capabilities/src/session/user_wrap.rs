@@ -10,9 +10,9 @@
 //! ```
 //!
 //! # Resolution Hierarchy (Precedence)
-//! 1. Project-level: `<working_dir>/.zap/user-wrap.md`
+//! 1. Project-level: `<working_dir>/.jeikcode/user-wrap.md`
 //! 2. Project-level: `<working_dir>/user-wrap.md`
-//! 3. Global-level: `~/.zap/user-wrap.md` (or `$ZAP_HOME/user-wrap.md`)
+//! 3. Global-level: `~/.jeikcode/user-wrap.md` (or `$JEIKCODE_HOME/user-wrap.md`)
 //!
 //! If a project-level file exists, it overrides the global configuration completely.
 //!
@@ -46,10 +46,10 @@ impl UserWrapHook {
 
     /// Resolve the active `user-wrap.md` path for a given working directory.
     pub fn resolve_wrap_file_for(working_dir: &Path) -> Option<PathBuf> {
-        // 1. Project-level: <working_dir>/.zap/user-wrap.md
-        let p1_zap = working_dir.join(".zap").join("user-wrap.md");
-        if p1_zap.is_file() {
-            return Some(p1_zap);
+        // 1. Project-level: <working_dir>/.jeikcode/user-wrap.md
+        let p1_jeik = working_dir.join(".jeikcode").join("user-wrap.md");
+        if p1_jeik.is_file() {
+            return Some(p1_jeik);
         }
 
         // 2. Project-level: <working_dir>/user-wrap.md
@@ -58,7 +58,7 @@ impl UserWrapHook {
             return Some(p2);
         }
 
-        // 3. Global-level: ~/.zap/user-wrap.md
+        // 3. Global-level: ~/.jeikcode/user-wrap.md
         let global = crate::session::config_dir().join("user-wrap.md");
         if global.is_file() {
             return Some(global);
@@ -213,20 +213,20 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_input_project_zap_dir_precedence() {
+    fn test_wrap_input_project_jeikcode_dir_precedence() {
         let temp = TempDir::new().unwrap();
-        let zap_dir = temp.path().join(".zap");
-        std::fs::create_dir_all(&zap_dir).unwrap();
+        let jeikcode_dir = temp.path().join(".jeikcode");
+        std::fs::create_dir_all(&jeikcode_dir).unwrap();
 
-        let p1 = zap_dir.join("user-wrap.md");
-        std::fs::write(&p1, "Project Zap: {{input}}").unwrap();
+        let p1 = jeikcode_dir.join("user-wrap.md");
+        std::fs::write(&p1, "Project JeikCode: {{input}}").unwrap();
 
         let p2 = temp.path().join("user-wrap.md");
         std::fs::write(&p2, "Project Root: {{input}}").unwrap();
 
         let hook = UserWrapHook::new(temp.path());
-        assert_eq!(hook.wrap_input("test"), "Project Zap: test");
-        assert_eq!(hook.unwrap_input("Project Zap: test"), "test");
+        assert_eq!(hook.wrap_input("test"), "Project JeikCode: test");
+        assert_eq!(hook.unwrap_input("Project JeikCode: test"), "test");
     }
 
     #[test]

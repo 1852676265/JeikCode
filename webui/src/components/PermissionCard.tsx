@@ -4,6 +4,11 @@ import { useState } from 'preact/hooks';
 import { respondPermission } from '../api';
 import { useT } from '../settings';
 import { formatToolPayload } from '../lib/toolDisplay';
+import {
+  PermissionRetiredError,
+  permissionRetiredInfo,
+} from '../lib/pendingPermission';
+import type { PermissionRetiredInfo } from '../lib/pendingPermission';
 
 interface PermissionRequest {
   session_id: string;
@@ -19,8 +24,13 @@ interface PermissionCardProps {
   onDone: () => void;
   /** Optional override for the decision action. When provided, replaces the
    *  default respondPermission call. Used by live-session approval (POST /live/permission)
-   *  so the non-sync /chat path is unchanged. */
+   *  so the non-sync /chat path is unchanged. A callback that throws
+   *  [`PermissionRetiredError`] retires the card instead of keeping it retryable. */
   onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist', toolName?: string) => Promise<void>;
+  /** The approval can never be applied again (expired, or already handled by
+   *  another client). Fired right before `onDone` so the dock can explain why the
+   *  card vanished instead of leaving the user guessing. */
+  onRetired?: (info: PermissionRetiredInfo) => void;
   /** Corner stack instead of a blocking overlay. */
   dock?: boolean;
   /** Non-blocking centered stage (foreground active session) instead of a blocking overlay. */
@@ -38,26 +48,44 @@ function formatArgs(args: unknown): string {
   }
 }
 
-export function PermissionCard({ req, onDone, onDecide, dock, center }: PermissionCardProps) {
+export function PermissionCard({ req, onDone, onDecide, onRetired, dock, center }: PermissionCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
+  /** Delivery failure that is still worth retrying (transport / timeout / wedged turn). */
+  const [error, setError] = useState('');
 
   async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist') {
     if (loading) return;
     setLoading(true);
+    setError('');
     try {
       if (onDecide) {
         await onDecide(decision, req.tool_name);
       } else {
         if (!req.approval_id) throw new Error('missing approval identity');
         const result = await respondPermission(req.session_id, req.approval_id, decision, req.tool_name);
-        if (!result.success) throw new Error('permission request is no longer pending');
+        const retired = permissionRetiredInfo(result);
+        if (retired) {
+          // The approval is gone for good (expired, or applied elsewhere): retrying
+          // can never succeed, so retire the card instead of stranding a dead modal.
+          onRetired?.(retired);
+          onDone();
+          return;
+        }
+        if (!result.success) throw new Error(result.error ?? 'permission request is no longer pending');
       }
       onDone();
-    } catch {
+    } catch (err) {
+      const info = err instanceof PermissionRetiredError ? err.info : null;
+      if (info) {
+        onRetired?.(info);
+        onDone();
+        return;
+      }
       // Keep the exact approval visible and actionable when delivery was not
-      // confirmed. Poll/SSE reconciliation can still retire a genuinely stale
-      // request, while transient transport failures remain retryable.
+      // confirmed — but say so: a silent failure reads as "the buttons are dead".
+      // Poll/SSE reconciliation can still retire a genuinely stale request.
+      setError(t('userInput.error'));
     } finally {
       setLoading(false);
     }
@@ -92,6 +120,11 @@ export function PermissionCard({ req, onDone, onDecide, dock, center }: Permissi
             <span class="modal-label">{t('perm.args')}</span>
             <pre class="tool-body-row-content">{argsDisplay}</pre>
           </div>
+          {error && (
+            <p class="permission-error" role="alert">
+              {error}
+            </p>
+          )}
         </div>
 
         <div class="modal-footer permission-footer">

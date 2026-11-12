@@ -48,7 +48,6 @@ impl Tool for WriteFileTool {
         String::new()
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let t0 = std::time::Instant::now();
         let a: Args =
             match parse_tool_args("write", args, r#"{"path":"<path>","content":"<text>"}"#)
                 .or_else(|_| {
@@ -81,11 +80,9 @@ impl Tool for WriteFileTool {
             return err(refusal_msg);
         }
 
-        // Capture pre-existing line count for an overwrite diff message.
-        let old_lines = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .map(|s| s.lines().count());
+        // Capture pre-existing content and line count for an overwrite diff message.
+        let old_content = tokio::fs::read_to_string(&path).await.ok();
+        let old_lines = old_content.as_ref().map(|s| s.lines().count());
 
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -108,10 +105,10 @@ impl Tool for WriteFileTool {
 
         let msg = match old_lines {
             Some(old) => {
-                let diff = new_lines as i64 - old as i64;
-                let sign = if diff >= 0 { "+" } else { "" };
+                let diff_count = new_lines as i64 - old as i64;
+                let sign = if diff_count >= 0 { "+" } else { "" };
                 let mut m = format!(
-                    "Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff})"
+                    "Overwrote {disp} (was {old} lines, now {new_lines} lines, {sign}{diff_count})"
                 );
                 // Warn on a large shrink — the model may have dropped content.
                 if old > 20 && new_lines < old / 2 {
@@ -120,15 +117,18 @@ impl Tool for WriteFileTool {
                         100 - (new_lines * 100 / old)
                     ));
                 }
+                if let Some(old_text) = old_content.as_deref() {
+                    let diff = super::edit::build_compact_diff(old_text, &a.content, Some(&path));
+                    if !diff.is_empty() {
+                        m.push('\n');
+                        m.push_str(&diff);
+                    }
+                }
                 m
             }
             None => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
         };
-        let cost_time = t0.elapsed();
-        ok(format!(
-            "> ⏱️ **Cost Time**: {:.2?}ms\n\n{msg}",
-            cost_time.as_millis()
-        ))
+        ok(msg)
     }
 }
 
@@ -181,6 +181,25 @@ mod tests {
             "{}",
             r.content
         );
+        assert!(
+            r.content.contains("--- a/"),
+            "output should retain unified diff for presentation: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("+++ b/"),
+            "output should retain unified diff for presentation: {}",
+            r.content
+        );
+        let model_view = crate::provider::strip_tool_result_diff_for_model(&r.content);
+        assert!(
+            !model_view.contains("--- a/"),
+            "model view must strip diff: {model_view}"
+        );
+        assert!(
+            model_view.contains("was 3 lines, now 5 lines, +2"),
+            "model view must retain concise summary: {model_view}"
+        );
     }
 
     #[tokio::test]
@@ -229,18 +248,20 @@ mod tests {
             "writing to unread existing file must be intercepted"
         );
         assert!(
-            r.content.contains("写入拦截：目标文件未读取确认"),
+            r.content
+                .contains("Write Intercepted: File Unread Confirmation Required"),
             "{}",
             r.content
         );
         assert!(
-            r.content.contains("请读取确认欲写入文件内容后再写入"),
+            r.content
+                .contains("Please verify the existing content before writing"),
             "{}",
             r.content
         );
         assert!(r.content.contains("1→line 1"), "{}", r.content);
         assert!(r.content.contains("line 2"), "{}", r.content);
-        assert!(r.content.contains("全量内容"), "{}", r.content);
+        assert!(r.content.contains("complete content"), "{}", r.content);
 
         // Verify disk content was untouched
         let disk = std::fs::read_to_string(&target).unwrap();
@@ -289,7 +310,7 @@ mod tests {
             r.content
         );
         assert!(
-            r.content.contains("尚有 100 行未读取。请全部读取完（使用 `read` 配合 offset=1501, limit=1500）确认后再写入！"),
+            r.content.contains("Please read the complete file (using `read` with offset=1501, limit=1500) before writing."),
             "{}",
             r.content
         );
@@ -409,7 +430,9 @@ mod tests {
             "Turn 2 write without read must be intercepted: {}",
             r2.content
         );
-        assert!(r2.content.contains("写入拦截：目标文件未读取确认"));
+        assert!(r2
+            .content
+            .contains("Write Intercepted: File Unread Confirmation Required"));
 
         // Turn 2: Read then write -> succeeds!
         crate::tools::write_state::record_read(&target);
@@ -448,7 +471,9 @@ mod tests {
             )
             .await;
         assert!(r.is_error, "write after edit must be intercepted");
-        assert!(r.content.contains("写入拦截：目标文件未读取确认"));
+        assert!(r
+            .content
+            .contains("Write Intercepted: File Unread Confirmation Required"));
 
         // Read again, then write -> succeeds
         crate::tools::write_state::record_read(&target);
@@ -475,5 +500,62 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         let on_disk = std::fs::read_to_string(d.path().join("created.txt")).unwrap();
         assert_eq!(on_disk, "hello from create_file\n");
+    }
+
+    #[tokio::test]
+    async fn test_intercept_full_content_survives_across_turn_start_grace() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("intercept_retry.txt");
+        std::fs::write(&target, "existing line 1\nexisting line 2\n").unwrap();
+
+        // Turn 1: Force fresh turn
+        crate::tools::write_state::advance_turn_for_dir(d.path());
+
+        // Turn 1: Attempt write -> must be intercepted and return full content
+        let r1 = WriteFileTool
+            .execute(
+                r#"{"path":"intercept_retry.txt","content":"new content v1\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r1.is_error, "Turn 1 must be intercepted: {}", r1.content);
+        assert!(r1.content.contains("existing line 1"));
+        assert!(r1.content.contains("complete content"));
+
+        // Simulate Turn 2 start via actual LifecycleHooks (turn counter increments)
+        let hook = crate::tools::write_state::WriteStateHook::with_dir(d.path());
+        let mut convo = zap_kernel::message::Conversation::new();
+        zap_kernel::hook::LifecycleHooks::turn_start(&hook, &mut convo).await;
+
+        // Turn 2: Retried write must succeed across the turn boundary!
+        let r2 = WriteFileTool
+            .execute(
+                r#"{"path":"intercept_retry.txt","content":"new content v1\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            !r2.is_error,
+            "Turn 2 retry write must succeed via grace period: {}",
+            r2.content
+        );
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(on_disk, "new content v1\n");
+
+        // Simulate Turn 3 start (after successful write, grace is consumed)
+        zap_kernel::hook::LifecycleHooks::turn_start(&hook, &mut convo).await;
+
+        // Turn 3: Attempt write without read must be intercepted again!
+        let r3 = WriteFileTool
+            .execute(
+                r#"{"path":"intercept_retry.txt","content":"blind overwrite\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            r3.is_error,
+            "Turn 3 blind write must be intercepted again: {}",
+            r3.content
+        );
     }
 }

@@ -92,7 +92,7 @@ pub fn candidate_apps(_home: &Path, env: &impl Fn(&str) -> Option<String>) -> Ve
     let mut out = Vec::new();
     let path_var = env("PATH").unwrap_or_default();
     for (name, bin) in [
-        ("JeikCode Desktop", "zap-desktop"),
+        ("JeikCode Desktop", "jeikcode-desktop"),
         ("JeikCode Air", "jeikcode-air"),
     ] {
         for dir in std::env::split_paths(&path_var) {

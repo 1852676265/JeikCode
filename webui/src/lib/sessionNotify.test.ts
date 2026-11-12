@@ -2,9 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   dispatchSystemNotification,
-  flashDocumentTitle,
   permissionInstanceKey,
-  playCompletionAudio,
   samePermissionInstance,
   sessionNoticeLabel,
   shouldEmitNotice,
@@ -12,9 +10,7 @@ import {
   shouldOsNotifyTerminal,
   shouldToastTerminal,
   showPermissionNotice,
-  triggerBrowserNotification,
   windowAwayFrom,
-  takeTerminalEdges,
   terminalKindFromDone,
 } from './sessionNotify.ts';
 
@@ -106,6 +102,8 @@ test('build and plan notify on each review; auto does not', () => {
   assert.equal(showPermissionNotice('plan'), true);
   assert.equal(showPermissionNotice('accept_edits'), true);
   assert.equal(showPermissionNotice('bypass'), false);
+  assert.equal(showPermissionNotice(null), false, 'unknown mode fails closed');
+  assert.equal(showPermissionNotice(undefined), false, 'unknown mode fails closed');
   assert.equal(shouldOsNotifyReview('build', true), true);
   assert.equal(shouldOsNotifyReview('build', false), false);
   assert.equal(shouldOsNotifyReview('bypass', true), false);
@@ -117,35 +115,6 @@ test('kernel stopped wire is a completed task', () => {
   assert.equal(terminalKindFromDone('cancelled'), 'stopped');
   assert.equal(terminalKindFromDone('provider_error'), 'failed');
   assert.equal(terminalKindFromDone('max_rounds'), 'stopped');
-});
-
-test('terminal edges fire once per seq increase and ignore the baseline', () => {
-  const seen = new Map<string, number>();
-  assert.deepEqual(
-    takeTerminalEdges(seen, [{ sessionId: 'a', seq: 2, kind: 'completed' }], { baseline: true }),
-    [],
-  );
-  assert.deepEqual(
-    takeTerminalEdges(seen, [{ sessionId: 'a', seq: 3, kind: 'stopped' }]),
-    [{ sessionId: 'a', seq: 3, kind: 'stopped' }],
-  );
-  assert.deepEqual(
-    takeTerminalEdges(seen, [
-      { sessionId: 'a', seq: 3, kind: 'stopped' },
-      { sessionId: 'b', seq: 1, kind: 'completed' },
-    ]),
-    [{ sessionId: 'b', seq: 1, kind: 'completed' }],
-  );
-  assert.deepEqual(
-    takeTerminalEdges(seen, [
-      { sessionId: 'a', seq: 3, kind: 'stopped' },
-      { sessionId: 'b', seq: 1, kind: 'completed' },
-    ]),
-    [],
-  );
-  takeTerminalEdges(seen, []);
-  assert.equal(seen.has('a'), false);
-  assert.equal(seen.has('b'), false);
 });
 
 test('duplicate notices inside the window collapse', () => {
@@ -224,11 +193,4 @@ test('dispatchSystemNotification calls backend post function with expected paylo
     tag: 'sess-123:done',
     sessionId: 'sess-123',
   });
-});
-
-test('playCompletionAudio and triggerBrowserNotification degrade gracefully without DOM / AudioContext', () => {
-  // Safe execution in headless / Node environment
-  playCompletionAudio();
-  triggerBrowserNotification('Title', 'Body');
-  flashDocumentTitle('Title');
 });

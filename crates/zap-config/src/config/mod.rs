@@ -434,7 +434,7 @@ fn default_tool_output_terminal_max_bytes() -> Option<usize> {
 }
 
 fn default_no_fold_tools() -> Vec<String> {
-    ["fetch_output", "code_explore", "web_fetch", "web_search"]
+    ["code_explore", "web_fetch", "web_search"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -462,7 +462,7 @@ impl Default for CodingConfig {
             ttft_secs: 180,
             transition_secs: 180,
             streaming_sliding_secs: 120,
-            first_token_timeout_retries: 3,
+            first_token_timeout_retries: 6,
         }
     }
 }
@@ -516,7 +516,7 @@ impl Default for SubAgentConfig {
             enabled: true,
             initial_turns: 4,
             max_turns: 12,
-            max_concurrent: 3,
+            max_concurrent: 0,
             // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
             max_rounds: 230,
@@ -681,6 +681,8 @@ pub struct Config {
         deserialize_with = "deserialize_lenient_bool"
     )]
     pub github_logo: bool,
+    #[serde(default = "default_true")]
+    pub auto_git_sync: bool,
     /// Offline deployment switch (intranet / air-gapped). Default off = online build unchanged.
     #[serde(default)]
     pub offline_mode: offline::OfflineMode,
@@ -964,6 +966,7 @@ impl Default for Config {
             web_search: WebSearchConfig::default(),
             keep_interrupted_context: true,
             github_logo: true,
+            auto_git_sync: true,
             offline_mode: offline::OfflineMode::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),
@@ -2649,6 +2652,7 @@ model = "missing-type"
             web_search: Default::default(),
             keep_interrupted_context: false,
             github_logo: true,
+            auto_git_sync: true,
             offline_mode: Default::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),

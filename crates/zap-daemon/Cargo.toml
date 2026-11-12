@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "zap_daemon"
+name = "jeikcode_daemon"
 path = "src/lib.rs"
 
 [[bin]]
@@ -25,12 +25,13 @@ zap-kernel = { path = "../zap-kernel" }
 zap-coding = { path = "../zap-coding" }
 zap-telemetry = { path = "../zap-telemetry" }
 zap-updater = { path = "../zap-updater" }
+sysinfo = "0.33"
 
 # HTTP
 axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "compression-br"] }
 futures = "0.3"
 
 # Serialization
@@ -52,6 +53,7 @@ regex = "1"
 tracing = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
+ignore = "0.4"
 # Image URL fetch for OpenAI/Anthropic compat (`image_url` / url sources).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # 远程访问二维码（/tunnel/status 的 SVG）
@@ -61,6 +63,7 @@ socket2 = "0.6"
 # 交互式终端：Windows 用 ConPTY，Linux / macOS 用 POSIX pty。
 portable-pty = "0.9"
 jsonwebtoken = "9"
+httpdate = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -77,10 +80,12 @@ ctor = "0.2"
 tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }

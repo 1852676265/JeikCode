@@ -88,18 +88,13 @@ pub struct GeminiProvider {
 
 impl GeminiProvider {
     pub fn new(cfg: GeminiConfig) -> Result<Self, ProviderError> {
-        let policy = cfg
-            .reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| ReasoningPolicy::derive(&cfg.model, &cfg.base_url));
+        let policy = cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        });
         let connect_timeout = cfg.connect_timeout;
         let skip_tls_verify = cfg.skip_tls_verify;
         let user_agent = cfg.user_agent.clone();
@@ -150,7 +145,7 @@ impl LlmProvider for GeminiProvider {
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
 
         let s = async_stream::stream! {
-            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            const MAX_STREAM_ATTEMPTS: u32 = 6;
             let mut stream_attempt = 0u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = match open_stream(
@@ -284,10 +279,7 @@ async fn open_stream(
         if !api_key.is_empty() {
             req = req.header("x-goog-api-key", api_key).bearer_auth(api_key);
         }
-        if !session_id.is_empty() {
-            req = req.header("x-jeikcode-session-id", session_id);
-            req = req.header("x-session-id", session_id);
-        }
+        req = super::apply_session_affinity(req, session_id);
         match super::retry::send_with_ttfb(req, open_timeout).await {
             super::retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
@@ -403,10 +395,6 @@ pub fn model_supports_thinking(model: &str) -> bool {
     zap_config::config::provider::gemini_defaults_thinking(model)
 }
 
-fn uses_thinking_level(model: &str) -> bool {
-    zap_config::config::provider::gemini_uses_thinking_level(model)
-}
-
 fn thinking_is_on(cfg: &GeminiConfig, options: &ChatOptions) -> bool {
     if cfg.thinking_enabled == Some(false) {
         return false;
@@ -454,18 +442,8 @@ fn thinking_level_for(effort: &ReasoningEffort) -> String {
     }
 }
 
-fn thinking_budget_for(cfg: &GeminiConfig, options: &ChatOptions) -> u32 {
-    if let Some(b) = cfg.thinking_budget {
-        return b;
-    }
-    match &options.reasoning_effort {
-        Some(ReasoningEffort::Off) => 0,
-        Some(ReasoningEffort::Low) => 2048,
-        Some(ReasoningEffort::Medium) => 5120,
-        Some(ReasoningEffort::High | ReasoningEffort::Max | ReasoningEffort::XHigh) => 16384,
-        Some(ReasoningEffort::Custom(s)) => s.parse().unwrap_or(8192),
-        None => 8192,
-    }
+fn max_output_tokens(cfg: &GeminiConfig, options: &ChatOptions) -> u32 {
+    options.max_tokens.or(cfg.max_tokens).unwrap_or(65536)
 }
 
 pub(crate) fn thinking_config_value(cfg: &GeminiConfig, options: &ChatOptions) -> Value {
@@ -476,29 +454,37 @@ pub(crate) fn thinking_config_value(cfg: &GeminiConfig, options: &ChatOptions) -
         return Value::Object(obj);
     }
     obj.insert("includeThoughts".into(), json!(true));
-    if uses_thinking_level(&cfg.model) {
-        if let Some(effort) = &options.reasoning_effort {
-            obj.insert("thinkingLevel".into(), json!(thinking_level_for(effort)));
-        } else if cfg.thinking_budget.is_none() {
-            obj.insert("thinkingLevel".into(), json!("HIGH"));
+
+    if matches!(
+        super::thinking::gemini_family(&cfg.model),
+        super::thinking::ThinkingFamily::Gemini3Plus
+    ) {
+        // Gemini 3+ is level-only. A configured numeric budget is intentionally
+        // ignored so the two mutually-exclusive control surfaces never mix.
+        let level = options
+            .reasoning_effort
+            .as_ref()
+            .map(thinking_level_for)
+            .unwrap_or_else(|| "HIGH".to_string());
+        obj.insert("thinkingLevel".into(), json!(level));
+        return Value::Object(obj);
+    }
+
+    // Gemini 2.5 is budget-only.
+    match super::thinking::resolve_budget(
+        super::thinking::ThinkingFamily::Gemini25,
+        cfg.thinking_budget,
+        options.reasoning_effort.as_ref(),
+        max_output_tokens(cfg, options),
+    ) {
+        Some(plan) => {
+            obj.insert("thinkingBudget".into(), json!(plan.tokens));
         }
-        if let Some(budget) = cfg.thinking_budget {
-            obj.insert("thinkingBudget".into(), json!(budget));
-        }
-    } else {
-        if let Some(budget) = cfg.thinking_budget {
-            obj.insert("thinkingBudget".into(), json!(budget));
-        } else {
-            obj.insert(
-                "thinkingBudget".into(),
-                json!(thinking_budget_for(cfg, options)),
-            );
-        }
-        if let Some(effort) = &options.reasoning_effort {
-            let level = thinking_level_for(effort);
-            if level != "OFF" {
-                obj.insert("thinkingLevel".into(), json!(level));
-            }
+        None => {
+            // Not enough output room for a legal budget + answer: disable
+            // thinking for this request rather than emit an invalid value.
+            obj.insert("thinkingBudget".into(), json!(0));
+            obj.insert("includeThoughts".into(), json!(false));
         }
     }
     Value::Object(obj)
@@ -523,24 +509,9 @@ fn build_request_body(
         body.insert("systemInstruction".into(), json!({ "parts": parts }));
     }
     let mut gen = Map::new();
-    let mut max_tokens = options.max_tokens.or(cfg.max_tokens).unwrap_or(65536);
-    let effective_budget = if !thinking_is_on(cfg, options) {
-        None
-    } else {
-        cfg.thinking_budget.or_else(|| {
-            if !uses_thinking_level(&cfg.model) {
-                Some(thinking_budget_for(cfg, options))
-            } else {
-                None
-            }
-        })
-    };
-    if let Some(budget) = effective_budget {
-        if budget >= max_tokens {
-            max_tokens =
-                (budget + 8192).min(cfg.context_window.saturating_sub(1024).max(budget + 1));
-        }
-    }
+    // The kernel-resolved output budget is authoritative; thinking shrinks to
+    // fit inside it and never expands it.
+    let max_tokens = max_output_tokens(cfg, options);
     gen.insert("maxOutputTokens".into(), json!(max_tokens));
     if let Some(t) = options.temperature {
         gen.insert("temperature".into(), json!(t));
@@ -561,7 +532,13 @@ fn build_request_body(
                 json!({
                     "name": td.name,
                     "description": td.description,
-                    "parameters": super::sanitize_schema_for_wire(&td.parameters),
+                    // Gemini accepts standard JSON Schema via `parametersJsonSchema`.
+                    // The old `parameters` field is an OpenAPI subset that rejects
+                    // unions and several standard keywords.
+                    "parametersJsonSchema": super::tool_schema::project(
+                        super::sanitize_schema_for_wire(&td.parameters),
+                        super::tool_schema::SchemaFamily::Gemini,
+                    ),
                 })
             })
             .collect();
@@ -612,10 +589,23 @@ fn format_contents(
                 i += 1;
             }
             Role::Assistant => {
-                contents.push(json!({
-                    "role": "model",
-                    "parts": model_parts(m, echo_thinking),
-                }));
+                // An empty model round (a failed / interrupted stream that persisted nothing
+                // replayable) must NOT become a wire turn: Gemini rejects empty `parts`, and
+                // dropping it lets the surrounding user turns stay adjacent so the merge
+                // below reconstructs a single user block (the lost reply never happened).
+                // Drop BEFORE thought-part synthesis: `echo_thinking` can otherwise turn
+                // stored reasoning into a thought-only model turn with nothing to continue.
+                if m.text.is_empty() && m.tool_calls.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let parts = model_parts(m, echo_thinking);
+                if !parts.is_empty() {
+                    contents.push(json!({
+                        "role": "model",
+                        "parts": parts,
+                    }));
+                }
                 i += 1;
             }
             Role::Tool => {
@@ -629,7 +619,56 @@ fn format_contents(
             }
         }
     }
+    let contents = merge_consecutive_user(contents);
     (system_blocks, contents)
+}
+
+/// Merge consecutive `role:"user"` wire entries into ONE with concatenated discrete parts.
+/// Aligns with Anthropic's discrete block merging so that frozen synthetic user prefixes
+/// (project instructions, memory, skills) and user prompts stay as distinct parts
+/// within a single initial user turn.
+fn merge_consecutive_user(contents: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(contents.len());
+    for item in contents {
+        let is_user = item.get("role").and_then(Value::as_str) == Some("user");
+        let prev_user = out
+            .last()
+            .and_then(|p| p.get("role").and_then(Value::as_str))
+            == Some("user");
+        if is_user && prev_user {
+            let last = out.last_mut().unwrap();
+            let mut last_parts = last
+                .get("parts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let item_parts = item
+                .get("parts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            if last_parts.len() == 1
+                && last_parts[0].get("text").and_then(Value::as_str) == Some("")
+                && !item_parts.is_empty()
+            {
+                last_parts.clear();
+            }
+            if !(item_parts.len() == 1
+                && item_parts[0].get("text").and_then(Value::as_str) == Some("")
+                && !last_parts.is_empty())
+            {
+                last_parts.extend(item_parts);
+            }
+            if last_parts.is_empty() {
+                last_parts.push(json!({ "text": "" }));
+            }
+            last["parts"] = Value::Array(last_parts);
+        } else {
+            out.push(item);
+        }
+    }
+    out
 }
 
 fn user_parts(m: &Message, vision: bool) -> Vec<Value> {
@@ -722,9 +761,6 @@ fn model_parts(m: &Message, echo_thinking: bool) -> Vec<Value> {
         }
         parts.push(Value::Object(part));
     }
-    if parts.is_empty() {
-        parts.push(json!({ "text": "" }));
-    }
     parts
 }
 
@@ -741,10 +777,11 @@ fn tool_name_for(messages: &[Message], idx: usize) -> String {
 }
 
 fn function_response_part(m: &Message, name: &str) -> Value {
-    let response: Value = serde_json::from_str(m.text.trim())
+    let model_text = super::strip_tool_result_diff_for_model(&m.text);
+    let response: Value = serde_json::from_str(model_text.trim())
         .ok()
         .filter(Value::is_object)
-        .unwrap_or_else(|| json!({ "result": m.text }));
+        .unwrap_or_else(|| json!({ "result": model_text }));
     let mut fr = Map::new();
     fr.insert("name".into(), json!(name));
     fr.insert("response".into(), response);
@@ -1030,7 +1067,10 @@ mod tests {
         assert_eq!(v["thinkingBudget"], json!(16384));
         assert_eq!(v["includeThoughts"], json!(true));
 
-        // Test maxOutputTokens default 65536 and expansion when budget >= max_tokens
+        // Gemini 2.5 is budget-only: thinkingLevel must never ride alongside.
+        assert!(v.get("thinkingLevel").is_none());
+
+        // Test maxOutputTokens default 65536 (no thinking-driven expansion).
         let body_default = build_request_body(
             &c,
             &[Message::user("hi")],
@@ -1043,7 +1083,8 @@ mod tests {
             json!(65536)
         );
 
-        // Explicit small max_tokens < budget (8192 <= 16384) -> expands to 24576
+        // Explicit max_tokens 8192 stays 8192; the thinking budget shrinks to
+        // leave MIN_ANSWER_TOKENS (1024): 8192 - 1024.
         opts.max_tokens = Some(8192);
         let body_expanded = build_request_body(
             &c,
@@ -1054,7 +1095,11 @@ mod tests {
         );
         assert_eq!(
             body_expanded["generationConfig"]["maxOutputTokens"],
-            json!(24576)
+            json!(8192)
+        );
+        assert_eq!(
+            body_expanded["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(7168)
         );
     }
 
@@ -1119,6 +1164,47 @@ mod tests {
     }
 
     #[test]
+    fn gemini_tools_use_parameters_json_schema_and_normalize_dialect() {
+        let c = cfg("gemini-3-flash");
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pair": {
+                        "type": "array",
+                        "items": [{ "type": "string" }, { "type": "number" }]
+                    }
+                }
+            }),
+        }];
+        let body = build_request_body(
+            &c,
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert!(
+            declaration.get("parameters").is_none(),
+            "Gemini must use parametersJsonSchema, not the OpenAPI-subset parameters field"
+        );
+        assert_eq!(declaration["parametersJsonSchema"]["type"], "object");
+        assert_eq!(
+            declaration["parametersJsonSchema"]["properties"]["pair"]["prefixItems"],
+            json!([{ "type": "string" }, { "type": "number" }])
+        );
+        assert!(
+            declaration["parametersJsonSchema"]["properties"]["pair"]
+                .get("items")
+                .is_none(),
+            "Draft-07 tuple items must be rewritten to prefixItems"
+        );
+    }
+
+    #[test]
     fn system_messages_stay_as_separate_parts_and_project_instructions_stay_in_contents() {
         let c = cfg("gemini-3-flash");
         let msgs = vec![
@@ -1145,13 +1231,134 @@ mod tests {
         );
 
         let contents = body["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 2);
+        assert_eq!(
+            contents.len(),
+            1,
+            "consecutive user messages must merge into a single user turn"
+        );
         assert_eq!(contents[0]["role"], json!("user"));
-        assert!(contents[0]["parts"][0]["text"]
+        let user_parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(user_parts.len(), 2, "must preserve discrete parts");
+        assert!(user_parts[0]["text"]
             .as_str()
             .unwrap()
             .contains("AUTHORITATIVE PROJECT INSTRUCTIONS"));
-        assert_eq!(contents[1]["parts"][0]["text"], json!("hello"));
+        assert_eq!(user_parts[1]["text"], json!("hello"));
+    }
+
+    #[test]
+    fn test_instructions_memory_and_user_input_merge_as_discrete_parts() {
+        let c = cfg("gemini-3-flash");
+        let msgs = vec![
+            Message::system("<environment>env</environment>"),
+            Message::synthetic_user("<available_skills>skills</available_skills>"),
+            Message::synthetic_user(
+                "=== AUTHORITATIVE PROJECT INSTRUCTIONS & KNOWLEDGE (*.md) ===\nagents",
+            ),
+            Message::synthetic_user("=== MEMORY ===\n- prefers concise answers"),
+            Message::user("how does auth work?"),
+        ];
+        let body = build_request_body(
+            &c,
+            &msgs,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(
+            contents.len(),
+            1,
+            "all consecutive user blocks merge into one user entry"
+        );
+        assert_eq!(contents[0]["role"], json!("user"));
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4, "preserves 4 discrete parts");
+        assert_eq!(
+            parts[0]["text"],
+            json!("<available_skills>skills</available_skills>")
+        );
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("AUTHORITATIVE PROJECT INSTRUCTIONS"));
+        assert_eq!(
+            parts[2]["text"],
+            json!("=== MEMORY ===\n- prefers concise answers")
+        );
+        assert_eq!(parts[3]["text"], json!("how does auth work?"));
+    }
+
+    #[test]
+    fn lost_model_round_merges_users_while_a_real_reply_keeps_turns_alternating() {
+        let c = cfg("gemini-3-flash");
+        // Failed round (disconnect / provider error): nothing replayable was persisted for
+        // the model, so the two user messages stay adjacent and fold into ONE user turn.
+        let lost = vec![
+            Message::user("first question"),
+            Message::assistant("", vec![]),
+            Message::user("retry"),
+        ];
+        let body = build_request_body(
+            &c,
+            &lost,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(
+            contents.len(),
+            1,
+            "an empty model round must not break the user merge"
+        );
+        assert_eq!(contents[0]["role"], json!("user"));
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], json!("first question"));
+        assert_eq!(parts[1]["text"], json!("retry"));
+
+        // Normal round: a real reply keeps user / model turns separate and alternating.
+        let ok = vec![
+            Message::user("first question"),
+            Message::assistant("answer", vec![]),
+            Message::user("follow up"),
+        ];
+        let body = build_request_body(
+            &c,
+            &ok,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Exclude,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], json!("user"));
+        assert_eq!(contents[1]["role"], json!("model"));
+        assert_eq!(contents[1]["parts"][0]["text"], json!("answer"));
+        assert_eq!(contents[2]["role"], json!("user"));
+    }
+
+    #[test]
+    fn reasoning_only_model_round_is_dropped_with_echo_thinking() {
+        let c = cfg("gemini-3-flash");
+        let mut lost = Message::assistant("", vec![]);
+        lost.reasoning = Some("partial thinking".into());
+        let msgs = vec![Message::user("first"), lost, Message::user("retry")];
+        let body = build_request_body(
+            &c,
+            &msgs,
+            &[],
+            &ChatOptions::default(),
+            ReasoningPolicy::Include,
+        );
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(
+            contents.len(),
+            1,
+            "thinking-only model turn must be dropped"
+        );
+        assert_eq!(contents[0]["role"], json!("user"));
     }
 
     #[test]

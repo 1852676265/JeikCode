@@ -11,6 +11,9 @@
 export interface ProgrammaticStopMark {
   sessionId: string;
   expiresAt: number;
+  /** Operation id of the displaced turn. New daemons stamp terminals with the
+   *  same id, so the replacement turn's terminal must not be swallowed. */
+  operationId?: string;
 }
 
 /**
@@ -42,11 +45,131 @@ export function consumesProgrammaticStopMark(
   mark: ProgrammaticStopMark | null | undefined,
   sessionId: string | null | undefined,
   now: number,
+  operationId?: string | null,
 ): boolean {
   if (!mark) return false;
   const sid = sessionId?.trim();
   if (!sid || sid !== mark.sessionId) return false;
+  if (mark.operationId && operationId && mark.operationId !== operationId) return false;
   return now <= mark.expiresAt;
+}
+
+/** Minimal terminal-frame shape needed to classify a displaced turn. */
+export interface StopTerminalFrame {
+  type: string;
+  stop_reason?: string;
+  operation_id?: string;
+}
+
+/**
+ * Is this terminal frame still reporting the turn that 「立即发送」 displaced?
+ *
+ * A cancelled turn emits `done(stop_reason=cancelled)` **and** a legacy
+ * `stopped`. Both belong to the old turn: settling the connection or clearing
+ * busy on them flips the send button back to the arrow while the replacement
+ * turn is already streaming. A normal completion (`done` without a cancel/stop
+ * reason) must still be honoured.
+ */
+export function isStaleProgrammaticStopFrame(
+  mark: ProgrammaticStopMark | null | undefined,
+  frame: StopTerminalFrame,
+  sessionId: string | null | undefined,
+  now: number,
+): boolean {
+  if (!consumesProgrammaticStopMark(mark, sessionId, now, frame.operation_id)) return false;
+  if (frame.type === 'stopped') return true;
+  return (
+    frame.type === 'done' &&
+    (frame.stop_reason === 'cancelled' || frame.stop_reason === 'stopped')
+  );
+}
+
+/**
+ * Is a terminal frame arriving **after a new turn was delivered, but before that
+ * turn produced any frame**, actually the previous turn's cached terminal?
+ *
+ * `/chat/watch` re-sends `session_terminal` to a reattaching watcher when the
+ * session looks idle. A freshly-drained steer starts its POST a moment later, so
+ * the cached `done` can land in between and would otherwise clear `busy` / close
+ * the new connection: the send button flips back to the arrow while the agent is
+ * running ("fake stop"). A turn that already produced a frame owns the next
+ * terminal, and the window expires so a genuinely silent failure cannot wedge it.
+ */
+export function isStaleTerminalForArmedTurn(input: {
+  armedAt?: number;
+  frameSeen: boolean;
+  now: number;
+  ttlMs?: number;
+}): boolean {
+  if (input.armedAt == null) return false;
+  if (input.frameSeen) return false;
+  return input.now - input.armedAt <= (input.ttlMs ?? 15_000);
+}
+
+/**
+ * 当前会话是否正处于「立即发送 / 新回合切换」的保护窗口内。
+ *
+ * Single Event Bus 架构下，`POST /chat` 收到 `202 Accepted`（数毫秒）后前台 HTTP
+ * 请求即结束（`abortRef === null`），但被「立即发送」停掉的旧回合退场广播的
+ * `activity(running: false)`、磁盘空闲探针（`!fresh.running`）或旧观察流的
+ * `watch_closed` 往往滞后到达。只要处于以下任一阶段，外部空闲信号均属于旧回合残影，
+ * 绝不能据此掐断新回合的 `/chat/watch` 流或清掉 `busy`：
+ *   1. `sendNowUntil`：「立即发送」正在执行 `stopRunningTurn -> deliver` 交接；
+ *   2. `armedAt`（且 `!frameSeen`）：新回合已投递但尚未收到首帧；
+ *   3. `mark`（且 `!frameSeen`）：程序化停止标记仍在有效期内，新回合尚未吐帧。
+ */
+export function isTurnHandoverProtected(input: {
+  sessionId: string | null | undefined;
+  now: number;
+  sendNowUntil?: number;
+  armedAt?: number;
+  frameSeen: boolean;
+  mark?: ProgrammaticStopMark | null;
+}): boolean {
+  const sid = input.sessionId?.trim();
+  if (!sid) return false;
+  if (input.sendNowUntil != null && input.now <= input.sendNowUntil) return true;
+  if (
+    isStaleTerminalForArmedTurn({
+      armedAt: input.armedAt,
+      frameSeen: input.frameSeen,
+      now: input.now,
+    })
+  ) {
+    return true;
+  }
+  if (!input.frameSeen && consumesProgrammaticStopMark(input.mark, sid, input.now)) {
+    return true;
+  }
+  return false;
+}
+
+const LANDING_EPOCH_KEY = '__landing__';
+
+function sendNowEpochKey(sessionId: string | null | undefined): string {
+  const trimmed = sessionId?.trim();
+  return trimmed ? trimmed : LANDING_EPOCH_KEY;
+}
+
+/** 按会话隔离递增「立即发送」代数，互不取消其他会话正在交接的立即发送。 */
+export function bumpSessionSendNowEpoch(
+  epochs: Map<string, number>,
+  sessionId: string | null | undefined,
+): number {
+  const key = sendNowEpochKey(sessionId);
+  const next = (epochs.get(key) ?? 0) + 1;
+  epochs.set(key, next);
+  return next;
+}
+
+/** 校验该会话的「立即发送」交接是否仍为最新代数（未被同会话的新操作或手动停止打断）。 */
+export function isCurrentSessionSendNowEpoch(
+  epochs: Map<string, number>,
+  sessionId: string | null | undefined,
+  expectedEpoch: number,
+): boolean {
+  const key = sendNowEpochKey(sessionId);
+  return (epochs.get(key) ?? 0) === expectedEpoch;
 }
 
 /**

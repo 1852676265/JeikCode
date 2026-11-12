@@ -55,7 +55,7 @@ fn socket_path() -> io::Result<PathBuf> {
     // `run/` is not in `uninstall_manifest()` under either spelling.
     let home = std::env::var("HOME")
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME env var not set"))?;
-    let dir = PathBuf::from(home).join(".zap").join("run");
+    let dir = PathBuf::from(home).join(".jeikcode").join("run");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(filename))
 }

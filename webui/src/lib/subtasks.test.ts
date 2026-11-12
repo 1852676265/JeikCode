@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import {
   applySubtaskProgress,
   applySubtaskResultsFromOutput,
-  SUBAGENT_ACTIVITY_MARKER,
+  settleSubtasksFromOutput,
   subtaskCounts,
   subtasksFromTaskArgs,
+  SUBAGENT_ACTIVITY_MARKER,
   taskArgsSummary,
 } from './subtasks.ts';
 
@@ -103,4 +104,48 @@ test('applySubtaskResultsFromOutput restores panel after history reload', () => 
   const counts = subtaskCounts(items);
   assert.equal(counts.completed, 3);
   assert.equal(counts.failed, 1);
+});
+
+test('settleSubtasksFromOutput settles a finished batch from <task> blocks', () => {
+  // Live rows whose terminal `✓ done` progress line was lost stay `running`
+  // under a tool row that already reads done. The tool result is authoritative.
+  const args = JSON.stringify({
+    tasks: [
+      { subagent_type: 'explore', description: 'a' },
+      { subagent_type: 'explore', description: 'b' },
+    ],
+  });
+  const stuck = subtasksFromTaskArgs(args)!.map((item) => ({
+    ...item,
+    status: 'running' as const,
+    activity: 'analyzing',
+  }));
+  const output = [
+    '<task id="explore#1" model="auto" state="completed">done</task>',
+    '<task id="explore#2" model="auto" state="completed">done</task>',
+  ].join('\n');
+
+  const settled = settleSubtasksFromOutput(
+    { name: 'task', args, subtasks: stuck },
+    output,
+  );
+  assert.ok(settled, 'stuck rows must settle');
+  assert.equal(settled!.subtasks[0]!.status, 'completed');
+  assert.equal(settled!.subtasks[1]!.status, 'completed');
+  assert.equal(subtaskCounts(settled!.subtasks).running, 0);
+
+  // Idempotent: settling again changes nothing, so there is no needless re-render.
+  assert.equal(
+    settleSubtasksFromOutput({ name: 'task', args, subtasks: settled!.subtasks }, output),
+    undefined,
+  );
+
+  // Seeds from the dispatch args when the live panel was never created.
+  const seeded = settleSubtasksFromOutput({ name: 'task', args }, output);
+  assert.ok(seeded, 'panel must be seeded from args');
+  assert.equal(seeded!.subtasks[0]!.status, 'completed');
+
+  // Other tools / empty output are untouched.
+  assert.equal(settleSubtasksFromOutput({ name: 'grep', args: '{}' }, output), undefined);
+  assert.equal(settleSubtasksFromOutput({ name: 'task', args }, undefined), undefined);
 });

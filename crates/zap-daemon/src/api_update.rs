@@ -5,12 +5,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 use zap_coding::config_sync::{
@@ -96,6 +93,10 @@ pub struct UpdateStatus {
     pub bytes: u64,
     pub total: u64,
     pub error: Option<String>,
+    /// Stable `UpgradeFailureKind` code. The WebUI localizes
+    /// `update.error.<code>` and keeps `error` as the raw diagnostic detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 static CURRENT_UPDATE_STATUS: Mutex<Option<UpdateStatus>> = Mutex::new(None);
@@ -112,6 +113,7 @@ fn get_update_status() -> UpdateStatus {
             bytes: 0,
             total: 0,
             error: None,
+            error_code: None,
         })
 }
 
@@ -180,15 +182,10 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
 
 /// 探测当前是否在桌面端环境
 pub fn is_desktop_environment() -> bool {
-    std::env::var("ZAP_DESKTOP")
-        .or_else(|_| std::env::var("JEIKCODE_DESKTOP"))
-        .is_ok()
+    std::env::var("JEIKCODE_DESKTOP").is_ok()
 }
 
-fn github_latest_api_url() -> String {
-    let repo = zap_config::endpoints::update_repo();
-    format!("https://api.github.com/repos/{repo}/releases/latest")
-}
+const GITHUB_LATEST_API_URL: &str = "https://api.github.com/repos/jeikl/JeikCode/releases/latest";
 
 #[derive(Debug, Deserialize, Clone)]
 struct GitHubRelease {
@@ -211,21 +208,19 @@ struct GitHubReleaseAsset {
 }
 
 fn create_update_client() -> Option<reqwest::Client> {
-    zap_updater::apply_proxy_policy(
-        reqwest::Client::builder()
-            .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-            .default_headers({
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(
-                    reqwest::header::ACCEPT,
-                    reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
-                );
-                headers
-            })
-            .timeout(std::time::Duration::from_secs(12)),
-    )
-    .build()
-    .ok()
+    reqwest::Client::builder()
+        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+            );
+            headers
+        })
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .ok()
 }
 
 /// 根据指定的更新通道，在 Release 列表中寻找语义化版本号最大的目标 Release，支持跨版本直升最高版
@@ -258,45 +253,25 @@ fn find_highest_release(
     highest.cloned()
 }
 
-fn is_desktop_installer_asset(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    #[cfg(target_os = "windows")]
-    {
-        if !lower.ends_with(".exe") {
-            return false;
-        }
-        // 明确排除 CLI 纯命令行独立二进制（如 jeikcode-v1.0.1-windows-x64.exe 或 jeikcode.exe）
-        if (lower.starts_with("jeikcode-") || lower == "jeikcode.exe")
-            && !lower.contains("desktop")
-            && !lower.contains("setup")
-        {
-            return false;
-        }
-        lower.contains("setup")
-            || lower.contains("installer")
-            || lower.contains("desktop")
-            || lower.contains("zap")
-            || lower.contains("pipirunner")
-            || lower.contains("皮皮跑腿")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        lower.ends_with(".dmg") || lower.ends_with(".pkg")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        lower.ends_with(".appimage") || lower.ends_with(".deb") || lower.ends_with(".rpm")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        false
-    }
-}
-
 fn find_desktop_installer_url_in_assets(assets: &[GitHubReleaseAsset]) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let predicate = |name: &str| -> bool {
+        let lower = name.to_lowercase();
+        lower.ends_with(".exe") && (lower.contains("setup") || lower.contains("desktop"))
+    };
+    #[cfg(target_os = "macos")]
+    let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
+    #[cfg(target_os = "linux")]
+    let predicate = |name: &str| -> bool {
+        let lower = name.to_lowercase();
+        lower.ends_with(".appimage") || lower.ends_with(".deb")
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let predicate = |_: &str| false;
+
     assets
         .iter()
-        .find(|a| is_desktop_installer_asset(&a.name))
+        .find(|a| predicate(&a.name))
         .map(|a| a.browser_download_url.clone())
 }
 
@@ -314,37 +289,86 @@ fn find_cli_asset_url(assets: &[GitHubReleaseAsset], tag: &str) -> Option<String
     None
 }
 
-/// 解析桌面安装包候选下载地址（优先从 GitHub Release Assets 动态提取，频控或断网时按标准安装包规范构造直连地址兜底）
+fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
+    let tag = if version.starts_with('v') || version.starts_with('V') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    };
+    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
+
+    #[cfg(target_os = "windows")]
+    {
+        Some(format!(
+            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(format!(
+            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(format!(
+            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 解析桌面安装包候选下载地址
 async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     let tag = if version.starts_with('v') || version.starts_with('V') {
         version.to_string()
     } else {
         format!("v{version}")
     };
+    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
 
-    let repo = zap_config::endpoints::update_repo();
-    let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    let client = create_update_client();
+    // 优先尝试通过 GitHub API 查找 release assets 列表中的安装包
+    let api_url = format!("https://api.github.com/repos/jeikl/JeikCode/releases/tags/{tag}");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
 
-    if let Some(client) = client {
-        if let Ok(resp) = client.get(&api_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
-                        let release_assets: Vec<GitHubReleaseAsset> = assets
-                            .iter()
-                            .filter_map(|item| {
-                                let name = item.get("name")?.as_str()?.to_string();
-                                let url = item.get("browser_download_url")?.as_str()?.to_string();
-                                Some(GitHubReleaseAsset {
-                                    name,
-                                    browser_download_url: url,
-                                })
-                            })
-                            .collect();
+    if let Ok(resp) = client.get(&api_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
+                    #[cfg(target_os = "windows")]
+                    let predicate = |name: &str| -> bool {
+                        let lower = name.to_lowercase();
+                        lower.ends_with(".exe")
+                            && (lower.contains("setup") || lower.contains("desktop"))
+                    };
+                    #[cfg(target_os = "macos")]
+                    let predicate = |name: &str| -> bool { name.to_lowercase().ends_with(".dmg") };
+                    #[cfg(target_os = "linux")]
+                    let predicate = |name: &str| -> bool {
+                        let lower = name.to_lowercase();
+                        lower.ends_with(".appimage") || lower.ends_with(".deb")
+                    };
+                    #[cfg(not(any(
+                        target_os = "windows",
+                        target_os = "macos",
+                        target_os = "linux"
+                    )))]
+                    let predicate = |_: &str| false;
 
-                        if let Some(found) = find_desktop_installer_url_in_assets(&release_assets) {
-                            return Some(found);
+                    for asset in assets {
+                        if let (Some(name), Some(url)) = (
+                            asset.get("name").and_then(|n| n.as_str()),
+                            asset.get("browser_download_url").and_then(|u| u.as_str()),
+                        ) {
+                            if predicate(name) {
+                                return Some(url.to_string());
+                            }
                         }
                     }
                 }
@@ -352,24 +376,23 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
         }
     }
 
-    // 兜底回退：当 GitHub API 触发 403 频控或网络受限时，按构建产物规范构造直连下载地址
-    let ver_clean = version.trim_start_matches(|c| c == 'v' || c == 'V');
+    // 后备方案：使用标准发布产物命名约定
     #[cfg(target_os = "windows")]
     {
         Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/Zap_{ver_clean}_x64-setup.exe"
+            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
         ))
     }
     #[cfg(target_os = "macos")]
     {
         Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/Zap_{ver_clean}_x64.dmg"
+            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
         ))
     }
     #[cfg(target_os = "linux")]
     {
         Some(format!(
-            "https://github.com/{repo}/releases/download/{tag}/Zap_{ver_clean}_amd64.AppImage"
+            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
         ))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -388,6 +411,21 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         _ => UpdateChannel::default(),
     };
 
+    // 离线/内网隔离模式下，直接返回当前版本且无新版，绝不产生外网探测请求
+    if zap_config::config::offline::is_offline_active() {
+        return Json(UpdateCheckResponse {
+            current_version: current_version.clone(),
+            latest_version: current_version,
+            has_update: false,
+            is_desktop,
+            release_notes: None,
+            download_url: None,
+            released_at: None,
+            channel: channel.as_str().to_string(),
+            versions: Vec::new(),
+        });
+    }
+
     let client = create_update_client();
 
     let mut latest_version = String::new();
@@ -404,65 +442,30 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     // 边缘缓存与 GitHub 分页合并后，按通道倒序给出全部历史版本。
     if let Ok(releases) = zap_updater::list_releases().await {
         let matched = zap_updater::filter_channel_releases(&releases, updater_channel);
-        if is_desktop {
-            // 桌面端环境：解析包含有效桌面安装包的 Release 列表（支持回退解析）
-            let mut resolved_first_url = None;
-            for rel in &matched {
-                let assets: Vec<GitHubReleaseAsset> = rel
-                    .assets
-                    .iter()
-                    .map(|a| GitHubReleaseAsset {
-                        name: a.name.clone(),
-                        browser_download_url: a.browser_download_url.clone(),
-                    })
-                    .collect();
-                let url = find_desktop_installer_url_in_assets(&assets);
-                let url = match url {
-                    Some(u) => Some(u),
-                    None => resolve_desktop_installer_url(&rel.tag_name).await,
-                };
-                if let Some(u) = url {
-                    if resolved_first_url.is_none() {
-                        resolved_first_url = Some(u);
-                        latest_version = rel.tag_name.clone();
-                        release_notes = rel.body.clone();
-                        released_at = rel.published_at.clone();
-                    }
-                    versions.push(UpdateVersionEntry {
-                        version: rel.tag_name.clone(),
-                        notes: rel.body.clone().filter(|s| !s.trim().is_empty()),
-                        released_at: rel.published_at.clone(),
-                    });
-                }
-            }
-            download_url = resolved_first_url;
-            if latest_version.is_empty() {
-                // 如果远端所有 Release 均无当前操作系统的桌面安装包，则当前桌面版本已是最新，绝不误报有更新
-                latest_version = current_version.clone();
-                download_url = None;
-            }
-        } else {
-            versions = matched
+        versions = matched
+            .iter()
+            .map(|r| UpdateVersionEntry {
+                version: r.tag_name.clone(),
+                notes: r.body.clone().filter(|s| !s.trim().is_empty()),
+                released_at: r.published_at.clone(),
+            })
+            .collect();
+        if let Some(rel) = matched.first() {
+            latest_version = rel.tag_name.clone();
+            release_notes = rel.body.clone();
+            released_at = rel.published_at.clone();
+            let assets: Vec<GitHubReleaseAsset> = rel
+                .assets
                 .iter()
-                .map(|r| UpdateVersionEntry {
-                    version: r.tag_name.clone(),
-                    notes: r.body.clone().filter(|s| !s.trim().is_empty()),
-                    released_at: r.published_at.clone(),
+                .map(|a| GitHubReleaseAsset {
+                    name: a.name.clone(),
+                    browser_download_url: a.browser_download_url.clone(),
                 })
                 .collect();
-
-            if let Some(rel) = matched.first() {
-                latest_version = rel.tag_name.clone();
-                release_notes = rel.body.clone();
-                released_at = rel.published_at.clone();
-                let assets: Vec<GitHubReleaseAsset> = rel
-                    .assets
-                    .iter()
-                    .map(|a| GitHubReleaseAsset {
-                        name: a.name.clone(),
-                        browser_download_url: a.browser_download_url.clone(),
-                    })
-                    .collect();
+            if is_desktop {
+                download_url = find_desktop_installer_url_in_assets(&assets)
+                    .or_else(|| resolve_desktop_installer_url_fallback(&latest_version));
+            } else {
                 download_url = find_cli_asset_url(&assets, &latest_version).or_else(|| {
                     zap_updater::detect_target()
                         .map(|target| zap_updater::binary_url(&latest_version, target))
@@ -482,17 +485,17 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                 download_url = Some(zap_updater::binary_url(&latest_version, target));
             }
         } else if let Some(ref c) = client {
-            let latest_api = github_latest_api_url();
-            let mut got_rel = false;
-            if let Ok(resp) = c.get(&latest_api).send().await {
+            if let Ok(resp) = c.get(GITHUB_LATEST_API_URL).send().await {
                 if resp.status().is_success() {
                     if let Ok(rel) = resp.json::<GitHubRelease>().await {
                         latest_version = rel.tag_name.clone();
                         release_notes = rel.body;
                         released_at = rel.published_at;
-                        got_rel = true;
                         if is_desktop {
-                            download_url = find_desktop_installer_url_in_assets(&rel.assets);
+                            download_url = find_desktop_installer_url_in_assets(&rel.assets)
+                                .or_else(|| {
+                                    resolve_desktop_installer_url_fallback(&latest_version)
+                                });
                         } else {
                             download_url = find_cli_asset_url(&rel.assets, &latest_version)
                                 .or_else(|| {
@@ -500,29 +503,6 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                                         zap_updater::binary_url(&latest_version, target)
                                     })
                                 });
-                        }
-                    }
-                }
-            }
-            if !got_rel {
-                let repo = zap_config::endpoints::update_repo();
-                let latest_endpoint = format!("https://api.github.com/repos/{repo}/releases/latest");
-                if let Ok(resp) = c.get(&latest_endpoint).send().await {
-                    if resp.status().is_success() {
-                        if let Ok(rel) = resp.json::<GitHubRelease>().await {
-                            latest_version = rel.tag_name.clone();
-                            release_notes = rel.body;
-                            released_at = rel.published_at;
-                            if is_desktop {
-                                download_url = find_desktop_installer_url_in_assets(&rel.assets);
-                            } else {
-                                download_url = find_cli_asset_url(&rel.assets, &latest_version)
-                                    .or_else(|| {
-                                        zap_updater::detect_target().map(|target| {
-                                            zap_updater::binary_url(&latest_version, target)
-                                        })
-                                    });
-                            }
                         }
                     }
                 }
@@ -537,9 +517,8 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         }
     }
 
-    let has_update = !latest_version.is_empty()
-        && compare_versions(&latest_version, &current_version)
-        && (!is_desktop || download_url.is_some());
+    let has_update =
+        !latest_version.is_empty() && compare_versions(&latest_version, &current_version);
 
     Json(UpdateCheckResponse {
         current_version,
@@ -575,9 +554,16 @@ pub async fn execute_update(
     }
 
     let req = payload.map(|Json(p)| p).unwrap_or_default();
+    let listen_host = state.bind_host.clone();
     let listen_port = state.bind_port;
     let restart_token = state.webui_tokens.display();
-    let is_desktop = is_desktop_environment();
+    let shutdown_tx = Some(state.shutdown_tx.clone());
+    let no_token = state
+        .token_optional
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || !state
+            .enforce_token
+            .load(std::sync::atomic::Ordering::Relaxed);
 
     tokio::spawn(async move {
         set_update_status(UpdateStatus {
@@ -586,41 +572,38 @@ pub async fn execute_update(
             bytes: 0,
             total: 0,
             error: None,
+            error_code: None,
         });
 
-        if is_desktop {
-            // 桌面端环境：直接下载全量安装包并自动拉起安装向导完成升级安装
-            if let Err(e) = run_desktop_update(req.download_url, req.version).await {
-                set_update_status(UpdateStatus {
-                    status: "error".to_string(),
-                    progress: 0,
-                    bytes: 0,
-                    total: 0,
-                    error: Some(format!("下载或安装更新失败: {e}")),
-                });
-                IS_UPDATING.store(false, Ordering::SeqCst);
-            }
-        } else {
-            // CLI / 无头环境：就地升级后台二进制并重启
-            if let Err(e) = run_cli_update(
-                req.version,
-                req.channel,
-                req.download_url,
-                req.force.unwrap_or(false),
-                listen_port,
-                restart_token,
-            )
-            .await
-            {
-                set_update_status(UpdateStatus {
-                    status: "error".to_string(),
-                    progress: 0,
-                    bytes: 0,
-                    total: 0,
-                    error: Some(format!("更新二进制失败: {e}")),
-                });
-                IS_UPDATING.store(false, Ordering::SeqCst);
-            }
+        // WebUI is embedded in this binary. Remote browsers and the desktop
+        // shell all hit this process — never open a host-side installer wizard.
+        // Swap the running jeikcode in place, then restart so the new UI is served.
+        if let Err(e) = run_cli_update(
+            req.version,
+            req.channel,
+            req.download_url,
+            req.force.unwrap_or(false),
+            Some(listen_host),
+            listen_port,
+            restart_token,
+            no_token,
+            shutdown_tx,
+        )
+        .await
+        {
+            set_update_status(UpdateStatus {
+                status: "error".to_string(),
+                progress: 0,
+                bytes: 0,
+                total: 0,
+                error: Some(format!("更新二进制失败: {e}")),
+                error_code: Some(
+                    zap_updater::UpgradeFailureKind::Other
+                        .as_str()
+                        .to_string(),
+                ),
+            });
+            IS_UPDATING.store(false, Ordering::SeqCst);
         }
     });
 
@@ -630,202 +613,16 @@ pub async fn execute_update(
     }))
 }
 
-async fn run_desktop_update(direct_url: Option<String>, version_opt: Option<String>) -> Result<()> {
-    let manifest_opt = if direct_url.is_none() {
-        zap_updater::fetch_manifest().await.ok()
-    } else {
-        None
-    };
-
-    let download_url = if let Some(u) = direct_url {
-        u
-    } else if let Some(ref ver) = version_opt {
-        resolve_desktop_installer_url(ver)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("未找到版本 {ver} 匹配当前系统的桌面安装包"))?
-    } else if let Some(ref m) = manifest_opt {
-        resolve_desktop_installer_url(&m.version)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("未找到匹配当前系统的桌面安装包"))?
-    } else {
-        anyhow::bail!("无法获取桌面端安装包下载地址");
-    };
-
-    let version_str = version_opt
-        .or_else(|| manifest_opt.map(|m| m.version))
-        .unwrap_or_else(|| "latest".to_string());
-
-    let client = zap_updater::apply_proxy_policy(
-        reqwest::Client::builder()
-            .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(600)),
-    )
-    .build()?;
-
-    let candidate_urls = zap_updater::get_mirror_urls(&download_url);
-    let mut last_err = None;
-    let mut response_opt = None;
-
-    for candidate in &candidate_urls {
-        match client.get(candidate).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                response_opt = Some(resp);
-                break;
-            }
-            Ok(resp) => {
-                last_err = Some(anyhow::anyhow!(
-                    "下载源 {} 响应 HTTP 状态码: {}",
-                    candidate,
-                    resp.status()
-                ));
-            }
-            Err(e) => {
-                last_err = Some(anyhow::anyhow!("连接下载源 {} 失败: {}", candidate, e));
-            }
-        }
-    }
-
-    let response = response_opt.ok_or_else(|| {
-        last_err.unwrap_or_else(|| anyhow::anyhow!("所有镜像与直连源均无法下载安装包"))
-    })?;
-
-    let total_bytes = response.content_length().unwrap_or(0);
-    let temp_dir = std::env::temp_dir();
-
-    let installer_filename = download_url
-        .split('?')
-        .next()
-        .and_then(|u| u.split('/').last())
-        .filter(|s| !s.is_empty() && s.contains('.'))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            #[cfg(target_os = "windows")]
-            { format!("installer-{version_str}.exe") }
-            #[cfg(target_os = "macos")]
-            { format!("installer-{version_str}.dmg") }
-            #[cfg(target_os = "linux")]
-            { format!("installer-{version_str}.AppImage") }
-            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-            { format!("installer-{version_str}") }
-        });
-
-    let installer_path = temp_dir.join(installer_filename);
-    if installer_path.exists() {
-        let _ = tokio::fs::remove_file(&installer_path).await;
-    }
-
-    let mut file = tokio::fs::File::create(&installer_path).await?;
-    let mut downloaded_bytes: u64 = 0;
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res?;
-        file.write_all(&chunk).await?;
-        downloaded_bytes += chunk.len() as u64;
-
-        let pct = if total_bytes > 0 {
-            ((downloaded_bytes * 100) / total_bytes) as u32
-        } else {
-            0
-        };
-
-        set_update_status(UpdateStatus {
-            status: "downloading".to_string(),
-            progress: pct.min(100),
-            bytes: downloaded_bytes,
-            total: total_bytes,
-            error: None,
-        });
-    }
-
-    file.flush().await?;
-    drop(file);
-
-    set_update_status(UpdateStatus {
-        status: "ready".to_string(),
-        progress: 100,
-        bytes: downloaded_bytes,
-        total: total_bytes,
-        error: None,
-    });
-
-    // 触发安装包重新安装并退出当前进程
-    trigger_installer_and_exit(installer_path).await?;
-
-    Ok(())
-}
-
-async fn trigger_installer_and_exit(installer_path: PathBuf) -> Result<()> {
-    set_update_status(UpdateStatus {
-        status: "installing".to_string(),
-        progress: 100,
-        bytes: 0,
-        total: 0,
-        error: None,
-    });
-
-    #[cfg(target_os = "windows")]
-    {
-        // 1. 通过 cmd /c start "" 拉起下载好的安装包，传入 /S 参数以进行静默安装（NSIS 标准无感安装）
-        let status = std::process::Command::new("cmd")
-            .args(&["/c", "start", "", &installer_path.to_string_lossy(), "/S"])
-            .status();
-        if status.is_err() {
-            let _ = std::process::Command::new(&installer_path).arg("/S").spawn();
-        }
-
-        // 2. 终止桌面端前端进程与后台旧进程，防止覆盖安装时被文件锁定
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "zap-desktop.exe"])
-            .spawn();
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "Zap.exe"])
-            .spawn();
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "皮皮跑腿 (PipiRunner).exe"])
-            .spawn();
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "JeikCode Desktop.exe"])
-            .spawn();
-
-        // 3. 延时片刻退出当前后台子进程，交由安装程序接管
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        std::process::exit(0);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg(&installer_path)
-            .spawn();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        std::process::exit(0);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&installer_path, std::fs::Permissions::from_mode(0o755));
-        }
-        let _ = std::process::Command::new(&installer_path).spawn();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        std::process::exit(0);
-    }
-
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
 async fn run_cli_update(
     version_opt: Option<String>,
     channel_opt: Option<String>,
     _direct_url: Option<String>,
     force: bool,
+    listen_host: Option<String>,
     listen_port: u16,
     restart_token: Option<String>,
+    no_token: bool,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Result<()> {
     let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<zap_updater::UpgradeEvent>();
@@ -840,9 +637,10 @@ async fn run_cli_update(
         } else {
             format!("v{ver}")
         };
-        let download_base = zap_updater::download_base().trim_end_matches('/');
-        let manifest_url = format!("{download_base}/{tag}/latest.json");
-        match zap_updater::fetch_manifest_from_url(&manifest_url).await {
+        // 走 updater 的 tag 清单解析，避免把下载源硬编码成 github.com：
+        // 用户配置的 JEIKCODE_UPDATE_DOWNLOAD_BASE / [config] update_download_base
+        // 镜像地址必须在这条路径上同样生效。
+        match zap_updater::fetch_manifest_for_tag(&tag).await {
             Ok(manifest) => tokio::spawn(zap_updater::run_upgrade_with_manifest(
                 manifest,
                 current_version,
@@ -879,6 +677,7 @@ async fn run_cli_update(
                     bytes,
                     total,
                     error: None,
+                    error_code: None,
                 });
             }
             zap_updater::UpgradeEvent::Verifying
@@ -889,6 +688,7 @@ async fn run_cli_update(
                     bytes: 0,
                     total: 0,
                     error: None,
+                    error_code: None,
                 });
             }
             zap_updater::UpgradeEvent::Done { exe, .. } => {
@@ -898,16 +698,35 @@ async fn run_cli_update(
                     bytes: 0,
                     total: 0,
                     error: None,
+                    error_code: None,
                 });
                 // File is already swapped in place. Restart so remote WebUI /
                 // serve picks up the new image (Unix exec; Windows delayed spawn).
                 let restart_token = restart_token.clone();
+                let restart_host = listen_host.clone();
+                if listen_port > 0 {
+                    let _ = crate::api_config::save_webui_listen_pref(
+                        restart_host.clone(),
+                        listen_port,
+                        restart_token.clone(),
+                    );
+                }
+                let shutdown_tx = shutdown_tx.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    let Err(err) = zap_updater::restart_replaced_process(
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    // 在调用 restart 前，主动触发优雅停机释放当前的监听套接字（Listen Socket）
+                    if let Some(tx) = shutdown_tx {
+                        let _ = tx.send(true);
+                    }
+                    crate::stop_server();
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    let Err(err) = zap_updater::restart_process_with_config(
                         &exe,
                         listen_port,
+                        restart_host.as_deref(),
+                        listen_port,
                         restart_token.as_deref(),
+                        Some(no_token),
                     );
                     tracing::error!("in-place upgrade restart failed: {err}");
                     set_update_status(UpdateStatus {
@@ -916,6 +735,11 @@ async fn run_cli_update(
                         bytes: 0,
                         total: 0,
                         error: Some(format!("重启失败: {err}")),
+                        error_code: Some(
+                            zap_updater::UpgradeFailureKind::Restart
+                                .as_str()
+                                .to_string(),
+                        ),
                     });
                     IS_UPDATING.store(false, Ordering::SeqCst);
                 });
@@ -927,14 +751,34 @@ async fn run_cli_update(
                     bytes: 0,
                     total: 0,
                     error: Some(err),
+                    error_code: None,
                 });
             }
             _ => {}
         }
     }
 
-    let _ = driver.await;
+    // 进度事件只描述 “正在做什么”；真正的失败通过 JoinHandle 的 Result 返回。
+    // 这里必须把它落成 error 终态：若丢弃 Result，清单拉取或下载失败后
+    // WebUI 轮询到的状态会永远停在 “downloading 0%”，既看不到原因也无法重试。
+    let outcome = match driver.await {
+        Ok(result) => result,
+        Err(join_err) => Err(zap_updater::UpgradeFailure::new(
+            zap_updater::UpgradeFailureKind::Other,
+            anyhow::anyhow!("update task terminated before reporting a result: {join_err}"),
+        )),
+    };
     IS_UPDATING.store(false, Ordering::SeqCst);
+    if let Err(failure) = outcome {
+        set_update_status(UpdateStatus {
+            status: "error".to_string(),
+            progress: 0,
+            bytes: 0,
+            total: 0,
+            error: Some(format!("{:#}", failure.error)),
+            error_code: Some(failure.kind.as_str().to_string()),
+        });
+    }
     Ok(())
 }
 

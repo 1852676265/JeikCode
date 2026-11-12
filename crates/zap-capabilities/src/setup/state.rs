@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub const STATE_FILENAME: &str = "setup-state.json";
-pub const STATE_DIR: &str = ".zap";
+pub const STATE_DIR: &str = ".jeikcode";
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub struct SetupState {
 }
 
 pub fn state_path(project_root: &Path) -> PathBuf {
-    project_root.join(".zap").join(STATE_FILENAME)
+    project_root.join(".jeikcode").join(STATE_FILENAME)
 }
 
 pub fn load_setup_state(project_root: &Path) -> Option<SetupState> {
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn load_returns_none_for_future_schema_version() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zap")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".jeikcode")).unwrap();
         let path = state_path(dir.path());
         std::fs::write(&path, r#"{"schema_version": 999, "junk": "future"}"#).unwrap();
         // Per sync_marker philosophy: future version → None, no error.
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn load_returns_none_for_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zap")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".jeikcode")).unwrap();
         std::fs::write(&state_path(dir.path()), "{not json").unwrap();
         assert!(load_setup_state(dir.path()).is_none());
     }

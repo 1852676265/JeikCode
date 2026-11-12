@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use zap_config::i18n::{t, Msg};
 
-use zap::host_service;
+use jeikcode::host_service;
 
 // ── CLI enum ──────────────────────────────────────────────────────────────────
 

@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -165,6 +165,86 @@ pub enum UpgradeEvent {
     },
 }
 
+/// Stable failure categories for hosts that localize their own wording.
+///
+/// Classification happens where the failure is raised, so UIs never have to
+/// guess from error text. The raw [`anyhow`] chain stays available on
+/// [`UpgradeFailure::error`] for diagnostics (URLs, HTTP status, checksums).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeFailureKind {
+    AlreadyLatest,
+    PackageManaged,
+    UnsupportedPlatform,
+    NotWritable,
+    ManifestFetch,
+    Download,
+    ChecksumMismatch,
+    Replace,
+    /// The new binary is installed but the host could not restart it.
+    Restart,
+    Other,
+}
+
+impl UpgradeFailureKind {
+    /// Stable wire code. WebUI catalogs key their wording as
+    /// `update.error.<code>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyLatest => "already_latest",
+            Self::PackageManaged => "package_managed",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::NotWritable => "not_writable",
+            Self::ManifestFetch => "manifest_fetch",
+            Self::Download => "download",
+            Self::ChecksumMismatch => "checksum_mismatch",
+            Self::Replace => "replace",
+            Self::Restart => "restart",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Typed upgrade error: category for the UI plus the original chain for logs.
+#[derive(Debug)]
+pub struct UpgradeFailure {
+    pub kind: UpgradeFailureKind,
+    pub error: anyhow::Error,
+}
+
+impl UpgradeFailure {
+    pub fn new(kind: UpgradeFailureKind, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind,
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UpgradeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.error)
+        } else {
+            write!(f, "{}", self.error)
+        }
+    }
+}
+
+impl std::error::Error for UpgradeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+impl From<anyhow::Error> for UpgradeFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            kind: UpgradeFailureKind::Other,
+            error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub version: String,
@@ -238,8 +318,8 @@ fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
     }
 }
 
-/// Release artifact filename for a given version + target, matching
-/// what `scripts/release.sh` publishes to `dist/<version>/`.
+/// Release artifact filename for a given version + target, matching the
+/// assets published by the GitHub release workflow to `dist/<version>/`.
 pub fn binary_filename(version: &str, target: &str) -> String {
     let tag = if version.starts_with('v') {
         version.to_string()
@@ -269,8 +349,32 @@ pub fn binary_url(version: &str, target: &str) -> String {
 
 /// Path of the running `jeikcode` executable. Resolved once at the
 /// start of an upgrade so we know what to replace.
+/// Normalizes away `.rolling` or `.bak` suffixes if the process image was
+/// previously renamed in-place on Windows.
 pub fn current_exe_path() -> Result<PathBuf> {
-    std::env::current_exe().context("could not resolve current executable path")
+    let exe = std::env::current_exe().context("could not resolve current executable path")?;
+    Ok(normalize_live_exe_path(exe))
+}
+
+pub fn normalize_live_exe_path(exe: PathBuf) -> PathBuf {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return exe;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower == ".zap.rolling" || lower == ".jeikcode.rolling" || lower == "zap.rolling" || lower == "jeikcode.rolling" {
+        return exe.with_file_name(if cfg!(windows) {
+            "zap.exe"
+        } else {
+            "zap"
+        });
+    }
+    if lower.ends_with(".bak") {
+        let trimmed = &name[..name.len() - 4];
+        if !trimmed.is_empty() {
+            return exe.with_file_name(trimmed);
+        }
+    }
+    exe
 }
 
 fn same_exe(a: &Path, b: &Path) -> bool {
@@ -283,105 +387,150 @@ fn same_exe(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Returns true if `path` has the product binary name.
 fn looks_like_jeikcode_binary(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    lower == "jeikcode" || lower == "jeikcode.exe"
+    lower == "zap" || lower == "zap.exe"
 }
 
-fn looks_like_desktop_cli_payload(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("cli-bin"))
-}
-
-fn desktop_cli_bin_candidates() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let local = PathBuf::from(local);
-        dirs.push(local.join("JeikCode Desktop"));
-        dirs.push(local.join("Programs").join("JeikCode Desktop"));
-    }
-    for key in ["ProgramFiles", "ProgramFiles(x86)", "PROGRAMFILES"] {
-        if let Some(pf) = std::env::var_os(key) {
-            dirs.push(PathBuf::from(pf).join("JeikCode Desktop"));
-        }
-    }
-    if let Some(home) = zap_config::util::real_home_dir() {
-        dirs.push(
-            home.join("Applications")
-                .join("JeikCode Desktop.app")
-                .join("Contents")
-                .join("Resources"),
-        );
-        dirs.push(home.join(".local").join("share").join("zap-desktop"));
-    }
-    dirs.push(PathBuf::from(
-        "/Applications/JeikCode Desktop.app/Contents/Resources",
-    ));
-    dirs.push(PathBuf::from("/usr/lib/zap-desktop"));
-    dirs.push(PathBuf::from("/usr/lib/JeikCode Desktop"));
-    dirs.push(PathBuf::from("/opt/JeikCode Desktop"));
-
-    let mut out = Vec::new();
-    for dir in dirs {
-        out.push(dir.join("cli-bin"));
-        out.push(dir.join("resources").join("cli-bin"));
-    }
-    out
-}
-
-/// Every CLI image we should overwrite: the running process, `~/.local/bin`,
-/// PATH copies, and the desktop installer's bundled `cli-bin`. Desktop copies
-/// `cli-bin` into `~/.local/bin` on launch; replacing only one side leaves
-/// either PATH or the next desktop start on the old build.
+/// Single authoritative install target: the running process binary.
+/// Replaces the legacy multi-candidate traversal across PATH and ProgramFiles.
 pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf, allow_payload: bool| {
-        if !(looks_like_jeikcode_binary(&p)
-            || (allow_payload && looks_like_desktop_cli_payload(&p)))
-        {
-            return;
-        }
-        if out.iter().any(|e| same_exe(e, &p)) {
-            return;
-        }
-        if p.exists() || same_exe(&p, running) {
-            out.push(p);
-        }
-    };
-    push(running.to_path_buf(), true);
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            push(dir.join("jeikcode"), false);
-            #[cfg(windows)]
-            push(dir.join("jeikcode.exe"), false);
-        }
-    }
+    vec![running.to_path_buf()]
+}
+
+/// Clean up orphaned legacy copies in `~/.local/bin` left by older dropper versions.
+pub fn cleanup_legacy_dropper_file(running: &Path) {
     if let Some(home) = zap_config::util::real_home_dir() {
-        push(home.join(".local/bin/jeikcode"), false);
-        #[cfg(windows)]
-        push(home.join(".local/bin/jeikcode.exe"), false);
+        let local_bin = home.join(".local").join("bin");
+        if let Ok(entries) = std::fs::read_dir(&local_bin) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if (name.starts_with("zap") || name.starts_with("atomcode"))
+                        && !same_exe(&path, running)
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&local_bin);
     }
+}
+
+/// Migrate legacy installations on Windows/Unix for direct binary update users:
+/// 1. Remove legacy `~/.local/bin/jeikcode(.exe)` if not the running executable.
+/// 2. On Windows, clean legacy `.local\bin` from `HKCU\Environment\Path` and
+///    ensure the running binary's directory is registered in `Path`.
+pub fn migrate_legacy_environment() {
     #[cfg(windows)]
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        push(
-            PathBuf::from(local).join("JeikCode").join("jeikcode.exe"),
-            false,
+    {
+        let Ok(running) = current_exe_path() else {
+            return;
+        };
+        cleanup_legacy_dropper_file(&running);
+
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let Ok(env) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+        else {
+            return;
+        };
+        let current: String = env.get_value("Path").unwrap_or_default();
+        let home = zap_config::util::real_home_dir();
+        let legacy_dir = home
+            .as_ref()
+            .map(|h| h.join(".local").join("bin").display().to_string());
+        let install_dir = running.parent().map(|d| d.display().to_string());
+
+        let mut parts: Vec<String> = current
+            .split(';')
+            .filter(|p| {
+                let trimmed = p.trim();
+                if trimmed.is_empty() {
+                    return false;
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.contains(".local\\bin")
+                    || lower.contains(".local/bin")
+                    || lower.contains("atomcode")
+                {
+                    return false;
+                }
+                true
+            })
+            .map(|s| s.to_string())
+            .collect();
+
+        // 仅在当前运行目录包含有效可执行文件且非临时目录时加入 PATH
+        if let Some(ref dir_str) = install_dir {
+            let lower = dir_str.to_ascii_lowercase();
+            if !lower.contains("temp") && !lower.contains("staged") && !lower.contains("target\\") {
+                if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(dir_str)) {
+                    parts.insert(0, dir_str.clone());
+                }
+            }
+        }
+
+        let new_path = parts.join(";");
+        if new_path != current {
+            let _ = env.set_value("Path", &new_path);
+            broadcast_setting_change();
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(running) = current_exe_path() {
+            cleanup_legacy_dropper_file(&running);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn broadcast_setting_change() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut std::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: *const u16,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let env_wide: Vec<u16> = std::ffi::OsStr::new("Environment")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let hwnd_broadcast = 0xffff as *mut std::ffi::c_void;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    let mut res = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd_broadcast,
+            WM_SETTINGCHANGE,
+            0,
+            env_wide.as_ptr(),
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut res,
         );
     }
-    for candidate in ["/usr/local/bin/jeikcode", "/usr/bin/jeikcode"] {
-        push(PathBuf::from(candidate), false);
-    }
-    if let Some(p) = std::env::var_os("JEIKCODE_DESKTOP_CLI_BIN") {
-        push(PathBuf::from(p), true);
-    }
-    for p in desktop_cli_bin_candidates() {
-        push(p, true);
-    }
-    out
 }
 
 fn file_sha256_hex(path: &Path) -> Result<String> {
@@ -411,7 +560,7 @@ fn download_path(exe: &Path) -> PathBuf {
 }
 
 /// Same-dir temp used during a three-way rollback swap. Also reused by the
-/// Windows uninstaller (zap-cli) to rename the live exe out of the way
+/// Windows uninstaller (jeikcode-cli) to rename the live exe out of the way
 /// before deleting the install dir, hence `pub` rather than `pub(crate)`.
 pub fn rolling_path(exe: &Path) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
@@ -573,13 +722,54 @@ fn notes_missing(body: &Option<String>) -> bool {
     body.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
 }
 
+/// Cheap HTML-to-text pass used only for truncation detection.
+fn plain_text_of_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The edge cache renders GitHub Markdown to HTML and trims oversized
+/// announcements, leaving a literal `...`/`…` before the closing tag. Such a
+/// body must never be treated as complete: the update dialog would show a
+/// truncated changelog with no way to recover the rest.
+///
+/// Only long bodies are considered; a short note that intentionally ends in an
+/// ellipsis is still a complete note.
+fn notes_look_truncated(body: &Option<String>) -> bool {
+    let Some(raw) = body.as_deref() else {
+        return false;
+    };
+    let text = plain_text_of_html(raw);
+    let trimmed = text.trim_end();
+    let ends_with_ellipsis = trimmed.ends_with("...") || trimmed.ends_with('…');
+    ends_with_ellipsis && trimmed.chars().count() >= 500
+}
+
 fn merge_listed_releases(into: &mut Vec<ListedRelease>, extra: Vec<ListedRelease>) {
     for rel in extra {
         if rel.tag_name.trim().is_empty() {
             continue;
         }
         if let Some(existing) = into.iter_mut().find(|r| r.tag_name == rel.tag_name) {
-            if notes_missing(&existing.body) && !notes_missing(&rel.body) {
+            // Prefer a complete body over a missing or truncated edge body.
+            // The edge response is HTML and may be cut off; GitHub's REST
+            // response is the untruncated Markdown source.
+            if (notes_missing(&existing.body) || notes_look_truncated(&existing.body))
+                && !notes_missing(&rel.body)
+                && !notes_look_truncated(&rel.body)
+            {
                 existing.body = rel.body;
             }
             if existing.published_at.is_none() {
@@ -634,63 +824,84 @@ async fn fetch_release_pages(
     Ok(all)
 }
 
-/// Releases list discovery:
-/// 1. If configured with a custom repository (not "jeikl/JeikCode"), prefer
-///    fetching GitHub Releases directly so downstream releases take precedence.
-/// 2. Otherwise try edge cache at `jeikcode.top/api/releases` with fallbacks.
+/// Full GitHub release row for one tag. Used to repair announcements that the
+/// edge cache truncated instead of downloading every release page.
+pub async fn fetch_release_by_tag(tag: &str) -> Result<ListedRelease> {
+    if zap_config::config::offline::is_offline_active() {
+        bail!("cannot fetch release notes in offline mode");
+    }
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()?;
+    fetch_release_by_tag_with_client(&client, tag).await
+}
+
+async fn fetch_release_by_tag_with_client(
+    client: &reqwest::Client,
+    tag: &str,
+) -> Result<ListedRelease> {
+    let url = format!("https://api.github.com/repos/1852676265/JeikCode/releases/tags/{tag}");
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("release {tag} returned HTTP {}", resp.status());
+    }
+    resp.json::<ListedRelease>()
+        .await
+        .context("parsing release row")
+}
+
+/// Releases from the edge cache at `jeikcode.top/api/releases`.
+///
+/// GitHub's REST API is used when the edge returns nothing, when it returns
+/// tags whose announcement `body` is still empty, or when the edge truncated a
+/// long announcement. Truncated tags are repaired individually by tag so a
+/// long changelog does not force a full release-page download.
 pub async fn list_releases() -> Result<Vec<ListedRelease>> {
+    if zap_config::config::offline::is_offline_active() {
+        return Ok(vec![]);
+    }
     let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(JEIKCODE_USER_AGENT)
         .build()?;
     let mut all = Vec::new();
-    let repo = zap_config::endpoints::update_repo();
-    let is_custom_repo = repo != "jeikl/JeikCode";
-
-    // Downstream custom repository: fetch directly from GitHub releases first
-    if is_custom_repo {
-        let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
-        if let Ok(pages) = fetch_release_pages(&client, &gh).await {
+    let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
+    if let Ok(resp) = client.get(&primary).send().await {
+        if resp.status().is_success() {
+            if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
+                merge_listed_releases(&mut all, list);
+            }
+        }
+    }
+    let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
+    if all.is_empty() || !edge_has_notes {
+        let gh = "https://api.github.com/repos/1852676265/JeikCode/releases?per_page=100";
+        if let Ok(pages) = fetch_release_pages(&client, gh).await {
             merge_listed_releases(&mut all, pages);
         }
-        if all.is_empty() {
-            // 对齐 Antigravity-Manager 策略：
-            // 当 GitHub REST API 遭遇 403 频控（未认证每小时仅限 60 次）或网络阻塞时，
-            // 自动降级拉取发布在 GitHub Releases 上的静态 latest.json 清单（直接走 CDN 资产分发，完全无频控限制）
-            if let Ok(manifest) = fetch_manifest().await {
-                let tag = manifest.version.clone();
-                all.push(ListedRelease {
-                    tag_name: tag.clone(),
-                    prerelease: tag_is_prerelease(&tag, false),
-                    body: Some("最新稳定发布版本 (由静态 Manifest 清单兜底)".to_string()),
-                    published_at: manifest.released_at,
-                    assets: vec![],
-                });
-            }
-        }
-        if all.is_empty() {
-            return Err(anyhow!("no releases found for custom repository {repo}"));
-        }
-        return Ok(all);
-    }
-
-    if all.is_empty() {
-        let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
-            .ok()
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
-        if let Ok(resp) = client.get(&primary).send().await {
-            if resp.status().is_success() {
-                if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
-                    merge_listed_releases(&mut all, list);
-                }
-            }
-        }
-        let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
-        if all.is_empty() || !edge_has_notes {
-            let gh = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
-            if let Ok(pages) = fetch_release_pages(&client, &gh).await {
-                merge_listed_releases(&mut all, pages);
+    } else {
+        // Targeted repair: the edge announcement for the newest release was
+        // truncated at ~10k chars (the body literally ends with `...`). Pull
+        // the complete body for those tags only; a failed repair keeps the
+        // truncated body so the dialog still opens with a scrollable note.
+        let truncated_tags: Vec<String> = all
+            .iter()
+            .filter(|r| notes_look_truncated(&r.body))
+            .take(5)
+            .map(|r| r.tag_name.clone())
+            .collect();
+        for tag in truncated_tags {
+            if let Ok(full) = fetch_release_by_tag_with_client(&client, &tag).await {
+                merge_listed_releases(&mut all, vec![full]);
             }
         }
     }
@@ -698,6 +909,14 @@ pub async fn list_releases() -> Result<Vec<ListedRelease>> {
         return Err(anyhow!("no releases found"));
     }
     Ok(all)
+}
+
+/// Releases directly from GitHub, returning empty vec in offline mode.
+pub async fn list_releases_from_github() -> Result<Vec<ListedRelease>> {
+    if zap_config::config::offline::is_offline_active() {
+        return Ok(vec![]);
+    }
+    list_releases().await
 }
 
 /// Channel releases, newest first. Stable drops prereleases; beta keeps them.
@@ -751,6 +970,9 @@ pub fn channel_for_tag(tag: &str) -> UpdateChannel {
 
 /// `latest.json` published next to one tag's binaries.
 pub async fn fetch_manifest_for_tag(version: &str) -> Result<Manifest> {
+    if zap_config::config::offline::is_offline_active() {
+        bail!("cannot fetch update manifest in offline mode");
+    }
     let tag = normalize_version_tag(version);
     if tag == "v" {
         return Err(anyhow!("missing version"));
@@ -766,6 +988,9 @@ pub async fn fetch_manifest_for_tag(version: &str) -> Result<Manifest> {
 /// `releases/latest`; beta picks the highest prerelease tag and loads that
 /// tag's `latest.json` (prereleases are never `/releases/latest`).
 pub async fn fetch_manifest_for_channel(channel: UpdateChannel) -> Result<Manifest> {
+    if zap_config::config::offline::is_offline_active() {
+        bail!("cannot fetch update manifest in offline mode");
+    }
     match channel {
         UpdateChannel::Stable => fetch_manifest().await,
         UpdateChannel::Beta => {
@@ -786,16 +1011,27 @@ pub async fn run_upgrade_for_channel(
     current_version: String,
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
-) -> Result<UpgradeSummary> {
+) -> Result<UpgradeSummary, UpgradeFailure> {
     if is_package_managed() {
-        return Err(anyhow!(PACKAGE_MANAGED));
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::PackageManaged,
+            anyhow!(PACKAGE_MANAGED),
+        ));
     }
-    let manifest = fetch_manifest_for_channel(channel).await?;
+    let manifest = fetch_manifest_for_channel(channel)
+        .await
+        .map_err(|e| UpgradeFailure::new(UpgradeFailureKind::ManifestFetch, e))?;
     run_upgrade_with_manifest(manifest, current_version, force, tx).await
 }
 
 /// Child waits for this parent pid to exit before binding the listen port.
 pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
+
+/// Old listen port of the predecessor process being replaced (used to wait for socket release).
+pub const RESTART_WAIT_PORT_ENV: &str = "JEIKCODE_RESTART_WAIT_PORT";
+
+/// Target listen host of the replacement process.
+pub const RESTART_LISTEN_HOST_ENV: &str = "JEIKCODE_RESTART_LISTEN_HOST";
 
 /// Actual listen port of the process that is being replaced.
 /// argv `--port` can still be the first choice from before a cold-start scan.
@@ -808,7 +1044,26 @@ pub const RESTART_EXACT_PORT_ENV: &str = "JEIKCODE_RESTART_EXACT_PORT";
 /// Token the browser already stored. Set only when argv has no `--token`.
 pub const RESTART_TOKEN_ENV: &str = "JEIKCODE_RESTART_TOKEN";
 
-fn pid_is_alive(pid: u32) -> bool {
+/// Explicit no-token mode indicator across restarts (`"1"` or `"0"`).
+pub const RESTART_NO_TOKEN_ENV: &str = "JEIKCODE_RESTART_NO_TOKEN";
+
+/// Marks that the current process is a restarted successor so interactive setup wizards are skipped.
+pub const RESTARTED_ENV: &str = "JEIKCODE_RESTARTED";
+
+/// Indicates the daemon/webui is directly supervised by `jeikcode-desktop`,
+/// which will immediately respawn the process upon exit.
+pub const DESKTOP_MANAGED_ENV: &str = "JEIKCODE_DESKTOP_MANAGED";
+
+/// PID of the supervising `jeikcode-desktop` process.
+pub const DESKTOP_PID_ENV: &str = "JEIKCODE_DESKTOP_PID";
+
+/// Dedicated exit code used by a desktop-managed child to signal an intentional
+/// restart (e.g. after self-upgrade or remote-access port/host/token change).
+/// Distinguishes intentional restarts from normal termination (`0`) or crashes,
+/// eliminating unconditional respawn loops in the desktop supervisor.
+pub const RESTART_REQUESTED_EXIT_CODE: i32 = 75;
+
+pub fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         extern "C" {
@@ -876,6 +1131,15 @@ pub fn restart_listen_port_from_env() -> Option<u16> {
         .filter(|port: &u16| *port > 0)
 }
 
+pub fn restart_listen_host_from_env() -> Option<String> {
+    let host = std::env::var(RESTART_LISTEN_HOST_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    std::env::remove_var(RESTART_LISTEN_HOST_ENV);
+    host
+}
+
 /// Read and remove the inherited webui token so later child processes do not
 /// see it.
 pub fn take_restart_token() -> Option<String> {
@@ -885,6 +1149,24 @@ pub fn take_restart_token() -> Option<String> {
         .filter(|value| !value.is_empty());
     std::env::remove_var(RESTART_TOKEN_ENV);
     token
+}
+
+/// Read and remove the explicit `no_token` override across restarts.
+pub fn take_restart_no_token() -> Option<bool> {
+    let val = std::env::var(RESTART_NO_TOKEN_ENV).ok()?;
+    std::env::remove_var(RESTART_NO_TOKEN_ENV);
+    match val.trim() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Returns true if the current process is an in-place restart successor.
+pub fn is_restarted_process() -> bool {
+    std::env::var_os(RESTARTED_ENV).is_some()
+        || std::env::var_os("JEIKCODE_SKIP_PENDING_UPGRADE").is_some()
+        || std::env::var_os(RESTART_EXACT_PORT_ENV).is_some()
 }
 
 /// `Some(port)` means this start is the successor of an in-place upgrade and
@@ -926,7 +1208,13 @@ pub fn wait_for_predecessor_if_requested() {
         return;
     };
     std::env::remove_var(RESTART_WAIT_PID_ENV);
-    let port = restart_listen_port_from_env()
+    let wait_port = std::env::var(RESTART_WAIT_PORT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|p| *p > 0);
+    std::env::remove_var(RESTART_WAIT_PORT_ENV);
+    let port = wait_port
+        .or_else(restart_listen_port_from_env)
         .or_else(|| listen_port_from_args(std::env::args_os().skip(1)));
     let Some(port) = port else {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -937,8 +1225,19 @@ pub fn wait_for_predecessor_if_requested() {
         return;
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut waited_for_non_loopback_pid = false;
     while std::time::Instant::now() < deadline {
         if predecessor_socket_released(tcp_port_accepting(port)) {
+            // If predecessor bound a specific non-loopback LAN IP, 127.0.0.1:port is not
+            // accepting even while the predecessor is still alive. Wait briefly for the
+            // predecessor PID to exit so we do not race its socket teardown.
+            if !waited_for_non_loopback_pid && pid_is_alive(pid) {
+                waited_for_non_loopback_pid = true;
+                let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < pid_deadline && pid_is_alive(pid) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(150));
             return;
         }
@@ -953,56 +1252,970 @@ pub fn wait_for_predecessor_if_requested() {
 
 #[cfg(unix)]
 fn supervised_by_service_manager() -> bool {
-    std::env::var_os("INVOCATION_ID").is_some()
+    if std::env::var_os("INVOCATION_ID").is_some()
         || std::env::var_os("LAUNCH_JOBNAME").is_some()
         || std::env::var_os("XPC_SERVICE_NAME").is_some()
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+            if cgroup.lines().any(|l| l.contains(".service")) {
+                return true;
+            }
+        }
+        if parent_is_procd() {
+            return true;
+        }
+    }
+    false
 }
 
-/// After an in-place swap, start the new binary with the current argv, then
-/// exit this process so the listen port is released.
-///
-/// The successor is this same server, not a second port. It inherits argv
-/// (`--port`, `--token`) plus the actual listen port, and it binds only that
-/// port. No other jeikcode process is signaled.
-///
-/// Spawn a detached successor that waits until this process stops accepting
-/// on `listen_port`. Do not use `cmd.exe`: the helper is killed when this
-/// process exits. Under systemd/launchd, `exec` keeps the supervised pid.
-///
-/// If the successor cannot be started, returns `Err` and the caller MUST keep
-/// serving so a remote browser is not left with a dead port.
+/// OpenWrt procd 托管判定：父进程为 `/sbin/procd`。
+#[cfg(target_os = "linux")]
+fn parent_is_procd() -> bool {
+    let ppid = std::os::unix::process::parent_id();
+    if ppid <= 1 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .map(|comm| comm.trim() == "procd")
+        .unwrap_or(false)
+}
+
+/// 由向导生成的服务定义统一写入此环境变量，值为服务名，
+/// 用于在重启时精确定位「正在托管自己」的那一个服务文件。
+pub const HOST_SERVICE_ENV: &str = "JEIKCODE_HOST_SERVICE";
+
+static DESKTOP_MANAGED_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static HOST_SERVICE_MARKER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// 进程启动时尽早调用（任何子进程/线程创建之前）：读取并从环境中移除
+/// `JEIKCODE_DESKTOP_MANAGED` 与 `JEIKCODE_HOST_SERVICE`，避免 Agent 在 bash 工具里
+/// 启动的另一个 jeikcode 继承到这两个标记，误判自己的启动方式并改写父服务文件。
+pub fn capture_launch_markers() {
+    let _ = is_desktop_managed();
+    let _ = host_service_marker();
+}
+
+/// 当前进程是否由桌面壳直接托管。
+pub fn is_desktop_managed() -> bool {
+    *DESKTOP_MANAGED_FLAG.get_or_init(|| {
+        let managed = std::env::var_os(DESKTOP_MANAGED_ENV).is_some()
+            || std::env::var_os("JEIKCODE_DESKTOP").is_some()
+            || std::env::var(DESKTOP_PID_ENV)
+                .ok()
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                .is_some_and(|pid| pid > 0);
+        std::env::remove_var(DESKTOP_MANAGED_ENV);
+        managed
+    })
+}
+
+fn host_service_marker() -> Option<String> {
+    HOST_SERVICE_MARKER
+        .get_or_init(|| {
+            let marker = std::env::var(HOST_SERVICE_ENV)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            std::env::remove_var(HOST_SERVICE_ENV);
+            marker
+        })
+        .clone()
+}
+
+/// 当前进程的启动方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// 桌面壳托管的子进程（由桌面壳负责重启）。
+    Desktop,
+    /// Linux systemd 服务。
+    Systemd,
+    /// OpenWrt procd 服务。
+    Procd,
+    /// macOS launchd 代理。
+    Launchd,
+    /// Windows 登录自启（HKCU Run + `.cmd` 启动器）。
+    WindowsLogon,
+    /// 终端前台运行。
+    Foreground,
+}
+
+impl LaunchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Systemd => "systemd",
+            Self::Procd => "procd",
+            Self::Launchd => "launchd",
+            Self::WindowsLogon => "windows-logon",
+            Self::Foreground => "foreground",
+        }
+    }
+}
+
+/// 识别当前进程是通过什么方式启动的。只看进程自身可确认的信号
+/// （环境变量 / 父进程 / cgroup），不按「磁盘上存在某个服务文件」去猜。
+pub fn detect_launch_mode() -> LaunchMode {
+    if is_desktop_managed() {
+        return LaunchMode::Desktop;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if parent_is_procd() {
+            return LaunchMode::Procd;
+        }
+        if std::env::var_os("INVOCATION_ID").is_some() {
+            return LaunchMode::Systemd;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let xpc = std::env::var("XPC_SERVICE_NAME").unwrap_or_default();
+        if xpc.starts_with("com.jeikcode-") || std::env::var_os("LAUNCH_JOBNAME").is_some() {
+            return LaunchMode::Launchd;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if host_service_marker()
+            .map(|v| v.to_ascii_lowercase().starts_with("jeikcode-"))
+            .unwrap_or(false)
+        {
+            return LaunchMode::WindowsLogon;
+        }
+    }
+    LaunchMode::Foreground
+}
+
+/// Patch CLI argv to inject updated host, port, and token parameters upon restart.
+pub fn patch_restart_args<I, S>(
+    args: I,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    patch_restart_args_with_auth(args, new_host, new_port, new_token, None)
+}
+
+/// Patch CLI argv to inject updated host, port, token, and `--no-token` parameters upon restart,
+/// automatically resolving mutual exclusion between `--token` and `--no-token`.
+pub fn patch_restart_args_with_auth<I, S>(
+    args: I,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let orig: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(orig.len() + 6);
+    let mut i = 0;
+    let effective_token = if no_token == Some(true) {
+        None
+    } else {
+        new_token.map(str::trim).filter(|t| !t.is_empty())
+    };
+    let want_no_token = no_token == Some(true);
+    let strip_no_token = no_token == Some(false) || effective_token.is_some();
+
+    let first_subcmd = orig
+        .first()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let is_daemon_subcmd = first_subcmd == "daemon";
+
+    let mut host_patched = new_host.is_none();
+    let mut port_patched = new_port.map_or(true, |p| p == 0);
+    let mut token_patched = effective_token.is_none();
+    let mut has_no_token_flag = false;
+
+    while i < orig.len() {
+        let arg = &orig[i];
+        let arg_str = arg.to_string_lossy();
+
+        if arg_str == "--no-token" {
+            if strip_no_token {
+                i += 1;
+                continue;
+            }
+            has_no_token_flag = true;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if want_no_token {
+            if arg_str == "--token" {
+                i += if i + 1 < orig.len() { 2 } else { 1 };
+                continue;
+            } else if arg_str.starts_with("--token=") {
+                i += 1;
+                continue;
+            }
+        }
+
+        if let Some(h) = new_host {
+            if arg_str == "--host" {
+                out.push(arg.clone());
+                out.push(std::ffi::OsString::from(h));
+                host_patched = true;
+                if i + 1 < orig.len() {
+                    i += 2;
+                    continue;
+                }
+            } else if arg_str.starts_with("--host=") {
+                out.push(std::ffi::OsString::from(format!("--host={h}")));
+                host_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        if let Some(p) = new_port.filter(|p| *p > 0) {
+            if arg_str == "--port" {
+                out.push(arg.clone());
+                out.push(std::ffi::OsString::from(p.to_string()));
+                port_patched = true;
+                if i + 1 < orig.len() {
+                    i += 2;
+                    continue;
+                }
+            } else if arg_str.starts_with("--port=") {
+                out.push(std::ffi::OsString::from(format!("--port={p}")));
+                port_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        if let Some(t) = effective_token {
+            if arg_str == "--token" {
+                out.push(arg.clone());
+                out.push(std::ffi::OsString::from(t));
+                token_patched = true;
+                if i + 1 < orig.len() {
+                    i += 2;
+                    continue;
+                }
+            } else if arg_str.starts_with("--token=") {
+                out.push(std::ffi::OsString::from(format!("--token={t}")));
+                token_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(arg.clone());
+        i += 1;
+    }
+
+    if let Some(h) = new_host {
+        if !host_patched {
+            out.push(std::ffi::OsString::from("--host"));
+            out.push(std::ffi::OsString::from(h));
+        }
+    }
+    if let Some(p) = new_port.filter(|p| *p > 0) {
+        if !port_patched {
+            out.push(std::ffi::OsString::from("--port"));
+            out.push(std::ffi::OsString::from(p.to_string()));
+        }
+    }
+    if want_no_token && !has_no_token_flag && !is_daemon_subcmd && first_subcmd != "webui" {
+        out.push(std::ffi::OsString::from("--no-token"));
+    } else if let Some(t) = effective_token {
+        if !token_patched {
+            out.push(std::ffi::OsString::from("--token"));
+            out.push(std::ffi::OsString::from(t));
+        }
+    }
+
+    out
+}
+
+/// Tokenize a command-line string preserving quoted segments.
+fn tokenize_command_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+        } else if ch.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn format_flag_val(val: &str, quote: bool) -> String {
+    if quote || val.chars().any(|c| c.is_whitespace()) {
+        format!("\"{}\"", val.trim_matches('"'))
+    } else {
+        val.trim_matches('"').to_string()
+    }
+}
+
+/// Rewrite `--host`, `--port`, `--token`, and `--no-token` flags in a single command line
+/// (used for systemd `ExecStart=`, OpenWrt `procd_set_param command`, and Windows `.cmd` launchers).
+pub fn rewrite_service_command_line(
+    line: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+    quote_values: bool,
+) -> String {
+    let tokens = tokenize_command_line(line);
+    if tokens.is_empty() {
+        return line.to_string();
+    }
+    let effective_token = if no_token == Some(true) {
+        None
+    } else {
+        new_token.map(str::trim).filter(|t| !t.is_empty())
+    };
+    let want_no_token = no_token == Some(true);
+    let strip_no_token = no_token == Some(false) || effective_token.is_some();
+
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len() + 4);
+    let mut i = 0;
+    let mut host_patched = new_host.is_none();
+    let mut port_patched = new_port.map_or(true, |p| p == 0);
+    let mut token_patched = effective_token.is_none();
+    let mut has_no_token = false;
+
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok == "--no-token" {
+            if strip_no_token {
+                i += 1;
+                continue;
+            }
+            has_no_token = true;
+            out.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        if want_no_token {
+            if tok == "--token" {
+                i += if i + 1 < tokens.len() { 2 } else { 1 };
+                continue;
+            } else if tok.starts_with("--token=") {
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(h) = new_host.map(str::trim).filter(|h| !h.is_empty()) {
+            if tok == "--host" && i + 1 < tokens.len() {
+                let was_quoted = tokens[i + 1].starts_with('"');
+                out.push("--host".to_string());
+                out.push(format_flag_val(h, quote_values || was_quoted));
+                host_patched = true;
+                i += 2;
+                continue;
+            } else if tok.starts_with("--host=") {
+                out.push(format!("--host={}", format_flag_val(h, quote_values)));
+                host_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(p) = new_port.filter(|p| *p > 0) {
+            if tok == "--port" && i + 1 < tokens.len() {
+                out.push("--port".to_string());
+                out.push(p.to_string());
+                port_patched = true;
+                i += 2;
+                continue;
+            } else if tok.starts_with("--port=") {
+                out.push(format!("--port={p}"));
+                port_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(t) = effective_token {
+            if tok == "--token" && i + 1 < tokens.len() {
+                let was_quoted = tokens[i + 1].starts_with('"');
+                out.push("--token".to_string());
+                out.push(format_flag_val(t, quote_values || was_quoted));
+                token_patched = true;
+                i += 2;
+                continue;
+            } else if tok.starts_with("--token=") {
+                out.push(format!("--token={}", format_flag_val(t, quote_values)));
+                token_patched = true;
+                i += 1;
+                continue;
+            }
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+
+    if let Some(h) = new_host.map(str::trim).filter(|h| !h.is_empty()) {
+        if !host_patched {
+            out.push("--host".to_string());
+            out.push(format_flag_val(h, quote_values));
+        }
+    }
+    if let Some(p) = new_port.filter(|p| *p > 0) {
+        if !port_patched {
+            out.push("--port".to_string());
+            out.push(p.to_string());
+        }
+    }
+    if want_no_token && !has_no_token {
+        out.push("--no-token".to_string());
+    } else if let Some(t) = effective_token {
+        if !token_patched {
+            out.push("--token".to_string());
+            out.push(format_flag_val(t, quote_values));
+        }
+    }
+
+    out.join(" ")
+}
+
+/// Rewrite systemd unit content (`ExecStart=...`) with updated listen options.
+pub fn rewrite_systemd_unit_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("ExecStart=") {
+            let updated =
+                rewrite_service_command_line(rest, new_host, new_port, new_token, no_token, false);
+            lines.push(format!("ExecStart={updated}"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Rewrite OpenWrt procd script content (`procd_set_param command ...`) with updated listen options.
+pub fn rewrite_procd_script_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("procd_set_param command ") {
+            let indent = &line[..line.len() - trimmed.len()];
+            let updated =
+                rewrite_service_command_line(rest, new_host, new_port, new_token, no_token, true);
+            lines.push(format!("{indent}procd_set_param command {updated}"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Rewrite Windows `.cmd` logon launcher content with updated listen options.
+pub fn rewrite_windows_cmd_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if !trimmed.is_empty()
+            && !trimmed.starts_with('@')
+            && !lower.starts_with("cd ")
+            && !lower.starts_with("set ")
+            && (trimmed.contains("--host") || trimmed.contains("--port"))
+        {
+            lines.push(rewrite_service_command_line(
+                trimmed, new_host, new_port, new_token, no_token, false,
+            ));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let mut out = lines.join("\r\n");
+    if content.ends_with('\n') {
+        out.push_str("\r\n");
+    }
+    out
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape_str(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Rewrite macOS launchd `.plist` `<key>ProgramArguments</key>` with updated listen options.
+pub fn rewrite_launchd_plist_content(
+    content: &str,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> Option<String> {
+    let key_idx = content.find("<key>ProgramArguments</key>")?;
+    let after_key = &content[key_idx..];
+    let array_start_rel = after_key.find("<array>")?;
+    let array_end_rel = after_key.find("</array>")?;
+    if array_start_rel >= array_end_rel {
+        return None;
+    }
+    let array_inner = &after_key[array_start_rel + "<array>".len()..array_end_rel];
+    let mut items = Vec::new();
+    let mut cursor = array_inner;
+    while let Some(s_idx) = cursor.find("<string>") {
+        let after_s = &cursor[s_idx + "<string>".len()..];
+        let e_idx = after_s.find("</string>")?;
+        items.push(xml_unescape(&after_s[..e_idx]));
+        cursor = &after_s[e_idx + "</string>".len()..];
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let exe_item = items[0].clone();
+    let patched =
+        patch_restart_args_with_auth(&items[1..], new_host, new_port, new_token, no_token);
+    let mut new_array = String::from("<array>\n");
+    new_array.push_str(&format!(
+        "    <string>{}</string>\n",
+        xml_escape_str(&exe_item)
+    ));
+    for arg in patched {
+        new_array.push_str(&format!(
+            "    <string>{}</string>\n",
+            xml_escape_str(&arg.to_string_lossy())
+        ));
+    }
+    new_array.push_str("  </array>");
+
+    let abs_array_start = key_idx + array_start_rel;
+    let abs_array_end = key_idx + array_end_rel + "</array>".len();
+    let mut out = String::with_capacity(content.len() + 64);
+    out.push_str(&content[..abs_array_start]);
+    out.push_str(&new_array);
+    out.push_str(&content[abs_array_end..]);
+    Some(out)
+}
+
+#[cfg(target_os = "linux")]
+fn write_system_file_with_sudo_fallback(target: &Path, content: &str) -> bool {
+    if std::fs::write(target, content).is_ok() {
+        return true;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        ".jeikcode-svc-{}-{}",
+        std::process::id(),
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unit")
+    ));
+    if std::fs::write(&tmp, content).is_err() {
+        return false;
+    }
+    let ok = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "cp",
+            tmp.to_str().unwrap_or_default(),
+            target.to_str().unwrap_or_default(),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&tmp);
+    ok
+}
+
+/// 在 `dir` 中定位正在托管当前进程的服务定义文件：
+/// 1. `JEIKCODE_HOST_SERVICE` 标记命中直接使用（标记已在启动时从环境移除，不会被子进程冒用）；
+/// 2. 来自 cgroup / `XPC_SERVICE_NAME` 的候选名，必须同时声明了当前端口才采用；
+/// 3. 否则只按「当前正在监听的端口」精确匹配，不做「只有一个就用它」的猜测，
+///    避免前台实例误改不相干的开机自启服务。
+fn locate_service_file(
+    dir: &Path,
+    marker_name: Option<String>,
+    hinted_name: Option<String>,
+    is_candidate: impl Fn(&str) -> bool,
+    old_port: u16,
+) -> Option<PathBuf> {
+    if let Some(name) = marker_name {
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if old_port == 0 {
+        return None;
+    }
+    if let Some(name) = hinted_name {
+        let candidate = dir.join(&name);
+        if std::fs::read_to_string(&candidate)
+            .map(|text| service_text_declares_port(&text, old_port))
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_candidate(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if service_text_declares_port(&text, old_port) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 服务定义里是否声明了该端口（按数字边界匹配，`4096` 不会命中 `40960`）。
+/// 兼容 `--port 4096`、`--port=4096`、`--port "4096"` 以及 launchd 的
+/// `<string>--port</string> <string>4096</string>`。
+pub fn service_text_declares_port(text: &str, port: u16) -> bool {
+    let want = port.to_string();
+    let mut rest = text;
+    while let Some(idx) = rest.find("--port") {
+        let after = &rest[idx + "--port".len()..];
+        let value = if let Some(v) = after.strip_prefix('=') {
+            v
+        } else if let Some(v) = after.strip_prefix("</string>") {
+            v.trim_start().strip_prefix("<string>").unwrap_or("")
+        } else {
+            after.trim_start_matches([' ', '\t'])
+        };
+        let value = value.trim_start_matches('"');
+        let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits == want {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// 按当前进程的启动方式，把新的 host/port/token 写回托管它的服务定义文件
+/// （systemd unit / procd init 脚本 / launchd plist / Windows 登录自启 `.cmd`），
+/// 保证异地换端口或更新后，下次开机/服务重拉仍是新配置。
+/// 桌面壳子进程与普通前台进程不改任何服务文件。返回实际更新的文件。
+pub fn sync_host_service_on_restart(
+    old_port: u16,
+    new_host: Option<&str>,
+    new_port: Option<u16>,
+    new_token: Option<&str>,
+    no_token: Option<bool>,
+) -> Option<PathBuf> {
+    let mode = detect_launch_mode();
+    let marker = host_service_marker();
+    let _ = (&marker, old_port, new_host, new_port, new_token, no_token);
+
+    match mode {
+        LaunchMode::Desktop => None,
+
+        #[cfg(target_os = "linux")]
+        LaunchMode::Systemd => {
+            let dir = Path::new("/etc/systemd/system");
+            let hinted = std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|cgroup| {
+                    cgroup
+                        .lines()
+                        .flat_map(|line| line.rsplit('/'))
+                        .map(str::trim)
+                        .find(|seg| {
+                            seg.starts_with("zap")
+                                && !seg.starts_with("jeikcode-schedule-")
+                                && seg.ends_with(".service")
+                        })
+                        .map(str::to_string)
+                });
+            let path = locate_service_file(
+                dir,
+                marker.map(|m| format!("{m}.service")),
+                hinted,
+                |n| {
+                    n.starts_with("zap")
+                        && !n.starts_with("jeikcode-schedule-")
+                        && n.ends_with(".service")
+                },
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_systemd_unit_content(&content, new_host, new_port, new_token, no_token);
+            if updated == content || !write_system_file_with_sudo_fallback(&path, &updated) {
+                return None;
+            }
+            let reloaded = std::process::Command::new("systemctl")
+                .arg("daemon-reload")
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !reloaded {
+                let _ = std::process::Command::new("sudo")
+                    .args(["-n", "systemctl", "daemon-reload"])
+                    .status();
+            }
+            Some(path)
+        }
+
+        #[cfg(target_os = "linux")]
+        LaunchMode::Procd => {
+            let path = locate_service_file(
+                Path::new("/etc/init.d"),
+                marker,
+                None,
+                |n| {
+                    (n == "zap" || n.starts_with("jeikcode-"))
+                        && !n.starts_with("jeikcode-schedule-")
+                },
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_procd_script_content(&content, new_host, new_port, new_token, no_token);
+            (updated != content && write_system_file_with_sudo_fallback(&path, &updated))
+                .then_some(path)
+        }
+
+        #[cfg(target_os = "macos")]
+        LaunchMode::Launchd => {
+            let dir = zap_config::util::real_home_dir()?.join("Library/LaunchAgents");
+            let hinted = std::env::var("XPC_SERVICE_NAME")
+                .ok()
+                .filter(|x| x.starts_with("com.jeikcode-"))
+                .map(|label| format!("{label}.plist"));
+            let path = locate_service_file(
+                &dir,
+                marker.map(|label| format!("{label}.plist")),
+                hinted,
+                |n| n.starts_with("com.jeikcode-") && n.ends_with(".plist"),
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_launchd_plist_content(&content, new_host, new_port, new_token, no_token)?;
+            (updated != content && std::fs::write(&path, updated).is_ok()).then_some(path)
+        }
+
+        #[cfg(target_os = "windows")]
+        LaunchMode::WindowsLogon | LaunchMode::Foreground => {
+            // Foreground 仅用于兼容早期未写入 JEIKCODE_HOST_SERVICE 标记的登录自启项：
+            // 同一端口不可能同时被两个进程监听，端口精确命中即视为同一服务。
+            let dir = zap_config::util::real_home_dir()?
+                .join(".jeikcode")
+                .join("services");
+            let path = locate_service_file(
+                &dir,
+                marker.map(|m| format!("{m}.cmd")),
+                None,
+                |n| {
+                    let lower = n.to_ascii_lowercase();
+                    lower.starts_with("jeikcode-") && lower.ends_with(".cmd")
+                },
+                old_port,
+            )?;
+            let content = std::fs::read_to_string(&path).ok()?;
+            let updated =
+                rewrite_windows_cmd_content(&content, new_host, new_port, new_token, no_token);
+            (updated != content && std::fs::write(&path, updated).is_ok()).then_some(path)
+        }
+
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// After an in-place swap or configuration change, restart the binary inheriting
+/// host, port, and token parameters.
 pub fn restart_replaced_process(
     exe: &Path,
     listen_port: u16,
     token: Option<&str>,
 ) -> Result<std::convert::Infallible> {
-    // The binary on disk is already the selected release. A staged
-    // pending.json must not replace it again on the next start.
+    restart_process_with_options(exe, None, listen_port, token)
+}
+
+/// Restart the process explicitly applying latest host, port, and token options.
+pub fn restart_process_with_options(
+    exe: &Path,
+    host: Option<&str>,
+    listen_port: u16,
+    token: Option<&str>,
+) -> Result<std::convert::Infallible> {
+    restart_process_with_config(exe, listen_port, host, listen_port, token, None)
+}
+
+/// Full-featured restart entrypoint supporting port change (`old_port` -> `listen_port`),
+/// host change, token update, `--no-token` toggle, and automatic host-service persistence sync.
+pub fn restart_process_with_config(
+    exe: &Path,
+    old_port: u16,
+    host: Option<&str>,
+    listen_port: u16,
+    token: Option<&str>,
+    no_token: Option<bool>,
+) -> Result<std::convert::Infallible> {
+    let clean_exe = normalize_live_exe_path(exe.to_path_buf());
+    let exe = clean_exe.as_path();
+
+    // 按启动方式把新的 host/port/token 同步到托管自己的服务定义文件（桌面壳/前台进程不改）
+    let _ = sync_host_service_on_restart(
+        old_port,
+        host,
+        (listen_port > 0).then_some(listen_port),
+        token,
+        no_token,
+    );
+
     std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    std::env::set_var(RESTARTED_ENV, "1");
+    if let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        std::env::set_var(RESTART_LISTEN_HOST_ENV, h);
+    }
     if listen_port > 0 {
         std::env::set_var(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
     }
     std::env::set_var(RESTART_EXACT_PORT_ENV, "1");
-    let token = token.map(str::trim).filter(|value| !value.is_empty());
-    if let Some(token) = token {
-        std::env::set_var(RESTART_TOKEN_ENV, token);
-    }
-    #[cfg(unix)]
-    if supervised_by_service_manager() {
-        return re_exec_self(Some(exe));
+    let token = if no_token == Some(true) {
+        std::env::remove_var(RESTART_TOKEN_ENV);
+        std::env::set_var(RESTART_NO_TOKEN_ENV, "1");
+        None
+    } else {
+        if no_token == Some(false) {
+            std::env::set_var(RESTART_NO_TOKEN_ENV, "0");
+        }
+        let tok = token.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(tok) = tok {
+            std::env::set_var(RESTART_TOKEN_ENV, tok);
+        }
+        tok
+    };
+
+    let orig_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let patched_args = patch_restart_args_with_auth(
+        orig_args,
+        host,
+        (listen_port > 0).then_some(listen_port),
+        token,
+        no_token,
+    );
+
+    // 桌面壳托管模式下，以专用重启退出码 75 退出当前子进程，
+    // 由桌面壳事件驱动唤醒后读取最新 webui-listen.json 重新拉起子进程并写入 ChildSlot。
+    if is_desktop_managed() {
+        std::process::exit(RESTART_REQUESTED_EXIT_CODE);
     }
 
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // 启动时已从环境移除服务标记；后继进程（re-exec 或新进程）仍由同一服务托管，需要归还标记
+    if let Some(marker) = host_service_marker() {
+        std::env::set_var(HOST_SERVICE_ENV, marker);
+    }
+
+    #[cfg(unix)]
+    {
+        let is_supervised = supervised_by_service_manager();
+        // 优先原地 re-exec：保留 PID、终端前台及 systemd/procd/launchd 纳管关系，0 秒无缝切换
+        match re_exec_self_with_args(Some(exe), Some(&patched_args)) {
+            Ok(infallible) => return Ok(infallible),
+            Err(_) => {
+                if is_supervised {
+                    // 非 0 退出码确保 systemd (Restart=always) 与 OpenWrt procd (respawn) 必然触发重拉
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(&args)
+    cmd.args(&patched_args)
         .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
         .env(RESTART_EXACT_PORT_ENV, "1")
+        .env(RESTARTED_ENV, "1")
         .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    if old_port > 0 {
+        cmd.env(RESTART_WAIT_PORT_ENV, old_port.to_string());
+    }
+    if let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        cmd.env(RESTART_LISTEN_HOST_ENV, h);
+    }
     if listen_port > 0 {
         cmd.env(RESTART_LISTEN_PORT_ENV, listen_port.to_string());
     }
-    if let Some(token) = token {
-        cmd.env(RESTART_TOKEN_ENV, token);
+    if no_token == Some(true) {
+        cmd.env_remove(RESTART_TOKEN_ENV);
+        cmd.env(RESTART_NO_TOKEN_ENV, "1");
+    } else {
+        if no_token == Some(false) {
+            cmd.env(RESTART_NO_TOKEN_ENV, "0");
+        }
+        if let Some(token) = token {
+            cmd.env(RESTART_TOKEN_ENV, token);
+        }
+    }
+    if let Ok(desktop_pid) = std::env::var(DESKTOP_PID_ENV) {
+        if !desktop_pid.trim().is_empty() {
+            cmd.env(DESKTOP_PID_ENV, desktop_pid);
+        }
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1025,10 +2238,14 @@ pub fn restart_replaced_process(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let mut flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        if !is_desktop_managed() && std::env::var_os("JEIKCODE_DESKTOP").is_none() {
+            flags |= CREATE_BREAKAWAY_FROM_JOB;
+        }
+        cmd.creation_flags(flags);
     }
 
     cmd.spawn()
@@ -1038,48 +2255,55 @@ pub fn restart_replaced_process(
 
 /// Fetch and parse `Manifest` from a specific manifest URL.
 pub async fn fetch_manifest_from_url(url: &str) -> Result<Manifest> {
+    if zap_config::config::offline::is_offline_active() {
+        bail!("cannot fetch update manifest in offline mode");
+    }
     let client = apply_proxy_policy(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(JEIKCODE_USER_AGENT)
         .build()?;
-
-    let candidate_urls = get_mirror_urls(url);
-    let mut last_err = None;
-
-    for candidate in &candidate_urls {
-        match client.get(candidate).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.text().await {
-                    let clean_body = body.trim_start_matches('\u{feff}');
-                    match serde_json::from_str(clean_body) {
-                        Ok(manifest) => return Ok(manifest),
-                        Err(e) => {
-                            last_err = Some(anyhow!(
-                                "parsing manifest from {} failed: {}",
-                                candidate,
-                                e
-                            ));
-                        }
-                    }
-                }
-            }
-            Ok(resp) => {
-                last_err = Some(anyhow!(
-                    "fetching manifest from {} returned HTTP {}",
-                    candidate,
-                    resp.status()
-                ));
-            }
-            Err(e) => {
-                last_err = Some(anyhow!("failed to fetch manifest from {}: {}", candidate, e));
-            }
+    // GitHub's release CDN intermittently answers a valid manifest URL with
+    // 5xx (504 on /releases/download/<tag>/latest.json has been observed).
+    // A user-triggered upgrade must not die on one such hiccup, so retry
+    // transport errors and 5xx/429 a couple of times before giving up.
+    const ATTEMPTS: u32 = 3;
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300 << (attempt - 1))).await;
         }
+        let resp = match client.get(url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_error = Some(
+                    anyhow::Error::new(err).context(format!("failed to fetch manifest from {url}")),
+                );
+                continue;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let err = anyhow!("fetching manifest from {url} returned HTTP {status}");
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                last_error = Some(err);
+                continue;
+            }
+            return Err(err);
+        }
+        let body = match resp.text().await {
+            Ok(body) => body,
+            Err(err) => {
+                last_error = Some(anyhow::Error::new(err).context("reading manifest body"));
+                continue;
+            }
+        };
+        let clean_body = body.trim_start_matches('\u{feff}');
+        return serde_json::from_str(clean_body)
+            .with_context(|| format!("parsing manifest (body: {:?})", truncate(clean_body, 200)));
     }
-
-    Err(last_err.unwrap_or_else(|| anyhow!("failed to fetch manifest from all candidate URLs")))
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to fetch manifest from {url}")))
 }
 
-#[allow(dead_code)]
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -1103,113 +2327,111 @@ async fn download_and_verify(
     expected_size: u64,
     dest: &Path,
     progress: &mpsc::UnboundedSender<UpgradeEvent>,
-) -> Result<()> {
+) -> Result<(), UpgradeFailure> {
     use futures::StreamExt;
 
-    let candidate_urls = get_mirror_urls(url);
-    let client = apply_proxy_policy(reqwest::Client::builder())
-        .timeout(std::time::Duration::from_secs(600))
-        .user_agent(JEIKCODE_USER_AGENT)
-        .build()?;
-
-    let mut last_err = None;
-
-    for candidate in &candidate_urls {
-        if dest.exists() {
-            let _ = std::fs::remove_file(dest);
-        }
-
-        let resp = match client.get(candidate).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                last_err = Some(anyhow!(
-                    "downloading {} returned HTTP {} — release may not exist for this platform",
-                    candidate,
-                    r.status()
-                ));
-                continue;
-            }
-            Err(e) => {
-                last_err = Some(anyhow!("GET {} failed: {}", candidate, e));
-                continue;
-            }
-        };
-
-        let mut file = match tokio::fs::File::create(dest).await {
-            Ok(f) => f,
-            Err(e) => return Err(anyhow!("creating {}: {}", dest.display(), e)),
-        };
-
-        let mut hasher = Sha256::new();
-        let mut written: u64 = 0;
-        let mut stream = resp.bytes_stream();
-        let mut stream_err = None;
-
-        while let Some(chunk_res) = stream.next().await {
-            match chunk_res {
-                Ok(chunk) => {
-                    hasher.update(&chunk);
-                    if let Err(e) = file.write_all(&chunk).await {
-                        stream_err = Some(anyhow!("writing chunk to disk: {}", e));
-                        break;
-                    }
-                    written += chunk.len() as u64;
-                    let _ = progress.send(UpgradeEvent::Downloading {
-                        bytes: written,
-                        total: expected_size,
-                    });
-                }
-                Err(e) => {
-                    stream_err = Some(anyhow!("reading response chunk: {}", e));
-                    break;
-                }
-            }
-        }
-
-        if let Some(e) = stream_err {
-            let _ = std::fs::remove_file(dest);
-            last_err = Some(e);
-            continue;
-        }
-
-        if let Err(e) = file.flush().await {
-            let _ = std::fs::remove_file(dest);
-            last_err = Some(anyhow!("flushing download to disk: {}", e));
-            continue;
-        }
-        drop(file);
-
-        if expected_size > 0 && written != expected_size {
-            let _ = std::fs::remove_file(dest);
-            last_err = Some(anyhow!(
-                "short download from {}: got {} bytes, expected {}",
-                candidate,
-                written,
-                expected_size
-            ));
-            continue;
-        }
-
-        let _ = progress.send(UpgradeEvent::Verifying);
-        let got = hex_encode(&hasher.finalize());
-        let skip_hash = expected_sha256.is_empty()
-            || expected_sha256.eq_ignore_ascii_case("skip")
-            || expected_sha256.eq_ignore_ascii_case("none");
-        if !skip_hash && !got.eq_ignore_ascii_case(expected_sha256) {
-            let _ = std::fs::remove_file(dest);
-            last_err = Some(anyhow!(
-                "checksum mismatch from {}.\n  expected: {}\n  got:      {}",
-                candidate,
-                expected_sha256,
-                got
-            ));
-            continue;
-        }
-
-        return Ok(());
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest);
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("download failed from all candidate URLs")))
+    // The 600s cap bounds the whole transfer; connect/read timeouts bound the
+    // two ways a release download silently stalls at 0 bytes (unreachable host
+    // or a connection that opens but never streams). Without them the UI sits
+    // at 0% until the overall timeout fires 10 minutes later.
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()
+        .map_err(|e| UpgradeFailure::new(UpgradeFailureKind::Download, e))?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        UpgradeFailure::new(
+            UpgradeFailureKind::Download,
+            anyhow::Error::new(e).context(format!("GET {url}")),
+        )
+    })?;
+    if !resp.status().is_success() {
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::Download,
+            anyhow!(
+                "downloading {} returned HTTP {} — release may not exist for this platform",
+                url,
+                resp.status()
+            ),
+        ));
+    }
+
+    // Don't bail on Content-Length mismatches.  The Content-Length
+    // header may differ from the manifest's `size` for several reasons:
+    //   - CDN mirrors or reverse proxies may alter Content-Length.
+    //   - The manifest may be slightly out of sync with the server's
+    //     binary (e.g. during a rolling release).
+    //   - Redirects can surface a different Content-Length from an
+    //     intermediate hop.
+    // The real integrity checks happen after the download completes:
+    //   1. Total bytes written must match `expected_size` (below).
+    //   2. SHA256 must match `expected_sha256`.
+    // These two checks are sufficient; an early Content-Length gate
+    // causes false-negative aborts (see issue #380).
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            UpgradeFailure::new(
+                UpgradeFailureKind::Download,
+                anyhow::Error::new(e).context("reading response chunk"),
+            )
+        })?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .context("writing download to disk")?;
+        written += chunk.len() as u64;
+        // Ignore send errors — receiver may have been dropped.
+        let _ = progress.send(UpgradeEvent::Downloading {
+            bytes: written,
+            total: expected_size,
+        });
+    }
+    file.flush().await.context("flushing download to disk")?;
+    drop(file);
+
+    if expected_size > 0 && written != expected_size {
+        let _ = std::fs::remove_file(dest);
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::ChecksumMismatch,
+            anyhow!(
+                "short download: got {} bytes, expected {}",
+                written,
+                expected_size
+            ),
+        ));
+    }
+
+    let _ = progress.send(UpgradeEvent::Verifying);
+    let got = hex_encode(&hasher.finalize());
+    let skip_hash = expected_sha256.is_empty()
+        || expected_sha256.eq_ignore_ascii_case("skip")
+        || expected_sha256.eq_ignore_ascii_case("none");
+    if !skip_hash && !got.eq_ignore_ascii_case(expected_sha256) {
+        let _ = std::fs::remove_file(dest);
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::ChecksumMismatch,
+            anyhow!(
+                "checksum mismatch — possible corruption or tampering.\n  expected: {}\n  got:      {}",
+                expected_sha256,
+                got
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1323,7 +2545,7 @@ where
         match rename(from, to) {
             Ok(()) => return Ok(()),
             // Cross-device: the staged binary lives under the user profile
-            // (e.g. C:\Users\…\.zap\staged\) while the running exe may be
+            // (e.g. C:\Users\…\.jeikcode\staged\) while the running exe may be
             // on another drive (H:\…). `rename` across volumes can NEVER
             // succeed (ERROR_NOT_SAME_DEVICE / EXDEV), so don't waste the retry
             // budget — copy the bytes across and drop the source instead.
@@ -1479,20 +2701,26 @@ pub async fn run_upgrade_with_manifest(
     current_version: String,
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
-) -> Result<UpgradeSummary> {
+) -> Result<UpgradeSummary, UpgradeFailure> {
     if is_package_managed() {
-        return Err(anyhow!(PACKAGE_MANAGED));
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::PackageManaged,
+            anyhow!(PACKAGE_MANAGED),
+        ));
     }
     let current_version = current_version.as_str();
     let target = detect_target().ok_or_else(|| {
-        anyhow!(
-            "this platform has no published jeikcode release ({}/{})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
+        UpgradeFailure::new(
+            UpgradeFailureKind::UnsupportedPlatform,
+            anyhow!(
+                "this platform has no published jeikcode release ({}/{})",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
         )
     })?;
     let exe = current_exe_path()?;
-    ensure_writable(&exe)?;
+    ensure_writable(&exe).map_err(|e| UpgradeFailure::new(UpgradeFailureKind::NotWritable, e))?;
     // Drop a leftover auto-update stage so `__sync_config` / the next
     // launch cannot paste an older package over this install.
     clear_pending_pointer();
@@ -1502,18 +2730,24 @@ pub async fn run_upgrade_with_manifest(
     });
 
     if !force && !version_is_newer(&manifest.version, current_version) {
-        return Err(anyhow!(
-            "{}: already on {} (latest is {}). Pass --force to reinstall.",
-            ALREADY_LATEST,
-            current_version,
-            manifest.version
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::AlreadyLatest,
+            anyhow!(
+                "{}: already on {} (latest is {}). Pass --force to reinstall.",
+                ALREADY_LATEST,
+                current_version,
+                manifest.version
+            ),
         ));
     }
 
     let entry = manifest.binaries.get(target).ok_or_else(|| {
-        anyhow!(
-            "manifest has no entry for target {} — this platform may not be in this release",
-            target
+        UpgradeFailure::new(
+            UpgradeFailureKind::UnsupportedPlatform,
+            anyhow!(
+                "manifest has no entry for target {} — this platform may not be in this release",
+                target
+            ),
         )
     })?;
 
@@ -1522,35 +2756,21 @@ pub async fn run_upgrade_with_manifest(
     download_and_verify(&url, &entry.sha256, entry.size, &download, &tx).await?;
 
     let _ = tx.send(UpgradeEvent::Replacing);
-    replace_binary(&download, &exe)?;
+    replace_binary(&download, &exe)
+        .map_err(|e| UpgradeFailure::new(UpgradeFailureKind::Replace, e))?;
     let expected_sha = entry.sha256.as_str();
     let got = file_sha256_hex(&exe)?;
     if !got.eq_ignore_ascii_case(expected_sha) {
-        return Err(anyhow!(
-            "replaced {} but sha256 is {got}, expected {expected_sha}",
-            exe.display()
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::ChecksumMismatch,
+            anyhow!(
+                "replaced {} but sha256 is {got}, expected {expected_sha}",
+                exe.display()
+            ),
         ));
     }
-    for extra in discover_install_exes(&exe)
-        .into_iter()
-        .filter(|p| !same_exe(p, &exe))
-    {
-        if ensure_writable(&extra).is_err() {
-            eprintln!(
-                "Note: skipped extra install copy {} (not writable). PATH may still hit the old binary.",
-                extra.display()
-            );
-            continue;
-        }
-        if let Err(e) = atomic_copy_replace(&exe, &extra) {
-            eprintln!(
-                "Note: could not update extra install copy {}: {e}",
-                extra.display()
-            );
-            continue;
-        }
-        eprintln!("    also updated {}", extra.display());
-    }
+    // 顺带清理可能遗留的历史老版本 ~/.local/bin/jeikcode 孤儿副本
+    cleanup_legacy_dropper_file(&exe);
 
     // Manual `/upgrade` just installed whatever the current manifest
     // advertises. Any staged upgrade sitting in `staged_dir()` is now
@@ -1611,11 +2831,16 @@ pub async fn run_upgrade(
     current_version: String,
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
-) -> Result<UpgradeSummary> {
+) -> Result<UpgradeSummary, UpgradeFailure> {
     if is_package_managed() {
-        return Err(anyhow!(PACKAGE_MANAGED));
+        return Err(UpgradeFailure::new(
+            UpgradeFailureKind::PackageManaged,
+            anyhow!(PACKAGE_MANAGED),
+        ));
     }
-    let manifest = fetch_manifest().await?;
+    let manifest = fetch_manifest()
+        .await
+        .map_err(|e| UpgradeFailure::new(UpgradeFailureKind::ManifestFetch, e))?;
     run_upgrade_with_manifest(manifest, current_version, force, tx).await
 }
 
@@ -1648,7 +2873,7 @@ fn purge_legacy_brand_plugins_on_upgrade() {
         }
     }
     let installed_root = plugins_root.join("installed");
-    for dirty_plugin in ["jeikcode", "jeikcode-skills", "jeikcode-workflows"] {
+    for dirty_plugin in ["zap", "jeikcode-skills", "jeikcode-workflows"] {
         let dirty_dir = installed_root.join(dirty_plugin);
         if dirty_dir.exists() {
             let _ = std::fs::remove_dir_all(&dirty_dir);
@@ -1797,6 +3022,9 @@ pub async fn prepare_deferred_upgrade(
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<Option<PendingUpgrade>> {
     if is_package_managed() {
+        return Ok(None);
+    }
+    if zap_config::config::offline::is_offline_active() {
         return Ok(None);
     }
     let target = detect_target().ok_or_else(|| {
@@ -1973,6 +3201,13 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
 /// constraints); caller should surface the error and keep running with
 /// the old binary rather than exiting silently.
 pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infallible> {
+    re_exec_self_with_args(override_exe, None)
+}
+
+pub fn re_exec_self_with_args(
+    override_exe: Option<&Path>,
+    override_args: Option<&[std::ffi::OsString]>,
+) -> Result<std::convert::Infallible> {
     let exe = override_exe.map(|p| p.to_path_buf()).unwrap_or_else(|| {
         current_exe_path().unwrap_or_else(|_| {
             // Fallback: if we can't resolve current_exe AND no override,
@@ -1983,7 +3218,10 @@ pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infalli
                 .unwrap_or_default()
         })
     });
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<std::ffi::OsString> = match override_args {
+        Some(a) => a.to_vec(),
+        None => std::env::args_os().skip(1).collect(),
+    };
 
     #[cfg(unix)]
     {
@@ -2121,14 +3359,13 @@ mod tests {
 
     #[test]
     fn binary_url_shape() {
-        let repo = zap_config::endpoints::update_repo();
         assert_eq!(
             binary_url("6.0.0", "windows-x64"),
-            format!("https://github.com/{repo}/releases/download/v6.0.0/jeikcode-v6.0.0-windows-x64.exe")
+            "https://github.com/jeikl/JeikCode/releases/download/v6.0.0/jeikcode-v6.0.0-windows-x64.exe"
         );
         assert_eq!(
             binary_url("v7.0.0", "windows-x64"),
-            format!("https://github.com/{repo}/releases/download/v7.0.0/jeikcode-v7.0.0-windows-x64.exe")
+            "https://github.com/jeikl/JeikCode/releases/download/v7.0.0/jeikcode-v7.0.0-windows-x64.exe"
         );
     }
 
@@ -2273,6 +3510,79 @@ mod tests {
         }
     }
 
+    fn release_with_body(tag: &str, body: Option<&str>) -> ListedRelease {
+        let mut rel = sample_release(tag, true);
+        rel.body = body.map(str::to_string);
+        rel
+    }
+
+    #[test]
+    fn notes_truncation_detection_matches_edge_cache_shapes() {
+        // The edge cache renders Markdown to HTML and appends an ellipsis
+        // inside the last paragraph when it trims a long announcement.
+        let edge_truncated = format!(
+            "<ul><li><p>{}**[System Prompts &amp; Local...</p></li></ul>",
+            "long paragraph ".repeat(60)
+        );
+        assert!(notes_look_truncated(&Some(edge_truncated)));
+        assert!(notes_look_truncated(&Some(format!(
+            "<p>{}…</p>",
+            "unicode ellipsis ".repeat(60)
+        ))));
+
+        // Complete bodies, short notes, and empty bodies are not truncated.
+        assert!(!notes_look_truncated(&None));
+        assert!(!notes_look_truncated(&Some(String::new())));
+        assert!(!notes_look_truncated(&Some(
+            "<p>short note...</p>".to_string()
+        )));
+        assert!(!notes_look_truncated(&Some(format!(
+            "<p>{}</p>",
+            "complete notes ".repeat(60)
+        ))));
+    }
+
+    #[test]
+    fn merge_replaces_truncated_edge_notes_with_the_full_github_body() {
+        let truncated = format!(
+            "<ul><li><p>{}**[System Prompts &amp; Local...</p></li></ul>",
+            "edge line ".repeat(80)
+        );
+        let full = format!("## Complete\n\n{}", "github line ".repeat(80));
+        let mut into = vec![release_with_body("v7.5.0-beta.0", Some(&truncated))];
+
+        merge_listed_releases(
+            &mut into,
+            vec![release_with_body("v7.5.0-beta.0", Some(&full))],
+        );
+
+        assert_eq!(
+            into[0].body.as_deref(),
+            Some(full.as_str()),
+            "截断的边缘公告必须被 GitHub 完整正文替换"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_complete_edge_notes_and_replaces_missing_ones() {
+        let complete = "<p>full edge notes</p>";
+        let mut into = vec![
+            release_with_body("v7.5.0-beta.0", Some(complete)),
+            release_with_body("v7.4.0", None),
+        ];
+
+        merge_listed_releases(
+            &mut into,
+            vec![
+                release_with_body("v7.5.0-beta.0", Some("github replacement")),
+                release_with_body("v7.4.0", Some("github notes")),
+            ],
+        );
+
+        assert_eq!(into[0].body.as_deref(), Some(complete));
+        assert_eq!(into[1].body.as_deref(), Some("github notes"));
+    }
+
     #[test]
     fn filter_channel_releases_sorts_newest_first() {
         let releases = vec![
@@ -2317,27 +3627,22 @@ mod tests {
         );
         assert_eq!(
             next_page_url(&headers).as_deref(),
-            Some("https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2")
+            Some("https://api.github.com/repos/1852676265/JeikCode/releases?per_page=100&page=2")
         );
     }
 
     #[test]
     fn looks_like_jeikcode_binary_accepts_product_name() {
-        assert!(looks_like_jeikcode_binary(Path::new("jeikcode")));
-        assert!(looks_like_jeikcode_binary(Path::new("jeikcode.exe")));
+        assert!(looks_like_jeikcode_binary(Path::new("zap")));
+        assert!(looks_like_jeikcode_binary(Path::new("zap.exe")));
         assert!(!looks_like_jeikcode_binary(Path::new("jeikcode.cmd")));
         assert!(!looks_like_jeikcode_binary(Path::new("other.exe")));
-        assert!(looks_like_desktop_cli_payload(Path::new("cli-bin")));
-        assert!(looks_like_desktop_cli_payload(Path::new(
-            "C:/app/resources/cli-bin"
-        )));
-        assert!(!looks_like_desktop_cli_payload(Path::new("jeikcode.exe")));
     }
 
     #[test]
     fn discover_install_exes_includes_running_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let running = tmp.path().join("jeikcode");
+        let running = tmp.path().join("zap");
         std::fs::write(&running, b"x").unwrap();
         let found = discover_install_exes(&running);
         assert!(found.iter().any(|p| same_exe(p, &running)));
@@ -2382,7 +3687,7 @@ mod tests {
         // A path inside tempdir must pass; a path whose parent doesn't
         // exist must fail with a clear message.
         let tmp = tempfile::tempdir().unwrap();
-        let ok = tmp.path().join("jeikcode");
+        let ok = tmp.path().join("zap");
         assert!(ensure_writable(&ok).is_ok());
 
         let bogus = Path::new("/nonexistent-dir-xyzzy-9999/jeikcode");
@@ -2393,7 +3698,7 @@ mod tests {
     #[test]
     fn replace_binary_renames_live_to_bak_via_three_way_swap() {
         let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("jeikcode");
+        let exe = tmp.path().join("zap");
         let new = tmp.path().join(".jeikcode.download");
         std::fs::write(&exe, b"OLD").unwrap();
         std::fs::write(&new, b"NEW").unwrap();
@@ -2412,7 +3717,7 @@ mod tests {
     #[test]
     fn replace_binary_overwrites_stale_bak() {
         let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("jeikcode");
+        let exe = tmp.path().join("zap");
         let new = tmp.path().join(".jeikcode.download");
         let bak = backup_path(&exe);
         std::fs::write(&exe, b"V2").unwrap();
@@ -2488,7 +3793,7 @@ mod tests {
 
     #[test]
     fn robust_rename_falls_back_to_copy_on_cross_device() {
-        // The reported bug: staged binary under the user profile (C:\…\.zap
+        // The reported bug: staged binary under the user profile (C:\…\.jeikcode
         // \staged\) vs a running exe on another drive (H:\). `rename` fails with
         // ERROR_NOT_SAME_DEVICE; robust_rename must transparently copy instead of
         // burning its retry budget on a deterministic failure.
@@ -2530,7 +3835,7 @@ mod tests {
     #[test]
     fn replace_binary_cleans_leftover_rolling() {
         let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("jeikcode");
+        let exe = tmp.path().join("zap");
         let new = tmp.path().join(".jeikcode.download");
         let rolling = rolling_path(&exe);
         std::fs::write(&exe, b"OLD").unwrap();
@@ -2553,7 +3858,7 @@ mod tests {
         // doesn't care about file permissions. The test verifies the
         // three-way swap completes successfully regardless.)
         let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("jeikcode");
+        let exe = tmp.path().join("zap");
         let new = tmp.path().join(".jeikcode.download");
         let bak = backup_path(&exe);
         let rolling = rolling_path(&exe);
@@ -2578,7 +3883,7 @@ mod tests {
         // binary. run_rollback uses current_exe() which we cannot
         // redirect, so we test the primitive by calling replace_binary
         // first then rename logic directly — model the three-way swap.
-        let exe = tmp.path().join("jeikcode");
+        let exe = tmp.path().join("zap");
         let bak = backup_path(&exe);
         std::fs::write(&exe, b"NEW").unwrap();
         std::fs::write(&bak, b"OLD").unwrap();
@@ -2742,11 +4047,13 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "should fail on size mismatch");
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, UpgradeFailureKind::ChecksumMismatch);
+        let msg = err.to_string();
         assert!(
-            err.contains("short download"),
+            msg.contains("short download"),
             "error should mention short download, got: {}",
-            err
+            msg
         );
         // Temp file must be cleaned up on failure.
         assert!(!dest.exists(), "partial download should be removed");
@@ -2788,11 +4095,13 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "should fail on checksum mismatch");
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, UpgradeFailureKind::ChecksumMismatch);
+        let msg = err.to_string();
         assert!(
-            err.contains("checksum mismatch"),
+            msg.contains("checksum mismatch"),
             "error should mention checksum mismatch, got: {}",
-            err
+            msg
         );
         // Temp file must be cleaned up on failure.
         assert!(!dest.exists(), "corrupted download should be removed");
@@ -2865,12 +4174,39 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, UpgradeFailureKind::Download);
+        let msg = err.to_string();
         assert!(
-            err.contains("HTTP 404"),
+            msg.contains("HTTP 404"),
             "error should mention HTTP 404, got: {}",
-            err
+            msg
         );
+    }
+
+    /// The WebUI keys its wording as `update.error.<code>`; these strings are
+    /// a cross-crate contract and must not drift silently.
+    #[test]
+    fn upgrade_failure_wire_codes_are_stable() {
+        assert_eq!(UpgradeFailureKind::AlreadyLatest.as_str(), "already_latest");
+        assert_eq!(
+            UpgradeFailureKind::PackageManaged.as_str(),
+            "package_managed"
+        );
+        assert_eq!(
+            UpgradeFailureKind::UnsupportedPlatform.as_str(),
+            "unsupported_platform"
+        );
+        assert_eq!(UpgradeFailureKind::NotWritable.as_str(), "not_writable");
+        assert_eq!(UpgradeFailureKind::ManifestFetch.as_str(), "manifest_fetch");
+        assert_eq!(UpgradeFailureKind::Download.as_str(), "download");
+        assert_eq!(
+            UpgradeFailureKind::ChecksumMismatch.as_str(),
+            "checksum_mismatch"
+        );
+        assert_eq!(UpgradeFailureKind::Replace.as_str(), "replace");
+        assert_eq!(UpgradeFailureKind::Restart.as_str(), "restart");
+        assert_eq!(UpgradeFailureKind::Other.as_str(), "other");
     }
 
     #[test]
@@ -2885,6 +4221,7 @@ mod tests {
         let err = super::run_upgrade("v1.0.0".to_string(), true, tx)
             .await
             .expect_err("package-managed build must refuse self-upgrade");
+        assert_eq!(err.kind, UpgradeFailureKind::PackageManaged);
         assert!(err.to_string().contains(super::PACKAGE_MANAGED));
     }
 
@@ -2938,5 +4275,259 @@ mod tests {
     fn zombie_pid_does_not_block_once_the_listen_socket_is_gone() {
         assert!(predecessor_socket_released(false));
         assert!(!predecessor_socket_released(true));
+    }
+
+    #[test]
+    fn patch_restart_args_replaces_and_injects_options() {
+        let orig = vec!["webui", "--host", "127.0.0.1", "--port", "13457"];
+        let patched = patch_restart_args(orig, Some("0.0.0.0"), Some(4096), Some("sk-token"));
+        let strings: Vec<String> = patched
+            .into_iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strings,
+            vec!["webui", "--host", "0.0.0.0", "--port", "4096", "--token", "sk-token"]
+        );
+    }
+
+    #[test]
+    fn patch_restart_args_with_auth_toggles_between_token_and_no_token() {
+        // Switching from --no-token to --token strips --no-token so `serve` does not abort
+        let orig = vec!["--host", "0.0.0.0", "--port", "4096", "--no-token"];
+        let patched = patch_restart_args_with_auth(
+            orig,
+            Some("0.0.0.0"),
+            Some(5000),
+            Some("new-secret"),
+            Some(false),
+        );
+        let strings: Vec<String> = patched
+            .into_iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "5000",
+                "--token",
+                "new-secret"
+            ]
+        );
+
+        // Switching from --token to --no-token strips --token and appends --no-token
+        let orig2 = vec![
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "5000",
+            "--token",
+            "new-secret",
+        ];
+        let patched2 =
+            patch_restart_args_with_auth(orig2, Some("127.0.0.1"), Some(5001), None, Some(true));
+        let strings2: Vec<String> = patched2
+            .into_iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            strings2,
+            vec!["--host", "127.0.0.1", "--port", "5001", "--no-token"]
+        );
+    }
+
+    #[test]
+    fn service_port_match_respects_digit_boundaries() {
+        assert!(service_text_declares_port("x --port 4096 --dir /", 4096));
+        assert!(service_text_declares_port("x --port=4096", 4096));
+        assert!(service_text_declares_port("x --port \"4096\"", 4096));
+        assert!(service_text_declares_port(
+            "<string>--port</string>\n    <string>4096</string>",
+            4096
+        ));
+        assert!(!service_text_declares_port("x --port 40960", 4096));
+        assert!(!service_text_declares_port("x --port 409", 4096));
+        assert!(!service_text_declares_port("x --host 4096", 4096));
+    }
+
+    #[test]
+    fn live_exe_path_strips_windows_swap_suffixes() {
+        let dir = std::path::Path::new("/opt/jc");
+        let expected = if cfg!(windows) {
+            "zap.exe"
+        } else {
+            "zap"
+        };
+        assert_eq!(
+            normalize_live_exe_path(dir.join(".jeikcode.rolling")),
+            dir.join(expected)
+        );
+        assert_eq!(
+            normalize_live_exe_path(dir.join("jeikcode.exe.bak")),
+            dir.join("zap.exe")
+        );
+        assert_eq!(
+            normalize_live_exe_path(dir.join("zap")),
+            dir.join("zap")
+        );
+    }
+
+    #[test]
+    fn windows_cmd_rewrite_leaves_marker_line_untouched() {
+        let cmd = "@echo off\r\ncd /d E:\\w\r\nset \"JEIKCODE_HOST_SERVICE=JeikCode-jeikcode\"\r\njeikcode.exe --host 0.0.0.0 --port 4096 --token a\r\n";
+        let out = rewrite_windows_cmd_content(cmd, None, Some(5000), Some("b"), Some(false));
+        assert!(out.contains("set \"JEIKCODE_HOST_SERVICE=JeikCode-jeikcode\""));
+        assert!(out.contains("jeikcode.exe --host 0.0.0.0 --port 5000 --token b"));
+    }
+
+    #[test]
+    fn rewrites_systemd_procd_launchd_and_windows_service_configs() {
+        // 1. Linux systemd unit
+        let unit = "[Service]\nExecStart=/usr/local/bin/jeikcode --host 0.0.0.0 --port 4096 --token oldtok --dir \"/root\"\nRestart=always\n";
+        let updated_unit = rewrite_systemd_unit_content(
+            unit,
+            Some("192.168.1.10"),
+            Some(8080),
+            Some("newtok"),
+            Some(false),
+        );
+        assert!(updated_unit.contains(
+            "ExecStart=/usr/local/bin/jeikcode --host 192.168.1.10 --port 8080 --token newtok --dir \"/root\""
+        ));
+
+        // 2. OpenWrt procd script
+        let procd = "start_service() {\n    procd_open_instance\n    procd_set_param command \"$PROG\" --host \"0.0.0.0\" --port 4096 --dir \"/root\" --token \"oldtok\"\n}\n";
+        let updated_procd = rewrite_procd_script_content(
+            procd,
+            Some("0.0.0.0"),
+            Some(9090),
+            Some("openwrt-tok"),
+            Some(false),
+        );
+        assert!(updated_procd.contains(
+            "    procd_set_param command \"$PROG\" --host \"0.0.0.0\" --port 9090 --dir \"/root\" --token \"openwrt-tok\""
+        ));
+
+        // 3. macOS launchd plist
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jeikcode-4096</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/jeikcode</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>4096</string>
+    <string>--token</string>
+    <string>oldtok</string>
+  </array>
+</dict>
+</plist>"#;
+        let updated_plist = rewrite_launchd_plist_content(
+            plist,
+            Some("127.0.0.1"),
+            Some(7070),
+            Some("mactok"),
+            Some(false),
+        )
+        .unwrap();
+        assert!(updated_plist.contains("<string>127.0.0.1</string>"));
+        assert!(updated_plist.contains("<string>7070</string>"));
+        assert!(updated_plist.contains("<string>mactok</string>"));
+
+        // 4. Windows logon .cmd
+        let win_cmd = "@echo off\r\ncd /d E:\\code\r\n\"C:\\Program Files\\JeikCode\\jeikcode.exe\" --host 0.0.0.0 --port 4096 --token oldtok\r\n";
+        let updated_cmd = rewrite_windows_cmd_content(
+            win_cmd,
+            Some("0.0.0.0"),
+            Some(6060),
+            Some("wintok"),
+            Some(false),
+        );
+        assert!(updated_cmd.contains(
+            "\"C:\\Program Files\\JeikCode\\jeikcode.exe\" --host 0.0.0.0 --port 6060 --token wintok"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn offline_suppression_guards_manifest_and_deferred_upgrade() {
+        use zap_config::config::offline::{seed_offline_verdict, OfflineMode};
+        seed_offline_verdict(OfflineMode::On, None);
+        let res = fetch_manifest_from_url("https://example.com/latest.json").await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("offline mode"));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let res_upgrade = prepare_deferred_upgrade("v0.1.0", tx).await;
+        assert!(matches!(res_upgrade, Ok(None)));
+
+        seed_offline_verdict(OfflineMode::Off, None);
+    }
+
+    /// A single transient 5xx from the release CDN must not abort an upgrade:
+    /// the manifest fetch retries and returns the next successful response.
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn manifest_fetch_retries_transient_5xx() {
+        use zap_config::config::offline::{seed_offline_verdict, OfflineMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        seed_offline_verdict(OfflineMode::Off, None);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest.json"))
+            .respond_with(ResponseTemplate::new(504))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/latest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"version":"v7.5.0-beta.2","binaries":{}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let manifest = fetch_manifest_from_url(&format!("{}/latest.json", server.uri()))
+            .await
+            .expect("a transient 504 should be retried");
+        assert_eq!(manifest.version, "v7.5.0-beta.2");
+    }
+
+    /// 4xx means the URL/permissions are wrong — retrying only burns time.
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn manifest_fetch_does_not_retry_client_errors() {
+        use zap_config::config::offline::{seed_offline_verdict, OfflineMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        seed_offline_verdict(OfflineMode::Off, None);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = fetch_manifest_from_url(&format!("{}/latest.json", server.uri()))
+            .await
+            .expect_err("404 must fail immediately");
+        assert!(err.to_string().contains("404"), "unexpected error: {err}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "client errors must not be retried"
+        );
     }
 }

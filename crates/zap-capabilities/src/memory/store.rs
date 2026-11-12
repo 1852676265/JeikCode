@@ -17,7 +17,7 @@ pub struct MemoryStore {
 }
 
 /// Resolve the project-scope memory file. `override_dir` = the value of
-/// `ZAP_PROJECT_MEMORY_DIR` / `JEIKCODE_PROJECT_MEMORY_DIR` (None/empty → default ".zap"). A relative value
+/// `JEIKCODE_PROJECT_MEMORY_DIR` (None/empty → default ".jeikcode"). A relative value
 /// nests under `project_root`; an absolute value is used as-is (std `Path::join`
 /// semantics). `memory.md` is appended in either case.
 fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
@@ -37,11 +37,9 @@ impl MemoryStore {
         Self::new(dir.join("memory.md"))
     }
 
-    /// Project-scope store. Honors `ZAP_PROJECT_MEMORY_DIR` / `JEIKCODE_PROJECT_MEMORY_DIR`; defaults to `.zap`.
+    /// Project-scope store. Honors `JEIKCODE_PROJECT_MEMORY_DIR`; defaults to `.jeikcode`.
     pub fn project(project_root: &Path) -> Self {
-        let override_dir = std::env::var("ZAP_PROJECT_MEMORY_DIR")
-            .or_else(|_| std::env::var("JEIKCODE_PROJECT_MEMORY_DIR"))
-            .ok();
+        let override_dir = std::env::var("JEIKCODE_PROJECT_MEMORY_DIR").ok();
         Self::new(project_memory_path(project_root, override_dir.as_deref()))
     }
 
@@ -157,9 +155,7 @@ impl MemoryStore {
             return String::new();
         }
 
-        let mut result = String::from(
-            "<memory>\nThe user has asked you to remember these facts and preferences. They take PRECEDENCE over default system prompt rules on conflict:\n",
-        );
+        let mut result = String::from("<memory>\n");
 
         if !global_entries.is_empty() {
             result.push_str("\n[Global]\n");
@@ -275,11 +271,11 @@ mod tests {
         // Default (unset/empty) is byte-identical to today's hardcoded path.
         assert_eq!(
             super::project_memory_path(root, None),
-            Path::new("/proj/.zap/memory.md")
+            Path::new("/proj/.jeikcode/memory.md")
         );
         assert_eq!(
             super::project_memory_path(root, Some("")),
-            Path::new("/proj/.zap/memory.md")
+            Path::new("/proj/.jeikcode/memory.md")
         );
         // Relative override nests under project_root.
         assert_eq!(

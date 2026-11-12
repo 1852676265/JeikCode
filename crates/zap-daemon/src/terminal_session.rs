@@ -6,7 +6,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -14,7 +14,7 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 use super::{daemon_terminals, now_unix_ms, publish_global, DaemonTerminalItem, GlobalWireEvent};
 
 pub(crate) struct LiveTerminalProcess {
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Mutex<Box<dyn Child + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -42,6 +42,7 @@ struct ShellLaunch {
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    actual_shell: String,
 }
 
 fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
@@ -53,6 +54,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                 program: "cmd.exe".to_string(),
                 args: vec!["/K".to_string()],
                 env: Vec::new(),
+                actual_shell: "cmd".to_string(),
             };
         }
         if shell == "wsl" || (shell.contains("wsl") && !shell.contains("git")) {
@@ -66,6 +68,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                     "-i".to_string(),
                 ],
                 env: Vec::new(),
+                actual_shell: "wsl".to_string(),
             };
         }
         if shell == "gitbash"
@@ -81,6 +84,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                     // MSYS 只有打开 pcon 才会把 ConPTY 当成真正的终端。
                     ("MSYS".to_string(), "enable_pcon".to_string()),
                 ],
+                actual_shell: "gitbash".to_string(),
             };
         }
         let program = if shell.contains("pwsh") {
@@ -92,6 +96,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
             program: program.to_string(),
             args: vec!["-NoLogo".to_string(), "-NoExit".to_string()],
             env: Vec::new(),
+            actual_shell: "powershell".to_string(),
         };
     }
     #[cfg(not(windows))]
@@ -101,6 +106,7 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                 program: "zsh".to_string(),
                 args: vec!["-l".to_string(), "-i".to_string()],
                 env: Vec::new(),
+                actual_shell: "zsh".to_string(),
             };
         }
         // "powershell" / "pwsh" 含有 "sh"，不能因此落到 /bin/sh。
@@ -115,12 +121,14 @@ fn shell_launch(shell_name: &str, cwd: &str) -> ShellLaunch {
                 program: "sh".to_string(),
                 args: vec!["-i".to_string()],
                 env: Vec::new(),
+                actual_shell: "sh".to_string(),
             };
         }
         ShellLaunch {
             program: "bash".to_string(),
             args: vec!["-l".to_string(), "-i".to_string()],
             env: Vec::new(),
+            actual_shell: "bash".to_string(),
         }
     }
 }
@@ -201,6 +209,7 @@ fn spawn_pty_command(
         program: program.to_string(),
         args: args.to_vec(),
         env: env.to_vec(),
+        actual_shell: program.to_string(),
     };
     let cmd = command_from_launch(&launch, cwd);
     let pty_system = native_pty_system();
@@ -252,25 +261,48 @@ fn utf8_prefix_len(bytes: &[u8]) -> usize {
     }
 }
 
+/// 过滤 Windows ConPTY 自行发出的光标位置查询序列（ESC[6n / ESC[?6n），
+/// 并由后台 PTY 读线程直接向子进程回复 CPR（\x1b[1;1R），满足 ConPTY 握手。
+/// 剔除该序列后，绝不将其广播给前端 xterm.js 或存入历史快照，彻底杜绝切会话回放导致敲入 "1R1R"。
+fn process_pty_output(text: &str, writer: &Mutex<Option<Box<dyn Write + Send>>>) -> String {
+    #[cfg(windows)]
+    {
+        if text.contains("\x1b[6n") || text.contains("\x1b[?6n") {
+            let mut w = lock(writer);
+            if let Some(w) = w.as_mut() {
+                let _ = w.write_all(b"\x1b[1;1R");
+                let _ = w.flush();
+            }
+            return text.replace("\x1b[6n", "").replace("\x1b[?6n", "");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = writer;
+
+    text.to_string()
+}
+
 fn start_reader(
     mut reader: Box<dyn Read + Send>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     buffer: Arc<Mutex<String>>,
     broadcast: tokio::sync::broadcast::Sender<String>,
-    proc_weak: Weak<LiveTerminalProcess>,
 ) {
     let _ = std::thread::Builder::new()
         .name("jeik-pty".to_string())
         .spawn(move || {
             let mut chunk = [0u8; 8192];
             let mut pending = Vec::new();
-            let mut startup_probe_pending = cfg!(windows);
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => {
                         if !pending.is_empty() {
                             let text = String::from_utf8_lossy(&pending).into_owned();
-                            append_output(&buffer, &text);
-                            let _ = broadcast.send(text);
+                            let clean = process_pty_output(&text, &writer);
+                            if !clean.is_empty() {
+                                append_output(&buffer, &clean);
+                                let _ = broadcast.send(clean);
+                            }
                         }
                         break;
                     }
@@ -279,40 +311,53 @@ fn start_reader(
                         if pending.len() > 8 && utf8_prefix_len(&pending) == 0 {
                             let text = String::from_utf8_lossy(&pending).into_owned();
                             pending.clear();
-                            append_output(&buffer, &text);
-                            let _ = broadcast.send(text);
+                            let clean = process_pty_output(&text, &writer);
+                            if !clean.is_empty() {
+                                append_output(&buffer, &clean);
+                                let _ = broadcast.send(clean);
+                            }
                             continue;
                         }
-                        let split = utf8_prefix_len(&pending);
+                        let mut split = utf8_prefix_len(&pending);
                         if split == 0 {
                             continue;
                         }
+                        // 边界处理：防止 \x1b[6n 或 \x1b[?6n 跨 chunk 读取时被截断
+                        let prefix_slice = &pending[..split];
+                        let partial_len = if prefix_slice.ends_with(b"\x1b[?6")
+                            || prefix_slice.ends_with(b"\x1b[6")
+                        {
+                            if prefix_slice.ends_with(b"\x1b[?6") {
+                                4
+                            } else {
+                                3
+                            }
+                        } else if prefix_slice.ends_with(b"\x1b[?")
+                            || prefix_slice.ends_with(b"\x1b[")
+                        {
+                            if prefix_slice.ends_with(b"\x1b[?") {
+                                3
+                            } else {
+                                2
+                            }
+                        } else if prefix_slice.ends_with(b"\x1b") {
+                            1
+                        } else {
+                            0
+                        };
+                        if partial_len > 0 && split > partial_len {
+                            split -= partial_len;
+                        } else if partial_len > 0 && split == partial_len {
+                            continue;
+                        }
+
                         let text = String::from_utf8_lossy(&pending[..split]).into_owned();
                         pending.drain(..split);
-                        let text = if startup_probe_pending {
-                            let (cleaned, had_probe) = strip_startup_cpr_probe(&text);
-                            if had_probe {
-                                startup_probe_pending = false;
-                                if let Some(proc) = proc_weak.upgrade() {
-                                    write_terminal_bytes(&proc, b"\x1b[1;1R");
-                                }
-                                if cleaned.is_empty() {
-                                    continue;
-                                }
-                                cleaned
-                            } else {
-                                if cleaned.bytes().any(|b| b >= 0x20 && b != 0x7f)
-                                    && !cleaned.starts_with("\x1b[?")
-                                {
-                                    startup_probe_pending = false;
-                                }
-                                cleaned
-                            }
-                        } else {
-                            text
-                        };
-                        append_output(&buffer, &text);
-                        let _ = broadcast.send(text);
+                        let clean = process_pty_output(&text, &writer);
+                        if !clean.is_empty() {
+                            append_output(&buffer, &clean);
+                            let _ = broadcast.send(clean);
+                        }
                     }
                 }
             }
@@ -375,126 +420,8 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
-/// 剥离 Windows ConPTY 初始化 `PSEUDOCONSOLE_INHERIT_CURSOR` 发出的首个 `\x1b[6n` 探测。
-fn strip_startup_cpr_probe(text: &str) -> (String, bool) {
-    if let Some(idx) = text.find("\x1b[6n") {
-        let mut cleaned = String::with_capacity(text.len() - 4);
-        cleaned.push_str(&text[..idx]);
-        cleaned.push_str(&text[idx + 4..]);
-        (cleaned, true)
-    } else {
-        (text.to_string(), false)
-    }
-}
-
-fn match_csi_query_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut j = start;
-    let prefix = if j < bytes.len() && matches!(bytes[j], b'?' | b'>' | b'=') {
-        let p = bytes[j];
-        j += 1;
-        Some(p)
-    } else {
-        None
-    };
-    let param_start = j;
-    while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
-        j += 1;
-    }
-    if j + 1 < bytes.len() && bytes[j] == b'$' && bytes[j + 1] == b'p' {
-        if matches!(prefix, None | Some(b'?')) {
-            return Some(j + 2);
-        }
-        return None;
-    }
-    if j >= bytes.len() {
-        return None;
-    }
-    let params = &bytes[param_start..j];
-    match bytes[j] {
-        b'n' if matches!(prefix, None | Some(b'?')) => Some(j + 1),
-        b'c' if params.is_empty() || params == b"0" => Some(j + 1),
-        b't' if prefix.is_none() => {
-            let first = params.split(|&b| b == b';').next().unwrap_or(b"");
-            if matches!(
-                first,
-                b"11" | b"13" | b"14" | b"16" | b"18" | b"19" | b"20" | b"21"
-            ) {
-                Some(j + 1)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn match_osc_query_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let limit = (start + 64).min(bytes.len());
-    let mut j = start;
-    while j < limit {
-        let (payload_end, term_end) = if bytes[j] == 0x07 {
-            (j, j + 1)
-        } else if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-            (j, j + 2)
-        } else if bytes[j] == 0x1b || bytes[j] == b'\r' || bytes[j] == b'\n' || bytes[j] == 0 {
-            return None;
-        } else {
-            j += 1;
-            continue;
-        };
-        let payload = &bytes[start..payload_end];
-        if let Some(prefix) = payload.strip_suffix(b";?") {
-            if matches!(prefix, b"10" | b"11" | b"12" | b"17" | b"19")
-                || (prefix.starts_with(b"4;")
-                    && prefix.len() > 2
-                    && prefix[2..].iter().all(|b| b.is_ascii_digit()))
-            {
-                return Some(term_end);
-            }
-        }
-        return None;
-    }
-    None
-}
-
-/// 清理历史快照中的终端设备/光标查询序列（如 `\x1b[6n`、`\x1b[c` 等）。
-/// 否则前端重连回放历史时 `xterm.js` 会自动发回 `\x1b[<row>;1R`，
-/// ConPTY 将其解析为 `VK_F3` 并导致 PowerShell PSReadLine `CharacterSearch` 吞掉下一条命令的首字符。
-pub(crate) fn strip_replay_terminal_queries(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    let mut last_copied = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'[' {
-                if let Some(end) = match_csi_query_end(bytes, i + 2) {
-                    out.push_str(&input[last_copied..i]);
-                    i = end;
-                    last_copied = i;
-                    continue;
-                }
-            } else if bytes[i + 1] == b']' {
-                if let Some(end) = match_osc_query_end(bytes, i + 2) {
-                    out.push_str(&input[last_copied..i]);
-                    i = end;
-                    last_copied = i;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    if last_copied == 0 {
-        return input.to_string();
-    }
-    out.push_str(&input[last_copied..]);
-    out
-}
-
 pub(crate) fn output_snapshot(proc: &LiveTerminalProcess) -> String {
-    strip_replay_terminal_queries(&lock(&proc.buffer))
+    lock(&proc.buffer).clone()
 }
 
 pub(crate) fn subscribe(proc: &LiveTerminalProcess) -> tokio::sync::broadcast::Receiver<String> {
@@ -570,13 +497,21 @@ fn register_daemon_terminal(term_id: &str, shell_name: &str, cwd: &str) {
     let mut guard = daemon_terminals()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
+    let count = guard.len();
     if let Some(existing) = guard.get_mut(term_id) {
         existing.cwd = cwd.to_string();
         existing.shell = shell_name.to_string();
+        // 自动纠正历史上或前端并发误传的异构平台终端名称
+        if (cfg!(not(windows)) && existing.name.starts_with("powershell"))
+            || (cfg!(windows)
+                && existing.name.starts_with("bash")
+                && !existing.name.contains("git"))
+        {
+            existing.name = format!("{shell_name} {count}");
+        }
         return;
     }
-    let count = guard.len() + 1;
-    let name = format!("{shell_name} {count}");
+    let name = format!("{shell_name} {}", count + 1);
     guard.insert(
         term_id.to_string(),
         DaemonTerminalItem {
@@ -650,30 +585,32 @@ pub(crate) async fn get_or_spawn_terminal_process(
         cols,
         rows,
     )?;
+    let actual_shell = launch.actual_shell.clone();
     let pid = spawned.child.process_id();
     let killer = spawned.child.clone_killer();
     let (broadcast, _) = tokio::sync::broadcast::channel::<String>(512);
     let greeting = format!(
-        "\x1b[32m[Zap Terminal: {term_id} ({shell_name})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
+        "\x1b[32m[JeikCode Terminal: {term_id} ({actual_shell})]\x1b[0m\r\nActive workspace: {target_cwd}\r\nReady.\r\n\r\n"
     );
     let buffer = Arc::new(Mutex::new(greeting));
+    let writer = Arc::new(Mutex::new(Some(spawned.writer)));
+    start_reader(
+        spawned.reader,
+        writer.clone(),
+        buffer.clone(),
+        broadcast.clone(),
+    );
     let proc = Arc::new(LiveTerminalProcess {
-        writer: Mutex::new(Some(spawned.writer)),
+        writer,
         master: Mutex::new(Some(spawned.master)),
         child: Mutex::new(spawned.child),
         killer: Mutex::new(killer),
         pid,
-        buffer: buffer.clone(),
-        broadcast: broadcast.clone(),
-    });
-    start_reader(
-        spawned.reader,
         buffer,
         broadcast,
-        Arc::downgrade(&proc),
-    );
+    });
     lock(live_terminals()).insert(term_id.to_string(), proc.clone());
-    register_daemon_terminal(term_id, shell_name, &target_cwd);
+    register_daemon_terminal(term_id, &actual_shell, &target_cwd);
     reap_when_exited(proc.clone(), term_id.to_string(), target_cwd);
     Ok(proc)
 }
@@ -689,6 +626,26 @@ pub(crate) fn lookup_live_terminal(term_id: &str) -> Option<Arc<LiveTerminalProc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_pty_output_strips_conpty_dsr_and_answers_cpr() {
+        let cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let writer: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(Some(Box::new(cursor)));
+
+        let input = "hello\x1b[6nworld\x1b[?6n!";
+        let clean = process_pty_output(input, &writer);
+
+        #[cfg(windows)]
+        {
+            assert_eq!(clean, "helloworld!");
+            assert!(!clean.contains("\x1b[6n"));
+            assert!(!clean.contains("\x1b[?6n"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(clean, input);
+        }
+    }
 
     #[test]
     fn pty_input_uses_single_carriage_return() {
@@ -868,25 +825,6 @@ mod tests {
         assert!(
             output.contains(&b'\r'),
             "pty output must include CR so the next line does not staircase, got {text:?}"
-        );
-    }
-
-    #[test]
-    fn strip_replay_queries_removes_dsr_da_and_osc_queries_preserving_text() {
-        let raw = "\x1b[32mReady.\x1b[0m\r\n\x1b[6n\x1b[?6n\x1b[c\x1b[>0c\x1b[?1004$p\x1b[18t\x1b]11;?\x07PS D:\\Zap> \x1b[?25h";
-        let cleaned = strip_replay_terminal_queries(raw);
-        assert_eq!(cleaned, "\x1b[32mReady.\x1b[0m\r\nPS D:\\Zap> \x1b[?25h");
-    }
-
-    #[test]
-    fn strip_startup_cpr_probe_only_removes_initial_6n() {
-        assert_eq!(
-            strip_startup_cpr_probe("\x1b[6n\x1b[?9001h"),
-            ("\x1b[?9001h".to_string(), true)
-        );
-        assert_eq!(
-            strip_startup_cpr_probe("PS D:\\Zap> "),
-            ("PS D:\\Zap> ".to_string(), false)
         );
     }
 }

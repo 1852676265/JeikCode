@@ -26,7 +26,6 @@ use super::{
     request_context_stats_render, save_and_reload, save_language_and_reload, LoopCtx,
     PersistedConfigReload,
 };
-use crate::custom_commands::ArgsRequirement;
 use crate::i18n::{t, Msg};
 use crate::modals::{
     DiffViewer, DirPicker, FileViewer, LanguagePicker, Modal, ModelPicker, ProxyPicker,
@@ -35,6 +34,7 @@ use crate::render::{Renderer, UiLine};
 use crate::session::{Session, SessionId};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
+use zap_capabilities::commands::ArgsRequirement;
 use zap_capabilities::memory::MemoryStore;
 use zap_config::config::Config;
 
@@ -356,7 +356,8 @@ fn bind_spawned_foreground(
     bind_telemetry_to_session(ctx, &ctx.current_session);
     state.on_turn_complete();
     state.on_session_replaced();
-    state.active_todos = None;
+    state.active_todos = crate::event_loop::todo_progress_from_board(&ctx.current_session.id)
+        .filter(|p| p.total > 0 && p.completed < p.total);
     crate::event_loop::sync_todo_titles(state);
     state.approval_panel = None;
     ctx.pending_runtime_request_id = None;
@@ -979,7 +980,6 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
         let scope = t(match line.level {
             InstructionLevel::Global => Msg::StatusInstructionScopeGlobal,
             InstructionLevel::Project => Msg::StatusInstructionScopeProject,
-            InstructionLevel::User => Msg::StatusInstructionScopeUser,
         });
         let path = line.path.display().to_string();
         if line.found {
@@ -2562,7 +2562,11 @@ fn execute_slash_command_impl(
             // 没有自己中继的部署可设 JEIKCODE_ENABLE_RELAY=0 关掉整条链路。
             if !zap_config::endpoints::relay_enabled() {
                 renderer.render(UiLine::CommandOutput(
-                    "远程访问在本部署中未启用（JEIKCODE_ENABLE_RELAY=0）。".to_string(),
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "远程访问在本部署中未启用（JEIKCODE_ENABLE_RELAY=0）。".to_string(),
+                        crate::i18n::Locale::Vi => "Truy cập từ xa chưa được bật trong bản triển khai này (JEIKCODE_ENABLE_RELAY=0).".to_string(),
+                        _ => "Remote access is not enabled in this deployment (JEIKCODE_ENABLE_RELAY=0).".to_string(),
+                    }
                 ));
                 renderer.flush();
                 return Ok(());
@@ -2619,12 +2623,25 @@ fn execute_slash_command_impl(
                     .is_some();
                 let server_stopped = zap_daemon::stop_app_server();
                 let mut output = if killed || server_stopped {
-                    "已停止 App 远程访问".to_string()
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "已停止 App 远程访问".to_string(),
+                        crate::i18n::Locale::Vi => "Đã dừng truy cập từ xa cho App".to_string(),
+                        _ => "Stopped App remote access".to_string(),
+                    }
                 } else {
-                    "App 远程访问未在运行".to_string()
+                    match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "App 远程访问未在运行".to_string(),
+                        crate::i18n::Locale::Vi => "Truy cập từ xa cho App không chạy".to_string(),
+                        _ => "App remote access is not running".to_string(),
+                    }
                 };
                 if let Some(error) = detach_error {
-                    output.push_str(&format!("\n{error}；TUI 暂时保持同步"));
+                    let sync_hint = match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "TUI 暂时保持同步",
+                        crate::i18n::Locale::Vi => "TUI tạm thời duy trì đồng bộ",
+                        _ => "TUI temporarily stays synced",
+                    };
+                    output.push_str(&format!("\n{error}; {sync_hint}"));
                 }
                 output
             } else {
@@ -2637,7 +2654,11 @@ fn execute_slash_command_impl(
                 };
                 match relay_base.filter(|s| !s.is_empty()) {
                     // 仅在显式给了空参数（如 `/app --relay`）时可达。
-                    None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
+                    None => match crate::i18n::current_locale() {
+                        crate::i18n::Locale::ZhCn => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
+                        crate::i18n::Locale::Vi => "Cách dùng: /app (mặc định relay chính thức), hoặc /app <địa chỉ relay> để ghi đè".to_string(),
+                        _ => "Usage: /app (default official relay), or /app <relay-url> to override".to_string(),
+                    },
                     Some(relay) => {
                         // 起本机 App server（daemon 模式、不开浏览器、回环绑定）。
                         //    每次 /app 都重建 server。
@@ -2655,7 +2676,11 @@ fn execute_slash_command_impl(
                             )
                         });
                         match started {
-                            Err(e) => format!("App server 启动失败：{e}"),
+                            Err(e) => match crate::i18n::current_locale() {
+                                crate::i18n::Locale::ZhCn => format!("App server 启动失败：{e}"),
+                                crate::i18n::Locale::Vi => format!("Khởi động App server thất bại: {e}"),
+                                _ => format!("Failed to start App server: {e}"),
+                            },
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
                                 // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
@@ -3838,12 +3863,9 @@ fn execute_slash_command_impl(
                 }
                 renderer.flush();
             } else {
-                // 贪婪多 skill 解析：前缀是一串已知 skill 名，其余是任务描述，
-                // 任务描述会传给每个 skill（保留 $ARGUMENTS 占位符语义）。单个
-                // skill（无第二个 skill 词）解析结果与旧 splitn(2) 一致，零回归。
-                // Returns the skill's canonical identity (`s.name`, the unique
-                // normalized registry key) so `split_skill_names` dedups by
-                // identity — two spellings of the same skill inject it once.
+                // 贪婪多 skill 解析：前缀是一串已知 skill 名，其余是任务描述。
+                // `resolve` 返回规范身份（`s.name`，含 plugin 命名空间），既用于
+                // 去重，也直接写进 `use_skill(<canonical>)`，避免裸名歧义。
                 let resolve = |name: &str| {
                     ctx.skill_registry.read().ok().and_then(|r| {
                         r.get(name)
@@ -3860,33 +3882,28 @@ fn execute_slash_command_impl(
                     ));
                     renderer.flush();
                 } else {
-                    // 按顺序展开每个 skill；expand_skill 可能因竞态返回 None。
-                    let blocks: Vec<String> = skills
+                    // 不在本地展开技能正文：把本次输入改写为
+                    // `use_skill(<canonical>)` + 用户真实请求，由模型走统一工具路径
+                    // 读取 raw SKILL.md。第二个及以后的 skill 名若打错字会静默
+                    // 落进任务描述，回显让用户一眼看出"只加载了 N 个"。
+                    let names = skills
                         .iter()
-                        .filter_map(|name| expand_skill(ctx, name.as_str(), &skill_args))
+                        .map(|(display, _)| display.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::SkillsLoaded {
+                            names: names.as_str(),
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    let canonical: Vec<String> = skills
+                        .iter()
+                        .map(|(_, canonical)| canonical.clone())
                         .collect();
-                    if blocks.is_empty() {
-                        renderer.render(UiLine::Error(
-                            t(Msg::SkillUnknown {
-                                name: skills[0].as_str(),
-                            })
-                            .into_owned(),
-                        ));
-                        renderer.flush();
-                    } else {
-                        // 回显已加载 skill：第二个及以后的 skill 名若打错字会静默
-                        // 落进任务描述，这行让用户一眼看出"只加载了 N 个"。
-                        let names = skills.join(" · ");
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::SkillsLoaded {
-                                names: names.as_str(),
-                            })
-                            .into_owned(),
-                        ));
-                        renderer.flush();
-                        let rendered = blocks.join("\n\n---\n\n");
-                        submit_agent_turn(ctx, state, rendered);
-                    }
+                    let rendered = skill_invocation_prompt(&canonical, &skill_args);
+                    submit_agent_turn(ctx, state, rendered);
                 }
             }
         }
@@ -3924,9 +3941,9 @@ fn execute_slash_command_impl(
         }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
-            // then user-invocable skills (loaded from .claude/skills,
-            // .jeikcode/skills, etc.). Both expand to a prompt and dispatch
-            // as a regular user message.
+            // then user-invocable skills. Commands expand their template; skills
+            // become a `use_skill(...)` request. Both dispatch as a regular user
+            // message.
             match decide_custom_command(&ctx.custom_commands, other, arg) {
                 CustomDispatch::Reject => {
                     render_custom_command_error(renderer, &CustomDispatch::Reject, other);
@@ -3935,7 +3952,7 @@ fn execute_slash_command_impl(
                     submit_agent_turn(ctx, state, rendered);
                 }
                 CustomDispatch::NotFound => {
-                    if let Some(rendered) = expand_skill(ctx, other, arg) {
+                    if let Some(rendered) = skill_invocation(ctx, other, arg) {
                         submit_agent_turn(ctx, state, rendered);
                     } else {
                         // Unknown command — emit failure telemetry
@@ -3971,14 +3988,16 @@ fn execute_slash_command_impl(
 }
 
 /// 贪婪切分 `/skills` 参数：从左到右扫 whitespace 分词，`resolve(token)` 返回该
-/// token 对应 skill 的**规范身份**（`Some(canonical)`）时收入列表，否则停止。去重
-/// 按规范身份而非原始拼写——两个拼写不同但解析到同一 skill 的 token（大小写、后缀
-/// 简写等）只注入一次。列表里存用户原始拼写（回显更友好），展开时 `expand_skill`
-/// 会再归一化。遇到第一个非 skill 的 token，它及其之后的内容（按原串偏移，保留原
-/// 空白）作为任务描述返回。单个 skill（后面无第二个 skill 词）等价于旧 `splitn(2)`。
-fn split_skill_names(arg: &str, resolve: impl Fn(&str) -> Option<String>) -> (Vec<String>, String) {
-    let mut skills: Vec<String> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+/// token 对应 skill 的**规范身份**（`Some(canonical)`）时收入列表，否则停止。每个
+/// 条目同时保留用户拼写（回显用）与规范身份（`use_skill(...)` 用，含 plugin 命名
+/// 空间）；去重按规范身份。遇到第一个非 skill 的 token，它及其之后的内容（按原串
+/// 偏移，保留原空白）作为任务描述返回。单个 skill（后面无第二个 skill 词）等价于
+/// 旧 `splitn(2)`。
+fn split_skill_names(
+    arg: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> (Vec<(String, String)>, String) {
+    let mut skills: Vec<(String, String)> = Vec::new();
     let mut rest = arg.trim_start();
     loop {
         let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
@@ -3989,9 +4008,8 @@ fn split_skill_names(arg: &str, resolve: impl Fn(&str) -> Option<String>) -> (Ve
         let Some(canonical) = resolve(token) else {
             break;
         };
-        if !seen.iter().any(|c| c == &canonical) {
-            seen.push(canonical);
-            skills.push(token.to_string());
+        if !skills.iter().any(|(_, seen)| seen == &canonical) {
+            skills.push((token.to_string(), canonical));
         }
         rest = rest[token_end..].trim_start();
     }
@@ -4063,7 +4081,7 @@ pub(super) fn render_custom_command_error(
 /// - otherwise resolved command → `Submit(render(arg))`
 /// - no match → `NotFound`
 pub(super) fn decide_custom_command(
-    registry: &crate::custom_commands::CustomCommandRegistry,
+    registry: &zap_capabilities::commands::UserCommandRegistry,
     name: &str,
     arg: &str,
 ) -> CustomDispatch {
@@ -4079,16 +4097,34 @@ pub(super) fn decide_custom_command(
     }
 }
 
-/// Look up a user-invocable skill by name and expand it with the current
-/// session id. Returns the rendered prompt to send as a user message, or
-/// `None` if no matching skill exists.
-pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
-    let reg = ctx.skill_registry.read().ok()?;
-    let skill = reg.get(name)?;
-    if !skill.user_invocable {
-        return None;
+/// Ask the model to load a user-invocable skill through the `use_skill` tool,
+/// then handle the real request. Skills are never expanded locally — the tool
+/// path returns the raw SKILL.md body.
+pub(super) fn skill_invocation(ctx: &LoopCtx, name: &str, task: &str) -> Option<String> {
+    let canonical = ctx
+        .skill_registry
+        .read()
+        .ok()?
+        .get(name)
+        .filter(|skill| skill.user_invocable)
+        .map(|skill| skill.name.clone())?;
+    Some(skill_invocation_prompt(&[canonical], task))
+}
+
+/// Build `use_skill(<canonical>)\n\n{task}`. Multiple skills are listed one per
+/// line before the blank line so the model can load each in order.
+fn skill_invocation_prompt(skills: &[String], task: &str) -> String {
+    let mut out = skills
+        .iter()
+        .map(|name| format!("use_skill({name})"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let task = task.trim();
+    if !task.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(task);
     }
-    Some(skill.expand_for_injection(arg, ctx.current_session.id.as_str()))
+    out
 }
 
 /// Handle `/plugin` subcommands: marketplace add/remove/update/list,
@@ -6180,101 +6216,33 @@ mod rate_limited_tests {
     }
 }
 
-/// The synthetic `todowrite`-empty call + its tool result. Appended to the
-/// conversation, they make `reduce_todos`/`derive_current_todos` fold the list to
-/// `[]` (the empty list is the last plan), while keeping the transcript's
-/// call/result pairing valid for the next request. Kernel (session) message model.
-fn todo_clear_messages(id: String) -> Vec<zap_kernel::message::Message> {
-    use zap_kernel::message::Message;
-    use zap_kernel::tool::ToolCall;
-    let mut call = Message::assistant(
-        "",
-        vec![ToolCall {
-            id: id.clone(),
-            name: zap_capabilities::tools::TODO_TOOL_NAME.to_string(),
-            arguments: r#"{"todos":[]}"#.to_string(),
-        }],
-    );
-    call.internal_origin = Some("todo_clear".to_string());
-    let mut result = Message::tool_result(id, "0 tasks", false);
-    result.internal_origin = Some("todo_clear".to_string());
-    vec![call, result]
-}
-
-/// Synthetic tool-call pair for `/todo add <content>`: an incremental
-/// `{"action":"add","content":…}` call plus its result. Mirrors
-/// [`todo_clear_messages`]; the `content` is JSON-encoded via `serde_json` so
-/// quotes/newlines in the user's text can't break the args. Folds through the
-/// canonical `reduce_todos` as a new pending task appended at the end.
-fn todo_add_messages(id: String, content: &str) -> Vec<zap_kernel::message::Message> {
-    use zap_kernel::message::Message;
-    use zap_kernel::tool::ToolCall;
-    let args = serde_json::json!({ "action": "add", "content": content }).to_string();
-    let mut call = Message::assistant(
-        "",
-        vec![ToolCall {
-            id: id.clone(),
-            name: zap_capabilities::tools::TODO_TOOL_NAME.to_string(),
-            arguments: args,
-        }],
-    );
-    call.internal_origin = Some("todo_add".to_string());
-    let mut result = Message::tool_result(id, format!("Added task: {content}"), false);
-    result.internal_origin = Some("todo_add".to_string());
-    vec![call, result]
-}
-
-/// Append a synthetic todo-mutation message `pair` to the conversation and reseed
-/// the kernel (the proven `/resume` `SetConversation` path), then rebuild the live
-/// panel from the resulting transcript and persist. The subtle reseed dance lives
-/// HERE so `/todo add` and `/todo clear` can't drift. The caller supplies the pair
-/// (each carries a unique `tool_call_id` — the message count grows by 2 per call,
-/// so a constant id would be rejected as a duplicate by a strict gateway). The
-/// panel is refolded from the transcript, which naturally yields `None` after a
-/// clear (empty `todowrite`) and the appended task after an add — one code path
-/// for both.
-fn reseed_todo_conversation(
-    ctx: &mut LoopCtx,
-    state: &mut UiState,
-    pair: Vec<zap_kernel::message::Message>,
-) {
-    let mut snapshot = ctx.current_session.to_conversation_snapshot();
-    snapshot.messages.extend(pair);
-    ctx.runtime
-        .dispatch(zap_coding::DriverCommand::RestoreSnapshot(
-            snapshot.clone(),
-        ))
-        .ok();
-    ctx.current_session
-        .update_from_conversation_snapshot(snapshot);
-    ctx.current_session.touch();
-    state.active_todos = crate::event_loop::todo_progress_from_board(&ctx.current_session.id);
-    crate::event_loop::sync_todo_titles(state);
-}
-
 /// `/todo add <content>` — deterministically append a pending task without waiting
 /// on the model, so the next turn's TodoHook sees it and the model can act on it.
 fn add_todo(ctx: &mut LoopCtx, state: &mut UiState, content: &str) {
-    let id = format!("todo-add-{}", ctx.current_session.messages.len());
     let sid = ctx.current_session.id.clone();
     let mut items = zap_capabilities::tools::read_todo_board(&sid)
         .map(|board| board.items)
         .unwrap_or_default();
     items.push(zap_capabilities::tools::TodoItem {
+        id: None,
         content: content.to_string(),
         status: zap_capabilities::tools::todo::TodoStatus::Pending,
     });
     zap_capabilities::tools::commit_todo_board(&sid, &items);
-    reseed_todo_conversation(ctx, state, todo_add_messages(id, content));
+    // TodoHook 每轮按 board 注入；面板直接读 board，不再往会话里塞合成工具对。
+    state.active_todos = crate::event_loop::todo_progress_from_board(&sid);
+    crate::event_loop::sync_todo_titles(state);
 }
 
 /// `/todo clear` — deterministically wipe the task list without waiting on the
 /// model, so cancelled/stale tasks stop reappearing (the next turn derives an
 /// empty list and injects nothing).
 fn clear_todos(ctx: &mut LoopCtx, state: &mut UiState) {
-    let id = format!("todo-clear-{}", ctx.current_session.messages.len());
-    zap_capabilities::tools::clear_todo_board(&ctx.current_session.id);
-    reseed_todo_conversation(ctx, state, todo_clear_messages(id));
+    let sid = ctx.current_session.id.clone();
+    zap_capabilities::tools::clear_todo_board(&sid);
+    // board 已清空；面板直接跟随，不再向 transcript 追加合成空清单。
+    state.active_todos = None;
+    crate::event_loop::sync_todo_titles(state);
 }
 
 fn format_todo_board(session_id: &str, unicode: bool) -> String {
@@ -7429,8 +7397,8 @@ mod todo_command_tests {
     use super::{
         decide_custom_command, format_todo_command, render_custom_command_error, CustomDispatch,
     };
-    use crate::custom_commands::ArgsRequirement;
     use crate::render::{Renderer, UiLine};
+    use zap_capabilities::commands::ArgsRequirement;
     use zap_config::i18n::{t, Msg};
     use zap_kernel::message::{Message, Role};
     use zap_kernel::tool::ToolCall;
@@ -7473,8 +7441,8 @@ mod todo_command_tests {
 
     #[test]
     fn custom_required_args_render_and_metadata() {
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Required,
@@ -7494,8 +7462,8 @@ mod todo_command_tests {
 
     #[test]
     fn dispatch_custom_optional_empty_arg_submits() {
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Optional,
@@ -7511,8 +7479,8 @@ mod todo_command_tests {
 
     #[test]
     fn dispatch_custom_none_empty_arg_submits() {
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::None,
@@ -7529,7 +7497,7 @@ mod todo_command_tests {
     // ── dispatch decision: `Required` + empty arg ⇒ Reject ──────────────
     //
     // Regression guard for the `other` arm of `execute_slash_command_impl`.
-    // The prior tests above only covered `CustomCommandRegistry::render`'s
+    // The prior tests above only covered `UserCommandRegistry::render`'s
     // template substitution and the `args_requirement` metadata; none
     // exercised the dispatcher's reject-vs-submit boundary. If a future
     // refactor drops the `CmdCustomArgRequired` arm or flips the rule so
@@ -7541,8 +7509,8 @@ mod todo_command_tests {
         // Trigger: user typed `/myreview` (Required) and pressed Enter
         // with no argument. Expected: render CmdCustomArgRequired, do
         // NOT submit an agent turn.
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Required,
@@ -7559,33 +7527,13 @@ mod todo_command_tests {
     }
 
     #[test]
-    fn todo_clear_pair_folds_the_list_to_empty() {
-        // A live plan, then the `/todo clear` synthetic pair appended, must
-        // derive to an empty list → `/todo` shows the "no list" message. This
-        // is what makes cancelled/stale tasks stop reappearing.
-        let mut msgs = vec![tool_call_msg(vec![ToolCall {
-            id: "1".into(),
-            name: "todowrite".into(),
-            arguments: r#"{"todos":[{"content":"do x","status":"pending"}]}"#.into(),
-        }])];
-        assert!(format_todo_command(&msgs, false).contains("[ ] do x"));
-        msgs.extend(super::todo_clear_messages("todo-clear-1".to_string()));
-        let no_list = t(Msg::TodoNoList).into_owned();
-        assert!(
-            format_todo_command(&msgs, false).contains(&no_list),
-            "after the clear pair, /todo must show the no-list message; got:\n{}",
-            format_todo_command(&msgs, false)
-        );
-    }
-
-    #[test]
     fn dispatch_required_whitespace_only_arg_is_rejected() {
         // The dispatcher trims before checking emptiness, so a bare
         // space/tab arg should also reject — otherwise the user could
         // bypass validation by typing `/myreview ` (trailing space gets
         // injected by the needs_args menu auto-complete path).
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Required,
@@ -7598,49 +7546,6 @@ mod todo_command_tests {
             matches!(decision, CustomDispatch::Reject),
             "Required command with whitespace-only arg must be rejected, got {:?}",
             decision
-        );
-    }
-
-    #[test]
-    fn todo_add_pair_appends_a_task_keeping_existing() {
-        // A live plan, then the `/todo add` synthetic pair appended, must fold to
-        // the ORIGINAL task plus the new one at the end — existing tasks untouched.
-        let mut msgs = vec![tool_call_msg(vec![ToolCall {
-            id: "1".into(),
-            name: "todowrite".into(),
-            arguments: r#"{"todos":[{"content":"do x","status":"in_progress"}]}"#.into(),
-        }])];
-        msgs.extend(super::todo_add_messages(
-            "todo-add-1".to_string(),
-            "ship it",
-        ));
-        let out = format_todo_command(&msgs, false);
-        assert!(out.contains("do x"), "existing task must remain:\n{out}");
-        assert!(
-            out.contains("[ ] ship it"),
-            "new pending task appended:\n{out}"
-        );
-    }
-
-    #[test]
-    fn todo_add_from_empty_creates_the_list() {
-        // No prior plan: `/todo add` alone should create a one-item list.
-        let msgs = super::todo_add_messages("todo-add-0".to_string(), "first task");
-        let out = format_todo_command(&msgs, false);
-        assert!(
-            out.contains("[ ] first task"),
-            "add-from-empty seeds the list:\n{out}"
-        );
-    }
-
-    #[test]
-    fn todo_add_content_with_quotes_is_json_safe() {
-        // serde_json encoding must keep the args valid so the fold sees the task.
-        let msgs = super::todo_add_messages("todo-add-2".to_string(), r#"handle "weird" input"#);
-        let out = format_todo_command(&msgs, false);
-        assert!(
-            out.contains(r#"handle "weird" input"#),
-            "quoted content survives round-trip:\n{out}"
         );
     }
 
@@ -7674,8 +7579,8 @@ mod todo_command_tests {
         // rendered template, never Reject. Guards against an overly-broad
         // rejection rule (e.g. someone drops the `arg.trim().is_empty()`
         // half of the condition).
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Required,
@@ -7696,8 +7601,8 @@ mod todo_command_tests {
         // reject rule is scoped to Required only). Locks the boundary so
         // a regression that rejects all empty-arg dispatches is caught.
         for requirement in [ArgsRequirement::Optional, ArgsRequirement::None] {
-            let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-            custom.register(crate::custom_commands::CustomCommand {
+            let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+            custom.register(zap_capabilities::commands::UserCommand {
                 name: "myreview".into(),
                 description: "".into(),
                 args_requirement: requirement.clone(),
@@ -7724,7 +7629,7 @@ mod todo_command_tests {
         // A name that matches neither a custom command nor (in the pure
         // decision layer) a skill falls through to NotFound, which the
         // dispatcher translates into the unknown-command telemetry arm.
-        let custom = crate::custom_commands::CustomCommandRegistry::empty();
+        let custom = zap_capabilities::commands::UserCommandRegistry::empty();
         let decision = decide_custom_command(&custom, "does_not_exist", "");
         assert!(
             matches!(decision, CustomDispatch::NotFound),
@@ -7854,8 +7759,8 @@ mod todo_command_tests {
         // This is the closest unit-testable seam to the real dispatcher; the
         // full LoopCtx is intentionally avoided (it'd require constructing an
         // AgentClient + Telemetry + a dozen channels just to reach one arm).
-        let mut custom = crate::custom_commands::CustomCommandRegistry::empty();
-        custom.register(crate::custom_commands::CustomCommand {
+        let mut custom = zap_capabilities::commands::UserCommandRegistry::empty();
+        custom.register(zap_capabilities::commands::UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Required,
@@ -8015,7 +7920,7 @@ mod mcp_subcommand_tests {
 
 #[cfg(test)]
 mod split_skill_names_tests {
-    use super::split_skill_names;
+    use super::{skill_invocation_prompt, split_skill_names};
 
     /// 测试用假解析器：返回 skill 的规范身份（小写）。镜像真实 `SkillRegistry::get`
     /// 的大小写不敏感解析——`resolve("BrainStorming")` 与 `resolve("brainstorming")`
@@ -8029,24 +7934,37 @@ mod split_skill_names_tests {
         .then_some(canonical)
     }
 
+    fn pairs(skills: &[(String, String)]) -> Vec<(&str, &str)> {
+        skills
+            .iter()
+            .map(|(display, canonical)| (display.as_str(), canonical.as_str()))
+            .collect()
+    }
+
     #[test]
     fn multiple_skills_then_task() {
         let (skills, task) = split_skill_names("adapt-agent skill-creator 路径在哪", resolve);
-        assert_eq!(skills, vec!["adapt-agent", "skill-creator"]);
+        assert_eq!(
+            pairs(&skills),
+            vec![
+                ("adapt-agent", "adapt-agent"),
+                ("skill-creator", "skill-creator")
+            ]
+        );
         assert_eq!(task, "路径在哪");
     }
 
     #[test]
     fn single_skill_with_task_unchanged() {
         let (skills, task) = split_skill_names("brainstorming 做个登录页", resolve);
-        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(pairs(&skills), vec![("brainstorming", "brainstorming")]);
         assert_eq!(task, "做个登录页");
     }
 
     #[test]
     fn single_skill_no_task_unchanged() {
         let (skills, task) = split_skill_names("brainstorming", resolve);
-        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(pairs(&skills), vec![("brainstorming", "brainstorming")]);
         assert_eq!(task, "");
     }
 
@@ -8060,31 +7978,43 @@ mod split_skill_names_tests {
     #[test]
     fn typo_second_skill_falls_into_task() {
         let (skills, task) = split_skill_names("adapt-agent skil-creator 路径在哪", resolve);
-        assert_eq!(skills, vec!["adapt-agent"]);
+        assert_eq!(pairs(&skills), vec![("adapt-agent", "adapt-agent")]);
         assert_eq!(task, "skil-creator 路径在哪");
     }
 
     #[test]
     fn duplicate_skill_deduped() {
         let (skills, task) = split_skill_names("a a 任务", resolve);
-        assert_eq!(skills, vec!["a"]);
+        assert_eq!(pairs(&skills), vec![("a", "a")]);
         assert_eq!(task, "任务");
     }
 
     #[test]
     fn task_whitespace_preserved_verbatim() {
         let (skills, task) = split_skill_names("brainstorming line1\n  line2", resolve);
-        assert_eq!(skills, vec!["brainstorming"]);
+        assert_eq!(pairs(&skills), vec![("brainstorming", "brainstorming")]);
         assert_eq!(task, "line1\n  line2");
+    }
+
+    #[test]
+    fn skill_invocation_prompt_is_use_skill_plus_task() {
+        assert_eq!(
+            skill_invocation_prompt(&["skills:foo".into()], "修复登录"),
+            "use_skill(skills:foo)\n\n修复登录"
+        );
+        assert_eq!(
+            skill_invocation_prompt(&["a".into(), "b".into()], ""),
+            "use_skill(a)\nuse_skill(b)"
+        );
     }
 
     #[test]
     fn variant_spellings_of_same_skill_dedup_to_one() {
         // Different case both resolve to canonical "brainstorming" → one skill,
-        // NOT two (which would inject the same skill body twice). The first
-        // spelling the user typed is kept for display.
+        // NOT two (which would emit two `use_skill(...)` calls). The canonical
+        // identity is what goes into the tool invocation.
         let (skills, task) = split_skill_names("BrainStorming brainstorming 任务", resolve);
-        assert_eq!(skills, vec!["BrainStorming"]);
+        assert_eq!(pairs(&skills), vec![("BrainStorming", "brainstorming")]);
         assert_eq!(task, "任务");
     }
 }

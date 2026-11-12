@@ -1,8 +1,10 @@
 import DOMPurify from 'dompurify';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus, UpdateVersionEntry } from '../api';
+import { upgradeErrorText } from '../i18n';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { Markdown } from './Markdown';
 import { useT } from '../settings';
 
@@ -52,13 +54,20 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   const [updating, setUpdating] = useState(false);
   const [status, setStatus] = useState<UpdateStatus | null>(null);
 
-  const isDesktop = info?.is_desktop ?? false;
+  const isDesktop = false;
   const isMounted = useRef(true);
   const reloadStarted = useRef(false);
   const sawInstallProgress = useRef(false);
   const targetVersionRef = useRef('');
   const currentVersionRef = useRef('');
+  const initialInstanceIdRef = useRef('');
   const reloadAfterRestartRef = useRef<() => void>(() => {});
+
+  // 遮罩空白处点击关闭：仅在「按下」与「松开」都落在遮罩本身时生效，避免拖拽划词误关。
+  const mainBackdropDismiss = useBackdropDismiss(() => {
+    if (!updating) onClose();
+  });
+  const notesBackdropDismiss = useBackdropDismiss(() => setNotesOpen(false));
 
   useEffect(() => {
     isMounted.current = true;
@@ -118,10 +127,13 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         if (!isMounted.current || stopped) return;
         misses = 0;
         setStatus(s);
-        const progressed =
-          s.status === 'installing' ||
-          s.status === 'done' ||
-          (s.status === 'downloading' && (s.progress ?? 0) >= 90);
+        if (s.status === 'error') {
+          stopped = true;
+          window.clearInterval(timer);
+          setUpdating(false);
+          return;
+        }
+        const progressed = s.status === 'installing' || s.status === 'done';
         if (progressed) sawInstallProgress.current = true;
         const restarted =
           s.status === 'done' ||
@@ -173,20 +185,34 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     reloadStarted.current = true;
     const want = targetVersionRef.current;
     const from = currentVersionRef.current;
+    const initialInstanceId = initialInstanceIdRef.current;
     const timeoutMessage = t('update.restartTimeout');
     void (async () => {
       let misses = 0;
+      // 类似小地球机制：先给 500ms 让后端完成最后的数据帧并进入平滑停机与重启流程
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
       const deadline = Date.now() + 45000;
       while (Date.now() < deadline) {
         try {
-          const resp = await fetch('/health', {
+          const resp = await fetch(`/health?_t=${Date.now()}`, {
             credentials: 'include',
             signal: AbortSignal.timeout(1500),
+            cache: 'no-store',
           });
           if (resp.ok) {
             const body = await resp.json();
             const got = String(body?.version ?? '');
-            if (shouldReloadUpgradedPage({ want, from, got, consecutiveMisses: misses })) {
+            const currentInstanceId = String(body?.instance_id ?? '');
+            if (
+              shouldReloadUpgradedPage({
+                want,
+                from,
+                got,
+                consecutiveMisses: misses,
+                initialInstanceId,
+                currentInstanceId,
+              })
+            ) {
               window.location.reload();
               return;
             }
@@ -217,6 +243,20 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     reloadStarted.current = false;
     sawInstallProgress.current = false;
     setUpdating(true);
+    // 启动更新前记录当前实例代际 ID，用于重启后瞬间感知新进程上线
+    try {
+      const probe = await fetch(`/health?_t=${Date.now()}`, {
+        credentials: 'include',
+        signal: AbortSignal.timeout(1000),
+        cache: 'no-store',
+      });
+      if (probe.ok) {
+        const body = await probe.json();
+        initialInstanceIdRef.current = String(body?.instance_id ?? '');
+      }
+    } catch {
+      /* 忽略前置失败 */
+    }
     try {
       await executeUpdate({
         channel,
@@ -267,38 +307,24 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
   };
 
   const hasUpdate = info?.has_update ?? false;
+  // 稳定失败码命中时直接展示自包含的多语言文案；未知码退回 “更新失败: 原始诊断”。
+  const localizedUpdateError = upgradeErrorText(t, status?.error_code);
   const canInstall =
     !isChecking &&
     !checkError &&
     !!targetVersion &&
-    (!isLatestPick || hasUpdate);
+    (!isLatestPick || hasUpdate || forceReinstall);
 
   return (
     <>
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        if (!updating && e.target === e.currentTarget) onClose();
-      }}
+      {...mainBackdropDismiss}
     >
       <div class="modal-card update-modal-card" role="dialog" aria-labelledby="update-dialog-title">
         <div class="modal-header">
           <span style="font-size: 16px;">🚀</span>
           <h3 id="update-dialog-title">{t('update.modalTitle')}</h3>
-          <div style={{ flex: 1 }} />
-          <a
-            class="update-github-link"
-            href="https://github.com/1852676265/JeikCode"
-            target="_blank"
-            rel="noopener noreferrer"
-            title="GitHub: 1852676265/JeikCode"
-            aria-label="GitHub Repository"
-          >
-            <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
-            </svg>
-            <span>GitHub</span>
-          </a>
           {!updating && (
             <button class="ghost-btn modal-close" onClick={onClose} aria-label={t('common.cancel')}>
               ×
@@ -378,6 +404,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                   <span class="update-status-sparkle">✨</span>
                   <span>{t('update.dialogDesc', { version: info?.latest_version || '' })}</span>
                 </div>
+              ) : forceReinstall ? (
+                <div class="update-status-row has-update">
+                  <span class="update-status-sparkle">🔁</span>
+                  <span>{t('update.dialogDescForce', { version: info?.latest_version || '' })}</span>
+                </div>
               ) : (
                 <div class="update-status-row latest">
                   <span class="update-status-check-icon">✓</span>
@@ -394,7 +425,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                 />
               </div>
               <div class="update-progress-status-row">
-                <span class="update-progress-text">
+                <span
+                  class="update-progress-text"
+                  // 原始诊断（URL / HTTP 状态）保留在悬浮提示里，正文只用本地化文案。
+                  title={status?.status === 'error' ? status?.error || undefined : undefined}
+                >
                   {status?.status === 'downloading'
                     ? isDesktop
                       ? t('update.downloadingSetup', { percent: status?.progress ?? 0 })
@@ -406,7 +441,8 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                       : status?.status === 'done'
                         ? t('update.readyCli')
                         : status?.status === 'error'
-                          ? t('update.failed', { error: status?.error || '' })
+                          ? (localizedUpdateError ??
+                            t('update.failed', { error: status?.error || '' }))
                           : t('update.downloading')}
                 </span>
                 <span class="update-progress-percent">
@@ -525,9 +561,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     {notesOpen && (
       <div
         class="release-notes-overlay"
-        onClick={(e) => {
-          if (e.target === e.currentTarget) setNotesOpen(false);
-        }}
+        {...notesBackdropDismiss}
       >
         <div
           class="release-notes-card"

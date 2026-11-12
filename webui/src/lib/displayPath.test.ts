@@ -111,8 +111,8 @@ test('getRelativePathToProject computes full project-relative path across root a
   assert.equal(getRelativePathToProject('webui/src/components/GitPanel.tsx', project, project), 'webui/src/components/GitPanel.tsx');
 
   // 2. 多仓/子仓库场景 (repoRoot 是 project 的子目录)
-  const subRepo = 'E:/code/jeikcode/crates/zap-daemon';
-  assert.equal(getRelativePathToProject('src/api_git_webhook.rs', subRepo, project), 'crates/zap-daemon/src/api_git_webhook.rs');
+  const subRepo = 'E:/code/jeikcode/crates/jeikcode-daemon';
+  assert.equal(getRelativePathToProject('src/api_git_webhook.rs', subRepo, project), 'crates/jeikcode-daemon/src/api_git_webhook.rs');
 
   // 3. 绝对路径转相对项目路径
   assert.equal(getRelativePathToProject('E:/code/jeikcode/README.md', project, project), 'README.md');

@@ -318,6 +318,12 @@ pub struct OnboardingWizard {
     pub(super) needs_confirm: bool,
 }
 
+/// Languages offered by the wizard, in display order. Aliased to
+/// [`zap_config::locale::Locale::ALL`] so `/language` and onboarding
+/// can never disagree about the set or the ordering.
+pub const ONBOARDING_LANGUAGES: &[zap_config::locale::Locale] =
+    zap_config::locale::Locale::ALL;
+
 impl OnboardingWizard {
     /// Standard constructor — `/welcome` with empty body. The 3-step
     /// (Intro → Language → Setup) flow is shared with first-launch.
@@ -359,12 +365,9 @@ impl OnboardingWizard {
         mut self,
         config_lang: Option<zap_config::locale::Locale>,
     ) -> Self {
-        self.language_idx = match config_lang {
-            None => 0,
-            Some(zap_config::locale::Locale::En) => 0,
-            Some(zap_config::locale::Locale::Vi) => 1,
-            Some(zap_config::locale::Locale::ZhCn) => 2,
-        };
+        self.language_idx = config_lang
+            .and_then(|lang| ONBOARDING_LANGUAGES.iter().position(|&l| l == lang))
+            .unwrap_or(0);
         self
     }
 
@@ -407,26 +410,21 @@ impl OnboardingWizard {
                 PureOutcome::Redraw
             }
             (Language, KeyCode::Down) => {
-                if self.language_idx < 2 {
+                let max_idx = ONBOARDING_LANGUAGES.len().saturating_sub(1);
+                if self.language_idx < max_idx {
                     self.language_idx += 1;
                 }
                 PureOutcome::Redraw
             }
-            // Number keys are shortcuts: pick AND commit in one
-            // keystroke. The arrow-key path still requires Enter,
-            // but typing a digit is unambiguous — the user already
-            // expressed intent, no second confirmation needed.
-            (Language, KeyCode::Char('1')) => {
-                self.language_idx = 0;
-                PureOutcome::ApplyLanguageThenAdvance
-            }
-            (Language, KeyCode::Char('2')) => {
-                self.language_idx = 1;
-                PureOutcome::ApplyLanguageThenAdvance
-            }
-            (Language, KeyCode::Char('3')) => {
-                self.language_idx = 2;
-                PureOutcome::ApplyLanguageThenAdvance
+            // Number keys are shortcuts: pick AND commit in one keystroke.
+            (Language, KeyCode::Char(c @ '1'..='9')) => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < ONBOARDING_LANGUAGES.len() {
+                    self.language_idx = idx;
+                    PureOutcome::ApplyLanguageThenAdvance
+                } else {
+                    PureOutcome::Noop
+                }
             }
             (Language, KeyCode::Enter) => PureOutcome::ApplyLanguageThenAdvance,
             (Language, KeyCode::Left) => {
@@ -564,18 +562,21 @@ impl OnboardingWizard {
         out.push(t(Msg::OnboardingStepHeaderLanguage).into_owned());
         out.push(String::new());
 
-        // Native labels let users pick their preferred language before the UI is translated.
-        let options = ["English", "Tiếng Việt", "简体中文"];
-
+        // Rows lead with the ASCII English name and append the native
+        // spelling as a recognition hint. The terminal font is still
+        // unknown at this point — a Linux console or an xterm using the
+        // classic `fixed` bitmap font has no CJK coverage and paints the
+        // native half as `♦`/`□` tofu — so the English name is what makes
+        // the row identifiable, never the native one alone.
         let mut content: Vec<String> = Vec::new();
         content.push(String::new());
         content.push(t(Msg::OnboardingLanguageTitleBilingual).into_owned());
         content.push(String::new());
         content.push(t(Msg::OnboardingLanguagePrompt).into_owned());
         content.push(String::new());
-        for (i, label) in options.iter().enumerate() {
+        for (i, loc) in ONBOARDING_LANGUAGES.iter().enumerate() {
             let bullet = if i == self.language_idx { '●' } else { '○' };
-            content.push(format!("{bullet}  [{}] {}", i + 1, label));
+            content.push(format!("{bullet}  [{}] {}", i + 1, loc.display_label()));
         }
         content.push(String::new());
         content.push(t(Msg::OnboardingNavHint).into_owned());
@@ -602,12 +603,10 @@ impl OnboardingWizard {
         store: &zap_config::ConfigStore,
     ) -> anyhow::Result<zap_config::locale::Locale> {
         use zap_config::locale::Locale;
-        let new_locale = match self.language_idx {
-            0 => Locale::En,
-            1 => Locale::Vi,
-            2 => Locale::ZhCn,
-            _ => unreachable!("language_idx is bounded 0..=2"),
-        };
+        let new_locale = ONBOARDING_LANGUAGES
+            .get(self.language_idx)
+            .copied()
+            .unwrap_or(Locale::En);
         // Only update active running state after config persistence succeeds.
         store.update(|latest| {
             latest.language = Some(new_locale);
@@ -1006,14 +1005,17 @@ mod tests {
     fn language_up_down_moves_idx() {
         let mut w = make_wizard();
         w.step = Step::Language;
-        w.language_idx = 1;
+        let last_idx = ONBOARDING_LANGUAGES.len() - 1;
+        w.language_idx = last_idx - 1;
         w.handle_key_for_test(KeyCode::Down);
-        assert_eq!(w.language_idx, 2);
+        assert_eq!(w.language_idx, last_idx);
         w.handle_key_for_test(KeyCode::Down);
-        assert_eq!(w.language_idx, 2, "should not exceed last index");
+        assert_eq!(w.language_idx, last_idx, "should not exceed last index");
         w.handle_key_for_test(KeyCode::Up);
-        assert_eq!(w.language_idx, 1);
-        w.handle_key_for_test(KeyCode::Up);
+        assert_eq!(w.language_idx, last_idx - 1);
+        while w.language_idx > 0 {
+            w.handle_key_for_test(KeyCode::Up);
+        }
         w.handle_key_for_test(KeyCode::Up);
         assert_eq!(w.language_idx, 0, "saturating_sub keeps idx at 0");
     }
@@ -1171,10 +1173,10 @@ mod tests {
 
     // ── Step 2 (Language) draw + apply tests ──
 
-    /// Bilingual title + 3 numbered options + nav hint all present in
+    /// Bilingual title + numbered options + nav hint all present in
     /// the rendered output.
     #[test]
-    fn language_layout_has_three_options_with_numbers() {
+    fn language_layout_has_numbered_options() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_language_lines(80, true);
@@ -1185,14 +1187,46 @@ mod tests {
             .join("\n");
         // Bilingual title (locale-independent).
         assert!(joined.contains("Choose your language / 选择语言"));
-        // Three numbered options.
+        // Numbered options: English name first, native spelling as a hint.
         assert!(joined.contains("[1] English"));
-        assert!(joined.contains("[2] Tiếng Việt"));
-        assert!(joined.contains("[3] 简体中文"));
+        assert!(joined.contains("[2] Vietnamese (Tiếng Việt)"));
+        assert!(joined.contains("[3] Simplified Chinese (简体中文)"));
         // Step header + indicator.
         assert!(joined.contains("Step 2/3 · Language"));
         // Nav hint.
-        assert!(joined.contains("1-3 select"));
+        assert!(joined.contains("select"));
+    }
+
+    /// Regression for the reported Linux bug: on a terminal whose font has
+    /// no CJK coverage (xterm with the classic `fixed` bitmap font, the
+    /// kernel VT console, …) the native half of every row renders as tofu.
+    /// Each row must still be identifiable from its ASCII prefix alone.
+    #[test]
+    fn every_language_row_is_identifiable_without_native_glyphs() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_language_lines(80, true);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (i, loc) in ONBOARDING_LANGUAGES.iter().enumerate() {
+            // Simulate a font that can only paint ASCII: drop every
+            // non-ASCII cell and the row must STILL name its language.
+            let ascii_row: String = joined
+                .lines()
+                .find(|l| l.contains(&format!("[{}] ", i + 1)))
+                .unwrap_or_else(|| panic!("row {} missing", i + 1))
+                .chars()
+                .filter(|c| c.is_ascii())
+                .collect();
+            assert!(
+                ascii_row.contains(loc.english_name()),
+                "row {} is unidentifiable without native glyphs: {ascii_row:?}",
+                i + 1
+            );
+        }
     }
 
     /// Selected marker `●` sits on the row matching language_idx;
@@ -1210,7 +1244,8 @@ mod tests {
             .map(|s| strip_sgr(s))
             .collect::<Vec<_>>()
             .join("\n");
-        // `●  [3] 简体中文` selected; `○  [2] Tiếng Việt` unselected.
+        // `●  [3] Simplified Chinese …` selected; `○  [2] Vietnamese …`
+        // unselected.
         let pos_filled = joined.find("●  [3]").expect("filled marker missing");
         let pos_hollow = joined.find("○  [2]").expect("hollow marker missing");
         assert!(
@@ -1226,10 +1261,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = zap_config::ConfigStore::new(tmp.path().join("config.toml"));
         let mut cfg = blank_config_for_test();
-        for (idx, locale) in [Locale::En, Locale::Vi, Locale::ZhCn]
-            .into_iter()
-            .enumerate()
-        {
+        for (idx, &locale) in ONBOARDING_LANGUAGES.iter().enumerate() {
             let mut w = OnboardingWizard::new();
             w.language_idx = idx;
             assert_eq!(w.apply_language(&mut cfg, &store).unwrap(), locale);

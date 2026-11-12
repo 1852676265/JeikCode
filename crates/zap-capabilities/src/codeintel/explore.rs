@@ -263,27 +263,46 @@ fn seed_fork_defaults() {
     if !tools_dest.exists() {
         let _ = std::fs::write(&tools_dest, BUILTIN_TOOLS_ASSET);
     }
-    // mcp.json — the fork's default MCP server wiring (brave-search /
-    // ddg-search / js-reverse). Only seeded when the user has no mcp.json.
+    // mcp.json — the fork's default MCP server wiring (ddg-search).
+    // Only seeded when the user has no mcp.json.
     let mcp_dest = dir.join("mcp.json");
     if !mcp_dest.exists() {
         let _ = std::fs::write(&mcp_dest, MCP_JSON_ASSET);
     }
     // .codegraphignore — bundled ignore rules. First run writes the file.
     // A later change to the asset is not written over an existing copy here.
-    // Config sync compares the bundled file with ~/.zap/.codegraphignore
+    // Config sync compares the bundled file with ~/.jeikcode/.codegraphignore
     // and offers it as a checked file diff (scan_zap_config_diffs).
     let ignore_dest = dir.join(".codegraphignore");
     if !ignore_dest.exists() {
         let _ = std::fs::write(&ignore_dest, CODEGRAPH_IGNORE_ASSET);
     }
-    // .codegraphignore.graph — GRAPH-ONLY sensitive rules (`.env*`, keys, SSH). Seeded
-    // alongside the noise list; the search walker never registers this filename, so
-    // glob/grep can still find what the user explicitly asks for.
+    // Legacy default: `*.log` used to live in `.codegraphignore`. Search now
+    // controls logs via the tool-level `include_logs` switch, so remove only the
+    // standalone default line from existing user configs. Custom rules stay.
+    migrate_legacy_log_ignore(&ignore_dest);
+    // .codegraphignore.graph — sensitive rules (`.env*`, keys, SSH). Seeded alongside
+    // the noise list; grep/glob exclude these paths by default. include_sensitive=true
+    // is the approval-gated switch that can include them.
     let graph_only_dest = dir.join(".codegraphignore.graph");
     if !graph_only_dest.exists() {
         let _ = std::fs::write(&graph_only_dest, CODEGRAPH_GRAPH_ONLY_ASSET);
     }
+}
+
+fn migrate_legacy_log_ignore(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if !text.lines().any(|line| line.trim() == "*.log") {
+        return;
+    }
+    let filtered: Vec<&str> = text.lines().filter(|line| line.trim() != "*.log").collect();
+    let mut out = filtered.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let _ = std::fs::write(path, out);
 }
 
 /// Bundled thesaurus dictionaries (this fork's domain word-lists), embedded so
@@ -335,15 +354,15 @@ static THESAURUS_ASSETS: std::sync::LazyLock<
 /// `[tools.tool_output] no_fold_tools`), embedded for first-run seeding.
 static BUILTIN_TOOLS_ASSET: &str = include_str!("../../assets/builtin-tools.txt");
 
-/// Bundled default MCP server wiring (brave-search / ddg-search / js-reverse),
+/// Bundled default MCP server wiring (ddg-search),
 /// seeded as `~/.jeikcode/mcp.json` on first run (never overwrites existing).
 static MCP_JSON_ASSET: &str = include_str!("../../assets/mcp.json");
 
 /// Bundled default code-graph ignore rules (generated/minified artifacts,
-/// vendored deps), seeded as `~/.zap/.codegraphignore` on first run.
+/// vendored deps), seeded as `~/.jeikcode/.codegraphignore` on first run.
 static CODEGRAPH_IGNORE_ASSET: &str = include_str!("../../assets/.codegraphignore");
-/// GRAPH-ONLY sensitive-credential rules (`assets/.codegraphignore.graph`): applied by
-/// `codeintel::index::load_codegraph_ignore` only — never by the glob/grep search walker.
+/// Sensitive-credential rules (`assets/.codegraphignore.graph`): applied by code graph
+/// indexing and as the default glob/grep exclusion; `include_sensitive` is approval-gated.
 static CODEGRAPH_GRAPH_ONLY_ASSET: &str = include_str!("../../assets/.codegraphignore.graph");
 
 #[derive(Deserialize)]
@@ -448,7 +467,7 @@ impl Tool for CodeExploreTool {
     }
 
     /// code_explore 的输出是模型做架构判断的完整上下文(候选表/目录全景/
-    /// 调用链/源码片段),中途折叠成「预览+fetch_output 取回」会打断阅读流。
+    /// 调用链/源码片段),中途折叠成「预览+artifact 折叠」会打断阅读流。
     /// 声明完整载荷 → ArtifactMiddleware 与内核大小上限都跳过,
     /// 直接全量展示(超大仓库场景仍受工具自身的 max_files/span 折叠控制)。
     fn never_truncate_result(&self) -> bool {
@@ -488,9 +507,9 @@ impl Tool for CodeExploreTool {
             }),
         );
 
-        // Load project-specific thesaurus from `.zap/thesaurus`
+        // Load project-specific thesaurus from `.jeikcode/thesaurus`
         {
-            let project_thesaurus_dir = root.join(".zap").join("thesaurus");
+            let project_thesaurus_dir = root.join(".jeikcode").join("thesaurus");
             if project_thesaurus_dir.is_dir() {
                 if let Ok(mut th) = self.thesaurus.write() {
                     th.load_from_dir(&project_thesaurus_dir);
@@ -3125,6 +3144,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_log_ignore_is_removed_but_custom_rules_stay() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(".codegraphignore");
+        std::fs::write(&path, "# custom\n*.log\nnoise.txt\n").unwrap();
+        migrate_legacy_log_ignore(&path);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.lines().any(|line| line.trim() == "*.log"));
+        assert!(out.contains("noise.txt"));
+    }
+
+    #[test]
     fn test_field_qualified_query_parser() {
         let q =
             parse_field_qualified_query("kind:trait path:session name:ToolMiddleware agent loop");
@@ -3849,7 +3879,7 @@ mod tests {
         ));
         assert!(!path_matches_scope(
             Path::new("jeikcode/crates/zap-tuix/src/event_loop.rs"),
-            Path::new("jeikcode/crates/zap-tui")
+            Path::new("jeikcode/crates/jeikcode-tui")
         ));
 
         // 4. Absolute canonicalized scope vs relative indexed file (the live Zero-Hit case)
@@ -4881,6 +4911,54 @@ mod tests {
         assert_eq!(
             cands2[0].file, sanshui_node.file,
             "搜索三水一调必须命中 CustomerBaseData"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline_verdict)]
+    async fn test_code_explore_works_offline_with_air_gap() {
+        use zap_config::config::offline::{seed_offline_verdict, OfflineMode};
+        use tokio_util::sync::CancellationToken;
+
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                zap_config::config::offline::seed_offline_verdict(OfflineMode::Off, None);
+            }
+        }
+        let _guard = ResetGuard;
+
+        seed_offline_verdict(OfflineMode::On, None);
+
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(
+            d.path().join("src/lib.rs"),
+            "pub fn offline_secure_function() -> bool { true }\n",
+        )
+        .unwrap();
+
+        let idx = Arc::new(CodeIndex::new());
+        let _ = idx.build(d.path());
+        let tool = CodeExploreTool::new(idx);
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: zap_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let args = r#"{"query":"offline_secure_function","path":"src"}"#;
+        let result = tool.execute(args, &ctx).await;
+
+        assert!(
+            !result.is_error,
+            "code_explore should succeed offline: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("offline_secure_function"),
+            "result must contain local symbol:\n{}",
+            result.content
         );
     }
 }

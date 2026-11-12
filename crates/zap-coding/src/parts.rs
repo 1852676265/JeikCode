@@ -27,17 +27,17 @@ use zap_capabilities::memory::MemoryHook;
 
 use zap_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use zap_capabilities::session::{
-    DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionContextHook,
-    SessionLease, SessionManager, SessionMeta, SnapshotHook, StatusReminderHook, StorageOwner,
-    TranscriptHook,
+    DisplayAnchor, DisplayHook, PresentationEntry, PresentationFile, PresentationRole,
+    SessionContextHook, SessionLease, SessionManager, SessionMeta, SnapshotHook,
+    StatusReminderHook, StorageOwner, TranscriptHook,
 };
 use zap_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use zap_capabilities::tools::{
     register_coding_tools_with_vision_and_bash_state, ApprovalMiddleware, ArtifactMiddleware,
-    ArtifactStore, BashRuntimeState, BashWorkspaceGate, FetchOutputTool, ReadFileTool,
-    RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    ArtifactStore, BashRuntimeState, BashWorkspaceGate, ReadFileTool, RepairToolArgsMiddleware,
+    SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use zap_kernel::agent::Agent;
 use zap_kernel::checkpoint::CompactionCheckpoint;
@@ -320,8 +320,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
-    let bash_runtime =
-        reuse_bash_runtime.unwrap_or_else(zap_capabilities::tools::legacy_bash_runtime_state);
+    // 每个 CodingRuntime 独占一个 BashRuntimeState：只有同一 runtime 的能力重载
+    // （Reprepare / 同会话 reconfigure）才复用旧状态，以便后台任务与关键词继续可见。
+    // 绝不能回退到进程级 `legacy_bash_runtime_state()`——那会让同进程内多个会话共享
+    // 一个任务注册表，导致 A 会话 Stop/被回收时误杀 B 会话正在执行的前台 run_command。
+    let bash_runtime = reuse_bash_runtime.unwrap_or_else(|| Arc::new(BashRuntimeState::new()));
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
@@ -518,7 +521,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let skills = Arc::new(skills);
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
-    // learns which skills exist — only the use_skill/list_skills tools were mounted).
+    // learns which skills exist — only the use_skill tool was mounted).
     let skill_catalog = skills.render_catalog();
     register_skill_tools(&mut registry, skills);
     names.extend(
@@ -640,6 +643,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     };
 
     if let Some(b) = &session {
+        // Bind the runtime state to this session so every live bash task it registers
+        // is attributable to (and cancellable only by) this session.
+        bash_runtime.bind_session(b.id.as_str());
         let keywords = b.manager.load_bash_keywords(&b.id).unwrap_or_default();
         if let Ok(path) = b.manager.bashkw_path(&b.id) {
             bash_runtime.bind_session_long_keywords(path, keywords);
@@ -710,6 +716,24 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             Arc::clone(&mcp_tool_names),
         )));
     }
+    // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
+    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
+    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
+    // JEIKCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
+    // references tools that aren't mounted). This is the ONLY production registration of
+    // TodoHook — every real entrypoint (CLI, daemon, clix) goes through prepare()/assemble()
+    // here; `assemble.rs::build_coding_agent` (which also registers it) is reachable only
+    // from tests + examples, so there is no double-registration.
+    //
+    // CRITICAL: Registered BEFORE SnapshotHook so that on turn_complete, TodoHook's
+    // close_todo_board_if_complete runs first, allowing SnapshotHook to observe the converged
+    // board closure and delete completed .todo sidecars during commit_native_runtime_mutation.
+    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
+        hooks.push(Arc::new(match todo_live {
+            Some(live) => crate::todo::TodoHook::with_live(live),
+            None => crate::todo::TodoHook::new(),
+        }));
+    }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
@@ -720,6 +744,14 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         compaction_checkpoint = Some(snapshot_hook.clone());
         snapshot_hook_handle = Some(snapshot_hook.clone());
+        // UI-only display log must run BEFORE SnapshotHook clears the partial
+        // sidecar on a cancelled turn; otherwise the already-rendered partial
+        // assistant can never be persisted for a cold start.
+        hooks.push(Arc::new(DisplayHook::new(
+            b.manager.clone(),
+            &b.id,
+            &cfg.working_dir,
+        )));
         hooks.push(snapshot_hook.clone());
         hooks.push(Arc::new(
             TranscriptHook::new(b.manager.clone(), &b.id)
@@ -737,22 +769,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     hooks.push(Arc::new(
         zap_capabilities::session::WriteStateHook::new(),
     ));
-    // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
-    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
-    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
-    // JEIKCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
-    // references tools that aren't mounted). This is the ONLY production registration of
-    // TodoHook — every real entrypoint (CLI, daemon, clix) goes through prepare()/assemble()
-    // here; `assemble.rs::build_coding_agent` (which also registers it) is reachable only
-    // from tests + examples, so there is no double-registration.
-    if crate::persona::todo_switch_enabled_for(cfg.todo.enabled) {
-        hooks.push(Arc::new(match todo_live {
-            Some(live) => crate::todo::TodoHook::with_live(live),
-            None => crate::todo::TodoHook::new(),
-        }));
-    }
-    // Opening-turn code_explore tail (appended to the first real user block, like
-    // the date reminder) + wander-meter middleware registered in `assemble`.
+    // Per-session code_explore wander meter: the tool middleware is registered in
+    // `assemble`, and this lifecycle handle keeps the session-end cleanup.
     let code_tools_first = Arc::new(crate::code_tools_first::CodeToolsFirstHook::new(
         code_explore_mounted,
         session.as_ref().map(|b| b.id.as_str()),
@@ -1395,20 +1413,18 @@ pub fn assemble(
     // likewise counted.
     let summary_provider = metered_provider;
 
-    // When a session is present, wire the artifact store: register the fetch_output tool
-    // so the model can retrieve large outputs, and prepare the middleware that intercepts
-    // oversized tool results and spills them to disk.  No session → no artifact I/O.
+    // When a session is present, wire the artifact store into ReadFileTool so the model
+    // can retrieve large outputs via `artifact://<artifact_id>`, and prepare the middleware
+    // that intercepts oversized tool results and spills them to disk. No session → no artifact I/O.
     let artifact_store: Option<Arc<ArtifactStore>> = parts.session.as_ref().and_then(|b| {
         b.manager
             .artifacts_dir(&b.id)
             .ok()
             .map(|dir| Arc::new(ArtifactStore::new(dir)))
     });
-    if let Some(store) = &artifact_store {
-        parts
-            .registry
-            .register(Arc::new(FetchOutputTool::new(store.clone())));
-    }
+    parts.registry.register(Arc::new(
+        ReadFileTool::new(cfg.supports_vision).with_optional_artifact_store(artifact_store.clone()),
+    ));
 
     // Must pass cfg.working_dir: the live/WebUI path never std::env::set_current_dir,
     // so falling back to process cwd leaves Block 1 stuck on the launch directory
@@ -1537,12 +1553,23 @@ pub fn assemble(
         // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
         // →drain+LLM-summary). Stubs old tool results once utilization crosses the threshold
         // (kept full below it); the overflow tiers fire only on a typed overflow error.
-        .compaction(Arc::new(
-            zap_capabilities::compaction::OverflowCompaction::new(
+        .compaction({
+            let mut strategy = zap_capabilities::compaction::OverflowCompaction::new(
                 zap_capabilities::compaction::StubCompaction::default(),
                 Some(summary_provider),
-            ),
-        ))
+            );
+            // Session-bound runtimes archive every drained span VERBATIM into the
+            // session's artifact store (watchdog-governed), so the summary can point a
+            // successor at `artifact://<id>` for exact code/errors/tool output.
+            if let Some(binding) = &parts.session {
+                if let Ok(dir) = binding.manager.artifacts_dir(&binding.id) {
+                    strategy = strategy.with_archive(Arc::new(
+                        zap_capabilities::tools::output_artifact::ArtifactStore::new(dir),
+                    ));
+                }
+            }
+            Arc::new(strategy)
+        })
         .compact_threshold(cfg.compact_threshold)
         .timeouts(cfg.timeouts)
         .first_token_timeout_retries(cfg.first_token_timeout_retries)
@@ -1695,24 +1722,15 @@ pub fn assemble(
     Ok(agent)
 }
 
-const ZAP_PERSONA_PREFIX: &str =
-    "You are Zap, an AI coding agent by Zap running the ";
 const JEIKCODE_PERSONA_PREFIX: &str =
     "You are JeikCode, an AI coding agent by JeikCode running the ";
 const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
 
 fn persona_model(text: &str) -> Option<&str> {
-    // Canonical: the machine-readable marker block 1 carries (`coding_persona_blocks_*`).
-    // The identity WORDING is owned by the built-in / env prompt and may not name the
-    // model at all — prose parsing alone silently stopped detecting `/model` switches.
-    if let Some(pos) = text.find(crate::persona::MODEL_MARKER_OPEN) {
-        let rest = &text[pos + crate::persona::MODEL_MARKER_OPEN.len()..];
-        if let Some(end) = rest.find(" -->") {
-            return Some(rest[..end].trim());
-        }
-    }
     // Legacy snapshots / custom persona templates that still name the model in the prose.
-    if let Some(rest) = text.strip_prefix(ZAP_PERSONA_PREFIX).or_else(|| text.strip_prefix(JEIKCODE_PERSONA_PREFIX)) {
+    // New personas deliberately carry no model marker; the model is tracked in
+    // `SessionSnapshot::model` instead.
+    if let Some(rest) = text.strip_prefix(JEIKCODE_PERSONA_PREFIX) {
         return rest.split_once(" model.").map(|(model, _)| model);
     }
     if let Some(pos) = text.find(" running the ") {
@@ -1727,9 +1745,7 @@ fn is_persona_block_1(message: &Message) -> bool {
         return false;
     }
     message.text.starts_with("<environment>")
-        || message.text.starts_with(ZAP_PERSONA_PREFIX)
         || message.text.starts_with(JEIKCODE_PERSONA_PREFIX)
-        || message.text.starts_with("You are Zap")
         || message.text.starts_with("You are JeikCode")
         || (message.text.contains(" running the ")
             && message.text.contains(" model.")
@@ -1740,9 +1756,11 @@ fn is_persona_block_2(message: &Message) -> bool {
     if message.role != Role::System {
         return false;
     }
-    message
-        .text
-        .starts_with("<workflow_and_execution_discipline>")
+    message.text.starts_with("<environment>")
+        || message.text.starts_with("<system_rules>")
+        || message
+            .text
+            .starts_with("<workflow_and_execution_discipline>")
         || message
             .text
             .starts_with(crate::persona::CRITICAL_PRECEDENCE_NOTICE)
@@ -1794,12 +1812,15 @@ fn reconcile_coding_persona(
     let is_model_change = |message: &Message| {
         message.role == Role::System && message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)
     };
-    let previous_model = snapshot
-        .messages
-        .iter()
-        .find(|message| is_persona_block_1(message))
-        .and_then(|message| persona_model(&message.text))
-        .map(str::to_owned);
+    let previous_model = snapshot.model.clone().or_else(|| {
+        snapshot
+            .messages
+            .iter()
+            .find(|message| is_persona_block_1(message))
+            .and_then(|message| persona_model(&message.text))
+            .map(str::to_owned)
+    });
+    snapshot.model = Some(cfg.model.clone());
     let existing_transition = snapshot.messages.iter().find_map(|m| {
         if m.role == Role::System {
             if let Some(idx) = m.text.find(MODEL_CHANGE_CONTEXT_PREFIX) {
@@ -1823,26 +1844,23 @@ fn reconcile_coding_persona(
         block_1
     };
 
-    let already_current = snapshot
-        .messages
-        .first()
-        .is_some_and(|message| message.role == Role::System && message.text == full_block_1)
-        && snapshot
-            .messages
-            .get(1)
-            .is_some_and(|message| message.role == Role::System && message.text == block_2)
-        && snapshot
-            .messages
-            .get(2)
-            .is_some_and(|message| message.role == Role::System && message.text == block_3)
-        && snapshot
-            .messages
-            .get(3)
-            .is_some_and(|message| message.role == Role::System && message.text == block_4)
+    // A gated-off persona block is empty; never materialize it as an empty system
+    // message (providers reject it, and it cannot be recognized as a persona block).
+    let expected: Vec<String> = [full_block_1, block_2, block_3, block_4]
+        .into_iter()
+        .filter(|block| !block.is_empty())
+        .collect();
+
+    let already_current = snapshot.messages.len() >= expected.len()
         && snapshot
             .messages
             .iter()
-            .skip(4)
+            .zip(&expected)
+            .all(|(message, block)| message.role == Role::System && message.text == *block)
+        && snapshot
+            .messages
+            .iter()
+            .skip(expected.len())
             .all(|message| !is_persona(message))
         && snapshot
             .messages
@@ -1858,10 +1876,9 @@ fn reconcile_coding_persona(
         .messages
         .retain(|message| !is_persona(message) && !is_model_change(message));
 
-    snapshot.messages.insert(0, Message::system(block_4));
-    snapshot.messages.insert(0, Message::system(block_3));
-    snapshot.messages.insert(0, Message::system(block_2));
-    snapshot.messages.insert(0, Message::system(full_block_1));
+    for block in expected.iter().rev() {
+        snapshot.messages.insert(0, Message::system(block.clone()));
+    }
     snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
 }
 
@@ -1906,7 +1923,7 @@ pub fn subagent_runtime_knobs(
     let max_rounds = max_rounds_env
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(cfg.max_rounds);
-    (cfg.max_concurrent.max(1), max_rounds)
+    (cfg.max_concurrent, max_rounds)
 }
 
 #[cfg(test)]
@@ -1964,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
+    fn subagent_runtime_knobs_ignore_legacy_timeout_and_keep_zero_as_unbounded() {
         use super::subagent_runtime_knobs;
         use zap_config::config::SubAgentConfig;
         let cfg = SubAgentConfig {
@@ -1973,16 +1990,16 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
-        assert_eq!(mc, 1, "max_concurrent is still floored to one");
+        assert_eq!(mc, 0, "zero is passed through and means unbounded");
         assert_eq!(rounds, 230);
     }
 
     #[test]
-    fn subagent_runtime_knobs_default_config_preserves_live_defaults() {
+    fn subagent_runtime_knobs_default_config_is_unbounded() {
         use super::subagent_runtime_knobs;
         use zap_config::config::SubAgentConfig;
         let (mc, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
-        assert_eq!(mc, 3, "default max_concurrent unchanged");
+        assert_eq!(mc, 0, "default is unbounded — a fan-out never queues");
         assert_eq!(rounds, 230, "default child round high-water unchanged");
     }
 
@@ -2033,7 +2050,8 @@ mod tests {
 
         let block_1 = &snapshot.messages[0].text;
         assert!(
-            block_1.contains("Project working directory: E:/switched-workspace"),
+            block_1.contains("Project working directory: `E:/switched-workspace`")
+                || block_1.contains("Project working directory: E:/switched-workspace"),
             "Block 1 must embed cfg.working_dir after a workspace switch:\n{block_1}"
         );
         let process_display = zap_capabilities::pathnorm::to_display(&process_cwd);
@@ -2055,10 +2073,12 @@ mod tests {
             true,
         );
 
-        assert!(snapshot.messages[0]
-            .text
-            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
-        assert_eq!(snapshot.messages[4].text, "SESSION CONTEXT");
+        assert!(snapshot.messages[0].text.starts_with("<environment>"));
+        assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
+        assert_eq!(snapshot.model.as_deref(), Some("deepseek-v4-flash"));
+        // Block 3 (`<todo_rules>`) is disabled, so three persona blocks precede the
+        // legacy session context: <environment>, <system_rules>, <explore_strategy>.
+        assert_eq!(snapshot.messages[3].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
@@ -2069,10 +2089,17 @@ mod tests {
 
         reconcile_coding_persona(&mut snapshot, &cfg, false, true, true);
 
-        assert!(!snapshot.messages[1].text.contains("## TASK TRACKING"));
-        assert!(snapshot.messages[0]
-            .text
-            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
+        // todo disabled → <todo_rules> is not materialized at all (no empty system block).
+        assert!(snapshot
+            .messages
+            .iter()
+            .all(|m| !m.text.starts_with("<todo_rules>")));
+        assert!(snapshot
+            .messages
+            .iter()
+            .all(|m| m.role != Role::System || !m.text.is_empty()));
+        assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
+        assert_eq!(snapshot.model.as_deref(), Some("deepseek-v4-flash"));
     }
 
     #[test]
@@ -2083,18 +2110,20 @@ mod tests {
         // of what other tests may have set concurrently (we hold the serial lock, so this
         // is safe — no other test in this serial group can observe the removal).
         let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
-        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks(
+        let (b1, b2, _b3, b4) = crate::persona::coding_persona_blocks(
             "old-model",
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
         );
+        // Block 3 (`<todo_rules>`) is disabled; inserting its empty string would create
+        // the empty system message that reconcile explicitly filters out.
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(b1),
             Message::system(b2),
-            Message::system(b3),
             Message::system(b4),
             Message::system("SESSION CONTEXT"),
         ]);
+        snapshot.model = Some("old-model".into());
 
         reconcile_coding_persona(
             &mut snapshot,
@@ -2109,16 +2138,14 @@ mod tests {
             .iter()
             .filter(|message| is_persona_message(message))
             .count();
-        assert_eq!(personas, 4);
-        assert!(snapshot.messages[0]
-            .text
-            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
+        assert_eq!(personas, 3, "Block 3 (`<todo_rules>`) is disabled");
+        assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
         assert!(snapshot.messages[0]
             .text
             .contains(MODEL_CHANGE_CONTEXT_PREFIX));
         assert!(snapshot.messages[0].text.contains("old-model"));
         assert!(snapshot.messages[0].text.contains("deepseek-v4-flash"));
-        assert_eq!(snapshot.messages[4].text, "SESSION CONTEXT");
+        assert_eq!(snapshot.messages[3].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
@@ -2127,7 +2154,7 @@ mod tests {
     fn repeated_model_switch_keeps_one_current_transition_boundary() {
         zap_config::config::offline::reset_offline_verdict_for_test();
         let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
-        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks(
+        let (b1, b2, _b3, b4) = crate::persona::coding_persona_blocks(
             "model-a",
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
@@ -2135,11 +2162,11 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(b1),
             Message::system(b2),
-            Message::system(b3),
             Message::system(b4),
             Message::user("what model are you?"),
             Message::assistant("I am model-a", vec![]),
         ]);
+        snapshot.model = Some("model-a".into());
 
         reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
         reconcile_coding_persona(&mut snapshot, &agent_config("model-c"), true, true, true);
@@ -2161,7 +2188,7 @@ mod tests {
         // is safe.
         let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
         let cfg = agent_config("deepseek-v4-flash");
-        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_context(
+        let (b1, b2, _b3, b4) = crate::persona::coding_persona_blocks_with_context(
             "deepseek-v4-flash",
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
@@ -2172,7 +2199,6 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![
             Message::system(b1.clone()),
             Message::system(b2.clone()),
-            Message::system(b3.clone()),
             Message::system(b4.clone()),
             Message::system("SESSION CONTEXT"),
         ]);
@@ -2181,8 +2207,8 @@ mod tests {
 
         assert_eq!(snapshot.messages[0].text, b1);
         assert_eq!(snapshot.messages[1].text, b2);
-        assert_eq!(snapshot.messages[2].text, b3);
-        assert_eq!(snapshot.messages[3].text, b4);
+        assert_eq!(snapshot.messages[2].text, b4);
+        assert_eq!(snapshot.messages[3].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 0);
     }
 
@@ -2199,13 +2225,12 @@ mod tests {
 
         reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
 
-        assert!(snapshot.messages[0]
-            .text
-            .contains("<!-- jeikcode:model model-a -->"));
+        assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
         assert!(!snapshot
             .messages
             .iter()
             .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
+        assert_eq!(snapshot.model.as_deref(), Some("model-a"));
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
@@ -2224,12 +2249,14 @@ mod tests {
             )),
             Message::assistant("I am model-a", vec![]),
         ]);
+        snapshot.model = Some("model-a".into());
         reconcile_coding_persona(&mut snapshot, &agent_config("model-b"), true, true, true);
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
         reconcile_coding_persona(&mut snapshot, &cfg, true, true, true);
 
+        assert!(!snapshot.messages[0].text.contains("jeikcode:model"));
         assert!(snapshot.messages[0]
             .text
             .contains(MODEL_CHANGE_CONTEXT_PREFIX));
@@ -2780,6 +2807,54 @@ mod tests {
         assert!(Arc::ptr_eq(&parts.bash_runtime, &bash_runtime));
     }
 
+    /// Regression guard: two sessions in one process must NOT share a Bash registry.
+    /// A shared registry let one session's Stop cancel the other session's foreground
+    /// command (`[task was canceled by bash kill tool]`).
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn distinct_prepares_isolate_bash_runtime_state_per_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _home = zap_config::test_util::IsolatedHome::at(home.path());
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        let mut opts = io_free_opts();
+        opts.session = SessionMode::Fresh;
+
+        let a = prepare_with_plugin_hooks_reusing_lease(
+            &cfg,
+            opts.clone(),
+            Vec::new(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let b = prepare_with_plugin_hooks_reusing_lease(&cfg, opts, Vec::new(), None, true, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&a.bash_runtime, &b.bash_runtime),
+            "each runtime must own its own BashRuntimeState"
+        );
+        let a_sid = a
+            .session
+            .as_ref()
+            .expect("fresh session binding")
+            .id
+            .clone();
+        let b_sid = b
+            .session
+            .as_ref()
+            .expect("fresh session binding")
+            .id
+            .clone();
+        assert_ne!(a_sid, b_sid);
+        assert_eq!(a.bash_runtime.session_id().as_deref(), Some(a_sid.as_str()));
+        assert_eq!(b.bash_runtime.session_id().as_deref(), Some(b_sid.as_str()));
+    }
+
     #[tokio::test]
     #[serial_test::serial(jeikcode_home)]
     async fn first_submit_seeds_provisional_title_and_message_count() {
@@ -3018,6 +3093,35 @@ mod tests {
         assert!(defs.contains(&"grep"), "explore subagent must have grep");
         assert!(defs.contains(&"glob"), "explore subagent must have glob");
 
+        // Mounted tools carry the REAL schema: the two visibility switches must
+        // reach subagents, otherwise they cannot search logs/sensitive paths.
+        for name in ["grep", "glob"] {
+            let def = explore_defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("{name} def missing"));
+            let props = &def.parameters["properties"];
+            assert!(
+                props.get("include_ignored").is_some(),
+                "{name} must expose include_ignored to subagents"
+            );
+            assert!(
+                props.get("include_sensitive").is_some(),
+                "{name} must expose include_sensitive to subagents"
+            );
+            if name == "grep" {
+                assert!(
+                    props.get("include_logs").is_some(),
+                    "grep must expose include_logs to subagents"
+                );
+            } else {
+                assert!(
+                    props.get("include_logs").is_none(),
+                    "glob must not expose grep-only include_logs"
+                );
+            }
+        }
+
         let worker = child_reg.mount(&[
             "read",
             "code_explore",
@@ -3239,12 +3343,10 @@ mod tests {
     }
 
     /// Unit-test the artifact wiring as `assemble` would build it:
-    /// big tool result → preview+handle stored → fetch_output retrieves full bytes.
+    /// big tool result → preview+handle stored → read(path="artifact://...") retrieves full bytes.
     #[tokio::test]
-    async fn artifact_wiring_store_middleware_and_fetch_roundtrip() {
-        use zap_capabilities::tools::{
-            ArtifactMiddleware, ArtifactStore, FetchOutputTool, THRESHOLD_BYTES,
-        };
+    async fn artifact_wiring_store_middleware_and_read_roundtrip() {
+        use zap_capabilities::tools::{ArtifactMiddleware, ArtifactStore, ReadFileTool};
         use zap_kernel::middleware::ToolMiddleware;
         use zap_kernel::tool::Tool as _;
         use zap_kernel::tool::{ToolContext, ToolResult};
@@ -3253,10 +3355,13 @@ mod tests {
         let artifacts_tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(ArtifactStore::new(artifacts_tmp.path()));
         let mw = ArtifactMiddleware::new(store.clone());
-        let fetch = FetchOutputTool::new(store.clone());
+        let reader = ReadFileTool::new(false).with_artifact_store(store.clone());
 
         // (a) a big result gets spilled and the content is replaced with a preview+handle
-        let big = "Z".repeat(THRESHOLD_BYTES * 2);
+        let mut big = String::new();
+        for i in 1..=1000 {
+            big.push_str(&format!("Line {i}: dummy text for artifact payload\n"));
+        }
         let mut result = ToolResult {
             call_id: "t1".into(),
             content: big.clone(),
@@ -3269,8 +3374,8 @@ mod tests {
             "middleware must shorten the content"
         );
         assert!(
-            result.content.contains("fetch_output"),
-            "middleware must embed fetch_output hint"
+            result.content.contains("read(path=\"artifact://"),
+            "middleware must embed read artifact hint"
         );
 
         // (b) artifact file exists on disk
@@ -3281,78 +3386,31 @@ mod tests {
             "artifact file must be present at {artifact_path:?}"
         );
 
-        // (c) fetch_output retrieves the full bytes
+        // (c) read retrieves the full bytes with line numbers
         let ctx = ToolContext {
             working_dir: artifacts_tmp.path().to_path_buf(),
             cancel: CancellationToken::new(),
             progress: zap_kernel::tool::ProgressSink::noop(),
             requester: None,
         };
-        let fetch_result = fetch
+        let read_result = reader
             .execute(
-                &format!(
-                    "{{\"artifact_id\":\"{id}\",\"offset\":0,\"limit\":{}}}",
-                    big.len()
-                ),
+                &format!("{{\"path\":\"artifact://{id}\",\"offset\":1,\"limit\":1000}}"),
                 &ctx,
             )
             .await;
         assert!(
-            !fetch_result.is_error,
-            "fetch_output must succeed: {}",
-            fetch_result.content
+            !read_result.is_error,
+            "read artifact must succeed: {}",
+            read_result.content
         );
         assert!(
-            fetch_result.content.starts_with('Z'),
-            "fetched bytes must start with the original content"
+            read_result.content.contains("Line 1: dummy text"),
+            "read content must start with the original content"
         );
-    }
-
-    /// When no session is present, fetch_output must NOT appear in the assembled tools.
-    #[tokio::test]
-    #[serial_test::serial(jeikcode_home)]
-    async fn no_session_means_no_fetch_output_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
-        let _home = zap_config::test_util::IsolatedHome::at(home.path());
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        // Disabled session: no artifact store, so fetch_output must not be mounted.
-        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
-        // After assemble(), parts.mounted_tools is populated by the mount() call inside.
-        let mounted = parts
-            .mounted_tools
-            .as_ref()
-            .expect("mounted_tools must be set after assemble");
         assert!(
-            mounted.get("fetch_output").is_none(),
-            "fetch_output must not be mounted when no session is present"
-        );
-    }
-
-    /// When a session IS present, fetch_output must appear in the assembled tools.
-    #[tokio::test]
-    #[serial_test::serial(jeikcode_home)]
-    async fn session_presence_mounts_fetch_output_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
-        let _home = zap_config::test_util::IsolatedHome::at(home.path());
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        let mut opts = io_free_opts();
-        opts.session = SessionMode::Fresh;
-        let mut parts = prepare(&cfg, opts).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
-        let mounted = parts
-            .mounted_tools
-            .as_ref()
-            .expect("mounted_tools must be set after assemble");
-        assert!(
-            mounted.get("fetch_output").is_some(),
-            "fetch_output must be mounted when a session is present"
+            read_result.content.contains("1→Line 1: dummy text"),
+            "read content must include line numbers"
         );
     }
 }

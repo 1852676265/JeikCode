@@ -64,7 +64,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Instruction files:\n".into(),
         Msg::StatusInstructionScopeGlobal => "User global".into(),
         Msg::StatusInstructionScopeProject => "Project shared".into(),
-        Msg::StatusInstructionScopeUser => "User project override".into(),
         Msg::StatusInstructionPresent { path, label, scope } =>
             format!("    ✓ {scope} ({label}): {path}\n").into(),
         Msg::StatusInstructionMissing { path, label, scope } =>
@@ -176,7 +175,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("Default set to {name}.").into(),
         Msg::ProviderAdded { name } =>
-            format!("Added account \"{name}\". Opened its model list; press Ctrl+A to add a model.").into(),
+            format!("Added provider \"{name}\". Opened its model list; press Ctrl+A to add a model.").into(),
         Msg::ProviderUpdated { name } =>
             format!("Updated \"{name}\".").into(),
         Msg::ProviderStepName => "Provider name?".into(),
@@ -228,8 +227,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelTabAccounts => "Accounts".into(),
         Msg::ProviderPanelTabModels => "Models".into(),
         Msg::ProviderPanelEmptyAccounts =>
-            "(No provider accounts yet — press Ctrl+A to add one)".into(),
-        Msg::ProviderPanelNoMatchingAccounts => "(No matching provider accounts)".into(),
+            "(No providers yet — press Ctrl+A to add one)".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "(No matching providers)".into(),
         Msg::ProviderPanelEmptyModels =>
             "(No models yet — press Ctrl+A to add one; fetches upstream /models)".into(),
         Msg::ProviderPanelNoMatchingModels => "(No matching models)".into(),
@@ -238,6 +237,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelModelCount { count } =>
             format!("{count} model{}", if count == 1 { "" } else { "s" }).into(),
         Msg::ProviderPanelAddModelRow => "+ Add model".into(),
+        Msg::ProviderPanelAddProviderRow => "+ Add custom provider".into(),
         Msg::ProviderPanelAccountsHint =>
             "Filter · ↑↓ select · ↵ models · Ctrl+A add · Ctrl+E edit · Ctrl+Dx2 delete · Tab switch · Esc close".into(),
         Msg::ProviderPanelModelsHint =>
@@ -248,13 +248,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelImageDirectWhileVlSet => {
             "Images go to this model; turn off image input to use VL.".into()
         }
-        Msg::ProviderPanelAddTitle => "[Add provider account]".into(),
+        Msg::ProviderPanelAddTitle => "[Add provider]".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
             format!("[Edit account {account}]").into(),
         Msg::ProviderPanelAddModelTitle => "[Add model]".into(),
         Msg::ProviderPanelEditModelTitle => "[Edit model]".into(),
         Msg::ProviderPanelFieldVendor => "Provider".into(),
         Msg::ProviderPanelFieldAccount => "Account".into(),
+        Msg::ProviderPanelFieldName => "Name".into(),
+        Msg::ProviderPanelFieldProtocol => "Protocol".into(),
+        Msg::ProviderPanelRequired => "(required)".into(),
+        Msg::ProviderPanelLocked => "(locked)".into(),
         Msg::ProviderPanelFieldBaseUrl => "Base URL".into(),
         Msg::ProviderPanelFieldApiKey => "API key".into(),
         Msg::ProviderPanelFieldModel => "Model".into(),
@@ -273,6 +277,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelProviderFormHint =>
             "Tab Next  ←→ Switch provider  Space Toggle  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelAddAccountHint =>
+            "Tab Next  ←→ Switch protocol  ↵ Save  Esc Back  (Name required; add models on Models tab)".into(),
+        Msg::ProviderPanelEditAccountLockedHint =>
+            "Tab Next  ↵ Save  Esc Back  (Vendor protocol locked)".into(),
+        Msg::ProviderPanelEditAccountHint =>
+            "Tab Next  ←→ Switch protocol  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelAccountNeedsKeyHint => "(provider not yet configured)".into(),
         Msg::ProviderPanelModelFormHint =>
             "Opens with upstream list  Type to filter  ↑↓ select  Tab/↵ fill  ←→ account (empty model)  Space toggle  Esc back".into(),
         Msg::ProviderPanelModelPlaceholder => "(type to filter upstream list)".into(),
@@ -288,6 +299,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelUpstreamNoUrl =>
             "No upstream URL — type a model id".into(),
         // ── Model picker ──
+        Msg::ModelPickerNoModelsConfigured =>
+            "(no models configured — use /provider to add)".into(),
+        Msg::ModelPickerNoModelsMatch => "(no models match)".into(),
+        Msg::ModelPickerNoModelsMatchQuery { query } =>
+            format!("(no models match \"{query}\" — Backspace to clear)").into(),
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
         Msg::ModelSwitchedAndDefault { provider, model } =>
@@ -599,7 +615,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SkillUnknown { name } =>
             format!("Unknown skill: {} (try /skills to list)", name).into(),
         Msg::SkillsLoaded { names } =>
-            format!("  Loaded skills: {}\n", names).into(),
+            format!("  Requested skill load: {}\n", names).into(),
 
         // ── /mcp ──
         Msg::McpReloading { count } =>
@@ -913,7 +929,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::SaveInvalidPath { path } => format!("Invalid path — directory does not exist: {path}").into(),
         Msg::SaveRefuseOverwrite { path } => format!("Target exists and isn't a markdown file — refused to overwrite it (avoids clobbering source/config): {path}. Use a .md filename or a new path.").into(),
         Msg::CodeBlockCopied => "📋 Copied code block to clipboard".into(),
-        Msg::CmdDescGuide => "Ask JeikCode config/usage via zap_config_guide".into(),
+        Msg::CmdDescGuide => "Ask JeikCode config/usage via jeikcode_config_guide".into(),
         Msg::CmdDescView => "View file content in an overlay modal".into(),
         Msg::CmdDescApp => "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)".into(),
         Msg::CmdDescReview => "Code review the current changes (/review · /review staged · /review <base>)".into(),
@@ -949,7 +965,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
 ".into(),
         Msg::GuideMenuDocUrl => "".into(),
         Msg::CmdGuideFallbackPrompt { question } => format!(
-            "Answer the user's JeikCode usage/config question. FIRST call the `zap_config_guide` tool with the best-matching `topic` (overview, prompts, models, mcp, skills, thesaurus, tools, directories, project, updates, or all). THEN answer concisely in the user's language based only on that tool output. Do not invent settings, and do not promote third-party skill stores.\n\nUser question: {question}"
+            "Answer the user's JeikCode usage/config question. FIRST call the `jeikcode_config_guide` tool with the best-matching `topic` (overview, prompts, models, mcp, skills, thesaurus, tools, directories, project, updates, or all). THEN answer concisely in the user's language based only on that tool output. Do not invent settings, and do not promote third-party skill stores.\n\nUser question: {question}"
         ).into(),
         Msg::CmdGuideInstalling => "Preparing guide answer, please wait...".into(),
         Msg::CmdGuideAutoInstall => "Optional ask skill not installed — using built-in guide.".into(),
@@ -997,8 +1013,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::OnboardingLanguageOptionEn => "English".into(),
         Msg::OnboardingLanguageOptionZhCn => "简体中文 (Simplified Chinese)".into(),
         Msg::OnboardingSetupTitle => "How would you like to set up?".into(),
+        // Arrows, not a digit range: step 2 lists every shipped locale
+        // (11 rows, and the number-key shortcut only reaches 1-9).
         Msg::OnboardingNavHint =>
-            "1-3 select · Enter confirm · ← back · Esc skip".into(),
+            "↑↓ select · Enter confirm · ← back · Esc skip".into(),
         Msg::OnboardingConfirmClear =>
             "/welcome will clear the screen. Continue? [y/N]".into(),
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
@@ -1299,5 +1317,74 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 .into(),
         Msg::ServeNoTokenSecurityWarning =>
             "[CRITICAL SECURITY WARNING] No access token configured!\nIf you have not set up a corresponding firewall, please ask JeikCode AI to help establish firewall rules and whitelist IPs; otherwise, your server can easily be compromised by hackers!".into(),
+        Msg::AgentRetryEmpty { attempt, max, wait } => if wait > 0 {
+            format!("Model returned an empty response, retrying in {wait}s ({attempt}/{max})...")
+        } else {
+            format!("Model returned an empty response, retrying ({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryThinking { attempt, max, wait } => if wait > 0 {
+            format!("Model returned only reasoning, retrying in {wait}s ({attempt}/{max})...")
+        } else {
+            format!("Model returned only reasoning, retrying ({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryMalformed { attempt, max, wait } => if wait > 0 {
+            format!("Malformed response, retrying in {wait}s ({attempt}/{max})...")
+        } else {
+            format!("Malformed response, retrying ({attempt}/{max})...")
+        }.into(),
+        Msg::AgentRetryFirstToken { secs, attempt, max } =>
+            format!("Model is slow: no token within {secs}s, retrying ({attempt}/{max})…").into(),
+        Msg::AgentRetryApi { reason, wait, attempt, max } =>
+            format!("API error {reason}, retrying in {wait}s ({attempt}/{max})...").into(),
+        Msg::AgentOverWindow { estimate_k, window_k, buffer_k } =>
+            format!(
+                "Request is ~{estimate_k}K tokens, at the context watermark \
+                 (window ~{window_k}K − buffer {buffer_k}K): trim the input or switch \
+                 to a larger-window model."
+            ).into(),
+        Msg::AgentContextOverflow { round, attempt } =>
+            format!("Context overflow on round {round} (attempt {attempt}); compacting and retrying").into(),
+        Msg::AgentStreamReconnecting { attempt, max } =>
+            format!("Stream idle timeout — reconnecting ({attempt}/{max})").into(),
+        Msg::AgentResponseTruncated => "Response truncated: finish_reason=length".into(),
+        Msg::AgentUnsupportedSnapshot { version, supported } =>
+            format!("Unsupported snapshot version {version} (kernel supports {supported}); starting empty").into(),
+        Msg::AgentPreRequestNotAppendOnly { stored } =>
+            format!(
+                "pre_request is not append-only: the outgoing prefix diverges from the {stored} \
+                 stored message(s) — this poisons the provider prefix cache for this request \
+                 (a pre_request hook may only APPEND tail reminders)"
+            ).into(),
+        Msg::AgentEchoLoopNudge => "You are in a loop. Please reconsider your actions.".into(),
+        Msg::AgentEchoLoopWarning => "You are in a loop. Please reconsider your actions. Repeating the same tool and arguments again will stop this turn.".into(),
+        Msg::AgentModelHighLatencyTerminal { retries, secs } =>
+            format!("Model latency is too high, please try again later ({retries} consecutive attempts without first token in {secs}s)").into(),
+        Msg::AgentExhaustedMalformed { max } =>
+            format!("Model returned unparseable responses {max} times consecutively (sporadic upstream issue). You can retry directly or try again later.").into(),
+        Msg::AgentExhaustedThinkingOverWindowIntro { max } =>
+            format!("Model only returned thinking without text or tools for {max} consecutive times. As noted earlier, this request exceeds the model's context window — please trim input or /compact and retry.").into(),
+        Msg::AgentExhaustedThinkingOverWindowSize { max, prompt_k, window_k } =>
+            format!("Model only returned thinking without text or tools for {max} consecutive times. Current request is ~{prompt_k}K tokens, near or exceeding model window (~{window_k}K), likely due to an oversized request. Consider /compact or trimming input.").into(),
+        Msg::AgentExhaustedThinkingGeneric { max } =>
+            format!("Model only returned thinking without text or tools for {max} consecutive times. You can retry directly or try again later.").into(),
+        Msg::AgentExhaustedEmptyOverWindowIntro { max } =>
+            format!("Model returned empty responses {max} times consecutively. As noted earlier, this request exceeds the model's context window — please trim input or /compact and retry.").into(),
+        Msg::AgentExhaustedEmptyOverWindowSize { max, prompt_k, window_k } =>
+            format!("Model returned empty responses {max} times consecutively. Current request is ~{prompt_k}K tokens, near or exceeding model window (~{window_k}K), likely due to an oversized request. Consider /compact or trimming input.").into(),
+        Msg::AgentExhaustedEmptyGeneric { max } =>
+            format!("Model returned empty responses {max} times consecutively (sporadic upstream issue, unrelated to context length). You can retry directly or try again later.").into(),
+        Msg::AgentStatusRateLimited => "Request rate limit exceeded or quota exhausted".into(),
+        Msg::AgentStatusUpstreamUnavailable => "Upstream service is temporarily unavailable".into(),
+        Msg::AgentStatusResponseTimeout => "Model response timed out".into(),
+        Msg::AgentStatusConnectionFailed => "Network connection failed".into(),
+        Msg::AgentStatusInsufficientBalance => "Insufficient account balance".into(),
+        Msg::AgentStatusUnauthorized => "API key is unauthorized or has expired".into(),
+        Msg::StreamReadRetryExhausted { attempts } =>
+            format!("Network connection interrupted: remote host closed or reset connection, reconnect failed after {attempts} attempts. You can retry.").into(),
+        Msg::StreamReadPartialResponse =>
+            "Response interrupted: not auto-replayed to prevent duplicated output or tool execution; safe partial response preserved, you can continue.".into(),
+        Msg::StreamReadResetHint =>
+            "This error is common in corporate network or proxy environments; please check proxy/VPN/firewall settings.".into(),
+        Msg::StreamReadDetailsPrefix => "Details: ".into(),
     }
 }

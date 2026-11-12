@@ -113,8 +113,8 @@ impl History {
         Self::load_with_cache(path, cache_dir)
     }
 
-    /// Default history path: `~/.zap/history` on Unix,
-    /// `%USERPROFILE%\.zap\history` on Windows (or a tempdir
+    /// Default history path: `~/.jeikcode/history` on Unix,
+    /// `%USERPROFILE%\.jeikcode\history` on Windows (or a tempdir
     /// fallback if home is unknown).
     pub fn default_path() -> Option<PathBuf> {
         Some(crate::platform::history_path())

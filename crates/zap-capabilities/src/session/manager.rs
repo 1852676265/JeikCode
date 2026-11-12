@@ -227,6 +227,12 @@ pub struct CatalogEntry {
     pub updated_at_ms: i64,
     pub message_count: usize,
     pub turn_count: usize,
+    /// Session-scoped model / approval / effort, copied from the native meta so
+    /// the list endpoint does not re-open every `<id>.meta` file per row.
+    pub preferred_model: Option<String>,
+    pub approval_mode: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<u32>,
     pub presence: CatalogPresence,
 }
 
@@ -398,6 +404,11 @@ pub struct SessionMeta {
     /// `user_renamed` so a resumed session does not run the one-shot namer again.
     #[serde(default)]
     pub ai_named: bool,
+    /// Stable protocol session key (OpenAI/Anthropic `user`). The display
+    /// `name` may be renamed by the user; this key must never change, so a
+    /// compat request can still resume the same session by name-key lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_key: Option<String>,
     /// Durable storage authority. Missing on pre-S2 metadata, which must be
     /// resolved under the session lease instead of guessed by readers.
     #[serde(default)]
@@ -433,6 +444,13 @@ pub struct SessionMeta {
     /// attributed to a provider/model written by older metadata.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub detached_unattributed_tokens: u64,
+    /// 最近一次成功压缩后的上下文占用（估算 prompt tokens）。
+    ///
+    /// 压缩保留最近窗口 + 摘要，但快照里最后一条助手消息的 usage 仍然是压缩前
+    /// 的数值；冷启动、刷新、异地端必须先看到压缩后的值，直到下一次真实 usage
+    /// 写入。新回合的 turn stat 或 undo 会清空它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_context_tokens: Option<u64>,
     /// How this session was created. Defaults to [`SessionOrigin::Manual`] so
     /// that sessions written before this field existed deserialize correctly.
     #[serde(default)]
@@ -442,6 +460,17 @@ pub struct SessionMeta {
     /// different models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    /// Reasoning effort last chosen for this session ("off" / "low" / ... / "max").
+    /// Overrides the provider-wide `config.toml` value for this session only, so
+    /// changing the intensity in one session never rewrites a sibling's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Custom thinking budget paired with [`Self::reasoning_effort`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    /// Mode last chosen for this session (e.g. "build", "accept_edits", "bypass", "plan").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 impl SessionMeta {
@@ -455,6 +484,7 @@ impl SessionMeta {
             id,
             user_renamed: false,
             ai_named: false,
+            protocol_key: None,
             owner: StorageOwner::Unconfirmed,
             import_info: None,
             fork_info: None,
@@ -466,8 +496,12 @@ impl SessionMeta {
             turn_stats: Vec::new(),
             detached_model_usage: Vec::new(),
             detached_unattributed_tokens: 0,
+            compacted_context_tokens: None,
             origin: SessionOrigin::Manual,
             preferred_model: None,
+            reasoning_effort: None,
+            thinking_budget: None,
+            approval_mode: None,
         }
     }
 
@@ -1111,7 +1145,9 @@ impl SessionManager {
             return Ok(());
         }
         match crate::tools::read_todo_board(id) {
-            Some(board) if !board.items.is_empty() => {
+            Some(board)
+                if !board.items.is_empty() && !crate::tools::list_fully_completed(&board.items) =>
+            {
                 let bytes =
                     serde_json::to_vec(&board).map_err(|error| SessionStoreError::Corrupt {
                         kind: "todo board",
@@ -1129,6 +1165,14 @@ impl SessionManager {
     }
 
     fn restore_todo_board(&self, id: &str) {
+        self.restore_todo_board_with_messages(id, None);
+    }
+
+    fn restore_todo_board_with_messages(
+        &self,
+        id: &str,
+        messages: Option<&[zap_kernel::message::Message]>,
+    ) {
         if crate::tools::todo_session_is_closed(id) || crate::tools::read_todo_board(id).is_some() {
             return;
         }
@@ -1139,6 +1183,27 @@ impl SessionManager {
             return;
         };
         if let Ok(board) = serde_json::from_slice::<crate::tools::TodoBoard>(&bytes) {
+            // 防线 1：如果磁盘上的 board 本身为空或全部项已是 Completed，说明是完成态，绝不能复活
+            if board.items.is_empty() || crate::tools::list_fully_completed(&board.items) {
+                let _ = fs::remove_file(&path);
+                crate::tools::clear_todo_board(id);
+                return;
+            }
+            // 防线 2：若传入了转录消息历史，校验历史中的最新 todo 状态。
+            // 若转录历史中曾经有 todo 调用，但最终 derive_current_todos 为空（说明在历史中已全部完成关闭），
+            // 则磁盘上的 .todo 文件是过期的历史幽灵数据，必须删除并拒绝复活。
+            if let Some(msgs) = messages {
+                let had_todo_calls = msgs.iter().any(|m| {
+                    m.tool_calls
+                        .iter()
+                        .any(|c| crate::tools::is_todo_tool_name(&c.name))
+                });
+                if had_todo_calls && crate::tools::derive_current_todos(msgs).is_empty() {
+                    let _ = fs::remove_file(&path);
+                    crate::tools::clear_todo_board(id);
+                    return;
+                }
+            }
             crate::tools::restore_todo_board(id, board);
         }
     }
@@ -1147,6 +1212,23 @@ impl SessionManager {
     pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "artifacts")
     }
+}
+
+fn dir_file_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+impl SessionManager {
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta")
     }
@@ -1446,16 +1528,20 @@ impl SessionManager {
         matches!(self.load_inflight_snapshot(id), Ok(Some(_)))
     }
 
-    /// Overlay a prefix-extending inflight checkpoint onto a catalog/display load.
+    /// Overlay an inflight checkpoint that extends the canonical conversation
+    /// onto a catalog/display load.
     ///
-    /// Canonical on-disk aggregate is unchanged. Used when a turn is parked
-    /// (approval card) or has not yet reached `turn_complete` (error diagnostic
-    /// is committed through that path; this covers the in-progress round).
+    /// The display view may carry extra leading sacred-floor context (system /
+    /// synthetic instruction blocks) that the staged first-user canonical snapshot
+    /// does not; [`snapshot_extends_display_prefix`] accepts that shape. Canonical
+    /// on-disk aggregate is unchanged. Used when a turn is parked (approval card)
+    /// or has not yet reached `turn_complete` (error diagnostic is committed
+    /// through that path; this covers the in-progress round).
     pub fn overlay_inflight_for_display(&self, id: &str, loaded: &mut LoadedSession) {
         let Ok(Some(checkpoint)) = self.load_inflight_snapshot(id) else {
             return;
         };
-        if !snapshot_extends_prefix(&loaded.snapshot, &checkpoint.snapshot) {
+        if !snapshot_extends_display_prefix(&loaded.snapshot, &checkpoint.snapshot) {
             return;
         }
         if checkpoint.snapshot.messages.len() > loaded.snapshot.messages.len() {
@@ -1551,7 +1637,7 @@ impl SessionManager {
         )
     }
 
-    fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
+    pub(crate) fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
         validate_session_id(id)?;
         Ok(self.root.join(format!("{id}.{extension}")))
     }
@@ -1611,7 +1697,7 @@ impl SessionManager {
             read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
         validate_snapshot(&snapshot)?;
-        self.restore_todo_board(id);
+        self.restore_todo_board_with_messages(id, Some(&snapshot.messages));
         Ok(snapshot)
     }
 
@@ -1701,6 +1787,27 @@ impl SessionManager {
             ensure_meta_id(id, &meta)?;
             self.write_meta_unlocked(&meta)
         })
+    }
+
+    fn display_lock_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "display.lock")
+    }
+
+    /// Serialize v4 display-log mutations. The display log has its own lock so a
+    /// turn-complete append and a display-only insert cannot read-modify-write
+    /// the same file concurrently. Lock order is always meta -> display.
+    pub(crate) fn with_display_lock<T>(
+        &self,
+        id: &str,
+        operation: impl FnOnce() -> SessionResult<T>,
+    ) -> SessionResult<T> {
+        validate_session_id(id)?;
+        fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
+        let lock_path = self.display_lock_path(id)?;
+        reject_existing_non_regular(&lock_path)?;
+        let lock = open_lock_file(&lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock).map_err(|e| io_at(&lock_path, e))?;
+        operation()
     }
 
     fn with_meta_lock<T>(
@@ -2141,6 +2248,19 @@ impl SessionManager {
             if src.is_file() {
                 let _ = fs::copy(&src, &dst);
             }
+        }
+        if let (Ok(src), Ok(dst)) = (
+            self.todo_board_path(source_id),
+            self.todo_board_path(destination_id),
+        ) {
+            if src.is_file() {
+                let _ = fs::copy(&src, &dst);
+            }
+        }
+        if let Some(board) = crate::tools::read_todo_board(source_id) {
+            crate::tools::restore_todo_board(destination_id, board);
+        } else {
+            self.restore_todo_board(destination_id);
         }
         Ok((forked, destination_lease))
     }
@@ -2833,6 +2953,7 @@ impl SessionManager {
                 });
             }
             self.commit_replacements_with_rollback(lease.id(), &replacements)?;
+            self.persist_todo_board(lease.id())?;
             Ok(result)
         })
     }
@@ -2899,8 +3020,36 @@ impl SessionManager {
                 }
                 Err(error) => return Err(error),
             };
-            presentation.entries.push(entry);
-            self.write_presentation_unlocked(id, &presentation)
+            presentation.entries.push(entry.clone());
+            self.write_presentation_unlocked(id, &presentation)?;
+            // Keep v4 in lockstep when it exists. If this is a v3/no-v4
+            // session, the next read migrates/rebuilds from ui.json instead of
+            // deleting the v3 migration source here.
+            let anchor_turn_id = match entry.anchor {
+                DisplayAnchor::AtStart => 0,
+                DisplayAnchor::AfterTurn { turn_id } => turn_id,
+            };
+            let role = match entry.role {
+                PresentationRole::User => "user",
+                PresentationRole::Assistant => "assistant",
+            };
+            let content = match entry.role {
+                PresentationRole::User => {
+                    let meta = self.read_meta(id)?;
+                    super::user_text_for_display(
+                        std::path::Path::new(&meta.working_dir),
+                        &entry.text,
+                    )
+                }
+                PresentationRole::Assistant => entry.text.clone(),
+            };
+            let _ = self.insert_presentation_rows(
+                id,
+                anchor_turn_id,
+                &[(role.to_string(), content)],
+                None,
+            );
+            Ok(())
         })
     }
 
@@ -2912,6 +3061,7 @@ impl SessionManager {
         &self,
         id: &str,
         messages: &[(PresentationRole, String)],
+        client_request_id: Option<&str>,
     ) -> SessionResult<usize> {
         self.with_meta_lock(id, || {
             let meta = self.read_meta(id)?;
@@ -2931,15 +3081,55 @@ impl SessionManager {
                     turn_id: stat.turn_id,
                 })
                 .unwrap_or(DisplayAnchor::AtStart);
+            let anchor_turn_id = match anchor {
+                DisplayAnchor::AtStart => 0,
+                DisplayAnchor::AfterTurn { turn_id } => turn_id,
+            };
             let mut presentation = self.read_presentation(id)?;
-            presentation
-                .entries
-                .extend(messages.iter().map(|(role, text)| PresentationEntry {
+            // A retried HTTP append must not duplicate UI-only rows. v4 is the
+            // durable request ledger for the idempotency key.
+            if let Some(request_id) = client_request_id {
+                if self.display_has_presentation_request(id, anchor_turn_id, request_id) {
+                    return Ok((meta.message_count as usize)
+                        .checked_add(presentation.entries.len())
+                        .ok_or(SessionStoreError::TooLarge {
+                            kind: "catalog message count",
+                            limit: usize::MAX,
+                            actual: usize::MAX,
+                        })?);
+                }
+            }
+            let new_entries: Vec<PresentationEntry> = messages
+                .iter()
+                .map(|(role, text)| PresentationEntry {
                     anchor,
                     role: *role,
                     text: text.clone(),
-                }));
+                })
+                .collect();
+            presentation.entries.extend(new_entries.iter().cloned());
             self.write_presentation_unlocked(id, &presentation)?;
+
+            let rows: Vec<(String, String)> = new_entries
+                .iter()
+                .map(|entry| {
+                    let role = match entry.role {
+                        PresentationRole::User => "user",
+                        PresentationRole::Assistant => "assistant",
+                    };
+                    let content = match entry.role {
+                        PresentationRole::User => super::user_text_for_display(
+                            std::path::Path::new(&meta.working_dir),
+                            &entry.text,
+                        ),
+                        PresentationRole::Assistant => entry.text.clone(),
+                    };
+                    (role.to_string(), content)
+                })
+                .collect();
+            let _ = self
+                .insert_presentation_rows(id, anchor_turn_id, &rows, client_request_id)
+                .unwrap_or(false);
             (meta.message_count as usize)
                 .checked_add(presentation.entries.len())
                 .ok_or(SessionStoreError::TooLarge {
@@ -2964,6 +3154,53 @@ impl SessionManager {
             }
             Ok(removed)
         })
+    }
+
+    /// Remove raw-transcript turns that an explicit edit/delete/rewind removed
+    /// from the canonical snapshot. The transcript is the pre-compaction
+    /// display/recall source: leaving deleted turns there lets a later display
+    /// backfill resurrect them.
+    ///
+    /// `turn_id == 0` (legacy backfill records) is preserved: it predates the
+    /// stable turn identity and is always older than the mutation boundary.
+    pub fn retain_transcript_turns(
+        &self,
+        id: &str,
+        surviving_turn_ids: &BTreeSet<u64>,
+    ) -> SessionResult<usize> {
+        let path = self.jsonl_path(id)?;
+        let bytes = match self.read_bytes_bounded(&path, "transcript", MAX_JSONL_BYTES) {
+            Ok(bytes) => bytes,
+            Err(SessionStoreError::NotFound { .. }) => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut removed = 0usize;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let keep = match serde_json::from_slice::<serde_json::Value>(line) {
+                Ok(value) => match value.get("turn_id").and_then(|value| value.as_u64()) {
+                    Some(turn_id) => turn_id == 0 || surviving_turn_ids.contains(&turn_id),
+                    // A record without turn identity cannot be attributed; keep it
+                    // rather than destroying recall on a schema mismatch.
+                    None => true,
+                },
+                // A partial final line is preserved; the next append repairs it.
+                Err(_) => true,
+            };
+            if keep {
+                out.extend_from_slice(line);
+                out.push(b'\n');
+            } else {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.write_bytes_atomic(&path, &out, "transcript", MAX_JSONL_BYTES)?;
+        }
+        Ok(removed)
     }
 
     /// Drop native turn stats whose stable turn no longer survives. Legacy stats
@@ -3146,9 +3383,13 @@ impl SessionManager {
             self.rewind_transaction_path(id)?,
             self.meta_path(id)?,
             self.jsonl_path(id)?,
+            self.display_path(id)?,
+            self.display_meta_path(id)?,
             self.presentation_path(id)?,
             self.legacy_path(id)?,
             self.bashkw_path(id)?,
+            self.todo_board_path(id)?,
+            self.pending_permission_path(id)?,
         ];
         for path in &targets {
             validate_delete_target(path)?;
@@ -3161,12 +3402,64 @@ impl SessionManager {
             }
         }
         if let Ok(dir) = self.artifacts_dir(id) {
+            let freed = dir_file_bytes(&dir);
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
+            #[cfg(feature = "tools")]
+            if freed > 0 {
+                crate::tools::artifact_watchdog::ArtifactWatchdog::global()
+                    .record_subtraction(freed);
+            }
         }
+        crate::tools::purge_todo_board(id);
         Ok(())
     }
 
+    /// Read the append-only raw transcript (`<id>.jsonl`) for UI reconstruction.
+    ///
+    /// Compaction drains messages from the model snapshot but never from this file,
+    /// so display consumers use it to rebuild the pre-compaction history. Missing
+    /// file = an empty transcript (a brand-new session has not flushed a turn yet).
+    pub fn read_transcript_turns(
+        &self,
+        id: &str,
+    ) -> SessionResult<Vec<super::transcript::TurnRecord>> {
+        let path = self.jsonl_path(id)?;
+        let mut out = Vec::new();
+        match for_each_jsonl_line(&path, |line| {
+            if out.len() >= MAX_JSONL_LINES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "transcript lines",
+                    limit: MAX_JSONL_LINES,
+                    actual: out.len() + 1,
+                });
+            }
+            let record: super::transcript::TurnRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: error.to_string(),
+                })?;
+            out.push(record);
+            Ok(())
+        }) {
+            Ok(_) => Ok(out),
+            Err(SessionStoreError::NotFound { .. }) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
+        let path = self.jsonl_path(id)?;
+        self.append_jsonl_line_at(id, &path, "transcript", line)
+    }
+
+    /// Bounded append to any session-owned JSONL file (transcript / display).
+    pub(crate) fn append_jsonl_line_at(
+        &self,
+        id: &str,
+        path: &Path,
+        kind: &'static str,
+        line: &[u8],
+    ) -> SessionResult<()> {
         self.ensure_native_writable(id, "append transcript")?;
         if line.len() > MAX_JSONL_LINE_BYTES {
             return Err(SessionStoreError::TooLarge {
@@ -3175,33 +3468,52 @@ impl SessionManager {
                 actual: line.len(),
             });
         }
-        let path = self.jsonl_path(id)?;
         fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
         // Windows security software and indexers can briefly deny an open or
         // lock while inspecting a newly-updated file. Retry only those
         // pre-write operations: retrying write_all itself could duplicate a
         // partially-written JSONL record.
-        let mut file = retry_transient_file_access(|| open_append_file(&path))?;
+        let mut file = retry_transient_file_access(|| open_append_file(path))?;
         retry_transient_file_access(|| {
-            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
+            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(path, e))
         })?;
         let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
             .unwrap_or(usize::MAX);
         let next = current
             .checked_add(line.len())
             .ok_or(SessionStoreError::TooLarge {
-                kind: "transcript",
+                kind,
                 limit: MAX_JSONL_BYTES,
                 actual: usize::MAX,
             })?;
         if next > MAX_JSONL_BYTES {
             return Err(SessionStoreError::TooLarge {
-                kind: "transcript",
+                kind,
                 limit: MAX_JSONL_BYTES,
                 actual: next,
             });
         }
-        file.write_all(line).map_err(|e| io_at(&path, e))
+        file.write_all(line).map_err(|e| io_at(path, e))
+    }
+
+    pub(crate) fn read_bytes_bounded(
+        &self,
+        path: &Path,
+        kind: &'static str,
+        limit: usize,
+    ) -> SessionResult<Vec<u8>> {
+        read_regular_file_bounded(path, kind, limit)
+    }
+
+    pub(crate) fn write_bytes_atomic(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        kind: &'static str,
+        limit: usize,
+    ) -> SessionResult<()> {
+        ensure_size(kind, bytes.len(), limit)?;
+        atomic_write(path, bytes)
     }
 
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
@@ -3363,6 +3675,29 @@ fn scan_catalog_cached(sessions_root: &Path) -> CatalogScan {
     scan
 }
 
+/// Session-owned auxiliary artifacts live in the same project bucket, but their
+/// filename stem is `<session-id>.<role>`, not a session id. The generic
+/// `.json` / `.jsonl` fallbacks in [`scan_catalog_root`] would otherwise mint
+/// fake catalog sources such as `<id>.display` and report them as damaged
+/// legacy sessions or orphan sidecars.
+///
+/// `display.jsonl` is written at prompt admission, BEFORE a brand-new `/chat`
+/// session has a `.meta`. Those false diagnostics then prefix-matched the real
+/// id in the daemon lookup and blocked the first turn with
+/// "matches multiple damaged catalog entries".
+fn session_auxiliary_artifact(name: &str) -> bool {
+    const AUXILIARY_SUFFIXES: &[&str] = &[
+        ".display.idx.jsonl",
+        ".display.jsonl",
+        ".display.meta.json",
+        ".bashkw.json",
+        ".pending_permission.json",
+    ];
+    AUXILIARY_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
 fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
     let mut scan = CatalogScan::default();
     let mut sessions: BTreeMap<(String, String), CatalogAggregate> = BTreeMap::new();
@@ -3467,6 +3802,13 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
                     continue;
                 }
             };
+            // Display logs, their index/meta and other session-owned auxiliary
+            // files are not catalog sources. Skip them BEFORE the generic
+            // suffix parsing so a healthy session never produces fake
+            // `<id>.display` sidecars or `<id>.display.meta` legacy entries.
+            if session_auxiliary_artifact(&name) {
+                continue;
+            }
             let direct_sidecar_id = name
                 .strip_suffix(".snapshot")
                 .or_else(|| name.strip_suffix(".jsonl"))
@@ -3723,6 +4065,10 @@ fn catalog_entry(
             updated_at_ms: native.updated_at,
             message_count: native.message_count as usize,
             turn_count: native.turn_count as usize,
+            preferred_model: native.preferred_model.clone(),
+            approval_mode: native.approval_mode.clone(),
+            reasoning_effort: native.reasoning_effort.clone(),
+            thinking_budget: native.thinking_budget,
             presence: if legacy.is_some() {
                 CatalogPresence::Both
             } else {
@@ -3739,6 +4085,10 @@ fn catalog_entry(
             updated_at_ms: checked_legacy_millis(legacy.updated_at).ok()?,
             message_count: legacy.messages.len(),
             turn_count: legacy.turn_stats.len(),
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
             presence: CatalogPresence::LegacyOnly,
         }),
         (None, None) => None,
@@ -3983,6 +4333,65 @@ fn ensure_meta_id(expected: &str, meta: &SessionMeta) -> SessionResult<()> {
 fn snapshot_extends_prefix(prefix: &SessionSnapshot, full: &SessionSnapshot) -> bool {
     let n = prefix.messages.len();
     full.messages.len() >= n && full.messages[..n] == prefix.messages[..]
+}
+
+/// Display-only extension check for the inflight checkpoint.
+///
+/// A fresh session's canonical snapshot is seeded with ONLY the raw first user
+/// message (`publish_staged_session_with_first_input`). The inflight checkpoint
+/// carries the full runtime conversation: the sacred-floor system blocks and the
+/// synthetic instruction blocks precede that same user message. The strict
+/// [`snapshot_extends_prefix`] test therefore rejects a perfectly valid inflight
+/// tail, and a mid-turn refresh falls back to the stale display slice (only the
+/// first user row) just as a promoted steer is projected after it.
+///
+/// For display we accept an extension only when EVERY canonical message carries
+/// an authoritative `Message.id` and the same id appears in the inflight in order.
+/// Text is never used to pair messages: id-less/legacy rows fail closed, and the
+/// strict [`snapshot_extends_prefix`] check remains their only path. Canonical
+/// storage and the resume/replay path keep the strict prefix rule.
+fn snapshot_extends_display_prefix(
+    canonical: &SessionSnapshot,
+    inflight: &SessionSnapshot,
+) -> bool {
+    if snapshot_extends_prefix(canonical, inflight) {
+        return true;
+    }
+    if canonical.messages.is_empty() {
+        return !inflight.messages.is_empty();
+    }
+    if inflight.messages.len() <= canonical.messages.len() {
+        return false;
+    }
+    let mut cursor = 0usize;
+    for want in &canonical.messages {
+        // No authoritative identity => never guess by text.
+        if want.id.is_none() {
+            return false;
+        }
+        let mut found = false;
+        while cursor < inflight.messages.len() {
+            let candidate = &inflight.messages[cursor];
+            cursor += 1;
+            if same_display_message(want, candidate) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+/// Authoritative display identity: same kernel message id (and role as a
+/// consistency guard). Missing ids never match — no text fallback by design.
+fn same_display_message(a: &Message, b: &Message) -> bool {
+    match (a.id.as_deref(), b.id.as_deref()) {
+        (Some(left), Some(right)) => left == right && a.role == b.role,
+        _ => false,
+    }
 }
 
 fn validate_snapshot(snapshot: &SessionSnapshot) -> SessionResult<()> {
@@ -4261,6 +4670,26 @@ fn read_regular_file_bounded(
     Ok(bytes)
 }
 
+/// Read a small optional JSON sidecar. Missing file = `None`; malformed/oversized
+/// content is an explicit corruption error (never silently defaulted).
+pub(crate) fn read_json_optional<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    kind: &'static str,
+) -> SessionResult<Option<T>> {
+    match read_regular_file_bounded(path, kind, 64 * 1024) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| SessionStoreError::Corrupt {
+                    kind,
+                    message: error.to_string(),
+                })
+        }
+        Err(SessionStoreError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn for_each_jsonl_line(
     path: &Path,
     mut visit: impl FnMut(&[u8]) -> SessionResult<()>,
@@ -4523,6 +4952,21 @@ mod tests {
         assert!(mgr.bashkw_path("s1").unwrap().is_file());
     }
 
+    #[test]
+    fn read_transcript_turns_round_trips_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        assert!(mgr.read_transcript_turns("s1").unwrap().is_empty());
+
+        let line = r#"{"v":1,"ts":123,"iso":"","session_id":"s1","turn_id":7,"undone":false,"user":"Q","assistant":"A","tools":[],"usage":{"prompt":1,"completion":2}}"#;
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), format!("{line}\n")).unwrap();
+        let turns = mgr.read_transcript_turns("s1").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, 7);
+        assert_eq!(turns[0].user, "Q");
+        assert_eq!(turns[0].assistant, "A");
+    }
+
     /// Windows 回归测试：transcript 追加必须真实完成 open → lock → append → unlock。
     /// 曾因 `open_append_file` 仅 `append(true)`（Windows 上只有 FILE_APPEND_DATA），
     /// `LockFileEx` 要求 GENERIC_READ/GENERIC_WRITE 而必然失败，
@@ -4579,6 +5023,115 @@ mod tests {
             "presentation writes must not mutate provider/runtime context"
         );
         assert!(mgr.presentation_path("s1").unwrap().ends_with("s1.ui.json"));
+    }
+
+    #[test]
+    fn presentation_bulk_append_updates_v4_display() {
+        use crate::session::display::DisplayRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let mut meta = SessionMeta::new("s1", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 2;
+        meta.turn_stats = vec![TurnStat {
+            after_message: 2,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 10,
+            model_usage: Vec::new(),
+        }];
+        mgr.write_meta(&meta).unwrap();
+        mgr.write_presentation("s1", &PresentationFile::default())
+            .unwrap();
+        let row = |id: &str, role: &str, content: &str, index: u32| DisplayRecord {
+            v: crate::session::display::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id: 1,
+            index,
+            seq: 0,
+            role: role.into(),
+            id: Some(id.into()),
+            content: content.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: Some(1),
+            elapsed_ms: None,
+        };
+        mgr.write_display_backfill(
+            "s1",
+            &[row("u1", "user", "Q", 0), row("a1", "assistant", "A", 1)],
+            1,
+        )
+        .unwrap();
+        mgr.append_presentation_at_latest_valid_turn(
+            "s1",
+            &[(PresentationRole::Assistant, "display only".into())],
+            None,
+        )
+        .unwrap();
+        let (display_meta, rows) = mgr.read_display("s1").unwrap().unwrap();
+        assert!(rows.iter().any(|row| {
+            row.internal_origin.as_deref() == Some("presentation") && row.content == "display only"
+        }));
+        assert_eq!(rows.last().unwrap().content, "display only");
+        assert_eq!(display_meta.last_seq, 3);
+        assert_eq!(
+            mgr.read_presentation("s1").unwrap().entries.len(),
+            1,
+            "ui.json remains the migration/rebuild source"
+        );
+
+        mgr.append_presentation_at_latest_valid_turn(
+            "s1",
+            &[(PresentationRole::Assistant, "second display-only".into())],
+            None,
+        )
+        .unwrap();
+        let (_, rows) = mgr.read_display("s1").unwrap().unwrap();
+        let presentation_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row.internal_origin.as_deref() == Some("presentation"))
+            .collect();
+        assert_eq!(presentation_rows.len(), 2);
+        assert_ne!(presentation_rows[0].id, presentation_rows[1].id);
+        assert_eq!(presentation_rows[0].index, 2);
+        assert_eq!(presentation_rows[1].index, 3);
+
+        let first = mgr
+            .append_presentation_at_latest_valid_turn(
+                "s1",
+                &[(PresentationRole::Assistant, "idempotent note".into())],
+                Some("req-1"),
+            )
+            .unwrap();
+        let retried = mgr
+            .append_presentation_at_latest_valid_turn(
+                "s1",
+                &[(PresentationRole::Assistant, "idempotent note".into())],
+                Some("req-1"),
+            )
+            .unwrap();
+        assert_eq!(first, retried);
+        let (_, rows) = mgr.read_display("s1").unwrap().unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.internal_origin.as_deref() == Some("presentation"))
+                .count(),
+            3,
+            "a retried request must append exactly once"
+        );
     }
 
     #[test]
@@ -6134,6 +6687,64 @@ mod tests {
     }
 
     #[test]
+    fn catalog_ignores_session_auxiliary_artifacts_as_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let id = "bae75c33-b339-49cd-9e0a-f8dd3ea881a6";
+        for name in [
+            format!("{id}.display.jsonl"),
+            format!("{id}.display.idx.jsonl"),
+            format!("{id}.display.meta.json"),
+            format!("{id}.bashkw.json"),
+            format!("{id}.pending_permission.json"),
+        ] {
+            std::fs::write(bucket.join(name), b"{}").unwrap();
+        }
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert!(scan.entries.is_empty());
+        assert!(
+            scan.diagnostics.is_empty(),
+            "session-owned auxiliaries must never become catalog sources: {:?}",
+            scan.diagnostics
+        );
+    }
+
+    #[test]
+    fn catalog_keeps_native_session_with_display_artifacts_single_and_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let mgr = SessionManager::with_root(&bucket);
+        let id = "display-native";
+        let lease = mgr.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snap(&["hello"])),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        mgr.append_display_user(id, "prompt-1", "hello", &[], None)
+            .unwrap();
+        let _ = mgr.read_display(id).unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, id);
+        assert!(
+            scan.diagnostics.is_empty(),
+            "display sidecars of a healthy session are not damage: {:?}",
+            scan.diagnostics
+        );
+    }
+
+    #[test]
     fn logical_delete_requires_the_same_bucket_lease_and_keeps_lock_files() {
         let root = tempfile::tempdir().unwrap();
         let bucket_a = root.path().join("aaaaaaaaaaaaaaaa");
@@ -6203,6 +6814,10 @@ mod tests {
             .unwrap();
 
         let lease = mgr.acquire_lease("s1").unwrap();
+        std::fs::write(mgr.todo_board_path("s1").unwrap(), b"{}").unwrap();
+        std::fs::write(mgr.pending_permission_path("s1").unwrap(), b"{}").unwrap();
+        assert!(mgr.todo_board_path("s1").unwrap().exists());
+        assert!(mgr.pending_permission_path("s1").unwrap().exists());
         mgr.save_rewind_transaction_with_lease(
             &lease,
             &super::super::rewind::RewindTransactionJournal {
@@ -6222,8 +6837,306 @@ mod tests {
         assert!(!mgr.jsonl_path("s1").unwrap().exists());
         assert!(!mgr.presentation_path("s1").unwrap().exists());
         assert!(!mgr.rewind_transaction_path("s1").unwrap().exists());
+        assert!(!mgr.todo_board_path("s1").unwrap().exists());
+        assert!(!mgr.pending_permission_path("s1").unwrap().exists());
         // Idempotent: deleting again is fine.
         mgr.delete(&lease).unwrap();
+    }
+
+    #[test]
+    fn delete_purges_todo_board_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        mgr.write_meta(&SessionMeta::new("s_purge", "/p", 1))
+            .unwrap();
+        mgr.save_snapshot("s_purge", &snap(&["task turn"])).unwrap();
+
+        let item = crate::tools::TodoItem {
+            id: None,
+            content: "in-memory task to purge".into(),
+            status: crate::tools::TodoStatus::InProgress,
+        };
+        crate::tools::commit_todo_board("s_purge", &[item]);
+        assert!(crate::tools::read_todo_board("s_purge").is_some());
+
+        let lease = mgr.acquire_lease("s_purge").unwrap();
+        mgr.delete(&lease).unwrap();
+        assert!(
+            crate::tools::read_todo_board("s_purge").is_none(),
+            "in-memory todo board must be fully purged on session delete"
+        );
+    }
+
+    #[test]
+    fn fork_native_session_preserves_todo_board_on_disk_and_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source_todo").unwrap();
+        let snapshot = snap(&["first turn", "second turn"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![],
+        };
+        let mut source_meta = SessionMeta::new("source_todo", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        source_meta.turn_count = 2;
+        source_meta.message_count = 2;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        let task = crate::tools::TodoItem {
+            id: None,
+            content: "retained branched task".into(),
+            status: crate::tools::TodoStatus::InProgress,
+        };
+        crate::tools::commit_todo_board("source_todo", &[task.clone()]);
+        mgr.save_snapshot("source_todo", &snapshot).unwrap();
+        assert!(mgr.todo_board_path("source_todo").unwrap().is_file());
+
+        let (forked, fork_lease) = mgr
+            .fork_native_session("source_todo", "dest_todo", 20)
+            .unwrap();
+
+        assert_eq!(forked.meta.id, "dest_todo");
+        assert!(
+            mgr.todo_board_path("dest_todo").unwrap().is_file(),
+            "forked session must inherit persisted .todo file on disk"
+        );
+
+        let inherited_board = crate::tools::read_todo_board("dest_todo")
+            .expect("forked session must inherit live todo board in memory");
+        assert_eq!(inherited_board.items.len(), 1);
+        assert_eq!(inherited_board.items[0].content, "retained branched task");
+        assert_eq!(
+            inherited_board.items[0].status,
+            crate::tools::TodoStatus::InProgress
+        );
+
+        // Cleanup
+        mgr.delete(&fork_lease).unwrap();
+        assert!(!mgr.todo_board_path("dest_todo").unwrap().exists());
+        assert!(crate::tools::read_todo_board("dest_todo").is_none());
+
+        mgr.delete(&source_lease).unwrap();
+        assert!(!mgr.todo_board_path("source_todo").unwrap().exists());
+        assert!(crate::tools::read_todo_board("source_todo").is_none());
+    }
+
+    #[test]
+    fn fork_native_session_restores_todo_board_to_memory_when_source_only_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source_cold").unwrap();
+        let snapshot = snap(&["turn 1"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![],
+        };
+        let mut source_meta = SessionMeta::new("source_cold", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        // Write .todo directly on disk, but ensure it is not registered in memory
+        let board = crate::tools::TodoBoard {
+            id: "cold-board-1".into(),
+            seq: 1,
+            revision: 0,
+            items: vec![crate::tools::TodoItem {
+                id: None,
+                content: "cold persisted task".into(),
+                status: crate::tools::TodoStatus::Pending,
+            }],
+        };
+        let bytes = serde_json::to_vec(&board).unwrap();
+        std::fs::write(mgr.todo_board_path("source_cold").unwrap(), bytes).unwrap();
+        assert!(crate::tools::read_todo_board("source_cold").is_none());
+
+        let (forked, fork_lease) = mgr
+            .fork_native_session("source_cold", "dest_cold", 20)
+            .unwrap();
+        assert_eq!(forked.meta.id, "dest_cold");
+        assert!(mgr.todo_board_path("dest_cold").unwrap().is_file());
+
+        let restored = crate::tools::read_todo_board("dest_cold").expect(
+            "forked session must restore todo board to memory even when source was cold on disk",
+        );
+        assert_eq!(restored.items.len(), 1);
+        assert_eq!(restored.items[0].content, "cold persisted task");
+        assert_eq!(restored.items[0].status, crate::tools::TodoStatus::Pending);
+
+        mgr.delete(&fork_lease).unwrap();
+        assert!(!mgr.todo_board_path("dest_cold").unwrap().exists());
+        assert!(crate::tools::read_todo_board("dest_cold").is_none());
+
+        mgr.delete(&source_lease).unwrap();
+        assert!(!mgr.todo_board_path("source_cold").unwrap().exists());
+        assert!(crate::tools::read_todo_board("source_cold").is_none());
+    }
+
+    #[test]
+    fn native_runtime_mutation_persists_and_clears_todo_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let session_id = "test_mutation_todo";
+        let lease = mgr.acquire_lease(session_id).unwrap();
+        let snapshot = snap(&["turn 1"]);
+        let presentation = PresentationFile {
+            v: PRESENTATION_VERSION,
+            entries: vec![],
+        };
+        let mut meta = SessionMeta::new(session_id, "/project", 10);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(&lease, Some(&snapshot), Some(&presentation), &meta)
+            .unwrap();
+
+        // 1. Commit active task, then commit_native_runtime_mutation -> .todo should be persisted on disk
+        let task = crate::tools::TodoItem {
+            id: None,
+            content: "task in progress".into(),
+            status: crate::tools::TodoStatus::InProgress,
+        };
+        crate::tools::commit_todo_board(session_id, &[task]);
+        mgr.commit_native_runtime_mutation(&lease, &snapshot, |_, _, _| Ok(()))
+            .unwrap();
+        assert!(
+            mgr.todo_board_path(session_id).unwrap().is_file(),
+            "active todo must be persisted by commit_native_runtime_mutation"
+        );
+
+        // 2. Mark completed and closed -> commit_native_runtime_mutation must delete the .todo file
+        assert!(crate::tools::close_todo_board_if_complete(session_id).is_none()); // only 1 task and it's in_progress
+        let completed_task = crate::tools::TodoItem {
+            id: None,
+            content: "task in progress".into(),
+            status: crate::tools::TodoStatus::Completed,
+        };
+        crate::tools::commit_todo_board(session_id, &[completed_task]);
+        let closed = crate::tools::close_todo_board_if_complete(session_id);
+        assert!(closed.is_some(), "all items completed must close the board");
+
+        mgr.commit_native_runtime_mutation(&lease, &snapshot, |_, _, _| Ok(()))
+            .unwrap();
+        assert!(
+            !mgr.todo_board_path(session_id).unwrap().exists(),
+            "completed and closed todo file must be deleted by commit_native_runtime_mutation"
+        );
+
+        mgr.delete(&lease).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_does_not_resurrect_completed_or_stale_todo_board() {
+        use zap_kernel::message::Message;
+        use zap_kernel::tool::ToolCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let session_id = "test_stale_resurrect";
+
+        // Case 1: Disk has a .todo file where all items are completed -> load_snapshot must delete it and NOT resurrect
+        let completed_board = crate::tools::TodoBoard {
+            id: "todo-done".into(),
+            seq: 1,
+            revision: 0,
+            items: vec![crate::tools::TodoItem {
+                id: None,
+                content: "already done task".into(),
+                status: crate::tools::TodoStatus::Completed,
+            }],
+        };
+        let bytes = serde_json::to_vec(&completed_board).unwrap();
+        std::fs::write(mgr.todo_board_path(session_id).unwrap(), bytes).unwrap();
+        let empty_snap = SessionSnapshot::new(Vec::new());
+        mgr.save_snapshot(session_id, &empty_snap).unwrap();
+
+        // Ensure memory is clean
+        crate::tools::purge_todo_board(session_id);
+        assert!(crate::tools::read_todo_board(session_id).is_none());
+
+        // load_snapshot should NOT restore completed board and should remove the file
+        let loaded = mgr.load_snapshot(session_id).unwrap();
+        assert_eq!(loaded.messages.len(), 0);
+        assert!(
+            crate::tools::read_todo_board(session_id).is_none(),
+            "completed todo board must NOT be resurrected into memory"
+        );
+        assert!(
+            !mgr.todo_board_path(session_id).unwrap().exists(),
+            "completed todo file on disk must be cleaned up"
+        );
+
+        // Case 2: Disk has an old .todo file with an InProgress task, but transcript shows it was already completed
+        let stale_board = crate::tools::TodoBoard {
+            id: "todo-stale".into(),
+            seq: 1,
+            revision: 0,
+            items: vec![crate::tools::TodoItem {
+                id: None,
+                content: "step 1".into(),
+                status: crate::tools::TodoStatus::InProgress,
+            }],
+        };
+        let stale_bytes = serde_json::to_vec(&stale_board).unwrap();
+        std::fs::write(mgr.todo_board_path(session_id).unwrap(), stale_bytes).unwrap();
+
+        // Create transcript where step 1 was added then completed
+        let transcript_msgs = vec![
+            Message::user("do work"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "todo_write".into(),
+                    arguments: r#"{"actions":[{"action":"add","content":"step 1"}]}"#.into(),
+                }],
+            ),
+            Message::tool_result("c1", "Added task: step 1", false),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c2".into(),
+                    name: "todo_write".into(),
+                    arguments: r#"{"actions":[{"id":1,"status":"completed"}]}"#.into(),
+                }],
+            ),
+            Message::tool_result("c2", "#1 -> completed", false),
+        ];
+        let mut snap_with_history = SessionSnapshot::new(transcript_msgs);
+        snap_with_history
+            .messages
+            .push(Message::user("is todo empty?"));
+
+        // Save snapshot without triggering persist_todo_board overwrite by writing directly or save_snapshot
+        let snap_bytes =
+            serialize_bounded(&snap_with_history, "snapshot", MAX_SNAPSHOT_BYTES).unwrap();
+        atomic_write(&mgr.snapshot_path(session_id).unwrap(), &snap_bytes).unwrap();
+
+        // Memory clean
+        crate::tools::purge_todo_board(session_id);
+        assert!(crate::tools::read_todo_board(session_id).is_none());
+        assert!(mgr.todo_board_path(session_id).unwrap().is_file());
+
+        // load_snapshot should detect transcript is completed, delete the stale disk file and NOT restore
+        let _ = mgr.load_snapshot(session_id).unwrap();
+        assert!(
+            crate::tools::read_todo_board(session_id).is_none(),
+            "stale todo board must NOT be resurrected when transcript is completed"
+        );
+        assert!(
+            !mgr.todo_board_path(session_id).unwrap().exists(),
+            "stale todo file on disk must be cleaned up"
+        );
     }
 
     #[test]
@@ -6606,6 +7519,7 @@ mod tests {
         mgr.append_presentation_at_latest_valid_turn(
             "s1",
             &[(PresentationRole::User, "concurrent append".into())],
+            None,
         )
         .unwrap();
 
@@ -6878,6 +7792,7 @@ mod tests {
             .append_presentation_at_latest_valid_turn(
                 "s1",
                 &[(PresentationRole::Assistant, "note".into())],
+                None,
             )
             .unwrap();
 
@@ -6900,6 +7815,7 @@ mod tests {
             .append_presentation_at_latest_valid_turn(
                 "s1",
                 &[(PresentationRole::Assistant, "note".into())],
+                None,
             )
             .unwrap_err();
 
@@ -7380,6 +8296,92 @@ mod tests {
     }
 
     #[test]
+    fn overlay_inflight_accepts_staged_first_user_with_leading_sacred_floor_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "staged-first-user-inflight";
+        let lease = mgr.acquire_lease(id).unwrap();
+
+        // A fresh session's canonical snapshot is seeded with only the raw first
+        // user row; the instruction blocks and persona are not in it.
+        let mut first = Message::user("first question");
+        first.id = Some("u-first".into());
+        let canonical = SessionSnapshot::new(vec![first.clone()]);
+        let mut meta = SessionMeta::new(id, "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+
+        // The inflight conversation carries the sacred-floor context before the
+        // same user row, then the assistant/steer tail.
+        let mut inflight_messages = vec![
+            Message::system("persona"),
+            Message::synthetic_user("<project_instructions>...</project_instructions>"),
+            first.clone(),
+        ];
+        let mut assistant = Message::assistant("working", Vec::new());
+        assistant.id = Some("m-1".into());
+        inflight_messages.push(assistant);
+        let mut steer = Message::user("steer after the first answer");
+        steer.id = Some("u-steer".into());
+        inflight_messages.push(steer);
+        let inflight = SessionSnapshot::new(inflight_messages);
+        mgr.save_inflight_snapshot(id, &inflight, false).unwrap();
+
+        let mut displayed = mgr.load_native_session(id).unwrap();
+        assert_eq!(displayed.snapshot, canonical);
+        mgr.overlay_inflight_for_display(id, &mut displayed);
+        assert_eq!(displayed.snapshot, inflight);
+
+        // Resume/replay keeps the strict prefix rule; only display widens it.
+        let (resumed, _) = mgr.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(resumed.snapshot, canonical);
+    }
+
+    #[test]
+    fn display_prefix_never_pairs_messages_by_text() {
+        let mut canonical_user = Message::user("same text");
+        canonical_user.id = Some("u-1".into());
+        let canonical = SessionSnapshot::new(vec![canonical_user.clone()]);
+
+        // Same text, different authoritative id: must NOT be treated as the same row.
+        let mut other_user = Message::user("same text");
+        other_user.id = Some("u-2".into());
+        let inflight = SessionSnapshot::new(vec![
+            Message::system("persona"),
+            other_user,
+            Message::assistant("answer", Vec::new()),
+        ]);
+        assert!(!snapshot_extends_display_prefix(&canonical, &inflight));
+
+        // Id-less canonical rows fail closed even when an identical text row follows
+        // extra leading context; the strict prefix check is their only path.
+        let idless = SessionSnapshot::new(vec![Message::user("same text")]);
+        let inflight_with_twin = SessionSnapshot::new(vec![
+            Message::system("persona"),
+            Message::user("same text"),
+            Message::assistant("answer", Vec::new()),
+        ]);
+        assert!(!snapshot_extends_display_prefix(
+            &idless,
+            &inflight_with_twin
+        ));
+
+        // The same authoritative id with leading sacred-floor context is accepted.
+        let accepted = SessionSnapshot::new(vec![
+            Message::system("persona"),
+            canonical_user,
+            Message::assistant("answer", Vec::new()),
+        ]);
+        assert!(snapshot_extends_display_prefix(&canonical, &accepted));
+    }
+
+    #[test]
     fn delete_removes_the_inflight_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
@@ -7401,6 +8403,45 @@ mod tests {
         mgr.delete(&lease).unwrap();
 
         assert!(!mgr.has_inflight_snapshot(id));
+    }
+
+    #[test]
+    fn retain_transcript_turns_drops_removed_turns_and_keeps_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let id = "retain-transcript";
+        let path = mgr.jsonl_path(id).unwrap();
+        let line = |turn_id: u64, user: &str| {
+            serde_json::json!({
+                "v": 1,
+                "ts": 1,
+                "iso": "x",
+                "session_id": id,
+                "turn_id": turn_id,
+                "user": user,
+                "assistant": "a",
+                "usage": {}
+            })
+            .to_string()
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                line(0, "legacy"),
+                line(1, "one"),
+                line(2, "two"),
+                line(3, "three")
+            ),
+        )
+        .unwrap();
+        let surviving = BTreeSet::from([1, 3]);
+        assert_eq!(mgr.retain_transcript_turns(id, &surviving).unwrap(), 1);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("\"turn_id\":0"), "legacy record stays");
+        assert!(out.contains("\"turn_id\":1"));
+        assert!(!out.contains("\"turn_id\":2"), "removed turn is gone");
+        assert!(out.contains("\"turn_id\":3"));
     }
 
     #[test]
@@ -7427,5 +8468,21 @@ mod tests {
         let old = r#"{"id":"x","name":"n","working_dir":"/w","created_at":0,"updated_at":0}"#;
         let parsed: SessionMeta = serde_json::from_str(old).unwrap();
         assert_eq!(parsed.origin, SessionOrigin::Manual);
+    }
+
+    #[test]
+    fn protocol_key_survives_display_rename_and_roundtrip() {
+        let mut meta = SessionMeta::new("s1", "/tmp/p", 0);
+        meta.protocol_key = Some("alice".into());
+        meta.name = "Renamed in WebUI".into();
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.protocol_key.as_deref(), Some("alice"));
+        assert_eq!(back.name, "Renamed in WebUI");
+
+        // Old metadata without the field must still deserialize.
+        let old = r#"{"id":"x","name":"n","working_dir":"/w","created_at":0,"updated_at":0}"#;
+        let parsed: SessionMeta = serde_json::from_str(old).unwrap();
+        assert!(parsed.protocol_key.is_none());
     }
 }

@@ -6,18 +6,29 @@
 
 ### 1.1 配置文件定位与优先级
 1. **工作区项目级**：`<workspace>/.mcp.json`（仅对当前项目生效，版本控制友好）。
-2. **用户全局级**：`~/.zap/mcp.json`（全局共享，所有项目均可访问）。
+2. **用户全局级**：`~/.jeikcode/mcp.json`（全局共享，所有项目均可访问）。
 3. **优先级**：同名配置下，项目级覆盖全局级。
 
-### 1.2 CLI 快速添加 MCP 工具
-使用 `jeikcode mcp add` 命令行添加（自动写入 JSON，无需手动编辑）：
+### 1.2 CLI 快速管理 MCP 工具
+使用 `jeikcode mcp` 命令行自动管理配置（自动写入并安全格式化 JSON，无需手动编辑）：
 
 ```bash
-# 写入当前项目 .mcp.json
+# 写入当前项目 .mcp.json (stdio 进程模式)
 jeikcode mcp add playwright npx @playwright/mcp@latest
 
-# 写入全局 ~/.zap/mcp.json
+# 添加 HTTP / SSE 远程 MCP 服务 (支持自定义请求头与信任标记)
+jeikcode mcp add-http remote-api https://mcp.example.com/sse -H "Authorization: Bearer secret-token" --trust
+
+# 写入全局 ~/.jeikcode/mcp.json
 jeikcode mcp add playwright npx -y @playwright/mcp@latest --global
+
+# 查看当前已配置 MCP 工具列表
+jeikcode mcp list
+jeikcode mcp ls --json
+
+# 移除指定 MCP 工具（自动安全清理）
+jeikcode mcp remove playwright
+jeikcode mcp rm remote-api --global
 
 # 指定工作区目录
 jeikcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
@@ -33,6 +44,13 @@ jeikcode mcp logout github
 ```json
 {
   "mcpServers": {
+    "remote-api": {
+      "url": "https://mcp.example.com/sse",
+      "headers": {
+        "Authorization": "Bearer secret-token"
+      },
+      "trust": true
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "E:/code"],
@@ -55,18 +73,33 @@ jeikcode mcp logout github
 
 ### 1.4 核心参数细微差异说明
 
-- **`scope` 范围模式（`"project"` vs `"session"`）**：
-  - `"project"`（默认）：项目级共享单例。同项目下所有会话复用同一子进程，生命周期跟随项目，不会被闲置回收。适合无状态工具（如 filesystem、git、搜索）。
-  - `"session"`：会话级独立隔离。每个会话单独启动一个独立子进程，并自动向子进程注入环境变量 `JEIKCODE_SESSION_ID=<当前会话ID>`。适合浏览器（Playwright）、有状态调试器等需要会话隔离的工具。
-  - **进程闲置回收**：在 `scope: "session"` 模式下，当会话切走且距离上次工具调用超过 `[mcp.session] idle_ttl_secs`（默认 600 秒 / 10 分钟）时，系统会自动回收终止该进程释放资源；下次该会话再次调用工具时自动懒加载拉起重启。在 `config.toml` 中设置 `idle_ttl_secs = 0` 可关闭闲置回收。
-- **`maxConcurrentCalls` 并发调用上限**：
-  - 允许范围 1~64（默认 8）。
-  - 无状态读取类服务保留默认 8 并发；
-  - 浏览器控制（Playwright、Puppeteer）等带独占状态的工具建议显式设为 `1`，避免并发操作冲突。
+- **`scope` 范围模式（`"global"` vs `"project"` vs `"session"`）**：
+  - `"global"`：全局级共享。跨所有项目与会话复用单例进程，生命周期贯穿应用。适合完全无本地工程状态的纯云端或公共服务（如 Brave 网页搜索、公网翻译等），实现资源极限轻量。
+  - `"project"`（默认）：项目级共享单例。同项目下所有会话复用同一子进程，生命周期跟随项目。适合无状态或工程级工具（如 filesystem、git、代码分析）。
+  - `"session"`：会话级独立隔离。每个会话单独启动一个独立子进程，并自动向子进程注入环境变量 `JEIKCODE_SESSION_ID=<当前会话ID>`。适合浏览器（Playwright）、有状态调试器等需要独占沙箱的工具。
+  - **进程闲置回收**：在 `scope: "session"` 模式下，当会话切走且距离上次工具调用超过 `[mcp.session] idle_ttl_secs`（默认 600 秒 / 10 分钟）时，系统会自动回收终止该进程释放资源；在 `config.toml` 中设置 `idle_ttl_secs = 0` 可关闭闲置回收。
+- **`maxConcurrentCalls` 并发调用上限（单服务并发控制）**：
+  - **缺省默认值**：`8`（不写即为 8，支持最多 8 个请求同时并发执行，适合文件读取、网页搜索等无状态服务）；
+  - **允许范围**：`1 ~ 64`；
+  - **何时显式设为 `1`（排队串行模式）**：
+    1. **有状态独占工具**：浏览器自动化（Playwright、Puppeteer）、屏幕控制、断点调试器等，必须单进单出避免页面操作打架踩踏；
+    2. **简易/单线程脚本**：个人用 Python/Bash 开发的轻量 MCP Server，设为 `1` 可防止并发请求冲垮对端或造成回包串包。
 - **`disabled` 临时禁用**：
   - 设为 `true` 即可临时停用该服务而无需删除配置。
 
-### 1.5 重载与生效方式
+### 1.5 守护进程 REST API
+
+Daemon 提供 MCP 服务的动态管理与热重载接口：
+
+- `GET /api/mcp/status`：获取当前 MCP 服务与连接状态。
+- `POST /api/mcp/add`：动态添加/更新 stdio 或 http MCP 配置并触发重载。
+  - 请求体示例：`{ "name": "remote-api", "url": "https://mcp.example.com/sse", "trust": true }`
+- `POST /api/mcp/remove`：动态删除 MCP 配置并触发重载。
+  - 请求体示例：`{ "name": "remote-api", "global": false }`
+- `DELETE /api/mcp/:name`：通过路径参数删除指定 MCP 服务。
+- `POST /api/mcp/reload`：手动触发 MCP 实例重载。
+
+### 1.6 重载与生效方式
 
 修改配置后**无需重启 JeikCode 进程**：
 
@@ -86,9 +119,9 @@ Skills 允许以 Markdown + YAML 方式为 Agent 注入特定工程工作流。
 
 ### 2.1 目录定位与优先级
 按以下优先级由高到低搜索（高优先级同名覆盖）：
-1. **项目专属**：`<workspace>/.zap/skills/<name>/SKILL.md` 或 `<workspace>/.skills/<name>/SKILL.md`
-2. **全局用户**：`~/.zap/skills/<name>/SKILL.md`
-3. **插件市场**：`~/.zap/plugins/marketplaces/...`
+1. **项目专属**：`<workspace>/.jeikcode/skills/<name>/SKILL.md` 或 `<workspace>/.skills/<name>/SKILL.md`
+2. **全局用户**：`~/.jeikcode/skills/<name>/SKILL.md`
+3. **插件市场**：`~/.jeikcode/plugins/marketplaces/...`
 
 ### 2.2 `SKILL.md` 标准格式
 
@@ -123,6 +156,6 @@ description: 专精于代码审查与架构规范检查。当用户要求 review
 
 ## 3. Plugins 插件管理
 
-- 插件主目录：`~/.zap/plugins/`。
+- 插件主目录：`~/.jeikcode/plugins/`。
 - 在 TUI 输入 `/plugin` 交互式浏览、安装与卸载插件。
 - 安装或更新插件后调用工具 `zap_config(action="reload")` 立即生效，无需重启。

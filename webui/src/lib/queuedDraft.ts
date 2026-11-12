@@ -12,17 +12,31 @@ function isApprovalMode(value: unknown): value is ApprovalMode {
 /** Map the UI approval mode to the daemon queue's existing wire property. */
 export function serializeQueuedCard<T extends { approvalMode?: ApprovalMode; clientInputId?: string }>(
   item: T,
-): Omit<T, 'approvalMode' | 'clientInputId'> & { approval_mode?: ApprovalMode } {
-  const { approvalMode, clientInputId: _localOnlyId, ...rest } = item;
-  return isApprovalMode(approvalMode) ? { ...rest, approval_mode: approvalMode } : rest;
+): Omit<T, 'approvalMode' | 'clientInputId'> & {
+  approval_mode?: ApprovalMode;
+  client_input_id?: string;
+} {
+  const { approvalMode, clientInputId, ...rest } = item;
+  return {
+    ...rest,
+    ...(clientInputId ? { client_input_id: clientInputId } : {}),
+    ...(isApprovalMode(approvalMode) ? { approval_mode: approvalMode } : {}),
+  };
 }
 
 /** Restore a daemon queue card without trusting malformed persisted modes. */
-export function deserializeQueuedCard<T extends { approval_mode?: ApprovalMode }>(
+export function deserializeQueuedCard<T extends { approval_mode?: ApprovalMode; client_input_id?: string }>(
   item: T,
-): Omit<T, 'approval_mode'> & { approvalMode?: ApprovalMode } {
-  const { approval_mode, ...rest } = item;
-  return isApprovalMode(approval_mode) ? { ...rest, approvalMode: approval_mode } : rest;
+): Omit<T, 'approval_mode' | 'client_input_id'> & {
+  approvalMode?: ApprovalMode;
+  clientInputId?: string;
+} {
+  const { approval_mode, client_input_id, ...rest } = item;
+  return {
+    ...rest,
+    ...(client_input_id ? { clientInputId: client_input_id } : {}),
+    ...(isApprovalMode(approval_mode) ? { approvalMode: approval_mode } : {}),
+  };
 }
 
 export const STORAGE_KEY_QUEUED_MESSAGES = 'jeikcode_queued_messages_v2';
@@ -99,10 +113,14 @@ export function stashSessionQueued<T>(
 /**
  * Restore a session's stashed queued/steer items when switching back or refreshing.
  */
-export function restoreSessionQueued<T>(
+export function restoreSessionQueued<
+  T extends { id?: unknown; clientInputId?: string },
+>(
   stash: Map<string, T[]>,
   sessionId: string | null | undefined,
 ): T[] {
+  const identity = (item: T | undefined): string =>
+    item?.clientInputId || String(item?.id ?? '');
   if (!sessionId) return [];
   let found = stash.get(sessionId);
   // Always query storage so any cross-tab or refreshed items are thoroughly restored
@@ -114,11 +132,12 @@ export function restoreSessionQueued<T>(
         stash.set(sessionId, loaded);
         found = loaded;
       } else {
-        // Merge without duplicating IDs
-        const existingIds = new Set(found.map((item: any) => String(item?.id ?? '')));
+        // Merge by the stable client identity first; numeric ids collide after
+        // refreshes and are only a legacy fallback.
+        const existingIds = new Set(found.map(identity));
         const merged = [...found];
         for (const it of loaded) {
-          if (!existingIds.has(String((it as any)?.id ?? ''))) {
+          if (!existingIds.has(identity(it))) {
             merged.push(it);
           }
         }
@@ -130,17 +149,25 @@ export function restoreSessionQueued<T>(
   return found && found.length > 0 ? [...found] : [];
 }
 
-/**
- * Keep this tab's follow-up queue when `/chat/active` says the session is
- * still running. Clearing it hid queued and steered chrome after a sidebar
- * switch even though `postChatSteer` continued to apply at the next step.
- */
-export function queueAfterSessionActiveCheck<T>(input: {
-  restored: T[];
-  sessionActive: boolean;
-}): T[] {
-  return input.restored;
+const QUEUE_KIND_RANK: Record<string, number> = { queue: 0, steering: 1, steer: 2 };
+
+/** A local stage only overrides the server while its write is still in flight. */
+export function mergeQueuedCardState<T extends { kind?: string }>(
+  serverCard: T,
+  localCard: T | undefined,
+  localMutationInFlight: boolean,
+): T {
+  if (
+    !localCard ||
+    !localMutationInFlight ||
+    (QUEUE_KIND_RANK[localCard.kind ?? ''] ?? 0) <= (QUEUE_KIND_RANK[serverCard.kind ?? ''] ?? 0)
+  ) {
+    return serverCard;
+  }
+  return { ...serverCard, kind: localCard.kind };
 }
+
+
 
 /**
  * Put queued follow-ups back into the composer.

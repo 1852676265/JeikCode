@@ -55,7 +55,7 @@ struct Sentinel {
 }
 
 fn lock_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".zap")
+    project_root.join(".jeikcode")
 }
 
 fn current_pid() -> u32 {

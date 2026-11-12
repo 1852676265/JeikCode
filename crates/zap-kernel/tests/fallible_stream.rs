@@ -602,6 +602,75 @@ async fn thinking_only_stream_is_retried_then_succeeds() {
     assert_eq!(stop.as_deref(), Some("Stopped"));
 }
 
+// ── WHITESPACE-ONLY stream is treated as EMPTY (gateway emits one blank token) ──
+//
+// OpenCode Zen answers a request it refuses (e.g. an oversized / moderated MCP
+// tool set) with a 200 whose ONLY content is a couple of spaces. That is a
+// content-free round: it must go through the empty-200 retry path instead of
+// being stored as a blank assistant bubble and reported as a clean stop.
+#[tokio::test(start_paused = true)]
+async fn whitespace_only_stream_is_retried_then_succeeds() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::TextDelta("  ".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("hello".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let received = provider.received.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut errored = false;
+    let mut stop: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::TextDelta(t) => text.push_str(&t),
+            AgentEvent::Error { .. } => errored = true,
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(format!("{reason:?}"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let calls = received.lock().unwrap().len();
+    assert_eq!(
+        calls, 2,
+        "a whitespace-only 200 must be RETRIED as an empty response; got {calls} calls"
+    );
+    // The blank delta already reached the driver before end-of-round detection
+    // (live events cannot be retracted — same constraint as the 429 replay path);
+    // the STORED answer is rebuilt from the retry round and is free of it.
+    assert_eq!(
+        text.trim(),
+        "hello",
+        "the recovered round must carry the answer; got {text:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("空响应") && w.contains("重试")),
+        "a whitespace-only stream must emit the VISIBLE empty-response retry notice; got {warnings:?}"
+    );
+    assert!(
+        !errored,
+        "a recovered whitespace-only response must NOT surface a terminal Error"
+    );
+    assert_eq!(stop.as_deref(), Some("Stopped"));
+}
+
 // ── EMPTY-RESPONSE EXHAUSTION (a run of empty 200s fails VISIBLY, not silently) ──
 //
 // If every resend is also empty, the dedicated budget is exhausted and the turn

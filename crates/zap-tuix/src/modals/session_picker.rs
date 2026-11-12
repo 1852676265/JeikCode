@@ -1488,6 +1488,7 @@ mod tests {
         zap_capabilities::tools::commit_todo_board(
             &session.id,
             &[zap_capabilities::tools::TodoItem {
+                id: None,
                 content: "task C".into(),
                 status: zap_capabilities::tools::todo::TodoStatus::Pending,
             }],

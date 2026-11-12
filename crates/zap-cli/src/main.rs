@@ -18,7 +18,7 @@ mod schedule_os;
 mod server_cmd;
 mod telemetry_cmd;
 mod vision;
-use zap::uninstall;
+use jeikcode::uninstall;
 
 // Redirect JEIKCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so unit tests never persist into the developer's real `~/.jeikcode`.
@@ -31,8 +31,10 @@ fn _isolate_jeikcode_home() {
 }
 
 use zap_capabilities::mcp::{
-    load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
-    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpTokenStore,
+    load_all_mcp_configs, load_mcp_config, login_mcp_oauth,
+    merge_http_mcp_server_with_options_into_json_file, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_with_options_into_json_file, read_raw_servers,
+    remove_mcp_server_from_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpTokenStore,
     McpTransportConfig,
 };
 use zap_config::config::Config;
@@ -188,7 +190,7 @@ fn format_serve_banner(
 
     let mut out = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(out, "Zap serve");
+    let _ = writeln!(out, "JeikCode serve");
     // canonicalize() on Windows yields `\\?\E:\...` — strip for human banner.
     let project_raw = workdir.display().to_string();
     let project_display = project_raw
@@ -276,11 +278,11 @@ fn format_serve_banner(
         );
         let _ = writeln!(
             out,
-            "  # zap-sdk: ZapClient(\"{base_local}\", token=\"{t}\")"
+            "  # jeikcode-sdk: JeikCodeClient(\"{base_local}\", token=\"{t}\")"
         );
         let _ = writeln!(
             out,
-            "  # OpenAI `user` field = Zap session key (e.g. alice_1 / chat-2)"
+            "  # OpenAI `user` field = JeikCode session key (e.g. alice_1 / chat-2)"
         );
     } else if no_token {
         let _ = writeln!(out, "Auth: disabled (--no-token)");
@@ -387,7 +389,7 @@ async fn attach_to_server(url: &str, token_arg: Option<&str>, no_open: bool) -> 
         None => format!("{base}/"),
     };
 
-    eprintln!("Connected to Zap server at {base}");
+    eprintln!("Connected to JeikCode server at {base}");
     eprintln!("  UI: {client_url}");
     if token.is_none() {
         eprintln!("  (no token; if the server requires auth, pass --token or a full ?token= URL)");
@@ -461,6 +463,7 @@ async fn run_serve_mode(
         } else {
             store.mint()
         };
+        store.set_display(&display);
         (Some(store), Some(display))
     };
     // Passed to either the native-service success summary or the foreground
@@ -470,6 +473,7 @@ async fn run_serve_mode(
         format_serve_banner(&host, port, &workdir, display_token.as_deref(), no_token);
 
     if config_auto_update_enabled()
+        && !zap_config::config::offline::is_offline_active()
         && !is_running_as_backup()
         && !zap_updater::is_package_managed()
     {
@@ -487,38 +491,42 @@ async fn run_serve_mode(
     }
 
     // Native service wizard BEFORE bind and BEFORE any address/token output.
-    // Linux uses systemd, macOS launchd, and Windows Task Scheduler.
-    let setup = zap::host_service::HostServiceSetupOptions {
-        host: &host,
-        port,
-        workdir: &workdir,
-        no_token,
-        fixed_token: fixed_token.as_deref(),
-        display_token: display_token.as_deref(),
-        yolo,
-        no_telemetry,
-        banner: &startup_footer,
-    };
-    match zap::host_service::prompt_host_service_setup(&setup) {
-        Ok(true) => return 0,
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!(
-                "{}",
-                zap::host_service::host_msg(
-                    &format!("Could not install the host service: {e:#}"),
-                    &format!("系统服务配置失败: {e:#}"),
-                    &format!("Không thể cài đặt dịch vụ hệ thống: {e:#}"),
-                )
-            );
-            eprintln!(
-                "{}",
-                zap::host_service::host_msg(
-                    "Continuing in the foreground.",
-                    "改为前台运行。",
-                    "Tiếp tục chạy ở chế độ foreground.",
-                )
-            );
+    // Linux uses systemd/procd, macOS launchd, and Windows logon autostart.
+    // Skip interactive wizard when this process is an in-place restart successor
+    // (e.g. triggered remotely via WebUI update or port/host change).
+    if !zap_updater::is_restarted_process() {
+        let setup = jeikcode::host_service::HostServiceSetupOptions {
+            host: &host,
+            port,
+            workdir: &workdir,
+            no_token,
+            fixed_token: fixed_token.as_deref(),
+            display_token: display_token.as_deref(),
+            yolo,
+            no_telemetry,
+            banner: &startup_footer,
+        };
+        match jeikcode::host_service::prompt_host_service_setup(&setup) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    jeikcode::host_service::host_msg(
+                        &format!("Could not install the host service: {e:#}"),
+                        &format!("系统服务配置失败: {e:#}"),
+                        &format!("Không thể cài đặt dịch vụ hệ thống: {e:#}"),
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    jeikcode::host_service::host_msg(
+                        "Continuing in the foreground.",
+                        "改为前台运行。",
+                        "Tiếp tục chạy ở chế độ foreground.",
+                    )
+                );
+            }
         }
     }
 
@@ -727,6 +735,13 @@ fn scan_config_language() -> Option<zap_tuix::i18n::Locale> {
         Ok(c) => c,
         Err(_) => return None,
     };
+    if let Ok(val) = toml::from_str::<toml::Value>(&content) {
+        if let Some(lang_val) = val.get("language") {
+            if let Ok(loc) = lang_val.clone().try_into::<zap_tuix::i18n::Locale>() {
+                return Some(loc);
+            }
+        }
+    }
     let cfg: zap_config::config::Config = match toml::from_str(&content) {
         Ok(c) => c,
         Err(_) => return None,
@@ -831,6 +846,9 @@ fn build_i18n_command() -> clap::Command {
 /// up `pending.json` and apply. Silent: stdout/stderr are already /dev/null
 /// (see `spawn_detached_upgrade_prep`), so any output would be discarded.
 async fn run_prepare_upgrade_worker() -> i32 {
+    if zap_config::config::offline::is_offline_active() {
+        return 0;
+    }
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
     // UpgradeEvent stream is per-byte progress; we don't surface it here
     // (parent is gone), so drain to /dev/null.
@@ -855,6 +873,9 @@ async fn run_prepare_upgrade_worker() -> i32 {
 /// the cancel-on-exit problem we're trying to solve). If spawning fails we
 /// just drop the error; auto-upgrade is best-effort.
 fn spawn_detached_upgrade_prep() {
+    if zap_config::config::offline::is_offline_active() {
+        return;
+    }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => return,
@@ -912,14 +933,14 @@ fn invoked_cli_name() -> &'static str {
                 p.file_stem()
                     .map(|s| s.to_string_lossy().to_ascii_lowercase())
             })
-            .filter(|s| s == "zap" || s == "jeikcode")
-            .unwrap_or_else(|| "zap".into())
+            .filter(|s| s == "jeikcode")
+            .unwrap_or_else(|| "jeikcode".into())
     })
     .as_str()
 }
 
 #[derive(Parser)]
-#[command(name = "zap", version = VERSION, about = "Zap — AI coding assistant")]
+#[command(name = "jeikcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1454,6 +1475,31 @@ enum McpCli {
         /// Executable and arguments, e.g. `npx @playwright/mcp@latest`
         #[arg(required = true, num_args = 1..)]
         command: Vec<String>,
+        /// Optional environment variable in KEY=VALUE format (can be specified multiple times)
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Trust this server and its tools
+        #[arg(long)]
+        trust: bool,
+        /// Write `~/.jeikcode/mcp.json` instead of `<dir>/.mcp.json`
+        #[arg(long)]
+        global: bool,
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
+        dir: Option<PathBuf>,
+    },
+    /// Add or replace an HTTP/SSE MCP server (`mcpServers.<name>` with `url` and optional headers)
+    AddHttp {
+        /// Server key (tools appear as `mcp__<name>__…`)
+        name: String,
+        /// Remote SSE / HTTP MCP endpoint URL (e.g. `https://example.com/sse`)
+        url: String,
+        /// Optional HTTP header in Key:Value or Key=Value format (can be specified multiple times)
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
+        /// Trust this server and its tools
+        #[arg(long)]
+        trust: bool,
         /// Write `~/.jeikcode/mcp.json` instead of `<dir>/.mcp.json`
         #[arg(long)]
         global: bool,
@@ -1472,6 +1518,28 @@ enum McpCli {
         /// Directory for project `.mcp.json` (defaults to current directory)
         #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
         dir: Option<PathBuf>,
+    },
+    /// Remove an MCP server from configuration (`.mcp.json` or `~/.jeikcode/mcp.json`)
+    #[command(alias = "rm")]
+    Remove {
+        /// Server key to remove
+        name: String,
+        /// Remove from `~/.jeikcode/mcp.json` instead of `<dir>/.mcp.json`
+        #[arg(long)]
+        global: bool,
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
+        dir: Option<PathBuf>,
+    },
+    /// List configured MCP servers
+    #[command(alias = "ls")]
+    List {
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long, value_hint = clap::ValueHint::DirPath)]
+        dir: Option<PathBuf>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
     /// Complete OAuth login for a remote MCP server.
     Login {
@@ -1535,6 +1603,35 @@ const INTERNAL_PREPARE_UPGRADE_ENV: &str = "JEIKCODE_INTERNAL_PREPARE_UPGRADE";
 /// process has no console. `ctrl_c()` then fails, and returning would drop
 /// the listener before the window connects.
 async fn wait_until_webui_stopped() {
+    if zap_updater::is_desktop_managed() {
+        // 纯事件驱动生命线（0 轮询、0% CPU）：
+        // 桌面壳持有子进程 stdin 管道写端；一旦桌面壳以任何方式退出，OS 内核立即关闭管道，
+        // 阻塞式 stdin.read 瞬间收到 EOF (Ok(0)) 并唤醒退出，配合 Windows Job Object 双重防孤儿。
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = std::thread::Builder::new()
+            .name("desktop-lifeline-eof".into())
+            .spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                let _ = std::io::stdin().read(&mut buf);
+                let _ = eof_tx.send(());
+            });
+        #[cfg(windows)]
+        if !process_has_console() {
+            let _ = eof_rx.await;
+            return;
+        }
+        tokio::select! {
+            _ = eof_rx => return,
+            res = tokio::signal::ctrl_c() => {
+                if res.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                return;
+            }
+        }
+    }
+
     #[cfg(windows)]
     {
         if !process_has_console() {
@@ -1568,6 +1665,9 @@ fn main() {
     // old process has exited and released the listen port.
     zap_updater::wait_for_predecessor_if_requested();
 
+    // 在任何线程/子进程创建前收走启动方式标记，避免 bash 工具里的子 jeikcode 继承后误判。
+    zap_updater::capture_launch_markers();
+
     // Before any thread or child process exists: a Git-Bash launch leaves TMP/TEMP/TMPDIR
     // as POSIX paths, which native children spawned directly (not via the bash tool) would
     // resolve as `<drive>:\tmp`. Best-effort and cheap; a no-op when already native.
@@ -1597,6 +1697,11 @@ fn main() {
 }
 
 fn real_main() {
+    // 异步执行老版本残留环境清理与迁移（不阻塞主流程）
+    std::thread::spawn(|| {
+        zap_updater::migrate_legacy_environment();
+    });
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
@@ -1679,6 +1784,9 @@ fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
 async fn async_main() {
     let inherited_token = zap_updater::take_restart_token();
     if let Some(mut launch) = desktop_webui_fast_launch() {
+        if let Some(h) = zap_updater::restart_listen_host_from_env() {
+            launch.host = h;
+        }
         if let Some(port) = zap_updater::restart_listen_port_from_env() {
             launch.port = port;
         }
@@ -1738,6 +1846,8 @@ async fn async_main() {
     // since the previous in-process download was tied to the parent's
     // tokio runtime and got cancelled on any quick exit.
     if std::env::var(INTERNAL_PREPARE_UPGRADE_ENV).is_ok() {
+        let early_cfg = Config::load(&Config::default_path()).ok();
+        zap_config::config::offline::seed_offline_from_config(early_cfg.as_ref());
         let code = run_prepare_upgrade_worker().await;
         std::process::exit(code);
     }
@@ -1808,7 +1918,7 @@ async fn async_main() {
                 eprintln!("✓ Upgrading to {}...", applied.version);
                 // 开启自动更新时，后台无感更新自动全选同步所有非模型配置文件及提示词/词林/指南
                 let home = zap_config::config::Config::config_dir();
-                if let Err(e) = zap::config_sync::apply_all_bundled_assets(&home, false) {
+                if let Err(e) = jeikcode::config_sync::apply_all_bundled_assets(&home, false) {
                     eprintln!("  ⚠ 自动更新配置同步警告: {e}");
                 }
                 // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
@@ -1835,7 +1945,7 @@ async fn async_main() {
             }
         }
         tracing::info!(
-            target: "zap::startup",
+            target: "jeikcode::startup",
             stage = "pending_upgrade",
             elapsed_ms = stage_start.elapsed().as_millis() as u64,
             total_ms = process_start.elapsed().as_millis() as u64,
@@ -1916,7 +2026,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             let token = std::env::var("JEIKCODE_ASKPASS_TOKEN").ok();
             match (sock, token) {
                 (Some(s), Some(t)) => {
-                    match zap::askpass::run_askpass(prompt, Path::new(&s), &t) {
+                    match jeikcode::askpass::run_askpass(prompt, Path::new(&s), &t) {
                         Some(pw) => {
                             use std::io::Write;
                             print!("{pw}");
@@ -1992,13 +2102,20 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::Daemon {
-                host,
-                port,
+                mut host,
+                mut port,
                 token,
                 client,
                 idle_timeout,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited_host) = zap_updater::restart_listen_host_from_env() {
+                    host = inherited_host;
+                }
+                if let Some(inherited) = zap_updater::restart_listen_port_from_env() {
+                    port = inherited;
+                }
+                let token = token.or_else(|| inherited_token.clone());
                 let webui_tokens = match zap_daemon::auth_token::standalone_daemon_tokens(
                     &host,
                     token.as_deref(),
@@ -2058,11 +2175,14 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             }
             Commands::Webui {
                 mut port,
-                host,
+                mut host,
                 no_open,
                 token,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited_host) = zap_updater::restart_listen_host_from_env() {
+                    host = inherited_host;
+                }
                 if let Some(inherited) = zap_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }
@@ -2080,19 +2200,29 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 return Ok(0);
             }
             Commands::Serve {
-                host,
+                mut host,
                 mut port,
                 dir,
                 token,
-                no_token,
+                mut no_token,
                 yolo,
                 idle_timeout,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                if let Some(inherited_host) = zap_updater::restart_listen_host_from_env() {
+                    host = inherited_host;
+                }
                 if let Some(inherited) = zap_updater::restart_listen_port_from_env() {
                     port = inherited;
                 }
-                let token = token.or_else(|| inherited_token.clone());
+                if let Some(inherited_nt) = zap_updater::take_restart_no_token() {
+                    no_token = inherited_nt;
+                }
+                let token = if no_token {
+                    None
+                } else {
+                    token.or_else(|| inherited_token.clone())
+                };
                 let code = run_serve_mode(
                     host,
                     port,
@@ -2196,14 +2326,14 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 // every ACP session. Sharing one pre-built provider would pin gateway
                 // session affinity to whichever session bound it first.
                 let provider_factory = zap_daemon::coding_provider_factory();
-                let engine = zap::acp::engine::EngineConfig::from_coding_config(
+                let engine = jeikcode::acp::engine::EngineConfig::from_coding_config(
                     runtime_cfg.agent_config(),
                 );
                 // Flush telemetry before the long-running stdio loop.
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
-                return zap::acp::serve_stdio(zap::acp::AcpServeOptions {
+                return jeikcode::acp::serve_stdio(jeikcode::acp::AcpServeOptions {
                     engine: Some(engine),
                     provider_factory: Some(provider_factory),
                     auto_approve,
@@ -2232,14 +2362,14 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 return Ok(0);
             }
             Commands::SyncConfig { auto } => {
-                if let Some(home) = dirs::home_dir().map(|h| h.join(".zap")) {
-                    let diffs = zap::config_sync::scan_zap_config_diffs(&home);
+                if let Some(home) = dirs::home_dir().map(|h| h.join(".jeikcode")) {
+                    let diffs = jeikcode::config_sync::scan_zap_config_diffs(&home);
                     if auto {
-                        let _ = zap::config_sync::apply_selected_diffs(diffs);
+                        let _ = jeikcode::config_sync::apply_selected_diffs(diffs);
                     } else if !diffs.is_empty() {
-                        let _ = zap::config_sync::prompt_interactive_config_sync(diffs);
+                        let _ = jeikcode::config_sync::prompt_interactive_config_sync(diffs);
                     }
-                    let _ = zap::config_sync::set_last_seen_version(
+                    let _ = jeikcode::config_sync::set_last_seen_version(
                         &home,
                         env!("CARGO_PKG_VERSION"),
                     );
@@ -2264,14 +2394,29 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     // so a lone flag cannot accidentally start a network server.
     if cli.host.is_some() || cli.port.is_some() {
         HEADLESS_MODE.store(true, Ordering::Relaxed);
-        let host = cli.host.clone().unwrap_or_else(|| "0.0.0.0".to_string());
-        let port = cli.port.unwrap_or(4096);
+        let mut host = cli.host.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+        let mut port = cli.port.unwrap_or(4096);
+        let mut no_token = cli.no_token;
+        if let Some(inherited_host) = zap_updater::restart_listen_host_from_env() {
+            host = inherited_host;
+        }
+        if let Some(inherited) = zap_updater::restart_listen_port_from_env() {
+            port = inherited;
+        }
+        if let Some(inherited_nt) = zap_updater::take_restart_no_token() {
+            no_token = inherited_nt;
+        }
+        let token = if no_token {
+            None
+        } else {
+            cli.token.clone().or_else(|| inherited_token.clone())
+        };
         let code = run_serve_mode(
             host,
             port,
             cli.dir.clone(),
-            cli.no_token,
-            cli.token.clone(),
+            no_token,
+            token,
             cli.yolo,
             0,
             cli.no_telemetry,
@@ -2350,7 +2495,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
         (Config::default(), None)
     };
     tracing::info!(
-        target: "zap::startup",
+        target: "jeikcode::startup",
         stage = "config_load",
         elapsed_ms = config_load_start.elapsed().as_millis() as u64,
         total_ms = run_start.elapsed().as_millis() as u64,
@@ -2362,11 +2507,8 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     // Locale was already pre-resolved above (before clap parse) so --help
     // could be localised. Re-resolve with the full config (which may specify
     // a language key) to honour config-over-env priority.
-    if config.language.is_some() {
-        let locale =
-            zap_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
-        zap_tuix::i18n::set_locale(locale);
-    }
+    let locale = zap_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+    zap_tuix::i18n::set_locale(locale);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
@@ -2412,7 +2554,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
         zap_capabilities::provider::spawn_models_dev_catalog_refresh();
     }
     tracing::info!(
-        target: "zap::startup",
+        target: "jeikcode::startup",
         stage = "pricing_refresh_spawned",
         spawned = pricing_refresh_spawned,
         total_ms = run_start.elapsed().as_millis() as u64,
@@ -2447,7 +2589,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
     )
     .await?;
     tracing::info!(
-        target: "zap::startup",
+        target: "jeikcode::startup",
         stage = "runtime_start",
         elapsed_ms = runtime_start.elapsed().as_millis() as u64,
         total_ms = run_start.elapsed().as_millis() as u64,
@@ -2632,6 +2774,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             // upgrades, so skip spawning the detached prep process entirely —
             // `prepare_deferred_upgrade` would no-op anyway.
             if config.auto_update
+                && !zap_config::config::offline::is_offline_active()
                 && !is_running_as_backup()
                 && !cli.dev
                 && !zap_updater::is_package_managed()
@@ -2680,7 +2823,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             // they must not retarget an already-open runtime.
             let provider_selection_mode = zap_tuix::ProviderSelectionMode::Pinned;
             tracing::info!(
-                target: "zap::startup",
+                target: "jeikcode::startup",
                 stage = "tui_enter",
                 total_ms = run_start.elapsed().as_millis() as u64,
                 "handing control to TUI"
@@ -3531,8 +3674,8 @@ fn is_git_repository(dir: &Path) -> bool {
     }
 }
 
-/// 判断 .gitignore 文件内容中是否已经包含了忽略 .zap/codegraph/ 的规则
-/// （包括显式忽略 codegraph，或父级 .zap/、.* 等整体忽略规则）
+/// 判断 .gitignore 文件内容中是否已经包含了忽略 .jeikcode/codegraph/ 的规则
+/// （包括显式忽略 codegraph，或父级 .jeikcode/、.* 等整体忽略规则）
 fn gitignore_contains_codegraph(content: &str) -> bool {
     content.lines().any(|raw_line| {
         let line = raw_line.trim();
@@ -3549,16 +3692,16 @@ fn gitignore_contains_codegraph(content: &str) -> bool {
         let rule = rule.strip_suffix('/').unwrap_or(rule);
         let rule = rule.strip_suffix("/*").unwrap_or(rule);
 
-        // 如果规则直接忽略了 .zap/codegraph、整个 .zap 目录或全局 codegraph 目录
-        rule == ".zap/codegraph" || rule == ".zap" || rule == "codegraph"
+        // 如果规则直接忽略了 .jeikcode/codegraph、整个 .jeikcode 目录或全局 codegraph 目录
+        rule == ".jeikcode/codegraph" || rule == ".jeikcode" || rule == "codegraph"
     })
 }
 
-/// 在 zap init / zap init --force 结束时确保 .gitignore 包含 .zap/codegraph/：
+/// 在 jeikcode init / jeikcode init --force 结束时确保 .gitignore 包含 .jeikcode/codegraph/：
 /// 1. 自动判断当前是否为 git 仓库，若不是则直接退出
 /// 2. 找当前目录下是否存在 .gitignore 文件
-///    - 如果没有，就创建并写入 .zap/codegraph/
-///    - 如果有，就判断 .zap/codegraph/ 是否在忽略列表：如果不在就加入，如果在就忽略
+///    - 如果没有，就创建并写入 .jeikcode/codegraph/
+///    - 如果有，就判断 .jeikcode/codegraph/ 是否在忽略列表：如果不在就加入，如果在就忽略
 fn ensure_gitignore_codegraph_entry(root: &Path) {
     if !is_git_repository(root) {
         return;
@@ -3566,7 +3709,7 @@ fn ensure_gitignore_codegraph_entry(root: &Path) {
 
     let gitignore_path = root.join(".gitignore");
     if !gitignore_path.exists() {
-        if let Err(e) = std::fs::write(&gitignore_path, ".zap/codegraph/\n") {
+        if let Err(e) = std::fs::write(&gitignore_path, ".jeikcode/codegraph/\n") {
             eprintln!("warning: failed to create .gitignore: {e}");
         }
         return;
@@ -3581,7 +3724,7 @@ fn ensure_gitignore_codegraph_entry(root: &Path) {
             if !next.is_empty() && !next.ends_with('\n') {
                 next.push('\n');
             }
-            next.push_str(".zap/codegraph/\n");
+            next.push_str(".jeikcode/codegraph/\n");
             if let Err(e) = std::fs::write(&gitignore_path, next) {
                 eprintln!("warning: failed to update .gitignore: {e}");
             }
@@ -3709,6 +3852,8 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
         Commands::Mcp(McpCli::Add {
             name,
             command,
+            env,
+            trust,
             global,
             dir,
         }) => {
@@ -3723,13 +3868,101 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
                 .expect("clap ensures at least one command token")
                 .clone();
             let args: Vec<String> = command.into_iter().skip(1).collect();
-            merge_stdio_mcp_server_into_json_file(&path, &name, &program, &args)?;
+            let mut env_map = std::collections::BTreeMap::new();
+            for e in env {
+                let e_trimmed = e.trim();
+                let delim = e_trimmed.find('=');
+                if let Some(idx) = delim {
+                    let key = e_trimmed[..idx].trim().to_string();
+                    let val = e_trimmed[idx + 1..].trim().to_string();
+                    if key.is_empty() {
+                        anyhow::bail!("Invalid env '{}': variable name must not be empty", e);
+                    }
+                    env_map.insert(key, val);
+                } else {
+                    anyhow::bail!("Invalid env format '{}', expected 'KEY=VALUE'", e);
+                }
+            }
+            let env_opt = if env_map.is_empty() {
+                None
+            } else {
+                Some(&env_map)
+            };
+            merge_stdio_mcp_server_with_options_into_json_file(
+                &path,
+                &name,
+                &program,
+                &args,
+                env_opt,
+                if trust { Some(true) } else { None },
+                None,
+            )?;
             println!(
-                "  Added MCP server {:?} → {} (stdio: {} + {} arg(s))",
+                "  Added MCP server {:?} → {} (stdio: {} + {} arg(s){})",
                 name,
                 path.display(),
                 program,
-                args.len()
+                args.len(),
+                if trust { ", trusted" } else { "" }
+            );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::AddHttp {
+            name,
+            url,
+            headers,
+            trust,
+            global,
+            dir,
+        }) => {
+            let base = resolve_working_dir(dir);
+            let path = if global {
+                Config::config_dir().join("mcp.json")
+            } else {
+                base.join(".mcp.json")
+            };
+            let mut header_map = std::collections::BTreeMap::new();
+            for h in headers {
+                let h_trimmed = h.trim();
+                let delim = match (h_trimmed.find(':'), h_trimmed.find('=')) {
+                    (Some(c), Some(e)) => Some(std::cmp::min(c, e)),
+                    (Some(c), None) => Some(c),
+                    (None, Some(e)) => Some(e),
+                    (None, None) => None,
+                };
+                if let Some(idx) = delim {
+                    let key = h_trimmed[..idx].trim().to_string();
+                    let val = h_trimmed[idx + 1..].trim().to_string();
+                    if key.is_empty() {
+                        anyhow::bail!("Invalid header '{}': header name must not be empty", h);
+                    }
+                    header_map.insert(key, val);
+                } else {
+                    anyhow::bail!(
+                        "Invalid header format '{}', expected 'Key: Value' or 'Key=Value'",
+                        h
+                    );
+                }
+            }
+            let headers_opt = if header_map.is_empty() {
+                None
+            } else {
+                Some(&header_map)
+            };
+            merge_http_mcp_server_with_options_into_json_file(
+                &path,
+                &name,
+                &url,
+                headers_opt,
+                if trust { Some(true) } else { None },
+                None,
+            )?;
+            println!(
+                "  Added HTTP MCP server {:?} → {} (url: {}{})",
+                name,
+                path.display(),
+                url,
+                if trust { ", trusted" } else { "" }
             );
             Ok(())
         }
@@ -3751,6 +3984,94 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
                 name,
                 path.display()
             );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::Remove { name, global, dir }) => {
+            let base = resolve_working_dir(dir);
+            let path = if global {
+                Config::config_dir().join("mcp.json")
+            } else {
+                base.join(".mcp.json")
+            };
+            let removed = remove_mcp_server_from_json_file(&path, &name)?;
+            if removed {
+                println!("  Removed MCP server {:?} from {}", name, path.display());
+            } else {
+                println!(
+                    "  MCP server {:?} was not found in {}",
+                    name,
+                    path.display()
+                );
+                if !global {
+                    let global_path = Config::config_dir().join("mcp.json");
+                    if global_path.exists() {
+                        let global_servers = read_raw_servers(&global_path);
+                        if global_servers.contains_key(&name) {
+                            println!(
+                                "  Tip: MCP server {:?} exists in global configuration (~/.jeikcode/mcp.json). Run with --global to remove it.",
+                                name
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Commands::Mcp(McpCli::List { dir, json }) => {
+            let base = resolve_working_dir(dir);
+            let configs = load_all_mcp_configs(&base)?;
+            if json {
+                let items: Vec<serde_json::Value> = configs
+                    .iter()
+                    .map(|c| {
+                        let (transport_type, details) = match &c.config {
+                            McpTransportConfig::Stdio { command, args, .. } => (
+                                "stdio",
+                                serde_json::json!({
+                                    "command": command,
+                                    "args": args,
+                                }),
+                            ),
+                            McpTransportConfig::Http { url, .. } => (
+                                "http",
+                                serde_json::json!({
+                                    "url": url,
+                                }),
+                            ),
+                        };
+                        serde_json::json!({
+                            "name": c.name,
+                            "transport": transport_type,
+                            "details": details,
+                            "source": format!("{:?}", c.source).to_lowercase(),
+                            "disabled": c.disabled,
+                            "trust": c.trust,
+                            "auto_approve": c.auto_approve,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if configs.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                println!("Configured MCP servers ({}):", configs.len());
+                for c in configs {
+                    let details = match &c.config {
+                        McpTransportConfig::Stdio { command, args, .. } => {
+                            format!("stdio: {} {}", command, args.join(" "))
+                        }
+                        McpTransportConfig::Http { url, .. } => {
+                            format!("http: {}", url)
+                        }
+                    };
+                    let status = if c.disabled { " (disabled)" } else { "" };
+                    let trust_info = if c.trust { " [trusted]" } else { "" };
+                    println!(
+                        "  - {:<16} [{:?}] {}{}{}",
+                        c.name, c.source, details, status, trust_info
+                    );
+                }
+            }
             Ok(())
         }
         Commands::Mcp(McpCli::Login {
@@ -4635,14 +4956,14 @@ async fn run_upgrade_cli(
 
                 if spawned.is_err() {
                     // Fallback to in-process sync if spawning new binary fails
-                    if let Some(home) = dirs::home_dir().map(|h| h.join(".zap")) {
-                        let diffs = zap::config_sync::scan_zap_config_diffs(&home);
+                    if let Some(home) = dirs::home_dir().map(|h| h.join(".jeikcode")) {
+                        let diffs = jeikcode::config_sync::scan_zap_config_diffs(&home);
                         if yes {
-                            let _ = zap::config_sync::apply_selected_diffs(diffs);
+                            let _ = jeikcode::config_sync::apply_selected_diffs(diffs);
                         } else if !diffs.is_empty() {
-                            let _ = zap::config_sync::prompt_interactive_config_sync(diffs);
+                            let _ = jeikcode::config_sync::prompt_interactive_config_sync(diffs);
                         }
-                        let _ = zap::config_sync::set_last_seen_version(
+                        let _ = jeikcode::config_sync::set_last_seen_version(
                             &home,
                             env!("CARGO_PKG_VERSION"),
                         );
@@ -4688,7 +5009,7 @@ async fn run_upgrade_cli(
                 println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
                 Ok(())
             } else {
-                Err(e)
+                Err(e.into())
             }
         }
         Err(e) => Err(anyhow::anyhow!("upgrade task panicked: {}", e)),
@@ -5747,39 +6068,39 @@ mod tests {
 
     #[test]
     fn test_gitignore_contains_codegraph_patterns() {
-        // 直接忽略 .zap/codegraph
-        assert!(gitignore_contains_codegraph(".zap/codegraph/"));
-        assert!(gitignore_contains_codegraph(".zap/codegraph"));
-        assert!(gitignore_contains_codegraph("/.zap/codegraph/"));
-        assert!(gitignore_contains_codegraph("/.zap/codegraph"));
-        assert!(gitignore_contains_codegraph("**/.zap/codegraph/"));
-        assert!(gitignore_contains_codegraph("**/.zap/codegraph"));
-        assert!(gitignore_contains_codegraph(".zap/codegraph/*"));
-        assert!(gitignore_contains_codegraph("/.zap/codegraph/*"));
-        assert!(gitignore_contains_codegraph("**/.zap/codegraph/*"));
+        // 直接忽略 .jeikcode/codegraph
+        assert!(gitignore_contains_codegraph(".jeikcode/codegraph/"));
+        assert!(gitignore_contains_codegraph(".jeikcode/codegraph"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph/"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph/"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph"));
+        assert!(gitignore_contains_codegraph(".jeikcode/codegraph/*"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/codegraph/*"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/codegraph/*"));
         assert!(gitignore_contains_codegraph("codegraph/"));
         assert!(gitignore_contains_codegraph("**/codegraph/"));
 
-        // 已经整目录忽略 .zap/ 或 .*，无需重复追加
-        assert!(gitignore_contains_codegraph(".zap/"));
-        assert!(gitignore_contains_codegraph(".zap"));
-        assert!(gitignore_contains_codegraph("/.zap/"));
-        assert!(gitignore_contains_codegraph("**/.zap/"));
+        // 已经整目录忽略 .jeikcode/ 或 .*，无需重复追加
+        assert!(gitignore_contains_codegraph(".jeikcode/"));
+        assert!(gitignore_contains_codegraph(".jeikcode"));
+        assert!(gitignore_contains_codegraph("/.jeikcode/"));
+        assert!(gitignore_contains_codegraph("**/.jeikcode/"));
         assert!(gitignore_contains_codegraph(".*"));
         assert!(gitignore_contains_codegraph(".*/"));
 
         // 前后有空白或换行
-        assert!(gitignore_contains_codegraph("  .zap/codegraph/  \n"));
+        assert!(gitignore_contains_codegraph("  .jeikcode/codegraph/  \n"));
 
         // 不匹配的情况（确保 rules.md, mcp.json, glossary.md 等项目配置不会被当成 codegraph 已忽略）
         assert!(!gitignore_contains_codegraph(""));
-        assert!(!gitignore_contains_codegraph("# .zap/codegraph/"));
-        assert!(!gitignore_contains_codegraph("!.zap/codegraph/"));
-        assert!(!gitignore_contains_codegraph(".zap/rules.md"));
-        assert!(!gitignore_contains_codegraph(".zap/glossary.md"));
-        assert!(!gitignore_contains_codegraph(".zap/local/"));
+        assert!(!gitignore_contains_codegraph("# .jeikcode/codegraph/"));
+        assert!(!gitignore_contains_codegraph("!.jeikcode/codegraph/"));
+        assert!(!gitignore_contains_codegraph(".jeikcode/rules.md"));
+        assert!(!gitignore_contains_codegraph(".jeikcode/glossary.md"));
+        assert!(!gitignore_contains_codegraph(".jeikcode/local/"));
         assert!(!gitignore_contains_codegraph("node_modules/"));
-        assert!(!gitignore_contains_codegraph(".zap_store/"));
+        assert!(!gitignore_contains_codegraph(".jeikcode_store/"));
     }
 
     #[test]
@@ -5789,7 +6110,7 @@ mod tests {
         ensure_gitignore_codegraph_entry(non_git.path());
         assert!(!non_git.path().join(".gitignore").exists());
 
-        // 场景 2：是 Git 仓库，但无 .gitignore 文件 -> 自动创建并写入 .zap/codegraph/\n
+        // 场景 2：是 Git 仓库，但无 .gitignore 文件 -> 自动创建并写入 .jeikcode/codegraph/\n
         let git_repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(git_repo.path().join(".git")).unwrap();
         ensure_gitignore_codegraph_entry(git_repo.path());
@@ -5797,14 +6118,14 @@ mod tests {
         assert!(gitignore.exists());
         assert_eq!(
             std::fs::read_to_string(&gitignore).unwrap(),
-            ".zap/codegraph/\n"
+            ".jeikcode/codegraph/\n"
         );
 
-        // 场景 3：已包含 .zap/codegraph/，不重复添加
+        // 场景 3：已包含 .jeikcode/codegraph/，不重复添加
         ensure_gitignore_codegraph_entry(git_repo.path());
         assert_eq!(
             std::fs::read_to_string(&gitignore).unwrap(),
-            ".zap/codegraph/\n"
+            ".jeikcode/codegraph/\n"
         );
 
         // 场景 4：已有 .gitignore 包含其它项目配置（如 rules.md 或 target），且不以换行符结尾，正确补齐换行并追加
@@ -5815,10 +6136,10 @@ mod tests {
         ensure_gitignore_codegraph_entry(git_repo2.path());
         assert_eq!(
             std::fs::read_to_string(&gi2).unwrap(),
-            "target\n.zap/codegraph/\n"
+            "target\n.jeikcode/codegraph/\n"
         );
 
-        // 场景 5：已有以换行符结尾的 .gitignore，追加 .zap/codegraph/\n
+        // 场景 5：已有以换行符结尾的 .gitignore，追加 .jeikcode/codegraph/\n
         let git_repo3 = tempfile::tempdir().unwrap();
         std::fs::create_dir(git_repo3.path().join(".git")).unwrap();
         let gi3 = git_repo3.path().join(".gitignore");
@@ -5826,15 +6147,15 @@ mod tests {
         ensure_gitignore_codegraph_entry(git_repo3.path());
         assert_eq!(
             std::fs::read_to_string(&gi3).unwrap(),
-            "node_modules/\n.zap/codegraph/\n"
+            "node_modules/\n.jeikcode/codegraph/\n"
         );
 
-        // 场景 6：已有 .zap/ 整体忽略时，判定已忽略，不重复追加
+        // 场景 6：已有 .jeikcode/ 整体忽略时，判定已忽略，不重复追加
         let git_repo4 = tempfile::tempdir().unwrap();
         std::fs::create_dir(git_repo4.path().join(".git")).unwrap();
         let gi4 = git_repo4.path().join(".gitignore");
-        std::fs::write(&gi4, ".zap/\n").unwrap();
+        std::fs::write(&gi4, ".jeikcode/\n").unwrap();
         ensure_gitignore_codegraph_entry(git_repo4.path());
-        assert_eq!(std::fs::read_to_string(&gi4).unwrap(), ".zap/\n");
+        assert_eq!(std::fs::read_to_string(&gi4).unwrap(), ".jeikcode/\n");
     }
 }

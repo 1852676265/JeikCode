@@ -23,7 +23,7 @@ use zap_kernel::message::Message;
 use zap_kernel::tool::{Tool, ToolContext, ToolRegistry, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,13 +34,44 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
-    fn parse(s: &str) -> Option<TodoStatus> {
+    pub fn parse(s: &str) -> Option<TodoStatus> {
         match s {
             "pending" => Some(TodoStatus::Pending),
             "in_progress" => Some(TodoStatus::InProgress),
             "completed" => Some(TodoStatus::Completed),
             _ => None,
         }
+    }
+
+    /// Lenient status parsing tolerant to common AI variants, aliases, and glyphs.
+    pub fn parse_fuzzy(s: &str) -> Option<TodoStatus> {
+        match s {
+            "pending" => Some(TodoStatus::Pending),
+            "in_progress" => Some(TodoStatus::InProgress),
+            "completed" => Some(TodoStatus::Completed),
+            _ => {
+                let norm = s.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
+                match norm.as_str() {
+                    "pending" | "todo" | "open" | "waiting" | "[ ]" | "[]" => {
+                        Some(TodoStatus::Pending)
+                    }
+                    "inprogress" | "doing" | "running" | "progress" | "active" | "[•]" | "[~]"
+                    | "[>]" => Some(TodoStatus::InProgress),
+                    "completed" | "complete" | "done" | "finished" | "fixed" | "closed" | "[√]"
+                    | "[x]" | "[v]" | "x" | "v" => Some(TodoStatus::Completed),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Whether status represents keeping/preserving the current task status unchanged.
+    pub fn is_stable(s: &str) -> bool {
+        let norm = s.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
+        matches!(
+            norm.as_str(),
+            "stable" | "keep" | "same" | "unchanged" | "preserve"
+        )
     }
 }
 
@@ -56,8 +87,57 @@ impl std::fmt::Display for TodoStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
+    /// Stable identity. Legacy boards omit it; `commit_todo_board` migrates by
+    /// matching existing content and generates an id only for genuinely new rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub content: String,
     pub status: TodoStatus,
+}
+
+fn new_todo_id() -> String {
+    format!(
+        "todo-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(1)
+    )
+}
+
+fn normalize_todo_content_key(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Assign identities to legacy rows and dedupe repeated ids. Existing content
+/// keeps its id across a full-list replace; new rows get a fresh one.
+fn normalize_todo_ids(existing: &[TodoItem], items: &mut [TodoItem]) {
+    let mut unused: Vec<(String, String)> = existing
+        .iter()
+        .filter_map(|item| {
+            item.id
+                .as_ref()
+                .map(|id| (normalize_todo_content_key(&item.content), id.clone()))
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for item in items.iter_mut() {
+        if item.id.is_none() {
+            let key = normalize_todo_content_key(&item.content);
+            if let Some(index) = unused.iter().position(|(content, _)| content == &key) {
+                item.id = Some(unused.remove(index).1);
+            }
+        }
+        if item.id.is_none() {
+            item.id = Some(new_todo_id());
+        }
+        if let Some(id) = item.id.as_ref() {
+            if !seen.insert(id.clone()) {
+                item.id = Some(new_todo_id());
+                seen.insert(item.id.clone().unwrap_or_default());
+            }
+        }
+    }
 }
 
 /// Terminal-safe status glyph. Unicode `[•]`/`[✓]` gated behind `unicode`; ASCII
@@ -110,12 +190,327 @@ struct Args {
     todos: Vec<RawItem>,
 }
 
+/// Parse a full plan rebuild payload from a JSON Value or string.
+/// The payload becomes the complete active list: array order is final order, duplicate
+/// payload titles merge (first position, last status wins), and existing tasks NOT
+/// mentioned in the payload are removed from the active list (history stays in the
+/// transcript). `existing` is used only to inherit identity/status for matched titles.
+pub fn parse_plan_rebuild(
+    value: &serde_json::Value,
+    existing: &[TodoItem],
+) -> Result<Vec<TodoItem>, String> {
+    let raw_plan = if let Some(p) = value.get("plan") {
+        p
+    } else if let Some(t) = value.get("todos") {
+        t
+    } else if value.is_array() {
+        value
+    } else {
+        return Err("todowrite: expected `plan` array.".to_string());
+    };
+
+    let items_array: Vec<&serde_json::Value> = if let Some(arr) = raw_plan.as_array() {
+        arr.iter().collect()
+    } else {
+        vec![raw_plan]
+    };
+
+    let mut out: Vec<TodoItem> = Vec::with_capacity(items_array.len());
+
+    for item in items_array.iter() {
+        let (raw_content, raw_status) = if let Some(s) = item.as_str() {
+            (s.to_string(), None)
+        } else if let Some(obj) = item.as_object() {
+            let c = obj
+                .get("content")
+                .or_else(|| obj.get("title"))
+                .or_else(|| obj.get("task"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let st = obj
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (c, st)
+        } else {
+            continue;
+        };
+
+        let content = normalize_todo_content(&raw_content);
+        if content.is_empty() {
+            return Err("todowrite: every plan item needs non-empty `content`.".to_string());
+        }
+        let key = normalize_todo_content_key(&content);
+
+        let existing_match = existing
+            .iter()
+            .find(|t| normalize_todo_content_key(&t.content) == key);
+
+        let status = match raw_status.as_deref() {
+            Some(st) if TodoStatus::is_stable(st) => existing_match
+                .map(|t| t.status)
+                .unwrap_or(TodoStatus::Pending),
+            Some(st) => TodoStatus::parse_fuzzy(st)
+                .or_else(|| existing_match.map(|t| t.status))
+                .unwrap_or(TodoStatus::Pending),
+            None => existing_match
+                .map(|t| t.status)
+                .unwrap_or(TodoStatus::Pending),
+        };
+
+        // Duplicate payload title: first position wins, last declared status wins.
+        if let Some(pos) = out
+            .iter()
+            .position(|t| normalize_todo_content_key(&t.content) == key)
+        {
+            if raw_status
+                .as_deref()
+                .is_some_and(|st| !TodoStatus::is_stable(st))
+            {
+                out[pos].status = status;
+            }
+            continue;
+        }
+
+        let id = existing_match
+            .and_then(|t| t.id.clone())
+            .or_else(|| Some(new_todo_id()));
+
+        out.push(TodoItem {
+            id,
+            content,
+            status,
+        });
+    }
+
+    // Full rebuild: old tasks not present in the payload are intentionally dropped
+    // from the active list. Single in_progress: the latest plan-declared one wins.
+    if let Some(chosen) = out.iter().rposition(|t| t.status == TodoStatus::InProgress) {
+        for (i, item) in out.iter_mut().enumerate() {
+            if i != chosen && item.status == TodoStatus::InProgress {
+                item.status = TodoStatus::Pending;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Apply a batch of updates (or single update) against `list`.
+/// Supports:
+/// - content-driven matching (fuzzy normalized content key)
+/// - 1-based id matching fallback
+/// - text refinement via `new_content`
+/// - status transition (or status preservation via "stable"/omitted status)
+/// - single object or array
+pub fn apply_batch_updates(
+    list: &mut Vec<TodoItem>,
+    val: &serde_json::Value,
+) -> Result<(usize, String), String> {
+    let raw_updates = if let Some(u) = val.get("update") {
+        u
+    } else if let Some(u) = val.get("updates") {
+        u
+    } else {
+        val
+    };
+
+    let update_items: Vec<&serde_json::Value> = if let Some(arr) = raw_updates.as_array() {
+        arr.iter().collect()
+    } else {
+        vec![raw_updates]
+    };
+
+    if update_items.is_empty() {
+        return Ok((0, "No updates applied.".to_string()));
+    }
+
+    let mut applied_count = 0;
+    let mut summaries = Vec::new();
+    let mut last_in_progress_idx: Option<usize> = None;
+
+    for (item_seq, u) in update_items.iter().enumerate() {
+        let is_explicit_delete = u.get("delete").and_then(|v| v.as_bool()).unwrap_or(false)
+            || u.get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("delete") || s.eq_ignore_ascii_case("remove"))
+                .unwrap_or(false);
+
+        // 1. Delete operation (content or id driven)
+        if is_explicit_delete {
+            let target_idx = resolve_update_target(list, u);
+            if let Some(idx) = target_idx {
+                let removed = list.remove(idx);
+                applied_count += 1;
+                summaries.push(format!("Removed: '{}'", removed.content));
+                continue;
+            } else if let Some(id) = json_id(u) {
+                return Err(unknown_task_id(id, list));
+            } else {
+                return Err(format!(
+                    "todowrite: update delete #{item_seq} could not match task to remove."
+                ));
+            }
+        }
+
+        let raw_content = u
+            .get("content")
+            .or_else(|| u.get("add"))
+            .or_else(|| u.get("insert"))
+            .and_then(|v| v.as_str())
+            .map(normalize_todo_content)
+            .filter(|c| !c.is_empty());
+
+        let parsed_status = u
+            .get("status")
+            .and_then(|s| s.as_str())
+            .and_then(TodoStatus::parse_fuzzy);
+
+        // 2. Insert / Move operation — `after` / `after_id` name the task immediately
+        //    PRECEDING the new item, so the item is inserted right after that anchor.
+        //    Legacy `before_content` / `before_id` aliases keep the same semantics.
+        if let Some(anchor) = update_anchor(u) {
+            let Some(anchor_idx) = resolve_anchor_index(list, &anchor) else {
+                return Err(format!(
+                    "todowrite: update item #{item_seq} anchor not found in current list."
+                ));
+            };
+            let Some(content) = raw_content else {
+                return Err(format!(
+                    "todowrite: update item #{item_seq} with an anchor needs non-empty `content`."
+                ));
+            };
+            // Anchor is the PRECEDING task: always insert immediately after it.
+            let insert_at = anchor_idx + 1;
+
+            // Same title already exists → move it instead of duplicating.
+            if let Some(existing_idx) = list.iter().position(|t| {
+                normalize_todo_content_key(&t.content) == normalize_todo_content_key(&content)
+            }) {
+                let mut item = list.remove(existing_idx);
+                if let Some(st) = parsed_status {
+                    item.status = st;
+                }
+                let adjusted = if existing_idx < insert_at {
+                    insert_at - 1
+                } else {
+                    insert_at
+                };
+                let landing = adjusted.min(list.len());
+                list.insert(landing, item);
+                if list[landing].status == TodoStatus::InProgress {
+                    last_in_progress_idx = Some(landing);
+                }
+                applied_count += 1;
+                summaries.push(format!("#{} Moved: {content}", landing + 1));
+            } else {
+                let status = parsed_status.unwrap_or(TodoStatus::Pending);
+                let landing = insert_at.min(list.len());
+                list.insert(
+                    landing,
+                    TodoItem {
+                        id: Some(new_todo_id()),
+                        content: content.clone(),
+                        status,
+                    },
+                );
+                if status == TodoStatus::InProgress {
+                    last_in_progress_idx = Some(landing);
+                }
+                applied_count += 1;
+                summaries.push(format!("#{} Inserted: {content}", landing + 1));
+            }
+            continue;
+        }
+
+        // 3. Bare item — exists → update in place; otherwise append at the tail.
+        let target_idx = resolve_update_target(list, u);
+        let Some(idx) = target_idx else {
+            if let Some(content) = raw_content {
+                let status = parsed_status.unwrap_or(TodoStatus::Pending);
+                let landing = list.len();
+                list.push(TodoItem {
+                    id: Some(new_todo_id()),
+                    content: content.clone(),
+                    status,
+                });
+                if status == TodoStatus::InProgress {
+                    last_in_progress_idx = Some(landing);
+                }
+                applied_count += 1;
+                summaries.push(format!("#{} Added: {content}", landing + 1));
+                continue;
+            }
+            if let Some(id) = json_id(u) {
+                return Err(unknown_task_id(id, list));
+            }
+            return Err(format!(
+                "todowrite: update item #{item_seq} must specify existing `content` or valid `id`."
+            ));
+        };
+
+        // 4. In-place Update (status or content refinement)
+        let mut changed_this_item = false;
+
+        // Content refinement
+        if let Some(new_c) = u
+            .get("new_content")
+            .or_else(|| u.get("new_title"))
+            .and_then(|v| v.as_str())
+        {
+            let norm_c = normalize_todo_content(new_c);
+            if !norm_c.is_empty() && norm_c != list[idx].content {
+                list[idx].content = norm_c;
+                changed_this_item = true;
+            }
+        }
+
+        // Status update
+        if let Some(next_st) = parsed_status {
+            if list[idx].status != next_st {
+                list[idx].status = next_st;
+                changed_this_item = true;
+            }
+            if next_st == TodoStatus::InProgress {
+                last_in_progress_idx = Some(idx);
+            }
+        }
+
+        if changed_this_item {
+            applied_count += 1;
+            summaries.push(format!(
+                "#{} '{}' \u{2192} {}",
+                idx + 1,
+                list[idx].content,
+                list[idx].status
+            ));
+        }
+    }
+
+    if let Some(in_prog_idx) = last_in_progress_idx {
+        ensure_single_in_progress(list, in_prog_idx);
+    }
+
+    let summary = if summaries.is_empty() {
+        "No changes applied.".to_string()
+    } else {
+        summaries.join("\n")
+    };
+
+    Ok((applied_count, summary))
+}
+
 /// Parse + validate the full-list args. Enforces: valid status enum, non-empty
 /// content, at most one `in_progress`. Returns a human-readable reason on failure
 /// (fed back to the model so it can correct and resend).
 pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
     let mut value: serde_json::Value = serde_json::from_str(args)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
+
+    if value.get("plan").is_some() {
+        return parse_plan_rebuild(&value, &[]);
+    }
     // Keep transcript-derived state aligned with RepairToolArgsMiddleware. The
     // kernel stores the model's original tool call before middleware rewriting,
     // so a provider that emits `{"todos":"[...]"}` must be tolerated here too:
@@ -129,6 +524,7 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
             }
         }
     }
+    canonicalize_todo_keys(&mut value);
     let a: Args = serde_json::from_value(value)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
     let mut out = Vec::with_capacity(a.todos.len());
@@ -188,8 +584,32 @@ pub enum ApplyOutcome {
 /// Apply `action` / `actions[]`. `todos` full-list replace is NOT handled here
 /// (that is a fold baseline / execute plan path). Malformed JSON is `Err`.
 pub fn try_apply_todo_args(list: &mut Vec<TodoItem>, args: &str) -> Result<ApplyOutcome, String> {
-    let v = serde_json::from_str::<serde_json::Value>(args)
+    let mut v = serde_json::from_str::<serde_json::Value>(args)
         .map_err(|e| format!("todowrite: invalid JSON arguments: {e}"))?;
+    canonicalize_todo_keys(&mut v);
+
+    // 1. Declarative full-plan rebuild
+    if v.get("plan").is_some() {
+        let before = list.clone();
+        let next = parse_plan_rebuild(&v, list)?;
+        if next == before {
+            return Ok(ApplyOutcome::Unchanged);
+        }
+        *list = next;
+        return Ok(ApplyOutcome::Changed);
+    }
+
+    // 2. Partial batch updates (content-first, id-fallback)
+    if v.get("update").is_some() || v.get("updates").is_some() {
+        let before = list.clone();
+        let (count, _) = apply_batch_updates(list, &v)?;
+        if count == 0 || *list == before {
+            return Ok(ApplyOutcome::Unchanged);
+        }
+        return Ok(ApplyOutcome::Changed);
+    }
+
+    // 3. Legacy actions array
     if let Some(arr) = v.get("actions").and_then(|a| a.as_array()) {
         if arr.is_empty() {
             return Err("todowrite: `actions` must be a non-empty array.".into());
@@ -218,7 +638,9 @@ fn explicit_action(v: &serde_json::Value) -> Option<&str> {
 }
 
 pub fn todo_action_kind(v: &serde_json::Value) -> Option<&'static str> {
-    action_kind(v)
+    let mut v = v.clone();
+    canonicalize_todo_keys(&mut v);
+    action_kind(&v)
 }
 
 fn action_kind(v: &serde_json::Value) -> Option<&'static str> {
@@ -254,19 +676,49 @@ fn infer_action_kind(v: &serde_json::Value) -> Option<&'static str> {
         (false, true, _, false) => Some("add"),
         (true, true, _, false) => Some("update"),
         (true, false, true, false) => Some("update"),
-        (true, false, false, false) => Some("delete"),
+        (true, false, false, false) => has_only_known_action_keys(v).then_some("delete"),
         _ => None,
     }
 }
 
+/// A root object carrying action fields (rather than an `actions`/`todos`
+/// container) is a legacy single-action call. Wrapping it keeps field-level
+/// diagnostics reachable for a typo (`{"id":1,"stauts":"completed"}`).
+fn looks_like_single_action(v: &serde_json::Value) -> bool {
+    v.as_object().is_some_and(|obj| {
+        obj.keys()
+            .any(|key| TODO_ACTION_FIELD_KEYS.contains(&key.as_str()))
+    })
+}
+
 fn unknown_or_uninferable_action(v: &serde_json::Value) -> String {
     if let Some(other) = explicit_action(v) {
-        format!(
-            "`action` must be `add`, `insert`, `update`, `delete`/`remove`, `clear`, or `list` (got `{other}`). Example: {{\"action\": \"add\", \"content\": \"Task text\"}}."
-        )
-    } else {
-        "could not infer `action` from fields. Use {content} to add, {content,position} to insert, {id,status} or {id,content} to update, {id} to delete. `clear` always needs action=\"clear\"".to_string()
+        return format!(
+            "`action` must be one of add|insert|update|delete|remove|clear|list (got `{other}`). It may also be omitted: {{content}} adds, {{content,position}} inserts, {{id,status|content}} updates."
+        );
     }
+    let unknown = unknown_action_keys(v);
+    let note = if unknown.is_empty() {
+        String::new()
+    } else {
+        let listed = unknown
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match unknown
+            .iter()
+            .find_map(|key| suggest_action_key(key).map(|known| (*key, known)))
+        {
+            Some((key, known)) => format!(
+                "unrecognized key(s) {listed} (did you mean `{known}` instead of `{key}`?); "
+            ),
+            None => format!("unrecognized key(s) {listed}; "),
+        }
+    };
+    format!(
+        "{note}could not infer `action` from fields. Use {{content}} to add, {{content,position}} to insert, {{id,status}} or {{id,content}} to update, {{id}} to delete. `clear` always needs action=\"clear\""
+    )
 }
 
 /// Legal `actions` mixes (id-shifting ops cannot share a batch with a different kind):
@@ -281,11 +733,19 @@ fn validate_actions_mix(arr: &[serde_json::Value]) -> Result<(), String> {
     for (i, item) in arr.iter().enumerate() {
         match action_kind(item) {
             Some(k) => {
+                // 明确写了 clear 却带着任务文本：这是「把 clear 当成 add/update 用」的
+                // 典型误填（strict-fill 模型会把 action 填成枚举里的破坏性值）。
+                // 宁可整批拒绝、保持清单不变，也不能静默清空后丢掉这些任务。
+                if k == "clear" && item_has_content(item) {
+                    return Err(format!(
+                        "todowrite: actions[{i}] sets `action`=\"clear\" but also carries non-empty `content`. A clear item never keeps task text; omit `action` to add/update, or send {{\"action\":\"clear\"}} as its own item. The list was NOT changed."
+                    ));
+                }
                 kinds.insert(k);
             }
             None => {
                 return Err(format!(
-                    "todowrite: actions[{i}] {}.",
+                    "todowrite: actions[{i}]: {}.",
                     unknown_or_uninferable_action(item).trim_end_matches('.')
                 ));
             }
@@ -327,6 +787,171 @@ fn normalize_todo_content(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Every field a task action may carry. Also the allow-list for key repair:
+/// a key that differs from one of these only by stray quoting/escaping is a
+/// serialization slip, never a distinct user field.
+const TODO_ACTION_FIELD_KEYS: &[&str] = &[
+    "action",
+    "id",
+    "position",
+    "status",
+    "content",
+    "new_content",
+    "new_title",
+    "delete",
+    "before",
+    "before_content",
+    "before_id",
+    "after",
+    "after_id",
+];
+
+fn is_root_todo_key(key: &str) -> bool {
+    matches!(
+        key,
+        "actions" | "todos" | "plan" | "update" | "updates" | "list"
+    ) || TODO_ACTION_FIELD_KEYS.contains(&key)
+}
+
+/// Exact-match repair for over-escaped keys.
+///
+/// A model/provider occasionally delivers `{"\"status\"":"in_progress"}`: after
+/// JSON parsing the key is the string `"status"` — quotes included — so every
+/// field lookup misses and the action falls through to the bare-`id` rule.
+/// Repairing is safe because no legitimate field starts or ends with a
+/// quote/backslash, and only KNOWN keys are remapped. A real typo (`stauts`)
+/// is left untouched so validation can report it instead of guessing.
+fn canonicalize_todo_keys(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    canonicalize_key_map(obj, is_root_todo_key);
+    if let Some(items) = obj
+        .get_mut("actions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in items {
+            if let Some(item) = item.as_object_mut() {
+                canonicalize_key_map(item, |key| TODO_ACTION_FIELD_KEYS.contains(&key));
+            }
+        }
+    }
+    if let Some(items) = obj
+        .get_mut("todos")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in items {
+            if let Some(item) = item.as_object_mut() {
+                canonicalize_key_map(item, |key| key == "content" || key == "status");
+            }
+        }
+    }
+    for field in ["update", "updates"] {
+        if let Some(items) = obj.get_mut(field).and_then(serde_json::Value::as_array_mut) {
+            for item in items {
+                if let Some(item) = item.as_object_mut() {
+                    canonicalize_key_map(item, |key| TODO_ACTION_FIELD_KEYS.contains(&key));
+                }
+            }
+        }
+    }
+}
+
+fn canonicalize_key_map<F>(obj: &mut serde_json::Map<String, serde_json::Value>, is_known: F)
+where
+    F: Fn(&str) -> bool,
+{
+    let repairs: Vec<(String, String)> = obj
+        .keys()
+        .filter_map(|original| {
+            let trimmed = original
+                .trim_matches(|c: char| c == '"' || c == '\\' || c.is_whitespace())
+                .to_string();
+            if trimmed.is_empty() || trimmed == *original {
+                return None;
+            }
+            // Case-insensitive exact match is still deterministic; fuzzy
+            // edit-distance repair is deliberately NOT done here — the error
+            // path suggests it instead (`suggest_action_key`).
+            let canonical = if is_known(&trimmed) {
+                trimmed
+            } else {
+                let lower = trimmed.to_ascii_lowercase();
+                TODO_ACTION_FIELD_KEYS
+                    .iter()
+                    .find(|known| known.eq_ignore_ascii_case(&lower))
+                    .map(|known| (*known).to_string())?
+            };
+            is_known(&canonical).then_some((original.clone(), canonical))
+        })
+        .collect();
+    for (original, canonical) in repairs {
+        // A correctly-spelled field wins over a damaged duplicate.
+        if obj.contains_key(&canonical) {
+            obj.remove(&original);
+        } else if let Some(value) = obj.remove(&original) {
+            obj.insert(canonical, value);
+        }
+    }
+}
+
+fn unknown_action_keys(v: &serde_json::Value) -> Vec<&str> {
+    v.as_object()
+        .map(|obj| {
+            obj.keys()
+                .filter(|key| !TODO_ACTION_FIELD_KEYS.contains(&key.as_str()))
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A bare `{id}` is a delete ONLY when nothing else is present. An unknown
+/// field means the payload is malformed (usually a misspelled `status`), and
+/// guessing `delete` there would silently destroy a task.
+fn has_only_known_action_keys(v: &serde_json::Value) -> bool {
+    v.as_object().is_some_and(|obj| {
+        obj.keys()
+            .all(|key| TODO_ACTION_FIELD_KEYS.contains(&key.as_str()))
+    })
+}
+
+/// Nearest known field for a typo, used ONLY in the error text — never to
+/// rewrite the payload. Bounded to Levenshtein distance ≤ 2 over keys of at
+/// least four chars so short/ambiguous names (`id`) never get a guess.
+fn suggest_action_key(key: &str) -> Option<&'static str> {
+    let key = key
+        .trim_matches(|c: char| c == '"' || c == '\\' || c.is_whitespace())
+        .to_ascii_lowercase();
+    if key.chars().count() < 4 {
+        return None;
+    }
+    TODO_ACTION_FIELD_KEYS
+        .iter()
+        .copied()
+        .filter(|known| known.chars().count() >= 4)
+        .map(|known| (edit_distance(&key, known), known))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, known)| known)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = substitution.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 fn find_todo_index(list: &[TodoItem], content: &str) -> Option<usize> {
     list.iter().position(|item| item.content == content)
 }
@@ -346,7 +971,7 @@ fn unknown_task_id(id: u64, list: &[TodoItem]) -> String {
         if n == 1 { "" } else { "s" }
     );
     if n > 0 && list.iter().all(|item| item.status == TodoStatus::Completed) {
-        msg.push_str(" Every task is completed, so the next `add` starts a NEW plan at id 1.");
+        msg.push_str(" Every task is completed, so the next new task starts a NEW plan at id 1.");
     }
     msg
 }
@@ -392,7 +1017,14 @@ fn upsert_todo(
     }
     let status = status.unwrap_or(TodoStatus::Pending);
     let idx = destination_index(position, list.len());
-    list.insert(idx, TodoItem { content, status });
+    list.insert(
+        idx,
+        TodoItem {
+            id: Some(new_todo_id()),
+            content,
+            status,
+        },
+    );
     if status == TodoStatus::InProgress {
         ensure_single_in_progress(list, idx);
     }
@@ -537,6 +1169,136 @@ fn item_has_content(v: &serde_json::Value) -> bool {
         .is_some_and(|c| !c.is_empty())
 }
 
+/// A single `update` entry is actionable when it carries a non-empty title, a valid
+/// `id`, or an explicit delete marker. An entry with only empty/absent fields is a
+/// read-only no-op, not an error.
+fn update_item_actionable(item: &serde_json::Value) -> bool {
+    let Some(obj) = item.as_object() else {
+        return false;
+    };
+    let content = obj
+        .get("content")
+        .or_else(|| obj.get("task"))
+        .or_else(|| obj.get("title"))
+        .and_then(|v| v.as_str())
+        .map(normalize_todo_content)
+        .is_some_and(|c| !c.is_empty());
+    content || json_id(item).is_some() || obj.get("delete").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// `plan` is actionable only when at least one listed item has non-empty content.
+/// An all-empty payload is a read-only query, matching `plan: []`.
+fn plan_has_actionable_items(v: &serde_json::Value) -> bool {
+    match v.get("plan") {
+        Some(serde_json::Value::Array(items)) => items.iter().any(|item| match item {
+            serde_json::Value::String(s) => !normalize_todo_content(s).is_empty(),
+            serde_json::Value::Object(obj) => obj
+                .get("content")
+                .or_else(|| obj.get("title"))
+                .or_else(|| obj.get("task"))
+                .and_then(|v| v.as_str())
+                .map(normalize_todo_content)
+                .is_some_and(|c| !c.is_empty()),
+            _ => false,
+        }),
+        Some(serde_json::Value::String(s)) => !normalize_todo_content(s).is_empty(),
+        Some(serde_json::Value::Object(obj)) => obj
+            .get("content")
+            .or_else(|| obj.get("title"))
+            .or_else(|| obj.get("task"))
+            .and_then(|v| v.as_str())
+            .map(normalize_todo_content)
+            .is_some_and(|c| !c.is_empty()),
+        Some(_) => false,
+        None => false,
+    }
+}
+
+/// `update` is actionable only when at least one entry can match or create a task.
+fn update_has_actionable_items(v: &serde_json::Value) -> bool {
+    match v.get("update").or_else(|| v.get("updates")) {
+        Some(serde_json::Value::Array(items)) => items.iter().any(update_item_actionable),
+        Some(item) => update_item_actionable(item),
+        None => false,
+    }
+}
+
+/// Resolve the update target for a bare update item (no `before` anchor).
+/// Priority: normalized `content` title match, then 1-based `id` rank fallback.
+fn resolve_update_target(list: &[TodoItem], u: &serde_json::Value) -> Option<usize> {
+    let content_opt = u
+        .get("content")
+        .or_else(|| u.get("task"))
+        .or_else(|| u.get("title"))
+        .and_then(|v| v.as_str())
+        .map(normalize_todo_content_key)
+        .filter(|s| !s.is_empty());
+    if let Some(ckey) = content_opt {
+        if let Some(idx) = list
+            .iter()
+            .position(|t| normalize_todo_content_key(&t.content) == ckey)
+        {
+            return Some(idx);
+        }
+    }
+    json_id(u).and_then(|id| {
+        if id >= 1 && (id as usize) <= list.len() {
+            Some((id as usize) - 1)
+        } else {
+            None
+        }
+    })
+}
+
+/// A positional anchor for `update`: the task immediately BEFORE the new item.
+enum AnchorRef<'a> {
+    Id(usize),
+    Content(&'a str),
+}
+
+/// Read the anchor from an update item. Canonical fields are `after` / `after_id`;
+/// `before_content` / `before_id` / `before` remain legacy aliases with identical
+/// "preceding task" semantics.
+fn update_anchor(u: &serde_json::Value) -> Option<AnchorRef<'_>> {
+    if let Some(id) = u.get("after_id").and_then(json_u64) {
+        return Some(AnchorRef::Id(id as usize));
+    }
+    if let Some(v) = u.get("after") {
+        if let Some(id) = v.as_u64() {
+            return Some(AnchorRef::Id(id as usize));
+        }
+        if let Some(s) = v.as_str() {
+            return Some(AnchorRef::Content(s));
+        }
+    }
+    // Legacy aliases: same "anchor is the preceding task" meaning.
+    if let Some(id) = u.get("before_id").and_then(json_u64) {
+        return Some(AnchorRef::Id(id as usize));
+    }
+    if let Some(v) = u.get("before_content").or_else(|| u.get("before")) {
+        if let Some(id) = v.as_u64() {
+            return Some(AnchorRef::Id(id as usize));
+        }
+        if let Some(s) = v.as_str() {
+            return Some(AnchorRef::Content(s));
+        }
+    }
+    None
+}
+
+/// Resolve the preceding-task anchor to its current list index.
+/// The caller inserts the new item immediately AFTER the returned index.
+fn resolve_anchor_index(list: &[TodoItem], anchor: &AnchorRef<'_>) -> Option<usize> {
+    match anchor {
+        AnchorRef::Id(id) => (*id >= 1 && *id <= list.len()).then(|| *id - 1),
+        AnchorRef::Content(s) => {
+            let key = normalize_todo_content_key(s);
+            list.iter()
+                .position(|t| normalize_todo_content_key(&t.content) == key)
+        }
+    }
+}
+
 fn list_is_seedable(list: &[TodoItem]) -> bool {
     list.is_empty() || list.iter().all(|t| t.status == TodoStatus::Completed)
 }
@@ -566,7 +1328,7 @@ fn apply_add(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Result<usize, S
         .and_then(|c| c.as_str())
         .map(normalize_todo_content)
         .filter(|c| !c.is_empty())
-        .ok_or_else(|| "todowrite: `add` needs non-empty `content`. Example: {\"action\": \"add\", \"content\": \"Implement feature X\"}.".to_string())?;
+        .ok_or_else(|| "todowrite: adding a task needs non-empty `content`. Example: {\"content\": \"Implement feature X\"}.".to_string())?;
     Ok(upsert_todo(list, content, action_status(v), None))
 }
 
@@ -576,7 +1338,7 @@ fn apply_insert(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Result<usize
         .and_then(|c| c.as_str())
         .map(normalize_todo_content)
         .filter(|c| !c.is_empty())
-        .ok_or_else(|| "todowrite: `insert` needs non-empty `content`. Example: {\"action\": \"insert\", \"content\": \"Task description\", \"position\": 1}.".to_string())?;
+        .ok_or_else(|| "todowrite: inserting needs non-empty `content`. Example: {\"content\": \"Task description\", \"position\": 1}.".to_string())?;
     Ok(upsert_todo(
         list,
         content,
@@ -591,7 +1353,7 @@ fn apply_update(
     visible_len: usize,
     add_landings: &[usize],
 ) -> Result<(), String> {
-    let id = json_id(v).ok_or_else(|| "todowrite: `update` needs a valid `id` (1-based task number). Example: {\"action\": \"update\", \"id\": 1, \"status\": \"in_progress\"}.".to_string())?;
+    let id = json_id(v).ok_or_else(|| "todowrite: updating needs a valid `id` (1-based task number). Example: {\"id\": 1, \"status\": \"in_progress\"}.".to_string())?;
     let Some(resolved) = resolve_update_id(id, visible_len, add_landings, list.len()) else {
         // Empty/closed list, or the next append slot: a content-bearing "update"
         // is a seed/add, not a missing-id error.
@@ -612,7 +1374,7 @@ fn apply_update(
         .filter(|c| !c.is_empty());
     if status.is_none() && new_content.is_none() {
         return Err(
-            "todowrite: `update` needs at least one of `status` (pending|in_progress|completed) or `content`. Example: {\"action\": \"update\", \"id\": 1, \"status\": \"in_progress\"}.".into(),
+            "todowrite: updating needs at least one of `status` (pending|in_progress|completed) or `content`. Example: {\"id\": 1, \"status\": \"in_progress\"}.".into(),
         );
     }
     if let Some(content) = new_content {
@@ -674,9 +1436,10 @@ fn try_apply_one_action(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Resu
 }
 
 pub fn is_batch_plan_establishment(args: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(args) else {
         return false;
     };
+    canonicalize_todo_keys(&mut v);
     if let Some(arr) = v.get("actions").and_then(|a| a.as_array()) {
         let add_count = arr
             .iter()
@@ -698,48 +1461,83 @@ pub fn is_todo_plan(args: &str) -> bool {
     if v.get("actions").and_then(|a| a.as_array()).is_some() {
         return false;
     }
+    if v.get("update").is_some() || v.get("updates").is_some() {
+        return false;
+    }
     parse_todos(args).is_ok()
 }
 
 /// Incremental patch shape: a single `action` or a non-absent `actions` array.
 /// False for full-list `todos` plans (use [`is_todo_plan`]).
 pub fn is_todo_action_args(args: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(args) else {
         return false;
     };
+    canonicalize_todo_keys(&mut v);
     if is_todo_plan(args) {
         return false;
     }
-    action_kind(&v).is_some() || v.get("actions").and_then(|a| a.as_array()).is_some()
+    v.get("update").is_some()
+        || v.get("updates").is_some()
+        || action_kind(&v).is_some()
+        || v.get("actions").and_then(|a| a.as_array()).is_some()
+}
+
+/// Apply one transcript todo call onto the running list.
+/// - `plan: [...]` replaces the current list (empty array is read-only).
+/// - legacy `todos: [...]` keeps its full-replace baseline semantics.
+/// - `clear: true` wipes the list.
+/// - `actions` / single action / `update` apply on top.
+fn apply_todo_call(list: &mut Vec<TodoItem>, args: &str) {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return;
+    };
+    canonicalize_todo_keys(&mut value);
+
+    if value.get("clear").and_then(|v| v.as_bool()) == Some(true) {
+        list.clear();
+        return;
+    }
+    if value.get("plan").is_some() {
+        // An empty plan is a read-only query, not a wipe.
+        if value
+            .get("plan")
+            .and_then(|p| p.as_array())
+            .is_some_and(|a| a.is_empty())
+        {
+            return;
+        }
+        if let Ok(next) = parse_plan_rebuild(&value, list) {
+            *list = next;
+        }
+        return;
+    }
+    if value.get("actions").and_then(|a| a.as_array()).is_none() && value.get("todos").is_some() {
+        // Legacy full-list replace / replay baseline.
+        if let Ok(todos) = parse_todos(args) {
+            *list = todos;
+        }
+        return;
+    }
+    apply_todo_action(list, args);
 }
 
 /// Fold an ORDERED stream of `(tool_name, args)` todo-affecting calls into the current list.
-/// Baseline = the LAST call carrying a valid full LIST (`{"todos":[…]}`; positions become the
-/// stable 1-based ids); then every incremental `{"action":…}` call AFTER that baseline is
-/// applied in order. Decided by ARG SHAPE, not tool name, so the merged `todowrite` (which
-/// sends the list shape to plan and the action shape to patch) folds correctly — and a resumed
-/// session's legacy `todo`-named calls fold identically. An invalid list never wipes an earlier
-/// valid one; action events before the baseline are void (a re-plan resets the ids). THE single
-/// source of truth for the fold — both the kernel-message reducer and the TUI panel derivation
-/// use this shape rule, so live / replay / injected views never diverge.
+/// Each call is applied in order: `plan` replaces the running list, legacy `todos`
+/// replaces it, and incremental actions/updates patch it. THE single source of truth for
+/// the fold — both the kernel-message reducer and the TUI panel derivation use this,
+/// so live / replay / injected views never diverge.
 pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<TodoItem> {
-    // Keep both names so a resumed transcript (legacy `todo` + `todowrite`) folds the same.
-    let calls: Vec<(&str, &str)> = calls
-        .into_iter()
-        .filter(|(n, _)| is_todo_tool_name(n))
-        .collect();
-    let baseline = calls.iter().rposition(|(_, a)| is_todo_plan(a));
-    let (mut list, start) = match baseline {
-        Some(i) => (parse_todos(calls[i].1).unwrap_or_default(), i + 1),
-        None => (Vec::new(), 0),
-    };
-    for (_, a) in &calls[start..] {
-        apply_todo_action(&mut list, a); // no-op unless the args carry an `action`
+    let mut list = Vec::new();
+    for (name, args) in calls {
+        if is_todo_tool_name(name) {
+            apply_todo_call(&mut list, args);
+        }
     }
     list
 }
 
-fn list_fully_completed(list: &[TodoItem]) -> bool {
+pub fn list_fully_completed(list: &[TodoItem]) -> bool {
     !list.is_empty() && list.iter().all(|item| item.status == TodoStatus::Completed)
 }
 
@@ -766,9 +1564,10 @@ fn replay_of_closed(list: &[TodoItem], closed: &[TodoItem]) -> bool {
 }
 
 fn args_have_explicit_add(args: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(args) else {
         return false;
     };
+    canonicalize_todo_keys(&mut value);
     if action_kind(&value) == Some("add") {
         return true;
     }
@@ -814,10 +1613,14 @@ fn fold_turn_calls(
         return;
     }
     if has_plan || carried.is_empty() {
-        *carried = reduce_todos(batch.iter().copied());
+        let mut next = carried.clone();
+        for (_, args) in batch.iter() {
+            apply_todo_call(&mut next, args);
+        }
+        *carried = next;
     } else {
         for (_, args) in batch.iter() {
-            apply_todo_action(carried, args);
+            apply_todo_call(carried, args);
         }
     }
     batch.clear();
@@ -903,6 +1706,11 @@ pub type TodoLive = Arc<Mutex<Vec<TodoItem>>>;
 pub struct TodoBoard {
     pub id: String,
     pub seq: u64,
+    /// Persisted monotonic version of this session's checklist. Every commit,
+    /// rebind, close and clear advances it, so clients can arbitrate snapshots
+    /// by revision instead of comparing arrival order.
+    #[serde(default)]
+    pub revision: u64,
     pub items: Vec<TodoItem>,
 }
 
@@ -910,6 +1718,8 @@ struct TodoSlot {
     board: Option<TodoBoard>,
     /// Set when a completed board was closed after stop. Blocks reloading that file.
     closed: bool,
+    /// Survives `clear`, so a reopened board never reuses an older revision.
+    revision: u64,
 }
 
 fn todo_registry() -> &'static std::sync::RwLock<std::collections::HashMap<String, TodoSlot>> {
@@ -919,8 +1729,19 @@ fn todo_registry() -> &'static std::sync::RwLock<std::collections::HashMap<Strin
     REGISTRY.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
-fn live_bindings() -> &'static Mutex<std::collections::HashMap<usize, String>> {
-    static BINDINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, String>>> =
+/// A live handle's session binding.
+///
+/// The owner is a weak reference to the very allocation the key points at. That
+/// weak reference pins the allocation, so the address can never be recycled onto
+/// a different live handle while a binding exists — a bare address would alias
+/// a freed handle onto a fresh one and hand it the previous session's checklist.
+struct LiveBinding {
+    owner: Weak<Mutex<Vec<TodoItem>>>,
+    session_id: String,
+}
+
+fn live_bindings() -> &'static Mutex<std::collections::HashMap<usize, LiveBinding>> {
+    static BINDINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, LiveBinding>>> =
         std::sync::OnceLock::new();
     BINDINGS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -937,15 +1758,30 @@ pub fn bind_todo_session(live: &TodoLive, session_id: &str) {
     live_bindings()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .insert(live_key(live), session_id.to_string());
+        .insert(
+            live_key(live),
+            LiveBinding {
+                owner: Arc::downgrade(live),
+                session_id: session_id.to_string(),
+            },
+        );
 }
 
 pub fn todo_session_of(live: &TodoLive) -> Option<String> {
-    live_bindings()
+    let mut guard = live_bindings()
         .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get(&live_key(live))
-        .cloned()
+        .unwrap_or_else(|err| err.into_inner());
+    let key = live_key(live);
+    match guard.get(&key) {
+        Some(binding) if binding.owner.strong_count() > 0 => Some(binding.session_id.clone()),
+        Some(_) => {
+            // The owner died without unbinding (a panicking caller). The binding no
+            // longer describes a live checklist, so it must not be handed out.
+            guard.remove(&key);
+            None
+        }
+        None => None,
+    }
 }
 
 /// Remove the session binding for this tool instance.
@@ -972,11 +1808,39 @@ pub fn todo_session_is_closed(session_id: &str) -> bool {
     guard.get(session_id).is_some_and(|slot| slot.closed)
 }
 
+/// Read the checklist items and the slot watermark atomically.
+///
+/// `read_todo_board` returns `None` for a closed board, so readers that must
+/// arbitrate snapshots (the session API) need the slot revision instead of
+/// `board.revision` — otherwise every closed board reports revision 0 and a
+/// client that has seen any revision can never accept the authoritative empty
+/// snapshot. Items and revision must come from one read lock: two separate reads
+/// could straddle a commit and pair new items with an old revision.
+pub fn read_todo_snapshot(session_id: &str) -> (Vec<TodoItem>, u64) {
+    let guard = todo_registry()
+        .read()
+        .unwrap_or_else(|err| err.into_inner());
+    guard
+        .get(session_id)
+        .map(|slot| {
+            (
+                slot.board
+                    .as_ref()
+                    .map(|board| board.items.clone())
+                    .unwrap_or_default(),
+                slot.revision,
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Install a board loaded from disk, unless this process already has a newer slot.
-pub fn restore_todo_board(session_id: &str, board: TodoBoard) {
-    if session_id.is_empty() || board.items.is_empty() {
+pub fn restore_todo_board(session_id: &str, mut board: TodoBoard) {
+    if session_id.is_empty() || board.items.is_empty() || list_fully_completed(&board.items) {
         return;
     }
+    let legacy = board.items.clone();
+    normalize_todo_ids(&legacy, &mut board.items);
     let mut guard = todo_registry()
         .write()
         .unwrap_or_else(|err| err.into_inner());
@@ -986,6 +1850,7 @@ pub fn restore_todo_board(session_id: &str, board: TodoBoard) {
     guard.insert(
         session_id.to_string(),
         TodoSlot {
+            revision: board.revision,
             board: Some(board),
             closed: false,
         },
@@ -1000,28 +1865,88 @@ pub fn commit_todo_board(session_id: &str, items: &[TodoItem]) -> TodoBoard {
     let slot = guard.entry(session_id.to_string()).or_insert(TodoSlot {
         board: None,
         closed: false,
+        revision: 0,
     });
     slot.closed = false;
+    slot.revision = slot.revision.saturating_add(1);
+    let revision = slot.revision;
+    let previous_items = slot
+        .board
+        .as_ref()
+        .map(|board| board.items.clone())
+        .unwrap_or_default();
+    let mut next_items = items.to_vec();
+    normalize_todo_ids(&previous_items, &mut next_items);
     let board = match slot.board.take() {
         Some(mut existing) => {
             existing.seq = existing.seq.saturating_add(1);
-            existing.items = items.to_vec();
+            existing.revision = revision;
+            existing.items = next_items;
             existing
         }
         None => TodoBoard {
-            id: format!(
-                "todo-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_nanos())
-                    .unwrap_or(1)
-            ),
+            id: new_todo_id(),
             seq: 1,
-            items: items.to_vec(),
+            revision,
+            items: next_items,
         },
     };
     slot.board = Some(board.clone());
     board
+}
+
+/// 撤销/回溯后的清单重建：**保留板身份**（id 不变、seq 单调递增），
+/// 只把 items 换成“剩余转录”的推导结果。
+///
+/// 与 `clear_todo_board` + `commit_todo_board` 的差别：
+/// - `clear` 会把槽的 board 置空，重建后 id 漂移、seq 归 1；任何把 `(board_id, seq)`
+///   当版本号的消费者（现在没有，但很容易出现）会把重建结果误判成“更旧/另起一板”；
+/// - 这里 id 与 seq 都单调向前，撤销永远不会被看成回退。
+///
+/// - 推导为空（整轮被删干净）→ 板随之关闭（`closed = true`，磁盘 `.todo` 由
+///   `persist_todo_board` 删除），下次真开新计划才是全新身份；
+/// - 槽不存在（新进程尚未装载该会话）→ 返回 `None`，调用方退回 clear/commit。
+pub fn rebind_todo_board(session_id: &str, items: &[TodoItem]) -> Option<TodoBoard> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    let slot = guard.get_mut(session_id)?;
+    if items.is_empty() {
+        // 整轮被删干净：板随之关闭（禁止旧槽/磁盘快照复活），身份到此结束。
+        slot.board = None;
+        slot.closed = true;
+        slot.revision = slot.revision.saturating_add(1);
+        return None;
+    }
+    slot.closed = false;
+    slot.revision = slot.revision.saturating_add(1);
+    let revision = slot.revision;
+    let previous_items = slot
+        .board
+        .as_ref()
+        .map(|board| board.items.clone())
+        .unwrap_or_default();
+    let mut next_items = items.to_vec();
+    normalize_todo_ids(&previous_items, &mut next_items);
+    let board = match slot.board.take() {
+        Some(mut existing) => {
+            existing.seq = existing.seq.saturating_add(1);
+            existing.revision = revision;
+            existing.items = next_items;
+            existing
+        }
+        None => TodoBoard {
+            id: new_todo_id(),
+            seq: 1,
+            revision,
+            items: next_items,
+        },
+    };
+    slot.board = Some(board.clone());
+    Some(board)
 }
 
 /// Explicit wipe (`/todo clear`). Readers afterwards see no live checklist.
@@ -1029,13 +1954,33 @@ pub fn clear_todo_board(session_id: &str) {
     let mut guard = todo_registry()
         .write()
         .unwrap_or_else(|err| err.into_inner());
+    let revision = guard
+        .get(session_id)
+        .map(|slot| slot.revision)
+        .unwrap_or(0)
+        .saturating_add(1);
     guard.insert(
         session_id.to_string(),
         TodoSlot {
             board: None,
             closed: true,
+            revision,
         },
     );
+}
+
+/// Fully purge the session slot and any associated live bindings when a session is deleted.
+pub fn purge_todo_board(session_id: &str) {
+    let mut guard = todo_registry()
+        .write()
+        .unwrap_or_else(|err| err.into_inner());
+    guard.remove(session_id);
+    drop(guard);
+
+    let mut bindings = live_bindings()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    bindings.retain(|_, b| b.session_id != session_id && b.owner.strong_count() > 0);
 }
 
 /// After streaming has stopped, drop the live board only when every item is checked.
@@ -1053,8 +1998,13 @@ pub fn close_todo_board_if_complete(session_id: &str) -> Option<TodoBoard> {
     if !list_fully_completed(&board.items) {
         return None;
     }
-    let closed = slot.board.take()?;
+    let mut closed = slot.board.take()?;
     slot.closed = true;
+    // Closing is a document transition, not just an in-memory cleanup: the
+    // empty snapshot handed to clients must carry a strictly newer revision,
+    // or their revision gate would keep the old non-empty list forever.
+    slot.revision = slot.revision.saturating_add(1);
+    closed.revision = slot.revision;
     Some(closed)
 }
 
@@ -1127,13 +2077,7 @@ impl TodoTool {
     }
 }
 
-const TODOWRITE_DESCRIPTION: &str = "Create or maintain a multi-step checklist for a task. \
-Checklists are automatically cleared once all items are completed. \
-Use to plan tasks, track progress, and improve delivery quality.";
-
-const TODO_ACTION_FIELD_KEYS: &[&str] = &[
-    "action", "id", "position", "status", "content", "after", "after_id",
-];
+const TODOWRITE_DESCRIPTION: &str = "Track multi-step task checklists. Use `plan: [...]` for a full plan rebuild; `update: [...]` to tick progress or locally add, move, or remove tasks while preserving unmentioned tasks; pass an empty object, `plan: []`, or `update: []` to view current tasks; `clear: true` clears everything and must be used alone.";
 
 /// Absorb stringified / single-object / hybrid `actions` payloads. Idempotent.
 pub(crate) fn normalize_todo_write_args(args: &str) -> String {
@@ -1142,12 +2086,34 @@ pub(crate) fn normalize_todo_write_args(args: &str) -> String {
     };
     crate::tools::repair::decode_lenient_array_field(&mut v, "actions", false);
     crate::tools::repair::decode_lenient_array_field(&mut v, "todos", false);
+    crate::tools::repair::decode_lenient_array_field(&mut v, "plan", false);
+    crate::tools::repair::decode_lenient_array_field(&mut v, "update", false);
+    crate::tools::repair::decode_lenient_array_field(&mut v, "updates", false);
+    canonicalize_todo_keys(&mut v);
+
+    if v.get("plan").is_some()
+        || v.get("update").is_some()
+        || v.get("updates").is_some()
+        || v.get("list").is_some()
+        || v.get("clear").is_some()
+    {
+        return v.to_string();
+    }
 
     let usable_actions = v
         .get("actions")
         .and_then(|a| a.as_array())
         .is_some_and(|a| !a.is_empty() && a.iter().any(|item| action_kind(item).is_some()));
-    if !usable_actions && v.get("todos").is_none() && action_kind(&v).is_some() {
+    // A non-array `actions` (truncated stringified field) yields to sibling
+    // fields, matching the hybrid repair contract. A real array that failed
+    // inference is NOT replaced: keeping it makes the error actionable.
+    if !usable_actions
+        && v.get("todos").is_none()
+        && v.get("actions")
+            .and_then(serde_json::Value::as_array)
+            .is_none()
+        && looks_like_single_action(&v)
+    {
         let action = {
             let mut action = serde_json::Map::new();
             if let Some(obj) = v.as_object() {
@@ -1239,40 +2205,66 @@ impl Tool for TodoTool {
         json!({
             "type": "object",
             "properties": {
-                "actions": {
+                "plan": {
                     "type": "array",
-                    "description": "Array of task action objects to apply in sequence. Each item specifies an action ('add', 'insert', 'update', 'delete', 'remove', 'clear'); the read-only 'list' must be the only item.",
+                    "description": "Full plan rebuild. Array order defines execution sequence; duplicate titles merge. Items need `content` and optional `status` (pending | in_progress | completed | stable).",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {
+                            "content": {
                                 "type": "string",
-                                "enum": ["add", "insert", "update", "delete", "remove", "clear", "list"],
-                                "description": "Optional when fields uniquely determine the op: {content}→add, {content,position}→insert, {id,status|content}→update, {id}→delete. Required for `clear` and for the read-only `list` (returns the current tasks). Explicit value always wins."
-                            },
-                            "id": {
-                                "type": "integer",
-                                "description": "1-based task number. Required for 'update', 'delete', 'remove'; omitted for 'add', 'clear'."
-                            },
-                            "position": {
-                                "type": "integer",
-                                "description": "1-based insert slot. Required for 'insert'; omitted for other actions."
+                                "description": "Task description."
                             },
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                                "description": "Task status. Required when 'update' modifies status; optional for 'add' (default: pending); omitted for 'delete', 'clear'."
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Task description text. Required for 'add', 'insert'; optional for 'update' (when changing text); omitted for 'delete', 'clear'."
+                                "enum": ["pending", "in_progress", "completed", "stable"],
+                                "description": "Status. 'stable' or omitted inherits existing status (default: pending)."
                             }
                         },
-                        "required": []
+                        "required": ["content"]
                     }
+                },
+                "update": {
+                    "description": "Batch or single partial update. Bare items match `content` (title) or `id`; if not found they are appended. `after` / `after_id` name the preceding task and insert (or move) this item right after it. `status: \"delete\"` removes the matched task.",
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Task title. Matches an existing task, or the new task's text."
+                            },
+                            "id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-based task number fallback."
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "stable", "delete"],
+                                "description": "New status. 'stable' or omitted keeps existing status; 'delete' removes the task."
+                            },
+                            "new_content": {
+                                "type": "string",
+                                "description": "Optional updated task description."
+                            },
+                            "after": {
+                                "type": "string",
+                                "description": "The task immediately before the new item: insert or move this item right after this title."
+                            },
+                            "after_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "The 1-based number of the task immediately before the new item: insert or move this item right after it."
+                            }
+                        }
+                    }
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "Clear the entire checklist. Use only when the user explicitly asks to clear all tasks."
                 }
-            },
-            "required": ["actions"]
+            }
         })
     }
     // Never touches the filesystem → risk() defaults to Safe.
@@ -1283,11 +2275,108 @@ impl Tool for TodoTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let args = normalize_todo_write_args(args);
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&args) else {
-            return err("todowrite: invalid JSON arguments.".to_string());
+            return err(with_current_list_for_args(
+                "todowrite: invalid JSON arguments.",
+                &self.board_items(),
+            ));
         };
         let mut list = self.board_items();
 
-        // Legacy full-list replace (resume / old transcripts). Prefer `actions`.
+        // Empty `plan` / `update` payloads (empty arrays, or items with no usable
+        // content/id) are read-only queries: strict-fill models often emit them as
+        // defaults, and they must never wipe or mutate the list.
+        let plan_raw = v.get("plan");
+        let update_present = v.get("update").is_some() || v.get("updates").is_some();
+        let plan_actionable = plan_raw.is_some() && plan_has_actionable_items(&v);
+        let update_actionable = update_present && update_has_actionable_items(&v);
+        let clear_requested = v.get("clear").and_then(|c| c.as_bool()) == Some(true);
+
+        if (plan_raw.is_some() || update_present)
+            && !plan_actionable
+            && !update_actionable
+            && v.get("actions").is_none()
+            && v.get("todos").is_none()
+            && !clear_requested
+        {
+            return ok(format!(
+                "Current task list:\n\n{}",
+                render_todos_numbered(&list, false)
+            ));
+        }
+
+        if clear_requested {
+            if plan_actionable
+                || update_actionable
+                || v.get("actions").is_some()
+                || v.get("todos").is_some()
+            {
+                return err(with_current_list_for_args(
+                    "todowrite: `clear` must be used alone; do not combine it with `plan`, `update`, `actions`, or `todos`.",
+                    &self.board_items(),
+                ));
+            }
+            let stored = self.commit_and_read(&[]);
+            return ok(format!(
+                "all tasks cleared\n\n{}",
+                render_todos_numbered(&stored, false)
+            ));
+        }
+
+        if plan_actionable && update_actionable {
+            return err(with_current_list_for_args(
+                "todowrite: provide exactly one of `plan` or `update`.",
+                &self.board_items(),
+            ));
+        }
+
+        // 1. Read-only query: an empty object (no arguments) echoes the current list.
+        // `list=true` and `action=list` stay accepted for legacy transcripts.
+        let is_query_list = v.as_object().is_some_and(|o| o.is_empty())
+            || v.get("list").is_some()
+            || v.get("action").and_then(|a| a.as_str()) == Some("list")
+            || matches!(
+                v.get("actions").and_then(|a| a.as_array()).map(Vec::as_slice),
+                Some([only]) if action_kind(only) == Some("list")
+            );
+        if is_query_list {
+            let items = self.board_items();
+            return ok(format!(
+                "Current task list:\n\n{}",
+                render_todos_numbered(&items, false)
+            ));
+        }
+
+        // 2. Full plan rebuild: the payload becomes the complete active list
+        if plan_actionable {
+            return match parse_plan_rebuild(&v, &list) {
+                Ok(new_items) => {
+                    let stored = self.commit_and_read(&new_items);
+                    ok(format!(
+                        "Plan updated ({} task{}):\n\n{}",
+                        stored.len(),
+                        if stored.len() == 1 { "" } else { "s" },
+                        render_todos_numbered(&stored, false)
+                    ))
+                }
+                Err(e) => err(with_current_list_for_args(e, &self.board_items())),
+            };
+        }
+
+        // 3. Partial batch updates (content-first, id fallback)
+        if update_actionable {
+            return match apply_batch_updates(&mut list, &v) {
+                Ok((_count, summary)) => {
+                    let stored = self.commit_and_read(&list);
+                    ok(format!(
+                        "{summary}\n\n{}",
+                        render_todos_numbered(&stored, false)
+                    ))
+                }
+                Err(e) => err(with_current_list(e, &self.board_items())),
+            };
+        }
+
+        // 4. Legacy full-list replace (resume / old transcripts). Prefer `actions`.
         // `actions` wins if both fields are present (same as the fold).
         if v.get("actions").and_then(|a| a.as_array()).is_none() && v.get("todos").is_some() {
             return match parse_todos(&args) {
@@ -1295,38 +2384,26 @@ impl Tool for TodoTool {
                     let stored = self.commit_and_read(&todos);
                     ok(render_todos_numbered(&stored, false))
                 }
-                Err(e) => err(with_current_list(e, &self.board_items())),
+                Err(e) => err(with_current_list_for_args(e, &self.board_items())),
             };
         }
 
+        // 5. Legacy single action wrapped into `actions`
         if v.get("actions").is_none() && v.get("todos").is_none() && action_kind(&v).is_some() {
             let single = v.clone();
             v = json!({ "actions": [single] });
         }
 
-        // Read-only `list`: echo the CURRENT list and touch nothing. The name predates the
-        // `actions` contract and is kept as a first-class read (old transcripts and models still
-        // ask for it), so it answers with the numbered list instead of the mutation summary.
-        if matches!(
-            v.get("actions").and_then(|a| a.as_array()).map(Vec::as_slice),
-            Some([only]) if action_kind(only) == Some("list")
-        ) {
-            return ok(format!(
-                "Current task list:\n\n{}",
-                render_todos_numbered(&self.board_items(), false)
-            ));
-        }
-
         if v.get("actions").and_then(|a| a.as_array()).is_none() {
-            return err(with_current_list(
-                "todowrite: provide a non-empty `actions` array of task action objects.",
+            return err(with_current_list_for_args(
+                "todowrite: provide `plan` for full rebuild, `update` for progress patch, or {} to view current list.",
                 &self.board_items(),
             ));
         }
 
         let summary = match todo_change_summary(&v) {
             Ok(s) => s,
-            Err(e) => return err(with_current_list(e, &self.board_items())),
+            Err(e) => return err(with_current_list_for_args(e, &self.board_items())),
         };
 
         match try_apply_todo_args(&mut list, &args) {
@@ -1352,6 +2429,16 @@ impl Tool for TodoTool {
 fn with_current_list(msg: impl std::fmt::Display, list: &[TodoItem]) -> String {
     format!(
         "{msg}\n\nCurrent list (unchanged):\n{}\nUse these 1-based ids. Do not retry a failed id.",
+        render_todos_numbered(list, false)
+    )
+}
+
+/// Schema/shape failure: the call never named a valid action, so "do not retry
+/// a failed id" is misleading and can make the model give up instead of fixing
+/// the fields. The list stays visible so ids can still be derived correctly.
+fn with_current_list_for_args(msg: impl std::fmt::Display, list: &[TodoItem]) -> String {
+    format!(
+        "{msg}\n\nCurrent list (unchanged):\n{}\nNo changes were applied. Correct the arguments and re-send the call.",
         render_todos_numbered(list, false)
     )
 }
@@ -1382,7 +2469,7 @@ fn summarize_todo_action(v: &serde_json::Value) -> Result<String, String> {
     match action_kind(v) {
         Some("add") => match v.get("content").and_then(|c| c.as_str()) {
             Some(c) if !c.trim().is_empty() => Ok(format!("Added task: {}", c.trim())),
-            _ => Err("`add` needs non-empty `content`. Example: {\"action\": \"add\", \"content\": \"Implement feature X\"}".into()),
+            _ => Err("adding a task needs non-empty `content`. Example: {\"content\": \"Implement feature X\"}".into()),
         },
         Some("insert") => {
             let content = v
@@ -1390,7 +2477,7 @@ fn summarize_todo_action(v: &serde_json::Value) -> Result<String, String> {
                 .and_then(|c| c.as_str())
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
-                .ok_or_else(|| "`insert` needs non-empty `content`. Example: {\"action\": \"insert\", \"content\": \"New task\", \"position\": 1}".to_string())?;
+                .ok_or_else(|| "inserting needs non-empty `content`. Example: {\"content\": \"New task\", \"position\": 1}".to_string())?;
             let pos = insert_position(v).unwrap_or(1).max(1);
             Ok(format!("#{pos} \u{2192} inserted: {content}"))
         }
@@ -1406,19 +2493,19 @@ fn summarize_todo_action(v: &serde_json::Value) -> Result<String, String> {
                 .is_some();
 
             if id.is_none() {
-                return Err("`update` needs a valid `id` (1-based task number). Example: {\"action\": \"update\", \"id\": 1, \"status\": \"in_progress\"}".into());
+                return Err("updating needs a valid `id` (1-based task number). Example: {\"id\": 1, \"status\": \"in_progress\"}".into());
             }
             let task_id = id.unwrap();
             if raw_status.is_some() && parsed_status.is_none() {
                 return Err(format!(
-                    "`update` has invalid `status`: `{}`. Must be `pending`, `in_progress`, or `completed`. Example: {{\"action\": \"update\", \"id\": {}, \"status\": \"in_progress\"}}",
+                    "`update` has invalid `status`: `{}`. Must be `pending`, `in_progress`, or `completed`. Example: {{\"id\": {}, \"status\": \"in_progress\"}}",
                     raw_status.unwrap(),
                     task_id
                 ));
             }
             if parsed_status.is_none() && !has_content {
                 return Err(format!(
-                    "`update` needs at least one of `status` ('pending'|'in_progress'|'completed') or `content` (non-empty text). Example: {{\"action\": \"update\", \"id\": {}, \"status\": \"in_progress\"}}",
+                    "updating needs at least one of `status` ('pending'|'in_progress'|'completed') or `content` (non-empty text). Example: {{\"id\": {}, \"status\": \"in_progress\"}}",
                     task_id
                 ));
             }
@@ -1431,7 +2518,7 @@ fn summarize_todo_action(v: &serde_json::Value) -> Result<String, String> {
         }
         Some("delete") => match json_id(v) {
             Some(id) if id >= 1 => Ok(format!("#{id} \u{2192} removed")),
-            _ => Err("`delete`/`remove` needs a valid `id` (1-based task number). Example: {\"action\": \"delete\", \"id\": 1}".into()),
+            _ => Err("`delete` needs a valid `id` (1-based task number). Example: {\"action\": \"delete\", \"id\": 1}".into()),
         },
         Some("clear") => Ok("all tasks cleared".to_string()),
         // Reachable only through a direct call: `execute` short-circuits a lone `list` before
@@ -1456,6 +2543,254 @@ mod tests {
             progress: zap_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    /// 回溯/删除改写转录尾部后，daemon 依赖的语义：`clear_todo_board` 必须让读者看到空清单，
+    /// 且禁止旧槽/磁盘快照复活（否则幽灵清单会被下一个回合继承，agent 状态错乱）。
+    #[test]
+    fn clear_todo_board_wipes_live_items_and_blocks_restore() {
+        let sid = "clear-on-rewind";
+        purge_todo_board(sid); // 隔离：不残留其他用例的槽
+        commit_todo_board(
+            sid,
+            &[TodoItem {
+                id: None,
+                content: "残留步骤".into(),
+                status: TodoStatus::InProgress,
+            }],
+        );
+        assert!(
+            read_todo_board(sid).is_some(),
+            "board must be live before clear"
+        );
+
+        clear_todo_board(sid);
+        assert!(
+            read_todo_board(sid).is_none(),
+            "readers must see no checklist after clear"
+        );
+        assert!(todo_session_is_closed(sid));
+
+        // closed 之后即使有人拿着旧 board（磁盘/旧槽）来恢复，也必须被拒绝。
+        restore_todo_board(
+            sid,
+            TodoBoard {
+                id: "todo-ghost".into(),
+                seq: 9,
+                revision: 0,
+                items: vec![TodoItem {
+                    id: None,
+                    content: "幽灵步骤".into(),
+                    status: TodoStatus::Pending,
+                }],
+            },
+        );
+        assert!(
+            read_todo_board(sid).is_none(),
+            "a closed session must not resurrect a ghost checklist"
+        );
+        purge_todo_board(sid);
+    }
+
+    /// 回溯重建：先 `clear` 关旧板（防旧槽/磁盘快照复活），再按“剩余转录”的推导结果
+    /// `commit` 回去。这是跨轮次回溯的正确语义：只回退被删掉的那些动作，
+    /// 更早轮次建立/修改过的项原样保留。
+    #[test]
+    fn commit_assigns_stable_ids_and_preserves_them_by_content() {
+        let sid = "todo-stable-ids";
+        purge_todo_board(sid);
+        let first = commit_todo_board(
+            sid,
+            &[
+                TodoItem {
+                    id: None,
+                    content: "alpha".into(),
+                    status: TodoStatus::Pending,
+                },
+                TodoItem {
+                    id: None,
+                    content: "beta".into(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+        );
+        let ids = first
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(Option::is_some));
+        assert_ne!(ids[0], ids[1]);
+
+        // Full-list replace with changed status keeps the content identity.
+        let second = commit_todo_board(
+            sid,
+            &[
+                TodoItem {
+                    id: None,
+                    content: "alpha".into(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    id: None,
+                    content: "beta".into(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        );
+        assert_eq!(second.revision, first.revision + 1);
+        assert_eq!(second.items[0].id, ids[0]);
+        assert_eq!(second.items[1].id, ids[1]);
+        purge_todo_board(sid);
+    }
+
+    #[test]
+    fn rewound_board_recommits_the_remaining_transcript() {
+        let sid = "rewind-rebuild";
+        purge_todo_board(sid);
+        commit_todo_board(
+            sid,
+            &[TodoItem {
+                id: None,
+                content: "A 轮计划".into(),
+                status: TodoStatus::Completed,
+            }],
+        );
+
+        // 回溯：旧板先关掉（禁止幽灵复活）……
+        clear_todo_board(sid);
+        assert!(read_todo_board(sid).is_none());
+
+        // ……再按剩余转录重建（这些项来自更早的轮次，必须留住）。
+        let rebuilt = vec![TodoItem {
+            id: None,
+            content: "A 轮计划".into(),
+            status: TodoStatus::InProgress,
+        }];
+        let board = commit_todo_board(sid, &rebuilt);
+        let pairs = |items: &[TodoItem]| {
+            items
+                .iter()
+                .map(|item| (item.content.clone(), item.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs(&board.items), pairs(&rebuilt));
+        assert!(board.items.iter().all(|item| item.id.is_some()));
+        assert_eq!(
+            read_todo_board(sid).map(|b| pairs(&b.items)),
+            Some(pairs(&rebuilt)),
+            "rebuild after clear must be readable"
+        );
+        assert!(
+            !todo_session_is_closed(sid),
+            "重建后的板必须是活的，下一轮还能继续折叠动作"
+        );
+        purge_todo_board(sid);
+    }
+
+    /// 撤销重建走原地重绑：板身份（id）不变、seq 只增不减，
+    /// 任何把 `(board_id, seq)` 当版本号的消费者都不会把撤销看成回退。
+    #[test]
+    fn rebind_keeps_board_identity_and_monotonic_seq() {
+        let sid = "rewind-rebind";
+        purge_todo_board(sid);
+        let first = commit_todo_board(
+            sid,
+            &[TodoItem {
+                id: None,
+                content: "A 轮计划".into(),
+                status: TodoStatus::InProgress,
+            }],
+        );
+
+        // steer 轮只改了两项 → 回溯后用剩余转录推导出的状态重绑。
+        let rebuilt = vec![
+            TodoItem {
+                id: None,
+                content: "A 轮计划".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                id: None,
+                content: "A 轮补充项".into(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        let board = rebind_todo_board(sid, &rebuilt).expect("live slot must rebind in place");
+        assert_eq!(board.id, first.id, "板身份必须保留");
+        assert_eq!(board.seq, first.seq + 1, "seq 只增不减");
+        let pairs = |items: &[TodoItem]| {
+            items
+                .iter()
+                .map(|item| (item.content.clone(), item.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read_todo_board(sid).map(|b| pairs(&b.items)),
+            Some(pairs(&rebuilt))
+        );
+        assert_eq!(
+            read_todo_board(sid).unwrap().items[0].id,
+            first.items[0].id,
+            "same content must keep its item identity across rebind"
+        );
+        assert!(!todo_session_is_closed(sid), "重建后的板是活的");
+
+        // 再回溯一次：seq 继续前进，id 仍然不变。
+        let again = rebind_todo_board(
+            sid,
+            &[TodoItem {
+                id: None,
+                content: "A 轮计划".into(),
+                status: TodoStatus::Pending,
+            }],
+        )
+        .expect("second rebind");
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.seq, first.seq + 2);
+        purge_todo_board(sid);
+    }
+
+    /// 整轮被删干净（推导为空）：板关闭且拒绝旧磁盘快照复活；
+    /// 槽不存在时返回 None，让调用方退回 clear/commit 兜底。
+    #[test]
+    fn rebind_with_empty_fold_closes_the_board() {
+        let sid = "rewind-rebind-empty";
+        purge_todo_board(sid);
+        assert!(
+            rebind_todo_board(sid, &[]).is_none(),
+            "no slot → caller falls back"
+        );
+        commit_todo_board(
+            sid,
+            &[TodoItem {
+                id: None,
+                content: "将被删光的计划".into(),
+                status: TodoStatus::InProgress,
+            }],
+        );
+        assert!(rebind_todo_board(sid, &[]).is_none());
+        assert!(read_todo_board(sid).is_none(), "关闭后不得再有清单");
+        assert!(todo_session_is_closed(sid));
+
+        restore_todo_board(
+            sid,
+            TodoBoard {
+                id: "todo-ghost-rebind".into(),
+                seq: 7,
+                revision: 0,
+                items: vec![TodoItem {
+                    id: None,
+                    content: "幽灵步骤".into(),
+                    status: TodoStatus::Pending,
+                }],
+            },
+        );
+        assert!(
+            read_todo_board(sid).is_none(),
+            "撤销清空后旧板不得被磁盘/旧槽复活"
+        );
+        purge_todo_board(sid);
     }
 
     #[test]
@@ -1528,10 +2863,12 @@ mod tests {
     fn render_text_ascii() {
         let todos = vec![
             TodoItem {
+                id: None,
                 content: "first".into(),
                 status: TodoStatus::Completed,
             },
             TodoItem {
+                id: None,
                 content: "second".into(),
                 status: TodoStatus::InProgress,
             },
@@ -1568,10 +2905,60 @@ mod tests {
         assert_eq!(todos[0].status, TodoStatus::InProgress);
     }
 
+    /// 与 WebUI 的 `todoRewind.test.ts` 同一场景：跨轮次回溯只回退被删掉的动作，
+    /// 更早轮次的计划必须留住（单轮内建了又整轮删干净才是空）。
+    /// 这里锁住**生产折叠**（derive_current_todos）的输出。
+    #[test]
+    fn rewind_after_steer_keeps_the_earlier_turns_plan() {
+        let call = |id: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "todowrite".into(),
+                    arguments: args.into(),
+                }],
+            )
+        };
+        let plan = r#"{"todos":[{"content":"读取项目结构","status":"in_progress"},{"content":"修复渲染","status":"pending"}]}"#;
+        let advance = r#"{"action":"update","id":1,"status":"completed"}"#;
+        let add = r#"{"action":"add","content":"补充单元测试"}"#;
+        let promote = r#"{"action":"update","id":2,"status":"in_progress"}"#;
+
+        let mut msgs = vec![
+            Message::user("帮我把这个项目跑起来"),
+            call("t1", plan),
+            call("t2", advance),
+            // steer 也是真实用户消息（非 synthetic），因此算轮次边界。
+            Message::user("接下来帮我改渲染"),
+            call("t3", add),
+            call("t4", promote),
+        ];
+        let full = derive_current_todos(&msgs);
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[0].status, TodoStatus::Completed);
+        assert_eq!(full[1].status, TodoStatus::InProgress);
+        assert_eq!(full[2].status, TodoStatus::Pending);
+
+        // 删除 steer 整轮（提问 + 之后的消息）：A 轮状态原样保留。
+        msgs.truncate(3);
+        let rolled_back = derive_current_todos(&msgs);
+        assert_eq!(rolled_back.len(), 2, "跨轮次回溯不得一刀切清空");
+        assert_eq!(rolled_back[0].content, "读取项目结构");
+        assert_eq!(rolled_back[0].status, TodoStatus::Completed);
+        assert_eq!(rolled_back[1].content, "修复渲染");
+        assert_eq!(rolled_back[1].status, TodoStatus::Pending);
+
+        // 单轮内建了又整轮删干净 → 空（与旧行为等价）。
+        assert!(derive_current_todos(&[]).is_empty());
+        assert!(derive_current_todos(&msgs[0..1]).is_empty());
+    }
+
     #[test]
     fn todo_board_stays_until_stop_closes_a_finished_list() {
         let session = format!("todo-board-{}", std::process::id());
         let open = vec![TodoItem {
+            id: None,
             content: "still".into(),
             status: TodoStatus::Pending,
         }];
@@ -1580,6 +2967,7 @@ mod tests {
         assert!(close_todo_board_if_complete(&session).is_none());
         assert_eq!(read_todo_board(&session).unwrap().items.len(), 1);
         let done = vec![TodoItem {
+            id: None,
             content: "still".into(),
             status: TodoStatus::Completed,
         }];
@@ -1977,6 +3365,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_action_does_not_close_a_completed_live_board() {
+        let session_id = format!("todo-list-complete-{}", std::process::id());
+        purge_todo_board(&session_id);
+        let tool = TodoTool::new();
+        bind_todo_session(&tool.live, &session_id);
+        let done = vec![TodoItem {
+            id: None,
+            content: "finished".into(),
+            status: TodoStatus::Completed,
+        }];
+        commit_todo_board(&session_id, &done);
+        *tool.lock_live() = done.clone();
+
+        let listed = tool.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(!listed.is_error, "{}", listed.content);
+        assert!(listed.content.contains("finished"), "{}", listed.content);
+        let listed_items = read_todo_board(&session_id).unwrap().items;
+        assert_eq!(
+            listed_items
+                .iter()
+                .map(|item| (item.content.clone(), item.status))
+                .collect::<Vec<_>>(),
+            done.iter()
+                .map(|item| (item.content.clone(), item.status))
+                .collect::<Vec<_>>(),
+        );
+        assert!(listed_items.iter().all(|item| item.id.is_some()));
+        assert_eq!(*tool.lock_live(), done);
+
+        unbind_todo_session(&tool.live);
+        purge_todo_board(&session_id);
+    }
+
+    #[tokio::test]
     async fn list_action_rejects_being_batched_with_a_mutation() {
         let t = TodoTool::new();
         let r = t
@@ -2163,8 +3585,8 @@ mod tests {
             "bad action"
         );
         assert!(
-            t.execute(r#"{}"#, &ctx()).await.is_error,
-            "neither todos nor action"
+            t.execute(r#"{"actions":[{}]}"#, &ctx()).await.is_error,
+            "an empty action object is still rejected"
         );
     }
 
@@ -2212,10 +3634,12 @@ mod tests {
     fn apply_todo_actions_batch_is_transactional() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "a".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "b".into(),
                 status: TodoStatus::Pending,
             },
@@ -2241,14 +3665,17 @@ mod tests {
     fn apply_todo_actions_updates_are_id_addressed_order_independent() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "a".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "b".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "c".into(),
                 status: TodoStatus::Pending,
             },
@@ -2273,10 +3700,12 @@ mod tests {
     fn apply_todo_actions_rejects_mixed_id_shifting_kinds() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "a".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "b".into(),
                 status: TodoStatus::Pending,
             },
@@ -2302,10 +3731,12 @@ mod tests {
     fn apply_todo_actions_clear_then_add_update_replaces_plan() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "old-1".into(),
                 status: TodoStatus::Completed,
             },
             TodoItem {
+                id: None,
                 content: "old-2".into(),
                 status: TodoStatus::InProgress,
             },
@@ -2325,10 +3756,12 @@ mod tests {
     fn add_on_finished_list_auto_clears_so_ids_restart() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "done-1".into(),
                 status: TodoStatus::Completed,
             },
             TodoItem {
+                id: None,
                 content: "done-2".into(),
                 status: TodoStatus::Completed,
             },
@@ -2356,6 +3789,7 @@ mod tests {
         // The live failure: list is `[x] 1. 查询…`, model adds a follow-up as
         // id 2 and updates id 2. Completed list must smoothly append.
         let mut list = vec![TodoItem {
+            id: None,
             content: "查询沉睡资源客户列表".into(),
             status: TodoStatus::Completed,
         }];
@@ -2374,6 +3808,7 @@ mod tests {
     fn update_and_multiple_adds_on_in_progress_list_does_not_clear() {
         let mut list = (1..=6)
             .map(|i| TodoItem {
+                id: None,
                 content: format!("task-{i}"),
                 status: if i == 6 {
                     TodoStatus::InProgress
@@ -2439,6 +3874,7 @@ mod tests {
     #[test]
     fn add_duplicate_title_upserts_instead_of_duplicating() {
         let mut list = vec![TodoItem {
+            id: None,
             content: "导出Excel".into(),
             status: TodoStatus::Pending,
         }];
@@ -2454,14 +3890,17 @@ mod tests {
     fn insert_duplicate_title_re_ranks() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "a".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "b".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "c".into(),
                 status: TodoStatus::Pending,
             },
@@ -2480,10 +3919,12 @@ mod tests {
     fn add_on_unfinished_list_does_not_auto_clear() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "done".into(),
                 status: TodoStatus::Completed,
             },
             TodoItem {
+                id: None,
                 content: "still-open".into(),
                 status: TodoStatus::Pending,
             },
@@ -2497,10 +3938,12 @@ mod tests {
     fn apply_todo_insert_then_update_uses_post_insert_ids() {
         let mut list = vec![
             TodoItem {
+                id: None,
                 content: "a".into(),
                 status: TodoStatus::Pending,
             },
             TodoItem {
+                id: None,
                 content: "b".into(),
                 status: TodoStatus::Pending,
             },
@@ -2543,6 +3986,7 @@ mod tests {
     #[test]
     fn apply_accepts_string_ids() {
         let mut list = vec![TodoItem {
+            id: None,
             content: "a".into(),
             status: TodoStatus::Pending,
         }];
@@ -2610,6 +4054,114 @@ mod tests {
         assert!(d.contains("task"), "covers task: {d}");
     }
 
+    /// Public schema guard: only `plan` and `update` are advertised. Legacy
+    /// compatibility aliases (`actions`, `todos`, `before*`, `position`, `list`)
+    /// remain internal-only and must never leak into the model-facing schema.
+    #[test]
+    fn schema_excludes_internal_aliases_and_legacy_actions() {
+        let t = TodoTool::new();
+        let s = t.parameters_schema();
+
+        let props = s["properties"].as_object().expect("properties object");
+        let mut roots: Vec<&str> = props.keys().map(String::as_str).collect();
+        roots.sort_unstable();
+        assert_eq!(roots, vec!["clear", "plan", "update"]);
+
+        let plan_items = s["properties"]["plan"]["items"]["properties"]
+            .as_object()
+            .expect("plan item properties");
+        let mut plan_keys: Vec<&str> = plan_items.keys().map(String::as_str).collect();
+        plan_keys.sort_unstable();
+        assert_eq!(plan_keys, vec!["content", "status"]);
+
+        let update_items = s["properties"]["update"]["items"]["properties"]
+            .as_object()
+            .expect("update item properties");
+        let mut update_keys: Vec<&str> = update_items.keys().map(String::as_str).collect();
+        update_keys.sort_unstable();
+        assert_eq!(
+            update_keys,
+            vec![
+                "after",
+                "after_id",
+                "content",
+                "id",
+                "new_content",
+                "status"
+            ]
+        );
+
+        let serialized = s.to_string();
+        for alias in [
+            "actions",
+            "todos",
+            "before_content",
+            "before_id",
+            "\"before\"",
+            "position",
+            "\"list\"",
+        ] {
+            assert!(
+                !serialized.contains(alias),
+                "internal alias `{alias}` leaked into the public schema: {serialized}"
+            );
+        }
+    }
+
+    /// Regression: a strict-fill model materialises EVERY declared property, so its
+    /// intended adds used to arrive as `action:"clear"` + `content`. That must never
+    /// be interpreted as a wipe: reject the batch and keep the existing list intact.
+    #[tokio::test]
+    async fn clear_with_task_content_is_rejected_before_any_mutation() {
+        let t = TodoTool::new();
+        let seeded = t
+            .execute(
+                r#"{"todos":[{"content":"keep a","status":"pending"},{"content":"keep b","status":"in_progress"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!seeded.is_error, "{}", seeded.content);
+
+        let weird = t
+            .execute(
+                r#"{"actions":[
+                    {"action":"clear","content":"","id":1,"position":1,"status":"pending"},
+                    {"action":"clear","content":"new task 1","id":1,"position":1,"status":"in_progress"},
+                    {"action":"clear","content":"new task 2","id":2,"position":2,"status":"pending"}
+                ]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(weird.is_error, "{}", weird.content);
+        assert!(weird.content.contains("actions[1]"), "{}", weird.content);
+        assert!(weird.content.contains("NOT changed"), "{}", weird.content);
+
+        let after = t.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(!after.is_error, "{}", after.content);
+        assert!(after.content.contains("1. keep a"), "{}", after.content);
+        assert!(after.content.contains("2. keep b"), "{}", after.content);
+        assert!(!after.content.contains("new task"), "{}", after.content);
+    }
+
+    /// With every verb advertised, a strict-fill payload that picks `add` recovers
+    /// cleanly even though it also carries the irrelevant defaults `id`/`position`.
+    #[tokio::test]
+    async fn strict_fill_with_explicit_add_ignores_irrelevant_defaults() {
+        let t = TodoTool::new();
+        let res = t
+            .execute(
+                r#"{"actions":[
+                    {"action":"add","content":"first","id":1,"position":1,"status":"pending"},
+                    {"action":"add","content":"second","id":2,"position":2,"status":"in_progress"}
+                ]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.contains("1. first"), "{}", res.content);
+        assert!(res.content.contains("2. second"), "{}", res.content);
+    }
+
     #[tokio::test]
     async fn todowrite_execute_accepts_insert() {
         let t = TodoTool::new();
@@ -2674,13 +4226,14 @@ mod tests {
         let res = t.execute(r#"{"actions":[{"action":"add"}]}"#, &ctx()).await;
         assert!(res.is_error);
         assert!(
-            res.content.contains("`add` needs non-empty `content`"),
+            res.content
+                .contains("adding a task needs non-empty `content`"),
             "{}",
             res.content
         );
         assert!(
             res.content
-                .contains("Example: {\"action\": \"add\", \"content\": \"Implement feature X\"}"),
+                .contains("Example: {\"content\": \"Implement feature X\"}"),
             "{}",
             res.content
         );
@@ -2697,14 +4250,13 @@ mod tests {
             .await;
         assert!(res.is_error);
         assert!(
-            res.content.contains("`update` needs a valid `id`"),
+            res.content.contains("updating needs a valid `id`"),
             "{}",
             res.content
         );
         assert!(
-            res.content.contains(
-                "Example: {\"action\": \"update\", \"id\": 1, \"status\": \"in_progress\"}"
-            ),
+            res.content
+                .contains("Example: {\"id\": 1, \"status\": \"in_progress\"}"),
             "{}",
             res.content
         );
@@ -2725,7 +4277,7 @@ mod tests {
         assert!(res.is_error);
         assert!(
             res.content
-                .contains("`update` needs at least one of `status`"),
+                .contains("updating needs at least one of `status`"),
             "{}",
             res.content
         );
@@ -2835,16 +4387,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_object_is_not_inferred_as_clear() {
+    async fn escaped_status_key_is_repaired_like_a_normal_update() {
+        // The provider double-escaped the tail of the payload: after JSON parsing
+        // the key is literally `"status"` (quotes included). It must repair to
+        // `status`, not fall through to the bare-`id` delete rule.
+        let t = TodoTool::new();
+        let r = t
+            .execute(
+                r#"{"actions":[
+                    {"content":"one"},
+                    {"content":"two"},
+                    {"\"status\"":"in_progress","id":1}
+                ]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(
+            !r.is_error,
+            "escaped `status` key must be repaired: {}",
+            r.content
+        );
+        assert!(r.content.contains("[~] 1. one"), "{}", r.content);
+        assert!(r.content.contains("[ ] 2. two"), "{}", r.content);
+    }
+
+    #[test]
+    fn escaped_status_key_folds_to_the_same_list_as_execute() {
+        // Live execution normalizes at the tool boundary; replay/resume folds the
+        // RAW transcript call, so the same repair must also live in
+        // `try_apply_todo_args` or the two views diverge.
+        let args = r#"{"actions":[{"content":"one"},{"content":"two"},{"\"status\"":"in_progress","id":1}]}"#;
+        let folded = reduce_todos([("todo_write", args)]);
+        assert_eq!(folded.len(), 2, "{folded:?}");
+        assert_eq!(folded[0].content, "one");
+        assert_eq!(folded[0].status, TodoStatus::InProgress);
+        assert_eq!(folded[1].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn escaped_status_key_in_plan_is_repaired() {
+        let plan = r#"{"todos":[{"content":"a","\"status\"":"in_progress"}]}"#;
+        let parsed = parse_todos(plan).expect("plan with an escaped status key must parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn escaped_root_actions_key_is_repaired() {
+        let normalized = normalize_todo_write_args(r#"{"\"actions\"":[{"content":"a"}]}"#);
+        let v: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        assert!(v.get("actions").is_some(), "{normalized}");
+        assert_eq!(v["actions"][0]["content"], "a");
+    }
+
+    #[tokio::test]
+    async fn misspelled_status_key_is_reported_not_treated_as_delete() {
+        let t = TodoTool::new();
+        let seeded = t
+            .execute(
+                r#"{"actions":[{"content":"keep"},{"content":"also"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!seeded.is_error, "{}", seeded.content);
+
+        let r = t
+            .execute(r#"{"actions":[{"id":1,"stauts":"completed"}]}"#, &ctx())
+            .await;
+        assert!(r.is_error, "a typo must not be applied: {}", r.content);
+        assert!(
+            r.content.contains("unrecognized key(s) `stauts`"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content
+                .contains("did you mean `status` instead of `stauts`"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("No changes were applied"),
+            "{}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("Do not retry a failed id"),
+            "schema errors must not reuse the id-retry hint: {}",
+            r.content
+        );
+
+        let list = t.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(
+            list.content.contains("1. keep") && list.content.contains("2. also"),
+            "the typo must not delete anything: {}",
+            list.content
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_id_with_unknown_key_is_not_a_delete() {
+        // Only an object whose sole field is `id` is destructive. Unknown keys
+        // (here `note`) mean the payload is malformed, not a delete request.
+        let t = TodoTool::new();
+        let seeded = t
+            .execute(r#"{"actions":[{"content":"a"},{"content":"b"}]}"#, &ctx())
+            .await;
+        assert!(!seeded.is_error, "{}", seeded.content);
+
+        let r = t
+            .execute(r#"{"actions":[{"id":1,"note":"x"}]}"#, &ctx())
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("unrecognized key(s) `note`"),
+            "{}",
+            r.content
+        );
+
+        let list = t.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(
+            list.content.contains("1. a") && list.content.contains("2. b"),
+            "an unknown key must never silently delete a task: {}",
+            list.content
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_object_reads_list_without_clearing() {
         let t = TodoTool::new();
         let _ = t
             .execute(r#"{"actions":[{"content":"keep me"}]}"#, &ctx())
             .await;
         let res = t.execute(r#"{}"#, &ctx()).await;
-        assert!(res.is_error, "empty payload must not clear the list");
+        assert!(!res.is_error, "{}", res.content);
+        assert!(
+            res.content.contains("Current task list:"),
+            "{}",
+            res.content
+        );
+        assert!(res.content.contains("keep me"), "{}", res.content);
         let res = t.execute(r#"{"actions":[{}]}"#, &ctx()).await;
         assert!(res.is_error);
         assert!(res.content.contains("could not infer"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn empty_object_and_legacy_list_flag_read_current_tasks_without_mutation() {
+        let t = TodoTool::new();
+        let _ = t.execute(r#"{"plan":["Task 1","Task 2"]}"#, &ctx()).await;
+        for args in ["{}", r#"{"list":true}"#] {
+            let r = t.execute(args, &ctx()).await;
+            assert!(!r.is_error, "{args}: {}", r.content);
+            assert!(r.content.contains("Current task list:"), "{}", r.content);
+            assert!(r.content.contains("1. Task 1"), "{}", r.content);
+            assert!(r.content.contains("2. Task 2"), "{}", r.content);
+        }
     }
 
     #[tokio::test]
@@ -2956,5 +4654,305 @@ mod tests {
         assert!(r.content.contains("1. renamed"), "{}", r.content);
         assert!(r.content.contains("2. second"), "{}", r.content);
         assert!(!r.content.contains("keep me"), "{}", r.content);
+    }
+
+    #[test]
+    fn a_dead_live_handle_never_hands_its_session_to_a_fresh_one() {
+        let live: TodoLive = Arc::new(Mutex::new(Vec::new()));
+        let key = live_key(&live);
+        bind_todo_session(&live, "dead-session");
+        assert_eq!(todo_session_of(&live).as_deref(), Some("dead-session"));
+
+        // The owner dies without unbinding (a panicking caller). The weak owner
+        // keeps the allocation pinned, so the address cannot be recycled onto a
+        // different live handle and alias the dead session onto it.
+        drop(live);
+        {
+            let guard = live_bindings().lock().unwrap();
+            let binding = guard.get(&key).expect("binding outlives its owner");
+            assert_eq!(binding.owner.strong_count(), 0);
+        }
+
+        let fresh: TodoLive = Arc::new(Mutex::new(Vec::new()));
+        assert_ne!(live_key(&fresh), key, "the dead allocation stays pinned");
+        assert!(
+            todo_session_of(&fresh).is_none(),
+            "a fresh live handle must not inherit a dead session"
+        );
+    }
+
+    #[test]
+    fn a_dead_binding_is_cleared_on_lookup() {
+        let live: TodoLive = Arc::new(Mutex::new(Vec::new()));
+        let key = live_key(&live);
+        // A binding whose owner is already dead — the owner was dropped without
+        // unbinding, so the binding describes no live checklist any more.
+        let dead_owner = {
+            let dead: TodoLive = Arc::new(Mutex::new(Vec::new()));
+            Arc::downgrade(&dead)
+        };
+        assert_eq!(dead_owner.strong_count(), 0);
+        live_bindings().lock().unwrap().insert(
+            key,
+            LiveBinding {
+                owner: dead_owner,
+                session_id: "stale".into(),
+            },
+        );
+
+        assert!(
+            todo_session_of(&live).is_none(),
+            "a dead binding must not be served"
+        );
+        assert!(
+            !live_bindings().lock().unwrap().contains_key(&key),
+            "the dead binding must be cleared on lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_rebuild_replaces_omitted_tasks() {
+        let t = TodoTool::new();
+        // Initial plan: A, B, C
+        let r1 = t
+            .execute(
+                r#"{"plan":[{"content":"Task A","status":"completed"},{"content":"Task B","status":"in_progress"},{"content":"Task C"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r1.is_error, "{}", r1.content);
+        assert!(r1.content.contains("1. Task A"));
+        assert!(r1.content.contains("2. Task B"));
+        assert!(r1.content.contains("3. Task C"));
+
+        // Full rebuild: new order is C, D, A; omitted B is removed from the active list.
+        let r2 = t
+            .execute(
+                r#"{"plan":[{"content":"Task C","status":"in_progress"},{"content":"Task D","status":"pending"},{"content":"Task A","status":"stable"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r2.is_error, "{}", r2.content);
+        assert!(r2.content.contains("1. Task C"), "{}", r2.content);
+        assert!(r2.content.contains("2. Task D"), "{}", r2.content);
+        assert!(r2.content.contains("3. Task A"), "{}", r2.content);
+        assert!(
+            !r2.content.contains("Task B"),
+            "omitted Task B must be removed by a full rebuild: {}",
+            r2.content
+        );
+        // Task A status was 'stable', so it should inherit 'completed'
+        assert!(
+            r2.content.contains("[√] 3. Task A"),
+            "Task A must remain completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_merges_duplicate_payload_titles() {
+        let t = TodoTool::new();
+        let r = t
+            .execute(
+                r#"{"plan":[{"content":"Same","status":"pending"},{"content":"Other"},{"content":"Same","status":"in_progress"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.content.matches("Same").count(), 1, "{}", r.content);
+        assert!(r.content.contains("[~] 1. Same"), "{}", r.content);
+        assert!(r.content.contains("2. Other"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn empty_plan_and_update_are_read_only() {
+        let t = TodoTool::new();
+        let _ = t.execute(r#"{"plan":["Keep"]}"#, &ctx()).await;
+        for args in [
+            r#"{"plan":[]}"#,
+            r#"{"update":[]}"#,
+            r#"{"plan":[{"content":""}]}"#,
+            r#"{"update":[{"content":""}]}"#,
+            r#"{"update":[{}]}"#,
+        ] {
+            let r = t.execute(args, &ctx()).await;
+            assert!(!r.is_error, "{args}: {}", r.content);
+            assert!(r.content.contains("Current task list:"), "{}", r.content);
+            assert!(r.content.contains("1. Keep"), "{}", r.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_true_clears_only_when_explicit() {
+        let t = TodoTool::new();
+        let _ = t.execute(r#"{"plan":["Keep"]}"#, &ctx()).await;
+        let combined = t.execute(r#"{"clear":true,"plan":["Keep"]}"#, &ctx()).await;
+        assert!(combined.is_error, "clear must be used alone");
+        let cleared = t.execute(r#"{"clear":true}"#, &ctx()).await;
+        assert!(!cleared.is_error, "{}", cleared.content);
+        assert!(
+            cleared.content.contains("(no tasks)"),
+            "{}",
+            cleared.content
+        );
+    }
+
+    #[tokio::test]
+    async fn content_driven_batch_update_matches_by_title() {
+        let t = TodoTool::new();
+        let _ = t
+            .execute(
+                r#"{"plan":["Configure display name","Update tasks.py","Deploy daemon"]}"#,
+                &ctx(),
+            )
+            .await;
+
+        // Content-driven: complete "Update tasks.py" and advance "Deploy daemon", without needing IDs
+        let r = t
+            .execute(
+                r#"{"update":[{"content":"Update tasks.py","status":"completed"},{"content":"Deploy daemon","status":"in_progress"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("[√] 2. Update tasks.py"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("[•] 3. Deploy daemon")
+                || r.content.contains("[~] 3. Deploy daemon"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("[ ] 1. Configure display name"),
+            "{}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn status_stable_protects_existing_status_during_refinement() {
+        let t = TodoTool::new();
+        let _ = t
+            .execute(
+                r#"{"plan":[{"content":"Audit auth","status":"completed"}]}"#,
+                &ctx(),
+            )
+            .await;
+
+        // Refine content with new_content while keeping status stable
+        let r = t
+            .execute(
+                r#"{"update":{"content":"Audit auth","new_content":"Audit auth & permissions","status":"stable"}}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("[√] 1. Audit auth & permissions"),
+            "{}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_in_progress_self_heals_to_latest() {
+        let t = TodoTool::new();
+        let r = t
+            .execute(
+                r#"{"plan":[{"content":"Step 1","status":"in_progress"},{"content":"Step 2","status":"in_progress"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        // Only Step 2 should be in_progress; Step 1 should demote to pending
+        assert!(r.content.contains("[ ] 1. Step 1"), "{}", r.content);
+        assert!(r.content.contains("2. Step 2"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn update_supports_local_crud_operations() {
+        let t = TodoTool::new();
+        // 初始状态：A, B, C
+        let _ = t
+            .execute(
+                r#"{"plan":[{"content":"Task A","status":"pending"},{"content":"Task B","status":"pending"},{"content":"Task C","status":"pending"}]}"#,
+                &ctx(),
+            )
+            .await;
+
+        // 1. 局部改（Bare update：存在则改状态）
+        let r1 = t
+            .execute(
+                r#"{"update":[{"content":"Task A","status":"completed"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r1.is_error, "{}", r1.content);
+        assert!(r1.content.contains("[√] 1. Task A"));
+
+        // 2. 局部插（after 指向前置任务：插在 Task A 后面）
+        let r2 = t
+            .execute(
+                r#"{"update":[{"content":"Task A2","after":"Task A","status":"in_progress"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r2.is_error, "{}", r2.content);
+        assert!(r2.content.contains("2. Task A2"));
+        assert!(r2.content.contains("3. Task B"));
+
+        // 2b. 局部插（after_id 指向前置任务：插在当前第 2 项 Task A2 后面）
+        let r2b = t
+            .execute(
+                r#"{"update":[{"content":"Task A-mid","after_id":2,"status":"pending"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r2b.is_error, "{}", r2b.content);
+        assert!(r2b.content.contains("3. Task A-mid"));
+        assert!(r2b.content.contains("4. Task B"));
+
+        // 3. 局部增（裸 item 不存在，自动尾部追加）
+        let r3 = t
+            .execute(
+                r#"{"update":[{"content":"Task D","status":"pending"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r3.is_error, "{}", r3.content);
+        assert!(r3.content.contains("6. Task D"));
+
+        // 4. 局部删（status: delete）
+        let r4 = t
+            .execute(
+                r#"{"update":[{"content":"Task B","status":"delete"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r4.is_error, "{}", r4.content);
+        assert!(r4.content.contains("Removed: 'Task B'"));
+        assert!(!r4.content.contains(". Task B"));
+        assert!(r4.content.contains("1. Task A"));
+        assert!(r4.content.contains("2. Task A2"));
+        assert!(r4.content.contains("3. Task A-mid"));
+        assert!(r4.content.contains("4. Task C"));
+        assert!(r4.content.contains("5. Task D"));
+
+        // 5. 局部调序（after 指向前置任务：把已存在的 C 移动到 A 后面）
+        let r5 = t
+            .execute(
+                r#"{"update":[{"content":"Task C","after":"Task A","status":"stable"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r5.is_error, "{}", r5.content);
+        assert!(r5.content.contains("1. Task A"));
+        assert!(r5.content.contains("2. Task C"));
+        assert!(r5.content.contains("3. Task A2"));
+        assert!(r5.content.contains("4. Task A-mid"));
+        assert!(r5.content.contains("5. Task D"));
     }
 }

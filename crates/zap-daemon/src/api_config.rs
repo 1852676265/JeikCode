@@ -84,6 +84,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         accounts,
         language,
         github_logo: config.github_logo,
+        auto_git_sync: config.auto_git_sync,
     }
 }
 
@@ -147,13 +148,20 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<String, String> {
 /// Apply one config delta to the latest on-disk snapshot. Provider/config API
 /// handlers should use this instead of load-mutate-save to avoid lost updates
 /// when an IDE and TUI write concurrently.
+///
+/// 落盘成功后广播 `config_reloaded`：语言/主题/模型/提供商/思考参数等**任何**
+/// 界面设置都是同一份 config，别的实例必须立即重读，而不是等手动 reload 或冷启动。
 pub(crate) fn update_config(
     mutate: impl FnOnce(&mut Config) -> anyhow::Result<()>,
 ) -> Result<Config, String> {
-    ConfigStore::default_store()
+    let result = ConfigStore::default_store()
         .update(mutate)
         .map(|commit| commit.snapshot.config)
-        .map_err(|e| format!("Failed to update config: {e:#}"))
+        .map_err(|e| format!("Failed to update config: {e:#}"));
+    if result.is_ok() {
+        crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
+    }
+    result
 }
 
 // ============================================================================
@@ -210,10 +218,32 @@ pub(crate) async fn set_language(Json(body): Json<LanguageBody>) -> impl IntoRes
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
     };
+    // 语言（小地球）也是全局设置：别的实例/标签页必须立即跟随，冷启动再读同一个 config。
+    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
     Json(config_response(&config)).into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub(crate) struct AutoGitSyncBody {
+    enabled: bool,
+}
+
+/// POST /config/auto-git-sync — 持久化「Agent 执行 git 变更命令后自动刷新/同步」开关。
+pub(crate) async fn set_auto_git_sync(Json(body): Json<AutoGitSyncBody>) -> impl IntoResponse {
+    let config = match update_config(|cfg| {
+        cfg.auto_git_sync = body.enabled;
+        Ok(())
+    }) {
+        Ok(config) => config,
+        Err(err) => {
+            return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+    };
+    // update_config 已统一广播 config_reloaded（语言/主题/模型/提供商同一份 config）。
+    Json(config_response(&config)).into_response()
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct RemoteAccessBody {
     host: String,
     port: u16,
@@ -228,6 +258,9 @@ pub(crate) struct RemoteAccessBody {
     /// the next start. `no_token` is never written to disk.
     #[serde(default)]
     apply_launch: bool,
+    /// Immediately restart the daemon to apply changed host or port.
+    #[serde(default)]
+    restart: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -250,6 +283,13 @@ struct RemoteAccessStatus {
     /// is listening now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_port: Option<u16>,
+    /// Host saved for the next launch when it differs from the socket that
+    /// is listening now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_host: Option<String>,
+    /// How this process was started: `desktop` / `systemd` / `procd` /
+    /// `launchd` / `windows-logon` / `foreground`. Restarts follow this mode.
+    launch_mode: &'static str,
 }
 
 fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccessStatus {
@@ -272,7 +312,10 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
     let token = token.or(active_token);
     let no_token = state
         .token_optional
-        .load(std::sync::atomic::Ordering::Relaxed);
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || !state
+            .enforce_token
+            .load(std::sync::atomic::Ordering::Relaxed);
     let urls = if active {
         access_urls(&host, port, token.as_deref(), no_token)
     } else {
@@ -289,6 +332,8 @@ fn remote_status(state: &crate::AppState, token: Option<String>) -> RemoteAccess
         urls,
         firewall: None,
         next_port: saved_listen_port().filter(|saved| *saved != port),
+        next_host: None,
+        launch_mode: zap_updater::detect_launch_mode().as_str(),
     }
 }
 
@@ -682,6 +727,10 @@ pub(crate) fn bind_listener(
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // 允许地址复用（消除 TIME_WAIT 状态导致原地重启交接时的端口冲突）
+    let _ = socket.set_reuse_address(true);
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    let _ = socket.set_reuse_port(true);
     // Windows defaults IPV6_V6ONLY to 0, so a `[::]` socket also claims
     // `0.0.0.0` and can leave the IPv4 listener accepting only this PC.
     // Keep the two stacks on separate sockets.
@@ -941,6 +990,8 @@ fn wait_child(child: &mut std::process::Child, limit: std::time::Duration) -> bo
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WebuiListenPref {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
     port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -961,8 +1012,19 @@ fn saved_listen_port() -> Option<u16> {
         .filter(|port| *port != 0)
 }
 
+pub(crate) fn saved_listen_token() -> Option<String> {
+    load_webui_listen_pref()
+        .and_then(|pref| pref.token)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// Write the next desktop launch. `token: None` keeps the token already on disk.
-pub(crate) fn save_webui_listen_pref(port: u16, token: Option<String>) -> Result<(), String> {
+pub(crate) fn save_webui_listen_pref(
+    host: Option<String>,
+    port: u16,
+    token: Option<String>,
+) -> Result<(), String> {
     if port == 0 {
         return Err("port must be 1-65535".to_string());
     }
@@ -970,8 +1032,18 @@ pub(crate) fn save_webui_listen_pref(port: u16, token: Option<String>) -> Result
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     }
-    let mut pref = load_webui_listen_pref().unwrap_or(WebuiListenPref { port, token: None });
+    let mut pref = load_webui_listen_pref().unwrap_or(WebuiListenPref {
+        host: None,
+        port,
+        token: None,
+    });
     pref.port = port;
+    if let Some(h) = host {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            pref.host = Some(trimmed.to_string());
+        }
+    }
     if token.is_some() {
         pref.token = token;
     }
@@ -989,12 +1061,21 @@ fn apply_launch_settings(
     if body.port == 0 {
         return Err("port must be 1-65535".to_string());
     }
+    let target_host = body.host.trim();
+    let host_opt = if !target_host.is_empty() {
+        Some(target_host.to_string())
+    } else {
+        None
+    };
     let port_changed = body.port != state.bind_port;
+    let host_changed =
+        !target_host.is_empty() && !target_host.eq_ignore_ascii_case(&state.bind_host);
+
     if body.no_token {
-        if !port_changed {
+        if !port_changed && !host_changed {
             apply_remote_auth(state, true);
         } else {
-            save_webui_listen_pref(body.port, None)?;
+            save_webui_listen_pref(host_opt, body.port, None)?;
             apply_remote_auth(state, true);
         }
     } else {
@@ -1010,15 +1091,20 @@ fn apply_launch_settings(
             }
             token.to_string()
         };
-        if !port_changed {
+        if !port_changed && !host_changed {
             state.webui_tokens.set_display(&token);
             apply_remote_auth(state, false);
         }
-        save_webui_listen_pref(body.port, Some(token))?;
+        save_webui_listen_pref(host_opt, body.port, Some(token))?;
     }
     let mut status = remote_status(state, None);
-    if port_changed {
-        status.next_port = Some(body.port);
+    if port_changed || host_changed {
+        if port_changed {
+            status.next_port = Some(body.port);
+        }
+        if host_changed {
+            status.next_host = Some(body.host.clone());
+        }
         if !body.no_token {
             if let Some(pref) = load_webui_listen_pref() {
                 status.token = pref.token;
@@ -1056,22 +1142,59 @@ pub(crate) async fn post_remote_access(
     // daemon into a network-reachable/no-token daemon. Explicit `serve --no-token`
     // startup semantics remain unchanged; this only constrains the runtime expansion API.
     if body.no_token {
-        let affected_host = if body.apply_launch {
-            state.bind_host.as_str()
-        } else {
-            body.host.trim()
-        };
-        if !crate::auth_token::is_loopback_bind_host(affected_host) {
-            return json_error(
-                axum::http::StatusCode::BAD_REQUEST,
-                "non-loopback remote access requires an access token",
-            )
-            .into_response();
+        let already_unauthenticated_remote = !state.initial_enforce_token
+            && !crate::auth_token::is_loopback_bind_host(&state.bind_host);
+        if !already_unauthenticated_remote {
+            let target = body.host.trim();
+            let affected_host = if body.apply_launch && !body.restart && target.is_empty() {
+                state.bind_host.as_str()
+            } else if !target.is_empty() {
+                target
+            } else {
+                state.bind_host.as_str()
+            };
+            if !crate::auth_token::is_loopback_bind_host(affected_host) {
+                return json_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "non-loopback remote access requires an access token",
+                )
+                .into_response();
+            }
         }
     }
     if body.apply_launch {
+        let should_restart = body.restart;
+        let old_port = state.bind_port;
+        let restart_host = body.host.trim().to_string();
+        let restart_port = body.port;
+        let no_token = body.no_token;
         return match apply_launch_settings(&state, &body) {
-            Ok(status) => Json(status).into_response(),
+            Ok(status) => {
+                if should_restart {
+                    let effective_token = status.token.clone().or_else(|| {
+                        let t = body.token.trim();
+                        (!t.is_empty()).then(|| t.to_string())
+                    });
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        if let Ok(exe) = zap_updater::current_exe_path() {
+                            let _ = zap_updater::restart_process_with_config(
+                                &exe,
+                                old_port,
+                                if restart_host.is_empty() {
+                                    None
+                                } else {
+                                    Some(&restart_host)
+                                },
+                                restart_port,
+                                effective_token.as_deref(),
+                                Some(no_token),
+                            );
+                        }
+                    });
+                }
+                Json(status).into_response()
+            }
             Err(err) => json_error(axum::http::StatusCode::BAD_REQUEST, err).into_response(),
         };
     }
@@ -1232,6 +1355,289 @@ pub(crate) async fn post_remote_access(
     Json(with_firewall(remote_status(&state, minted)).await).into_response()
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ZombieProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub path: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LegacyStatusResponse {
+    pub has_legacy_files: bool,
+    pub legacy_files: Vec<String>,
+    pub has_dirty_path: bool,
+    pub zombie_count: usize,
+    pub zombies: Vec<ZombieProcessInfo>,
+    pub needs_migration: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MigrateLegacyRequest {
+    #[serde(default)]
+    pub kill_zombies: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MigrateLegacyResponse {
+    pub success: bool,
+    pub cleaned_files_count: usize,
+    pub killed_zombies_count: usize,
+}
+
+pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let my_pid = sysinfo::get_current_pid().ok().map(|p| p.as_u32());
+    let mut out = Vec::new();
+
+    // 收集所有当前活跃的桌面壳 PID (jeikcode-desktop)
+    let mut active_desktop_pids = std::collections::HashSet::new();
+    for (pid, proc_) in sys.processes() {
+        let name = proc_.name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("desktop") || name.contains("tauri") {
+            active_desktop_pids.insert(pid.as_u32());
+        }
+    }
+
+    for (pid, proc_) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        if Some(pid_u32) == my_pid {
+            continue;
+        }
+        let name = proc_.name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("desktop") || name.contains("tauri") {
+            continue;
+        }
+
+        let is_jeik_family = name.starts_with("jeikcode") || name.starts_with("atomcode");
+        if !is_jeik_family {
+            continue;
+        }
+
+        let exe_path_str = proc_
+            .exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let exe_path_lower = exe_path_str.to_ascii_lowercase();
+
+        // 1. 判定是否为老旧 Dropper 目录残存
+        let is_legacy_path = exe_path_lower.contains(".local\\bin")
+            || exe_path_lower.contains(".local/bin")
+            || exe_path_lower.contains("atomcode");
+
+        // 2. 检查环境变量是否包含 JEIKCODE_DESKTOP=1
+        let is_desktop_env = proc_.environ().iter().any(|env_str| {
+            let s = env_str.to_string_lossy();
+            s.starts_with("JEIKCODE_DESKTOP=")
+                || s.starts_with("JEIKCODE_DESKTOP_CLI_BIN=")
+                || s.starts_with("JEIKCODE_DESKTOP_PID=")
+        });
+
+        let declared_desktop_pid = proc_.environ().iter().find_map(|env_str| {
+            let s = env_str.to_string_lossy();
+            s.strip_prefix("JEIKCODE_DESKTOP_PID=")
+                .and_then(|val| val.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 0)
+        });
+
+        // 3. 检查父进程与绑定的桌面壳状态
+        let parent_pid = proc_.parent().map(|p| p.as_u32());
+        let desktop_owner_alive = parent_pid
+            .is_some_and(|ppid| active_desktop_pids.contains(&ppid))
+            || declared_desktop_pid.is_some_and(|dpid| active_desktop_pids.contains(&dpid));
+
+        // 判定准则（严格保护普通终端/开发/TUI 实例）：
+        // - 如果是运行在旧目录 .local\bin 下的实例 -> 100% 历史遗留僵尸
+        // - 如果原本是桌面端子进程 (is_desktop_env)，但绑定的父级桌面壳已不再存活 -> 100% 孤儿僵尸
+        let mut zombie_reason = None;
+        if is_legacy_path {
+            zombie_reason = Some("旧版 ~/.local/bin 遗留运行实例".to_string());
+        } else if is_desktop_env && !desktop_owner_alive {
+            zombie_reason = Some("父级桌面壳已退出，脱离托管的孤儿子进程".to_string());
+        }
+
+        if let Some(reason) = zombie_reason {
+            out.push(ZombieProcessInfo {
+                pid: pid_u32,
+                name: name.clone(),
+                path: if exe_path_str.is_empty() {
+                    None
+                } else {
+                    Some(exe_path_str)
+                },
+                reason,
+            });
+        }
+    }
+    out
+}
+
+pub fn kill_zombie_processes_all() -> usize {
+    let zombies = scan_zombie_processes();
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let mut killed = 0;
+    for z in zombies {
+        if let Some(proc_) = sys.process(Pid::from_u32(z.pid)) {
+            if proc_.kill() {
+                killed += 1;
+            }
+        }
+    }
+    killed
+}
+
+pub(crate) async fn get_legacy_status() -> impl IntoResponse {
+    let mut legacy_files = Vec::new();
+    let current_exe = std::env::current_exe().ok();
+    if let Some(home) = zap_config::util::real_home_dir() {
+        let local_bin = home.join(".local").join("bin");
+        if let Ok(entries) = std::fs::read_dir(&local_bin) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let is_current = current_exe.as_ref().map_or(false, |c| c == &path);
+                    if (name.starts_with("jeikcode") || name.starts_with("atomcode")) && !is_current
+                    {
+                        legacy_files.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut has_dirty_path = false;
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
+            let path_val: String = env.get_value("Path").unwrap_or_default();
+            for item in path_val.split(';') {
+                let lower = item.trim().to_ascii_lowercase();
+                if lower.contains(".local\\bin")
+                    || lower.contains(".local/bin")
+                    || lower.contains("atomcode")
+                {
+                    has_dirty_path = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let zombies = scan_zombie_processes();
+    let zombie_count = zombies.len();
+    let has_legacy_files = !legacy_files.is_empty();
+    let needs_migration = has_legacy_files || has_dirty_path || zombie_count > 0;
+
+    Json(LegacyStatusResponse {
+        has_legacy_files,
+        legacy_files,
+        has_dirty_path,
+        zombie_count,
+        zombies,
+        needs_migration,
+    })
+}
+
+pub(crate) async fn post_migrate_legacy(
+    Json(payload): Json<MigrateLegacyRequest>,
+) -> impl IntoResponse {
+    let mut cleaned_files_count = 0;
+    let current_exe = std::env::current_exe().ok();
+    if let Some(ref running) = current_exe {
+        if let Some(home) = zap_config::util::real_home_dir() {
+            let local_bin = home.join(".local").join("bin");
+            if let Ok(entries) = std::fs::read_dir(&local_bin) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if (name.starts_with("jeikcode") || name.starts_with("atomcode"))
+                            && running != &path
+                        {
+                            if std::fs::remove_file(&path).is_ok() {
+                                cleaned_files_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&local_bin);
+        }
+    }
+
+    zap_updater::migrate_legacy_environment();
+
+    let mut killed_zombies_count = 0;
+    if payload.kill_zombies {
+        killed_zombies_count = kill_zombie_processes_all();
+    }
+
+    Json(MigrateLegacyResponse {
+        success: true,
+        cleaned_files_count,
+        killed_zombies_count,
+    })
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DesktopSettingsPayload {
+    #[serde(default)]
+    pub close_action: String,
+}
+
+fn desktop_settings_file_path() -> std::path::PathBuf {
+    zap_config::config::Config::config_dir().join("desktop-settings.json")
+}
+
+pub(crate) async fn get_desktop_settings() -> impl IntoResponse {
+    let path = desktop_settings_file_path();
+    let text = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
+    let mut payload =
+        serde_json::from_str::<DesktopSettingsPayload>(&text).unwrap_or(DesktopSettingsPayload {
+            close_action: "ask".into(),
+        });
+    if payload.close_action.is_empty() {
+        payload.close_action = "ask".into();
+    }
+    Json(payload)
+}
+
+pub(crate) async fn post_desktop_settings(
+    Json(payload): Json<DesktopSettingsPayload>,
+) -> impl IntoResponse {
+    let path = desktop_settings_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::to_string_pretty(&payload).unwrap_or_default();
+    let _ = std::fs::write(path, body);
+    Json(serde_json::json!({ "success": true }))
+}
+
 /// POST /config/reload - Reloads config.toml from disk, remounts MCP/skills on
 /// the live runtime, and returns the sanitized config view.
 pub(crate) async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
@@ -1241,7 +1647,7 @@ pub(crate) async fn reload_config(State(state): State<AppState>) -> impl IntoRes
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     };
-    let _ = crate::reload_mcp_and_live_runtime(&state).await;
+    let _ = crate::reload_mcp_and_live_runtime(&state, true, None).await;
     crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
     Json(config_response(&config)).into_response()
 }
@@ -1267,7 +1673,7 @@ mod tests {
             assert_eq!(i18n::current_locale(), locale);
         }
         let before = std::fs::read(store.path()).unwrap();
-        for invalid in ["fr", "vi-VN-extra", "", "vi_US"] {
+        for invalid in ["invalid_lang", "vi-VN-extra", "", "vi_US"] {
             assert!(super::parse_language(invalid).is_err());
             assert_eq!(std::fs::read(store.path()).unwrap(), before);
             assert_eq!(i18n::current_locale(), Locale::ZhCn);
@@ -1507,6 +1913,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), apply)
@@ -1532,6 +1939,7 @@ mod tests {
                 no_token: false,
                 stop: true,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), stop)
@@ -1563,6 +1971,7 @@ mod tests {
                 no_token: true,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         )
         .await
@@ -1605,6 +2014,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), different_port)
@@ -1627,6 +2037,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: false,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), same_port)
@@ -1645,6 +2056,7 @@ mod tests {
         let mut state = crate::tests::chat_test_state(&home);
         state.bind_host = "0.0.0.0".into();
         state.bind_port = 13457;
+        state.initial_enforce_token = true;
         state.webui_tokens.register("old-token");
         state.webui_tokens.set_display("old-token");
         state
@@ -1660,6 +2072,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: true,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), same_port)
@@ -1683,6 +2096,7 @@ mod tests {
                 no_token: false,
                 stop: false,
                 apply_launch: true,
+                restart: false,
             }),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), next_port)
@@ -1703,6 +2117,7 @@ mod tests {
                 no_token: true,
                 stop: false,
                 apply_launch: true,
+                restart: false,
             }),
         );
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), open_now)

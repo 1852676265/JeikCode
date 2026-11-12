@@ -84,7 +84,7 @@ fn build_coding_agent_from_tools(
 ) -> Agent {
     let summary_provider = provider.clone(); // tier-2 overflow summary uses the same provider
                                              // Single source of truth for the todo switch (`JEIKCODE_TODO` env overrides the
-                                             // default-on config). Used for BOTH the persona usage-guidance section AND the
+                                             // default-on config). Used for BOTH the `<todo_rules>` persona block AND the
                                              // TodoHook below, so the system prompt never tells the model to use `todowrite`
                                              // when the tool + hook aren't mounted (and vice-versa). The `todowrite` TOOL
                                              // itself is registered on the same env gate in `zap-capabilities`.
@@ -230,7 +230,7 @@ fn base_coding_tools(
 }
 
 /// Lifecycle hook that dynamically reconciles Block 1 (<environment>) and Block 2
-/// (<workflow_and_execution_discipline>) into Conversation system messages on each turn
+/// (<system_rules>) into Conversation system messages on each turn
 /// based on mtime of init.yaml and rules.yaml.
 pub(crate) struct CodingPersonaHook {
     model: String,
@@ -291,9 +291,7 @@ impl CodingPersonaHook {
             .enumerate()
             .take_while(|(_, m)| m.role == Role::System)
             .find(|(_, m)| {
-                m.text.starts_with("<environment>")
-                    || m.text.starts_with("You are Zap")
-                    || m.text.starts_with("You are JeikCode")
+                m.text.starts_with("<environment>") || m.text.starts_with("You are JeikCode")
             })
             .map(|(i, _)| i);
 
@@ -311,7 +309,8 @@ impl CodingPersonaHook {
             .enumerate()
             .take_while(|(_, m)| m.role == Role::System)
             .find(|(_, m)| {
-                m.text.starts_with("<workflow_and_execution_discipline>")
+                m.text.starts_with("<system_rules>")
+                    || m.text.starts_with("<workflow_and_execution_discipline>")
                     || m.text.contains("CRITICAL PRECEDENCE")
             })
             .map(|(i, _)| i);
@@ -321,24 +320,16 @@ impl CodingPersonaHook {
                 convo.messages[idx] = Message::system(block_2);
             }
         } else {
-            convo.reconcile_system_block("<workflow_and_execution_discipline>", Some(block_2));
+            convo.reconcile_system_block("<system_rules>", Some(block_2));
         }
 
-        let existing_b3 = convo
-            .messages
-            .iter()
-            .enumerate()
-            .take_while(|(_, m)| m.role == Role::System)
-            .find(|(_, m)| m.text.starts_with("<todo_rules>"))
-            .map(|(i, _)| i);
-
-        if let Some(idx) = existing_b3 {
-            if convo.messages[idx].text != block_3 {
-                convo.messages[idx] = Message::system(block_3);
-            }
-        } else {
-            convo.reconcile_system_block("<todo_rules>", Some(block_3));
-        }
+        // Block 3 (`<todo_rules>`) is temporarily disabled in `persona.rs`, so the block
+        // arrives empty. Pass `None` instead of `Some("")` — the latter would insert an
+        // empty system message — and drop any block left by a resumed conversation.
+        convo.reconcile_system_block(
+            "<todo_rules>",
+            (!block_3.trim().is_empty()).then_some(block_3),
+        );
 
         let existing_b4 = convo
             .messages

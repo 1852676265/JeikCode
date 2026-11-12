@@ -45,19 +45,15 @@ pub struct CatalogEntry {
     /// don't carry one (always `None`); the core twin passes it through.
     pub hint: Option<String>,
     pub description: String,
-    /// Absolute skill directory (directory-style skills only). Surfaced so the
-    /// model never has to `find` the skill root after reading the catalog —
-    /// mirrors Grok's `<agent_skill path>` / OpenCode `<location>`.
-    pub location: Option<String>,
     pub source_rank: u8,
 }
 
 /// Source-priority tier from a skill's `source_path`. Curated, product-native
 /// dirs survive a budget squeeze over community bulk. Kept as approved:
-/// `.zap` > `.claude` > `.agents` > everything else.
+/// `.jeikcode` > `.claude` > `.agents` > everything else.
 pub fn source_rank(path: &Path) -> u8 {
     let s = path.to_string_lossy();
-    if s.contains(".zap") {
+    if s.contains(".jeikcode") {
         0
     } else if s.contains(".claude") {
         1
@@ -76,19 +72,6 @@ fn truncate_desc(desc: &str) -> String {
     }
     let cut: String = desc.chars().take(PER_SKILL_DESC_CAP).collect();
     format!("{cut}…")
-}
-
-/// Compact an absolute skill path for the catalog: keep the last two segments
-/// (e.g. `multi-db-executor` or `skills/multi-db-executor`) so many skills fit
-/// the budget. Full absolute path is always in the use_skill envelope.
-fn short_location(path: &str) -> String {
-    let norm = path.replace('\\', "/");
-    let parts: Vec<&str> = norm.split('/').filter(|p| !p.is_empty()).collect();
-    match parts.as_slice() {
-        [] => norm,
-        [one] => (*one).to_string(),
-        [.., a, b] => format!("{a}/{b}"),
-    }
 }
 
 /// Render the full `=== AVAILABLE SKILLS ===` section, or `None` when there are
@@ -117,21 +100,10 @@ pub fn render_skill_catalog(entries: &[CatalogEntry]) -> Option<String> {
             .as_deref()
             .map(|h| format!(" {h}"))
             .unwrap_or_default();
-        // Prefer a short location suffix (last two path segments) so the budget
-        // still fits many skills; full path is still returned by use_skill.
-        let loc = e
-            .location
-            .as_deref()
-            .map(short_location)
-            .map(|l| format!(" @ {l}"))
-            .unwrap_or_default();
-        let line = format!(
-            "- {}{}{}: {}",
-            e.name,
-            hint,
-            loc,
-            truncate_desc(&e.description)
-        );
+        // The catalog stays name + description only. The absolute skill and
+        // guide paths are returned by `use_skill`, so no location suffix is
+        // needed here (it also keeps the prompt budget for real descriptions).
+        let line = format!("- {}{}: {}", e.name, hint, truncate_desc(&e.description));
         let cost = line.len() + 1; // + newline
                                    // Always emit at least the top-ranked skill even if it alone is huge.
         if lines.is_empty() || body_bytes + cost <= CATALOG_BYTE_BUDGET {
@@ -168,17 +140,6 @@ mod tests {
             name: name.into(),
             hint: None,
             description: desc.into(),
-            location: None,
-            source_rank: rank,
-        }
-    }
-
-    fn entry_with_loc(name: &str, desc: &str, loc: &str, rank: u8) -> CatalogEntry {
-        CatalogEntry {
-            name: name.into(),
-            hint: None,
-            description: desc.into(),
-            location: Some(loc.into()),
             source_rank: rank,
         }
     }
@@ -191,7 +152,7 @@ mod tests {
     #[test]
     fn source_rank_tiers() {
         assert_eq!(
-            source_rank(&PathBuf::from("/home/u/.zap/skills/x/SKILL.md")),
+            source_rank(&PathBuf::from("/home/u/.jeikcode/skills/x/SKILL.md")),
             0
         );
         assert_eq!(
@@ -220,6 +181,7 @@ mod tests {
         );
         assert!(out.contains("- brainstorming: before creative work"));
         assert!(out.contains("- seo: search stuff"));
+        assert!(!out.contains(" @ "), "no location suffix: {out}");
         assert!(
             !out.contains("not shown"),
             "no omission under budget: {out}"
@@ -284,34 +246,6 @@ mod tests {
             out.contains("- solo: "),
             "top-ranked always emitted:\n{}",
             &out[..80.min(out.len())]
-        );
-    }
-
-    #[test]
-    fn catalog_includes_short_location_for_directory_skills() {
-        let out = render_skill_catalog(&[entry_with_loc(
-            "multi-db-executor",
-            "连接数据库",
-            "/root/.zap/skills/multi-db-executor",
-            0,
-        )])
-        .unwrap();
-        assert!(
-            out.contains("@ skills/multi-db-executor") || out.contains("@ multi-db-executor"),
-            "catalog must surface skill location: {out}"
-        );
-        assert!(out.contains("连接数据库"), "{out}");
-    }
-
-    #[test]
-    fn short_location_keeps_last_two_segments() {
-        assert_eq!(
-            short_location("/root/.zap/skills/multi-db-executor"),
-            "skills/multi-db-executor"
-        );
-        assert_eq!(
-            short_location("C:\\Users\\a\\.zap\\skills\\x"),
-            "skills/x"
         );
     }
 }

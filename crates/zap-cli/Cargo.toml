@@ -2,19 +2,16 @@
 name = "zap"
 version.workspace = true
 edition.workspace = true
-description = "Zap"
-default-run = "zap"
+default-run = "jeikcode"
 
 [[bin]]
 name = "zap"
 path = "src/main.rs"
 
-[[bin]]
-name = "jeikcode"
-path = "src/main.rs"
-
 # Thin lib target so integration tests (and the bin) can reach testable
-# modules like `uninstall`.
+# modules like `uninstall` (moved here from jeikcode-core). A bin-only crate
+# exposes no API to `tests/`, which is why the uninstall manifest used to
+# live in core just to be reachable from script_parity.rs.
 [lib]
 name = "zap"
 path = "src/lib.rs"
@@ -35,7 +32,7 @@ zap-updater = { path = "../zap-updater" }
 zap-tuix = { path = "../zap-tuix" }
 zap-telemetry = { path = "../zap-telemetry" }
 zap-daemon = { path = "../zap-daemon" }
-# ACP (Agent Client Protocol) stdio server — the `zap acp` subcommand's engine
+# ACP (Agent Client Protocol) stdio server — the `jeikcode acp` subcommand's engine
 # lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
 # uses (kernel + coding + capabilities) + the protocol SDK. capabilities is all-platform
 # here (acp is cross-platform); it also covers the unix-only `::askpass` helper below.

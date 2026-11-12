@@ -102,6 +102,7 @@ pub enum SessionViewEvent {
         count: usize,
         inputs: Vec<zap_kernel::event::SteeredInput>,
         client_input_ids: Vec<Option<String>>,
+        anchor_message_id: Option<String>,
     },
     CommandOutput(String),
     RequestResolved {
@@ -473,7 +474,19 @@ impl SessionRuntimeRegistry {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .filter(|e| e.handle.is_some() && e.meta.activity.is_live_turn())
+            .filter(|e| {
+                if let Some(handle) = e.handle.as_ref() {
+                    !handle.is_stopped()
+                        && matches!(
+                            handle.status().phase,
+                            crate::runtime::RuntimePhase::InTurn
+                                | crate::runtime::RuntimePhase::WaitingApproval
+                        )
+                        && e.meta.activity.is_live_turn()
+                } else {
+                    false
+                }
+            })
             .map(|e| e.meta.session_id.clone())
             .collect()
     }

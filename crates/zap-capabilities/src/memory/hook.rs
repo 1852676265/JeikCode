@@ -35,8 +35,8 @@ pub struct MemoryHook {
 }
 
 impl MemoryHook {
-    /// The standard wiring: the global `$ZAP_HOME/memory.md` + the project's
-    /// `<root>/.zap/memory.md`, labeled with the root's directory name (the
+    /// The standard wiring: the global `$JEIKCODE_HOME/memory.md` + the project's
+    /// `<root>/.jeikcode/memory.md`, labeled with the root's directory name (the
     /// literal `"project"` when the root has none — e.g. `/` — same as production).
     pub fn for_project(project_root: &Path) -> Self {
         let project_name = project_root
@@ -91,7 +91,7 @@ mod tests {
 
     fn stores(dir: &Path, global: &str, project: &str) -> (MemoryStore, MemoryStore) {
         let g = MemoryStore::new(dir.join("memory.md"));
-        let p = MemoryStore::new(dir.join("proj").join(".zap").join("memory.md"));
+        let p = MemoryStore::new(dir.join("proj").join(".jeikcode").join("memory.md"));
         if !global.is_empty() {
             g.append(global).unwrap();
         }

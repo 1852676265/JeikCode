@@ -104,6 +104,13 @@ async fn start_native_runtime_with_session_bootstrap(
                             let _ = manager.rename(&id, title);
                         }
                     }
+                    // Pin the immutable protocol key even when the display name
+                    // was already correct (legacy sessions predate this field).
+                    let _ = manager.update_meta(&id, |meta| {
+                        if meta.protocol_key.is_none() {
+                            meta.protocol_key = Some(title.to_string());
+                        }
+                    });
                 }
             } else {
                 let now = zap_capabilities::session::now_ms();
@@ -123,6 +130,7 @@ async fn start_native_runtime_with_session_bootstrap(
                 {
                     meta.name = title.to_string();
                     meta.user_renamed = true;
+                    meta.protocol_key = Some(title.to_string());
                     meta.origin = zap_capabilities::session::SessionOrigin::Protocol;
                 }
                 meta.message_count = u32::try_from(snapshot.messages.len()).map_err(|_| {
@@ -508,6 +516,7 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::Release);
             (
                 zap_coding::UserInput {
+                    id: None,
                     text: format!("recognized: {text}"),
                     images: Vec::new(),
                 },
@@ -610,6 +619,7 @@ mod tests {
         control_tx
             .send(zap_coding::DriverCommand::Submit(
                 zap_coding::UserInput {
+                    id: None,
                     text: "inspect".into(),
                     images: vec![zap_coding::ImageContent {
                         media_type: "image/png".into(),

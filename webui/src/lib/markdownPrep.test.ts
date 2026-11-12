@@ -3,8 +3,12 @@ import { test } from 'node:test';
 import { marked } from 'marked';
 import {
   buildTableDelimiter,
+  fenceOpen,
+  isLanguageLikeInfo,
   isTableDelimiterLine,
+  normalizeBreakTags,
   preprocessMarkdown,
+  promoteNestedCodeFences,
   splitTableCells,
   stripLanguageSentinel,
 } from './markdownPrep.ts';
@@ -91,6 +95,29 @@ test('fullwidth pipes are normalized into a table', () => {
   assert.match(out, /<table>/);
   assert.match(out, /<th>左<\/th>/);
   assert.match(out, /<td>a<\/td>/);
+});
+
+test('normalizeBreakTags repairs html entity, escaped, and fullwidth br tags outside code', () => {
+  const line = '| A | &lt;br&gt; | \\<br> | ＜br＞ | `<br>` |';
+  assert.equal(normalizeBreakTags(line), '| A | <br> | <br> | <br> | `<br>` |');
+});
+
+test('table with escaped and entity br variants renders with proper html line breaks', () => {
+  const markdown = [
+    '| 账号 | 状态 |',
+    '|---|---|',
+    '| ULTRA | ❌ 没有徽章&lt;br&gt;❌ 没有配额条\\<br>❌ 报错 503 |',
+  ].join('\n');
+  const out = html(markdown);
+  assert.match(out, /<table>/);
+  assert.match(out, /<td>❌ 没有徽章<br>❌ 没有配额条<br>❌ 报错 503<\/td>/);
+});
+
+test('breaks inside bold or cjk punctuation emphasis spans survive without html entity corruption', () => {
+  const markdown = '（**“第一项”<br>“第二项”**）';
+  const out = html(markdown);
+  assert.match(out, /<br>/);
+  assert.doesNotMatch(out, /&lt;br&gt;/);
 });
 
 test('tables inside fenced code are not rewritten', () => {
@@ -427,6 +454,163 @@ test('nested lists with 4-space indent preserve hierarchy and are not stripped',
   assert.match(out, /二级步骤 2[\s\S]*?<ul>[\s\S]*?三级说明点 2\.1/);
 });
 
+test('ordered list continuing after code block and paragraph parses as distinct items', () => {
+  const md = [
+    '源码铁证：',
+    '1. **配置归属**：',
+    '   在 `crates/jeikcode-config/src/config/mod.rs` 与各默认配置中：',
+    '   ```toml',
+    '   [mcp.session]',
+    '   idle_ttl_secs = 600',
+    '   ```',
+    '   该配置属于 `[mcp.session]` 子表，而不是全局或 project 配置。',
+    '2. **Reaper 守护线程范围**：',
+    '   在 `crates/jeikcode-capabilities/src/mcp/session_pool.rs` 中。',
+    '3. **`ProjectMcpPool` 完全没有闲置回收程**：',
+    '   在 `crates/jeikcode-capabilities/src/mcp/pool.rs` 中。',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+
+  // 确保 2. 和 3. 被成功解析为列表项 li，而不是被合并在 p 内部
+  assert.match(out, /<li[^>]*>[\s\S]*?Reaper 守护线程范围/);
+  assert.match(out, /<li[^>]*>[\s\S]*?ProjectMcpPool/);
+});
+
+test('cleanRedactedThinkingBlocks collapses raw encrypted thinking blocks into details', () => {
+  const textWithEnglish = '[Redacted Thinking: EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+]\n\nHello world';
+  const out1 = preprocessMarkdown(textWithEnglish);
+  assert.match(out1, /<details class="redacted-thinking-box notranslate" translate="no">/);
+  assert.match(out1, /Hello world/);
+
+  const textWithChinese = '[已遮挡思考：EoMCCpEBAWkUfRPz9IZ4N1V3yQ73tqP8z2BskF2Qz82N5f0Y4e5q7z0f9qQz/g8w2k7E4w1+】\n\n用户提供的反馈表明...';
+  const out2 = preprocessMarkdown(textWithChinese);
+  assert.match(out2, /<details class="redacted-thinking-box notranslate" translate="no">/);
+  assert.match(out2, /用户提供的反馈表明/);
+});
+
+test('isLanguageLikeInfo accepts language tags (incl. comma options) and rejects prose tokens', () => {
+  for (const ok of [
+    'rust',
+    'diff',
+    'json',
+    'c++',
+    'c#',
+    'mermaid-streaming',
+    'toml',
+    'bash',
+    'markdown',
+    // Comma-separated options survive `fenceOpen`'s first-token split → must be accepted,
+    // otherwise a genuine nested ```rust,no_run fence is not promoted and the fences desync.
+    'rust,no_run',
+    'python,linenums',
+  ]) {
+    assert.equal(isLanguageLikeInfo(ok), true, `expected language-like: ${ok}`);
+  }
+  for (const bad of ['', '+', '这是示例', '标签', '...', '1.2']) {
+    assert.equal(isLanguageLikeInfo(bad), false, `expected non-language token: ${bad}`);
+  }
+});
+
+test('fenceOpen reduces info strings to the first token that isLanguageLikeInfo judges', () => {
+  // Production passes `fenceOpen(line).lang` — the FIRST whitespace-delimited token, not the
+  // whole multi-word info string. Pin that contract so these unit tests cannot silently drift
+  // away from the real call sites in findMatchingFenceClose / promoteNestedCodeFences.
+  assert.equal(fenceOpen('```rust,no_run')?.lang, 'rust,no_run');
+  assert.equal(isLanguageLikeInfo(fenceOpen('```rust,no_run')?.lang), true);
+  assert.equal(fenceOpen('```js title="x"')?.lang, 'js');
+  assert.equal(isLanguageLikeInfo(fenceOpen('```js title="x"')?.lang), true);
+  // The historical prose line: first token is `+` → rejected even though the tail is prose.
+  assert.equal(fenceOpen('``` + 【执行铁律】(禁 checkout)')?.lang, '+');
+  assert.equal(isLanguageLikeInfo(fenceOpen('``` + 【执行铁律】(禁 checkout)')?.lang), false);
+});
+
+test('a genuine nested fence whose info carries comma options (```rust,no_run) is still promoted', () => {
+  const md = ['```markdown', '# title', '```rust,no_run', 'fn main() {}', '```', '```'].join('\n');
+  const promoted = promoteNestedCodeFences(md);
+  assert.match(promoted, /^````markdown$/m); // outer promoted to 4 backticks
+  assert.match(promoted, /^````$/m); // outer close promoted in lockstep
+  assert.match(promoted, /^```rust,no_run$/m); // inner kept as-is
+});
+
+test('prose line starting with ``` inside a fence is not mistaken for a nested sub-fence (no desync)', () => {
+  // 复刻历史失真原文：外层 3 反引号，正文里出现 ` ``` + 【执行铁律】… `，后面还有一个同级代码块
+  const md = [
+    '**① 用户轮消息** — `formatted_comment_instruction`：',
+    '',
+    '```',
+    '【来源事件】：Issue #64 (...)',
+    '【评论内容】：',
+    '``` + 【执行铁律】(禁 checkout / 遵守 System Prompt / 非 OWNER 回 0)',
+    '```',
+    '',
+    '**② 动态 System Prompt 前缀**',
+    '```',
+    '评论双语输出规范：',
+    '```',
+    '',
+  ].join('\n');
+
+  // 预处理器绝不能把外层围栏提升到 4 个反引号（那会与真实闭合行错位）
+  const prepared = preprocessMarkdown(md);
+  assert.doesNotMatch(prepared, /````/);
+
+  const out = markdownToHtml(md);
+  // ① 的围栏代码块必须完整包含那行散文内容（注意避开行内 <code>）
+  const firstBlock = out.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/)?.[1] ?? '';
+  assert.match(firstBlock, /【来源事件】/);
+  assert.match(firstBlock, /``` \+ 【执行铁律】/);
+  // ② 的标题必须作为正常正文加粗渲染，绝不能被吞进代码块
+  assert.match(out, /<strong>② 动态 System Prompt 前缀<\/strong>/);
+  const codes = out.match(/<code[\s\S]*?<\/code>/g) ?? [];
+  for (const block of codes) assert.doesNotMatch(block, /② 动态 System Prompt/);
+});
+
+test('correctly authored 4-backtick outer fence is left intact and not over-promoted', () => {
+  const md = ['````', 'outer content', '``` + prose that looks like a fence', '````'].join('\n');
+  const prepared = preprocessMarkdown(md);
+  assert.doesNotMatch(prepared, /`````/); // 不得被提升到 5 反引号
+  const out = markdownToHtml(md);
+  const code = out.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/)?.[1] ?? '';
+  assert.match(code, /``` \+ prose that looks like a fence/);
+});
+
+test('genuine nested language-tagged fence is still promoted (regression guard)', () => {
+  const md = ['```markdown', '# title', '```bash', 'echo hi', '```', '```'].join('\n');
+  const promoted = promoteNestedCodeFences(md);
+  assert.match(promoted, /^````markdown$/m); // 外层被提升到 4 反引号
+  assert.match(promoted, /^````$/m);        // 外层闭合同步提升
+  assert.match(promoted, /^```bash$/m);     // 内层语言标签围栏保持不变
+});
+
+test('indented code block with nested code fences under list item is not sliced by gluedFence into stray backticks', () => {
+  const sample = [
+    '3. **代码块 100% 深度豁免验证**：',
+    '   - 输入包含代码块：',
+    '     ```python',
+    '     Instructions from OpenAI:',
+    '     ```python',
+    '     import openai',
+    '     from anthropic import Anthropic',
+    '     # Supported by Tencent and Huawei',
+    '     client = openai.OpenAI()',
+    '     ```',
+    '     End of instructions.',
+    '     ```',
+    '   - 结果：代码块外部的说明性文本 `Instructions from OpenAI:` 被准确清洗替换为...',
+  ].join('\n');
+
+  const out = markdownToHtml(sample);
+  // 1. 外部 4 围栏不应被错误拆分为单个反引号
+  assert.doesNotMatch(out, /输入包含代码块：\s*`/);
+  assert.doesNotMatch(out, /End of instructions\.\s*`/);
+  // 2. 整个代码块应完整包裹，后续列表项不应被错误吞进代码块
+  assert.match(out, /<div class="code-block-wrapper has-language">/);
+  assert.match(out, /<code class="language-python">/);
+  assert.match(out, /Instructions from OpenAI:/);
+  assert.match(out, /client = openai\.OpenAI\(\)/);
+  assert.match(out, /<li>结果：代码块外部的说明性文本/);
+});
 
 
 

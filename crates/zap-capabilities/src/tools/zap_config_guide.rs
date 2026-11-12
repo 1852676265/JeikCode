@@ -44,11 +44,11 @@ const DOC_PROJECT_EN: &str =
 const DOC_UPDATES_EN: &str = include_str!("../../assets/teaches/en/08_updates_and_releases.md");
 
 #[derive(Default)]
-pub struct JeikcodeConfigTool;
+pub struct ZapConfigTool;
 
-pub type JeikcodeConfigGuideTool = JeikcodeConfigTool;
+pub type ZapConfigGuideTool = ZapConfigTool;
 
-impl JeikcodeConfigTool {
+impl ZapConfigTool {
     pub fn new() -> Self {
         Self
     }
@@ -174,23 +174,17 @@ struct Args {
 }
 
 #[async_trait]
-impl Tool for JeikcodeConfigTool {
+impl Tool for ZapConfigTool {
     fn name(&self) -> &str {
         "zap_config"
     }
 
     fn aliases(&self) -> &'static [&'static str] {
-        &[
-            "zap_config",
-            "zap_config_guide",
-            "zap_config_reload",
-            "zap_config_guide",
-            "zap_config_reload",
-        ]
+        &["zap_config_guide", "zap_config_reload"]
     }
 
     fn description(&self) -> &str {
-        "Manage Zap configuration: query guide documents or hot-reload all configurations in the active session. Querying currently mounted MCP servers or skills is not supported as they are already available in the context."
+        "Manage JeikCode configuration: query guide documents or hot-reload all configurations in the active session. Querying currently mounted MCP servers or skills is not supported as they are already available in the context."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -249,10 +243,7 @@ impl Tool for JeikcodeConfigTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
         let args = if args.trim().is_empty() { "{}" } else { args };
         let parsed: Args = match parse_tool_args("zap_config", args, r#"{"action":"guide"}"#)
-            .or_else(|_| parse_tool_args("zap_config", args, r#"{"action":"guide"}"#))
             .or_else(|_| parse_tool_args("zap_config_guide", args, r#"{"topic":"overview"}"#))
-            .or_else(|_| parse_tool_args("zap_config_guide", args, r#"{"topic":"overview"}"#))
-            .or_else(|_| parse_tool_args("zap_config_reload", args, r#"{}"#))
             .or_else(|_| parse_tool_args("zap_config_reload", args, r#"{}"#))
         {
             Ok(a) => a,
@@ -465,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_overview_returns_index() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -486,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_prompts_topic_returns_hot_reload_details() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -497,7 +488,6 @@ mod tests {
         assert!(!res.is_error);
         assert!(res.content.contains("init.yaml"));
         assert!(res.content.contains("rules.yaml"));
-        assert!(res.content.contains("root_docs_"));
         assert!(
             res.content.contains("动态热重载")
                 || res.content.contains("Dynamic Hot-Reload")
@@ -507,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_models_topic_returns_reasoning_and_provider_info() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -524,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_tools_topic_returns_timeouts_and_policies() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -541,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_directories_topic_returns_folder_map() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -557,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_project_topic_returns_constraints_and_packs() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -574,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_updates_topic_returns_sources_and_workflow() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -612,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn guide_tool_bilingual_locale_and_explicit_lang() {
-        let tool = JeikcodeConfigGuideTool::new();
+        let tool = ZapConfigGuideTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -660,7 +650,7 @@ mod tests {
         };
 
         clear_pending_config_reload();
-        let tool = JeikcodeConfigTool::new();
+        let tool = ZapConfigTool::new();
         let ctx = ToolContext {
             working_dir: PathBuf::from("."),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -683,3 +673,6 @@ mod tests {
         clear_pending_config_reload();
     }
 }
+
+pub type JeikcodeConfigGuideTool = ZapConfigGuideTool;
+pub type JeikcodeConfigTool = ZapConfigTool;

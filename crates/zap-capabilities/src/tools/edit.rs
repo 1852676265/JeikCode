@@ -23,12 +23,24 @@ use async_trait::async_trait;
 use zap_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
+use std::time::Duration;
+use tokio::sync::OwnedMutexGuard;
 
 pub struct EditFileTool;
 
 #[derive(Deserialize)]
 struct Args {
-    #[serde(alias = "file_path", alias = "target_file", alias = "filePath")]
+    #[serde(
+        alias = "file_path",
+        alias = "target_file",
+        alias = "filePath",
+        alias = "filename"
+    )]
     path: String,
     #[serde(
         default,
@@ -107,7 +119,11 @@ impl Tool for EditFileTool {
     }
     fn always_grant_scope(&self, _args: &str) -> String {
         // Tool-wide: "总是 / Always" approves every edit this session (v1 parity),
-        // not just this one exact file/old/new triple.
+        // not just this one exact file/old/new triple. NOTE: this is only the
+        // fallback for the generic ApprovalMiddleware; the coding assembly
+        // registers WriteApprovalGate FIRST (assemble.rs), which scopes
+        // out-of-workspace edits per canonical directory and always re-prompts
+        // for sensitive targets.
         String::new()
     }
     fn coalesce_group_key(&self, args: &str) -> Option<String> {
@@ -117,7 +133,6 @@ impl Tool for EditFileTool {
         crate::tools::repair::merge_edit_file_args(args_list)
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let t0 = std::time::Instant::now();
         // 调用方是否真的传了非空 `edits[]`（而非便捷形）。必须在归一化前判定：
         // 归一化会把顶层 old/new 对合成进 edits[]，之后无法再区分两者。
         let caller_passed_edits = serde_json::from_str::<serde_json::Value>(args)
@@ -235,115 +250,206 @@ impl Tool for EditFileTool {
             }
         }
         let path = resolve_path(&a.path, &ctx.working_dir);
-        let raw = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    return err(format_path_not_found(
-                        "edit",
-                        &a.path,
-                        &path,
-                        &ctx.working_dir,
-                    ));
-                }
-                return err(format!(
-                    "edit: cannot read {}: {e}",
-                    crate::pathnorm::to_display(&path)
-                ));
-            }
+        // Snapshot + decode ONCE. The same snapshot is used for matching, for the
+        // no-op check, and for the pre-write fingerprint comparison.
+        let snapshot = match read_edit_snapshot(&path, &a.path, &ctx.working_dir).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return err(e),
         };
-        // Decode to UTF-8 for matching, remembering the on-disk encoding so the edit is
-        // written back in the SAME encoding. A GBK/GB18030 file (Chinese Windows) is
-        // edited in place; an ambiguous non-UTF-8 file is refused, not corrupted.
-        let decoded = match crate::tools::encoding::decode_for_edit(&path, &raw) {
-            Some(d) => d,
-            None => {
-                return err(format!(
-                    "edit: cannot read {} as UTF-8 or a supported legacy text encoding \
-                     (GBK/GB18030). Convert it to UTF-8 first. The file was NOT modified.",
-                    crate::pathnorm::to_display(&path)
-                ))
-            }
-        };
-        let content = decoded.text;
-        let file_encoding = decoded.encoding;
 
         // CPU-bound heal / diagnose / 3-way rebase MUST NOT run on the async worker:
         // the old Levenshtein diagnostic pinned the runtime for minutes, so Esc/Ctrl-C
         // (ctx.cancel) could not be polled — a user-visible deadlock. spawn_blocking
-        // plus cooperative cancel checks keep the event loop live.
+        // plus cooperative cancel checks keep the event loop live. The timeout is a
+        // last-resort guard: a timed-out task never writes (writes happen below).
         let cancel = ctx.cancel.clone();
         let path_cpu = path.clone();
-        let original = content.clone();
-        let applied = match tokio::task::spawn_blocking(move || {
-            apply_hunks_cpu(&path_cpu, content, hunks, &cancel)
-        })
+        let workspace_root = ctx.working_dir.clone();
+        let text_for_cpu = snapshot.text.clone();
+        let hunks_for_retry = hunks.clone();
+        let applied = match tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                apply_hunks_cpu(&path_cpu, text_for_cpu, hunks, &cancel, &workspace_root)
+            }),
+        )
         .await
         {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return err(e),
-            Err(e) => {
-                return err(format!("edit: apply task failed: {e}"));
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => return err(e),
+            Ok(Err(e)) => return err(format!("edit: apply task failed: {e}")),
+            Err(_) => {
+                return err(
+                    "edit: timed out while applying hunks; the file was NOT modified.".to_string(),
+                )
             }
         };
-        let HunkApplyResult {
-            buf,
-            total,
-            kinds,
-            auto_healed_old_strings,
-            skipped,
-        } = applied;
-        if total == 0 && buf == original {
-            let skip_note = if skipped.is_empty() {
+        if applied.total == 0 && applied.buf == snapshot.text {
+            let skip_note = if applied.skipped.is_empty() {
                 String::new()
             } else {
-                format!(" skipped hunks: {}.", skipped.join(", "))
+                format!(" skipped hunks: {}.", applied.skipped.join(", "))
             };
             return ok(format!(
                 "edit: no replacements applied; the file was not modified.{skip_note}"
             ));
         }
-        if let Err(msg) = write_encoded(&path, &buf, file_encoding).await {
-            return err(msg);
+
+        // Serialize the read-modify-write window. Re-read AFTER acquiring the lock:
+        // another session/process may have changed the file while we were healing.
+        let lock_key = crate::pathnorm::path_case_key(&snapshot.canonical);
+        let _lock = match acquire_edit_lock(&lock_key, &ctx.cancel).await {
+            Ok(lock) => lock,
+            Err(e) => return err(e),
+        };
+        let fresh = match read_edit_snapshot(&path, &a.path, &ctx.working_dir).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => return err(e),
+        };
+        // A concurrent rename/symlink retarget changes the file the lock protects.
+        // Fail closed instead of writing to an unguarded new target.
+        if crate::pathnorm::path_case_key(&fresh.canonical)
+            != crate::pathnorm::path_case_key(&snapshot.canonical)
+        {
+            return err(
+                "edit: the target file changed identity while editing; retry the edit. \
+                 The file was NOT modified."
+                    .to_string(),
+            );
         }
-        // Record the newly edited version into VersionRing
-        crate::tools::edit_history::record_version(&path, &buf);
-        crate::tools::write_state::record_edit(&path);
-        #[cfg(feature = "codeintel")]
-        crate::codeintel::notify_code_index_file_changed(&path, Some(&buf));
-        let diff = build_compact_diff(&original, &buf, Some(&path));
-        let cost_time = t0.elapsed();
-        let kind_note = if kinds.len() == 1 {
-            if kinds[0] == "exact" {
-                String::new()
-            } else {
-                format!(" ({})", kinds[0])
-            }
+        let (final_applied, write_stat, write_encoding, diff_base) = if fresh.bytes
+            == snapshot.bytes
+        {
+            (
+                applied,
+                fresh.stat.clone(),
+                fresh.encoding,
+                snapshot.text.clone(),
+            )
         } else {
-            format!(" ({} hunks: {})", kinds.len(), kinds.join(", "))
+            // The file changed after our snapshot. Re-apply the same hunks to the
+            // fresh content instead of overwriting the other writer.
+            let cancel = ctx.cancel.clone();
+            let path_cpu = path.clone();
+            let workspace_root = ctx.working_dir.clone();
+            let text_for_cpu = fresh.text.clone();
+            let retry = match tokio::time::timeout(
+                    Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        apply_hunks_cpu(
+                            &path_cpu,
+                            text_for_cpu,
+                            hunks_for_retry,
+                            &cancel,
+                            &workspace_root,
+                        )
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(Ok(v))) => v,
+                    Ok(Ok(Err(e))) => return err(e),
+                    Ok(Err(e)) => return err(format!("edit: apply task failed: {e}")),
+                    Err(_) => {
+                        return err(
+                            "edit: timed out while re-applying hunks after a concurrent change; the file was NOT modified."
+                                .to_string(),
+                        )
+                    }
+                };
+            if retry.total == 0 && retry.buf == fresh.text {
+                let skip_note = if retry.skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" skipped hunks: {}.", retry.skipped.join(", "))
+                };
+                return ok(format!(
+                        "edit: the file changed concurrently; after re-reading, no replacements were needed. The file was NOT modified.{skip_note}"
+                    ));
+            }
+            (
+                retry,
+                fresh.stat.clone(),
+                fresh.encoding,
+                fresh.text.clone(),
+            )
         };
 
-        let mut out = format!("> ⏱️ **Cost Time**: {:.2?}ms\n\n", cost_time.as_millis());
+        let bytes = match crate::tools::encoding::encode(&final_applied.buf, write_encoding) {
+            Some(bytes) => bytes,
+            None => {
+                return err(format!(
+                    "edit: cannot re-encode the edit to {}'s original encoding; the file was \
+                     NOT modified. Convert it to UTF-8 first.",
+                    crate::pathnorm::to_display(&path)
+                ))
+            }
+        };
+        // Write to the CANONICAL target: renaming over a symlink path would replace
+        // the link itself instead of the file the user asked to edit.
+        let write_path = fresh.canonical.clone();
+        let path_atomic = write_path.clone();
+        let stat_atomic = write_stat.clone();
+        let bytes_atomic = bytes.clone();
+        match tokio::task::spawn_blocking(move || {
+            atomic_replace(&path_atomic, &bytes_atomic, &stat_atomic)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return err(e),
+            Err(e) => return err(format!("edit: write task failed: {e}")),
+        }
+        // The write critical section is over. Release the per-file lock BEFORE
+        // history/diff work so a slow copy cannot stall other sessions.
+        drop(_lock);
 
-        if !auto_healed_old_strings.is_empty() {
+        // Record the newly edited version under the same size policy.
+        let plan = crate::tools::edit_history::plan_for(&path, final_applied.buf.len());
+        crate::tools::edit_history::record_version(&path, &final_applied.buf, plan);
+        crate::tools::write_state::record_edit(&path);
+        #[cfg(feature = "codeintel")]
+        crate::codeintel::notify_code_index_file_changed(&path, Some(&final_applied.buf));
+        let diff = build_compact_diff(&diff_base, &final_applied.buf, Some(&path));
+        let kind_note = if final_applied.kinds.len() == 1 {
+            if final_applied.kinds[0] == "exact" {
+                String::new()
+            } else {
+                format!(" ({})", final_applied.kinds[0])
+            }
+        } else {
+            format!(
+                " ({} hunks: {})",
+                final_applied.kinds.len(),
+                final_applied.kinds.join(", ")
+            )
+        };
+
+        let mut out = String::new();
+
+        if !final_applied.auto_healed_old_strings.is_empty() {
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            let latest_str = auto_healed_old_strings.join("\n---\n");
+            let latest_str = final_applied.auto_healed_old_strings.join("\n---\n");
             out.push_str(&format!(
-                "⚠️ **[自动安全修改提示]**：\n你的 old_string 存在冲突，已为你自动执行成功后的安全修改，请你下次如果修改涉及到这块old str 请记得使用新的old str 不用去读源文件。\n\n当前位置最新的实际 old_string 为：\n```{ext}\n{latest_str}\n```\n\n本次修改已成功！以下为最终生效的差异：\n\n"
+                "⚠️ **[Auto-heal Note]**: A conflict in old_string was safely resolved and applied. If future edits touch this section, use the latest content below:\n```{ext}\n{latest_str}\n```\n\nEdit applied successfully!\n\n"
             ));
         }
 
-        if !skipped.is_empty() {
+        if !final_applied.skipped.is_empty() {
             out.push_str("skipped hunks: ");
-            out.push_str(&skipped.join(", "));
+            out.push_str(&final_applied.skipped.join(", "));
             out.push('\n');
         }
         out.push_str(&format!(
-            "Edited {} ({total} replacement{}{kind_note})\n{}",
+            "The file {} has been updated successfully ({} replacement{}{kind_note}). Edited successfully.",
             crate::pathnorm::to_display(&path),
-            if total == 1 { "" } else { "s" },
-            diff,
+            final_applied.total,
+            if final_applied.total == 1 { "" } else { "s" },
         ));
+        if !diff.is_empty() {
+            out.push('\n');
+            out.push_str(&diff);
+        }
         return ok(out);
     }
 }
@@ -363,11 +469,13 @@ fn apply_hunks_cpu(
     content: String,
     hunks: Vec<EditHunk>,
     cancel: &tokio_util::sync::CancellationToken,
+    workspace_root: &std::path::Path,
 ) -> Result<HunkApplyResult, String> {
     if cancel.is_cancelled() {
         return Err("edit: cancelled.".into());
     }
-    crate::tools::edit_history::record_version(path, &content);
+    let history_plan = crate::tools::edit_history::plan_for(path, content.len());
+    crate::tools::edit_history::record_version(path, &content, history_plan);
     let mut hunks = hunks;
     for (idx, h) in hunks.iter_mut().enumerate() {
         if h.original_index == 0 {
@@ -376,13 +484,16 @@ fn apply_hunks_cpu(
     }
 
     // 强化 3：在多 hunk 情形下，利用已有明确锚定点的行号区间对多匹配的 hunk 做拓扑消歧
-    disambiguate_hunks_topologically(&content, &mut hunks);
+    disambiguate_hunks_topologically(&content, &mut hunks, cancel);
 
     let hunks = if hunks.len() > 1 {
-        sort_hunks_topologically(&content, &hunks)
+        sort_hunks_topologically(&content, &hunks, cancel)
     } else {
         hunks
     };
+    if cancel.is_cancelled() {
+        return Err("edit: cancelled.".into());
+    }
 
     // 强化 1：预检校验 / 试运行流水线。如果发现错误，收集全部失败 hunk 的精准诊断，聚合输出
     let mut test_buf = content.clone();
@@ -419,6 +530,7 @@ fn apply_hunks_cpu(
             &h.new_string,
             h.replace_all,
             h.occurrence,
+            workspace_root,
         ) {
             Ok((next, n, kind, actual_matched)) => {
                 let (s, e) = locate_hunk_lines(&orig_lines, &h.old_string).unwrap_or((0, 0));
@@ -505,6 +617,7 @@ fn apply_hunks_cpu(
                             &victim_hunk.old_string,
                             &test_buf,
                             Some(path),
+                            workspace_root,
                         );
                     }
                 }
@@ -747,6 +860,7 @@ fn apply_hunk(
     new_string: &str,
     replace_all: bool,
     occurrence: u32,
+    workspace_root: &std::path::Path,
 ) -> Result<(String, usize, &'static str, Option<String>), String> {
     // User-facing path: heal, then diagnose at most once on the current file.
     apply_hunk_with(
@@ -757,6 +871,7 @@ fn apply_hunk(
         replace_all,
         occurrence,
         true,
+        workspace_root,
     )
 }
 
@@ -769,7 +884,16 @@ pub(crate) fn apply_hunk_direct(
     new_string: &str,
     replace_all: bool,
 ) -> Result<(String, usize, &'static str, Option<String>), String> {
-    apply_hunk_with(None, content, old_string, new_string, replace_all, 0, false)
+    apply_hunk_with(
+        None,
+        content,
+        old_string,
+        new_string,
+        replace_all,
+        0,
+        false,
+        std::path::Path::new(""),
+    )
 }
 
 fn apply_hunk_with(
@@ -780,6 +904,7 @@ fn apply_hunk_with(
     replace_all: bool,
     occurrence: u32,
     diagnose: bool,
+    workspace_root: &std::path::Path,
 ) -> Result<(String, usize, &'static str, Option<String>), String> {
     if !old_string.is_empty() {
         return apply_text_hunk(
@@ -790,6 +915,7 @@ fn apply_hunk_with(
             replace_all,
             occurrence,
             diagnose,
+            workspace_root,
         );
     }
     Err("edit: provide a non-empty `old_string` in each edit hunk.".into())
@@ -797,8 +923,12 @@ fn apply_hunk_with(
 
 /// 强化 3：在多 hunk 批量编辑中，当某 hunk 出现多个完全相同的匹配点且 caller 未指定 occurrence 时，
 /// 结合前后其它已有明确锚定点的 hunk 所在行号区间，进行拓扑消歧。
-fn disambiguate_hunks_topologically(content: &str, hunks: &mut [EditHunk]) {
-    if hunks.len() <= 1 {
+fn disambiguate_hunks_topologically(
+    content: &str,
+    hunks: &mut [EditHunk],
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    if hunks.len() <= 1 || cancel.is_cancelled() {
         return;
     }
 
@@ -839,6 +969,9 @@ fn disambiguate_hunks_topologically(content: &str, hunks: &mut [EditHunk]) {
 
     // 2. 尝试为具有多处匹配且 occurrence == 0 的 hunk 做拓扑定界消歧
     for i in 0..n {
+        if cancel.is_cancelled() {
+            return;
+        }
         if hunks[i].occurrence != 0 || match_spans[i].len() <= 1 {
             continue;
         }
@@ -898,8 +1031,12 @@ fn disambiguate_hunks_topologically(content: &str, hunks: &mut [EditHunk]) {
 ///    Hunk A must execute before Hunk B (WAR: Write-After-Read).
 /// 3. For disjoint/independent hunks, orders bottom-up (higher line numbers first)
 ///    so modifications deeper in the file do not perturb line offsets for earlier hunks.
-fn sort_hunks_topologically(content: &str, hunks: &[EditHunk]) -> Vec<EditHunk> {
-    if hunks.len() <= 1 {
+fn sort_hunks_topologically(
+    content: &str,
+    hunks: &[EditHunk],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<EditHunk> {
+    if hunks.len() <= 1 || cancel.is_cancelled() {
         return hunks.to_vec();
     }
 
@@ -1011,6 +1148,9 @@ fn sort_hunks_topologically(content: &str, hunks: &[EditHunk]) -> Vec<EditHunk> 
     let mut available: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
 
     while !available.is_empty() {
+        if cancel.is_cancelled() {
+            return hunks.to_vec();
+        }
         available.sort_by(|&a, &b| {
             spans[b]
                 .read_start
@@ -1124,6 +1264,7 @@ fn apply_text_hunk(
     replace_all: bool,
     occurrence: u32,
     diagnose: bool,
+    workspace_root: &std::path::Path,
 ) -> Result<(String, usize, &'static str, Option<String>), String> {
     if old_string == new_string {
         return Err("old_string and new_string are identical — nothing to change.".into());
@@ -1157,6 +1298,7 @@ fn apply_text_hunk(
                 replace_all,
                 occurrence,
                 false,
+                workspace_root,
             ) {
                 let actual = res.3.unwrap_or(clean_old);
                 return Ok((res.0, res.1, "stripped-arrow prefix match", Some(actual)));
@@ -1217,7 +1359,9 @@ fn apply_text_hunk(
             }
         }
         if diagnose {
-            let hint = find_closest_match_snippet(path, &file, old_string).unwrap_or_default();
+            let hint =
+                find_closest_match_snippet_with_root(path, &file, old_string, workspace_root)
+                    .unwrap_or_default();
             return Err(format!("old_string not found in file.\n{hint}"));
         }
         return Err("old_string not found in file.".into());
@@ -1314,34 +1458,15 @@ fn format_match_sites(content: &str, needle: &str) -> String {
     out
 }
 
-/// Write edited text back to `path` in its original on-disk `encoding`. Refuses (Err
-/// with a user-facing message) rather than write replacement bytes if the text cannot
-/// be represented — so a failed re-encode leaves the file untouched, never corrupted.
-async fn write_encoded(
-    path: &std::path::Path,
-    text: &str,
-    encoding: crate::tools::encoding::FileEncoding,
-) -> Result<(), String> {
-    let bytes = crate::tools::encoding::encode(text, encoding).ok_or_else(|| {
-        format!(
-            "edit: cannot re-encode the edit to {}'s original encoding; the file was \
-             NOT modified. Convert it to UTF-8 first.",
-            crate::pathnorm::to_display(path)
-        )
-    })?;
-    tokio::fs::write(path, bytes).await.map_err(|e| {
-        format!(
-            "edit: failed to write {}: {e}",
-            crate::pathnorm::to_display(path)
-        )
-    })
-}
-
 /// A compact GIT UNIFIED DIFF (`@@` hunks, 3 lines of context) between the OLD
 /// and NEW whole-file contents, capped so a large edit can't flood the model
 /// context / transcript. The TUI re-parses this into a line-numbered, color-
 /// coded diff block; the model reads it as a normal unified diff.
-fn build_compact_diff(old_file: &str, new_file: &str, path: Option<&std::path::Path>) -> String {
+pub(crate) fn build_compact_diff(
+    old_file: &str,
+    new_file: &str,
+    path: Option<&std::path::Path>,
+) -> String {
     const MAX_DIFF_LINES: usize = 60;
     let mut config = similar::TextDiff::configure();
     config.timeout(std::time::Duration::from_millis(200));
@@ -2011,8 +2136,24 @@ fn best_window_by_token_bag(
             hits += 1;
         }
     }
+    let boundary_score = |start_idx: usize| -> i32 {
+        let mut b = 0;
+        if let Some(first) = old_tokens.first() {
+            if file.tokens.get(start_idx).map(|s| s.as_str()) == Some(first.as_str()) {
+                b += 2;
+            }
+        }
+        if let Some(last) = old_tokens.last() {
+            if file.tokens.get(start_idx + w - 1).map(|s| s.as_str()) == Some(last.as_str()) {
+                b += 1;
+            }
+        }
+        b
+    };
+
     let mut best_hits = hits;
     let mut best_i = 0usize;
+    let mut best_boundary = boundary_score(0);
 
     for start in 1..=m.saturating_sub(w) {
         let drop = file.tokens[start - 1].as_str();
@@ -2032,9 +2173,11 @@ fn best_window_by_token_bag(
                 hits += 1;
             }
         }
-        if hits > best_hits {
+        let cur_b = boundary_score(start);
+        if hits > best_hits || (hits == best_hits && cur_b > best_boundary) {
             best_hits = hits;
             best_i = start;
+            best_boundary = cur_b;
         }
     }
 
@@ -2085,19 +2228,12 @@ fn best_window_by_line_similarity(
 
 const EDIT_DIFF_PROTOCOL_LEGEND: &str = "\
 Below is the discrepancy between your old_string and the actual file content:\n\
-Lines with '-' are the mismatched or erroneous line(s) in your old_string.\n\
-Lines with '+' are the actual, authoritative content in the file.\n\
-'>>> ' indicates the target matching location(s) in the file.\n\
-Lines without '-' or '+' are surrounding context for reference only.\n\
-Adjust your old_string based on the comparison below to achieve an exact match.\n\n";
+Lines with '-' come from your old_string; the number is the physical file line it conflicts with (-- = no corresponding file line at this position).\n\
+Lines with '+' are actual file content; the number is the physical file line.\n\
+Lines without '-' or '+' are surrounding file context for reference only.\n\n";
 
-#[derive(Debug)]
-struct ExactDiscrepancy {
-    line_no: usize,
-    expected: String,
-    actual: String,
-    hint: String,
-}
+const MISMATCH_ACTION_HINT: &str =
+    "👉 Conflict found — adjust your old_string to match the actual file content above.";
 
 fn format_cascade_conflict_diagnostic(
     cause_orig_idx: usize,
@@ -2109,19 +2245,25 @@ fn format_cascade_conflict_diagnostic(
     victim_old_string: &str,
     test_buf: &str,
     path: Option<&std::path::Path>,
+    workspace_root: &std::path::Path,
 ) -> String {
     let cause_json = cause_orig_idx.saturating_sub(1);
     let victim_json = victim_orig_idx.saturating_sub(1);
 
     let test_buf_norm = NormalizedFile::new(test_buf);
-    let diff_block = find_closest_match_snippet(path, &test_buf_norm, victim_old_string)
-        .unwrap_or_else(|| {
-            format!(
-                "```````diff\n- {}\n+ {}\n```````",
-                victim_old_string.trim(),
-                cause_new_string.trim()
-            )
-        });
+    let diff_block = find_closest_match_snippet_with_root(
+        path,
+        &test_buf_norm,
+        victim_old_string,
+        workspace_root,
+    )
+    .unwrap_or_else(|| {
+        format!(
+            "```````diff\n- {}\n+ {}\n```````",
+            victim_old_string.trim(),
+            cause_new_string.trim()
+        )
+    });
 
     format!(
         "⚠️ Cascading Overlap Conflict (Hunk {cause_orig_idx} ➔ Hunk {victim_orig_idx}):\n\
@@ -2140,6 +2282,157 @@ fn format_cascade_conflict_diagnostic(
     )
 }
 
+/// Most similar real file line inside the hunk. Pairing by index alone loses
+/// reordered/shifted lines; `预设` should point at `预估`, not at whichever
+/// unrelated line happens to occupy the same slot.
+fn closest_file_line(
+    expect: &str,
+    file_lines: &[&str],
+    search_start: usize,
+    search_end: usize,
+) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for idx in search_start..search_end.min(file_lines.len()) {
+        let candidate = file_lines[idx];
+        let sim = line_similarity(expect, candidate);
+        if best.map_or(true, |(_, score)| sim > score) {
+            best = Some((idx, sim));
+        }
+    }
+    best.filter(|(_, sim)| *sim >= 0.60)
+}
+
+/// Render one hunk. `-`/`+` numbers are physical file lines: paired Replace
+/// lines share the number, and old lines with no counterpart use `--`.
+fn render_hunk(
+    ops: &[similar::DiffOp],
+    old_lines: &[&str],
+    file_lines: &[&str],
+    win_start: usize,
+    win_end: usize,
+    hunk_start: usize,
+    hunk_end: usize,
+    first_equal: Option<usize>,
+    last_equal: Option<usize>,
+) -> Vec<String> {
+    const MAX_HUNK_LINES: usize = 60;
+
+    let file_no = |new_index: usize| win_start + new_index + 1;
+    let search_start = hunk_start.saturating_sub(win_start + 1);
+    let search_end = hunk_end.saturating_sub(win_start);
+    let mut out = Vec::new();
+    let mut omitted = 0usize;
+    let mut push = |line: String| {
+        if out.len() < MAX_HUNK_LINES {
+            out.push(line);
+        } else {
+            omitted += 1;
+        }
+    };
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        match *op {
+            similar::DiffOp::Equal { new_index, len, .. } => {
+                for k in 0..len {
+                    let no = file_no(new_index + k);
+                    if no >= hunk_start && no <= hunk_end {
+                        push(format!("  {:>4} | {}", no, file_lines[new_index + k]));
+                    }
+                }
+            }
+            similar::DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+                ..
+            } => {
+                let at = (win_start + new_index + 1).min(win_end);
+                if at < hunk_start || at > hunk_end {
+                    continue;
+                }
+                for k in 0..old_len {
+                    push(format!("-   -- | {}", old_lines[old_index + k]));
+                }
+            }
+            similar::DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                let span_start = file_no(new_index);
+                let span_end = file_no(new_index + new_len.saturating_sub(1));
+                if span_end < hunk_start || span_start > hunk_end {
+                    continue;
+                }
+                let boundary = match (first_equal, last_equal) {
+                    (Some(f), Some(l)) => op_idx < f || op_idx > l,
+                    _ => false,
+                };
+                for k in 0..new_len {
+                    let no = file_no(new_index + k);
+                    if no < hunk_start || no > hunk_end {
+                        continue;
+                    }
+                    if boundary {
+                        push(format!("  {:>4} | {}", no, file_lines[new_index + k]));
+                    } else {
+                        push(format!("+ {:>4} | {}", no, file_lines[new_index + k]));
+                    }
+                }
+            }
+            similar::DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                let span_start = file_no(new_index);
+                let span_end = file_no(new_index + new_len.saturating_sub(1));
+                if span_end < hunk_start || span_start > hunk_end {
+                    continue;
+                }
+                for k in 0..old_len {
+                    let expect = old_lines[old_index + k];
+                    // Default to the positional pair; only jump to a different
+                    // real file line when it is clearly more similar (e.g.
+                    // '预设' matches '预估' better than its slot's neighbour).
+                    let paired = if k < new_len {
+                        Some((
+                            file_no(new_index + k),
+                            line_similarity(expect, file_lines[new_index + k]),
+                        ))
+                    } else {
+                        None
+                    };
+                    let best = closest_file_line(expect, file_lines, search_start, search_end);
+                    let num = match (paired, best) {
+                        (Some((_, paired_sim)), Some((idx, best_sim)))
+                            if best_sim > paired_sim + 0.15 =>
+                        {
+                            Some(win_start + idx + 1)
+                        }
+                        (Some((paired_no, _)), _) => Some(paired_no),
+                        (None, Some((idx, _))) => Some(win_start + idx + 1),
+                        (None, None) => None,
+                    }
+                    .map(|n| format!("{:>4}", n))
+                    .unwrap_or_else(|| "  --".to_string());
+                    push(format!("- {} | {}", num, expect));
+                }
+                for k in 0..new_len {
+                    push(format!(
+                        "+ {:>4} | {}",
+                        file_no(new_index + k),
+                        file_lines[new_index + k]
+                    ));
+                }
+            }
+        }
+    }
+    if omitted > 0 {
+        out.push(format!("  ... ({} more line(s) omitted)", omitted));
+    }
+    out
+}
+
 fn build_structured_mismatch_diff(
     path: Option<&std::path::Path>,
     file: &NormalizedFile<'_>,
@@ -2148,195 +2441,159 @@ fn build_structured_mismatch_diff(
     end: usize,
     score: f32,
 ) -> String {
-    use similar::{ChangeTag, TextDiff};
+    use similar::{DiffOp, TextDiff};
+
+    const CONTEXT: usize = 3;
+    const HUNK_GAP: usize = CONTEXT * 2;
 
     let target_display = path
         .map(|p| crate::pathnorm::to_display(p))
         .map(|s| format!(" in {s}"))
         .unwrap_or_default();
 
-    let file_core = file.lines[start..end].join("\n");
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    if old_lines.is_empty() {
+        return MISMATCH_GREP_HINT.to_string();
+    }
+
+    // Widen the window: a real conflict may sit outside the token-bag pick
+    // (old_string can stitch together lines from different regions). Use
+    // terminator-free slices for the diff — `diff_lines(old_string, join(...))`
+    // used to invent a Replace on the last line when old_string ended with '\n'.
+    let win_start = start.saturating_sub(CONTEXT);
+    let win_end = end.saturating_add(CONTEXT).min(file.lines.len());
+    if win_start >= win_end {
+        return MISMATCH_GREP_HINT.to_string();
+    }
+    let file_lines: Vec<&str> = file.lines[win_start..win_end].to_vec();
+
     let mut config = TextDiff::configure();
     config.timeout(std::time::Duration::from_millis(200));
-    let diff = config.diff_lines(old_string, &file_core);
+    let diff = config.diff_slices(&old_lines, &file_lines);
+    let ops = diff.ops();
+    let first_equal = ops.iter().position(|op| matches!(op, DiffOp::Equal { .. }));
+    let last_equal = ops
+        .iter()
+        .rposition(|op| matches!(op, DiffOp::Equal { .. }));
+    let file_no = |new_index: usize| win_start + new_index + 1;
+    let insertion_no = |new_index: usize| (win_start + new_index + 1).min(win_end);
 
-    let changes: Vec<_> = diff.iter_all_changes().collect();
-
-    // 1. 第一遍扫描：准确定位第一处失配冲突点所在的真实文件物理行号与差异细节
-    let mut first_conflict_line: Option<usize> = None;
-    let mut discrepancy: Option<ExactDiscrepancy> = None;
-    let mut scan_line = start + 1;
-    let mut scan_idx = 0;
-
-    while scan_idx < changes.len() {
-        let change = &changes[scan_idx];
-        match change.tag() {
-            ChangeTag::Equal => {
-                scan_line += 1;
-                scan_idx += 1;
+    // Collect real (internal) changes. Leading/trailing Inserts are just the
+    // window boundary around old_string, not omissions, so they do not create
+    // their own hunk.
+    let mut changes: Vec<(usize, usize)> = Vec::new();
+    for (op_idx, op) in ops.iter().enumerate() {
+        match *op {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Delete { new_index, .. } => {
+                let at = insertion_no(new_index);
+                changes.push((at, at));
             }
-            ChangeTag::Delete => {
-                if first_conflict_line.is_none() {
-                    first_conflict_line = Some(scan_line);
-                }
-                let exp = change.value().trim_end_matches(['\r', '\n']);
-
-                if scan_idx + 1 < changes.len() && changes[scan_idx + 1].tag() == ChangeTag::Insert
-                {
-                    let act = changes[scan_idx + 1].value().trim_end_matches(['\r', '\n']);
-                    if discrepancy.is_none() {
-                        let hint = if exp.trim() == act.trim() {
-                            "Notice whitespace/indentation mismatch".to_string()
-                        } else if exp.starts_with(act) && !act.is_empty() {
-                            let extra = &exp[act.len()..];
-                            format!(
-                                "Notice extra trailing characters in your input: {:?}",
-                                extra
-                            )
-                        } else if act.starts_with(exp) && !exp.is_empty() {
-                            let missing = &act[exp.len()..];
-                            format!(
-                                "Notice missing trailing characters from actual file: {:?}",
-                                missing
-                            )
-                        } else {
-                            "Notice character mismatch on this line".to_string()
-                        };
-
-                        discrepancy = Some(ExactDiscrepancy {
-                            line_no: scan_line,
-                            expected: exp.to_string(),
-                            actual: act.to_string(),
-                            hint,
-                        });
-                    }
-                    scan_line += 1;
-                    scan_idx += 2;
-                } else {
-                    if discrepancy.is_none() {
-                        discrepancy = Some(ExactDiscrepancy {
-                            line_no: scan_line,
-                            expected: exp.to_string(),
-                            actual: String::new(),
-                            hint: format!(
-                                "Notice extra unexpected line in your old_string: {:?}",
-                                exp
-                            ),
-                        });
-                    }
-                    scan_idx += 1;
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                let boundary = match (first_equal, last_equal) {
+                    (Some(f), Some(l)) => op_idx < f || op_idx > l,
+                    _ => false,
+                };
+                if !boundary {
+                    changes.push((
+                        file_no(new_index),
+                        file_no(new_index + new_len.saturating_sub(1)),
+                    ));
                 }
             }
-            ChangeTag::Insert => {
-                if first_conflict_line.is_none() {
-                    first_conflict_line = Some(scan_line);
+            DiffOp::Replace {
+                new_index, new_len, ..
+            } => {
+                changes.push((
+                    file_no(new_index),
+                    file_no(new_index + new_len.saturating_sub(1)),
+                ));
+            }
+        }
+    }
+    if changes.is_empty() {
+        // No internal change (all matches are Equal and only boundary inserts
+        // exist): fall back to every non-Equal op so the caller still sees the
+        // block. Low-similarity cases are refused before reaching here.
+        for op in ops {
+            match *op {
+                DiffOp::Equal { .. } => {}
+                DiffOp::Delete { new_index, .. } => {
+                    let at = insertion_no(new_index);
+                    changes.push((at, at));
                 }
-                let act = change.value().trim_end_matches(['\r', '\n']);
-                if discrepancy.is_none() {
-                    discrepancy = Some(ExactDiscrepancy {
-                        line_no: scan_line,
-                        expected: String::new(),
-                        actual: act.to_string(),
-                        hint: format!("Notice missing line from actual file: {:?}", act),
-                    });
+                DiffOp::Insert {
+                    new_index, new_len, ..
+                } => {
+                    changes.push((
+                        file_no(new_index),
+                        file_no(new_index + new_len.saturating_sub(1)),
+                    ));
                 }
-                scan_line += 1;
-                scan_idx += 1;
+                DiffOp::Replace {
+                    new_index, new_len, ..
+                } => {
+                    changes.push((
+                        file_no(new_index),
+                        file_no(new_index + new_len.saturating_sub(1)),
+                    ));
+                }
             }
         }
     }
 
-    // 2. 以冲突行（first_conflict_line）为绝对圆心，严格锁定上下各 3 行（最多 7-8 行）紧凑上下文，
-    // 杜绝长 Hunk 后续几十行完全相同的 Equal 行全量刷屏！
-    let target_conflict_line = first_conflict_line.unwrap_or(start + 1);
-    const FOCUS_RADIUS: usize = 3;
-    let focus_start = target_conflict_line.saturating_sub(FOCUS_RADIUS).max(1);
-    let focus_end = target_conflict_line + FOCUS_RADIUS;
-
-    let mut core_lines = Vec::new();
-    let mut curr_line = start + 1;
-    let mut idx = 0;
-
-    while idx < changes.len() {
-        let change = &changes[idx];
-        match change.tag() {
-            ChangeTag::Equal => {
-                let val = change.value().trim_end_matches(['\r', '\n']);
-                if curr_line >= focus_start && curr_line <= focus_end {
-                    core_lines.push(format!("  {:>4} | {}", curr_line, val));
-                }
-                curr_line += 1;
-                idx += 1;
-            }
-            ChangeTag::Delete => {
-                let exp = change.value().trim_end_matches(['\r', '\n']);
-                let in_focus = curr_line >= focus_start && curr_line <= focus_end;
-
-                if idx + 1 < changes.len() && changes[idx + 1].tag() == ChangeTag::Insert {
-                    let act = changes[idx + 1].value().trim_end_matches(['\r', '\n']);
-                    if in_focus {
-                        core_lines.push(format!("- {:>4} | {}", curr_line, exp));
-                        core_lines.push(format!("+ {:>4} | {}", curr_line, act));
-                    }
-                    curr_line += 1;
-                    idx += 2;
-                } else {
-                    if in_focus {
-                        core_lines.push(format!("- {:>4} | {}", curr_line, exp));
-                    }
-                    idx += 1;
-                }
-            }
-            ChangeTag::Insert => {
-                let act = change.value().trim_end_matches(['\r', '\n']);
-                if curr_line >= focus_start && curr_line <= focus_end {
-                    core_lines.push(format!("+ {:>4} | {}", curr_line, act));
-                }
-                curr_line += 1;
-                idx += 1;
-            }
-        }
-    }
-
-    // 如果冲突行在整个 block 的开头或结尾导致前后缺少上下文，从物理文件中优雅补齐参考行
-    let mut display_lines = Vec::new();
-    if focus_start < (start + 1) {
-        for i in focus_start..(start + 1) {
-            if i >= 1 && i <= file.lines.len() {
-                display_lines.push(format!("  {:>4} | {}", i, file.lines[i - 1]));
-            }
-        }
-    }
-    display_lines.extend(core_lines);
-    if focus_end > end {
-        for i in (end + 1)..=focus_end {
-            if i <= file.lines.len() {
-                display_lines.push(format!("  {:>4} | {}", i, file.lines[i - 1]));
-            }
+    // Merge changes whose untouched gap is <= 2*CONTEXT; farther clusters get
+    // their own action hint + diff block.
+    let mut hunks: Vec<Vec<(usize, usize)>> = Vec::new();
+    for change in changes {
+        let merge = hunks
+            .last()
+            .and_then(|hunk| hunk.last())
+            .is_some_and(|last| change.0 <= last.1.saturating_add(HUNK_GAP + 1));
+        if merge {
+            hunks.last_mut().unwrap().push(change);
+        } else {
+            hunks.push(vec![change]);
         }
     }
 
     let mut out = String::new();
     out.push_str(&format!(
         "[Content Mismatch]: Closest matching block found around lines {}-{}{target_display} (similarity {:.0}%):\n\n",
-        start + 1,
-        end,
+        win_start + 1,
+        win_end,
         score * 100.0,
     ));
-
     out.push_str(EDIT_DIFF_PROTOCOL_LEGEND);
 
-    if let Some(disc) = discrepancy {
-        out.push_str(&format!(
-            "👉 Exact Line Discrepancy (around line {}):\n  expected : {:?}\n  actual   : {:?}\n  ({})\n\n",
-            disc.line_no, disc.expected, disc.actual, disc.hint
-        ));
+    for hunk in &hunks {
+        let first = hunk.first().unwrap().0;
+        let last = hunk.last().unwrap().1;
+        let hunk_start = first.saturating_sub(CONTEXT).max(win_start + 1);
+        let hunk_end = last.saturating_add(CONTEXT).min(win_end);
+
+        out.push_str(MISMATCH_ACTION_HINT);
+        out.push_str("\n\n");
+
+        let lines = render_hunk(
+            ops,
+            &old_lines,
+            &file_lines,
+            win_start,
+            win_end,
+            hunk_start,
+            hunk_end,
+            first_equal,
+            last_equal,
+        );
+        out.push_str("```````diff\n");
+        out.push_str(&lines.join("\n"));
+        out.push_str("\n```````\n\n");
     }
 
-    out.push_str("```````diff\n");
-    out.push_str(&display_lines.join("\n"));
-    out.push_str("\n```````\n");
-    out.push_str("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)");
+    out.push_str("(Hint: surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)");
 
     out
 }
@@ -2350,10 +2607,11 @@ fn build_structured_mismatch_diff(
 /// 1. scores every window with a rolling token-bag (O(file lines));
 /// 2. refines only tiny hunks (≤ 8 non-empty lines) with per-line similarity;
 /// 3. emits one bounded `similar` TextDiff of the winning window.
-fn find_closest_match_snippet(
+fn find_closest_match_snippet_with_root(
     path: Option<&std::path::Path>,
     file: &NormalizedFile<'_>,
     old_string: &str,
+    workspace_root: &std::path::Path,
 ) -> Option<String> {
     let old_lines: Vec<&str> = old_string.lines().collect();
     let old_tokens: Vec<String> = old_lines
@@ -2385,6 +2643,7 @@ fn find_closest_match_snippet(
             if let Some(recent_file) = crate::tools::edit_history::find_exact_match_in_recent_files(
                 target_path,
                 old_string,
+                workspace_root,
             ) {
                 let current_display = crate::pathnorm::to_display(target_path);
                 let recent_display = crate::pathnorm::to_display(&recent_file);
@@ -2413,6 +2672,477 @@ fn find_closest_match_snippet(
     Some(build_structured_mismatch_diff(
         path, file, old_string, start, end, score,
     ))
+}
+
+/// Metadata captured with a snapshot: preserves mode and refuses hard-linked /
+/// non-regular targets before any write.
+#[derive(Debug, Clone)]
+struct EditFileStat {
+    permissions: std::fs::Permissions,
+    is_file: bool,
+    nlink: u64,
+    /// Unix owner. Atomic replace creates a temp owned by this process; if the
+    /// target is owned by someone else we refuse rather than silently chown it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    owner: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct EditSnapshot {
+    canonical: PathBuf,
+    bytes: Vec<u8>,
+    text: String,
+    encoding: crate::tools::encoding::FileEncoding,
+    stat: EditFileStat,
+}
+
+fn file_nlink(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        1
+    }
+}
+
+fn file_owner(meta: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Reject a path that resolved through a symlink/junction to an out-of-workspace
+/// or sensitive target. `canonical == lexical` (the normal no-symlink case) is
+/// always allowed: the approval gate classified that same explicit path.
+fn validate_resolved_target(resolved: &Path, canonical: &Path, cwd: &Path) -> Result<(), String> {
+    let lexical = crate::pathnorm::lexical_normalize(resolved);
+    if crate::pathnorm::path_case_key(&lexical) == crate::pathnorm::path_case_key(canonical) {
+        return Ok(());
+    }
+    let inside = crate::tools::write_approval::path_in_workspace(&canonical.to_string_lossy(), cwd);
+    let sensitive = crate::tools::path_is_sensitive(canonical);
+    // Platform aliases make an explicit in-workspace path differ from its
+    // canonical form even when no user-created link exists: macOS resolves
+    // `/var/...` to `/private/var/...`, and Windows may expand an 8.3 short
+    // name (`RUNNER~1`) to the long user name. If the exact path the approval
+    // gate classified was already sensitive and the final component is a real
+    // file (not a symlink), allow it; only a final-component link is a
+    // redirect. A parent junction still has to resolve inside the workspace.
+    let lexical_sensitive = crate::tools::path_is_sensitive(&lexical);
+    let final_is_symlink = std::fs::symlink_metadata(resolved)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if inside && lexical_sensitive && !final_is_symlink {
+        return Ok(());
+    }
+    if inside && !sensitive {
+        return Ok(());
+    }
+    Err(format!(
+        "edit: {} resolves through a symlink/junction to {} ({}). \
+         Use the explicit target path so approval can classify it. \
+         The file was NOT modified.",
+        crate::pathnorm::to_display(resolved),
+        crate::pathnorm::to_display(canonical),
+        if sensitive {
+            "sensitive target"
+        } else {
+            "outside the workspace"
+        }
+    ))
+}
+
+/// Read + decode one stable snapshot. If the file changes between `stat` and
+/// `read` (same-length in-place rewrite is not detectable here, but the content
+/// comparison before write is), retry once and then fail closed.
+async fn read_edit_snapshot(
+    path: &Path,
+    raw_path: &str,
+    cwd: &Path,
+) -> Result<EditSnapshot, String> {
+    for attempt in 0..2 {
+        let meta = match tokio::fs::metadata(path).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(format_path_not_found("edit", raw_path, path, cwd));
+                }
+                return Err(format!(
+                    "edit: cannot read {}: {e}",
+                    crate::pathnorm::to_display(path)
+                ));
+            }
+        };
+        if !meta.is_file() {
+            return Err(format!(
+                "edit: {} is not a regular file; refusing to edit it.",
+                crate::pathnorm::to_display(path)
+            ));
+        }
+        let nlink = file_nlink(&meta);
+        if nlink > 1 {
+            return Err(format!(
+                "edit: {} has {nlink} hard links; refusing to edit it in place. \
+                 Copy it to a standalone file first (the file was NOT modified).",
+                crate::pathnorm::to_display(path)
+            ));
+        }
+        // Validate the FINAL target BEFORE reading its bytes. This is the
+        // approval → snapshot TOCTOU guard: a benign in-workspace name swapped
+        // to a symlink/junction must not silently read/write an outside or
+        // sensitive file that the gate never classified.
+        let canonical_before =
+            crate::pathnorm::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        validate_resolved_target(path, &canonical_before, cwd)?;
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(format_path_not_found("edit", raw_path, path, cwd));
+                }
+                return Err(format!(
+                    "edit: cannot read {}: {e}",
+                    crate::pathnorm::to_display(path)
+                ));
+            }
+        };
+        let after = match tokio::fs::metadata(path).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(format_path_not_found("edit", raw_path, path, cwd));
+                }
+                return Err(format!(
+                    "edit: cannot re-read metadata for {}: {e}",
+                    crate::pathnorm::to_display(path)
+                ));
+            }
+        };
+        if after.len() != bytes.len() as u64 {
+            if attempt == 0 {
+                continue;
+            }
+            return Err(format!(
+                "edit: {} changed while being read; retry the edit.",
+                crate::pathnorm::to_display(path)
+            ));
+        }
+        let canonical = crate::pathnorm::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if crate::pathnorm::path_case_key(&canonical)
+            != crate::pathnorm::path_case_key(&canonical_before)
+        {
+            if attempt == 0 {
+                continue;
+            }
+            return Err(format!(
+                "edit: {} changed identity while being read; retry the edit.",
+                crate::pathnorm::to_display(path)
+            ));
+        }
+        validate_resolved_target(path, &canonical, cwd)?;
+        let decoded = match crate::tools::encoding::decode_for_edit(path, &bytes) {
+            Some(decoded) => decoded,
+            None => {
+                return Err(format!(
+                    "edit: cannot read {} as UTF-8 or a supported legacy text encoding \
+                     (GBK/GB18030). Convert it to UTF-8 first. The file was NOT modified.",
+                    crate::pathnorm::to_display(path)
+                ))
+            }
+        };
+        let stat = EditFileStat {
+            permissions: after.permissions(),
+            is_file: after.is_file(),
+            nlink: file_nlink(&after),
+            owner: file_owner(&after),
+        };
+        return Ok(EditSnapshot {
+            canonical,
+            bytes,
+            text: decoded.text,
+            encoding: decoded.encoding,
+            stat,
+        });
+    }
+    Err("edit: file changed while being read; retry the edit.".to_string())
+}
+
+/// Write to a same-directory temp file, fsync, preserve mode, then atomically
+/// replace the target. Readers see either the old or the new file, never a
+/// half-written one. Windows sharing violations are retried (25..400 ms).
+fn atomic_replace(path: &Path, bytes: &[u8], stat: &EditFileStat) -> Result<(), String> {
+    if !stat.is_file {
+        return Err(format!(
+            "edit: {} is not a regular file; refusing to edit it.",
+            crate::pathnorm::to_display(path)
+        ));
+    }
+    if stat.nlink > 1 {
+        return Err(format!(
+            "edit: {} has {} hard links; refusing to replace it atomically.",
+            crate::pathnorm::to_display(path),
+            stat.nlink
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if stat.permissions.mode() & 0o222 == 0 {
+            return Err(format!(
+                "edit: {} is read-only; the file was NOT modified.",
+                crate::pathnorm::to_display(path)
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if stat.permissions.readonly() {
+        return Err(format!(
+            "edit: {} is read-only; the file was NOT modified.",
+            crate::pathnorm::to_display(path)
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "edit: {} has no parent directory; the file was NOT modified.",
+            crate::pathnorm::to_display(path)
+        )
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        format!(
+            "edit: cannot create a temporary file next to {}: {e}. The file was NOT modified.",
+            crate::pathnorm::to_display(path)
+        )
+    })?;
+    #[cfg(unix)]
+    if let Some(owner) = stat.owner {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(temp_meta) = tmp.as_file().metadata() {
+            if temp_meta.uid() != owner {
+                return Err(format!(
+                    "edit: {} is owned by uid {owner}, but this process runs as uid {}; \
+                     refusing to change ownership. The file was NOT modified.",
+                    crate::pathnorm::to_display(path),
+                    temp_meta.uid()
+                ));
+            }
+        }
+    }
+    tmp.write_all(bytes).map_err(|e| {
+        format!(
+            "edit: cannot write the temporary file for {}: {e}. The file was NOT modified.",
+            crate::pathnorm::to_display(path)
+        )
+    })?;
+    tmp.as_file_mut().sync_all().map_err(|e| {
+        format!(
+            "edit: cannot fsync the temporary file for {}: {e}. The file was NOT modified.",
+            crate::pathnorm::to_display(path)
+        )
+    })?;
+    tmp.as_file()
+        .set_permissions(stat.permissions.clone())
+        .map_err(|e| {
+            format!(
+                "edit: cannot preserve permissions for {}: {e}. The file was NOT modified.",
+                crate::pathnorm::to_display(path)
+            )
+        })?;
+    persist_with_retries(tmp, path)?;
+    fsync_parent(parent)?;
+    Ok(())
+}
+
+fn persist_with_retries(mut tmp: tempfile::NamedTempFile, path: &Path) -> Result<(), String> {
+    const RETRY_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 400];
+    let mut last = String::new();
+    for (attempt, delay) in RETRY_DELAYS_MS.iter().enumerate() {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last = error.error.to_string();
+                tmp = error.file;
+                if attempt + 1 < RETRY_DELAYS_MS.len() {
+                    std::thread::sleep(Duration::from_millis(*delay));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "edit: failed to replace {} atomically: {last}. The file was NOT modified.",
+        crate::pathnorm::to_display(path)
+    ))
+}
+
+#[cfg(unix)]
+fn fsync_parent(parent: &Path) -> Result<(), String> {
+    use std::fs::File;
+    File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("edit: failed to fsync {}: {e}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn fsync_parent(_parent: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+const EDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const EDIT_LOCK_RETRY: Duration = Duration::from_millis(25);
+
+static EDIT_LOCKS: LazyLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Holds BOTH the in-process per-path mutex and the cross-process sidecar lock.
+/// Dropping it releases the OS lock first, then the in-process guard.
+struct EditLockGuard {
+    _os: EditOsLock,
+    _in_process: OwnedMutexGuard<()>,
+}
+
+struct EditOsLock {
+    file: std::fs::File,
+}
+
+impl Drop for EditOsLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+async fn acquire_edit_lock(
+    key: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<EditLockGuard, String> {
+    let mutex = {
+        let mut map = EDIT_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 1024 {
+            map.retain(|_, weak| weak.strong_count() > 0);
+        }
+        match map.get(key).and_then(Weak::upgrade) {
+            Some(mutex) => mutex,
+            None => {
+                let mutex = Arc::new(tokio::sync::Mutex::new(()));
+                map.insert(key.to_string(), Arc::downgrade(&mutex));
+                mutex
+            }
+        }
+    };
+    let in_process = tokio::select! {
+        guard = mutex.lock_owned() => guard,
+        _ = cancel.cancelled() => {
+            return Err(
+                "edit: cancelled while waiting for the file lock. The file was NOT modified."
+                    .to_string(),
+            )
+        }
+        _ = tokio::time::sleep(EDIT_LOCK_TIMEOUT) => {
+            return Err(
+                "edit: timed out waiting for the file lock. The file was NOT modified."
+                    .to_string(),
+            )
+        }
+    };
+    let os = acquire_os_lock(key, cancel).await?;
+    Ok(EditLockGuard {
+        _os: os,
+        _in_process: in_process,
+    })
+}
+
+async fn acquire_os_lock(
+    key: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<EditOsLock, String> {
+    let path = edit_lock_path(key)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| {
+            format!(
+                "edit: cannot open the file lock {}: {e}. The file was NOT modified.",
+                path.display()
+            )
+        })?;
+    let deadline = std::time::Instant::now() + EDIT_LOCK_TIMEOUT;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(EditOsLock { file }),
+            Err(e) if is_lock_contended(&e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "edit: timed out waiting for the cross-process file lock. The file was NOT modified."
+                            .to_string(),
+                    );
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(EDIT_LOCK_RETRY) => {}
+                    _ = cancel.cancelled() => {
+                        return Err(
+                            "edit: cancelled while waiting for the cross-process file lock. The file was NOT modified."
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "edit: cannot lock {}: {e}. The file was NOT modified.",
+                    path.display()
+                ))
+            }
+        }
+    }
+}
+
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports contention as ERROR_LOCK_VIOLATION (33), which the
+        // std error kind does not map to WouldBlock.
+        error.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn edit_lock_path(key: &str) -> Result<PathBuf, String> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let dir = std::env::temp_dir().join("jeikcode-edit-locks");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "edit: cannot create the file lock directory {}: {e}. The file was NOT modified.",
+            dir.display()
+        )
+    })?;
+    Ok(dir.join(format!("{:016x}.lock", hasher.finish())))
+}
+
+#[cfg(test)]
+fn find_closest_match_snippet(
+    path: Option<&Path>,
+    file: &NormalizedFile<'_>,
+    old_string: &str,
+) -> Option<String> {
+    find_closest_match_snippet_with_root(path, file, old_string, Path::new(""))
 }
 
 #[cfg(test)]
@@ -2467,6 +3197,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_legacy_file_path_alias() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("alias.txt"), "alpha\n").unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"alias.txt","old_string":"alpha","new_string":"beta"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("alias.txt")).unwrap(),
+            "beta\n"
+        );
+    }
+
+    #[tokio::test]
     async fn gbk_file_edits_in_place_and_stays_gbk() {
         // A GBK/GB18030-encoded file (common on Chinese Windows) must be editable
         // directly — matched in UTF-8 space, then written back in its ORIGINAL encoding,
@@ -2478,7 +3225,7 @@ mod tests {
 
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"notes.txt","old_string":"第二行","new_string":"改过的第二行"}"#,
+                r#"{"path":"notes.txt","old_string":"第二行","new_string":"改过的第二行"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2507,7 +3254,7 @@ mod tests {
 
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"weird.txt","old_string":"plain","new_string":"changed"}"#,
+                r#"{"path":"weird.txt","old_string":"plain","new_string":"changed"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2526,7 +3273,7 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
+                r#"{"path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2547,7 +3294,7 @@ mod tests {
         .unwrap();
         let ok = EditFileTool
             .execute(
-                r#"{"file_path":"a.rs","edits":[{"old_string":"fn a() { 1 }","new_string":"fn a() { 10 }"},{"old_string":"fn c() { 3 }","new_string":"fn c() { 30 }"}]}"#,
+                r#"{"path":"a.rs","edits":[{"old_string":"fn a() { 1 }","new_string":"fn a() { 10 }"},{"old_string":"fn c() { 3 }","new_string":"fn c() { 30 }"}]}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2557,7 +3304,7 @@ mod tests {
 
         let fail = EditFileTool
             .execute(
-                r#"{"file_path":"a.rs","edits":[{"old_string":"fn a() { 10 }","new_string":"fn a() { 11 }"},{"old_string":"missing","new_string":"x"}]}"#,
+                r#"{"path":"a.rs","edits":[{"old_string":"fn a() { 10 }","new_string":"fn a() { 11 }"},{"old_string":"missing","new_string":"x"}]}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2576,7 +3323,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "file_path": "Coupon.java",
+            "path": "Coupon.java",
             "old_string": "    /**\n     * 创建时间\n     */\n    private LocalDateTime createTime;",
             "new_string": "    /**\n     * 创建时间\n     */\n    private LocalDateTime createTime;\n\n    /** 过期提前预警天数 */\n    private Integer expireWarningDays;"
         });
@@ -2601,7 +3348,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "file_path": "Coupon.java",
+            "path": "Coupon.java",
             "old_string": "    /**\n     * 创建时间\n     */\n    @TableField(\"create_time\")\n    private LocalDateTime createTime;\n}",
             "new_string": "    /**\n     * 过期提前预警天数 (默认为3天)\n     */\n    @TableField(\"expire_warning_days\")\n    private Integer expireWarningDays;\n}"
         });
@@ -2673,7 +3420,7 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.txt","old_string":"dup","new_string":"x"}"#,
+                r#"{"path":"a.txt","old_string":"dup","new_string":"x"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2694,7 +3441,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() { 1 }\nfn b() { 2 }\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": [
                 {"old_string": "fn a() { 1 }", "new_string": "fn a() { 1 }"},
                 {"old_string": "fn b() { 2 }", "new_string": "fn b() { 20 }"}
@@ -2720,7 +3467,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() { 1 }\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": [
                 {"old_string": "fn a() { 1 }", "new_string": "fn a() { 1 }"}
             ]
@@ -2745,7 +3492,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "dup\nkeep\ndup\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": [
                 {"old_string": "dup", "new_string": "second", "occurrence": 2}
             ]
@@ -2766,7 +3513,7 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "dup\ndup\ndup\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.txt","old_string":"dup","new_string":"x","replace_all":true}"#,
+                r#"{"path":"a.txt","old_string":"dup","new_string":"x","replace_all":true}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2785,7 +3532,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.txt",
+            "path": "a.txt",
             "replace_all": true,
             "edits": [{"old_string": "dup", "new_string": "x"}]
         });
@@ -2807,7 +3554,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.txt",
+            "path": "a.txt",
             "edits": [{"old_string": "dup", "new_string": "x", "replace_all": true}]
         });
         let r = EditFileTool
@@ -2847,7 +3594,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "dup\ndup\ndup\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.txt",
+            "path": "a.txt",
             "edits": [{"old_string": "dup", "new_string": "x", "replace_all": true, "occurrence": 2}]
         });
         let r = EditFileTool
@@ -2867,7 +3614,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
         let args = serde_json::json!({
-            "file_path": "a.txt",
+            "path": "a.txt",
             "edits": [
                 {"old_string": "hello", "new_string": "world"},
                 {"new_string": "新增"}
@@ -2890,7 +3637,7 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.txt","old_string":"absent","new_string":"x"}"#,
+                r#"{"path":"a.txt","old_string":"absent","new_string":"x"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2921,7 +3668,7 @@ mod tests {
         .unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"router.js","old_string":"  path: '/help',\n  next: 1,","new_string":"  path: '/proxyCase',\n  next: 1,"}"#,
+                r#"{"path":"router.js","old_string":"  path: '/help',\n  next: 1,","new_string":"  path: '/proxyCase',\n  next: 1,"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2946,7 +3693,7 @@ mod tests {
         std::fs::write(d.path().join("m.txt"), "head\r\nalpha\nbeta\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"m.txt","old_string":"alpha\nbeta","new_string":"alpha\nBETA"}"#,
+                r#"{"path":"m.txt","old_string":"alpha\nbeta","new_string":"alpha\nBETA"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2967,7 +3714,7 @@ mod tests {
         std::fs::write(d.path().join("c.txt"), "a\r\nb\r\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"c.txt","old_string":"a\nb","new_string":"a\r\nb"}"#,
+                r#"{"path":"c.txt","old_string":"a\nb","new_string":"a\r\nb"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -2985,7 +3732,7 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "abc").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.txt","old_string":"","new_string":"X","replace_all":true}"#,
+                r#"{"path":"a.txt","old_string":"","new_string":"X","replace_all":true}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3007,7 +3754,7 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), "let x = 1;\nlet y = 2;\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.rs","old_string":"let x = 1;\nlet y = 2;","new_string":"let x = 9;\nlet y = 2;"}"#,
+                r#"{"path":"a.rs","old_string":"let x = 1;\nlet y = 2;","new_string":"let x = 9;\nlet y = 2;"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3033,7 +3780,7 @@ mod tests {
         .unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
+                r#"{"path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3068,7 +3815,7 @@ mod tests {
         // Model copied LF text (read strips \r) with SPACE indentation.
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
+                r#"{"path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3087,7 +3834,7 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "\tx\n").unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.txt","old_string":"  x","new_string":"  y"}"#,
+                r#"{"path":"a.txt","old_string":"  x","new_string":"  y"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3123,7 +3870,7 @@ mod tests {
         .unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"f.rs","old_string":"    let a = 1;\n    let b = 20;\n    let c = 3;","new_string":"    let a = 1;\n    let b = 99;\n    let c = 3;"}"#,
+                r#"{"path":"f.rs","old_string":"    let a = 1;\n    let b = 20;\n    let c = 3;","new_string":"    let a = 1;\n    let b = 99;\n    let c = 3;"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3150,7 +3897,7 @@ mod tests {
         let r = EditFileTool
             .execute(
                 // first/last match, but all 3 interior lines are wrong → 2/5 < half → reject.
-                r#"{"file_path":"a.txt","old_string":"start marker\nWRONG a\nWRONG b\nWRONG c\nend marker","new_string":"start marker\nX\nend marker"}"#,
+                r#"{"path":"a.txt","old_string":"start marker\nWRONG a\nWRONG b\nWRONG c\nend marker","new_string":"start marker\nX\nend marker"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3177,7 +3924,7 @@ mod tests {
         let r = EditFileTool
             .execute(
                 // first/last match; BOTH interior lines wrong → matched 2/4 → reject.
-                r#"{"file_path":"a.txt","old_string":"region top\nWRONG one\nWRONG two\nregion bottom","new_string":"region top\nX\nregion bottom"}"#,
+                r#"{"path":"a.txt","old_string":"region top\nWRONG one\nWRONG two\nregion bottom","new_string":"region top\nX\nregion bottom"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3207,7 +3954,7 @@ mod tests {
         let r = EditFileTool
             .execute(
                 // Model copied with spaces; new_string's 2nd line is OUTDENTED to column 0.
-                r#"{"file_path":"f.rs","old_string":"    let a = 1;\n    let b = 2;","new_string":"    let a = 1;\ndone();"}"#,
+                r#"{"path":"f.rs","old_string":"    let a = 1;\n    let b = 2;","new_string":"    let a = 1;\ndone();"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3232,7 +3979,7 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), original).unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.txt","old_string":"open block\n  drifted\nclose block","new_string":"open block\n  changed\nclose block"}"#,
+                r#"{"path":"a.txt","old_string":"open block\n  drifted\nclose block","new_string":"open block\n  changed\nclose block"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3255,7 +4002,7 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), original).unwrap();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.rs","old_string":"{\n    bar();\n}","new_string":"{\n    baz();\n}"}"#,
+                r#"{"path":"a.rs","old_string":"{\n    bar();\n}","new_string":"{\n    baz();\n}"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3282,7 +4029,7 @@ mod tests {
         // fuzzy path fires.
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"f.py","old_string":"    x = 1\n    y = 2","new_string":"    x = 99\n    y = 2"}"#,
+                r#"{"path":"f.py","old_string":"    x = 1\n    y = 2","new_string":"    x = 99\n    y = 2"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3307,7 +4054,7 @@ mod tests {
         let r = EditFileTool
             .execute(
                 &format!(
-                    r#"{{"file_path":"calc.rs","old_string":{},"new_string":{}}}"#,
+                    r#"{{"path":"calc.rs","old_string":{},"new_string":{}}}"#,
                     serde_json::to_string(old_str).unwrap(),
                     serde_json::to_string(new_str).unwrap()
                 ),
@@ -3337,7 +4084,7 @@ mod tests {
         let r = EditFileTool
             .execute(
                 &format!(
-                    r#"{{"file_path":"main.rs","old_string":{},"new_string":{}}}"#,
+                    r#"{{"path":"main.rs","old_string":{},"new_string":{}}}"#,
                     serde_json::to_string(old_str).unwrap(),
                     serde_json::to_string(new_str).unwrap()
                 ),
@@ -3361,7 +4108,7 @@ mod tests {
 
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"act.rs","old_string":"let state = get_state();\nstate.validate_and_rollback();","new_string":"let state = get_state();"}"#,
+                r#"{"path":"act.rs","old_string":"let state = get_state();\nstate.validate_and_rollback();","new_string":"let state = get_state();"}"#,
                 &ctx(d.path()),
             )
             .await;
@@ -3372,11 +4119,7 @@ mod tests {
             r.content
         );
         assert!(r.content.contains("```diff"), "{}", r.content);
-        assert!(
-            r.content.contains("Exact Line Discrepancy"),
-            "{}",
-            r.content
-        );
+        assert!(r.content.contains("👉 Conflict found"), "{}", r.content);
         assert!(
             r.content.contains("adjust your old_string"),
             "{}",
@@ -3390,7 +4133,7 @@ mod tests {
         std::fs::write(d.path().join("code.rs"), "fn foo() {\n    bar();\n}\n").unwrap();
         // Model accidentally copied read output prefix "1→" and "2→"
         let args = serde_json::json!({
-            "file_path": "code.rs",
+            "path": "code.rs",
             "edits": [
                 {
                     "old_string": "1→fn foo() {\n2→    bar();",
@@ -3406,6 +4149,17 @@ mod tests {
             std::fs::read_to_string(d.path().join("code.rs")).unwrap(),
             "fn foo() {\n    baz();\n}\n"
         );
+    }
+
+    #[test]
+    fn schema_advertises_path_only() {
+        let schema = EditFileTool.parameters_schema();
+        assert!(schema["properties"].get("path").is_some());
+        assert!(
+            schema["properties"].get("file_path").is_none(),
+            "legacy file_path must stay internal-only"
+        );
+        assert_eq!(schema["required"], serde_json::json!(["path", "edits"]));
     }
 
     #[test]
@@ -3426,7 +4180,7 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), "fn a() { 1 }\nfn b() { 2 }\n").unwrap();
         let inner = r#"[{"old_string":"fn a() { 1 }","new_string":"fn a() { 10 }"}]"#;
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": inner
         })
         .to_string();
@@ -3450,7 +4204,7 @@ mod tests {
         // inner JSON snippet — the common provider/model double-encoding miss.
         let inner = "[{ \"old_string\": \"let x = 1;\nlet y = 2;\", \"new_string\": \"let x = 9;\nlet y = 2;\" }]";
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": inner
         })
         .to_string();
@@ -3472,7 +4226,7 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), "fn a() { 1 }\n").unwrap();
         let inner = r#"[{"old_string":"fn a() { 1 }","new_string":"fn a() { 10 }""#;
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": inner
         })
         .to_string();
@@ -3494,7 +4248,7 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), "fn a() { 1 }\n").unwrap();
         let inner = r#"[{"old_string":"fn a() { 1 }","new_string":"fn a() { 10"#;
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": inner
         })
         .to_string();
@@ -3547,7 +4301,7 @@ fn b() { 2 }
                 r#"[{{"old_string":"fn a() {{ 1 }}","new_string":"fn a() {{ 10 }}"}},{}"#,
                 tail
             );
-            let args = serde_json::json!({"file_path":"a.rs", "edits":inner}).to_string();
+            let args = serde_json::json!({"path":"a.rs", "edits":inner}).to_string();
             let r = EditFileTool.execute(&args, &ctx(d.path())).await;
             assert!(r.is_error, "partial request must fail: {}", r.content);
             assert_eq!(
@@ -3576,7 +4330,7 @@ fn b() { 2 }
             serde_json::json!([{"old_string":"a", "new_string":"changed"}, {"old_string":"b"}]),
         ] {
             for sibling in [false, true] {
-                let mut value = serde_json::json!({"file_path":"a.rs", "edits":edits});
+                let mut value = serde_json::json!({"path":"a.rs", "edits":edits});
                 if sibling {
                     value["hunk"] = serde_json::json!({"old_string":"a", "new_string":"changed"});
                 }
@@ -3601,12 +4355,12 @@ fn b() { 2 }
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn a() { 1 }\n").unwrap();
         let inner = serde_json::json!({
-            "file_path": "ignored.rs",
+            "path": "ignored.rs",
             "edits": [{"old_string":"fn a() { 1 }","new_string":"fn a() { 10 }"}]
         })
         .to_string();
         let args = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": inner
         })
         .to_string();
@@ -3631,7 +4385,7 @@ fn b() { 2 }
         )
         .unwrap();
         let args = serde_json::json!({
-            "file_path": "mod.rs",
+            "path": "mod.rs",
             "edits": r#"[{"old_string":"            \"todowrite\","#,
             "new_string": {
                 "old_string": "            \"todowrite\",",
@@ -3672,7 +4426,7 @@ fn b() { 2 }
 
         let hunk1_new = "# block-a\na1\na2\na3\na4\na5\n";
         let args = serde_json::json!({
-            "file_path": "config.yaml",
+            "path": "config.yaml",
             "edits": [
                 {
                     "old_string": "# block-a\na1\na2",
@@ -3708,7 +4462,7 @@ fn b() { 2 }
         let new_str = "    let value = 456;\n    let next = value + 1;";
 
         let args = serde_json::json!({
-            "file_path": "example.rs",
+            "path": "example.rs",
             "old_string": old_str,
             "new_string": new_str
         });
@@ -3718,22 +4472,23 @@ fn b() { 2 }
             .await;
         assert!(!r.is_error, "auto-heal must succeed: {}", r.content);
         assert!(
-            r.content.contains("⚠️ **[自动安全修改提示]**："),
+            r.content.contains("⚠️ **[Auto-heal Note]**:"),
             "should contain the warning header: {}",
             r.content
         );
         assert!(
-            r.content.contains("你的 old_string 存在冲突，已为你自动执行成功后的安全修改，请你下次如果修改涉及到这块old str 请记得使用新的old str 不用去读源文件。"),
-            "should contain exact user-specified notice: {}",
+            r.content
+                .contains("A conflict in old_string was safely resolved and applied."),
+            "should contain exact notice: {}",
             r.content
         );
         assert!(
-            r.content.contains("当前位置最新的实际 old_string 为："),
+            r.content.contains("use the latest content below:"),
             "should contain latest actual old_string section: {}",
             r.content
         );
         assert!(
-            r.content.contains("本次修改已成功！以下为最终生效的差异："),
+            r.content.contains("Edit applied successfully!"),
             "should contain success summary: {}",
             r.content
         );
@@ -3757,7 +4512,7 @@ fn b() { 2 }
         std::fs::write(d.path().join("hello.rs"), content).unwrap();
 
         let args = serde_json::json!({
-            "file_path": "hello.rs",
+            "path": "hello.rs",
             "old_string": "    println!(\"world\");",
             "new_string": "    println!(\"jeikcode\");"
         });
@@ -3767,7 +4522,7 @@ fn b() { 2 }
             .await;
         assert!(!r.is_error, "exact match must succeed: {}", r.content);
         assert!(
-            !r.content.contains("自动安全修改提示"),
+            !r.content.contains("Auto-heal Note"),
             "exact match should NOT emit auto-heal notice: {}",
             r.content
         );
@@ -3805,7 +4560,7 @@ fn b() { 2 }
         // Pass in the order [Hunk B, Hunk A] which would fail without topological sorting
         // because B modifies step2, breaking A's read context.
         let args = serde_json::json!({
-            "file_path": "proc.rs",
+            "path": "proc.rs",
             "edits": [hunk_b, hunk_a]
         });
 
@@ -3838,7 +4593,7 @@ fn b() { 2 }
 
         // Turn 1: Modify alpha
         let args1 = serde_json::json!({
-            "file_path": "calc.rs",
+            "path": "calc.rs",
             "old_string": "fn alpha() { 1 }",
             "new_string": "fn alpha() { 100 }"
         });
@@ -3849,7 +4604,7 @@ fn b() { 2 }
 
         // Turn 2: Modify beta
         let args2 = serde_json::json!({
-            "file_path": "calc.rs",
+            "path": "calc.rs",
             "old_string": "fn beta() { 2 }",
             "new_string": "fn beta() { 200 }"
         });
@@ -3861,7 +4616,7 @@ fn b() { 2 }
         // Turn 3: Model has attention time-travel and emits edit based on Turn 0 (before beta was modified):
         // old_string includes the old `beta` as context
         let args3 = serde_json::json!({
-            "file_path": "calc.rs",
+            "path": "calc.rs",
             "old_string": "fn beta() { 2 }\nfn gamma() { 3 }",
             "new_string": "fn beta() { 2 }\nfn gamma() { 999 }"
         });
@@ -3874,7 +4629,7 @@ fn b() { 2 }
             r3.content
         );
         assert!(
-            r3.content.contains("⚠️ **[自动安全修改提示]**："),
+            r3.content.contains("⚠️ **[Auto-heal Note]**:"),
             "should emit auto-heal notice: {}",
             r3.content
         );
@@ -3908,7 +4663,7 @@ fn b() { 2 }
         .join("\n");
 
         let args = serde_json::json!({
-            "file_path": "scenario1.txt",
+            "path": "scenario1.txt",
             "edits": [
                 {
                     "old_string": "AAA_top = 1",
@@ -3953,7 +4708,7 @@ fn b() { 2 }
         // Pass [hunk_write_line1, hunk_read1_write2]: naive execution would overwrite line 1 first,
         // causing hunk_read1_write2 to fail matching.
         let args = serde_json::json!({
-            "file_path": "scenario2.txt",
+            "path": "scenario2.txt",
             "edits": [hunk_write_line1, hunk_read1_write2]
         });
 
@@ -3988,7 +4743,7 @@ fn b() { 2 }
         std::fs::write(d.path().join("hunk_index.txt"), &initial).unwrap();
 
         let args = serde_json::json!({
-            "file_path": "hunk_index.txt",
+            "path": "hunk_index.txt",
             "edits": [
                 {
                     "old_string": "AAA_TYPO = 1",
@@ -4035,7 +4790,7 @@ fn b() { 2 }
 
         // Turn 1
         let args1 = serde_json::json!({
-            "file_path": "scenario3.txt",
+            "path": "scenario3.txt",
             "old_string": "AAA_port = 8080",
             "new_string": "BBB_port = 9000"
         });
@@ -4046,7 +4801,7 @@ fn b() { 2 }
 
         // Turn 2 (Stale context from V0)
         let args2 = serde_json::json!({
-            "file_path": "scenario3.txt",
+            "path": "scenario3.txt",
             "old_string": "AAA_port = 8080\nAAA_host = \"127.0.0.1\"\nAAA_timeout = 30",
             "new_string": "AAA_port = 8080\nAAA_host = \"127.0.0.1\"\nCCC_timeout = 60"
         });
@@ -4059,7 +4814,7 @@ fn b() { 2 }
             r2.content
         );
         assert!(
-            r2.content.contains("⚠️ **[自动安全修改提示]**："),
+            r2.content.contains("⚠️ **[Auto-heal Note]**:"),
             "should emit auto-heal notice: {}",
             r2.content
         );
@@ -4090,7 +4845,7 @@ fn b() { 2 }
 
         // Turn 1: Replace AAA with BBB
         let args1 = serde_json::json!({
-            "file_path": "scenario4.txt",
+            "path": "scenario4.txt",
             "old_string": "AAA_item = \"original\";",
             "new_string": "BBB_item = \"modified\";"
         });
@@ -4105,7 +4860,7 @@ fn b() { 2 }
 
         // Turn 2: Addition at previous site (append CCC)
         let args2 = serde_json::json!({
-            "file_path": "scenario4.txt",
+            "path": "scenario4.txt",
             "old_string": "BBB_item = \"modified\";",
             "new_string": "BBB_item = \"modified\";\nCCC_addition = \"appended\";"
         });
@@ -4120,7 +4875,7 @@ fn b() { 2 }
 
         // Turn 3: Deletion at previous site (delete BBB, leaving CCC)
         let args3 = serde_json::json!({
-            "file_path": "scenario4.txt",
+            "path": "scenario4.txt",
             "old_string": "BBB_item = \"modified\";\n",
             "new_string": ""
         });
@@ -4151,7 +4906,7 @@ fn b() { 2 }
 
         for (old_s, new_s) in steps {
             let args = serde_json::json!({
-                "file_path": "scenario5.txt",
+                "path": "scenario5.txt",
                 "old_string": old_s,
                 "new_string": new_s
             });
@@ -4182,7 +4937,7 @@ fn b() { 2 }
 
         // Turn 1
         let args1 = serde_json::json!({
-            "file_path": "scenario6.txt",
+            "path": "scenario6.txt",
             "old_string": "AAA_val = 10;",
             "new_string": "BBB_val = 20;"
         });
@@ -4193,7 +4948,7 @@ fn b() { 2 }
 
         // Turn 2: Conflicting modification on same line
         let args2 = serde_json::json!({
-            "file_path": "scenario6.txt",
+            "path": "scenario6.txt",
             "old_string": "AAA_val = 10;",
             "new_string": "CCC_val = 30;"
         });
@@ -4259,7 +5014,7 @@ fn b() { 2 }
         let r = EditFileTool
             .execute(
                 &serde_json::json!({
-                    "file_path": "ApiProxy.tsx",
+                    "path": "ApiProxy.tsx",
                     "old_string": old_str,
                     "new_string": new_str
                 })
@@ -4298,7 +5053,7 @@ fn b() { 2 }
         ctx.cancel.cancel();
         let r = EditFileTool
             .execute(
-                r#"{"file_path":"a.rs","old_string":"fn a() { 1 }","new_string":"fn a() { 2 }"}"#,
+                r#"{"path":"a.rs","old_string":"fn a() { 1 }","new_string":"fn a() { 2 }"}"#,
                 &ctx,
             )
             .await;
@@ -4355,7 +5110,7 @@ fn b() { 2 }
         let r = EditFileTool
             .execute(
                 &serde_json::json!({
-                    "file_path": "code.rs",
+                    "path": "code.rs",
                     "edits": [
                         { "old_string": "fn first() { 1 }", "new_string": "fn first() { 10 }" },
                         { "old_string": "fn non_existent()", "new_string": "fn replaced()" }
@@ -4415,7 +5170,11 @@ fn b() { 2 }
         std::fs::write(&file_b, chat_code).unwrap();
 
         // 记录 GitPanel.tsx 为最近成功修改过的文件
-        crate::tools::edit_history::record_version(&file_a, git_panel_code);
+        crate::tools::edit_history::record_version(
+            &file_a,
+            git_panel_code,
+            crate::tools::edit_history::HistoryPlan::Full,
+        );
 
         let file_b_norm = NormalizedFile::new(chat_code);
         let old_str_from_a = "  // 彻底移除盲目轮询，仅在窗口切回时刷新\n  useEffect(() => {\n    gitStore.scheduleRefresh();\n  }, []);";
@@ -4444,13 +5203,13 @@ fn b() { 2 }
         assert!(
             hint.contains("[Content Mismatch]: Closest matching block found around lines")
                 && hint.contains("```diff")
-                && hint.contains("(Hint: adjust your old_string to match the actual file content above; surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)"),
+                && hint.contains("(Hint: surrounding context lines without '-' or '+' are for location reference only; do not blindly re-read the whole file)"),
             "Expected expanded Unified Diff, got: {hint}"
         );
     }
 
     #[test]
-    fn test_structured_mismatch_diff_with_line_numbers_and_discrepancy() {
+    fn test_structured_mismatch_diff_with_line_numbers() {
         let content =
             "line 1\nline 2\n```bash [Linux]\ncurl install.sh | bash\n```\nline 7\nline 8\n";
         let file_norm = NormalizedFile::new(content);
@@ -4462,12 +5221,11 @@ fn b() { 2 }
             find_closest_match_snippet(Some(path), &file_norm, old_str_with_trailing).unwrap();
 
         assert!(hint.contains("in scripts/test.md"));
-        assert!(hint.contains("👉 Exact Line Discrepancy"));
-        assert!(hint.contains("Notice extra trailing characters in your input: \"}],path:\""));
+        assert!(hint.contains("👉 Conflict found — adjust your old_string"));
         assert!(hint.contains(
             "Below is the discrepancy between your old_string and the actual file content:"
         ));
-        assert!(hint.contains("Lines with '-' are the mismatched or erroneous line(s)"));
+        assert!(hint.contains("Lines with '-' come from your old_string"));
         assert!(hint.contains("2 | line 2")); // 上下文行不带任何 - 或 +
         assert!(hint.contains("-    5 | ```}],path:"));
         assert!(hint.contains("+    5 | ```"));
@@ -4501,7 +5259,7 @@ fn b() { 2 }
         let r = EditFileTool
             .execute(
                 &serde_json::json!({
-                    "file_path": "code.rs",
+                    "path": "code.rs",
                     "edits": [
                         { "old_string": "fn missing_1()", "new_string": "fn rep1()" },
                         { "old_string": "fn b() { 2 }", "new_string": "fn b() { 20 }" },
@@ -4541,12 +5299,354 @@ fn b() { 2 }
             "function demo() {\n  const a = 1;\n  const c = 3;\n  return a + b + c;\n}";
         let hint = find_closest_match_snippet(None, &file_norm, old_str_missing_b).unwrap();
 
-        assert!(hint.contains("👉 Exact Line Discrepancy"), "hint: {hint}");
+        assert!(hint.contains("👉 Conflict found"), "hint: {hint}");
         assert!(hint.contains("const b = 2;"), "hint: {hint}");
         assert!(
             hint.contains("```diff"),
             "hint should still retain expanded diff: {hint}"
         );
+    }
+
+    fn marked_lines(hint: &str, marker: char) -> Vec<(usize, String)> {
+        hint.lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix(marker)?.strip_prefix(' ')?;
+                let (no, text) = rest.split_once(" | ")?;
+                Some((no.trim().parse().ok()?, text.to_string()))
+            })
+            .collect()
+    }
+
+    /// Both '-' and '+' numbers are physical file lines; '--' marks an old line
+    /// with no counterpart (skipped by the parser). Neither side may repeat or
+    /// regress, and the same visible line must never be marked as both removed
+    /// and added (the old trailing-newline artifact).
+    fn assert_diff_invariants(hint: &str) {
+        let minus = marked_lines(hint, '-');
+        let plus = marked_lines(hint, '+');
+        for (name, lines) in [("-", &minus), ("+", &plus)] {
+            let mut prev = 0;
+            for (no, _) in lines {
+                assert!(
+                    *no > prev,
+                    "{name} line numbers must be unique and ascending: {no}\n{hint}"
+                );
+                prev = *no;
+            }
+        }
+        let minus_texts: std::collections::HashSet<&str> =
+            minus.iter().map(|(_, text)| text.as_str()).collect();
+        for (_, text) in &plus {
+            assert!(
+                !minus_texts.contains(text.as_str()),
+                "the same line must never be marked as both '-' and '+': {text:?}\n{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_line_replace_keeps_block_together_and_never_reports_missing_lines() {
+        let content = "function demo() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  const d = 4;\n  return a + b + c + d;\n}\n";
+        let file_norm = NormalizedFile::new(content);
+        // Two consecutive wrong lines + a trailing newline (the old phantom-
+        // Replace trigger). The whole 2->2 block must stay one unit.
+        let old = "function demo() {\n  const a = 1;\n  const wrongB = 20;\n  const wrongC = 30;\n  const d = 4;\n  return a + b + c + d;\n}\n";
+        let hint = find_closest_match_snippet(None, &file_norm, old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "a line that exists in the file must never be reported as missing: {hint}"
+        );
+        assert!(hint.contains("-    3 |   const wrongB = 20;"), "{hint}");
+        assert!(hint.contains("-    4 |   const wrongC = 30;"), "{hint}");
+        assert!(hint.contains("+    3 |   const b = 2;"), "{hint}");
+        assert!(hint.contains("+    4 |   const c = 3;"), "{hint}");
+        assert!(hint.contains("👉 Conflict found"), "{hint}");
+    }
+
+    #[test]
+    fn multi_region_old_string_reports_real_conflicts_without_false_absence() {
+        let content = "const k0 = 0;\n  'tokens.estBadge': '预估',\n  'tokens.estimatedCache': '预估缓存',\n  'tokens.hitBadge': '命中',\n  'tokens.inputLabel': '輸入',\n  'tokens.inputTooltip': '輸入 (history): {n}',\n  'tokens.loopHitLabel': '累計缓存',\n  'tokens.loopSavingsLabel': '累計节省',\n  'tokens.onlineCacheHit': '缓存',\nconst k9 = 9;\n";
+        let file_norm = NormalizedFile::new(content);
+        // 复现真实故障：把文件中相隔几行的 key 拼成一个 old_string。
+        let old = "  'tokens.hitBadge': '命中',\n  'tokens.estBadge': '预设',\n  'tokens.loopHitLabel': '累計缓存',\n  'tokens.loopSavingsLabel': '累計节省',\n";
+        let hint = find_closest_match_snippet(None, &file_norm, old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "hitBadge/estBadge exist in the file; absence must not be fabricated: {hint}"
+        );
+        // Both conflict regions must be visible, not just the first one.
+        assert!(hint.contains("estimatedCache"), "{hint}");
+        assert!(hint.contains("inputLabel"), "{hint}");
+        assert!(hint.contains("预设"), "{hint}");
+        assert!(hint.contains("预估"), "{hint}");
+        // The old line points at the real file line it conflicts with, not at
+        // its own index inside old_string.
+        assert!(hint.contains("👉 Conflict found"), "{hint}");
+        assert!(
+            hint.contains("-    2 |   'tokens.estBadge': '预设',"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn long_multi_region_fixture_reports_every_conflict() {
+        let mut lines = vec!["// long generated fixture".to_string()];
+        for i in 0..40 {
+            lines.push(format!("const filler_a{i} = {i};"));
+        }
+        lines.push("function alphaBlock() {".into());
+        lines.push("  const alpha = 1;".into());
+        lines.push("  const beta = 2;".into());
+        lines.push("  const gamma = 3;".into());
+        lines.push("  return alpha + beta + gamma;".into());
+        lines.push("}".into());
+        for i in 0..40 {
+            lines.push(format!("const filler_b{i} = {i};"));
+        }
+        lines.push("function omegaBlock() {".into());
+        lines.push("  const omega = 10;".into());
+        lines.push("  const sigma = 20;".into());
+        lines.push("  return omega + sigma;".into());
+        lines.push("}".into());
+        let content = lines.join("\n") + "\n";
+        let file_norm = NormalizedFile::new(&content);
+
+        let mut old_lines = vec!["function alphaBlock() {".to_string()];
+        old_lines.push("  const alpha = 1;".into());
+        old_lines.push("  const betaWrong = 2;".into());
+        old_lines.push("  const gammaWrong = 3;".into());
+        old_lines.push("  return alpha + beta + gamma;".into());
+        old_lines.push("}".into());
+        for i in 0..40 {
+            old_lines.push(format!("const filler_b{i} = {i};"));
+        }
+        old_lines.push("function omegaBlock() {".into());
+        old_lines.push("  const omega = 10;".into());
+        old_lines.push("  const sigmaWrong = 20;".into());
+        old_lines.push("  return omega + sigma;".into());
+        old_lines.push("}".into());
+        let old = old_lines.join("\n") + "\n";
+
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+        assert_diff_invariants(&hint);
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "both wrong clusters exist in the file; no absence may be fabricated: {hint}"
+        );
+        // Each conflict cluster gets its own action hint + diff block.
+        assert_eq!(hint.matches("👉 Conflict found").count(), 2, "{hint}");
+        // Both clusters must be reported, not just the first one.
+        assert!(
+            hint.contains("betaWrong") && hint.contains("gammaWrong"),
+            "{hint}"
+        );
+        assert!(hint.contains("sigmaWrong"), "{hint}");
+        assert!(hint.contains("const beta = 2;"), "{hint}");
+        assert!(hint.contains("const sigma = 20;"), "{hint}");
+        // '-' lines use the same physical file numbers as '+' lines; the old
+        // string's own line numbers (3/4/49) must never leak into the diff.
+        assert!(hint.contains("-   44 |   const betaWrong = 2;"), "{hint}");
+        assert!(hint.contains("-   45 |   const gammaWrong = 3;"), "{hint}");
+        assert!(hint.contains("+   44 |   const beta = 2;"), "{hint}");
+        assert!(hint.contains("+   45 |   const gamma = 3;"), "{hint}");
+        assert!(hint.contains("-   90 |   const sigmaWrong = 20;"), "{hint}");
+        assert!(hint.contains("+   90 |   const sigma = 20;"), "{hint}");
+        assert!(!hint.contains("-    3 |   const betaWrong"), "{hint}");
+        assert!(!hint.contains("-   49 |   const sigmaWrong"), "{hint}");
+    }
+
+    fn one_block_fixture(wrong: &[usize]) -> (String, String) {
+        let mut lines = vec!["// header".to_string()];
+        for i in 0..10 {
+            lines.push(format!("const pre{i} = {i};"));
+        }
+        lines.push("function settings() {".into());
+        for i in 0..30 {
+            lines.push(format!("  const v{i} = {i};"));
+        }
+        lines.push("}".into());
+        let content = lines.join("\n") + "\n";
+
+        let mut old_lines = vec!["function settings() {".to_string()];
+        for i in 0..30 {
+            if wrong.contains(&i) {
+                old_lines.push(format!("  const v{i}Wrong = {i};"));
+            } else {
+                old_lines.push(format!("  const v{i} = {i};"));
+            }
+        }
+        old_lines.push("}".into());
+        (content, old_lines.join("\n") + "\n")
+    }
+
+    #[test]
+    fn one_block_with_sparse_mismatches_prints_multiple_hunks() {
+        // One contiguous old_string, three wrong lines separated by 8 Equal
+        // lines each (> 2*context), so each cluster must get its own
+        // discrepancy + diff block.
+        let (content, old) = one_block_fixture(&[3, 12, 21]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 3, "{hint}");
+        for (file_line, wrong, right) in [
+            (16, "v3Wrong", "v3"),
+            (25, "v12Wrong", "v12"),
+            (34, "v21Wrong", "v21"),
+        ] {
+            assert!(
+                hint.contains(&format!("-   {file_line} |   const {wrong} = ")),
+                "{hint}"
+            );
+            assert!(
+                hint.contains(&format!("+   {file_line} |   const {right} = ")),
+                "{hint}"
+            );
+        }
+        // old_string indices 5/14/23 must never appear as file lines.
+        assert!(!hint.contains("-    5 |   const v3Wrong"), "{hint}");
+        assert!(!hint.contains("-   14 |   const v12Wrong"), "{hint}");
+        assert!(!hint.contains("-   23 |   const v21Wrong"), "{hint}");
+        assert!(
+            !hint.contains("<no corresponding line at this position>"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn one_block_with_near_mismatches_merges_into_one_hunk() {
+        // Two wrong lines separated by only 2 Equal lines (<= 2*context) stay
+        // in one hunk, but both conflict runs are still printed.
+        let (content, old) = one_block_fixture(&[3, 6]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 1, "{hint}");
+        assert!(hint.contains("-   16 |   const v3Wrong = 3;"), "{hint}");
+        assert!(hint.contains("-   19 |   const v6Wrong = 6;"), "{hint}");
+        assert!(hint.contains("+   16 |   const v3 = 3;"), "{hint}");
+        assert!(hint.contains("+   19 |   const v6 = 6;"), "{hint}");
+        // Exactly three context lines above the first change and below the last.
+        assert!(hint.contains("   13 |   const v0 = 0;"), "{hint}");
+        assert!(hint.contains("   22 |   const v9 = 9;"), "{hint}");
+        assert!(!hint.contains("   12 | function settings()"), "{hint}");
+        assert!(!hint.contains("   23 |   const v10 = 10;"), "{hint}");
+    }
+
+    #[test]
+    fn hunk_merge_boundary_is_six_unchanged_lines() {
+        // Gap of 6 untouched lines -> the +/- 3 context windows touch, so the
+        // two conflicts merge into one hunk.
+        let (content, old) = one_block_fixture(&[3, 10]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 1, "{hint}");
+        // v3 is line 16, v10 is line 23; merged context = 13..26.
+        assert!(hint.contains("   13 |   const v0 = 0;"), "{hint}");
+        assert!(hint.contains("   26 |   const v13 = 13;"), "{hint}");
+        assert!(!hint.contains("   12 | function settings()"), "{hint}");
+        assert!(!hint.contains("   27 |   const v14 = 14;"), "{hint}");
+        assert!(hint.contains("-   16 |   const v3Wrong = 3;"), "{hint}");
+        assert!(hint.contains("-   23 |   const v10Wrong = 10;"), "{hint}");
+
+        // Gap of 7 untouched lines -> a one-line hole remains, so they split.
+        let (content, old) = one_block_fixture(&[3, 11]);
+        let file_norm = NormalizedFile::new(&content);
+        let hint = find_closest_match_snippet(None, &file_norm, &old).unwrap();
+        assert_diff_invariants(&hint);
+        assert_eq!(hint.matches("👉 Conflict found").count(), 2, "{hint}");
+        // Hunk 1 = 13..19, hunk 2 = 21..27; line 20 is the middle of the gap.
+        assert!(hint.contains("   19 |   const v6 = 6;"), "{hint}");
+        assert!(hint.contains("   21 |   const v8 = 8;"), "{hint}");
+        assert!(!hint.contains("   20 |   const v7 = 7;"), "{hint}");
+        assert!(hint.contains("   27 |   const v14 = 14;"), "{hint}");
+    }
+
+    /// Manual end-to-end smoke: node generates a long fixture and an
+    /// old_string with multiple cross-region conflicts, then the real tool is
+    /// invoked against it. Run with --ignored --nocapture and both env vars.
+    #[tokio::test]
+    #[ignore = "manual smoke: set JEIKCODE_EDIT_DIAG_FIXTURE / JEIKCODE_EDIT_DIAG_OLD"]
+    async fn manual_node_fixture_multi_region_diagnostic() {
+        let (Ok(fixture), Ok(old_path)) = (
+            std::env::var("JEIKCODE_EDIT_DIAG_FIXTURE"),
+            std::env::var("JEIKCODE_EDIT_DIAG_OLD"),
+        ) else {
+            eprintln!("skip: set JEIKCODE_EDIT_DIAG_FIXTURE and JEIKCODE_EDIT_DIAG_OLD");
+            return;
+        };
+        let old = std::fs::read_to_string(&old_path).unwrap();
+        let fixture_path = std::path::PathBuf::from(&fixture);
+        let dir = fixture_path.parent().unwrap().to_path_buf();
+        let name = fixture_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let args = serde_json::json!({
+            "path": name,
+            "edits": [{ "old_string": old, "new_string": "unused" }]
+        })
+        .to_string();
+        let r = EditFileTool.execute(&args, &ctx(&dir)).await;
+        assert!(
+            r.is_error,
+            "the deliberately wrong old_string must fail: {}",
+            r.content
+        );
+        println!("{}", r.content);
+        assert_diff_invariants(&r.content);
+        let allow_extra = std::env::var("JEIKCODE_EDIT_DIAG_ALLOW_EXTRA")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !allow_extra {
+            assert!(
+                !r.content
+                    .contains("<no corresponding line at this position>"),
+                "{}",
+                r.content
+            );
+        }
+        let expected_hunks: usize = std::env::var("JEIKCODE_EDIT_DIAG_EXPECT_HUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        assert_eq!(
+            r.content.matches("👉 Conflict found").count(),
+            expected_hunks,
+            "{}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn test_token_bag_window_boundary_tie_break_avoids_bogus_discrepancy() {
+        let content = "import { test } from 'node:test';\nimport assert from 'node:assert';\nimport {\n  buildTurnNavItems,\n  buildTurnNavItemsFromOutline,\n  filterTurnNavItems,\n  resolveActiveTurnId,\n  truncateTurnNavLabel,\n  turnNavId,\n  turnNavScrollTop,\n} from './turnNav.ts';\n\ntest('turnNavId is stable', () => {});\n";
+        let file_norm = NormalizedFile::new(content);
+
+        // old_string 从 import { 开始，但多写了 compactTurnNavText
+        let old_string = "import {\n  buildTurnNavItems,\n  buildTurnNavItemsFromOutline,\n  compactTurnNavText,\n  filterTurnNavItems,\n  resolveActiveTurnId,\n  truncateTurnNavLabel,\n  turnNavId,\n  turnNavScrollTop,\n} from './turnNav.ts';";
+        let hint = find_closest_match_snippet(None, &file_norm, old_string).unwrap();
+
+        // 核心验证：必须准确定位到真正冲突的 compactTurnNavText 所在行（第 6 行），
+        // 绝不能因为平局先到先得误将第 2 行的 import assert 当作 expected: "" 误报！
+        assert!(hint.contains("compactTurnNavText"), "hint: {hint}");
+        assert!(
+            !hint.contains("import assert"),
+            "hint should not claim line 2 import assert is mismatched: {hint}"
+        );
+        assert!(
+            hint.contains("-   -- |   compactTurnNavText,"),
+            "the extra old line must be visible in the diff: {hint}"
+        );
+        assert!(hint.contains("👉 Conflict found"), "hint: {hint}");
     }
 
     #[tokio::test]
@@ -4562,7 +5662,7 @@ fn b() { 2 }
         let r = EditFileTool
             .execute(
                 &serde_json::json!({
-                    "file_path": "code.rs",
+                    "path": "code.rs",
                     "edits": [
                         { "old_string": "fn head() { 0 }", "new_string": "fn head() { 100 }" },
                         { "old_string": "match output { Ok(()) => () }", "new_string": "match output { Ok(()) => 1 }" },
@@ -4605,7 +5705,7 @@ fn b() { 2 }
         let r = EditFileTool
             .execute(
                 &serde_json::json!({
-                    "file_path": "code.rs",
+                    "path": "code.rs",
                     "edits": [
                         {
                             "old_string": "    init_stage();\n    process_data();",
@@ -4637,5 +5737,226 @@ fn b() { 2 }
         // File must stay 100% untouched on disk
         let on_disk = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(on_disk, initial);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_linked_file_is_refused_without_writing() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("linked.rs");
+        let sibling = d.path().join("sibling.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+        std::fs::hard_link(&target, &sibling).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":"linked.rs","edits":[{"old_string":"main","new_string":"run"}]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "hard links must be refused: {}", r.content);
+        assert!(r.content.contains("hard links"), "{}", r.content);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}\n");
+        assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "fn main() {}\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_replace_preserves_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("script.sh");
+        std::fs::write(&target, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":"script.sh","edits":[{"old_string":"echo old","new_string":"echo new"}]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "atomic replace must preserve the executable bit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_file_is_refused_without_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("readonly.rs");
+        std::fs::write(&target, "const A: u8 = 1;\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":"readonly.rs","edits":[{"old_string":"1","new_string":"2"}]}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "read-only files must be refused: {}", r.content);
+        assert!(r.content.contains("read-only"), "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "const A: u8 = 1;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_lock_serializes_same_key_and_releases_on_drop() {
+        let key = format!(
+            "edit-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = acquire_edit_lock(&key, &cancel).await.expect("first lock");
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            acquire_edit_lock(&key, &cancel),
+        )
+        .await;
+        assert!(blocked.is_err(), "same-key acquisition must wait");
+
+        drop(first);
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_edit_lock(&key, &cancel),
+        )
+        .await
+        .expect("same-key lock should be released")
+        .expect("second lock");
+        drop(second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_outside_workspace_is_refused_before_write() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("secret.rs");
+        std::fs::write(&real, "const SECRET: &str = \"old\";\n").unwrap();
+        let link = ws.path().join("notes.rs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":"notes.rs","edits":[{"old_string":"old","new_string":"new"}]}"#,
+                &ctx(ws.path()),
+            )
+            .await;
+        assert!(r.is_error, "symlink escape must be refused: {}", r.content);
+        assert!(
+            r.content.contains("resolves through a symlink"),
+            "{}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "const SECRET: &str = \"old\";\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_sensitive_in_workspace_file_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let secret = ws.path().join(".env");
+        std::fs::write(&secret, "SECRET=old\n").unwrap();
+        let link = ws.path().join("notes.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":"notes.txt","edits":[{"old_string":"old","new_string":"new"}]}"#,
+                &ctx(ws.path()),
+            )
+            .await;
+        assert!(
+            r.is_error,
+            "sensitive symlink target must be refused: {}",
+            r.content
+        );
+        assert!(r.content.contains("sensitive target"), "{}", r.content);
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET=old\n");
+    }
+
+    #[tokio::test]
+    async fn explicit_sensitive_path_is_not_blocked_by_symlink_guard() {
+        let ws = tempfile::tempdir().unwrap();
+        let env = ws.path().join(".env");
+        std::fs::write(&env, "SECRET=old\n").unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":".env","edits":[{"old_string":"old","new_string":"new"}]}"#,
+                &ctx(ws.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "SECRET=new\n");
+    }
+
+    #[test]
+    fn final_target_outside_workspace_is_rejected() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let resolved = ws.path().join("a.rs");
+        let canonical = outside.path().join("b.rs");
+        let err = validate_resolved_target(&resolved, &canonical, ws.path()).unwrap_err();
+        assert!(err.contains("outside the workspace"), "{err}");
+    }
+
+    #[test]
+    fn final_target_sensitive_is_rejected() {
+        let ws = tempfile::tempdir().unwrap();
+        let resolved = ws.path().join("notes.txt");
+        let canonical = ws.path().join(".env");
+        let err = validate_resolved_target(&resolved, &canonical, ws.path()).unwrap_err();
+        assert!(err.contains("sensitive target"), "{err}");
+    }
+
+    #[test]
+    fn final_target_inside_workspace_is_allowed() {
+        let ws = tempfile::tempdir().unwrap();
+        let resolved = ws.path().join("link.rs");
+        let canonical = ws.path().join("target.rs");
+        validate_resolved_target(&resolved, &canonical, ws.path())
+            .expect("benign in-workspace target");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn benign_workspace_symlink_is_allowed_and_preserved() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = ws.path().join("target.rs");
+        std::fs::write(&target, "const A: u8 = 1;\n").unwrap();
+        let link = ws.path().join("link.rs");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let r = EditFileTool
+            .execute(
+                r#"{"path":"link.rs","edits":[{"old_string":"1","new_string":"2"}]}"#,
+                &ctx(ws.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "const A: u8 = 2;\n"
+        );
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the workspace symlink must be preserved"
+        );
     }
 }

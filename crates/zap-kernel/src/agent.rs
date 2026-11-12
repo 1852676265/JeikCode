@@ -14,6 +14,7 @@ use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ProgressSink, ToolCall, ToolContext, ToolResult};
 use futures::StreamExt;
+use jeikcode_config::i18n;
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -76,7 +77,7 @@ impl Default for ToolLoopPolicy {
     fn default() -> Self {
         Self {
             warning_threshold: 3,
-            stop_threshold: 4,
+            stop_threshold: 5,
         }
     }
 }
@@ -119,12 +120,12 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// waits) so the user perceives a retry is happening AND a fresh connection gets
 /// a real chance to recover (the stale keep-alive class). NON-retryable errors
 /// (auth / 400 / balance) never enter this path — they fail fast.
-const MAX_PROVIDER_RETRIES: u32 = 3;
+const MAX_PROVIDER_RETRIES: u32 = 6;
 /// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
 /// (codex parity: 5). Each reconnect re-issues the SAME round from history
 /// (partial output discarded), with exponential backoff. Distinct from
 /// `MAX_PROVIDER_RETRIES` (which covers failures at OPEN, before any token).
-const MAX_STREAM_RETRIES: u32 = 5;
+const MAX_STREAM_RETRIES: u32 = 6;
 
 /// Max round re-issues after a FIRST-TOKEN timeout (model hasn't emitted ANY
 /// token within `first_token_timeout`). Each retry opens a FRESH connection and
@@ -132,7 +133,7 @@ const MAX_STREAM_RETRIES: u32 = 5;
 /// partial output is never double-pushed). After this budget the turn fails with
 /// the explicit "model unresponsive / high latency" terminal error. User-facing
 /// expectation: 180s wait × retry3 → "模型延迟过高,请稍后再试".
-const MAX_FIRST_TOKEN_RETRIES: u32 = 3;
+const MAX_FIRST_TOKEN_RETRIES: u32 = 6;
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -169,7 +170,7 @@ const SILENT_FIRST_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::
 /// request resent recovers — so it gets MORE attempts and a much SHORTER backoff
 /// than the generic error path (the empty body returns instantly; a long wait is
 /// pure latency). Mirrors v1's `EMPTY_RESPONSE_MAX_RETRIES`.
-const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
+const EMPTY_RESPONSE_MAX_RETRIES: u32 = 6;
 
 /// How many times a turn may auto-continue after the model's output was cut off at
 /// the token limit (`finish_reason=length`) with no tool call. A truncated response
@@ -183,8 +184,8 @@ const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
 /// compares the executed call, effective cwd, result and success state; this fuse
 /// covers the broader failure mode where the model keeps choosing the same action
 /// even while results change, or when a product has disabled exact detection.
-const MAX_REPEAT_ROUNDS: u32 = 6;
-const REPEAT_NUDGE_AT: u32 = 2;
+const MAX_REPEAT_ROUNDS: u32 = 7;
+const REPEAT_NUDGE_AT: u32 = 3;
 const REPEAT_LOOP_NUDGE: &str =
     "You have issued the SAME tool call with the SAME arguments several rounds in a row. \
      Stop repeating it and change your approach. If you are trying to ask the user something, \
@@ -202,11 +203,14 @@ const REPEAT_LOOP_NUDGE: &str =
 ///
 /// Round 1 is evidence. Rounds 2 and 3 remind. Round 4 stops. Two ignored
 /// reminders is enough to call it stuck without dying on the first retry.
-const ECHO_NUDGE_AT: u32 = 2;
-const ECHO_STOP_AT: u32 = 4;
-const ECHO_LOOP_NUDGE: &str = "你死循环了，请你重新思考你的动作。";
-const ECHO_LOOP_NUDGE_FINAL: &str =
-    "你死循环了，请你重新思考你的动作。若再重复相同工具和参数，本回合将停止。";
+const ECHO_NUDGE_AT: u32 = 3;
+const ECHO_STOP_AT: u32 = 5;
+fn echo_loop_nudge() -> String {
+    i18n::format_agent_echo_loop_nudge()
+}
+fn echo_loop_nudge_final() -> String {
+    i18n::format_agent_echo_loop_warning()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolCallOutcome {
@@ -402,16 +406,25 @@ fn strip_leading_parameter_tail(input: &str) -> (String, bool) {
 /// message sniff for transport errors that carry no status. Mirrors v1's
 /// `public_error_reason` but only for the transient (retryable) classes — the
 /// only ones that reach the retry notice.
-fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
+fn retry_reason(e: &crate::stream::ProviderError) -> String {
     match e.http_status {
-        Some(429) => "请求过于频繁或额度已用尽",
-        Some(500 | 502 | 503 | 504 | 529) => "上游服务暂时不可用",
+        Some(429) => i18n::format_agent_status_rate_limited(),
+        Some(504) => format!(
+            "{} (HTTP 504)",
+            i18n::format_agent_status_response_timeout()
+        ),
+        Some(code @ (500 | 502 | 503 | 529)) => {
+            format!(
+                "{} (HTTP {code})",
+                i18n::format_agent_status_upstream_unavailable()
+            )
+        }
         _ => {
             let m = e.message.to_ascii_lowercase();
             if m.contains("timeout") || m.contains("timed out") {
-                "模型响应超时"
+                i18n::format_agent_status_response_timeout()
             } else {
-                "网络连接失败"
+                i18n::format_agent_status_connection_failed()
             }
         }
     }
@@ -495,10 +508,14 @@ fn empty_retry_wait_secs(thinking_only: bool, empty_retries: u32) -> u64 {
     } else {
         empty_retries
     };
-    if n == 0 {
-        0
-    } else {
-        (((n + 1) / 2).min(3)) as u64
+    match n {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 5,
+        5 => 8,
+        _ => 12,
     }
 }
 
@@ -519,47 +536,37 @@ fn empty_exhaustion_message(
     already_advised: bool,
 ) -> String {
     if saw_malformed {
-        return format!(
-            "模型连续 {max_retries} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。"
-        );
+        return i18n::format_agent_exhausted_malformed(max_retries);
     }
     // u64 to avoid overflow on the *10 / *9 scaling for very large windows.
     let budget = input_watermark_budget(ctx_window);
     let near_or_over_window = budget > 0 && (est_prompt_tokens as u64) * 10 >= (budget as u64) * 9;
     if thinking_only {
         if near_or_over_window && already_advised {
-            return format!(
-                "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。"
-            );
+            return i18n::format_agent_exhausted_thinking_over_window_intro(max_retries);
         } else if near_or_over_window {
-            return format!(
-                "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。当前请求约 {}K tokens，已接近或超过模型上下文窗口（约 {}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。",
+            return i18n::format_agent_exhausted_thinking_over_window_size(
+                max_retries,
                 est_prompt_tokens / 1000,
                 ctx_window / 1000,
             );
         } else {
-            return format!(
-                "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。可直接重试，或稍后再试。"
-            );
+            return i18n::format_agent_exhausted_thinking_generic(max_retries);
         }
     }
     if near_or_over_window && already_advised {
         // The pre-send over-window advisory already explained the size cause and
         // the remedy this turn — don't repeat the full size-blame. Keep a SHORT
         // terminal that points back to it.
-        format!(
-            "模型连续 {max_retries} 次返回空响应。如开头所述，本次请求已超过模型上下文窗口——请精简输入或 /compact 后重试。"
-        )
+        i18n::format_agent_exhausted_empty_over_window_intro(max_retries)
     } else if near_or_over_window {
-        format!(
-            "模型连续 {max_retries} 次返回空响应。当前请求约 {}K tokens，已接近或超过模型上下文窗口（约 {}K），很可能是请求过大所致。建议 /compact 或精简输入后重试。",
+        i18n::format_agent_exhausted_empty_over_window_size(
+            max_retries,
             est_prompt_tokens / 1000,
             ctx_window / 1000,
         )
     } else {
-        format!(
-            "模型连续 {max_retries} 次返回空响应（上游偶发，与上下文长度无关）。可直接重试，或稍后再试。"
-        )
+        i18n::format_agent_exhausted_empty_generic(max_retries)
     }
 }
 
@@ -573,16 +580,29 @@ fn empty_exhaustion_message(
 /// "near the limit" at 49% — the "max_tokens folded into the context window" defect.)
 const OUTPUT_WATERMARK_BUFFER: u32 = 20_000;
 
-/// Default per-call output budget when `[models.X] max_tokens` is unset — the 64K tier the
-/// model editor offers (32K / 64K / 128K / 256K / 384K / custom).
-pub const DEFAULT_OUTPUT_BUDGET: u32 = 64_000;
+/// Default per-call output budget when `[models.X] max_tokens` is unset — the 64Ki
+/// tier the model editor offers (32K / 64K / 128K / 256K / 384K / custom).
+pub const DEFAULT_OUTPUT_BUDGET: u32 = 65_536;
 
-/// The output budget handed to the provider this round: the DECLARED value VERBATIM
-/// (`max_tokens` / `max_output_tokens` per protocol), or [`DEFAULT_OUTPUT_BUDGET`] when
-/// unset. The only adjustment is a window sanity clamp — a budget above the window is
-/// protocol-invalid on every gateway. This value never feeds the context/watermark math:
-/// the real output is whatever the model actually generates within it, and real context
-/// pressure comes from the provider's reported usage.
+/// Soft per-request output-budget cap expressed as a fraction of the window
+/// (`window / 8`). A model's declared capability (e.g. 384K) is an upper bound,
+/// not a per-request target: reserving it on every call shrinks the usable input
+/// to `window − capability` and makes gateways reject otherwise valid requests
+/// (`prompt + max_tokens > context`). One eighth of the window is a wide ceiling —
+/// 128Ki on a 1M model, 25Ki on 200K — that still leaves ~7/8 of the window for
+/// the prompt even at the compaction trigger.
+pub const OUTPUT_SOFT_CAP_DIVISOR: u32 = 8;
+
+/// Fallback per-request cap when the context window is UNKNOWN (`window == 0`),
+/// where the window-relative cap can't be computed.
+pub const DEFAULT_REQUEST_MAX_TOKENS: u32 = 65_536;
+
+/// The model's output CAPABILITY ceiling (`max_tokens` / `max_output_tokens` per
+/// protocol), or [`DEFAULT_OUTPUT_BUDGET`] when unset. The only adjustment here is
+/// a window sanity clamp — a budget above the window is protocol-invalid on every
+/// gateway. This is an upper bound only: the per-request value is further capped
+/// by [`DEFAULT_REQUEST_MAX_TOKENS`] and by the remaining context window in
+/// [`wire_output_budget_for_prompt`]. It never feeds the context/watermark math.
 pub fn wire_output_budget(window: u32, declared: Option<u32>) -> u32 {
     let budget = declared.unwrap_or(DEFAULT_OUTPUT_BUDGET);
     let bounded = if window > 0 {
@@ -591,6 +611,51 @@ pub fn wire_output_budget(window: u32, declared: Option<u32>) -> u32 {
         budget
     };
     bounded.max(1)
+}
+
+/// The per-request output budget actually put on the wire.
+///
+/// `[models.X] max_tokens` is a CAPABILITY declaration (the model's maximum
+/// output), but the REST of the window is what the prompt gets to use: gateways
+/// validate `prompt_tokens + max_tokens <= context_window` and answer HTTP 400
+/// once the declared ceiling no longer fits. Sending 384K verbatim killed a long
+/// session precisely at `window - 384K` prompt tokens even though the prompt
+/// itself was well inside the window (opencode-zen returns
+/// `{"model":"…"}` for this rejection).
+///
+/// The wire value is the capability ceiling CLAMPED by, in order:
+///   1. a wide soft cap of `window / 8` ([`OUTPUT_SOFT_CAP_DIVISOR`]), and
+///   2. what actually remains in the window: `window - prompt - 4K guard`.
+///
+/// This mirrors Pi's adaptive clamp (plus a window-relative ceiling). Small
+/// sessions send the soft cap (or the declared capability when smaller); as the
+/// context fills the budget shrinks to exactly the room left. At the compaction
+/// trigger (0.9 × watermark) a 1M window still has ~119K of output room, so the
+/// budget never collapses to a token or two before compaction fires.
+///
+/// The 4K guard is fixed (not a fraction of the prompt) because the prompt anchor
+/// is CONSERVATIVE: it uses the provider's exact last context plus
+/// [`Message::estimate_tokens_conservative`], which counts each CJK char as a full
+/// token. Overestimating only shrinks the output budget; underestimating would
+/// re-open the gateway 400.
+pub fn wire_output_budget_for_prompt(
+    window: u32,
+    declared: Option<u32>,
+    prompt_tokens: u32,
+) -> u32 {
+    let capability = wire_output_budget(window, declared);
+    let soft_cap = if window > 0 {
+        (window / OUTPUT_SOFT_CAP_DIVISOR).max(1)
+    } else {
+        DEFAULT_REQUEST_MAX_TOKENS
+    };
+    let budget = capability.min(soft_cap).max(1);
+    if window == 0 {
+        return budget;
+    }
+    let margin = 4_096.min(window);
+    let remaining = window.saturating_sub(prompt_tokens).saturating_sub(margin);
+    budget.min(remaining.max(1)).max(1)
 }
 
 /// The input WATERMARK budget — the denominator of every pressure decision: the window
@@ -613,8 +678,7 @@ fn over_window_advisory(
     if ctx_window == 0 || (est_prompt_tokens as u64) < (watermark_limit as u64) {
         return None;
     }
-    Some(format!(
-        "请求约 {}K tokens 已达上下文水位（窗口约 {}K − 水位缓冲 {}K）：请精简输入或换用更大窗口的模型。",
+    Some(i18n::format_agent_over_window(
         est_prompt_tokens / 1000,
         ctx_window / 1000,
         ctx_window.saturating_sub(watermark_limit) / 1000,
@@ -639,6 +703,28 @@ fn auto_compact_trigger(
     }
     let utilization = used_tokens as f32 / watermark_budget as f32;
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
+}
+
+/// Mid-turn auto-compaction verdict: evaluate the SAME threshold as the
+/// task-boundary trigger, but against the CURRENT outgoing prompt (conservative
+/// CJK-aware estimate) before every model call. `None` when compaction is
+/// disabled (`compact_threshold` unset), the window is unknown, or pressure is
+/// still below the line.
+fn midturn_auto_utilization(
+    window: u32,
+    threshold: Option<f32>,
+    estimated_prompt: u32,
+) -> Option<f32> {
+    let threshold = threshold?;
+    if window == 0 {
+        return None;
+    }
+    let limit = input_watermark_budget(window);
+    if limit == 0 {
+        return None;
+    }
+    let utilization = estimated_prompt as f32 / limit as f32;
+    (utilization >= threshold).then_some(utilization)
 }
 
 /// Classification of a single tool call for the three-phase tool loop.
@@ -931,11 +1017,11 @@ fn sort_json_object_keys(value: Value) -> Value {
 /// never breaks the append-only wire-prefix (prefix-cache) invariant.
 ///
 /// Kernel-side marker for an artifact-backed preview produced by middleware
-/// (e.g. `ArtifactMiddleware` in zap-capabilities). When present, the
+/// (e.g. `ArtifactMiddleware` in jeikcode-capabilities). When present, the
 /// content is ALREADY a bounded head+marker+tail preview, so the kernel cap
 /// must not truncate it again — re-capping would cut the embedded artifact id
-/// and turn the fetch_output recovery handle into a dead link.
-pub const ARTIFACT_PREVIEW_MARKER: &str = "[jeikcode: output truncated";
+/// and turn the artifact recovery handle into a dead link.
+pub const ARTIFACT_PREVIEW_MARKER: &str = "section of output folded";
 fn cap_tool_result(result: &mut ToolResult, max: usize) {
     if max == 0 {
         return; // unbounded
@@ -983,6 +1069,8 @@ fn cap_tool_result(result: &mut ToolResult, max: usize) {
 pub(crate) struct SteerInput {
     pub text: String,
     pub images: Vec<ImageContent>,
+    /// 客户端铸造的提问 id（`SendMessageWithId` 路径）；折叠后仍用它落盘。
+    pub message_id: Option<String>,
 }
 
 /// Shared, per-turn steer buffer. `process_send_message` pushes; `run_turn`
@@ -1346,9 +1434,10 @@ impl RunningAgent {
     }
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
-    /// `compact_threshold` is configured AND the last stored assistant turn's raw
-    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model's
-    /// WATERMARK budget (`window − min(20K, output budget)`) are `>= threshold`
+    /// `compact_threshold` is configured AND the last stored assistant turn's
+    /// CONTEXT size (`prompt + completion` — what the next request carries)
+    /// recomputed against the CURRENT model's WATERMARK budget
+    /// (`window − min(20K, output budget)`) is `>= threshold`
     /// (default 0.9). The denominator is the watermark budget — NOT the raw window and
     /// NOT the declared output ceiling — so this trigger and the pre-send guard share
     /// one line: a `max_tokens` capability ceiling (e.g. 384K) can no longer shrink the
@@ -1362,13 +1451,31 @@ impl RunningAgent {
     /// threshold. Pure read — never mutates the conversation.
     fn should_compact(&self, convo: &Conversation) -> Option<CompactTrigger> {
         let thresh = self.compact_threshold?;
+        // Measure the context the NEXT request will carry: the provider's prompt
+        // PLUS that response's completion (the assistant output is now part of the
+        // history). `meta.used_tokens` alone is the prompt side, so a 20K response
+        // used to arrive "20K under" the real pressure. Fall back to the
+        // conservative estimator when the provider reported no usage.
         let (recorded_window, used) = convo
             .messages
             .iter()
             .rev()
             .find(|m| m.role == crate::message::Role::Assistant)
             .and_then(|m| m.meta.as_ref())
-            .map(|meta| (meta.ctx_window, meta.used_tokens))?;
+            .map(|meta| {
+                let used = if meta.used_tokens > 0 {
+                    meta.used_tokens
+                } else if meta.tokens.prompt > 0 {
+                    meta.tokens.prompt.saturating_add(meta.tokens.completion)
+                } else {
+                    convo
+                        .messages
+                        .iter()
+                        .map(|m| m.estimate_tokens_conservative())
+                        .sum()
+                };
+                (meta.ctx_window, used)
+            })?;
         // Prefer the live window; fall back to the recorded one only when the live
         // window is unknown (0) — mirrors `run_compaction`, and reproduces the old
         // stored-ratio behavior for the unknown-window case (no regression there).
@@ -1484,16 +1591,14 @@ impl RunningAgent {
                 utilization,
                 sacred_floor: floor,
             };
-            // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
-            // show a "compacting…" progress line — but ONLY if the strategy will
-            // actually do that slow drain/summarize. A manual `/compact` that turns out
-            // to be a no-op (nothing older than the active turn) must NOT show a
-            // spurious "compacting…" line ahead of "nothing to compact" (v1 parity).
-            if self.compaction.will_summarize(&view) {
-                self.rt.emit(AgentEvent::CompactionStarted {
-                    trigger: trigger_for_event.clone(),
-                });
-            }
+            // Announce BEFORE the plan/summary so drivers render a live
+            // "Compacting..." status for EVERY compaction pass — stub-only passes
+            // included. (For a no-op pass the matching `Compacted`/terminal event
+            // clears the status immediately; a brief flash is preferable to the UI
+            // showing "Working..." while a stub/summary is actually running.)
+            self.rt.emit(AgentEvent::CompactionStarted {
+                trigger: trigger_for_event.clone(),
+            });
             self.compaction.plan(&view).await
         };
         // Prepare the complete next conversation without changing the live state.
@@ -1632,18 +1737,43 @@ impl RunningAgent {
                 // → Null (fail-closed), so a stranded approval oneshot can't linger. A
                 // no-op map (the common case) is harmless.
                 AgentCommand::Cancel => self.rt.cancel_pending(),
-                AgentCommand::CancelSteer { text } => {
-                    if let Some(target) = &text {
-                        let trimmed = target.trim();
-                        pending.retain(|cmd| match cmd {
-                            AgentCommand::SendMessage { text: cmd_text, .. } => {
-                                let cmd_trimmed = cmd_text.trim();
-                                !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
-                            }
-                            _ => true,
+                AgentCommand::CancelSteer { text, message_id } => {
+                    if let Some(id) = message_id.as_deref() {
+                        pending.retain(|cmd| {
+                            !matches!(
+                                cmd,
+                                AgentCommand::SendMessageWithId { message_id: cmd_id, .. }
+                                    if cmd_id == id
+                            )
                         });
+                    } else if let Some(target) = &text {
+                        let trimmed = target.trim();
+                        if trimmed.is_empty() {
+                            pending.retain(|cmd| {
+                                !matches!(
+                                    cmd,
+                                    AgentCommand::SendMessage { .. }
+                                        | AgentCommand::SendMessageWithId { .. }
+                                )
+                            });
+                        } else {
+                            pending.retain(|cmd| match cmd {
+                                AgentCommand::SendMessage { text: cmd_text, .. }
+                                | AgentCommand::SendMessageWithId { text: cmd_text, .. } => {
+                                    let cmd_trimmed = cmd_text.trim();
+                                    !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
+                                }
+                                _ => true,
+                            });
+                        }
                     } else {
-                        pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
+                        pending.retain(|cmd| {
+                            !matches!(
+                                cmd,
+                                AgentCommand::SendMessage { .. }
+                                    | AgentCommand::SendMessageWithId { .. }
+                            )
+                        });
                     }
                 }
                 AgentCommand::Respond { id, value } => self.rt.resolve(id, value),
@@ -1670,6 +1800,7 @@ impl RunningAgent {
                             text,
                             images,
                             None,
+                            None,
                         )
                         .await;
                     if shutdown {
@@ -1677,6 +1808,34 @@ impl RunningAgent {
                     }
                     // DRAIN queued mid-turn commands (FIFO) now that the turn is done
                     // and `convo` is free (see `drain_pending`).
+                    if self
+                        .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
+                        .await
+                    {
+                        break;
+                    }
+                }
+                AgentCommand::SendMessageWithId {
+                    text,
+                    images,
+                    message_id,
+                } => {
+                    let shutdown = self
+                        .process_send_message(
+                            &mut convo,
+                            &mut cmd_rx,
+                            &mut pending,
+                            &mut tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                            Some(message_id),
+                            None,
+                        )
+                        .await;
+                    if shutdown {
+                        break;
+                    }
                     if self
                         .drain_pending(&mut convo, &mut cmd_rx, &mut pending, &mut tool_loop_state)
                         .await
@@ -1698,6 +1857,7 @@ impl RunningAgent {
                             PromptKind::User,
                             text,
                             images,
+                            None,
                             Some(context),
                         )
                         .await;
@@ -1725,6 +1885,7 @@ impl RunningAgent {
                             PromptKind::Synthetic,
                             text,
                             Vec::new(),
+                            None,
                             None,
                         )
                         .await;
@@ -1757,6 +1918,8 @@ impl RunningAgent {
         kind: PromptKind,
         mut text: String,
         images: Vec<ImageContent>,
+        // 调用方铸造的持久身份；`None` = 内核自行分配。
+        message_id: Option<String>,
         synthetic_context: Option<String>,
     ) -> bool {
         if let Err(reason) = self.hooks.user_prompt_submit(&mut text).await {
@@ -1797,10 +1960,16 @@ impl RunningAgent {
         if let Some(context) = synthetic_context.filter(|context| !context.trim().is_empty()) {
             convo.push(Message::synthetic_user(context));
         }
-        convo.push(match kind {
+        let mut message = match kind {
             PromptKind::User => Message::user_with_images(text, images),
             PromptKind::Synthetic => Message::synthetic_user(text),
-        });
+        };
+        // 身份契约：调用方给的 id 优先。`Conversation::push` 只在缺省时分配，
+        // 因此这个 id 会原样写进 snapshot / display log / 事件帧，跨端可对账。
+        if let Some(id) = message_id {
+            message.id = Some(id);
+        }
+        convo.push(message);
         // Identity boundary: announce the STORED user message so a client can bind
         // its optimistic first-prompt bubble to the same id the transcript carries
         // (id-based merges across refresh / session switch / replay). Synthetic
@@ -1818,6 +1987,9 @@ impl RunningAgent {
                 self.rt.emit(AgentEvent::UserMessage {
                     message_id,
                     turn_ordinal,
+                    // The prompt was just pushed: its absolute position in the
+                    // conversation (== the persisted snapshot index) is the last row.
+                    message_index: convo.messages.len().saturating_sub(1),
                 });
             }
         }
@@ -1869,16 +2041,24 @@ impl RunningAgent {
                         self.rt.cancel_pending();
                         steer.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     }
-                    Some(AgentCommand::CancelSteer { text }) => {
+                    Some(AgentCommand::CancelSteer { text, message_id }) => {
                         let mut b = steer.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(target) = &text {
+                        if let Some(id) = message_id.as_deref() {
+                            b.retain(|input| input.message_id.as_deref() != Some(id));
+                            pending.retain(|cmd| !matches!(
+                                cmd,
+                                AgentCommand::SendMessageWithId { message_id: cmd_id, .. }
+                                    if cmd_id == id
+                            ));
+                        } else if let Some(target) = &text {
                             let trimmed = target.trim();
                             b.retain(|input| {
                                 let input_text = input.text.trim();
                                 !input_text.contains(trimmed) && !trimmed.contains(input_text)
                             });
                             pending.retain(|cmd| match cmd {
-                                AgentCommand::SendMessage { text: cmd_text, .. } => {
+                                AgentCommand::SendMessage { text: cmd_text, .. }
+                                | AgentCommand::SendMessageWithId { text: cmd_text, .. } => {
                                     let cmd_trimmed = cmd_text.trim();
                                     !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
                                 }
@@ -1886,7 +2066,7 @@ impl RunningAgent {
                             });
                         } else {
                             b.clear();
-                            pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
+                            pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. } | AgentCommand::SendMessageWithId { .. }));
                         }
                     }
                     // QUEUE a mid-turn Snapshot rather than dropping it:
@@ -1916,6 +2096,18 @@ impl RunningAgent {
                         steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput {
                             text,
                             images,
+                            message_id: None,
+                        });
+                    }
+                    Some(AgentCommand::SendMessageWithId {
+                        text,
+                        images,
+                        message_id,
+                    }) => {
+                        steer.lock().unwrap_or_else(|e| e.into_inner()).push_back(SteerInput {
+                            text,
+                            images,
+                            message_id: Some(message_id),
                         });
                     }
                     // A Compact mid-turn is QUEUED, not executed: compacting inside a
@@ -1938,9 +2130,16 @@ impl RunningAgent {
         // run_turn (e.g. Task 2 not yet implemented, or a very late arrival) falls
         // back to the pending deque so the user's prompt is NOT silently lost.
         for s in steer.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
-            pending.push_back(AgentCommand::SendMessage {
-                text: s.text,
-                images: s.images,
+            pending.push_back(match s.message_id {
+                Some(message_id) => AgentCommand::SendMessageWithId {
+                    text: s.text,
+                    images: s.images,
+                    message_id,
+                },
+                None => AgentCommand::SendMessage {
+                    text: s.text,
+                    images: s.images,
+                },
             });
         }
         if shutdown {
@@ -1987,6 +2186,29 @@ impl RunningAgent {
                             text,
                             images,
                             None,
+                            None,
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                }
+                AgentCommand::SendMessageWithId {
+                    text,
+                    images,
+                    message_id,
+                } => {
+                    if self
+                        .process_send_message(
+                            convo,
+                            cmd_rx,
+                            pending,
+                            tool_loop_state,
+                            PromptKind::User,
+                            text,
+                            images,
+                            Some(message_id),
+                            None,
                         )
                         .await
                     {
@@ -2007,6 +2229,7 @@ impl RunningAgent {
                             PromptKind::User,
                             text,
                             images,
+                            None,
                             Some(context),
                         )
                         .await
@@ -2025,6 +2248,7 @@ impl RunningAgent {
                             text,
                             Vec::new(),
                             None,
+                            None,
                         )
                         .await
                     {
@@ -2037,18 +2261,43 @@ impl RunningAgent {
                     self.run_compaction(convo, CompactTrigger::Manual { focus })
                         .await;
                 }
-                AgentCommand::CancelSteer { text } => {
-                    if let Some(target) = &text {
-                        let trimmed = target.trim();
-                        pending.retain(|cmd| match cmd {
-                            AgentCommand::SendMessage { text: cmd_text, .. } => {
-                                let cmd_trimmed = cmd_text.trim();
-                                !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
-                            }
-                            _ => true,
+                AgentCommand::CancelSteer { text, message_id } => {
+                    if let Some(id) = message_id.as_deref() {
+                        pending.retain(|cmd| {
+                            !matches!(
+                                cmd,
+                                AgentCommand::SendMessageWithId { message_id: cmd_id, .. }
+                                    if cmd_id == id
+                            )
                         });
+                    } else if let Some(target) = &text {
+                        let trimmed = target.trim();
+                        if trimmed.is_empty() {
+                            pending.retain(|cmd| {
+                                !matches!(
+                                    cmd,
+                                    AgentCommand::SendMessage { .. }
+                                        | AgentCommand::SendMessageWithId { .. }
+                                )
+                            });
+                        } else {
+                            pending.retain(|cmd| match cmd {
+                                AgentCommand::SendMessage { text: cmd_text, .. }
+                                | AgentCommand::SendMessageWithId { text: cmd_text, .. } => {
+                                    let cmd_trimmed = cmd_text.trim();
+                                    !cmd_trimmed.contains(trimmed) && !trimmed.contains(cmd_trimmed)
+                                }
+                                _ => true,
+                            });
+                        }
                     } else {
-                        pending.retain(|cmd| !matches!(cmd, AgentCommand::SendMessage { .. }));
+                        pending.retain(|cmd| {
+                            !matches!(
+                                cmd,
+                                AgentCommand::SendMessage { .. }
+                                    | AgentCommand::SendMessageWithId { .. }
+                            )
+                        });
                     }
                 }
                 // Only snapshot, prompt, and compact commands are ever enqueued.
@@ -2278,7 +2527,19 @@ impl RunningAgent {
         // to once per turn (robust to the empty-retry / provider-retry `round -= 1`
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
         // terminal not to repeat the same size-blame.
+        // The turn's INITIAL user prompt is one complete user block. A steer that
+        // arrives after the turn starts is the NEXT user block, even if it lands
+        // before the first provider request opens. Only start folding steers once
+        // the first assistant/tool round has been committed; otherwise q2+q3 would
+        // be merged into the prompt's first request and the model would answer
+        // both in one round (the observed q2 -> q3 -> assistant bug).
+        let mut initial_prompt_round = true;
         let mut over_window_warned = false;
+        // Whether the mid-turn AUTO compaction pass has run this turn. Mainstream
+        // agents check the context threshold before every model call; we do the
+        // same, but at most ONCE per turn so a no-op pass cannot thrash. The
+        // 100%-watermark emergency block below remains the hard backstop.
+        let mut midturn_auto_attempted = false;
         // Per-turn state for the always-on coarse fuse. Unlike the exact guard's
         // session-owned streak, this only describes consecutive rounds of this
         // running turn.
@@ -2379,13 +2640,33 @@ impl RunningAgent {
                 }
             }
             let start = self.clock.now_millis();
-            // STEER: fold any prompts the user submitted mid-turn into THIS turn before
-            // building the next request. Real user messages (count toward prompt/undo),
-            // appended append-only (prefix-cache safe).
-            let steered: Vec<SteerInput> = {
+            // STEER: fold prompts the user submitted mid-turn into THIS turn before
+            // building the next request. The initial prompt round is exempt: a steer
+            // arriving while its first request is opening belongs to the NEXT round.
+            let mut steered: Vec<SteerInput> = if initial_prompt_round {
+                Vec::new()
+            } else {
                 let mut b = steer.lock().unwrap_or_else(|e| e.into_inner());
                 b.drain(..).collect()
             };
+            if !steered.is_empty() {
+                // Daemon -> coding runtime -> kernel is asynchronous; a second
+                // steer clicked a few ms later can still be in flight at this
+                // boundary. Re-drain a very short quiescent window so the batch
+                // keeps the user's click order instead of splitting one round.
+                // Steer-free rounds pay no extra latency.
+                for _ in 0..2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let more: Vec<SteerInput> = {
+                        let mut b = steer.lock().unwrap_or_else(|e| e.into_inner());
+                        b.drain(..).collect()
+                    };
+                    if more.is_empty() {
+                        break;
+                    }
+                    steered.extend(more);
+                }
+            }
             if !steered.is_empty() {
                 // A real user steer changes the intent of the currently-running
                 // turn. Evidence collected before that intervention must not be
@@ -2408,10 +2689,12 @@ impl RunningAgent {
                 let n = steered.len();
                 let mut inputs = Vec::with_capacity(n);
                 for input in steered {
-                    convo.push(Message::user_with_images(
-                        input.text.clone(),
-                        input.images.clone(),
-                    ));
+                    let mut message =
+                        Message::user_with_images(input.text.clone(), input.images.clone());
+                    // 身份契约：折叠的转向沿用客户端铸造的 id（若有），
+                    // 否则内核照旧分配。两者都必须进 snapshot/display/事件三处。
+                    message.id = input.message_id.clone();
+                    convo.push(message);
                     // Same identity the persisted steer message will carry, so the
                     // client's pending steer card/bubble adopts it (instead of keeping
                     // its local client id) and id-based merges converge with disk.
@@ -2437,6 +2720,48 @@ impl RunningAgent {
             // provider can spuriously compact persistent conversation state, while
             // synthesized results can make the final wire larger than estimated.
             Conversation::repair_pairing(&mut messages);
+            // MID-TURN AUTO COMPACTION (mainstream timing): pi / opencode /
+            // grok-build all check the context threshold before EVERY model call,
+            // not only at task boundaries. Do the same with the gentle `Auto`
+            // strategy (recent-window kept verbatim, old span drained+summarized)
+            // instead of waiting for the 100% overflow ladder. Runs at most once
+            // per turn: if it cannot shrink (single huge input), the emergency
+            // block below still owns the hard backstop.
+            if !midturn_auto_attempted {
+                let window = self.provider.context_window();
+                let estimated_prompt: u32 = messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative())
+                    .sum();
+                if let Some(utilization) =
+                    midturn_auto_utilization(window, self.compact_threshold, estimated_prompt)
+                {
+                    // Only the HIGH-QUALITY drain+summary path is worth a mid-turn
+                    // cache break. A pure-stub strategy keeps the task-boundary
+                    // cadence it was designed for (the stub exists to protect the
+                    // prefix cache, and mid-turn stubbing would rewrite a prefix the
+                    // current turn already sent).
+                    let view = CompactionView {
+                        messages: &convo.messages,
+                        trigger: CompactTrigger::Auto { utilization },
+                        ctx_window: window,
+                        used_tokens: estimated_prompt,
+                        utilization,
+                        sacred_floor: convo.sacred_floor(),
+                    };
+                    if self.compaction.will_summarize(&view) {
+                        midturn_auto_attempted = true;
+                        self.run_compaction(convo, CompactTrigger::Auto { utilization })
+                            .await;
+                        messages = convo.model_history();
+                        self.hooks.pre_request(&mut messages, &turn_ctx).await;
+                        let stored_wire = convo.model_history();
+                        appended_only &= messages.len() >= stored_wire.len()
+                            && messages[..stored_wire.len()] == stored_wire[..];
+                        Conversation::repair_pairing(&mut messages);
+                    }
+                }
+            }
             // PRE-SEND EMERGENCY COMPACTION: if the estimated outgoing request already
             // meets/exceeds the model window, COMPACT before sending rather than firing a
             // doomed over-window request. This is the case the between-turn `should_compact`
@@ -2450,8 +2775,13 @@ impl RunningAgent {
             {
                 let window = self.provider.context_window();
                 let limit = input_watermark_budget(window);
+                // CONSERVATIVE estimate (CJK chars count as full tokens): the
+                // byte/4 estimate undercounts Chinese ~2×, which used to let a
+                // CJK-heavy turn slide past the watermark without compacting.
                 let est = |msgs: &[Message]| -> u64 {
-                    msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
+                    msgs.iter()
+                        .map(|m| m.estimate_tokens_conservative() as u64)
+                        .sum()
                 };
                 // Only worth compacting if a COMPLETED exchange exists to drain. On the
                 // very first request an over-window prompt is a single oversized input that
@@ -2488,7 +2818,12 @@ impl RunningAgent {
             // request under the window (single input too large), so the user gets the
             // actionable advice instead of a silent doomed request.
             if !over_window_warned {
-                let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
+                // Same conservative estimator as the emergency compaction above, so
+                // the advisory and the compaction verdict agree for CJK content.
+                let est: u32 = messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative())
+                    .sum();
                 let window = self.provider.context_window();
                 let limit = input_watermark_budget(window);
                 if let Some(advisory) = over_window_advisory(est, window, limit) {
@@ -2519,17 +2854,46 @@ impl RunningAgent {
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
             let mut request_options = self.chat_options.clone();
-            // OUTPUT BUDGET (capability declaration → protocol max budget): the configured
-            // `[models.X] max_tokens` rides the wire VERBATIM (32K / 64K / 128K / 256K / 384K /
-            // custom; 64K when unset), so the model may generate up to it. It deliberately
-            // does NOT feed the context/watermark math above — that math uses the window minus
-            // a fixed watermark buffer, and real pressure comes from the provider's report.
-            // `pre_request_options` runs below and may still override (documented hook seam).
+            // OUTPUT BUDGET (capability ceiling → per-request budget): `[models.X]
+            // max_tokens` declares how much the model CAN emit, but it must not
+            // reserve that much of the window on every call — gateways validate
+            // `prompt_tokens + max_tokens <= context_window`, so sending 384K
+            // verbatim makes every request 400 once the history passes
+            // `window - 384K`. Clamp to what remains for THIS request; small
+            // sessions still get the wide soft cap (`window / 8`).
+            //
+            // This value does NOT feed the pressure/watermark math (that remains
+            // window − fixed watermark; real pressure comes from the provider's
+            // report). `pre_request_options` runs below and may still override
+            // (documented hook seam).
             let wire_window = self.provider.context_window();
             if wire_window > 0 {
-                request_options.max_tokens = Some(wire_output_budget(
+                // Anchor the prompt size on the provider's last reported context
+                // (`prompt + completion` — the response is now part of the next
+                // prompt) plus a CONSERVATIVE estimate of the messages appended
+                // after it. `estimate_tokens_conservative` counts each CJK char as
+                // a full token, so the anchor errs HIGH; the 4K guard in the
+                // helper on top means we never under-reserve the prompt.
+                let full_estimate: u32 = messages
+                    .iter()
+                    .map(|m| m.estimate_tokens_conservative())
+                    .sum();
+                let provider_context = convo.last_context_tokens();
+                let prompt_anchor = if provider_context > 0 {
+                    let tail: u32 = messages
+                        .iter()
+                        .rev()
+                        .take_while(|m| m.role != crate::message::Role::Assistant)
+                        .map(|m| m.estimate_tokens_conservative())
+                        .sum();
+                    provider_context.saturating_add(tail).max(full_estimate)
+                } else {
+                    full_estimate
+                };
+                request_options.max_tokens = Some(wire_output_budget_for_prompt(
                     wire_window,
                     self.chat_options.max_tokens,
+                    prompt_anchor,
                 ));
             }
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
@@ -2700,10 +3064,13 @@ impl RunningAgent {
                 Err(e) if e.retryable && provider_retry < MAX_PROVIDER_RETRIES => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
-                    self.rt.emit(AgentEvent::Warning(format!(
-                        "API error {}，{wait} 秒后重试({provider_retry}/{MAX_PROVIDER_RETRIES})...",
-                        retry_reason(&e)
-                    )));
+                    self.rt
+                        .emit(AgentEvent::Warning(i18n::format_agent_retry_api(
+                            &retry_reason(&e),
+                            wait,
+                            provider_retry as u32,
+                            MAX_PROVIDER_RETRIES as u32,
+                        )));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the full delay.
                     tokio::select! {
@@ -2771,6 +3138,11 @@ impl RunningAgent {
             // arrival in each content arm below.
             let mut saw_stream_content = false;
             let mut saw_text_or_tool = false;
+            // Did the PROVIDER stream any NON-WHITESPACE visible text this round
+            // (before hooks)? Distinguishes a gateway that emits a lone whitespace
+            // token and stops (content-free → retry) from a hook that redacts real
+            // text down to whitespace (must NOT be retried as empty).
+            let mut saw_visible_text = false;
             let mut saw_suppressed_reasoning_filler = false;
             // Did the adapter report dropping an UNPARSEABLE chunk this round (a
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
@@ -2828,9 +3200,10 @@ impl RunningAgent {
                                 let retry_budget = self.first_token_retries;
                                 if first_token_retries < retry_budget {
                                     first_token_retries += 1;
-                                    self.rt.emit(AgentEvent::Warning(format!(
-                                        "模型延迟高:{} 秒内无响应,正在重试({}/{})…",
-                                        first_token_secs, first_token_retries, retry_budget
+                                    self.rt.emit(AgentEvent::Warning(i18n::format_agent_retry_first_token(
+                                        first_token_secs,
+                                        first_token_retries as u32,
+                                        retry_budget as u32,
                                     )));
                                     tokio::select! {
                                         biased;
@@ -2843,9 +3216,9 @@ impl RunningAgent {
                                     retry_this_round = true;
                                     break;
                                 }
-                                let msg = format!(
-                                    "模型延迟过高,请稍后再试(连续 {} 次在 {} 秒内未收到首token)",
-                                    retry_budget, first_token_secs
+                                let msg = i18n::format_agent_model_high_latency_terminal(
+                                    retry_budget as u32,
+                                    first_token_secs,
                                 );
                                 self.hooks.on_error(&msg).await;
                                 self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
@@ -2943,6 +3316,9 @@ impl RunningAgent {
                         // (possibly clearing) hook, so a redacted/cleared response is
                         // not misread as an empty 200 and retried.
                         saw_stream_content = true;
+                        if !t.trim().is_empty() {
+                            saw_visible_text = true;
+                        }
                         self.hooks.on_text_delta(&mut t).await;
                         if !t.is_empty() {
                             if suppress_internal_stream {
@@ -3244,8 +3620,21 @@ impl RunningAgent {
                 && pending_calls.is_empty()
                 && !filler_only_reasoning
                 && !truncated;
+            // A gateway can stream a SINGLE whitespace token and end the stream
+            // (observed with OpenCode Zen when it refuses a large tool set): the
+            // provider DID emit visible output, so `saw_text_or_tool` is set and
+            // neither `thinking_only` nor `filler_only_reasoning` fires — yet the
+            // round has no answer. Without this, the blank bubble is stored and the
+            // turn reports a clean stop. Keyed on PRE-hook text so a hook that
+            // redacts a real response to whitespace is never misclassified.
+            let blank_text_only = saw_stream_content
+                && !saw_visible_text
+                && assistant_text.trim().is_empty()
+                && pending_calls.is_empty()
+                && !truncated;
             let empty_completion =
-                (!saw_stream_content || filler_only_reasoning || thinking_only) && !truncated;
+                (!saw_stream_content || filler_only_reasoning || thinking_only || blank_text_only)
+                    && !truncated;
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
@@ -3255,14 +3644,24 @@ impl RunningAgent {
                     let wait = empty_retry_wait_secs(thinking_only, empty_retries);
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
                     // from a truly EMPTY one — different upstream faults, different wording.
-                    let notice = if thinking_only && wait == 0 {
-                        format!("模型只返回了思考，正在重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
-                    } else if thinking_only {
-                        format!("模型只返回了思考，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    let notice = if thinking_only {
+                        i18n::format_agent_retry_thinking(
+                            empty_retries as u32,
+                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            wait,
+                        )
                     } else if saw_malformed {
-                        format!("响应格式异常，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                        i18n::format_agent_retry_malformed(
+                            empty_retries as u32,
+                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            wait,
+                        )
                     } else {
-                        format!("模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                        i18n::format_agent_retry_empty(
+                            empty_retries as u32,
+                            EMPTY_RESPONSE_MAX_RETRIES as u32,
+                            wait,
+                        )
                     };
                     self.rt.emit(AgentEvent::Warning(notice));
                     // Cancellable backoff: Esc during the wait aborts the turn instead
@@ -3401,6 +3800,9 @@ impl RunningAgent {
             );
             assistant_msg.id = Some(assistant_message_id.clone());
             convo.push(assistant_msg);
+            // The initial prompt has now produced its first assistant/tool round.
+            // From the next boundary on, parked steers fold normally.
+            initial_prompt_round = false;
             self.hooks.on_turn_progress(convo).await;
             if pending_calls.is_empty() {
                 // Exact-loop evidence is consecutive across tool rounds only. A
@@ -3474,6 +3876,12 @@ impl RunningAgent {
                     } = continuation;
                     active_internal_continuation = Some((kind, visibility));
                     convo.push(Message::synthetic_user(text));
+                    continue;
+                }
+                // Re-check the steer buffer after `offer_typed_continuation`: a steer
+                // that arrived while the continuation hook was awaiting must fold into
+                // this turn rather than falling out into `drain_pending`.
+                if !steer.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
                     continue;
                 }
                 // The turn is ENDING. If it ends because the output was truncated and
@@ -3897,6 +4305,15 @@ impl RunningAgent {
                         },
                     };
                     r.call_id = call.id.clone();
+                    // SETTLE FIRST, RESULT LATER: Phase ③ still applies every result
+                    // in emission order (provider pairing / prefix-cache determinism),
+                    // so a fast call in a batch with a slow sibling would keep its row
+                    // spinning until the slow one returns. Announce the completion here
+                    // — the row can settle while the batch is still running.
+                    let _ = events.send(AgentEvent::ToolFinished {
+                        call_id: call.id.clone(),
+                        is_error: r.is_error,
+                    });
                     (
                         idx,
                         Some(ExecutedCallResult {
@@ -4186,13 +4603,13 @@ impl RunningAgent {
                 echo_nudged = true;
                 let last_reminder = echo_rounds + 1 >= ECHO_STOP_AT;
                 let nudge = if last_reminder {
-                    ECHO_LOOP_NUDGE_FINAL
+                    echo_loop_nudge_final()
                 } else {
-                    ECHO_LOOP_NUDGE
+                    echo_loop_nudge()
                 };
                 self.rt
                     .emit(AgentEvent::Warning(format!("possible echo loop: {nudge}")));
-                convo.push(Message::synthetic_user(nudge.to_string()));
+                convo.push(Message::synthetic_user(nudge));
             }
             let echo_streak_active = echo_rounds > 1;
 
@@ -4757,30 +5174,36 @@ mod empty_retry_wait_tests {
     #[test]
     fn thinking_only_retries_immediately_then_backs_off() {
         assert_eq!(
-            (1..=5)
+            (1..=6)
                 .map(|n| empty_retry_wait_secs(true, n))
                 .collect::<Vec<_>>(),
-            vec![0, 1, 1, 2, 2]
+            vec![0, 1, 2, 3, 5, 8]
         );
     }
 
     #[test]
     fn empty_and_malformed_keep_the_short_backoff() {
         assert_eq!(
-            (1..=5)
+            (1..=6)
                 .map(|n| empty_retry_wait_secs(false, n))
                 .collect::<Vec<_>>(),
-            vec![1, 1, 2, 2, 3]
+            vec![1, 2, 3, 5, 8, 12]
         );
     }
 }
 
 #[cfg(test)]
+static I18N_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod empty_exhaustion_message_tests {
-    use super::empty_exhaustion_message;
+    use super::{empty_exhaustion_message, I18N_TEST_LOCK};
+    use jeikcode_config::i18n::{self, Locale};
 
     #[test]
     fn size_aware_when_near_or_over_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         // 339k prompt into a 200k window (170%) must blame request size, NOT
         // assert it's context-independent.
         let m = empty_exhaustion_message(false, false, 339_000, 200_000, 5, false);
@@ -4793,6 +5216,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn upstream_framing_when_comfortably_within_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, false, 5_000, 200_000, 5, false);
         assert!(
             m.contains("与上下文长度无关"),
@@ -4803,6 +5228,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn unknown_window_cannot_claim_over_size() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         // window unknown (0) — never attribute to size even with a huge estimate.
         let m = empty_exhaustion_message(false, false, 999_999, 0, 5, false);
         assert!(
@@ -4813,6 +5240,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn malformed_keeps_distinct_wording_and_no_size_blame() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(true, false, 339_000, 200_000, 5, false);
         assert!(m.contains("无法解析"), "malformed keeps its wording: {m}");
         assert!(
@@ -4823,6 +5252,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn already_advised_avoids_duplicating_the_full_size_blame() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         // When the pre-send over-window advisory already fired this turn, the
         // exhaustion terminal must be SHORT and reference it — not repeat the
         // full "约 NNN K tokens … 接近或超过窗口" blurb (the double-show fix).
@@ -4840,6 +5271,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn thinking_only_framing_when_comfortably_within_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, true, 5_000, 200_000, 5, false);
         assert!(
             m.contains("只返回了思考"),
@@ -4857,6 +5290,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn thinking_only_size_aware_when_near_or_over_window() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, true, 339_000, 200_000, 5, false);
         assert!(
             m.contains("只返回了思考"),
@@ -4868,6 +5303,8 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn thinking_only_when_already_advised() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::ZhCn);
         let m = empty_exhaustion_message(false, true, 339_000, 200_000, 5, true);
         assert!(
             m.contains("只返回了思考"),
@@ -4875,6 +5312,19 @@ mod empty_exhaustion_message_tests {
         );
         assert!(m.contains("如开头"), "points back to advisory: {m}");
         assert!(m.contains("/compact"), "actionable suggestion: {m}");
+    }
+
+    #[test]
+    fn exhaustion_message_in_english() {
+        let _guard = I18N_TEST_LOCK.lock().unwrap();
+        i18n::set_locale(Locale::En);
+        let m = empty_exhaustion_message(true, false, 100_000, 200_000, 3, false);
+        assert!(m.contains("unparseable"), "english malformed message: {m}");
+        let m_think = empty_exhaustion_message(false, true, 5_000, 200_000, 3, false);
+        assert!(
+            m_think.contains("only returned thinking"),
+            "english thinking message: {m_think}"
+        );
     }
 }
 
@@ -4908,6 +5358,8 @@ mod over_window_advisory_tests {
 
     #[test]
     fn advisory_is_actionable_and_one_line() {
+        let _guard = super::I18N_TEST_LOCK.lock().unwrap();
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::ZhCn);
         let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
         assert!(!m.contains('\n'), "must be a single line: {m}");
         assert!(m.contains("窗口"), "must name the window: {m}");
@@ -4922,6 +5374,21 @@ mod over_window_advisory_tests {
         assert!(
             !m.contains("/compact"),
             "must NOT suggest /compact (already ran): {m}"
+        );
+    }
+
+    #[test]
+    fn advisory_in_english() {
+        let _guard = super::I18N_TEST_LOCK.lock().unwrap();
+        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::En);
+        let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
+        assert!(
+            m.contains("watermark"),
+            "english advisory mentions watermark: {m}"
+        );
+        assert!(
+            m.contains("window"),
+            "english advisory mentions window: {m}"
         );
     }
 
@@ -5197,7 +5664,8 @@ mod internal_continuation_compaction_tests {
     #[tokio::test]
     async fn hook_continuation_below_threshold_does_not_compact() {
         // One token below the watermark-budget threshold (0.7 × 750 = 525).
-        let (events, calls) = run_hook_continuation(524).await;
+        // Pressure is prompt + completion, and the fixture's completion is 1.
+        let (events, calls) = run_hook_continuation(523).await;
         assert!(
             !events
                 .iter()
@@ -5465,10 +5933,10 @@ mod cap_tests {
         // A bounded artifact preview (head + marker + tail, as produced by
         // ArtifactMiddleware) is ALREADY small. A tiny kernel cap must NOT
         // truncate it again — re-capping would cut the embedded artifact id
-        // and turn fetch_output into a dead link.
+        // and turn artifact recovery into a dead link.
         let preview = format!(
-            "HEAD{}\n[jeikcode: output truncated — 20000 bytes total, showing first 4096 + last 4096 bytes. \
-Full output saved as artifact 7450efc5941c8ce0. To read more: fetch_output(artifact_id=\"7450efc5941c8ce0\", offset, limit).]\n{}TAIL",
+            "HEAD{}\n[Middle section of output folded (50 lines elided), saved as artifact 7450efc5941c8ce0. \
+If current information is insufficient to resolve the issue, call `read(path=\"artifact://7450efc5941c8ce0\")` to inspect more.]\n{}TAIL",
             "h".repeat(4000),
             "t".repeat(4000)
         );
@@ -5775,6 +6243,85 @@ mod steer_buffer_tests {
         assert_eq!(turn_started, 1, "steer must NOT open a second turn");
     }
 
+    struct BlockingTurnStart {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hook::LifecycleHooks for BlockingTurnStart {
+        async fn turn_start(&self, _convo: &mut Conversation) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    /// The initial prompt is one complete user block. A steer that arrives while
+    /// the turn is still in `turn_start` (before the first drain/request) must NOT
+    /// be merged into the prompt's first request; it belongs to the next round.
+    #[tokio::test]
+    async fn initial_prompt_round_defers_early_steer_to_next_round() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("first".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("second".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]));
+        let received = provider.received.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hook: Arc<dyn crate::hook::LifecycleHooks> = Arc::new(BlockingTurnStart {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(ToolRegistry::new().mount(&[]))
+            .hook(hook)
+            .build()
+            .spawn();
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "q2".into(),
+                images: vec![],
+            })
+            .unwrap();
+        started.notified().await;
+        // The turn future is parked inside turn_start; the command select is free
+        // to route this into the per-turn steer buffer before the first drain.
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "q3-steer".into(),
+                images: vec![],
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        release.notify_one();
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+        let log = received.lock().unwrap();
+        assert_eq!(log.len(), 2, "first round + next steered round");
+        let first: Vec<&str> = log[0].iter().map(|(_, text)| text.as_str()).collect();
+        assert!(first.contains(&"q2"));
+        assert!(
+            !first.contains(&"q3-steer"),
+            "the initial prompt round must not merge an early steer: {first:?}"
+        );
+        let second: Vec<&str> = log[1].iter().map(|(_, text)| text.as_str()).collect();
+        assert!(second.contains(&"q2"));
+        assert!(second.contains(&"first"));
+        assert!(second.contains(&"q3-steer"));
+    }
+
     /// Full end-to-end steer test: steered prompt is folded into the same turn's
     /// next request.
     ///
@@ -5964,6 +6511,7 @@ mod steer_buffer_tests {
                 AgentEvent::UserMessage {
                     message_id,
                     turn_ordinal,
+                    ..
                 } => prompts.push((message_id, turn_ordinal)),
                 AgentEvent::Steered { inputs, .. } => {
                     steered_ids.extend(inputs.into_iter().map(|input| input.message_id));
@@ -6185,6 +6733,7 @@ mod steer_buffer_tests {
                     cmd_tx
                         .send(AgentCommand::CancelSteer {
                             text: Some("DO-NOT-STEER".into()),
+                            message_id: None,
                         })
                         .unwrap();
                 }
@@ -6346,17 +6895,90 @@ mod provider_message_pairing_tests {
 
 #[cfg(test)]
 mod output_budget_tests {
-    use super::{input_watermark_budget, wire_output_budget, DEFAULT_OUTPUT_BUDGET};
+    use super::{
+        input_watermark_budget, midturn_auto_utilization, wire_output_budget,
+        wire_output_budget_for_prompt, DEFAULT_OUTPUT_BUDGET, DEFAULT_REQUEST_MAX_TOKENS,
+    };
 
     #[test]
-    fn declared_budget_rides_the_wire_verbatim() {
-        // The model editor's tiers: 32K / 64K / 128K / 256K / 384K / custom.
+    fn midturn_auto_compaction_uses_the_task_boundary_threshold() {
+        let window = 1_048_576;
+        // watermark = 1,028,576; 0.9 ⇒ 925,718.
+        assert_eq!(
+            midturn_auto_utilization(window, Some(0.9), 925_000),
+            None,
+            "just below the line must not compact"
+        );
+        assert!(
+            midturn_auto_utilization(window, Some(0.9), 926_000).is_some(),
+            "crossing the line MUST compact before the next request"
+        );
+        // Auto-compaction disabled / unknown window ⇒ never.
+        assert_eq!(midturn_auto_utilization(window, None, 1_000_000), None);
+        assert_eq!(midturn_auto_utilization(0, Some(0.9), 1_000_000), None);
+    }
+
+    #[test]
+    fn soft_cap_bounds_a_large_capability_to_an_eighth_of_the_window() {
+        let window = 1_048_576;
+        // Capability alone (editor tiers) is preserved by the raw helper…
         for tier in [32_000, 64_000, 128_000, 256_000, 384_000] {
             assert_eq!(wire_output_budget(1_000_000, Some(tier)), tier);
         }
-        // Unset ⇒ the 64K default tier.
-        assert_eq!(DEFAULT_OUTPUT_BUDGET, 64_000);
-        assert_eq!(wire_output_budget(1_000_000, None), 64_000);
+        // …but the WIRE value is bounded by window/8 (128Ki on a 1M model).
+        assert_eq!(
+            wire_output_budget_for_prompt(window, Some(384_000), 28_000),
+            131_072
+        );
+        // A declared capability BELOW the soft cap wins.
+        assert_eq!(
+            wire_output_budget_for_prompt(window, Some(32_000), 28_000),
+            32_000
+        );
+        // A small window scales the soft cap down with it (200K ⇒ 25K).
+        assert_eq!(
+            wire_output_budget_for_prompt(200_000, Some(384_000), 28_000),
+            25_000
+        );
+    }
+
+    #[test]
+    fn prompt_clamp_keeps_prompt_plus_budget_inside_the_window() {
+        let window = 1_048_576;
+        // At the compaction trigger (0.9 × watermark) the budget is still
+        // meaningful — it must NOT collapse before compaction fires.
+        let trigger = 925_718;
+        let budget = wire_output_budget_for_prompt(window, Some(384_000), trigger);
+        assert!(
+            budget > 100_000,
+            "budget must stay healthy at the compaction trigger: {budget}"
+        );
+        assert!(
+            trigger + budget < window,
+            "prompt + budget must fit the window: {trigger} + {budget}"
+        );
+        // As the window fills, the budget shrinks to exactly the room left.
+        let near = window - 10_000;
+        let budget = wire_output_budget_for_prompt(window, Some(384_000), near);
+        assert_eq!(budget, 5_904, "window - prompt - 4K guard");
+        // Near the window the request stays VALID (never a negative/zero budget).
+        assert_eq!(
+            wire_output_budget_for_prompt(window, Some(384_000), window - 100),
+            1
+        );
+        // Unknown window ⇒ the fixed 64Ki fallback cap applies.
+        assert_eq!(
+            wire_output_budget_for_prompt(0, Some(384_000), 10_000),
+            DEFAULT_REQUEST_MAX_TOKENS
+        );
+        assert_eq!(DEFAULT_REQUEST_MAX_TOKENS, 65_536);
+    }
+
+    #[test]
+    fn declared_budget_rides_the_wire_verbatim() {
+        // Unset ⇒ the 64Ki default tier.
+        assert_eq!(DEFAULT_OUTPUT_BUDGET, 65_536);
+        assert_eq!(wire_output_budget(1_000_000, None), 65_536);
         // The ONLY adjustment is the window sanity clamp (a budget above the window is
         // protocol-invalid on every gateway) — never a capability downsizing.
         assert_eq!(wire_output_budget(16_000, Some(384_000)), 16_000);

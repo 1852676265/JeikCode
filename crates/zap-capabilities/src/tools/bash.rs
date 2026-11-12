@@ -173,7 +173,7 @@ impl Tool for BashTool {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The command in the selected shell's native syntax. On Windows, send PowerShell cmdlets directly with shell=powershell; never nest powershell -Command inside the default shell." },
+                "command": { "type": "string", "description": "The command in the selected shell's native syntax. On Windows, send PowerShell cmdlets directly with shell=powershell; never nest powershell -Command inside the default shell. In PowerShell, prefer single quotes ('...') for paths and strings with backslashes to avoid unterminated quote syntax errors." },
                 "cwd": {
                     "type": "string",
                     "description": "Optional working directory for the command. Relative paths resolve against the workspace root. If omitted, defaults to the current workspace root directory."
@@ -282,41 +282,55 @@ impl Tool for BashTool {
                 crate::process_utils::rewrite_unquoted_windows_paths(&effective_command)
             }
         };
-        let (effective_cwd, cwd_advisory) = if let Some(ref raw_cwd) = a.cwd {
-            let trimmed = raw_cwd.trim().replace('\\', "/");
-            if trimmed.is_empty() {
-                (ctx.working_dir.clone(), None)
-            } else {
-                let resolved = super::resolve_path(&trimmed, &ctx.working_dir);
-                let meta = match tokio::fs::metadata(&resolved).await {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let hint = super::not_found_hint(&resolved, &ctx.working_dir).await;
+        let (effective_cwd, cwd_advisory) =
+            match a.cwd.as_deref().map(|s| s.trim().replace('\\', "/")) {
+                Some(trimmed) if !trimmed.is_empty() => {
+                    let resolved = super::resolve_path(&trimmed, &ctx.working_dir);
+                    let meta = match tokio::fs::metadata(&resolved).await {
+                        Ok(m) => m,
+                        Err(_) => {
+                            let hint = super::not_found_hint(&resolved, &ctx.working_dir).await;
+                            return err(format!(
+                                "bash: working directory not found: '{}'{hint}",
+                                trimmed
+                            ));
+                        }
+                    };
+                    if !meta.is_dir() {
                         return err(format!(
-                            "bash: working directory not found: '{}'{hint}",
+                            "bash: cwd must be a directory, but '{}' is a file",
                             trimmed
                         ));
                     }
-                };
-                if !meta.is_dir() {
-                    return err(format!(
-                        "bash: cwd must be a directory, but '{}' is a file",
-                        trimmed
-                    ));
-                }
-                let advisory = if !resolved.starts_with(&ctx.working_dir) {
-                    Some(format!(
+                    let advisory = if !resolved.starts_with(&ctx.working_dir) {
+                        Some(format!(
                         "[advisory] Command executed in external directory outside workspace: {}\n",
                         resolved.display()
                     ))
-                } else {
-                    None
-                };
-                (resolved, advisory)
-            }
-        } else {
-            (ctx.working_dir.clone(), None)
-        };
+                    } else {
+                        None
+                    };
+                    (resolved, advisory)
+                }
+                _ => {
+                    let meta = match tokio::fs::metadata(&ctx.working_dir).await {
+                        Ok(m) => m,
+                        Err(_) => {
+                            return err(format!(
+                                "bash: working directory not found: '{}'",
+                                ctx.working_dir.display()
+                            ));
+                        }
+                    };
+                    if !meta.is_dir() {
+                        return err(format!(
+                            "bash: cwd must be a directory, but '{}' is not a directory",
+                            ctx.working_dir.display()
+                        ));
+                    }
+                    (ctx.working_dir.clone(), None)
+                }
+            };
         let cwd = effective_cwd.clone();
         let rewritten_command = effective_command.clone();
         let advisory_note = cwd_advisory.clone();
@@ -333,6 +347,13 @@ impl Tool for BashTool {
             };
 
         if a.background {
+            // A turn-level cancel that arrived before spawn must not create a
+            // process after the user already stopped the turn.
+            if ctx.cancel.is_cancelled() {
+                return annotate(err(
+                    "bash: cancelled before background process started.".to_string()
+                ));
+            }
             let running = runtime.active_background_tasks();
             if let Some(existing) = running
                 .iter()
@@ -533,20 +554,19 @@ impl Tool for BashTool {
         if a.background {
             let settle_secs = a.settle_secs.unwrap_or(3).max(1);
             let settle_deadline = Instant::now() + Duration::from_secs(settle_secs);
+            // A steer/stop can arrive after the detached child is already alive.
+            // Killing it or dropping the future here is what produced
+            // `(cancelled — side effects unknown)` plus a zombie service. Once the
+            // process exists, turn cancellation only stops the startup observation;
+            // the background reader below still detaches and drains its pipes.
+            let mut startup_observation_cancelled = false;
 
             while Instant::now() < settle_deadline {
                 tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => {
-                        #[cfg(windows)]
-                        crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-                        #[cfg(not(target_os = "windows"))]
-                        if let Some(pgid) = child_pid {
-                            unsafe { killpg(pgid as i32, SIGKILL) };
-                        }
-                        runtime.unregister_live_bash(child_pid_val);
-                        let (out, errb) = snapshot();
-                        return annotate(err(with_note(&out, &errb, "bash: cancelled before completion.")));
+                        startup_observation_cancelled = true;
+                        break;
                     }
                     _ = live.kill.cancelled() => {
                         #[cfg(windows)]
@@ -622,9 +642,20 @@ impl Tool for BashTool {
             let initial_output = format_streams(&init_out, &init_err, None, false);
 
             let pid_num = child_pid.unwrap_or(0);
-            let mut bg_writer = BackgroundLogWriter::create(&session_id, pid_num, &initial_output)
+            // Diagnostic setup is best-effort and time-boxed: a slow temp/log scan,
+            // PID probe, or port check must never delay a successfully spawned
+            // background service (or let a turn cancel turn it into a zombie).
+            let mut bg_writer = if startup_observation_cancelled {
+                None
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    BackgroundLogWriter::create(&session_id, pid_num, &initial_output),
+                )
                 .await
-                .ok();
+                .ok()
+                .and_then(|r| r.ok())
+            };
             let bg_log_path_display = bg_writer
                 .as_ref()
                 .map(|w| w.path_display())
@@ -721,14 +752,20 @@ impl Tool for BashTool {
             // its Git-Bash pid (`kill`) — see `render_background_pid_block` for why the
             // wrapper shell's number alone is not enough.
             #[cfg(target_os = "windows")]
-            let workloads = {
+            let workloads = if startup_observation_cancelled {
+                Vec::new()
+            } else {
                 let rows = match child_pid {
                     Some(pid) => windows_descendant_rows(pid),
                     None => Vec::new(),
                 };
                 let leaves = workload_leaves(&rows);
                 let winpids: Vec<u32> = leaves.iter().map(|(pid, _)| *pid).collect();
-                let mut msys = msys_pids_for(&winpids).await;
+                let mut msys =
+                    tokio::time::timeout(Duration::from_secs(1), msys_pids_for(&winpids))
+                        .await
+                        .ok()
+                        .unwrap_or_default();
                 leaves
                     .into_iter()
                     .map(|(pid, name)| (pid, msys.remove(&pid), name))
@@ -741,7 +778,11 @@ impl Tool for BashTool {
                 Some(pid) => render_background_pid_block(pid, &workloads),
                 None => "PID: unknown".to_string(),
             };
-            let detected_ports = detect_listening_ports_from_output(&initial_output);
+            let detected_ports = if startup_observation_cancelled {
+                Vec::new()
+            } else {
+                detect_listening_ports_from_output(&initial_output)
+            };
             // Health-check every port the startup output declared: a listener that ACCEPTS
             // on 127.0.0.1 is real evidence the service is up. "Not reachable yet" stays an
             // observation (bind addresses vary), never a failure claim.
@@ -772,13 +813,34 @@ impl Tool for BashTool {
                 "\n\n[Note: The process is detached and actively running in the background. It may still be initializing, loading model weights, or warming up. If initial connection attempts fail, wait a few moments for startup to complete, poll the health endpoint/port, or inspect live progress via the log path above.\n\
                  Tips for fast log inspection with `read`:\n\
                  - To inspect latest logs at the tail: call `read` with a negative offset (e.g. `read(path=\"{bg_log_path_display}\", offset=-50)`).\n\
-                 - To search keywords or error context: call `read` with `key_string` and adjust `upward`/`downward` (e.g. `read(path=\"{bg_log_path_display}\", key_string=\"<keyword>\", upward=10, downward=20)`).]"
+                 - To search keywords or error context: call `read` with `keyword` and adjust `upward`/`downward` (e.g. `read(path=\"{bg_log_path_display}\", keyword=\"<keyword>\", upward=10, downward=20)`).]"
             );
 
+            let cancelled_note = if startup_observation_cancelled {
+                "\n\n[Note: the turn was cancelled while observing startup. The process was already \
+                 spawned and remains detached; use the PID above to stop it. The startup log/PID \
+                 diagnostics were intentionally skipped to return immediately.]"
+            } else {
+                ""
+            };
             return annotate(ok(format!(
-                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}{unverified_note}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{guidance_note}"
+                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}{unverified_note}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{cancelled_note}{guidance_note}"
             )));
         }
+
+        // Foreground only: a stdout redirect sends nothing down the pipe, so the live
+        // pane sits silent for the whole run. Say so once (with the file to inspect)
+        // and keep the elapsed heartbeat below ticking; otherwise a working command is
+        // indistinguishable from a wedged one — it just reads `运行中` with no output.
+        let redirect_target = output_redirect_target(&effective_command);
+        if let Some(target) = redirect_target.as_ref() {
+            progress.emit(format!(
+                "[note: stdout is redirected to `{target}`; live output stays empty until the command exits. \
+                 Inspect the file with read(path=\"{target}\", offset=-50).]\n"
+            ));
+        }
+        let heartbeat_interval = silent_run_heartbeat();
+        let mut heartbeat_due = Instant::now() + heartbeat_interval;
 
         enum Drive {
             Result(ToolResult),
@@ -808,6 +870,7 @@ impl Tool for BashTool {
                 Duration::from_secs(86400)
             };
             let until_hard = hard_deadline.saturating_duration_since(Instant::now());
+            let until_heartbeat = heartbeat_due.saturating_duration_since(Instant::now());
 
             let elapsed_since_last_byte = last_byte
                 .lock()
@@ -849,6 +912,7 @@ impl Tool for BashTool {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
                             *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                            heartbeat_due = Instant::now() + heartbeat_interval;
                             extend_capped(
                                 &mut *stdout_cap.lock().unwrap_or_else(|e| e.into_inner()),
                                 &out_buf[..n],
@@ -867,6 +931,7 @@ impl Tool for BashTool {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
                             *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                            heartbeat_due = Instant::now() + heartbeat_interval;
                             extend_capped(
                                 &mut *stderr_cap.lock().unwrap_or_else(|e| e.into_inner()),
                                 &err_buf[..n],
@@ -917,9 +982,9 @@ impl Tool for BashTool {
                                 ),
                             )));
                         }
-                    } else if elapsed >= Duration::from_secs(3) && !is_network_or_download_workload(&effective_command) {
+                    } else if elapsed >= Duration::from_secs(15) && !is_network_or_download_workload(&effective_command) {
                         // 陌生脚本 / 阻塞式命令自适应收网：
-                        // 排除网络下载类任务（apt/npm/curl等），屏幕已静默超过 3 秒，且整棵子进程树 CPU 已经彻底归零（处于内核输入等待态）
+                        // 排除网络下载类任务（apt/npm/curl等），屏幕已静默超过 15 秒，且整棵子进程树 CPU 已经彻底归零（处于内核输入等待态）
                         #[cfg(windows)]
                         let busy = tree_is_busy(child_pid, &job_guard).await;
                         #[cfg(not(windows))]
@@ -994,6 +1059,29 @@ impl Tool for BashTool {
                         }
                         Err(e) => err(format!("bash: error running command: {e}")),
                     });
+                }
+                // Silent-run liveness tick. Long jobs (npm/cargo/…) skip idle
+                // rechecks entirely, and a redirected command never writes to the
+                // pipe, so without this the pane has no evidence of life while the
+                // command runs (up to max_timeout_secs). Any output pushes the
+                // deadline out again. Placed AFTER child.wait so a finishing
+                // process always wins.
+                _ = tokio::time::sleep(until_heartbeat) => {
+                    let secs = started.elapsed().as_secs();
+                    let silent_for = last_byte
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .elapsed()
+                        .as_secs();
+                    let redirected = if redirect_target.is_some() {
+                        "; stdout is redirected to a file"
+                    } else {
+                        ""
+                    };
+                    progress.emit(format!(
+                        "[still running: {secs}s total, {silent_for}s without output (pid {child_pid_val}){redirected}]\n"
+                    ));
+                    heartbeat_due = Instant::now() + heartbeat_interval;
                 }
                 _ = tokio::time::sleep(until_idle), if idle_enabled => {
                     #[cfg(windows)]
@@ -1259,7 +1347,10 @@ fn shell_tool_description(
              A silent CPU-idle process with no interactive fingerprint is a wait and \
              keeps running until it exits or `max_timeout_secs`. \
              Resident servers (uvicorn/nginx/npm run dev) should be started with background=true (or started detached). \
-             Compile/test families wait on `max_timeout_secs`."
+             Compile/test families wait on `max_timeout_secs`. \
+             If stdout/stderr are redirected to a file (`> log 2>&1`), nothing streams \
+             live: prefer letting output stream, or start long jobs with `background=true` \
+             and read the log path."
         };
     }
     macro_rules! cmd_suffix {
@@ -1275,7 +1366,10 @@ fn shell_tool_description(
              `powershell -Command` inside cmd.exe. Native PowerShell mode uses EncodedCommand, so \
              UNC backslashes and a trailing `$` reach PowerShell unchanged. Quote the path inside \
              the script and use `-LiteralPath`, for example \
-             `Get-ChildItem -LiteralPath '\\\\server\\share$'`. Always quote paths \
+             `Get-ChildItem -LiteralPath '\\\\server\\share$'`. In PowerShell, prefer single quotes \
+             (`'...'`) for paths or literals with backslashes (e.g. `TrimEnd('\\\\')`); in double \
+             quotes, a trailing `\\\"` is parsed as an escaped quote and triggers an unclosed-string \
+             syntax error. Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
              The dedicated file tools above (read / grep / glob) also \
@@ -1294,7 +1388,10 @@ fn shell_tool_description(
              bash-native `//server/share$`, or set this tool's `shell` argument to `powershell` \
              and run `Get-ChildItem -LiteralPath '\\\\server\\share$'`. Native PowerShell mode \
              uses EncodedCommand and does not pass through Bash, so backslashes and `$` are not \
-             consumed by an outer shell. Do NOT nest `pwsh -Command` inside Bash.\n\
+             consumed by an outer shell. In PowerShell, prefer single quotes (`'...'`) for paths or \
+             literals with backslashes (e.g. `TrimEnd('\\\\')`); in double quotes, a trailing `\\\"` \
+             is parsed as an escaped quote and triggers an unclosed-string syntax error. \
+             Do NOT nest `pwsh -Command` inside Bash.\n\
              Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
              NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
              equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above.\n\
@@ -1857,7 +1954,13 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
     let shell = "sh";
     #[cfg(not(target_env = "ohos"))]
     let shell = detect_unix_shell();
+    let command = crate::process_utils::escape_unquoted_backticks_in_inline_script(&command)
+        .unwrap_or(command);
+    let (command, inline_envs) = crate::process_utils::extract_inline_scripts_to_env(&command);
     let mut cmd = tokio::process::Command::new(shell);
+    for (k, v) in inline_envs {
+        cmd.env(k, v);
+    }
     cmd.arg("-c").arg(&command);
     apply_shell_env(&mut cmd);
     Ok(cmd)
@@ -2762,7 +2865,13 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
             .map(std::path::Path::to_path_buf);
         let command = rewrite_msys_arg_conventions(command.as_ref(), git_root.as_deref());
         let command = crate::process_utils::rewrite_python3_for_windows_shell(command.as_ref());
+        let command = crate::process_utils::escape_unquoted_backticks_in_inline_script(&command)
+            .unwrap_or(command);
+        let (command, inline_envs) = crate::process_utils::extract_inline_scripts_to_env(&command);
         let mut cmd = tokio::process::Command::new(&bash);
+        for (k, v) in inline_envs {
+            cmd.env(k, v);
+        }
 
         // Grok-Build hardening: prevent MSYS2 from rewriting /flags (e.g. /NOLOGO, /DEBUG, /t:Build) into pseudo paths
         cmd.env("MSYS_NO_PATHCONV", "1");
@@ -3237,6 +3346,12 @@ fn sanitize_terminal_output(s: &str) -> String {
 /// bounds the mid-flight UI/event flood (`yes`, tight loops, huge logs).
 const MAX_LIVE_STREAM_BYTES: usize = 256 * 1024;
 
+/// How often a foreground command that has produced NO output reports that it is
+/// still alive (`[still running: Ns …]`). Long jobs skip idle rechecks entirely and
+/// a redirected command never writes to the pipe, so this is the only UI evidence
+/// that the process has not wedged.
+const SILENT_RUN_HEARTBEAT: Duration = Duration::from_secs(20);
+
 fn emit_live_chunk(
     progress: &ProgressSink,
     live_sent: &std::sync::atomic::AtomicUsize,
@@ -3333,6 +3448,134 @@ async fn read_pipe_and_stream(
     }
 }
 
+/// Target of a stdout redirect to a real file (`> log`, `>> log`, `&> log`), if any.
+///
+/// `run_command` reads the child's stdout/stderr PIPES. A command that redirects
+/// stdout to a file emits NOTHING on the pipe, so the live pane is empty for the
+/// entire run — indistinguishable from a hang. Detecting the target lets the tool
+/// say so up front (and point `read` at the file).
+///
+/// Conservative by design: only an unquoted `>`-family operator whose target is a
+/// real file counts. fd dups (`2>&1`, `>&2`, `>&-`), `/dev/null`, `nul`, and
+/// stderr-only redirects (`2> err.log`; stdout still streams) return `None`.
+pub(crate) fn output_redirect_target(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let n = bytes.len();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'\\' && i + 1 < n {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'\\' if i + 1 < n => i += 2,
+            b'>' => {
+                // Operator position: start, whitespace/separator, fd digit, or `&>`.
+                let prev = i.checked_sub(1).map(|p| bytes[p]);
+                let operator = match prev {
+                    None => true,
+                    Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b';')
+                    | Some(b'|') | Some(b'&') | Some(b'(') => true,
+                    Some(d) if d.is_ascii_digit() => true,
+                    _ => false,
+                };
+                if !operator {
+                    i += 1;
+                    continue;
+                }
+                // `2>`/`3>` write another stream; stdout still streams to the pipe.
+                let is_stdout = match prev {
+                    Some(d) if d.is_ascii_digit() => d == b'1',
+                    _ => true,
+                };
+                let mut j = i + 1;
+                while j < n && (bytes[j] == b'>' || bytes[j] == b'|') {
+                    j += 1;
+                }
+                while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'&' {
+                    // `>&2`, `2>&1`, `>&-` — fd dup keeps the pipe live.
+                    j += 1;
+                    while j < n && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                // Read the (possibly quoted) target word.
+                let (target, next) = if j < n && (bytes[j] == b'\'' || bytes[j] == b'"') {
+                    let quote = bytes[j];
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < n && bytes[k] != quote {
+                        if quote == b'"' && bytes[k] == b'\\' && k + 1 < n {
+                            k += 2;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    (command[start..k.min(n)].to_string(), (k + 1).min(n))
+                } else {
+                    let start = j;
+                    let mut k = start;
+                    while k < n
+                        && !matches!(
+                            bytes[k],
+                            b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b')' | b'>' | b'<'
+                        )
+                    {
+                        k += 1;
+                    }
+                    (command[start..k].to_string(), k)
+                };
+                i = next.max(i + 1);
+                if !is_stdout {
+                    continue;
+                }
+                let normalized = target.replace('\\', "/").to_ascii_lowercase();
+                if target.is_empty()
+                    || normalized == "/dev/null"
+                    || normalized == "nul"
+                    || normalized == "nul:"
+                    || normalized == "$null"
+                {
+                    continue;
+                }
+                return Some(target);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 fn format_streams(
     stdout: &[u8],
     stderr: &[u8],
@@ -3354,6 +3597,10 @@ fn format_streams(
         s.push_str(&stderr);
         if stderr.contains("unexpected EOF while looking for matching") {
             s.push_str("\n[Self-Healing Guidance: Shell command failed with an unmatched quote or quote escaping conflict. For complex inline Python/Node scripts on Windows, consider: 1. Pass `shell: \"powershell\"`; 2. Write the code to a file via `write_file` and execute it; 3. Ensure balanced quotes.]\n");
+        } else if stderr.contains("字符串缺少终止符")
+            || stderr.contains("The string is missing the terminator")
+        {
+            s.push_str("\n[Self-Healing Guidance: PowerShell command failed with an unterminated string. In PowerShell, `\\\"` inside double quotes is treated as an escaped quote rather than string closing; prefer single quotes `'...'` for strings/paths with backslashes (e.g. `TrimEnd('\\\\')`).]\n");
         }
     }
     match exit {
@@ -4538,6 +4785,12 @@ pub(crate) fn is_network_or_download_workload(cmd: &str) -> bool {
                 | "go"
                 | "mvn"
                 | "gradle"
+                | "jeik"
+                | "playwright"
+                | "puppeteer"
+                | "pytest"
+                | "scrapy"
+                | "httpx"
         ) {
             return true;
         }
@@ -5359,6 +5612,41 @@ fn agent_second_level_secs(configured: u64) -> u64 {
 thread_local! {
     static TEST_AGENT_IDLE_SECS: std::cell::Cell<Option<u64>> =
         std::cell::Cell::new(None);
+    static TEST_SILENT_HEARTBEAT_MS: std::cell::Cell<Option<u64>> =
+        std::cell::Cell::new(None);
+}
+
+/// Interval between zero-output liveness ticks (test override: milliseconds).
+fn silent_run_heartbeat() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = TEST_SILENT_HEARTBEAT_MS.with(|c| c.get()) {
+        return Duration::from_millis(ms.max(1));
+    }
+    SILENT_RUN_HEARTBEAT
+}
+
+#[cfg(test)]
+struct TestHeartbeatGuard {
+    prev: Option<u64>,
+}
+
+#[cfg(test)]
+impl TestHeartbeatGuard {
+    fn set_ms(ms: u64) -> Self {
+        let prev = TEST_SILENT_HEARTBEAT_MS.with(|c| {
+            let previous = c.get();
+            c.set(Some(ms));
+            previous
+        });
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHeartbeatGuard {
+    fn drop(&mut self) {
+        TEST_SILENT_HEARTBEAT_MS.with(|c| c.set(self.prev));
+    }
 }
 
 #[cfg(test)]
@@ -6554,7 +6842,7 @@ mod tests {
             res.content
         );
         assert!(
-            res.content.contains("key_string"),
+            res.content.contains("keyword"),
             "must include keyword search guidance: {:?}",
             res.content
         );
@@ -6605,6 +6893,65 @@ mod tests {
             "log file must be preserved for diagnostics after process exit"
         );
         let _ = tokio::fs::remove_file(&log_path).await;
+    }
+
+    #[tokio::test]
+    async fn run_command_background_turn_cancel_after_spawn_returns_success() {
+        use crate::tools::bash_runtime::BashRuntimeState;
+        let runtime = Arc::new(BashRuntimeState::new());
+        let tool = BashTool::with_runtime_state(Arc::clone(&runtime));
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: cancel.clone(),
+            progress: zap_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let cmd = if cfg!(target_os = "windows") {
+            "powershell -Command Start-Sleep -Seconds 10"
+        } else {
+            "sleep 10"
+        };
+        let args = serde_json::json!({
+            "command": cmd,
+            "background": true,
+            "settle_secs": 5
+        })
+        .to_string();
+
+        // Simulate a steer/stop arriving during the startup observation window,
+        // after the detached child already exists.
+        let cancel_after_spawn = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            cancel_after_spawn.cancel();
+        });
+
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(3), tool.execute(&args, &ctx))
+                .await
+                .expect("cancel must end the startup observation, not hang the tool");
+        assert!(
+            !res.is_error,
+            "a process that already spawned must not become side-effects-unknown: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("Background process started")
+                && res.content.contains("remains detached"),
+            "content: {}",
+            res.content
+        );
+
+        let active = runtime.active_background_tasks();
+        let matched = active.iter().find(|t| t.command == cmd);
+        assert!(
+            matched.is_some(),
+            "cancelled observation must keep the background task registered"
+        );
+        assert!(runtime.kill_by_pid(matched.unwrap().pid));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     #[test]
@@ -6696,6 +7043,12 @@ mod tests {
         ));
         assert!(super::looks_like_resident_service("nginx -g 'daemon off;'"));
         assert!(super::looks_like_resident_service("npm run dev"));
+        assert!(super::looks_like_resident_service(
+            "npm run dev >> dev.log 2>&1"
+        ));
+        assert!(super::looks_like_resident_service(
+            "uvicorn app.main:app >> server.log 2>&1"
+        ));
         assert!(super::looks_like_resident_service("docker compose up"));
         assert!(!super::looks_like_resident_service("docker compose up -d"));
         assert!(super::looks_like_resident_service(
@@ -7164,6 +7517,91 @@ mod tests {
         );
         // no sudo at all → unchanged
         assert_eq!(rewrite_sudo_for_askpass("find / -name x"), "find / -name x");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirected_silent_command_reports_redirect_and_heartbeat() {
+        let _hb = TestHeartbeatGuard::set_ms(20);
+        let d = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_sink = Arc::clone(&seen);
+        let mut cx = ctx(d.path());
+        cx.progress = ProgressSink::new(Arc::new(move |message| {
+            seen_sink
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_str(&message);
+        }));
+
+        let log = d
+            .path()
+            .join("probe.log")
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Both streams leave the pipe for the file AND the process stays silent long
+        // enough for a couple of heartbeat ticks.
+        // Use real shell quotes (a raw `\"` is a literal backslash + quote on
+        // POSIX, so bash would look for a filename that includes the quotes).
+        let command = format!(r#"sleep 0.12 > "{log}" 2>&1; echo done >> "{log}""#);
+        let args = serde_json::json!({ "command": command }).to_string();
+        let started = Instant::now();
+        let r = BashTool.execute(&args, &cx).await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a silent redirected command must still finish promptly"
+        );
+        let progress = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            progress.contains("stdout is redirected") && progress.contains("probe.log"),
+            "redirect note missing: {progress}"
+        );
+        assert!(
+            progress.contains("still running"),
+            "silent liveness heartbeat missing: {progress}"
+        );
+    }
+
+    #[test]
+    fn output_redirect_target_detects_stdout_file() {
+        assert_eq!(
+            output_redirect_target(
+                r#"cd webui && npm run typecheck > "$TMPDIR/webui-typecheck.log" 2>&1; echo EXIT=$?"#
+            )
+            .as_deref(),
+            Some("$TMPDIR/webui-typecheck.log")
+        );
+        assert_eq!(
+            output_redirect_target("cargo test >> build.log").as_deref(),
+            Some("build.log")
+        );
+        assert_eq!(
+            output_redirect_target("make &> all.log").as_deref(),
+            Some("all.log")
+        );
+        assert_eq!(
+            output_redirect_target("foo 1>out.txt").as_deref(),
+            Some("out.txt")
+        );
+    }
+
+    #[test]
+    fn output_redirect_target_ignores_dups_null_and_stderr_only() {
+        // fd dups keep stdout on the pipe.
+        assert_eq!(output_redirect_target("cmd >&2"), None);
+        assert_eq!(output_redirect_target("cmd 2>&1"), None);
+        assert_eq!(output_redirect_target("cmd >&- 2>/dev/null"), None);
+        // Discard targets are not files worth inspecting.
+        assert_eq!(output_redirect_target("cmd >/dev/null 2>&1"), None);
+        assert_eq!(output_redirect_target("cmd > nul"), None);
+        assert_eq!(output_redirect_target("cmd 2>NUL"), None);
+        // stderr-only redirect leaves stdout streaming.
+        assert_eq!(output_redirect_target("cmd 2> err.log"), None);
+        // A `>` inside quotes is data, not a redirect.
+        assert_eq!(output_redirect_target("echo 'a > b'"), None);
+        assert_eq!(output_redirect_target(r#"echo "a > b""#), None);
+        assert_eq!(output_redirect_target("echo no-redirect"), None);
     }
 
     // On Windows the `bash` tool routes through Git Bash / MSYS2, where the cmd.exe
@@ -7765,6 +8203,21 @@ mod tests {
             .execute(r#"{"command":"ls"}"#, &ctx(d.path()))
             .await;
         assert!(r.content.contains("marker.txt"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_working_dir_reports_clean_error() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("missing_workspace");
+        let r = BashTool
+            .execute(r#"{"command":"ls"}"#, &ctx(&missing))
+            .await;
+        assert!(r.is_error, "should fail when workspace dir does not exist");
+        assert!(
+            r.content.contains("working directory not found"),
+            "got: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

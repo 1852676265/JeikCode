@@ -18,6 +18,28 @@ test('a newer build reloads only after health reports that version', () => {
   );
 });
 
+test('a changed instance_id immediately triggers reload across zero-downtime restarts', () => {
+  const base = { want: '7.2.4-beta.11', from: '7.2.4-beta.11', got: '7.2.4-beta.11' };
+  assert.equal(
+    shouldReloadUpgradedPage({
+      ...base,
+      consecutiveMisses: 0,
+      initialInstanceId: 'inst-a',
+      currentInstanceId: 'inst-b',
+    }),
+    true,
+  );
+  assert.equal(
+    shouldReloadUpgradedPage({
+      ...base,
+      consecutiveMisses: 0,
+      initialInstanceId: 'inst-a',
+      currentInstanceId: 'inst-a',
+    }),
+    false,
+  );
+});
+
 test('a same-version reinstall waits for the listen port to drop', () => {
   const base = { want: '7.2.4-beta.11', from: 'v7.2.4-beta.11', got: '7.2.4-beta.11' };
   assert.equal(shouldReloadUpgradedPage({ ...base, consecutiveMisses: 1 }), false);

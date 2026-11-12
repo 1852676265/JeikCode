@@ -1,4 +1,4 @@
-// crates/zap-core/tests/plugin_integration.rs
+// crates/jeikcode-core/tests/plugin_integration.rs
 //
 // End-to-end smoke test for the plugin marketplace pipeline:
 // add_marketplace → install → SkillRegistry::reload + CustomCommandRegistry::load.

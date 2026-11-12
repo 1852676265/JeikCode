@@ -6,18 +6,29 @@
 
 ### 1.1 Configuration File Locations & Priority
 1. **Workspace Project-Level**: `<workspace>/.mcp.json` (Scoped strictly to the current project, version-control friendly).
-2. **User Global-Level**: `~/.zap/mcp.json` (Shared globally, accessible by all projects).
+2. **User Global-Level**: `~/.jeikcode/mcp.json` (Shared globally, accessible by all projects).
 3. **Priority**: For identical server names, project-level configuration overrides global-level configuration.
 
-### 1.2 CLI Quick Addition for MCP Tools
-Use the `jeikcode mcp add` CLI to add tools automatically without manual JSON editing:
+### 1.2 CLI Quick Management for MCP Tools
+Use the `jeikcode mcp` commands to manage tools automatically without manual JSON editing:
 
 ```bash
-# Add to current project .mcp.json
+# Add to current project .mcp.json (stdio process mode)
 jeikcode mcp add playwright npx @playwright/mcp@latest
 
-# Add to global ~/.zap/mcp.json
+# Add HTTP / SSE remote MCP server (supports headers and trust flag)
+jeikcode mcp add-http remote-api https://mcp.example.com/sse -H "Authorization: Bearer secret-token" --trust
+
+# Add to global ~/.jeikcode/mcp.json
 jeikcode mcp add playwright npx -y @playwright/mcp@latest --global
+
+# List configured MCP servers
+jeikcode mcp list
+jeikcode mcp ls --json
+
+# Remove an MCP server (safely removes and cleans keys)
+jeikcode mcp remove playwright
+jeikcode mcp rm remote-api --global
 
 # Specify workspace target directory
 jeikcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
@@ -33,6 +44,13 @@ jeikcode mcp logout github
 ```json
 {
   "mcpServers": {
+    "remote-api": {
+      "url": "https://mcp.example.com/sse",
+      "headers": {
+        "Authorization": "Bearer secret-token"
+      },
+      "trust": true
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "E:/code"],
@@ -55,18 +73,33 @@ jeikcode mcp logout github
 
 ### 1.4 Core Parameter Nuances & Behavioral Differences
 
-- **`scope` Lifecycle Mode (`"project"` vs `"session"`)**:
-  - `"project"` (default): Project-shared singleton. All sessions under the same project share one background child process, with lifecycle tied to the project, exempt from idle reclamation. Best for stateless tools (filesystem, git, search).
-  - `"session"`: Isolated per session. Each session spawns an independent child process, injecting `JEIKCODE_SESSION_ID=<current_session_id>` into the child environment. Best for browsers (Playwright), stateful debuggers, or tools requiring session isolation.
-  - **Process Idle Reclamation**: Under `scope: "session"`, when switching away from a session and no tool calls occur for longer than `[mcp.session] idle_ttl_secs` (default 600s / 10 minutes), the system automatically reaps the process to free memory; the process lazily restarts upon the next tool call. Set `idle_ttl_secs = 0` in `config.toml` to disable idle reclamation.
-- **`maxConcurrentCalls` Concurrency Cap**:
-  - Valid range: 1 to 64 (default 8).
-  - Keep default 8 for stateless read-heavy services;
-  - Set explicitly to `1` for stateful or exclusive control tools (Playwright, Puppeteer) to prevent race conditions.
+- **`scope` Lifecycle Mode (`"global"` vs `"project"` vs `"session"`)**:
+  - `"global"`: Application-wide shared singleton. Reused across all projects and sessions, with lifecycle spanning the entire application. Best for stateless cloud or public APIs (Brave web search, translation) for maximum resource efficiency.
+  - `"project"` (default): Project-shared singleton. All sessions under the same project share one background child process, with lifecycle tied to the project. Best for stateless or workspace tools (filesystem, git, code analysis).
+  - `"session"`: Isolated per session. Each session spawns an independent child process, injecting `JEIKCODE_SESSION_ID=<current_session_id>` into the child environment. Best for browsers (Playwright), stateful debuggers, or tools requiring dedicated sandboxes.
+  - **Process Idle Reclamation**: Under `scope: "session"`, when switching away from a session and no tool calls occur for longer than `[mcp.session] idle_ttl_secs` (default 600s / 10 minutes), the system automatically reaps the process to free memory; set `idle_ttl_secs = 0` in `config.toml` to disable idle reclamation.
+- **`maxConcurrentCalls` Concurrency Cap (Per-Server Concurrency Control)**:
+  - **Default Value**: `8` (Unset defaults to 8, allowing up to 8 concurrent requests simultaneously; optimal for stateless read-heavy services like filesystem or web search);
+  - **Valid Range**: `1` to `64`;
+  - **When to Explicitly Set to `1` (FIFO Queue / Serial Mode)**:
+    1. **Stateful Exclusive Tools**: Browser automation (Playwright, Puppeteer), screen control, debuggers; serial execution prevents race conditions and UI collision;
+    2. **Single-threaded / Lightweight Scripts**: Custom Python/Bash MCP servers lacking multiplexing support; setting to `1` prevents process overload or packet cross-talk.
 - **`disabled` Temporary Disable**:
   - Set to `true` to temporarily disable a server without removing its configuration.
 
-### 1.5 Reload & Effective Semantics
+### 1.5 Daemon REST API
+
+The daemon provides programmatic endpoints for MCP management with automatic live-runtime reloading:
+
+- `GET /api/mcp/status`: Query active MCP servers and connection statuses.
+- `POST /api/mcp/add`: Dynamically register or update a stdio/http MCP server and reload runtime.
+  - Request body example: `{ "name": "remote-api", "url": "https://mcp.example.com/sse", "trust": true }`
+- `POST /api/mcp/remove`: Dynamically remove an MCP server from configuration and reload.
+  - Request body example: `{ "name": "remote-api", "global": false }`
+- `DELETE /api/mcp/:name`: Delete an MCP server by name.
+- `POST /api/mcp/reload`: Manually trigger an MCP runtime reload.
+
+### 1.6 Reload & Effective Semantics
 
 Modifying MCP configuration **never requires restarting JeikCode**:
 
@@ -86,9 +119,9 @@ Skills allow injecting specialized engineering workflows into the Agent via Mark
 
 ### 2.1 Directory Layout & Priority
 Searched in order from highest to lowest precedence (higher priority overrides identical names):
-1. **Project Specific**: `<workspace>/.zap/skills/<name>/SKILL.md` or `<workspace>/.skills/<name>/SKILL.md`
-2. **Global User**: `~/.zap/skills/<name>/SKILL.md`
-3. **Plugin Marketplace**: `~/.zap/plugins/marketplaces/...`
+1. **Project Specific**: `<workspace>/.jeikcode/skills/<name>/SKILL.md` or `<workspace>/.skills/<name>/SKILL.md`
+2. **Global User**: `~/.jeikcode/skills/<name>/SKILL.md`
+3. **Plugin Marketplace**: `~/.jeikcode/plugins/marketplaces/...`
 
 ### 2.2 `SKILL.md` Standard Structure
 
@@ -123,6 +156,6 @@ description: Specialized in code review and architecture rule compliance. Activa
 
 ## 3. Plugins Management
 
-- Plugins root directory: `~/.zap/plugins/`.
+- Plugins root directory: `~/.jeikcode/plugins/`.
 - Enter `/plugin` in the TUI to interactively browse, install, and uninstall plugins.
 - After installing or updating plugins, invoke `zap_config(action="reload")` to apply changes immediately without restart.

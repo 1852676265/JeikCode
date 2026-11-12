@@ -465,6 +465,94 @@ fn split_table_row(line: &str) -> Vec<String> {
     cells
 }
 
+/// Split a cell string on `<br>` variants outside inline code spans.
+/// Handles:
+///   - `<br>`, `<br/>`, `<br />` (case-insensitive)
+///   - `&lt;br&gt;`, `&lt;br/&gt;`, `&lt;br /&gt;` (case-insensitive)
+///   - `\<br>`, `\<br/>`, `\<br />` (case-insensitive)
+///   - `＜br＞`, `＜br/＞`, `＜br /＞` (case-insensitive)
+/// Inside code spans (`` `...` ``), tags are preserved verbatim.
+fn split_cell_br(cell: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_code = false;
+    let chars: Vec<char> = cell.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+        if c == '`' {
+            in_code = !in_code;
+            current.push('`');
+            i += 1;
+            continue;
+        }
+        if !in_code {
+            let slice: String = chars[i..].iter().collect();
+            let lower = slice.to_ascii_lowercase();
+
+            // 1. CJK fullwidth angle brackets ＜br＞, ＜br/＞, ＜br /＞
+            if lower.starts_with("＜br＞") || lower.starts_with("＜br/＞") {
+                lines.push(current.trim().to_string());
+                current.clear();
+                i += if lower.starts_with("＜br/＞") { 5 } else { 4 };
+                continue;
+            }
+            if lower.starts_with("＜br /＞") {
+                lines.push(current.trim().to_string());
+                current.clear();
+                i += 6;
+                continue;
+            }
+
+            // 2. Escaped / entity forms: &lt;br...&gt; or \<br...>
+            let mut prefix_len = 0;
+            if lower.starts_with('\\') {
+                prefix_len = 1;
+            }
+            let sub = &lower[prefix_len..];
+
+            if sub.starts_with("&lt;br&gt;")
+                || sub.starts_with("&lt;br/&gt;")
+                || sub.starts_with("&lt;br /&gt;")
+            {
+                lines.push(current.trim().to_string());
+                current.clear();
+                let tag_len = if sub.starts_with("&lt;br /&gt;") {
+                    12
+                } else if sub.starts_with("&lt;br/&gt;") {
+                    11
+                } else {
+                    10
+                };
+                i += prefix_len + tag_len;
+                continue;
+            }
+
+            if sub.starts_with("<br>") || sub.starts_with("<br/>") || sub.starts_with("<br />") {
+                lines.push(current.trim().to_string());
+                current.clear();
+                let tag_len = if sub.starts_with("<br />") {
+                    6
+                } else if sub.starts_with("<br/>") {
+                    5
+                } else {
+                    4
+                };
+                i += prefix_len + tag_len;
+                continue;
+            }
+        }
+
+        current.push(c);
+        i += 1;
+    }
+
+    lines.push(current.trim().to_string());
+    lines
+}
+
 /// A GFM delimiter row (`---|:--:|--:`) — cells are made up only of `-`, `:`
 /// and spaces. Shared by every table stage so the "is this the separator?"
 /// rule can't drift between the box, wrapped-grid and flat paths.
@@ -591,8 +679,10 @@ fn fit_columns_to_grid(
             if j >= ncols {
                 break;
             }
-            let tok = longest_token_width(&strip_md_for_width(cell));
-            floors[j] = floors[j].max(tok.min(TOKEN_CAP));
+            for subline in split_cell_br(cell) {
+                let tok = longest_token_width(&strip_md_for_width(&subline));
+                floors[j] = floors[j].max(tok.min(TOKEN_CAP));
+            }
         }
     }
     // Never grow beyond natural — a column narrower than its floor stays put.
@@ -640,7 +730,10 @@ fn grid_too_starved(parsed: &[Vec<String>], col_widths: &[usize]) -> bool {
             .enumerate()
             .map(|(j, &w)| {
                 let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-                word_wrap_cell(&strip_md_for_width(cell), w).len()
+                split_cell_br(cell)
+                    .iter()
+                    .map(|subline| word_wrap_cell(&strip_md_for_width(subline), w).len())
+                    .sum::<usize>()
             })
             .max()
             .unwrap_or(1);
@@ -701,7 +794,14 @@ fn render_wrapped_box_table(
         let wrapped: Vec<Vec<String>> = (0..ncols)
             .map(|j| {
                 let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-                word_wrap_cell(&strip_md_for_width(cell), col_widths[j])
+                let mut cell_lines = Vec::new();
+                for subline in split_cell_br(cell) {
+                    cell_lines.extend(word_wrap_cell(&strip_md_for_width(&subline), col_widths[j]));
+                }
+                if cell_lines.is_empty() {
+                    cell_lines.push(String::new());
+                }
+                cell_lines
             })
             .collect();
         let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
@@ -796,9 +896,11 @@ pub fn flush_aligned_table_with_width(
             if j >= ncols {
                 break;
             }
-            let plain = strip_md_for_width(cell);
-            let w = crate::width::display_width(&plain);
-            col_widths[j] = col_widths[j].max(w);
+            for subline in split_cell_br(cell) {
+                let plain = strip_md_for_width(&subline);
+                let w = crate::width::display_width(&plain);
+                col_widths[j] = col_widths[j].max(w);
+            }
         }
     }
     // Round up each column width so (w + 2) is a multiple of dash_w.
@@ -906,25 +1008,42 @@ pub fn flush_aligned_table_with_width(
 
     for (i, row) in data_rows.iter().enumerate() {
         // Data row: │ cell │ cell │
-        out.push_str(border_on);
-        out.push('│');
-        out.push_str(border_off);
-        for (j, w) in col_widths.iter().enumerate() {
-            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let plain_w = crate::width::display_width(&strip_md_for_width(cell));
-            let body = render_inline(cell, caps);
-            out.push(' ');
-            out.push_str(&body);
-            let pad = w.saturating_sub(plain_w);
-            for _ in 0..pad {
-                out.push(' ');
-            }
-            out.push(' ');
+        let cell_sublines: Vec<Vec<String>> = (0..ncols)
+            .map(|j| {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                split_cell_br(cell)
+            })
+            .collect();
+        let height = cell_sublines
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        for line_idx in 0..height {
             out.push_str(border_on);
             out.push('│');
             out.push_str(border_off);
+            for (j, w) in col_widths.iter().enumerate() {
+                let subline = cell_sublines[j]
+                    .get(line_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let plain_w = crate::width::display_width(&strip_md_for_width(subline));
+                let body = render_inline(subline, caps);
+                out.push(' ');
+                out.push_str(&body);
+                let pad = w.saturating_sub(plain_w);
+                for _ in 0..pad {
+                    out.push(' ');
+                }
+                out.push(' ');
+                out.push_str(border_on);
+                out.push('│');
+                out.push_str(border_off);
+            }
+            out.push('\n');
         }
-        out.push('\n');
 
         // Separator between every pair of rows: ├─┼─┤
         if i + 1 < data_rows.len() {
@@ -977,7 +1096,7 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
         first = false;
         for j in 0..ncols {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let cell_rendered = render_inline(cell, caps);
+            let sublines = split_cell_br(cell);
             if let Some(header) = headers.get(j) {
                 let h_rendered = render_inline(header, caps);
                 let hw = crate::width::display_width(&strip_md_for_width(header));
@@ -986,11 +1105,23 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
                     out.push(' ');
                 }
                 out.push('：');
-                out.push_str(&cell_rendered);
+                for (sub_idx, subline) in sublines.iter().enumerate() {
+                    let cell_rendered = render_inline(subline, caps);
+                    if sub_idx > 0 {
+                        for _ in 0..(label_w + 2) {
+                            out.push(' ');
+                        }
+                    }
+                    out.push_str(&cell_rendered);
+                    out.push('\n');
+                }
             } else {
-                out.push_str(&cell_rendered);
+                for subline in &sublines {
+                    let cell_rendered = render_inline(subline, caps);
+                    out.push_str(&cell_rendered);
+                    out.push('\n');
+                }
             }
-            out.push('\n');
         }
     }
     // Drop the trailing newline so the caller's `format!("{}\n{}", t, body)`
@@ -1460,6 +1591,51 @@ mod tests {
         assert_eq!(
             split_table_row(row),
             vec!["模式匹配".to_string(), "`Foo | Bar` 多模式".to_string(),],
+        );
+    }
+
+    #[test]
+    fn split_cell_br_handles_all_variants_outside_code() {
+        let cell = "第1项<br>第2项<br/>第3项<br />第4项\\<br>第5项&lt;br&gt;第6项＜br＞第7项 `<br>` 保持代码";
+        let lines = split_cell_br(cell);
+        assert_eq!(
+            lines,
+            vec![
+                "第1项",
+                "第2项",
+                "第3项",
+                "第4项",
+                "第5项",
+                "第6项",
+                "第7项 `<br>` 保持代码"
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_aligned_table_with_br_renders_multiline_box_rows() {
+        let rows = vec![
+            "| 账号 | 状态 |".to_string(),
+            "| :--- | :--- |".to_string(),
+            "| ULTRA | ❌ 没有徽章<br>❌ 没有配额条<br>❌ 反代报 503 |".to_string(),
+            "| PRO | 保持原样 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        // The table must contain all 3 lines of the ULTRA cell
+        assert!(out.contains("❌ 没有徽章"));
+        assert!(out.contains("❌ 没有配额条"));
+        assert!(out.contains("❌ 反代报 503"));
+        // Check that all lines with borders have equal display width
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(crate::width::display_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row must share one display width; got {:?} for\n{}",
+            widths,
+            out
         );
     }
 

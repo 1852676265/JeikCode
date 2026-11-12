@@ -35,14 +35,15 @@ mod commands;
 mod compat_api;
 mod fs_upload;
 pub mod git_adapter;
+mod git_intent;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
 pub mod live_hub;
 pub mod native_live;
 mod runtime_host;
+mod shell_open;
 mod sidebar_projects;
 mod steer_prompt;
-pub mod plugins_api;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `JEIKCODE_TUIX_LOG`.
 /// Moved here from the retired `jeikcode-core` (daemon is its only consumer;
 /// `zap_tuix::trace` keeps its own copy targeting the same append file).
@@ -67,6 +68,7 @@ mod telemetry_scope;
 mod terminal_session;
 pub mod webui;
 pub mod plugin_rpc;
+pub mod plugins_api;
 
 pub(crate) use telemetry_scope::daemon_scope;
 
@@ -75,9 +77,12 @@ use axum::{
         ws::{Message, WebSocketUpgrade},
         DefaultBodyLimit, Path, Query, State,
     },
-    http::{header, request::Parts as RequestParts, HeaderName, HeaderValue, Method, StatusCode},
+    http::{
+        header, request::Parts as RequestParts, HeaderMap, HeaderName, HeaderValue, Method,
+        StatusCode,
+    },
     response::{sse::Sse, IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use futures::stream::StreamExt;
@@ -89,6 +94,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use zap_auth as auth;
@@ -103,6 +110,22 @@ use zap_telemetry::{
 };
 
 const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Build a `MessageInfo` with the additive display-metadata fields defaulted.
+/// Legacy call sites (tests, backfill helpers) keep the old behavior; the two
+/// canonical projections set `display_text/internal/editable` explicitly.
+macro_rules! message_info {
+    ($($field:ident $(: $value:expr)?),* $(,)?) => {
+        MessageInfo { $($field $(: $value)?,)* ..Default::default() }
+    };
+}
+
+/// Build a `SessionDetailQuery` with the additive window fields defaulted.
+macro_rules! session_query {
+    ($($field:ident $(: $value:expr)?),* $(,)?) => {
+        SessionDetailQuery { $($field $(: $value)?,)* ..Default::default() }
+    };
+}
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -132,6 +155,8 @@ pub(crate) struct ConfigResponse {
     pub language: String,
     /// Whether to display the GitHub repository logo in the UI.
     pub github_logo: bool,
+    /// Agent 执行完会改动分支/引用/远端的 git 命令后，是否自动向该项目全部会话广播 Git 刷新。
+    pub auto_git_sync: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +331,10 @@ pub struct AppendSessionMessagesRequest {
     /// Optional working directory (uses current project dir if not provided)
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
+    /// Client-generated idempotency key. A retry with the same key returns the
+    /// already-applied state instead of appending the UI-only rows twice.
+    #[serde(default)]
+    pub client_request_id: Option<String>,
     pub messages: Vec<AppendSessionMessage>,
 }
 
@@ -331,8 +360,25 @@ struct SessionDetailQuery {
     tail: Option<usize>,
     offset: Option<usize>,
     limit: Option<usize>,
+    /// Incremental v4 delta cursor: return rows with `seq > after_seq`.
+    /// Takes precedence over tail/offset/limit.
+    after_seq: Option<u64>,
+    /// Older-history cursor: return at most `limit` rows with `seq < before_seq`.
+    /// Replaces the positional `offset` for identity-first pagination.
+    before_seq: Option<u64>,
+    /// Jump to the page containing this record id (right-rail navigation).
+    around: Option<String>,
+    /// Outline-only read: skip the transcript entirely and return just the turn
+    /// list (plus session metadata). Used by the right rail on wake, so
+    /// refreshing the outline costs no transcript bytes on a weak network.
+    turns_only: Option<bool>,
 }
 
+/// `tail` is a hard page cap. Do not walk the cut back through every tool row:
+/// a long turn is larger than one page, and pulling it into the first paint
+/// stalls the timeline. The opening user question is pinned separately by
+/// [`take_session_page`]; `/chat/watch` must still not append the tool prefix
+/// under the answer.
 fn apply_session_message_window<T>(
     messages: Vec<T>,
     query: &SessionDetailQuery,
@@ -351,16 +397,393 @@ fn apply_session_message_window<T>(
     )
 }
 
+fn is_visible_user_turn_start_content(role: &str, synthetic: bool, content: &str) -> bool {
+    role.eq_ignore_ascii_case("user")
+        && !synthetic
+        && !(content.contains("[jeikcode-steer]")
+            || (content.contains("<user-query>") && content.contains("</user-query>")))
+}
+
+fn resolve_page_indices<T>(
+    items: &[T],
+    is_user_start: impl Fn(&T) -> bool,
+    query: &SessionDetailQuery,
+) -> (usize, usize, usize, usize, Option<usize>) {
+    let total = items.len();
+    if let Some(n) = query.tail.filter(|n| *n > 0) {
+        let offset = total.saturating_sub(n);
+        if offset == 0 {
+            return (total, 0, 0, total, None);
+        }
+        let turn_start = if is_user_start(&items[offset]) {
+            Some(offset)
+        } else {
+            (0..offset).rev().find(|&i| is_user_start(&items[i]))
+        };
+        if let Some(start) = turn_start {
+            return (total, start, start, total, None);
+        }
+        let pinned = (0..offset).rev().find(|&i| is_user_start(&items[i]));
+        return (total, offset, offset, total, pinned);
+    }
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    if limit == usize::MAX {
+        return (total, offset, offset, total, None);
+    }
+    let end = offset.saturating_add(limit).min(total);
+    let start = if offset < total && is_user_start(&items[offset]) {
+        offset
+    } else {
+        (0..offset)
+            .rev()
+            .find(|&i| is_user_start(&items[i]))
+            .unwrap_or(offset)
+    };
+    let next = (end..total)
+        .find(|&i| is_user_start(&items[i]))
+        .unwrap_or(end);
+    (total, start, start, next, None)
+}
+
+fn last_visible_user_before(messages: &[MessageInfo], end: usize) -> Option<usize> {
+    (0..end)
+        .rev()
+        .find(|&index| is_visible_user_turn_start(&messages[index]))
+}
+
+fn first_visible_user_from(messages: &[MessageInfo], start: usize) -> Option<usize> {
+    (start..messages.len()).find(|&index| is_visible_user_turn_start(&messages[index]))
+}
+
+fn take_session_after(
+    messages: Vec<MessageInfo>,
+    after_seq: u64,
+) -> (usize, usize, Vec<MessageInfo>, Option<usize>) {
+    let total = messages.len();
+    let offset = messages
+        .iter()
+        .position(|message| message.seq.is_some_and(|seq| seq > after_seq))
+        .unwrap_or(total);
+    let window: Vec<MessageInfo> = messages
+        .into_iter()
+        .filter(|message| message.seq.is_some_and(|seq| seq > after_seq))
+        .collect();
+    (total, offset, window, None)
+}
+
+struct DisplayTailView {
+    turns: Vec<SessionTurnOutline>,
+    message_count: usize,
+    offset: usize,
+    messages: Vec<MessageInfo>,
+    pinned_user_index: Option<usize>,
+}
+
+/// Segmented v4 read for the first-paint `tail=N` query. Uses the v4 offset
+/// index to seek to the tail and rebuilds the rail from indexed user rows,
+/// avoiding a full log parse. Returns None on any inconsistency so the caller
+/// can fall back to the canonical full read.
+fn read_display_tail_view(
+    manager: &NativeSessionManager,
+    session: &crate::legacy_convert::CatalogSessionView,
+    tail: usize,
+    operation_id: Option<&str>,
+    turn_running: bool,
+    snapshot_last_turn: u64,
+) -> Option<DisplayTailView> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if tail == 0 || turn_running {
+        return None;
+    }
+    let (meta, index) = manager
+        .ensure_display_index(&session.meta.id)
+        .ok()
+        .flatten()?;
+    let display_ids: std::collections::HashSet<String> =
+        index.iter().filter_map(|row| row.id.clone()).collect();
+    if index.is_empty()
+        || meta.v != zap_capabilities::session::DISPLAY_VERSION
+        || !v4_display_covers_completed_user_turns(
+            &meta,
+            &display_ids,
+            &session.snapshot.messages,
+            &session.meta.turn_stats,
+            snapshot_last_turn,
+        )
+    {
+        return None;
+    }
+    let total = index.len();
+    let mut start = total.saturating_sub(tail);
+    let is_visible_user = |row: &zap_capabilities::session::DisplayIndexRow| {
+        row.role.eq_ignore_ascii_case("user") && !row.synthetic
+    };
+    if start > 0 && !is_visible_user(&index[start]) {
+        if let Some(position) = index[..start].iter().rposition(is_visible_user) {
+            start = position;
+        }
+    }
+    let path = manager.display_path(&session.meta.id).ok()?;
+    let mut file = std::fs::File::open(&path).ok()?;
+    file.seek(SeekFrom::Start(index[start].offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let records: Vec<zap_capabilities::session::DisplayRecord> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            serde_json::from_slice::<zap_capabilities::session::DisplayRecord>(line).ok()
+        })
+        .collect();
+    if records.len() != total - start {
+        return None;
+    }
+    // A stale/same-length index must not paint the wrong window: verify every
+    // parsed record against the index identity (seq + role + id).
+    for (offset, record) in records.iter().enumerate() {
+        let indexed = &index[start + offset];
+        if record.seq != indexed.seq
+            || !record.role.eq_ignore_ascii_case(&indexed.role)
+            || record.id != indexed.id
+        {
+            return None;
+        }
+    }
+
+    let already_prefixed = meta.backfilled
+        || index.first().is_some_and(|row| {
+            row.role.eq_ignore_ascii_case("system")
+                || (row.role.eq_ignore_ascii_case("user") && row.synthetic)
+        });
+    let prefix = if already_prefixed {
+        Vec::new()
+    } else {
+        display_prefix_messages(session)
+    };
+    let prefix_len = prefix.len();
+    let mut turns = session_user_outline(&prefix);
+    for (position, row) in index.iter().enumerate() {
+        if !is_visible_user(row) {
+            continue;
+        }
+        let label = outline_label(&row.content);
+        if label.is_empty() {
+            continue;
+        }
+        turns.push(SessionTurnOutline {
+            ordinal: turns.len(),
+            id: row.id.clone(),
+            index: prefix_len + position,
+            label,
+            pending: false,
+            seq: None,
+        });
+    }
+
+    // A hard kill mid-turn never produces a completed `turn_stat`, so the
+    // coverage check above cannot see the crashed turn. If the display does not
+    // end at the snapshot's last message, it may be missing that in-flight tail
+    // (the snapshot/inflight file already has it). Fall back to the full read,
+    // which appends the snapshot tail idempotently.
+    let display_last_id = records.last().and_then(|record| record.id.as_deref());
+    if let Some(snapshot_last_id) = session
+        .snapshot
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| message.id.as_deref())
+    {
+        if display_last_id != Some(snapshot_last_id) {
+            return None;
+        }
+    }
+
+    let elapsed = display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
+    let mut window: Vec<MessageInfo> = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let mut message = display_record_to_message_info(record);
+            if let Some(duration) = elapsed.get(&index) {
+                message.elapsed_ms = Some(*duration);
+            }
+            message
+        })
+        .collect();
+    let snapshot_ids: std::collections::HashSet<&str> = session
+        .snapshot
+        .messages
+        .iter()
+        .filter_map(|message| message.id.as_deref())
+        .collect();
+    mark_display_only_archive_rows(
+        &records,
+        &mut window,
+        &snapshot_ids,
+        snapshot_last_turn,
+        meta.last_turn_id <= snapshot_last_turn,
+    );
+    let offset = if start == 0 { 0 } else { prefix_len + start };
+    let mut messages = if start == 0 { prefix } else { Vec::new() };
+    messages.extend(window);
+    append_streaming_before_pending(
+        &mut messages,
+        &mut turns,
+        &session.meta.id,
+        operation_id,
+        std::path::Path::new(&session.meta.working_dir),
+        offset,
+    );
+    annotate_client_input_ids(&mut messages, &session.meta.id);
+    attach_display_images(
+        &mut messages,
+        std::path::Path::new(&session.meta.working_dir),
+        &session.meta.id,
+    );
+    repair_display_clock(&mut messages);
+    Some(DisplayTailView {
+        turns,
+        message_count: prefix_len + total,
+        offset,
+        messages,
+        pinned_user_index: None,
+    })
+}
+
+/// Tail/older page snapped to complete user turns. A pathological turn is
+/// loaded whole instead of pinning its question and leaving an unloaded middle:
+/// "load older" walks backward from the cached head and could never fill that
+/// hole. Correctness wins over a bounded first paint here.
+fn take_session_page(
+    mut messages: Vec<MessageInfo>,
+    query: &SessionDetailQuery,
+) -> (usize, usize, Vec<MessageInfo>, Option<usize>) {
+    let total = messages.len();
+    // Identity-first pagination: `before_seq` is exclusive and independent of
+    // array/sourceIndex position. Snap the page start down to a visible user
+    // turn so an older page never begins mid-answer.
+    if let Some(before) = query.before_seq {
+        let limit = query.limit.unwrap_or(48).max(1);
+        let end = messages
+            .iter()
+            .position(|message| message.seq.is_some_and(|seq| seq >= before))
+            .unwrap_or(total);
+        let mut start = end.saturating_sub(limit);
+        if start > 0 && !is_visible_user_turn_start(&messages[start]) {
+            if let Some(position) = messages[..start]
+                .iter()
+                .rposition(is_visible_user_turn_start)
+            {
+                start = position;
+            }
+        }
+        return (total, start, messages.drain(start..end).collect(), None);
+    }
+    // Right-rail jump: start exactly at the requested identity and return its
+    // whole turn so the client never has to translate it back into a fragile
+    // positional index.
+    if let Some(around) = query.around.as_deref() {
+        if let Some(start) = messages
+            .iter()
+            .position(|message| message.id.as_deref() == Some(around))
+        {
+            let end = (start + 1..total)
+                .find(|&index| is_visible_user_turn_start(&messages[index]))
+                .unwrap_or(total);
+            return (total, start, messages.drain(start..end).collect(), None);
+        }
+    }
+    let (total, offset, start, end, pinned) =
+        resolve_page_indices(&messages, is_visible_user_turn_start, query);
+    if let Some(idx) = pinned {
+        let pinned_msg = messages[idx].clone();
+        let mut window: Vec<MessageInfo> = messages.drain(start..end).collect();
+        window.insert(0, pinned_msg);
+        return (total, offset, window, Some(idx));
+    }
+    let window = if start == 0 && end == total {
+        messages
+    } else {
+        messages.drain(start..end).collect()
+    };
+    (total, offset, window, None)
+}
+
 #[cfg(test)]
 mod session_window_tests {
     use super::*;
 
+    fn seq_rows(n: usize) -> Vec<MessageInfo> {
+        (0..n)
+            .map(|i| {
+                let mut row = page_msg(
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &format!("m{i}"),
+                );
+                row.seq = Some(u64::try_from(i + 1).unwrap());
+                row.id = Some(format!("id-{i}"));
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn before_seq_pages_older_by_identity_not_position() {
+        let q = session_query! { before_seq: Some(5), limit: Some(2) };
+        let (total, offset, window, pinned) = take_session_page(seq_rows(6), &q);
+        assert_eq!(total, 6);
+        assert_eq!(offset, 2);
+        assert_eq!(pinned, None);
+        assert_eq!(
+            window.iter().map(|m| m.seq.unwrap()).collect::<Vec<_>>(),
+            vec![3, 4],
+            "before_seq is exclusive and never uses sourceIndex"
+        );
+    }
+
+    #[test]
+    fn around_starts_at_the_requested_record_identity() {
+        // Right-rail targets are user rows; the whole turn (question + answer)
+        // comes back so the jump never lands on a half-loaded page.
+        let q = session_query! { around: Some("id-2".into()) };
+        let (total, offset, window, pinned) = take_session_page(seq_rows(6), &q);
+        assert_eq!(total, 6);
+        assert_eq!(offset, 2);
+        assert_eq!(pinned, None);
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.id.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["id-2", "id-3"]
+        );
+    }
+
+    #[test]
+    fn after_seq_returns_only_newer_rows() {
+        let mut first = page_msg("user", "q1");
+        first.seq = Some(1);
+        let mut second = page_msg("assistant", "a1");
+        second.seq = Some(2);
+        let mut third = page_msg("user", "q2");
+        third.seq = Some(3);
+        let (total, offset, window, pinned) = take_session_after(vec![first, second, third], 2);
+        assert_eq!(total, 3);
+        assert_eq!(offset, 2);
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].seq, Some(3));
+        assert!(pinned.is_none());
+    }
+
     #[test]
     fn tail_returns_last_n() {
-        let q = SessionDetailQuery {
+        let q = session_query! {
             tail: Some(2),
             offset: None,
             limit: None,
+            after_seq: None,
         };
         let (total, offset, msgs) = apply_session_message_window(vec![1, 2, 3, 4, 5], &q);
         assert_eq!(total, 5);
@@ -370,10 +793,11 @@ mod session_window_tests {
 
     #[test]
     fn offset_limit_pages_older() {
-        let q = SessionDetailQuery {
+        let q = session_query! {
             tail: None,
             offset: Some(1),
             limit: Some(2),
+            after_seq: None,
         };
         let (total, offset, msgs) = apply_session_message_window(vec![10, 20, 30, 40], &q);
         assert_eq!(total, 4);
@@ -389,9 +813,287 @@ mod session_window_tests {
     }
 
     #[test]
+    fn tail_stays_capped_when_the_cut_falls_mid_turn() {
+        // 8 rows, tail 3 starts on an assistant. The page stays 3; it must not
+        // grow back to the question that opened the turn.
+        let q = session_query! {
+            tail: Some(3),
+            offset: None,
+            limit: None,
+            after_seq: None,
+        };
+        let (total, offset, window) =
+            apply_session_message_window(vec!["u", "a", "t", "u2", "a2", "t2", "a3", "a4"], &q);
+        assert_eq!(total, 8);
+        assert_eq!(offset, 5);
+        assert_eq!(window, vec!["t2", "a3", "a4"]);
+    }
+
+    fn page_msg(role: &str, content: &str) -> MessageInfo {
+        message_info! {
+            turn_id: None,
+            seq: None,
+            role: role.into(),
+            content: content.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms: None,
+            id: None,
+        }
+    }
+
+    #[test]
+    fn tail_expands_to_the_opening_user_when_the_turn_fits() {
+        let q = session_query! {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+            after_seq: None,
+        };
+        let messages = vec![
+            page_msg("user", "上一问"),
+            page_msg("assistant", "上一答"),
+            page_msg("user", "这一问"),
+            page_msg("assistant", "思考"),
+            page_msg("tool", "结果"),
+            page_msg("assistant", "回答"),
+        ];
+        let (total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(total, 6);
+        assert_eq!(offset, 2);
+        assert_eq!(pinned, None);
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["这一问", "思考", "结果", "回答"]
+        );
+    }
+
+    #[test]
+    fn tail_loads_the_whole_oversized_turn_without_a_hole() {
+        const OVERSIZED: usize = 300;
+        let q = session_query! {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+            after_seq: None,
+        };
+        let mut messages = vec![page_msg("user", "超长提问")];
+        for index in 0..OVERSIZED + 4 {
+            messages.push(page_msg("assistant", &format!("步骤{index}")));
+        }
+        let total = messages.len();
+        let (got_total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(got_total, total);
+        assert_eq!(offset, 0);
+        assert_eq!(pinned, None);
+        assert_eq!(window.len(), total);
+        assert_eq!(window[0].content, "超长提问");
+    }
+
+    #[test]
+    fn offset_page_snaps_to_complete_turns() {
+        let q = session_query! {
+            tail: None,
+            offset: Some(1),
+            limit: Some(2),
+            after_seq: None,
+        };
+        let messages = vec![
+            page_msg("user", "问一"),
+            page_msg("assistant", "答一"),
+            page_msg("tool", "结果一"),
+            page_msg("user", "问二"),
+            page_msg("assistant", "答二"),
+            page_msg("tool", "结果二"),
+            page_msg("user", "问三"),
+            page_msg("assistant", "答三"),
+        ];
+        let (total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(total, 8);
+        assert_eq!(offset, 0);
+        assert_eq!(pinned, None);
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["问一", "答一", "结果一"]
+        );
+    }
+
+    #[test]
+    fn offset_page_loads_the_whole_oversized_turn_without_a_hole() {
+        const OVERSIZED: usize = 300;
+        let q = session_query! {
+            tail: None,
+            offset: Some(2),
+            limit: Some(2),
+            after_seq: None,
+        };
+        let mut messages = vec![page_msg("user", "超长提问")];
+        for index in 0..OVERSIZED + 4 {
+            messages.push(page_msg("assistant", &format!("步骤{index}")));
+        }
+        messages.push(page_msg("user", "下一问"));
+        let (total, offset, window, pinned) = take_session_page(messages, &q);
+        assert_eq!(total, OVERSIZED + 6);
+        assert_eq!(offset, 0);
+        assert_eq!(pinned, None);
+        assert_eq!(window.len(), OVERSIZED + 5);
+        assert_eq!(window[0].content, "超长提问");
+        assert_eq!(
+            window.last().unwrap().content,
+            format!("步骤{}", OVERSIZED + 3)
+        );
+    }
+
+    #[test]
+    fn tail_does_not_pin_when_the_page_already_starts_on_a_user() {
+        let q = session_query! {
+            tail: Some(2),
+            offset: None,
+            limit: None,
+            after_seq: None,
+        };
+        let (total, offset, window, pinned) = take_session_page(
+            vec![page_msg("user", "问"), page_msg("assistant", "答")],
+            &q,
+        );
+        assert_eq!((total, offset, pinned), (2, 0, None));
+        assert_eq!(window.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_tail_projects_unflushed_rows_with_absolute_indices() {
+        use zap_kernel::message::Message;
+        let mut q1 = Message::user("旧问题");
+        q1.id = Some("u-1".into());
+        let mut q2 = Message::user("继续");
+        q2.id = Some("u-2".into());
+        let mut a2 = Message::assistant("回答", Vec::new());
+        a2.id = Some("a-2".into());
+        let snapshot = vec![q1.clone(), q2, a2];
+
+        let mut messages = vec![MessageInfo::from_kernel_in(&q1, None)];
+        let mut turns = session_user_outline(&messages);
+        let appended = append_snapshot_tail(
+            &mut messages,
+            &mut turns,
+            &snapshot,
+            std::path::Path::new("/p"),
+        );
+        assert_eq!(
+            appended, 2,
+            "user + assistant tail rows must both be projected"
+        );
+        assert_eq!(messages.len(), 3);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].id.as_deref(), Some("u-2"));
+        assert_eq!(
+            turns[1].index, 1,
+            "outline index must be the absolute canvas position, not a window length"
+        );
+
+        // Idempotent: a second projection sees both rows already present.
+        let appended_again = append_snapshot_tail(
+            &mut messages,
+            &mut turns,
+            &snapshot,
+            std::path::Path::new("/p"),
+        );
+        assert_eq!(appended_again, 0);
+        assert_eq!(turns.len(), 2);
+    }
+
+    #[test]
+    fn display_with_a_middle_user_hole_is_not_authoritative() {
+        use zap_kernel::message::Message;
+
+        fn outline_record(
+            turn_id: u64,
+            id: &str,
+            text: &str,
+        ) -> zap_capabilities::session::DisplayRecord {
+            zap_capabilities::session::DisplayRecord {
+                v: zap_capabilities::session::DISPLAY_VERSION,
+                session_id: "s".into(),
+                turn_id,
+                index: 0,
+                seq: 0,
+                role: "user".into(),
+                id: Some(id.into()),
+                content: text.into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: None,
+                elapsed_ms: None,
+            }
+        }
+        fn turn_stat(
+            after_message: usize,
+            turn_id: u64,
+        ) -> zap_capabilities::session::TurnStat {
+            zap_capabilities::session::TurnStat {
+                after_message,
+                position_valid: true,
+                turn_id,
+                round_count: 1,
+                tool_call_count: 0,
+                duration_ms: 1,
+                total_tokens: 0,
+                errored: false,
+                used_tokens: 0,
+                ctx_window: 0,
+                model_usage: Vec::new(),
+            }
+        }
+
+        let mut q1 = Message::user("Q1");
+        q1.id = Some("u1".into());
+        let mut q2 = Message::user("Q2");
+        q2.id = Some("u2".into());
+        let mut q3 = Message::user("Q3");
+        q3.id = Some("u3".into());
+        let snapshot = vec![q1, q2, q3];
+        let stats = vec![turn_stat(1, 1), turn_stat(2, 2), turn_stat(3, 3)];
+
+        // The real 825c5172 shape: turn 2 is missing but turn 3 is visible.
+        let holed = vec![outline_record(1, "u1", "Q1"), outline_record(3, "u3", "Q3")];
+        assert!(
+            !display_covers_completed_user_rows(&holed, &snapshot, &stats, 3),
+            "a middle user hole must force the snapshot projection"
+        );
+
+        let complete = vec![
+            outline_record(1, "u1", "Q1"),
+            outline_record(2, "u2", "Q2"),
+            outline_record(3, "u3", "Q3"),
+        ];
+        assert!(display_covers_completed_user_rows(
+            &complete, &snapshot, &stats, 3
+        ));
+    }
+
+    #[test]
     fn outline_ordinals_ignore_failed_turn_diagnostic_rows() {
         let msgs = vec![
-            MessageInfo {
+            message_info! {
+                turn_id: None,
+                seq: None,
                 role: "user".into(),
                 content: "第一问".into(),
                 reasoning: None,
@@ -405,7 +1107,9 @@ mod session_window_tests {
                 elapsed_ms: None,
                 id: None,
             },
-            MessageInfo {
+            message_info! {
+                turn_id: None,
+                seq: None,
                 role: "assistant".into(),
                 content: "upstream unavailable".into(),
                 reasoning: None,
@@ -419,7 +1123,9 @@ mod session_window_tests {
                 elapsed_ms: None,
                 id: None,
             },
-            MessageInfo {
+            message_info! {
+                turn_id: None,
+                seq: None,
                 role: "user".into(),
                 content: "第二问".into(),
                 reasoning: None,
@@ -433,7 +1139,9 @@ mod session_window_tests {
                 elapsed_ms: None,
                 id: None,
             },
-            MessageInfo {
+            message_info! {
+                turn_id: None,
+                seq: None,
                 role: "assistant".into(),
                 content: "upstream unavailable again".into(),
                 reasoning: None,
@@ -447,7 +1155,9 @@ mod session_window_tests {
                 elapsed_ms: None,
                 id: None,
             },
-            MessageInfo {
+            message_info! {
+                turn_id: None,
+                seq: None,
                 role: "user".into(),
                 content: "服务恢复后继续".into(),
                 reasoning: None,
@@ -466,13 +1176,183 @@ mod session_window_tests {
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].ordinal, 0);
         assert_eq!(turns[0].index, 0);
-        assert_eq!(turns[0].text, "第一问");
+        assert_eq!(turns[0].label, "第一问");
         assert_eq!(turns[1].ordinal, 1);
         assert_eq!(turns[1].index, 2);
-        assert_eq!(turns[1].text, "第二问");
+        assert_eq!(turns[1].label, "第二问");
         assert_eq!(turns[2].ordinal, 2);
         assert_eq!(turns[2].index, 4);
-        assert_eq!(turns[2].text, "服务恢复后继续");
+        assert_eq!(turns[2].label, "服务恢复后继续");
+    }
+
+    #[test]
+    fn session_detail_response_emits_etag_and_honors_if_none_match() {
+        let detail = SessionDetail {
+            id: "s".into(),
+            name: "n".into(),
+            working_dir: PathBuf::from("."),
+            created_at: 0,
+            updated_at: 0,
+            message_count: 0,
+            revision: 0,
+            caps: session_capabilities(),
+            cursor: SessionCursor {
+                oldest_seq: None,
+                total: 0,
+            },
+            offset: 0,
+            pinned_user_index: None,
+            turns: Vec::new(),
+            input_cursor: 0,
+            messages: Vec::new(),
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
+            token_usage: None,
+            origin: zap_capabilities::session::SessionOrigin::Manual,
+            todos: Vec::new(),
+            todos_revision: 0,
+            daemon_instance_id: "test-instance".into(),
+        };
+        let wire = serde_json::to_value(&detail).unwrap();
+        assert_eq!(
+            wire.get("todos"),
+            Some(&serde_json::json!([])),
+            "an empty checklist must stay on the wire; absence means 'unknown' to clients"
+        );
+        assert_eq!(wire.get("todos_revision"), Some(&serde_json::json!(0)));
+        assert_eq!(
+            wire.get("daemon_instance_id"),
+            Some(&serde_json::json!("test-instance")),
+            "clients need the daemon epoch to reset revision arbitration after a restart"
+        );
+        let first = session_detail_response(&HeaderMap::new(), detail.clone());
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            HeaderValue::from_str(&etag).unwrap(),
+        );
+        let second = session_detail_response(&request_headers, detail);
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            second
+                .headers()
+                .get(axum::http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag
+        );
+    }
+
+    #[test]
+    fn catalog_summary_uses_entry_config_without_meta_read() {
+        let entry = zap_capabilities::session::CatalogEntry {
+            id: "s".into(),
+            name: "n".into(),
+            fork_root_id: None,
+            project_bucket: "p".into(),
+            // Deliberately nonexistent: the summary must not read a meta file.
+            working_dir: PathBuf::from("/does/not/exist"),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            message_count: 0,
+            turn_count: 0,
+            preferred_model: Some("model-a".into()),
+            approval_mode: None,
+            reasoning_effort: Some("high".into()),
+            thinking_budget: Some(4096),
+            presence: zap_capabilities::session::CatalogPresence::NativeOnly,
+        };
+        let summary = catalog_entry_to_session_summary(&entry);
+        assert_eq!(summary.preferred_model.as_deref(), Some("model-a"));
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(summary.thinking_budget, Some(4096));
+    }
+
+    #[test]
+    fn outline_label_is_short_but_canvas_content_is_full() {
+        let long = "长".repeat(1000);
+
+        let msgs = vec![message_info! {
+            turn_id: None,
+            seq: None,
+            role: "user".into(),
+            content: long.clone(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms: None,
+            id: None,
+        }];
+        let turns = session_user_outline(&msgs);
+        assert_eq!(turns[0].label.chars().count(), 120);
+        assert!(turns[0].label.ends_with('…'));
+
+        let record = zap_capabilities::session::DisplayRecord {
+            v: zap_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id: 1,
+            index: 0,
+            seq: 0,
+            role: "user".into(),
+            id: None,
+            content: long.clone(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: None,
+            elapsed_ms: None,
+        };
+        let turns = session_records_user_outline(&[record], 0);
+        assert_eq!(turns[0].label.chars().count(), 120);
+        assert!(turns[0].label.ends_with('…'));
+
+        let msg = zap_kernel::message::Message::user(long.clone());
+        let info = MessageInfo::from_kernel(&msg);
+        assert_eq!(info.content, long);
+    }
+
+    #[test]
+    fn empty_user_display_rows_never_enter_the_outline() {
+        let record = zap_capabilities::session::DisplayRecord {
+            v: zap_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id: 1,
+            index: 0,
+            seq: 1,
+            role: "user".into(),
+            id: Some("m-empty".into()),
+            content: "   \n\t".into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: None,
+            elapsed_ms: None,
+        };
+        assert!(session_records_user_outline(&[record], 0).is_empty());
     }
 }
 
@@ -481,21 +1361,131 @@ mod chat_replay_tests {
     use super::*;
 
     #[test]
+    fn part_rev_is_monotonic_within_a_part_and_resets_on_a_new_part() {
+        let mut projector = ChatRuntimeProjector::default();
+        projector.current_message_id = Some("m-rev".into());
+
+        let first = projector.next_part_stamp("text");
+        assert_eq!(first.2, Some(1));
+        assert_eq!(first.3, Some(1));
+        let second = projector.next_part_stamp("text");
+        assert_eq!(second.2, Some(1), "same part keeps part_seq");
+        assert_eq!(second.3, Some(2), "same part bumps part_rev");
+
+        let reasoning = projector.next_part_stamp("reasoning");
+        assert_eq!(reasoning.2, Some(2), "kind change opens a new part");
+        assert_eq!(reasoning.3, Some(1), "new part starts at revision 1");
+
+        let text_after_reasoning = projector.next_part_stamp("text");
+        assert_eq!(text_after_reasoning.2, Some(3));
+        assert_eq!(text_after_reasoning.3, Some(1));
+
+        projector.end_streaming_part();
+        let after_tool = projector.next_part_stamp("text");
+        assert_eq!(after_tool.2, Some(4));
+        assert_eq!(after_tool.3, Some(1));
+    }
+
+    #[test]
+    fn artifact_split_text_events_get_distinct_part_revisions() {
+        use zap_kernel::event::AgentEvent;
+
+        let mut projector = ChatRuntimeProjector::default();
+        let _ = projector.project_agent(
+            AgentEvent::AssistantMessage {
+                message_id: "m-artifact-rev".into(),
+            },
+            "sess-artifact-rev",
+        );
+        let events = projector.project_agent(
+            AgentEvent::TextDelta("before\n\n```rust\ncode\n```\nafter".into()),
+            "sess-artifact-rev",
+        );
+        let revisions: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::TextDelta { part_rev, .. } => *part_rev,
+                _ => None,
+            })
+            .collect();
+        assert!(
+            revisions.len() > 1,
+            "artifact detector must split the delta"
+        );
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] < pair[1]),
+            "each emitted TextDelta needs a distinct increasing part_rev: {revisions:?}"
+        );
+    }
+
+    #[test]
+    fn replay_log_seq_advances_for_every_event_and_keeps_the_last_on_coalesce() {
+        let delta = |content: &str| ChatEvent::TextDelta {
+            content: content.into(),
+            message_id: Some("m-seq".into()),
+            part_id: Some("m-seq:1:text".into()),
+            part_seq: Some(1),
+            part_rev: Some(1),
+        };
+        let mut log = ReplayLog::new(10);
+        assert_eq!(push_chat_replay(&mut log, delta("a")), 11);
+        assert_eq!(push_chat_replay(&mut log, delta("b")), 12);
+        assert_eq!(log.events[0].0, 12, "coalesced entry exposes the last seq");
+        assert_eq!(push_chat_replay(&mut log, ChatEvent::Stopped), 13);
+        assert_eq!(log.events.len(), 2);
+        assert_eq!(log.high_water(), 13);
+    }
+
+    #[test]
+    fn replay_coalescing_keeps_the_last_part_rev() {
+        let delta = |content: &str, rev: u64| ChatEvent::TextDelta {
+            content: content.into(),
+            message_id: Some("m-rev".into()),
+            part_id: Some("m-rev:1:text".into()),
+            part_seq: Some(1),
+            part_rev: Some(rev),
+        };
+        let mut log = ReplayLog::new(0);
+        assert_eq!(push_chat_replay(&mut log, delta("a", 1)), 1);
+        assert_eq!(push_chat_replay(&mut log, delta("b", 2)), 2);
+        assert_eq!(log.events.len(), 1);
+        assert_eq!(log.events[0].0, 2, "coalesced entry keeps the LAST seq");
+        match &log.events[0].1 {
+            ChatEvent::TextDelta {
+                content, part_rev, ..
+            } => {
+                assert_eq!(content, "ab");
+                assert_eq!(
+                    *part_rev,
+                    Some(2),
+                    "replay snapshot carries the last revision"
+                );
+            }
+            other => panic!("expected text delta, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn chat_replay_coalesces_only_within_the_same_identity() {
         let delta = |content: &str, message_id: &str, part_id: &str| ChatEvent::TextDelta {
             content: content.into(),
             message_id: Some(message_id.into()),
             part_id: Some(part_id.into()),
             part_seq: Some(1),
+            part_rev: None,
         };
-        let mut buf = Vec::new();
-        push_chat_replay(&mut buf, delta("a", "m-1", "m-1:1:text"));
-        push_chat_replay(&mut buf, delta("b", "m-1", "m-1:1:text"));
-        assert_eq!(buf.len(), 1, "same identity coalesces");
+        let mut log = ReplayLog::new(0);
+        push_chat_replay(&mut log, delta("a", "m-1", "m-1:1:text"));
+        push_chat_replay(&mut log, delta("b", "m-1", "m-1:1:text"));
+        assert_eq!(log.events.len(), 1, "same identity coalesces");
         // 身份不同绝不合并：合并后回放会把后一回合的正文画到前一回合名下。
-        push_chat_replay(&mut buf, delta("c", "m-2", "m-2:1:text"));
-        assert_eq!(buf.len(), 2, "a different round keeps its own replay entry");
-        match (&buf[0], &buf[1]) {
+        push_chat_replay(&mut log, delta("c", "m-2", "m-2:1:text"));
+        assert_eq!(
+            log.events.len(),
+            2,
+            "a different round keeps its own replay entry"
+        );
+        match (&log.events[0].1, &log.events[1].1) {
             (
                 ChatEvent::TextDelta {
                     content: first,
@@ -515,6 +1505,238 @@ mod chat_replay_tests {
             }
             other => panic!("unexpected replay buffer: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod transcript_display_tests {
+    use super::*;
+    use zap_capabilities::session::{ToolRecord, TurnRecord};
+
+    fn turn(id: u64, ts: i64, user: &str, assistant: &str) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            ts,
+            iso: String::new(),
+            session_id: "s1".into(),
+            turn_id: id,
+            user: user.into(),
+            assistant: assistant.into(),
+            reasoning: String::new(),
+            tools: Vec::new(),
+            usage: Default::default(),
+        }
+    }
+
+    fn info(role: &str, text: &str, synthetic: bool) -> MessageInfo {
+        message_info! {
+            turn_id: None,
+            seq: None,
+            role: role.into(),
+            id: None,
+            content: text.into(),
+            reasoning: None,
+            synthetic,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: None,
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn missing_display_clock_inherits_the_previous_row() {
+        // 行序就是时间序：缺时间的工具行必须继承上一条，绝不能用会话 updated_at。
+        let mut rows = vec![
+            info("user", "Q", false),
+            info("tool", "out", false),
+            info("assistant", "A", false),
+        ];
+        rows[0].created_at = Some(1_000);
+        rows[1].created_at = None;
+        rows[2].created_at = Some(1_200);
+        fill_missing_display_clock(&mut rows, 500);
+        assert_eq!(rows[0].created_at, Some(1_000));
+        assert_eq!(rows[1].created_at, Some(1_000));
+        assert_eq!(rows[2].created_at, Some(1_200));
+    }
+
+    #[test]
+    fn repair_display_clock_pulls_fabricated_stamps_back_into_order() {
+        // 旧日志里工具行与注入提示行被写成会话 updated_at(=9_000)，比它后面的回复还晚。
+        let mut rows = vec![
+            info("user", "Q", false),
+            info("user", "<available_skills>", true),
+            info("assistant", "A1", false),
+            info("tool", "out", false),
+            info("assistant", "A2", false),
+        ];
+        rows[0].created_at = Some(1_000);
+        rows[1].created_at = Some(9_000);
+        rows[2].created_at = Some(1_100);
+        rows[3].created_at = Some(9_000);
+        rows[4].created_at = Some(1_200);
+        repair_display_clock(&mut rows);
+        assert_eq!(
+            rows[0].created_at,
+            Some(1_000),
+            "已按行序的提问时间保持原样"
+        );
+        assert_eq!(rows[1].created_at, Some(1_100), "伪造的注入提示时间被拉回");
+        assert_eq!(rows[3].created_at, Some(1_200));
+        let stamps: Vec<u64> = rows.iter().filter_map(|row| row.created_at).collect();
+        assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn transcript_prefix_rebuilds_user_assistant_and_paired_tools() {
+        let mut first = turn(1, 100, "Q1", "A1");
+        first.tools.push(ToolRecord {
+            name: "read".into(),
+            args: "{\"path\":\"a\"}".into(),
+            result: "R1".into(),
+            is_error: false,
+        });
+        let second = turn(2, 200, "Q2", "A2");
+
+        let rows = display_prefix_from_transcript(&[first, second], Some(150), None);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].content, "Q1");
+        assert_eq!(rows[0].created_at, None);
+        assert_eq!(rows[1].role, "assistant");
+        assert_eq!(rows[1].id.as_deref(), Some("transcript-1-assistant-tools"));
+        let call = rows[1].tool_calls.as_ref().unwrap()[0].clone();
+        assert_eq!(call.id, "transcript-1-tool-0");
+        assert_eq!(rows[2].role, "tool");
+        assert_eq!(rows[2].content, "R1");
+        assert_eq!(rows[2].tool_result.as_ref().unwrap().call_id, call.id);
+        assert!(rows[2].tool_result.as_ref().unwrap().success);
+        assert_eq!(rows[3].role, "assistant");
+        assert_eq!(rows[3].content, "A1");
+        assert_eq!(rows[3].created_at, Some(100));
+    }
+
+    #[test]
+    fn transcript_prefix_can_split_by_user_text_when_timestamp_is_missing() {
+        let first = turn(1, 100, "Q1", "A1");
+        let second = turn(2, 200, "Q2", "A2");
+        let rows = display_prefix_from_transcript(&[first, second], None, Some("Q2"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content, "Q1");
+        assert_eq!(rows[1].content, "A1");
+    }
+
+    fn display_record(role: &str, content: &str) -> zap_capabilities::session::DisplayRecord {
+        zap_capabilities::session::DisplayRecord {
+            v: zap_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id: 1,
+            index: 0,
+            seq: 0,
+            role: role.into(),
+            id: Some("m-1".into()),
+            content: content.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: Some(1),
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn display_record_round_trips_images_and_tool_results() {
+        let mut user = display_record("user", "看这张图");
+        user.images
+            .push(zap_capabilities::session::DisplayImage {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+                missing: false,
+            });
+        let info = display_record_to_message_info(&user);
+        assert_eq!(info.images.as_ref().unwrap()[0].data, "AAAA");
+        let back = display_record_from_message_info("s1", 0, &info);
+        assert_eq!(back.images[0].data, "AAAA");
+
+        let mut call = display_record("assistant", "");
+        call.tool_calls
+            .push(zap_capabilities::session::DisplayToolCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"a\"}".into(),
+            });
+        let call_info = display_record_to_message_info(&call);
+        assert_eq!(call_info.tool_calls.as_ref().unwrap()[0].id, "call-1");
+
+        let mut result = display_record("tool", "tool output");
+        result.tool_call_id = Some("call-1".into());
+        let result_info = display_record_to_message_info(&result);
+        assert_eq!(result_info.tool_result.as_ref().unwrap().call_id, "call-1");
+        assert!(result_info.tool_result.as_ref().unwrap().success);
+        assert_eq!(result_info.content, "tool output");
+    }
+
+    #[test]
+    fn display_prefix_stops_before_the_first_real_user() {
+        let snapshot = zap_kernel::message::SessionSnapshot::new(vec![
+            zap_kernel::message::Message::system("sys"),
+            zap_kernel::message::Message::synthetic_user("ctx"),
+            zap_kernel::message::Message::user("Q1"),
+        ]);
+        let meta = zap_capabilities::session::SessionMeta::new("s1", "/p", 1);
+        let view = crate::legacy_convert::CatalogSessionView {
+            snapshot,
+            meta,
+            presentation: zap_capabilities::session::PresentationFile::default(),
+        };
+        let prefix = display_prefix_messages(&view);
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(prefix[0].role, "system");
+        assert_eq!(prefix[1].role, "user");
+        assert!(prefix[1].synthetic);
+        assert!(prefix.iter().all(|message| message.content != "Q1"));
+    }
+
+    #[test]
+    fn display_record_strips_the_vision_marker_and_adds_a_placeholder() {
+        let record = display_record("user", "请描述[图片内容（由模型识别）]：一只猫");
+        let info = display_record_to_message_info(&record);
+        assert_eq!(info.content, "请描述");
+        assert!(info
+            .images
+            .as_ref()
+            .is_some_and(|images| images.iter().any(|image| image.missing)));
+    }
+
+    #[test]
+    fn splice_compacted_display_keeps_prefix_then_retained_tail_without_duplication() {
+        let messages = vec![
+            info("system", "sys", false),
+            info("user", "你好啊\n\n<strong-reminder>x", false),
+            info("user", "<!-- jeikcode:anchor v1 -->\nsummary", true),
+            info("user", "Q2", false),
+            info("assistant", "A2", false),
+        ];
+        let prefix = vec![
+            info("user", "你好啊", false),
+            info("assistant", "A1", false),
+        ];
+        let out = splice_compacted_display(messages, prefix);
+        let texts: Vec<_> = out.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, vec!["你好啊", "A1", "sys", "Q2", "A2"]);
+        assert_eq!(
+            out.iter().filter(|m| m.content == "你好啊").count(),
+            1,
+            "the pre-anchor user must be covered by the transcript prefix, not duplicated"
+        );
     }
 }
 
@@ -645,6 +1867,25 @@ mod global_events_tests {
     use super::*;
 
     #[test]
+    fn runtime_activity_serializes_revision_phase_and_owner() {
+        let json = serde_json::to_value(GlobalWireEvent::RuntimeActivity {
+            session_id: "s1".into(),
+            revision: 7,
+            running: true,
+            phase: Some("compacting".into()),
+            phase_started_at: Some(1_700_000_000_000),
+            owner: Some("manual:op-1".into()),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "runtime_activity");
+        assert_eq!(json["session_id"], "s1");
+        assert_eq!(json["revision"], 7);
+        assert_eq!(json["phase"], "compacting");
+        assert_eq!(json["phase_started_at"], 1_700_000_000_000u64);
+        assert_eq!(json["owner"], "manual:op-1");
+    }
+
+    #[test]
     fn global_bus_fans_out_to_every_subscriber() {
         // 跨实例语义：每个实例一条订阅，投递必须广播到所有订阅者（而不是竞争消费）。
         let mut first = global_events().subscribe();
@@ -666,6 +1907,43 @@ mod global_events_tests {
             assert!(matches!(a, GlobalWireEvent::Activity { .. }));
             assert!(matches!(b, GlobalWireEvent::ReviewAsked { .. }));
         }
+    }
+
+    /// `/loop` / `/goal` 控制器也是「会话正在干活」的一部分：wakeup 等待期间
+    /// 没有执行中的回合，但控制器还挂着，不能被 `/chat/active` 当成空闲。
+    #[test]
+    fn controller_state_counts_as_running_until_it_is_released() {
+        let session_id = "controller-test-loop";
+        crate::note_loop_state(session_id, true, 2, "watch CI");
+        let state = crate::controller_state_for(session_id).expect("loop state must be recorded");
+        assert!(state.loop_active);
+        assert_eq!(state.loop_round, 2);
+        assert_eq!(state.loop_label, "watch CI");
+        assert!(crate::controller_running_session_ids()
+            .iter()
+            .any(|id| id == session_id));
+
+        // 控制器结束：记录仍在（保留最后一轮信息），但不再计入运行态。
+        crate::note_loop_state(session_id, false, 2, "watch CI");
+        assert!(crate::controller_state_for(session_id).is_some());
+        assert!(!crate::controller_running_session_ids()
+            .iter()
+            .any(|id| id == session_id));
+    }
+
+    #[test]
+    fn goal_state_alone_keeps_the_session_running() {
+        let session_id = "controller-test-goal";
+        crate::note_goal_state(session_id, true);
+        assert!(crate::controller_state_for(session_id).is_some_and(|state| state.goal_active));
+        assert!(crate::controller_running_session_ids()
+            .iter()
+            .any(|id| id == session_id));
+
+        crate::note_goal_state(session_id, false);
+        assert!(!crate::controller_running_session_ids()
+            .iter()
+            .any(|id| id == session_id));
     }
 
     /// 路由级 smoke：`/events` 必须先发 `sync` 对齐帧，随后把总线上的增量事件
@@ -735,6 +2013,10 @@ mod global_events_tests {
                 updated_at: 2,
                 message_count: 3,
                 origin: "manual".into(),
+                approval_mode: None,
+                preferred_model: None,
+                reasoning_effort: None,
+                thinking_budget: None,
             },
         })
         .unwrap();
@@ -749,6 +2031,24 @@ mod global_events_tests {
         .unwrap();
         assert_eq!(deleted["type"], "session_deleted");
         assert_eq!(deleted["session_id"], "s1");
+
+        // 查看信号：其它实例据此熄灭「刚完成」徽标。
+        let seen = serde_json::to_value(GlobalWireEvent::SessionSeen {
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(seen["type"], "session_seen");
+        assert_eq!(seen["session_id"], "s1");
+
+        // 编辑/删除/回溯的跨实例失效信号：只带 revision，客户端据此作废缓存。
+        let mutated = serde_json::to_value(GlobalWireEvent::SessionMutated {
+            session_id: "s1".into(),
+            revision: 7,
+        })
+        .unwrap();
+        assert_eq!(mutated["type"], "session_mutated");
+        assert_eq!(mutated["session_id"], "s1");
+        assert_eq!(mutated["revision"], 7);
 
         // 终态带 kind（客户端据此出右下角通知）；运行中事件不带 terminal。
         let terminal = serde_json::to_value(GlobalWireEvent::Activity {
@@ -783,13 +2083,22 @@ mod global_events_tests {
         assert_eq!(resolved["type"], "review_resolved");
         assert_eq!(resolved["approval_id"], "a1");
         assert!(resolved.get("request_id").is_none());
+
+        let mode_event = serde_json::to_value(GlobalWireEvent::SessionMode {
+            session_id: Some("s1".into()),
+            mode: "bypass".into(),
+        })
+        .unwrap();
+        assert_eq!(mode_event["type"], "session_mode");
+        assert_eq!(mode_event["session_id"], "s1");
+        assert_eq!(mode_event["mode"], "bypass");
     }
 
     #[tokio::test]
     async fn fanout_chat_events_backfills_session_id_from_done_and_emits_terminal_activity() {
         let mut global_rx = global_events().subscribe();
         let (primary_tx, mut primary_rx) = mpsc::unbounded_channel();
-        let (bus_tx, _bus_rx) = tokio::sync::broadcast::channel(16);
+        let (bus_tx, _bus_rx) = tokio::sync::broadcast::channel::<(u64, ChatEvent)>(16);
         let tx = fanout_chat_events_for_session(primary_tx, bus_tx, None, None, None);
 
         tx.send(ChatEvent::Done {
@@ -798,6 +2107,7 @@ mod global_events_tests {
             session_id: "sid-fanout".into(),
             stop_reason: None,
             message: None,
+            message_id: None,
         })
         .expect("send Done");
         tx.send(ChatEvent::Stopped).expect("send Stopped");
@@ -834,20 +2144,61 @@ mod global_events_tests {
     }
 }
 
-const DISPLAY_FIELD_CAP: usize = 24 * 1024;
-
 /// Compact user-question row for the session outline (right-rail). Not the
 /// model context — just labels.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct SessionTurnOutline {
     /// Stable ordinal among real user questions. Unlike `index`, this is not
     /// affected by assistant/tool/diagnostic rows inserted by failed turns.
     pub ordinal: usize,
+    /// Stable persisted message id when available. The primary dedupe identity;
+    /// older rows without an id fall back to `index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub index: usize,
-    pub text: String,
+    /// Short rail label. The full question lives in `messages`; keeping the
+    /// outline compact avoids duplicating the whole transcript in every page.
+    pub label: String,
+    /// Input admitted but not yet folded/persisted. Rendered with a pending
+    /// badge; its index is a display-space anchor like any other row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+    /// Admission order from the durable input log (absent for persisted rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
-const OUTLINE_TEXT_CAP: usize = 240;
+const OUTLINE_LABEL_CAP: usize = 120;
+
+fn outline_label(text: &str) -> String {
+    let un_steered = if let Some(start) = text.find("<user-query>") {
+        if let Some(end) = text.find("</user-query>") {
+            &text[start + "<user-query>".len()..end]
+        } else {
+            text
+        }
+    } else if let Some(idx) = text.find("[jeikcode-steer]") {
+        let before = text[..idx].trim();
+        if !before.is_empty() {
+            before
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+    let compact = un_steered.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= OUTLINE_LABEL_CAP {
+        return compact;
+    }
+    format!(
+        "{}…",
+        compact
+            .chars()
+            .take(OUTLINE_LABEL_CAP.saturating_sub(1))
+            .collect::<String>()
+    )
+}
 
 fn session_user_outline(messages: &[MessageInfo]) -> Vec<SessionTurnOutline> {
     messages
@@ -857,47 +2208,796 @@ fn session_user_outline(messages: &[MessageInfo]) -> Vec<SessionTurnOutline> {
             if !msg.role.eq_ignore_ascii_case("user") || msg.synthetic {
                 return None;
             }
-            let text = msg.content.split_whitespace().collect::<Vec<_>>().join(" ");
-            if text.is_empty() {
+            let label = outline_label(&msg.content);
+            if label.is_empty() {
                 return None;
             }
-            let text = if text.chars().count() > OUTLINE_TEXT_CAP {
-                format!(
-                    "{}…",
-                    text.chars()
-                        .take(OUTLINE_TEXT_CAP.saturating_sub(1))
-                        .collect::<String>()
-                )
-            } else {
-                text
-            };
-            Some((index, text))
+            // 旧快照行可能没有 id：用确定性 id 兑底，大纲条目始终可按 id 命中。
+            Some((
+                index,
+                msg.id.clone().or_else(|| Some(format!("m-legacy-{index}"))),
+                label,
+                msg.seq,
+            ))
         })
         .enumerate()
-        .map(|(ordinal, (index, text))| SessionTurnOutline {
+        .map(|(ordinal, (index, id, label, seq))| SessionTurnOutline {
             ordinal,
+            id,
             index,
-            text,
+            label,
+            pending: false,
+            seq,
         })
         .collect()
 }
 
-fn cap_display_field(s: String) -> String {
-    if s.len() <= DISPLAY_FIELD_CAP {
-        return s;
+/// Collect the session-unique message identities present in a display log.
+fn display_record_ids(
+    records: &[zap_capabilities::session::DisplayRecord],
+) -> std::collections::HashSet<String> {
+    records
+        .iter()
+        .filter_map(|record| record.id.clone())
+        .collect()
+}
+
+/// v4 completeness: every completed turn's boundary messages must be present in
+/// the durable display log.
+///
+/// Turn ids alone are NOT a sufficient identity: a rewind can restore the
+/// kernel turn counter, so a later turn may REUSE an id whose archived
+/// `turn_stats` entry is still present. `completed_turns.contains(id)` then
+/// reports coverage for a turn that never reached the log — exactly how the
+/// final turn of a session can vanish from the canvas after a refresh. Message
+/// ids are session-unique, so they survive id reuse.
+///
+/// Both boundaries are checked:
+/// - the prompting user row, and
+/// - the turn's last assistant row (the tool-call finalization or the
+///   error diagnostic).
+///
+/// The second check matters because a mid-turn refresh/backfill can legitimately
+/// write the prompt row early; prompt presence alone would then trust a log
+/// whose `turn_complete` slice was dropped.
+///
+/// A `backfilled` log is no longer exempt: its rows carry the canonical message
+/// ids, so the same check applies and a later dropped append is still caught.
+fn v4_display_covers_completed_user_turns(
+    meta: &zap_capabilities::session::DisplayMeta,
+    display_ids: &std::collections::HashSet<String>,
+    snapshot: &[zap_kernel::message::Message],
+    turn_stats: &[zap_capabilities::session::TurnStat],
+    snapshot_last_turn: u64,
+) -> bool {
+    use zap_kernel::message::Role;
+
+    if meta.last_turn_id < snapshot_last_turn {
+        return false;
     }
-    let mut end = DISPLAY_FIELD_CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    let completed: std::collections::HashSet<u64> = meta.completed_turns.iter().copied().collect();
+    let mut previous = 0usize;
+    for stat in turn_stats
+        .iter()
+        .filter(|stat| stat.position_valid && stat.turn_id != 0)
+    {
+        let end = stat.after_message.min(snapshot.len());
+        let start = previous.min(end);
+        let turn = &snapshot[start..end];
+        if let Some(prompt) = turn
+            .iter()
+            .find(|message| message.role == Role::User && !message.synthetic)
+        {
+            let covered = match prompt.id.as_deref() {
+                Some(id) => display_ids.contains(id),
+                // A pre-id snapshot cannot be reconciled by identity. A
+                // backfilled log is the only trustworthy projection for those
+                // raw rows; otherwise keep the legacy turn-id contract.
+                None => meta.backfilled || completed.contains(&stat.turn_id),
+            };
+            if !covered {
+                return false;
+            }
+        }
+        // The terminal assistant row proves the whole turn slice landed, not
+        // just a prompt row written by a mid-turn backfill.
+        if let Some(last_assistant) = turn.iter().rev().find(|m| m.role == Role::Assistant) {
+            if let Some(id) = last_assistant.id.as_deref() {
+                if !display_ids.contains(id) {
+                    return false;
+                }
+            }
+        }
+        previous = end;
     }
-    let mut out = s[..end].to_string();
-    out.push_str("\n… [truncated for display]");
-    out
+    true
+}
+
+/// v3 migration guard only. v4 sessions use the exact turn-id check in
+/// [`v4_display_covers_completed_user_turns`]; a normal v4 read never calls this.
+///
+/// 展示日志只覆盖「已落盘的完整回合」。当某个已完成回合的用户行缺失，
+/// 且它后面还有可见提问时，这是日志中间的洞（晚到/中断的 flush），
+/// 不是运行中的尾巴——此时必须回退到快照投影，而不是继续信任 display。
+fn display_covers_completed_user_rows(
+    records: &[zap_capabilities::session::DisplayRecord],
+    snapshot: &[zap_kernel::message::Message],
+    turn_stats: &[zap_capabilities::session::TurnStat],
+    snapshot_last_turn: u64,
+) -> bool {
+    use zap_kernel::message::Role;
+
+    let display_ids: std::collections::HashSet<String> = records
+        .iter()
+        .filter(|record| record.role.eq_ignore_ascii_case("user") && !record.synthetic)
+        .map(display_record_identity)
+        .collect();
+    // 旧日志没有 id 时无法核对；下一次空闲读取会用确定性 id 回填。
+    if display_ids.is_empty() {
+        return true;
+    }
+    for (index, message) in snapshot.iter().enumerate() {
+        if message.role != Role::User || message.synthetic {
+            continue;
+        }
+        let Some(id) = message.id.as_deref() else {
+            continue;
+        };
+        if display_ids.contains(id) {
+            continue;
+        }
+        // `after_message` 是快照消息数边界：第一个覆盖该下标的回合就是它所属的 turn。
+        let turn_id = turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid && stat.after_message > index)
+            .min_by_key(|stat| stat.after_message)
+            .map(|stat| stat.turn_id)
+            .unwrap_or(u64::MAX);
+        if turn_id > snapshot_last_turn {
+            // 运行中的尾巴还没有 turn_stat：这是未落盘尾巴，不是洞。
+            continue;
+        }
+        let later_visible = snapshot[index + 1..].iter().any(|later| {
+            later.role == Role::User
+                && !later.synthetic
+                && later
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| display_ids.contains(id))
+        });
+        if later_visible {
+            return false;
+        }
+    }
+    true
+}
+
+/// 把快照里「display 最后一条共享行之后」的未落盘内容投影到画布与大纲。
+///
+/// 这是运行中/刚停止但尚未 flush 的唯一尾巴来源：display 日志要等
+/// `turn_complete`，而 inflight 快照已经有序、带 id。只追加共享锚点之后的
+/// 行，绝不猜测锚点之前的位置；没有共享锚点的旧日志交给 snapshot 回退路径。
+fn append_snapshot_tail(
+    messages: &mut Vec<MessageInfo>,
+    turns: &mut Vec<SessionTurnOutline>,
+    snapshot: &[zap_kernel::message::Message],
+    working_dir: &std::path::Path,
+) -> usize {
+    use zap_kernel::message::Role;
+
+    if snapshot.is_empty() || messages.is_empty() {
+        return 0;
+    }
+    let display_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|message| message.id.clone())
+        .collect();
+    let Some(anchor) = snapshot.iter().rposition(|message| {
+        message
+            .id
+            .as_deref()
+            .is_some_and(|id| display_ids.contains(id))
+    }) else {
+        // 没有共享身份：旧日志/旧 daemon。不能靠文本猜位置。
+        return 0;
+    };
+    let known_turn_ids: std::collections::HashSet<String> =
+        turns.iter().filter_map(|turn| turn.id.clone()).collect();
+    let mut next_seq = messages
+        .iter()
+        .filter_map(|message| message.seq)
+        .max()
+        .unwrap_or(0);
+    let mut appended = 0usize;
+    for message in snapshot.iter().skip(anchor + 1) {
+        let Some(id) = message.id.as_deref() else {
+            continue;
+        };
+        if display_ids.contains(id) {
+            continue;
+        }
+        let index = messages.len();
+        let mut msg_info = MessageInfo::from_kernel_in(message, Some(working_dir));
+        next_seq = next_seq.saturating_add(1);
+        msg_info.seq = Some(next_seq);
+        messages.push(msg_info);
+        appended += 1;
+        if message.role == Role::User && !message.synthetic && !known_turn_ids.contains(id) {
+            let label = outline_label(&zap_capabilities::session::user_text_for_display(
+                working_dir,
+                &message.text,
+            ));
+            if !label.is_empty() {
+                turns.push(SessionTurnOutline {
+                    ordinal: turns.len(),
+                    id: Some(id.to_string()),
+                    index,
+                    label,
+                    pending: false,
+                    seq: Some(next_seq),
+                });
+            }
+        }
+    }
+    appended
+}
+
+/// Show an interrupted per-token checkpoint on a cold read. The next `/chat`
+/// overlays the same content into the model context and clears the sidecar; this
+/// projection only makes the recovered text visible before the retry.
+fn append_interrupted_partial(messages: &mut Vec<MessageInfo>, session_id: &str) {
+    fn already_present(
+        messages: &[MessageInfo],
+        partial: &zap_capabilities::session::PartialStream,
+    ) -> bool {
+        partial.message_id.as_deref().is_some_and(|id| {
+            messages
+                .iter()
+                .any(|message| message.id.as_deref() == Some(id))
+        }) || (!partial.text.trim().is_empty()
+            && messages.iter().any(|message| {
+                message.role == "assistant" && message.content.contains(partial.text.trim())
+            }))
+    }
+    fn append_one(
+        messages: &mut Vec<MessageInfo>,
+        partial: zap_capabilities::session::PartialStream,
+    ) {
+        if partial.text.trim().is_empty() && partial.reasoning.trim().is_empty() {
+            return;
+        }
+        if already_present(messages, &partial) {
+            return;
+        }
+        let next_seq = messages
+            .iter()
+            .filter_map(|message| message.seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        messages.push(message_info! {
+            turn_id: None,
+            seq: Some(next_seq),
+            role: "assistant".into(),
+            id: partial.message_id,
+            content: partial.text,
+            reasoning: (!partial.reasoning.trim().is_empty()).then_some(partial.reasoning),
+            synthetic: false,
+            internal_origin: Some("interrupted_partial".into()),
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: None,
+            created_at: Some(partial.updated_at),
+            elapsed_ms: None,
+        });
+    }
+    // Archived partials belong to an older turn whose display slice has not
+    // flushed yet. Keep showing them even while the next turn is running.
+    let archived = zap_capabilities::session::partial::load_archived_global(session_id);
+    if let Some(archived) = archived {
+        if already_present(messages, &archived) {
+            zap_capabilities::session::partial::clear_archived_global(session_id);
+        } else {
+            append_one(messages, archived);
+        }
+    }
+    // Always project the live checkpoint too. It is the assistant row currently
+    // being streamed; pending steers (projected by the caller afterwards) must
+    // be ordered after it. The watcher/replay dedupes the same identity/text.
+    if let Some(partial) = zap_capabilities::session::partial::load_global(session_id) {
+        append_one(messages, partial);
+    }
+}
+
+/// Overlay a per-token crash checkpoint onto the canonical conversation.
+/// Idempotent: a persisted assistant message with the same id (or already
+/// containing the checkpoint text) wins. Returns true when a row was appended.
+pub(crate) fn overlay_partial_stream(
+    conversation: &mut Vec<zap_kernel::message::Message>,
+    partial: &zap_capabilities::session::PartialStream,
+) -> bool {
+    if partial.text.trim().is_empty()
+        && partial.reasoning.trim().is_empty()
+        && partial.tool_calls.is_empty()
+    {
+        return false;
+    }
+    let already = conversation.iter().any(|message| {
+        message.role == zap_kernel::message::Role::Assistant
+            && (partial
+                .message_id
+                .as_deref()
+                .is_some_and(|id| message.id.as_deref() == Some(id))
+                || (!partial.text.trim().is_empty() && message.text.contains(partial.text.trim())))
+    });
+    if already {
+        return false;
+    }
+    let calls: Vec<zap_kernel::tool::ToolCall> = partial
+        .tool_calls
+        .iter()
+        .filter_map(|tool| {
+            Some(zap_kernel::tool::ToolCall {
+                id: tool.id.clone()?,
+                name: tool.name.clone()?,
+                arguments: tool.arguments.clone(),
+            })
+        })
+        .collect();
+    let mut recovered =
+        zap_kernel::message::Message::assistant(partial.text.clone(), calls.clone());
+    recovered.id = partial.message_id.clone();
+    recovered.reasoning =
+        (!partial.reasoning.trim().is_empty()).then_some(partial.reasoning.clone());
+    recovered.internal_origin = Some("interrupted_partial".into());
+    conversation.push(recovered);
+    // A tool call without a result makes the provider context invalid. Pair every
+    // interrupted call with an explicit failed result; the next turn can retry.
+    for call in calls {
+        if conversation
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+        {
+            continue;
+        }
+        let mut result = zap_kernel::message::Message::tool_result(
+            call.id,
+            "interrupted: tool call did not complete before the process stopped",
+            true,
+        );
+        result.internal_origin = Some("interrupted_partial_tool".into());
+        conversation.push(result);
+    }
+    true
+}
+
+/// Project admitted-but-not-yet-folded inputs (prompt/steer) onto the canvas
+/// and rail. This is the durable gap between POST acceptance and the kernel's
+/// persisted message; it is scoped to the current operation so stale rows from
+/// an older turn can never reappear.
+fn append_streaming_before_pending(
+    messages: &mut Vec<MessageInfo>,
+    turns: &mut Vec<SessionTurnOutline>,
+    session_id: &str,
+    operation_id: Option<&str>,
+    working_dir: &std::path::Path,
+    absolute_index_base: usize,
+) {
+    // The live partial is the current round's assistant row. Project it BEFORE
+    // pending inputs: a queued steer belongs to the next round boundary, so a
+    // mid-turn refresh must render aq1, as1, steer1 — not aq1, steer1, as1.
+    // With no partial, pending steers stay after the last user row and the
+    // provider merges that same-round user run at the wire.
+    append_interrupted_partial(messages, session_id);
+    append_pending_inputs(
+        messages,
+        turns,
+        session_id,
+        operation_id,
+        working_dir,
+        absolute_index_base,
+    );
+}
+
+fn append_pending_inputs(
+    messages: &mut Vec<MessageInfo>,
+    turns: &mut Vec<SessionTurnOutline>,
+    session_id: &str,
+    operation_id: Option<&str>,
+    working_dir: &std::path::Path,
+    absolute_index_base: usize,
+) {
+    let mut existing: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|message| message.id.clone())
+        .collect();
+    let mut next_seq = messages
+        .iter()
+        .filter_map(|message| message.seq)
+        .max()
+        .unwrap_or(0);
+    let all_inputs = zap_capabilities::session::inputs::list_global(session_id);
+    if let Some(operation_id) = operation_id {
+        for input in all_inputs.iter().filter(|input| {
+            input.status == "admitted"
+                && input.operation_id.as_deref() == Some(operation_id)
+                && (!input.text.trim().is_empty() || !input.images.is_empty())
+        }) {
+            // Queued steers live in `/chat/queue` as cancellable cards until the
+            // kernel actually folds them at a round boundary (`Steered`). Projecting
+            // an un-folded steer into `messages` prematurely paints a user bubble
+            // below the in-flight assistant round while that round continues
+            // streaming above it.
+            if input.delivery == "steer" {
+                continue;
+            }
+            if existing.contains(&input.id) {
+                continue;
+            }
+            let content =
+                zap_capabilities::session::user_text_for_display(working_dir, &input.text);
+            let images: Vec<ImageData> = input
+                .images
+                .iter()
+                .map(|image| ImageData {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                    missing: false,
+                })
+                .collect();
+            if content.trim().is_empty() && images.is_empty() {
+                continue;
+            }
+            let label_text = if content.trim().is_empty() {
+                "[图片]".to_string()
+            } else {
+                content.clone()
+            };
+            let label = outline_label(&label_text);
+            if label.is_empty() {
+                continue;
+            }
+            let index = absolute_index_base + messages.len();
+            next_seq = next_seq.saturating_add(1);
+            let user_info = message_info! {
+                turn_id: None,
+                seq: Some(next_seq),
+                role: "user".into(),
+                id: Some(input.id.clone()),
+                content,
+                reasoning: None,
+                synthetic: false,
+                internal_origin: Some("pending_input".into()),
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: (!images.is_empty()).then_some(images),
+                created_at: Some(input.created_at),
+                elapsed_ms: None,
+            };
+            messages.push(user_info);
+            turns.push(SessionTurnOutline {
+                ordinal: turns.len(),
+                id: Some(input.id.clone()),
+                index,
+                label,
+                pending: true,
+                seq: Some(next_seq),
+            });
+        }
+    }
+    // A promoted steer is already a real persisted user message, but display.jsonl
+    // is only flushed at turn end. Project it into `messages` now so a refresh in
+    // the fold→settle window cannot lose BOTH the queue card (already retired) and
+    // the canvas bubble (not yet flushed).
+    for input in &all_inputs {
+        if input.delivery != "steer" || input.status != "promoted" {
+            continue;
+        }
+        if let (Some(current), Some(input_op)) = (operation_id, input.operation_id.as_deref()) {
+            if current != input_op {
+                continue;
+            }
+        }
+        let message_id = input
+            .message_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| input.id.clone());
+        if existing.contains(&message_id) || existing.contains(&input.id) {
+            continue;
+        }
+        if turns.iter().any(|turn| {
+            turn.id.as_deref() == Some(message_id.as_str())
+                || turn.id.as_deref() == Some(input.id.as_str())
+        }) {
+            continue;
+        }
+        let content =
+            zap_capabilities::session::user_text_for_display(working_dir, &input.text);
+        let images: Vec<ImageData> = input
+            .images
+            .iter()
+            .map(|image| ImageData {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+                missing: false,
+            })
+            .collect();
+        if content.trim().is_empty() && images.is_empty() {
+            continue;
+        }
+        next_seq = next_seq.saturating_add(1);
+        messages.push(message_info! {
+            turn_id: None,
+            seq: Some(next_seq),
+            role: "user".into(),
+            id: Some(message_id.clone()),
+            content,
+            reasoning: None,
+            synthetic: false,
+            internal_origin: Some("promoted_steer".into()),
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: (!images.is_empty()).then_some(images),
+            created_at: Some(input.created_at),
+            elapsed_ms: None,
+        });
+        existing.insert(message_id);
+        existing.insert(input.id.clone());
+    }
+    append_folded_steer_outline(
+        messages,
+        turns,
+        &all_inputs,
+        operation_id,
+        working_dir,
+        absolute_index_base,
+    );
+}
+
+/// Keep queued/folded steers in the right-rail outline before display flush.
+///
+/// `display.jsonl` only gets the steer at `turn_complete` (in the correct
+/// assistant/user order). The durable input log already records the admitted
+/// steer (and marks it promoted when folded); projecting it here prevents a
+/// refresh from rebuilding the outline without it. The pending row is replaced
+/// by the persisted display row once the turn settles (merge is by `id`).
+fn append_folded_steer_outline(
+    messages: &[MessageInfo],
+    turns: &mut Vec<SessionTurnOutline>,
+    inputs: &[zap_capabilities::session::SessionInput],
+    operation_id: Option<&str>,
+    working_dir: &std::path::Path,
+    absolute_index_base: usize,
+) {
+    let existing: std::collections::HashSet<String> =
+        turns.iter().filter_map(|turn| turn.id.clone()).collect();
+    let mut added = 0usize;
+    for input in inputs {
+        if input.delivery != "steer"
+            || (input.status != "admitted"
+                && input.status != "submitted"
+                && input.status != "promoted")
+        {
+            continue;
+        }
+        // `/chat` steers carry the owning operation's client id. A live-runtime
+        // steer has no ActiveChatRegistry operation; it is still included as
+        // long as it is promoted and not already in the persisted outline.
+        if let (Some(current), Some(input_op)) = (operation_id, input.operation_id.as_deref()) {
+            if current != input_op {
+                continue;
+            }
+        }
+        let outline_identity = input
+            .message_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(input.id.as_str());
+        if existing.contains(&input.id) || existing.contains(outline_identity) {
+            continue;
+        }
+        let content =
+            zap_capabilities::session::user_text_for_display(working_dir, &input.text);
+        let label_text = if content.trim().is_empty() {
+            if input.images.is_empty() {
+                continue;
+            }
+            "[图片]".to_string()
+        } else {
+            content
+        };
+        let label = outline_label(&label_text);
+        if label.is_empty() {
+            continue;
+        }
+        let message_id = input
+            .message_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(input.id.as_str());
+        let projected_index = messages.iter().position(|message| {
+            message.id.as_deref() == Some(message_id)
+                || message.id.as_deref() == Some(input.id.as_str())
+        });
+        turns.push(SessionTurnOutline {
+            ordinal: turns.len(),
+            id: Some(input.id.clone()),
+            // Promoted rows now have a canvas index; pending rows remain jumped
+            // by id until display.jsonl flushes.
+            index: projected_index
+                .map(|position| absolute_index_base + position)
+                .unwrap_or(absolute_index_base + messages.len() + added),
+            label,
+            pending: projected_index.is_none(),
+            seq: Some(input.seq),
+        });
+        added = added.saturating_add(1);
+    }
+}
+
+/// Explicit edit/rewind: prune the in-memory turn stats that describe the
+/// removed tail. Derived files are pruned separately AFTER the canonical
+/// snapshot commit, so a failed snapshot write can never leave them ahead.
+fn prune_rewound_turn_stats(
+    meta: &mut zap_capabilities::session::SessionMeta,
+    keep_count: usize,
+) -> Option<std::collections::BTreeSet<u64>> {
+    let had_native = meta
+        .turn_stats
+        .iter()
+        .any(|stat| stat.position_valid && stat.turn_id != 0);
+    meta.turn_stats
+        .retain(|stat| stat.after_message <= keep_count);
+    meta.turn_count = u32::try_from(meta.turn_stats.len()).unwrap_or(0);
+    if !had_native {
+        return None;
+    }
+    Some(
+        meta.turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid && stat.turn_id != 0)
+            .map(|stat| stat.turn_id)
+            .collect(),
+    )
+}
+
+fn resync_todo_board_after_rewind(id: &str, messages: &[zap_kernel::message::Message]) {
+    // 删除/回溯只回退被删掉的那些 todo 动作，保留更早轮次建立/修改过的项。
+    // 按**剩余转录**重新推导；板身份（id + 单调 seq）原地重绑，撤销不会被
+    // 看成“另起一板/版本回退”。
+    let derived = zap_capabilities::tools::derive_current_todos(messages);
+    if zap_capabilities::tools::rebind_todo_board(id, &derived).is_none() {
+        if derived.is_empty() {
+            zap_capabilities::tools::clear_todo_board(id);
+        } else {
+            zap_capabilities::tools::commit_todo_board(id, &derived);
+        }
+    }
+}
+
+fn prune_deleted_turn_stats(
+    meta: &mut zap_capabilities::session::SessionMeta,
+    deleted_range_start: usize,
+    removed_count: usize,
+) -> Option<std::collections::BTreeSet<u64>> {
+    // A single-turn delete keeps every LATER turn. Remove only the stat that
+    // covered the deleted range and shift later positions by the removed rows.
+    let had_native = meta
+        .turn_stats
+        .iter()
+        .any(|stat| stat.position_valid && stat.turn_id != 0);
+    let affected_after = meta
+        .turn_stats
+        .iter()
+        .filter(|stat| {
+            stat.position_valid && stat.turn_id != 0 && stat.after_message > deleted_range_start
+        })
+        .min_by_key(|stat| stat.after_message)
+        .map(|stat| stat.after_message);
+    if let Some(affected_after) = affected_after {
+        meta.turn_stats
+            .retain(|stat| stat.after_message != affected_after);
+        for stat in &mut meta.turn_stats {
+            if stat.after_message > affected_after {
+                stat.after_message = stat.after_message.saturating_sub(removed_count);
+            }
+        }
+    }
+    meta.turn_count = u32::try_from(meta.turn_stats.len()).unwrap_or(0);
+    if !had_native {
+        return None;
+    }
+    Some(
+        meta.turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid && stat.turn_id != 0)
+            .map(|stat| stat.turn_id)
+            .collect(),
+    )
+}
+
+/// Apply derived-file pruning only AFTER the canonical snapshot + meta commit.
+fn prune_derived_turns(
+    manager: &NativeSessionManager,
+    id: &str,
+    surviving: &std::collections::BTreeSet<u64>,
+) {
+    let _ = manager.prune_presentation(id, surviving);
+    let _ = manager.retain_transcript_turns(id, surviving);
+}
+
+fn session_records_user_outline(
+    records: &[zap_capabilities::session::DisplayRecord],
+    index_offset: usize,
+) -> Vec<SessionTurnOutline> {
+    records
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            if !record.role.eq_ignore_ascii_case("user") || record.synthetic {
+                return None;
+            }
+            let label = outline_label(&record.content);
+            if label.is_empty() {
+                return None;
+            }
+            Some((
+                index_offset + idx,
+                Some(display_record_identity(record)),
+                label,
+                (record.seq > 0).then_some(record.seq),
+            ))
+        })
+        .enumerate()
+        .map(|(ordinal, (index, id, label, seq))| SessionTurnOutline {
+            ordinal,
+            id,
+            index,
+            label,
+            pending: false,
+            seq,
+        })
+        .collect()
+}
+
+/// 该 daemon 支持的跨端身份 / 版本能力。客户端据此决定是否启用 legacy 文本兜底：
+/// 声明了 `id` 就意味着 wire / 磁盘 / 大纲三处共享同一个消息 id，无需再猜文本。
+/// 新增能力只能追加，不能改名（旧客户端靠字符串匹配）。
+pub(crate) fn session_capabilities() -> Vec<String> {
+    vec![
+        "id".into(),
+        "revision".into(),
+        "seq".into(),
+        "session_mutated".into(),
+        // Terminal frames carry the client correlation id; interrupted turns
+        // commit their partial context instead of rolling it back.
+        "terminal_operation_id".into(),
+        "preserve_interrupted".into(),
+        // Live frames carry an explicit replay boolean; clients must not infer
+        // replay from seq presence on this daemon.
+        "explicit_replay".into(),
+    ]
+}
+
+/// Session-global display cursor for identity-first pagination.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SessionCursor {
+    /// Oldest display `seq` in the returned window (None for legacy rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_seq: Option<u64>,
+    pub total: usize,
 }
 
 /// Session detail response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionDetail {
+    /// Session-global display cursor.
+    #[serde(default)]
+    pub cursor: SessionCursor,
     pub id: String,
     pub name: String,
     pub working_dir: PathBuf,
@@ -907,17 +3007,43 @@ pub struct SessionDetail {
     pub updated_at: u64,
     /// Total messages in the transcript (not the returned window size).
     pub message_count: usize,
+    /// 会话权威版本号（内核 `cache_epoch`）。每次显式变更（编辑 / 删除 / 回溯）
+    /// 自增；客户端用它给缓存写入设闸门，旧快照永远不能覆盖新快照。
+    #[serde(default)]
+    pub revision: u64,
+    /// 本 daemon 的能力集（见 [`session_capabilities`]）。客户端据此关闭旧文本兜底。
+    #[serde(default)]
+    pub caps: Vec<String>,
     /// Index of `messages[0]` in the full transcript.
+    /// When `pinned_user_index` is set, `messages[0]` is that question and this
+    /// is the index of `messages[1]`.
     #[serde(default)]
     pub offset: usize,
+    /// Absolute index of the user question pinned ahead of a mid-turn tail page.
+    /// Rows between it and `offset` are not included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_user_index: Option<usize>,
     /// All user questions (short text) in transcript order. Independent of the
     /// `messages` window so the WebUI turn rail can list the full session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turns: Vec<SessionTurnOutline>,
+    /// Highest durable input-log sequence. Clients pass it back as `after_seq`
+    /// to fetch only newly admitted prompt/steer rows.
+    #[serde(default)]
+    pub input_cursor: u64,
     pub messages: Vec<MessageInfo>,
     /// Per-session model selection. Absent on older sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
+    /// Per-session approval mode ("build" | "accept_edits" | "bypass" | "plan"). Absent on older sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    /// Per-session reasoning effort. Absent means "inherit the provider default".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Per-session custom thinking budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
     /// Footer occupancy from the last completed turn (`used_tokens` / last request).
     /// Must not be turn-cumulative `model_usage` billing, or restart paints over-budget.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -926,11 +3052,20 @@ pub struct SessionDetail {
     #[serde(default, skip_serializing_if = "is_manual_session_origin")]
     pub origin: zap_capabilities::session::SessionOrigin,
     /// The session's single live checklist. Empty after a completed board is closed on stop.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized: an absent field would be indistinguishable from "this daemon
+    /// has no todo support", and clients would then keep a stale cached list instead of
+    /// applying the authoritative empty snapshot.
+    #[serde(default)]
     pub todos: Vec<zap_capabilities::tools::TodoItem>,
-    /// Per-turn telemetry stats (token usage, duration, tool call count, errors) for turn analysis.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub turn_stats: Vec<zap_capabilities::session::TurnStat>,
+    /// Monotonic version of `todos` (server-assigned). Clients must arbitrate
+    /// snapshots by revision; a lower revision may never overwrite a higher one.
+    #[serde(default)]
+    pub todos_revision: u64,
+    /// Process-unique daemon instance. Todo revisions are only comparable within
+    /// one instance; a restart resets the per-session watermark, so clients must
+    /// start a new revision epoch instead of rejecting the fresh empty snapshot.
+    #[serde(default)]
+    pub daemon_instance_id: String,
 }
 
 fn is_manual_session_origin(origin: &zap_capabilities::session::SessionOrigin) -> bool {
@@ -1096,6 +3231,17 @@ pub(crate) fn session_token_usage_from_session(
     meta: &zap_capabilities::session::SessionMeta,
     snapshot: &zap_kernel::message::SessionSnapshot,
 ) -> Option<SessionTokenUsage> {
+    // 刚提交的压缩是比「最后一条助手消息的 usage」更新的上下文事实：后者仍是
+    // 压缩前的 prompt 大小。新回合 / undo / 显式变更会清空该字段。
+    if let Some(compacted) = meta.compacted_context_tokens.filter(|tokens| *tokens > 0) {
+        return Some(footer_from_last_request(
+            compacted as usize,
+            0,
+            0,
+            None,
+            false,
+        ));
+    }
     if let Some((prompt, completion, cached, ctx_window)) =
         last_assistant_request_usage(&snapshot.messages)
     {
@@ -1175,14 +3321,26 @@ pub(crate) static DAEMON_PROJECT: std::sync::Mutex<Option<ProjectStateStore>> =
 #[derive(Clone)]
 struct AdmittedUser {
     content: String,
+    /// Server-rendered user-facing text (user-wrap unwrapped, reminders/VL
+    /// markers stripped). Live frames carry this so clients never parse protocol
+    /// strings on the authoritative path.
+    display_text: String,
     created_at: Option<u64>,
+    /// 客户端关联键（`/chat` 的 `request_id`）。回传到 `ChatEvent::User`，让发送端
+    /// 按身份认领自己的乐观气泡，而不是退化到文本比对。
+    client_input_id: Option<String>,
+    images: Vec<ImageData>,
 }
 
 /// One admitted `/chat` operation. Aliases include both the persisted session id
 /// and the browser-generated request id so either client protocol can stop it.
 struct ActiveChatOperation {
     started_at: u64,
+    status: Option<String>,
     session_id: Option<String>,
+    /// 客户端为本轮提供的关联键（`/chat` 的 `request_id`；`/chat/steer` 走
+    /// `client_input_id` + `steered` 通道）。回传到 user 回声，供前端按 id 认领。
+    request_id: Option<String>,
     aliases: Vec<String>,
     cancellation: CancellationToken,
     /// Linearizes user stop against approval consumption. A stop must mark this
@@ -1199,7 +3357,7 @@ struct ActiveChatOperation {
     /// Fan-out bus so WebUI (or other observers) can `GET /chat/watch` and
     /// reattach to a turn started by OpenAI/API clients without owning the
     /// primary SSE response.
-    event_bus: tokio::sync::broadcast::Sender<ChatEvent>,
+    event_bus: tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
     /// The user message admitted for this turn, recorded right when it is
     /// pushed to the conversation. `tokio::broadcast` does not replay history,
     /// so a `/chat/watch` observer that attaches *after* the turn started would
@@ -1210,7 +3368,7 @@ struct ActiveChatOperation {
     /// has no history; without this buffer a reattached WebUI only paints deltas
     /// *after* subscribe and loses thinking/text/tools already streamed.
     /// Consecutive text/reasoning deltas are coalesced to bound memory.
-    replay: Arc<std::sync::Mutex<Vec<ChatEvent>>>,
+    replay: Arc<std::sync::Mutex<ReplayLog>>,
     /// 本回合帧的起始游标：第 i 条缓冲帧的 seq = `seq_base + i + 1`。
     /// 回合结束时把 `seq_base + 缓冲长度` 回写到会话计数器，下一回合接着往上走。
     seq_base: u64,
@@ -1222,6 +3380,8 @@ struct ActiveChatOperation {
     /// Drained by the projection when a `Steered` event lands, so the wire can
     /// echo the id and let the WebUI reconcile an in-flight steer after refresh.
     steer_client_ids: std::collections::VecDeque<Option<String>>,
+    /// FIFO of arrival timestamps for `/chat/steer` submits awaiting fold.
+    steer_timestamps: std::collections::VecDeque<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -1229,16 +3389,26 @@ struct ActiveChatIndex {
     operations: HashMap<String, ActiveChatOperation>,
     aliases: HashMap<String, String>,
     /// `/chat/watch` observers that arrived while the session had NO active
-    /// turn. They stay parked here until a turn is admitted for this session
-    /// (`admit` drains and converts them to live broadcast subscribers), so the
-    /// WebUI gets a push the moment an API turn starts instead of having to
-    /// poll. Keyed by session id (the `session_id` alias the watcher used).
-    standby_watchers: HashMap<String, Vec<mpsc::UnboundedSender<ChatEvent>>>,
-    /// 会话级断点续传游标（严格单调递增）。
+    /// turn. Keyed by session id -> client id -> sender.
+    standby_watchers: HashMap<String, HashMap<String, mpsc::UnboundedSender<(u64, ChatEvent)>>>,
+    /// Session-scoped event state. Survives the operation: the turn's frames live
+    /// in the operation, but "how far did this session get" and "what was its
+    /// terminal frame" must outlive the turn.
     ///
-    /// 它是我们自己定义的序号，与模型上下文无关 —— 回合结束清空回合缓冲、
-    /// 上下文压缩、历史改写都不会重置它，所以跨回合重连可以带着旧游标精准续传。
+    /// The resume cursor (`after_seq`) is session-scoped while the frames were
+    /// turn-scoped — that mismatch is exactly why a subscriber attaching after the
+    /// turn ended could never learn the turn was over, and the WebUI stayed stuck
+    /// in "running" (red stop button, clock still ticking, checklist frozen).
     session_seq: HashMap<String, u64>,
+    /// 会话级终态帧记录。
+    ///
+    /// 断点续传游标是会话级的，帧却只活在回合里 —— 回合一结束，断链重连 / 刷新 /
+    /// 切回的订阅者就再也拿不到终态帧，前端会一直停在「运行中」（红色停止按钮 + 计时器
+    /// 一直叠加 + 清单定格），只能靠切一次会话顺带修好。终态帧是整个回合最重要的一帧，
+    /// 它必须活得比 operation 久，所以记在会话上而不是记在 operation 里。
+    ///
+    /// 键是会话的 alias；值是（序号, 帧本身）。
+    session_terminal: HashMap<String, (u64, ChatEvent)>,
 }
 
 /// Atomic admission and identity-aware cleanup for background `/chat` turns.
@@ -1260,7 +3430,7 @@ struct ActiveChatAdmission {
 /// Outcome of `subscribe_or_standby`: either attach to a running turn now
 /// (`Live`) or park until a turn is admitted for this session (`Standby`).
 enum WatchOutcome {
-    Live(tokio::sync::broadcast::Receiver<ChatEvent>),
+    Live(tokio::sync::broadcast::Receiver<(u64, ChatEvent)>),
     Standby,
 }
 
@@ -1345,7 +3515,9 @@ impl ActiveChatRegistry {
             operation_id.clone(),
             ActiveChatOperation {
                 started_at,
+                status: None,
                 session_id: session_id.clone(),
+                request_id,
                 aliases,
                 cancellation: cancellation.clone(),
                 stop_gate,
@@ -1354,10 +3526,11 @@ impl ActiveChatRegistry {
                 terminal_reached: false,
                 event_bus,
                 admitted_user: None,
-                replay: Arc::new(std::sync::Mutex::new(Vec::new())),
+                replay: Arc::new(std::sync::Mutex::new(ReplayLog::new(seq_base))),
                 seq_base,
                 steer_tx: None,
                 steer_client_ids: std::collections::VecDeque::new(),
+                steer_timestamps: std::collections::VecDeque::new(),
             },
         );
 
@@ -1394,7 +3567,7 @@ impl ActiveChatRegistry {
     async fn event_bus(
         &self,
         operation_id: &str,
-    ) -> Option<tokio::sync::broadcast::Sender<ChatEvent>> {
+    ) -> Option<tokio::sync::broadcast::Sender<(u64, ChatEvent)>> {
         self.inner
             .read()
             .await
@@ -1403,13 +3576,21 @@ impl ActiveChatRegistry {
             .map(|op| op.event_bus.clone())
     }
 
+    /// Set the human/client-visible operation status (e.g. "compacting").
+    pub async fn set_operation_status(&self, operation_id: &str, status: Option<String>) {
+        let mut index = self.inner.write().await;
+        if let Some(op) = index.operations.get_mut(operation_id) {
+            op.status = status;
+        }
+    }
+
     /// Event bus + shared replay log for a turn (fan-out records into `replay`).
     async fn event_bus_with_replay(
         &self,
         operation_id: &str,
     ) -> Option<(
-        tokio::sync::broadcast::Sender<ChatEvent>,
-        Arc<std::sync::Mutex<Vec<ChatEvent>>>,
+        tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
+        Arc<std::sync::Mutex<ReplayLog>>,
     )> {
         self.inner
             .read()
@@ -1424,23 +3605,25 @@ impl ActiveChatRegistry {
     /// open tabs stay synchronized without polling or full-transcript reloads.
     pub async fn broadcast_to_session(&self, session_id: &str, event: ChatEvent) {
         let index = self.inner.read().await;
+        let mut seq = 0u64;
         if let Some(operation_id) = index.aliases.get(session_id) {
             if let Some(operation) = index.operations.get(operation_id) {
                 // 会话变更（删/改/截断）改写了权威转录：本回合的旧帧立即作废，
                 // 否则带旧游标或全量重连会把变更前发出的帧补回来（已删内容复活）。
+                let mut log = operation
+                    .replay
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if matches!(event, ChatEvent::SessionMutation { .. }) {
-                    operation
-                        .replay
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clear();
+                    log.events.clear();
                 }
-                let _ = operation.event_bus.send(event.clone());
+                seq = log.push(event.clone());
+                let _ = operation.event_bus.send((seq, event.clone()));
             }
         }
         if let Some(watchers) = index.standby_watchers.get(session_id) {
-            for tx in watchers {
-                let _ = tx.send(event.clone());
+            for tx in watchers.values() {
+                let _ = tx.send((seq, event.clone()));
             }
         }
     }
@@ -1453,25 +3636,23 @@ impl ActiveChatRegistry {
         session_id: &str,
     ) -> Option<(
         Vec<(u64, ChatEvent)>,
-        tokio::sync::broadcast::Receiver<ChatEvent>,
+        tokio::sync::broadcast::Receiver<(u64, ChatEvent)>,
     )> {
         let index = self.inner.read().await;
         let operation_id = index.aliases.get(session_id)?.clone();
         let operation = index.operations.get(&operation_id)?;
-        if operation.terminal_reached || operation.stopped {
-            return None;
-        }
+        // A terminal turn is NOT a reason to bail out: the terminal frame may still
+        // be queued for the fan-out. Handing back the snapshot plus the bus lets a
+        // watcher that attaches now either read the terminal from the snapshot or
+        // receive it live — instead of parking, which means keepalives only and a
+        // client that waits forever.
         let guard = operation
             .replay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // 游标就是缓冲序号（从 1 开始）：缓冲是追加式的（连续同身份合并只改最后一条的内容，
         // 不改它的位置），所以同一个事件的 seq 永远稳定 —— 断点续传靠的就是这一点。
-        let mut snapshot: Vec<(u64, ChatEvent)> = guard
-            .iter()
-            .enumerate()
-            .map(|(index, event)| (operation.seq_base + index as u64 + 1, event.clone()))
-            .collect();
+        let mut snapshot: Vec<(u64, ChatEvent)> = guard.events.clone();
         let rx = operation.event_bus.subscribe();
         drop(guard);
         if let Some(ref admitted) = operation.admitted_user {
@@ -1486,13 +3667,18 @@ impl ActiveChatRegistry {
                         operation.seq_base,
                         ChatEvent::User {
                             content: admitted.content.clone(),
+                            display_text: Some(admitted.display_text.clone()),
+                            internal: Some(false),
+                            editable: Some(true),
                             session_id: Some(session_id.to_string()),
                             created_at: admitted
                                 .created_at
                                 .or((operation.started_at > 0).then_some(operation.started_at)),
-                            message_id: None,
+                            message_id: admitted.client_input_id.clone(),
                             order: None,
                             turn_ordinal: None,
+                            client_input_id: admitted.client_input_id.clone(),
+                            images: (!admitted.images.is_empty()).then(|| admitted.images.clone()),
                         },
                     ),
                 );
@@ -1522,7 +3708,7 @@ impl ActiveChatRegistry {
             .replay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending_interactive_from_replay(&guard)
+        pending_interactive_from_replay(&guard.events)
     }
 
     /// True when the turn replay already closed `call_id` (result/output/terminal).
@@ -1539,7 +3725,7 @@ impl ActiveChatRegistry {
             .replay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        replay_resolves_call(&guard, call_id)
+        replay_resolves_call(&guard.events, call_id)
     }
 
     /// Subscribe to a session's turn **if one is already running**, otherwise
@@ -1551,29 +3737,56 @@ impl ActiveChatRegistry {
     async fn subscribe_or_standby(
         &self,
         session_id: &str,
-        standby_tx: &mpsc::UnboundedSender<ChatEvent>,
+        client_id: Option<&str>,
+        standby_tx: &mpsc::UnboundedSender<(u64, ChatEvent)>,
+        replay_terminal: bool,
     ) -> WatchOutcome {
         let mut index = self.inner.write().await;
         if let Some(operation_id) = index.aliases.get(session_id).cloned() {
             if let Some(operation) = index.operations.get(&operation_id) {
                 if !operation.terminal_reached && !operation.stopped {
                     return WatchOutcome::Live(operation.event_bus.subscribe());
-                } else {
-                    index.aliases.remove(session_id);
                 }
-            } else {
-                index.aliases.remove(session_id);
+            }
+            index.aliases.remove(session_id);
+        }
+        // The session's turn is over (or never started). Hand the watcher the
+        // terminal frame recorded on the session — parking here would mean
+        // keepalives only and a client that waits forever for a finished turn.
+        //
+        // The lookup is by session id and deliberately independent of the alias:
+        // the alias is gone once the operation is cleaned up, and a watcher
+        // attaching after the turn ended is exactly the case that must not hang.
+        //
+        // Only the reattach path asks for it: the idle standby watcher must stay
+        // silent, or it would re-deliver the same terminal on every re-arm and
+        // spin.
+        if replay_terminal {
+            if let Some((seq, terminal)) = index.session_terminal.get(session_id) {
+                let _ = standby_tx.send((*seq, terminal.clone()));
             }
         }
-        // One standby slot per session: WebUI reconnect/refresh used to pile up
-        // many dead parkers (drained 4+), spamming admit logs and wasting tasks.
-        // Drop prior standby senders; their SSE side closes when the channel dies.
+        // Multi-client standby pool: prune dead senders, and update or register this client_id.
+        // A single tab refreshing reuses its client_id and replaces its own dead sender without piling up;
+        // multiple independent remote clients with distinct client_ids stay concurrently subscribed.
         let entry = index
             .standby_watchers
             .entry(session_id.to_string())
             .or_default();
-        entry.clear();
-        entry.push(standby_tx.clone());
+        entry.retain(|_, tx| !tx.is_closed());
+        let cid = client_id.unwrap_or("").trim();
+        let key = if cid.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            cid.to_string()
+        };
+        // Hard capacity cap per session (max 16 concurrent standby tabs/devices) to prevent unbounded memory growth.
+        if entry.len() >= 16 && !entry.contains_key(&key) {
+            if let Some(oldest_key) = entry.keys().next().cloned() {
+                entry.remove(&oldest_key);
+            }
+        }
+        entry.insert(key, standby_tx.clone());
         WatchOutcome::Standby
     }
 
@@ -1584,13 +3797,19 @@ impl ActiveChatRegistry {
         &self,
         operation_id: &str,
         content: String,
+        display_text: String,
         created_at: Option<u64>,
+        images: Vec<ImageData>,
     ) {
         if let Some(op) = self.inner.write().await.operations.get_mut(operation_id) {
             let created = created_at.or((op.started_at > 0).then_some(op.started_at));
+            let client_input_id = op.request_id.clone();
             op.admitted_user = Some(AdmittedUser {
                 content,
+                display_text,
                 created_at: created,
+                client_input_id,
+                images,
             });
         }
     }
@@ -1611,7 +3830,17 @@ impl ActiveChatRegistry {
             .and_then(|op| op.admitted_user.clone())
     }
 
-    async fn replay_admitted_user(&self, session_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    /// Resolve an admitted user message directly by session id.
+    async fn admitted_user_for_session(&self, session_id: &str) -> Option<AdmittedUser> {
+        let op_id = self.operation_for_session(session_id).await?;
+        self.admitted_user_message(&op_id).await
+    }
+
+    async fn replay_admitted_user(
+        &self,
+        session_id: &str,
+        tx: &mpsc::UnboundedSender<(u64, ChatEvent)>,
+    ) {
         let Some(operation_id) = self.operation_for_session(session_id).await else {
             return;
         };
@@ -1629,14 +3858,22 @@ impl ActiveChatRegistry {
         let created_at = admitted
             .created_at
             .or((started_at > 0).then_some(started_at));
-        let _ = tx.send(ChatEvent::User {
-            content: admitted.content,
-            session_id: Some(session_id.to_string()),
-            created_at,
-            message_id: None,
-            order: None,
-            turn_ordinal: None,
-        });
+        let _ = tx.send((
+            0,
+            ChatEvent::User {
+                content: admitted.content,
+                display_text: Some(admitted.display_text),
+                internal: Some(false),
+                editable: Some(true),
+                session_id: Some(session_id.to_string()),
+                created_at,
+                message_id: admitted.client_input_id.clone(),
+                order: None,
+                turn_ordinal: None,
+                client_input_id: admitted.client_input_id,
+                images: (!admitted.images.is_empty()).then(|| admitted.images),
+            },
+        ));
     }
 
     /// Drain (wake) all standby watchers parked for `session_id`, converting
@@ -1646,23 +3883,24 @@ impl ActiveChatRegistry {
     fn drain_standby_locked(
         index: &mut ActiveChatIndex,
         session_id: &str,
-        bus: &tokio::sync::broadcast::Sender<ChatEvent>,
+        bus: &tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
     ) -> usize {
-        if let Some(watchers) = index.standby_watchers.remove(session_id) {
+        if let Some(mut watchers) = index.standby_watchers.remove(session_id) {
+            watchers.retain(|_, tx| !tx.is_closed());
             let n = watchers.len();
-            for tx in watchers {
+            for (_cid, tx) in watchers {
                 let mut rx = bus.subscribe();
                 tokio::spawn(async move {
                     loop {
                         match rx.recv().await {
-                            Ok(event) => {
+                            Ok((seq, event)) => {
                                 let terminal = matches!(
                                     event,
                                     ChatEvent::Done { .. }
                                         | ChatEvent::Error { .. }
                                         | ChatEvent::Stopped
                                 );
-                                if tx.send(event).is_err() {
+                                if tx.send((seq, event)).is_err() {
                                     break;
                                 }
                                 if terminal {
@@ -1834,13 +4072,14 @@ impl ActiveChatRegistry {
     async fn admit_or_preempt(
         self,
         session_id: Option<String>,
+        request_id: Option<String>,
         occupancy: Option<String>,
         timeout: Duration,
     ) -> Result<ActiveChatAdmission, ActiveChatAdmissionError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             match self
-                .admit_occupied(session_id.clone(), None, occupancy.clone())
+                .admit_occupied(session_id.clone(), request_id.clone(), occupancy.clone())
                 .await
             {
                 Ok(admission) => return Ok(admission),
@@ -1926,28 +4165,98 @@ impl ActiveChatRegistry {
         index.operations.get(operation_id)?.steer_tx.clone()
     }
 
-    /// Record a `/chat/steer` submit's client correlation id (FIFO; `None` when
-    /// the client sent none) so the turn projection can echo it on `steered`.
-    async fn record_steer_client_id(&self, alias: &str, client_input_id: Option<String>) {
+    /// Record a `/chat/steer` submit's client correlation id and timestamp (FIFO)
+    /// so the turn projection can echo them on `steered`.
+    async fn record_steer_metadata(
+        &self,
+        alias: &str,
+        client_input_id: Option<String>,
+        created_at: Option<u64>,
+    ) {
         let mut index = self.inner.write().await;
         if let Some(operation_id) = index.aliases.get(alias).cloned() {
             if let Some(operation) = index.operations.get_mut(&operation_id) {
                 operation.steer_client_ids.push_back(client_input_id);
+                operation.steer_timestamps.push_back(created_at);
             }
         }
     }
 
-    /// Drain up to `count` recorded steer client ids for the operation (FIFO),
-    /// padding with `None` so the returned list always aligns 1:1 with the folded
-    /// inputs reported by the kernel.
-    async fn take_steer_client_ids(&self, operation_id: &str, count: usize) -> Vec<Option<String>> {
+    /// Remove a cancelled steer's correlation id and timestamp so a later steer
+    /// fold never pops the cancelled steer's stale metadata.
+    async fn cancel_steer_metadata(&self, alias: &str, client_input_id: Option<&str>) {
+        let mut index = self.inner.write().await;
+        let Some(operation_id) = index.aliases.get(alias).cloned() else {
+            return;
+        };
+        let Some(operation) = index.operations.get_mut(&operation_id) else {
+            return;
+        };
+        if let Some(cid) = client_input_id.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(pos) = operation
+                .steer_client_ids
+                .iter()
+                .position(|entry| entry.as_deref() == Some(cid))
+            {
+                operation.steer_client_ids.remove(pos);
+                operation.steer_timestamps.remove(pos);
+            }
+        } else {
+            operation.steer_client_ids.clear();
+            operation.steer_timestamps.clear();
+        }
+    }
+
+    /// Drain up to `count` recorded steer client ids and timestamps for the operation,
+    /// matching by the kernel's preserved `SteeredInput.message_id` when present so an
+    /// out-of-band or cancelled steer cannot shift the FIFO alignment.
+    async fn take_steer_metadata_for_inputs(
+        &self,
+        operation_id: &str,
+        count: usize,
+        inputs: &[zap_kernel::event::SteeredInput],
+    ) -> (Vec<Option<String>>, Vec<Option<u64>>) {
         let mut index = self.inner.write().await;
         let Some(operation) = index.operations.get_mut(operation_id) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        (0..count)
-            .map(|_| operation.steer_client_ids.pop_front().unwrap_or(None))
-            .collect()
+        let mut ids = Vec::with_capacity(count);
+        let mut timestamps = Vec::with_capacity(count);
+        for i in 0..count {
+            let kernel_id = inputs
+                .get(i)
+                .and_then(|inp| inp.message_id.as_deref())
+                .filter(|s| !s.is_empty());
+            if let Some(kid) = kernel_id {
+                if let Some(pos) = operation
+                    .steer_client_ids
+                    .iter()
+                    .position(|entry| entry.as_deref() == Some(kid))
+                {
+                    let id = operation.steer_client_ids.remove(pos).unwrap_or(None);
+                    let ts = operation.steer_timestamps.remove(pos).unwrap_or(None);
+                    ids.push(id.or_else(|| Some(kid.to_string())));
+                    timestamps.push(ts);
+                    continue;
+                }
+                ids.push(Some(kid.to_string()));
+                let ts = if operation
+                    .steer_client_ids
+                    .front()
+                    .is_some_and(|entry| entry.is_none())
+                {
+                    let _ = operation.steer_client_ids.pop_front();
+                    operation.steer_timestamps.pop_front().unwrap_or(None)
+                } else {
+                    None
+                };
+                timestamps.push(ts);
+            } else {
+                ids.push(operation.steer_client_ids.pop_front().unwrap_or(None));
+                timestamps.push(operation.steer_timestamps.pop_front().unwrap_or(None));
+            }
+        }
+        (ids, timestamps)
     }
 
     /// Remove only the exact operation that finished. A late cleanup from an
@@ -1959,12 +4268,11 @@ impl ActiveChatRegistry {
         };
         // 会话级游标推进：把本回合已发出的帧数累加进去，下一回合从更高的序号开始。
         // 严格单调递增，且与上下文/压缩无关。
-        let turn_frames = operation
+        let next_base = operation
             .replay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len() as u64;
-        let next_base = operation.seq_base + turn_frames;
+            .high_water();
         for alias in &operation.aliases {
             index.session_seq.insert(alias.clone(), next_base);
         }
@@ -1980,6 +4288,12 @@ impl ActiveChatRegistry {
         operation.finished.notify_waiters();
         // 跨实例增量：操作结束 → 活动状态回落（不触发任何整表重拉）。
         if let Some(sid) = operation.session_id.clone() {
+            // 只结束属于本次 operation 的阶段：手动压缩归 `manual:<op>`，
+            // `/chat` 自动压缩归 `turn` 前缀。绝不能无条件清掉 live 或别的 owner
+            // 正在执行的压缩（旧实现正是这样让刷新误杀另一条链路）。
+            let manual_owner = manual_compaction_owner(operation_id);
+            finish_compaction_phase(&sid, &manual_owner, false);
+            finish_compaction_phase_prefix(&sid, COMPACTION_OWNER_TURN, false);
             publish_global(GlobalWireEvent::Activity {
                 session_id: sid,
                 running: false,
@@ -1990,14 +4304,49 @@ impl ActiveChatRegistry {
         true
     }
 
-    /// Mark that a terminal event (Done, Stopped, or Error) has been emitted.
-    /// Immediately excludes this operation from `active_session_ids` so the UI
-    /// spinner stops rotating without waiting for background handle.shutdown() or task join.
-    async fn mark_terminal(&self, operation_id: &str) {
+    /// Mark that a terminal event (Done, Stopped, or Error) has been emitted, and
+    /// record that terminal frame **on the session** in the same critical section
+    /// that raises the flag.
+    ///
+    /// The flag used to become visible before the terminal frame existed anywhere:
+    /// the frame was still queued for the fan-out task, so a watcher attaching in
+    /// that window saw "already terminal" with nothing to replay — and it parked,
+    /// and parking means keepalives only, never a terminal. The WebUI then stayed
+    /// in "running" forever (red stop button, clock still ticking, checklist
+    /// frozen) until the user happened to switch sessions.
+    ///
+    /// Recording the frame here makes "this turn is over" and "here is its
+    /// terminal frame" a single fact, so a late watcher can always be told.
+    async fn mark_terminal(&self, operation_id: &str, terminal: &ChatEvent) {
         let mut index = self.inner.write().await;
-        if let Some(op) = index.operations.get_mut(operation_id) {
-            op.terminal_reached = true;
+        let Some(op) = index.operations.get_mut(operation_id) else {
+            return;
+        };
+        // The terminal frame takes the next slot in the turn's replay log, so its
+        // cursor is the same number the replay snapshot hands out.
+        let seq = op
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .high_water()
+            .saturating_add(1);
+        op.terminal_reached = true;
+        let aliases = op.aliases.clone();
+        for alias in aliases {
+            index
+                .session_terminal
+                .insert(alias, (seq, terminal.clone()));
         }
+    }
+
+    /// Evict all in-memory tracking state (sequences, cached terminal frames, standby watchers, aliases)
+    /// when a session is deleted, preventing resource leakage across session lifecycles.
+    pub(crate) async fn clear_session(&self, session_id: &str) {
+        let mut index = self.inner.write().await;
+        index.session_seq.remove(session_id);
+        index.session_terminal.remove(session_id);
+        index.standby_watchers.remove(session_id);
+        index.aliases.remove(session_id);
     }
 
     async fn active_session_ids(&self) -> Vec<String> {
@@ -2064,7 +4413,9 @@ fn log_truncate(value: &str, max: usize) -> String {
 /// terminal) has closed that `call_id`. A `UserInputRequest` is pending until
 /// a later `request_user_input` tool result or the turn ends — TUI/live can
 /// answer or decline without a dedicated chat-bus resolve event.
-fn pending_interactive_from_replay(events: &[ChatEvent]) -> (Option<ChatEvent>, Option<ChatEvent>) {
+fn pending_interactive_from_replay(
+    events: &[(u64, ChatEvent)],
+) -> (Option<ChatEvent>, Option<ChatEvent>) {
     // A PermissionRequest is only "answered" by a resolution event that occurs
     // AFTER it (by index). A tool that started / produced output / returned a
     // result BEFORE the request cannot be what answered it, so a genuinely
@@ -2077,10 +4428,15 @@ fn pending_interactive_from_replay(events: &[ChatEvent]) -> (Option<ChatEvent>, 
     let mut last_resolution: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut turn_terminal = false;
-    for (index, event) in events.iter().enumerate() {
+    for (index, (_, event)) in events.iter().enumerate() {
         match event {
             ChatEvent::ToolCallStarted { id, .. } => {
                 // Tool already started running — approval was granted / not needed.
+                last_resolution.insert(id.clone(), index);
+            }
+            // Execution returned ⇒ the call necessarily got past its gate, even when
+            // the authoritative result frame has not been applied yet (batch order).
+            ChatEvent::ToolFinished { id, .. } => {
                 last_resolution.insert(id.clone(), index);
             }
             ChatEvent::ToolCallResult { id, name, .. } => {
@@ -2121,10 +4477,11 @@ fn pending_interactive_from_replay(events: &[ChatEvent]) -> (Option<ChatEvent>, 
     (permission, user_input)
 }
 
-fn replay_resolves_call(events: &[ChatEvent], call_id: &str) -> bool {
-    events.iter().any(|event| match event {
+fn replay_resolves_call(events: &[(u64, ChatEvent)], call_id: &str) -> bool {
+    events.iter().any(|(_, event)| match event {
         ChatEvent::ToolCallStarted { id, .. }
         | ChatEvent::ToolCallResult { id, .. }
+        | ChatEvent::ToolFinished { id, .. }
         | ChatEvent::ToolOutputChunk { id, .. } => id == call_id,
         ChatEvent::Done { .. } | ChatEvent::Stopped | ChatEvent::Error { .. } => true,
         _ => false,
@@ -2154,7 +4511,33 @@ pub(crate) enum GlobalWireEvent {
         session_id: String,
         project_hash: String,
     },
+    /// 某会话已被用户打开/查看：其它实例据此熄灭该会话的「刚完成」徽标。
+    ///
+    /// 徽标由全局 `activity` 广播点亮，熄灭也必须走同一条全局总线，
+    /// 否则只清当前实例会在其它标签页/浏览器上留下幽灵勾。
+    #[serde(rename = "session_seen")]
+    SessionSeen { session_id: String },
+    /// 会话转录被显式变更（编辑 / 删除 / 回溯 / 压缩）。
+    ///
+    /// 与 `session_mutation` 的区别：那条走**会话总线**，只送达“正在看这个会话”
+    /// 的订阅者；本事件走**全局总线**，让没打开该会话的标签页/浏览器也能立刻作废
+    /// 本地缓存。只带 revision，不背 payload —— 客户端按版本决定是否重取。
+    #[serde(rename = "session_mutated")]
+    SessionMutated {
+        session_id: String,
+        /// 变更后的权威版本；客户端只接受 `incoming >= stored`。
+        revision: u64,
+    },
+    /// 一条已落盘的展示记录（压缩边界、警告等）刚刚追加。
+    ///
+    /// display 追加不一定改变 snapshot 的 `cache_epoch`；单靠
+    /// `session_mutated` 的 revision 闸门会让“恰好已知同版本”的客户端跳过重取。
+    /// 本事件只带 session id，客户端做一次定向磁盘尾部对账即可。
+    #[serde(rename = "display_appended")]
+    DisplayAppended { session_id: String },
     /// 活动/转圈变化；`terminal` 非空时同时携带终态供右下角通知去重；`status` 可携带 "compacting" 等阶段状态。
+    ///
+    /// 兼容旧客户端保留；新客户端应优先消费 `runtime_activity`（带 revision/owner）。
     #[serde(rename = "activity")]
     Activity {
         session_id: String,
@@ -2164,10 +4547,64 @@ pub(crate) enum GlobalWireEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
+    /// 会话执行态的权威快照（阶段 + revision + owner）。
+    ///
+    /// 这是压缩/运行态的唯一阶段信号：客户端只接受 `revision` 更高的快照，
+    /// 不再根据单个 `status` 字段或事件到达顺序猜测阶段。
+    #[serde(rename = "runtime_activity")]
+    RuntimeActivity {
+        session_id: String,
+        revision: u64,
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase_started_at: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+    },
     /// 某会话弹出待交互卡片（审批/提问）。只带会话 id，客户端对该会话做一次
     /// 定向 pending 拉取（单会话、小请求），避免重拉整表。
     #[serde(rename = "review_asked")]
     ReviewAsked { session_id: String },
+    /// 会话待发卡片队列（排队 / 转向中 / 转向已排队）变化：创建、点转向、取消、
+    /// 被内核消费都算。只带会话 id，客户端对该会话做一次定向 `/chat/queue` 拉取，
+    /// 既不背大 payload，也不重拉整表。
+    #[serde(rename = "queue_updated")]
+    QueueUpdated { session_id: String },
+    /// 中途转向已被内核 fold：携带权威输入。活跃视图由 `/chat/watch` 的 `steered`
+    /// 帧落笔（带光标与归位锚点）；本事件让**其它会话/其它客户端**把这条提问提前
+    /// 写进该会话的本地画布缓存，切过去或冷启动时用户气泡已经在里面。
+    ///
+    /// 只传文本/身份，**不传图片本体**（可能是一整张 base64）：各端自己队列卡片里
+    /// 就有原图，随后的 `queue_updated` 也会把已被消费的卡片收走。
+    #[serde(rename = "steer_folded")]
+    SteerFolded {
+        session_id: String,
+        inputs: Vec<SteerFoldedInputWire>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        client_input_ids: Vec<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_message_id: Option<String>,
+    },
+    /// 模型配置变更（会话聊天模型 / 思考强度 / 思考预算）。
+    ///
+    /// 只带**本会话实际生效的值**：`provider` 为模型选择 id，`effort` 存在时
+    /// 两个字段都按快照下发（`null` = 显式清空/继承模型默认）。其它客户端据此更新
+    /// 下拉框与会话缓存；本轮仍在跑时参数已落盘，停止后下一轮自然生效。
+    #[serde(rename = "model_config")]
+    ModelConfig {
+        /// `Some` = 会话级；`None` = 新会话默认模型变了。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<ModelEffortWire>,
+        /// 本轮仍在跑，参数已落盘、下一轮生效（仅作 UI 提示，不参与合并）。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        deferred: bool,
+    },
     /// 待交互卡片已解决：客户端直接就地移除卡片。
     #[serde(rename = "review_resolved")]
     ReviewResolved {
@@ -2180,12 +4617,57 @@ pub(crate) enum GlobalWireEvent {
     /// 全局配置热重载（如 CLI 执行 jeikcode ghimg 或后台变更）。
     #[serde(rename = "config_reloaded")]
     ConfigReloaded,
-    /// Git 仓库状态变更（discard / stage / commit / pull / fetch / checkout 等），跨设备全量广播
+    /// Git 仓库状态变更（discard / stage / commit / pull / fetch / checkout 等），跨设备全量广播。
+    /// `fetch: true` 表示「分支/远端引用可能已变」：客户端除本地刷新外，还应（按自身节流）
+    /// 补一次 `git fetch`（只更新 remote-tracking refs，绝不动工作区）。
     #[serde(rename = "git_updated")]
-    GitUpdated { cwd: String },
+    GitUpdated {
+        cwd: String,
+        #[serde(default)]
+        fetch: bool,
+    },
     /// 终端会话状态变更（创建 / 关闭 / 清空），项目级跨设备全局广播
     #[serde(rename = "terminal_updated")]
     TerminalUpdated { cwd: String },
+    /// 会话审批模式变更（跨实例全局广播）
+    #[serde(rename = "session_mode")]
+    SessionMode {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        mode: String,
+    },
+    /// 全局模式开关变更（跨实例全局广播）。`enabled` 为 true 时所有会话统一
+    /// 跟随 `mode`；为 false 时各会话恢复自己的模式。
+    #[serde(rename = "mode_global")]
+    ModeGlobal { enabled: bool, mode: String },
+}
+
+/// 一次模型参数变更里携带的思考强度/预算快照（两字段都序列化，`null` 即清空）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct ModelEffortWire {
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<u32>,
+}
+
+/// 全局 `steer_folded` 里的单条转向：只带跨端匹配所需的轻量字段。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SteerFoldedInputWire {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// 是否带图（图片本体不进全局通道）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_images: bool,
+}
+
+impl SteerFoldedInputWire {
+    pub(crate) fn from_kernel(input: &zap_kernel::event::SteeredInput) -> Self {
+        Self {
+            text: input.text.clone(),
+            message_id: input.message_id.clone(),
+            has_images: !input.images.is_empty(),
+        }
+    }
 }
 
 /// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
@@ -2200,6 +4682,14 @@ pub(crate) struct SessionRowWire {
     pub updated_at: u64,
     pub message_count: u32,
     pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
 }
 
 /// Build the incremental session row for one stored session. `None` when the
@@ -2224,6 +4714,13 @@ pub(crate) fn session_row_wire(
         updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
         message_count: meta.message_count,
         origin: origin.to_string(),
+        approval_mode: Some(live_api::live_display_approval_mode_wire(
+            session_id,
+            meta.approval_mode.as_deref(),
+        )),
+        preferred_model: meta.preferred_model.clone(),
+        reasoning_effort: meta.reasoning_effort.clone(),
+        thinking_budget: meta.thinking_budget,
     })
 }
 
@@ -2250,6 +4747,13 @@ pub(crate) fn session_row_wire_in_bucket(
         updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
         message_count: meta.message_count,
         origin: origin.to_string(),
+        approval_mode: Some(live_api::live_display_approval_mode_wire(
+            session_id,
+            meta.approval_mode.as_deref(),
+        )),
+        preferred_model: meta.preferred_model.clone(),
+        reasoning_effort: meta.reasoning_effort.clone(),
+        thinking_budget: meta.thinking_budget,
     })
 }
 
@@ -2272,10 +4776,622 @@ pub(crate) fn global_events() -> &'static tokio::sync::broadcast::Sender<GlobalW
     })
 }
 
+/// Broadcast a model-config change to every instance. `session_id = None` means the
+/// new-session default model changed; `effort = None` means the event only carries a
+/// provider switch. `deferred` tells the UI the turn in flight keeps its assembled
+/// provider and the values apply from the next turn.
+pub(crate) fn publish_model_config(
+    session_id: Option<&str>,
+    provider: Option<&str>,
+    effort: Option<ModelEffortWire>,
+    deferred: bool,
+) {
+    publish_global(GlobalWireEvent::ModelConfig {
+        session_id: session_id.map(str::to_string),
+        provider: provider.map(str::to_string),
+        effort,
+        deferred,
+    });
+}
+
 /// Broadcast an invalidation signal. No subscribers / lagged receivers are fine:
 /// the next invalidation (or a client's cold start) reconciles the state.
 pub(crate) fn publish_global(event: GlobalWireEvent) {
     let _ = global_events().send(event);
+}
+
+/// 压缩 owner 命名空间。
+///
+/// 压缩阶段必须按 owner 隔离：`/chat` 的自动压缩归当前 turn，native live 归
+/// live runtime，手动 `/compact` 归该次 operation。任何一个 owner 的收尾都
+/// 不得清除另一个 owner 正在执行的压缩。
+pub(crate) const COMPACTION_OWNER_TURN: &str = "turn";
+pub(crate) const COMPACTION_OWNER_LIVE: &str = "live";
+
+pub(crate) fn manual_compaction_owner(operation_id: &str) -> String {
+    format!("manual:{operation_id}")
+}
+
+#[derive(Clone, Debug)]
+struct CompactionPhase {
+    started_at: u64,
+    owner: String,
+}
+
+/// 会话级执行阶段。`revision` 在每次阶段变化时单调递增；即使阶段结束也保留
+/// 最后一次 revision，客户端据此拒绝迟到的旧事件。
+#[derive(Clone, Debug, Default)]
+struct ExecutionPhaseState {
+    revision: u64,
+    phase: Option<CompactionPhase>,
+}
+
+fn execution_phases() -> &'static std::sync::Mutex<HashMap<String, ExecutionPhaseState>> {
+    static PHASES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ExecutionPhaseState>>> =
+        std::sync::OnceLock::new();
+    PHASES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 登记一次压缩开始；同一 owner 的重复开始保留最早的起点。
+///
+/// 返回该 pass 的权威起点。不同 owner 同时到达时拒绝抢占，保留先到者——
+/// 正常情况下 `ActiveChatRegistry` 的准入已经保证同一会话只有一个执行 owner。
+pub(crate) fn note_compaction_started(session_id: &str, owner: &str) -> u64 {
+    let started_at = u64::try_from(zap_capabilities::session::now_ms()).unwrap_or(0);
+    let result = {
+        let mut phases = execution_phases()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = phases.entry(session_id.to_string()).or_default();
+        state.revision = state.revision.saturating_add(1);
+        match state.phase.as_ref() {
+            Some(existing) => {
+                if existing.owner != owner {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        running_owner = %existing.owner,
+                        incoming_owner = %owner,
+                        "compaction start ignored: another owner already holds the phase"
+                    );
+                }
+                existing.started_at
+            }
+            None => {
+                state.phase = Some(CompactionPhase {
+                    started_at,
+                    owner: owner.to_string(),
+                });
+                started_at
+            }
+        }
+    };
+    publish_runtime_activity(session_id, true);
+    result
+}
+
+/// 只结束指定 owner 的压缩阶段；owner 不匹配时保持现状。
+pub(crate) fn note_compaction_finished(session_id: &str, owner: &str) -> bool {
+    let mut phases = execution_phases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(state) = phases.get_mut(session_id) else {
+        return false;
+    };
+    if state
+        .phase
+        .as_ref()
+        .map_or(true, |phase| phase.owner != owner)
+    {
+        return false;
+    }
+    state.phase = None;
+    state.revision = state.revision.saturating_add(1);
+    true
+}
+
+/// 结束某个 owner 前缀的压缩阶段（用于 turn/live 这类没有精确 run id 的投影器）。
+pub(crate) fn note_compaction_finished_for_prefix(session_id: &str, prefix: &str) -> bool {
+    let mut phases = execution_phases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(state) = phases.get_mut(session_id) else {
+        return false;
+    };
+    if !state
+        .phase
+        .as_ref()
+        .is_some_and(|phase| phase.owner.starts_with(prefix))
+    {
+        return false;
+    }
+    state.phase = None;
+    state.revision = state.revision.saturating_add(1);
+    true
+}
+
+/// 结束阶段并广播权威运行态。`running_after` 描述该 owner 结束后会话是否仍在执行。
+pub(crate) fn finish_compaction_phase(session_id: &str, owner: &str, running_after: bool) -> bool {
+    if note_compaction_finished(session_id, owner) {
+        publish_runtime_activity(session_id, running_after);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn finish_compaction_phase_prefix(
+    session_id: &str,
+    prefix: &str,
+    running_after: bool,
+) -> bool {
+    if note_compaction_finished_for_prefix(session_id, prefix) {
+        publish_runtime_activity(session_id, running_after);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn compaction_started_at(session_id: &str) -> Option<u64> {
+    execution_phases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .and_then(|state| state.phase.as_ref().map(|phase| phase.started_at))
+}
+
+pub(crate) fn compaction_owner(session_id: &str) -> Option<String> {
+    execution_phases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .and_then(|state| state.phase.as_ref().map(|phase| phase.owner.clone()))
+}
+
+pub(crate) fn execution_phase_revision(session_id: &str) -> u64 {
+    execution_phases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .map(|state| state.revision)
+        .unwrap_or(0)
+}
+
+pub(crate) fn compaction_running_session_ids() -> Vec<String> {
+    execution_phases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|(_, state)| state.phase.is_some())
+        .map(|(session_id, _)| session_id.clone())
+        .collect()
+}
+
+/// 广播一条带 revision/owner 的权威运行态。
+///
+/// `RuntimeActivity` 是新客户端的唯一阶段信号；`Activity` 继续保留给旧客户端
+/// 与侧栏的活动列表，两者由同一个状态快照派生，不能再由各处自行拼装。
+pub(crate) fn publish_runtime_activity(session_id: &str, running: bool) {
+    let (started_at, owner, revision) = {
+        let phases = execution_phases()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match phases.get(session_id) {
+            Some(state) => (
+                state.phase.as_ref().map(|phase| phase.started_at),
+                state.phase.as_ref().map(|phase| phase.owner.clone()),
+                state.revision,
+            ),
+            None => (None, None, 0),
+        }
+    };
+    let compacting = started_at.is_some();
+    publish_global(GlobalWireEvent::RuntimeActivity {
+        session_id: session_id.to_string(),
+        revision,
+        running,
+        phase: compacting.then(|| "compacting".to_string()),
+        phase_started_at: started_at,
+        owner: owner.clone(),
+    });
+    // 旧客户端只理解 Activity；状态字段必须与新快照保持一致。
+    publish_global(GlobalWireEvent::Activity {
+        session_id: session_id.to_string(),
+        running,
+        terminal: None,
+        status: Some(if compacting { "compacting" } else { "running" }.to_string()),
+    });
+}
+
+#[cfg(test)]
+mod folded_steer_outline_tests {
+    use super::*;
+
+    #[test]
+    fn folded_steer_is_projected_into_the_outline_without_a_display_row() {
+        let inputs = vec![zap_capabilities::session::SessionInput {
+            id: "steer-1".into(),
+            seq: 7,
+            session_id: "session-1".into(),
+            delivery: "steer".into(),
+            status: "promoted".into(),
+            text: "<user-query>\n看这个\n</user-query>".into(),
+            images: Vec::new(),
+            created_at: 1_700_000_000_000,
+            message_id: Some("m-steer-1".into()),
+            operation_id: Some("op-1".into()),
+        }];
+        let mut turns = Vec::new();
+        append_folded_steer_outline(
+            &[],
+            &mut turns,
+            &inputs,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id.as_deref(), Some("steer-1"));
+        assert_eq!(turns[0].label, "看这个");
+        assert!(turns[0].pending);
+
+        // The same durable steer must not be added twice on every read.
+        append_folded_steer_outline(
+            &[],
+            &mut turns,
+            &inputs,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(turns.len(), 1);
+    }
+
+    #[test]
+    fn promoted_steer_is_projected_as_a_user_message_before_display_flush() {
+        let session_id = format!("promoted-steer-projection-{}", std::process::id());
+        zap_capabilities::session::inputs::clear_global(&session_id);
+        let mut input = zap_capabilities::session::SessionInput {
+            id: "steer-1".into(),
+            seq: 0,
+            session_id: session_id.clone(),
+            delivery: "steer".into(),
+            status: "promoted".into(),
+            text: "folded but display not flushed".into(),
+            images: Vec::new(),
+            created_at: 1_700_000_000_000,
+            message_id: Some("steer-1".into()),
+            operation_id: Some("op-1".into()),
+        };
+        zap_capabilities::session::inputs::append_global(&mut input).unwrap();
+
+        let mut messages = Vec::new();
+        let mut turns = Vec::new();
+        append_pending_inputs(
+            &mut messages,
+            &mut turns,
+            &session_id,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].id.as_deref(), Some("steer-1"));
+        assert!(messages[0]
+            .content
+            .contains("folded but display not flushed"));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].index, 0);
+        assert!(
+            !turns[0].pending,
+            "promoted row already has a canvas bubble"
+        );
+
+        // A later detail read (display still lagging) must be idempotent.
+        append_pending_inputs(
+            &mut messages,
+            &mut turns,
+            &session_id,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(turns.len(), 1);
+        zap_capabilities::session::inputs::clear_global(&session_id);
+    }
+
+    #[test]
+    fn streaming_assistant_is_projected_before_a_pending_steer() {
+        let session_id = format!("streaming-before-pending-{}", std::process::id());
+        zap_capabilities::session::inputs::clear_global(&session_id);
+        zap_capabilities::session::partial::clear_global(&session_id);
+        zap_capabilities::session::partial::clear_archived_global(&session_id);
+
+        let mut q1 = zap_kernel::message::Message::user("123");
+        q1.id = Some("q-1".into());
+        let mut messages = vec![MessageInfo::from_kernel_in(&q1, None)];
+        let mut turns = Vec::new();
+
+        let live = zap_capabilities::session::PartialStream {
+            session_id: session_id.clone(),
+            message_id: Some("m-as1".into()),
+            text: "working on the first round".into(),
+            updated_at: 1_700_000_000_500,
+            ..Default::default()
+        };
+        zap_capabilities::session::partial::save_global(&live).unwrap();
+
+        let mut steer = zap_capabilities::session::SessionInput {
+            id: "steer-1".into(),
+            seq: 0,
+            session_id: session_id.clone(),
+            delivery: "steer".into(),
+            // The kernel has already folded it at the next round boundary; this
+            // is the promoted row projected before display.jsonl flushes.
+            status: "promoted".into(),
+            text: "456".into(),
+            images: Vec::new(),
+            created_at: 1_700_000_000_600,
+            message_id: Some("steer-1".into()),
+            operation_id: Some("op-1".into()),
+        };
+        zap_capabilities::session::inputs::append_global(&mut steer).unwrap();
+
+        append_streaming_before_pending(
+            &mut messages,
+            &mut turns,
+            &session_id,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].id.as_deref(), Some("q-1"));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].id.as_deref(), Some("m-as1"));
+        assert!(messages[1].content.contains("working on the first round"));
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[2].id.as_deref(), Some("steer-1"));
+        assert!(messages[2].content.contains("456"));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].index, 2);
+
+        // No live partial: the pending steer groups with the same-round user run
+        // (aq1, steer1); the provider merges adjacent user parts on the wire.
+        zap_capabilities::session::partial::clear_global(&session_id);
+        let mut no_partial = vec![MessageInfo::from_kernel_in(&q1, None)];
+        let mut no_partial_turns = Vec::new();
+        append_streaming_before_pending(
+            &mut no_partial,
+            &mut no_partial_turns,
+            &session_id,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(
+            no_partial
+                .iter()
+                .map(|message| (message.role.as_str(), message.id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("user", Some("q-1")), ("user", Some("steer-1"))]
+        );
+
+        zap_capabilities::session::inputs::clear_global(&session_id);
+        zap_capabilities::session::partial::clear_global(&session_id);
+        zap_capabilities::session::partial::clear_archived_global(&session_id);
+    }
+
+    #[test]
+    fn rejected_steer_is_not_left_in_the_live_outline() {
+        let inputs = vec![zap_capabilities::session::SessionInput {
+            id: "steer-rejected".into(),
+            seq: 7,
+            session_id: "session-1".into(),
+            delivery: "steer".into(),
+            status: "rejected".into(),
+            text: "failed steer".into(),
+            images: Vec::new(),
+            created_at: 1_700_000_000_000,
+            message_id: None,
+            operation_id: Some("op-1".into()),
+        }];
+        let mut turns = Vec::new();
+        append_folded_steer_outline(
+            &[],
+            &mut turns,
+            &inputs,
+            Some("op-1"),
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn queued_and_live_steers_are_projected_without_an_operation_alias() {
+        let inputs = vec![
+            zap_capabilities::session::SessionInput {
+                id: "steer-queued".into(),
+                seq: 8,
+                session_id: "session-1".into(),
+                delivery: "steer".into(),
+                status: "admitted".into(),
+                text: "<user-query>\n排队中\n</user-query>".into(),
+                images: Vec::new(),
+                created_at: 1_700_000_000_100,
+                message_id: None,
+                operation_id: Some("op-1".into()),
+            },
+            zap_capabilities::session::SessionInput {
+                id: "steer-live".into(),
+                seq: 9,
+                session_id: "session-1".into(),
+                delivery: "steer".into(),
+                status: "admitted".into(),
+                text: "<user-query>\nlive 转向\n</user-query>".into(),
+                images: Vec::new(),
+                created_at: 1_700_000_000_200,
+                message_id: None,
+                operation_id: None,
+            },
+        ];
+        let mut turns = Vec::new();
+        append_folded_steer_outline(
+            &[],
+            &mut turns,
+            &inputs,
+            None,
+            std::path::Path::new("/project"),
+            0,
+        );
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|turn| turn.pending));
+        assert_eq!(turns[0].label, "排队中");
+        assert_eq!(turns[1].label, "live 转向");
+    }
+}
+
+#[cfg(test)]
+mod compaction_phase_tests {
+    use super::*;
+
+    #[test]
+    fn compaction_phase_keeps_earliest_start_and_only_owner_can_finish() {
+        let session_id = "compaction-phase-test-session";
+        note_compaction_finished(session_id, "turn");
+        let first = note_compaction_started(session_id, "turn");
+        // 同一个 pass 的重复 CompactionStarted 不得把计时起点往后拽。
+        assert_eq!(note_compaction_started(session_id, "turn"), first);
+        assert_eq!(compaction_started_at(session_id), Some(first));
+
+        // 另一个 owner 不得清除当前阶段。
+        assert!(!note_compaction_finished(session_id, "live"));
+        assert_eq!(compaction_started_at(session_id), Some(first));
+        assert_eq!(compaction_owner(session_id).as_deref(), Some("turn"));
+
+        let revision_while_compacting = execution_phase_revision(session_id);
+        assert!(revision_while_compacting > 0);
+
+        assert!(note_compaction_finished(session_id, "turn"));
+        assert_eq!(compaction_started_at(session_id), None);
+        // revision 在阶段结束后继续单调保留，客户端可拒绝迟到的旧事件。
+        assert!(execution_phase_revision(session_id) > revision_while_compacting);
+    }
+}
+
+/// 运行时控制器（`/loop` / `/goal`）的服务端权威状态。
+///
+/// `/loop` 在两次唤醒之间会进入 wakeup 等待：那一刻没有回合在执行，
+/// `ActiveChatRegistry` 与会话运行态注册表都如实报告「空闲」，但控制器还挂着，
+/// 下一轮随时开始。客户端若只据此熄灭 busy，就会出现「循环仍在输出、按钮/呼吸点
+/// 却是停止态，刷新才恢复」。这里把 `LoopChanged` / `GoalChanged` 收成一份进程级
+/// 状态，让 `/chat/active` 与 `/chat/runtime` 能如实回答「这个会话还有没有人在干活」。
+///
+/// 每轮至少刷新一次 `updated_at`；超过 [`CONTROLLER_STALE_AFTER`] 未刷新即视为
+/// 控制器已消失，避免 runtime 崩溃/重启后永久占住运行态。
+#[derive(Clone, Debug, Default)]
+struct ControllerState {
+    loop_active: bool,
+    goal_active: bool,
+    loop_round: u32,
+    loop_label: String,
+    updated_at: Option<std::time::Instant>,
+}
+
+/// 控制器状态的保鲜窗口。`schedule_wakeup` 允许最长 3600s 的唤醒延迟，期间不会
+/// 再发 `LoopChanged`，所以窗口必须覆盖一整轮睡眠再留余量；超过即视为控制器
+/// 已消失（runtime 崩溃/重启不会永久占住运行态）。
+const CONTROLLER_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(7200);
+
+fn controller_states(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ControllerState>> {
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ControllerState>>,
+    > = std::sync::OnceLock::new();
+    STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fresh_controller_state(state: &ControllerState) -> bool {
+    state
+        .updated_at
+        .is_some_and(|at| at.elapsed() < CONTROLLER_STALE_AFTER)
+}
+
+/// Record the `/loop` controller state for a session (called from the runtime
+/// event projector; the daemon used to drop these events on the floor).
+fn note_loop_state(session_id: &str, active: bool, round: u32, label: &str) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let mut guard = controller_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 写路径顺便清掉过期条目：长期运行的 daemon 不会因为历史会话无限增长。
+    guard.retain(|_, state| fresh_controller_state(state));
+    let state = guard.entry(session_id.to_string()).or_default();
+    state.loop_active = active;
+    state.loop_round = round;
+    state.loop_label = label.to_string();
+    state.updated_at = Some(std::time::Instant::now());
+}
+
+/// Record the `/goal` controller state for a session.
+fn note_goal_state(session_id: &str, active: bool) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let mut guard = controller_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, state| fresh_controller_state(state));
+    let state = guard.entry(session_id.to_string()).or_default();
+    state.goal_active = active;
+    state.updated_at = Some(std::time::Instant::now());
+}
+
+fn controller_state_for(session_id: &str) -> Option<ControllerState> {
+    let guard = controller_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get(session_id)
+        .filter(|state| fresh_controller_state(state))
+        .cloned()
+}
+
+/// 这个会话是否仍有已武装的运行时控制器（`/loop` 或 `/goal`）。
+fn session_controller_running(session_id: &str) -> bool {
+    controller_state_for(session_id).is_some_and(|state| state.loop_active || state.goal_active)
+}
+
+/// Sessions whose runtime still owns an armed controller. These must count as
+/// "running" for `/chat/active` even while no turn is executing.
+fn controller_running_session_ids() -> Vec<String> {
+    let guard = controller_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .iter()
+        .filter(|(_, state)| {
+            fresh_controller_state(state) && (state.loop_active || state.goal_active)
+        })
+        .map(|(session_id, _)| session_id.clone())
+        .collect()
+}
+
+/// 「git 变更命令自动同步」开关：默认开启；读配置失败时按开启兜底。
+/// 仅在确实命中 git 写命令的关键节点调用，开销可忽略（不做任何轮询）。
+fn auto_git_sync_enabled() -> bool {
+    zap_config::store::ConfigStore::default_store()
+        .read()
+        .map(|snapshot| snapshot.config.auto_git_sync)
+        .unwrap_or(true)
 }
 
 /// `/events` 的挂载点。单独抽成 helper，生产路由与测试共用同一份定义：
@@ -2335,39 +5451,153 @@ async fn global_events_stream() -> axum::response::Response {
 /// same `message_id`/`part_id`. Merging across identities used to fuse a later
 /// round's tail into an earlier round's entry, so a watch/live replay repainted
 /// that text under the WRONG stored message (ghost rounds + misplaced text).
-fn push_chat_replay(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
+/// The turn's replay buffer AND the single monotonic event cursor. Every
+/// emitted event (live or replayed) consumes one seq; coalesced text/reasoning
+/// deltas keep the LAST seq, so a replay snapshot is always a prefix of the
+/// same ordered log.
+struct ReplayLog {
+    next_seq: u64,
+    events: Vec<(u64, ChatEvent)>,
+}
+
+impl ReplayLog {
+    fn new(seq_base: u64) -> Self {
+        Self {
+            next_seq: seq_base,
+            events: Vec::new(),
+        }
+    }
+
+    fn high_water(&self) -> u64 {
+        self.next_seq
+    }
+
+    fn push(&mut self, event: ChatEvent) -> u64 {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let seq = self.next_seq;
+        let coalesced = match (&event, self.events.last_mut()) {
+            (
+                ChatEvent::TextDelta {
+                    content,
+                    message_id,
+                    part_id,
+                    part_rev,
+                    ..
+                },
+                Some((
+                    prev_seq,
+                    ChatEvent::TextDelta {
+                        content: prev,
+                        message_id: prev_message_id,
+                        part_id: prev_part_id,
+                        part_rev: prev_part_rev,
+                        ..
+                    },
+                )),
+            ) if message_id == prev_message_id && part_id == prev_part_id => {
+                prev.push_str(content);
+                if part_rev.is_some() {
+                    *prev_part_rev = *part_rev;
+                }
+                *prev_seq = seq;
+                true
+            }
+            (
+                ChatEvent::ReasoningDelta {
+                    content,
+                    message_id,
+                    part_id,
+                    part_rev,
+                    ..
+                },
+                Some((
+                    prev_seq,
+                    ChatEvent::ReasoningDelta {
+                        content: prev,
+                        message_id: prev_message_id,
+                        part_id: prev_part_id,
+                        part_rev: prev_part_rev,
+                        ..
+                    },
+                )),
+            ) if message_id == prev_message_id && part_id == prev_part_id => {
+                prev.push_str(content);
+                if part_rev.is_some() {
+                    *prev_part_rev = *part_rev;
+                }
+                *prev_seq = seq;
+                true
+            }
+            (
+                ChatEvent::ToolOutputChunk { id, chunk },
+                Some((
+                    prev_seq,
+                    ChatEvent::ToolOutputChunk {
+                        id: prev_id,
+                        chunk: prev,
+                    },
+                )),
+            ) if id == prev_id => {
+                prev.push_str(chunk);
+                *prev_seq = seq;
+                true
+            }
+            _ => false,
+        };
+        if !coalesced {
+            self.events.push((seq, event));
+        }
+        seq
+    }
+}
+
+fn push_chat_replay(log: &mut ReplayLog, event: ChatEvent) -> u64 {
+    log.push(event)
+}
+
+fn push_chat_replay_legacy(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
     match (&event, buf.last_mut()) {
         (
             ChatEvent::TextDelta {
                 content,
                 message_id,
                 part_id,
+                part_rev,
                 ..
             },
             Some(ChatEvent::TextDelta {
                 content: prev,
                 message_id: prev_message_id,
                 part_id: prev_part_id,
+                part_rev: prev_part_rev,
                 ..
             }),
         ) if message_id == prev_message_id && part_id == prev_part_id => {
             prev.push_str(content);
+            if part_rev.is_some() {
+                *prev_part_rev = *part_rev;
+            }
         }
         (
             ChatEvent::ReasoningDelta {
                 content,
                 message_id,
                 part_id,
+                part_rev,
                 ..
             },
             Some(ChatEvent::ReasoningDelta {
                 content: prev,
                 message_id: prev_message_id,
                 part_id: prev_part_id,
+                part_rev: prev_part_rev,
                 ..
             }),
         ) if message_id == prev_message_id && part_id == prev_part_id => {
             prev.push_str(content);
+            if part_rev.is_some() {
+                *prev_part_rev = *part_rev;
+            }
         }
         (
             ChatEvent::ToolOutputChunk { id, chunk },
@@ -2389,8 +5619,8 @@ fn push_chat_replay(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
 /// can rehydrate the full turn after a browser refresh.
 pub(crate) fn fanout_chat_events(
     primary: mpsc::UnboundedSender<ChatEvent>,
-    bus: tokio::sync::broadcast::Sender<ChatEvent>,
-    replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
+    bus: tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
+    replay: Option<Arc<std::sync::Mutex<ReplayLog>>>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
     fanout_chat_events_for_session(primary, bus, replay, None, None)
 }
@@ -2400,25 +5630,45 @@ pub(crate) fn fanout_chat_events(
 /// compat turns on the same session.
 pub(crate) fn fanout_chat_events_for_session(
     primary: mpsc::UnboundedSender<ChatEvent>,
-    bus: tokio::sync::broadcast::Sender<ChatEvent>,
-    replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
+    bus: tokio::sync::broadcast::Sender<(u64, ChatEvent)>,
+    replay: Option<Arc<std::sync::Mutex<ReplayLog>>>,
     session_id: Option<String>,
     working_dir: Option<std::path::PathBuf>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     tokio::spawn(async move {
         let mut current_sid = session_id;
+        let mut no_replay_seq: u64 = 0;
         let current_wd = working_dir;
+        // Git 变更命令登记表：call_id → 意图（见 git_intent）。仅在 shell 工具里命中
+        // 「改动分支/引用/远端」的 git 命令时登记，待其 ToolResult 落地才触发一次广播。
+        // 这是关键节点启发触发，不引入任何轮询。
+        let mut pending_git: HashMap<String, crate::git_intent::GitIntent> = HashMap::new();
         while let Some(event) = rx.recv().await {
+            let mut deferred_activity: Option<GlobalWireEvent> = None;
+            let mut deferred_upsert_sid: Option<String> = None;
             match &event {
                 ChatEvent::ToolCallStarted {
-                    name, arguments, ..
+                    id,
+                    name,
+                    arguments,
+                    ..
                 } => {
                     tracing::info!(
                         tool = %name,
                         args = %log_truncate(arguments, 300),
                         "chat: tool call started"
                     );
+                    // 关键节点启发：仅解析 shell 工具的命令，命中 git 写操作才登记，
+                    // 等 ToolResult 落地后再广播（绝不新增轮询）。
+                    if zap_capabilities::tools::is_shell_tool_name(name) {
+                        if let Some(intent) =
+                            zap_capabilities::tools::extract_shell_command(arguments)
+                                .and_then(|cmd| crate::git_intent::classify(&cmd))
+                        {
+                            pending_git.insert(id.clone(), intent);
+                        }
+                    }
                 }
                 ChatEvent::PermissionRequest {
                     session_id,
@@ -2443,14 +5693,57 @@ pub(crate) fn fanout_chat_events_for_session(
                         session_id: session_id.clone(),
                     });
                 }
-                ChatEvent::User { session_id, .. } => {
+                ChatEvent::User {
+                    session_id,
+                    client_input_id,
+                    message_id,
+                    ..
+                } => {
                     let sid = session_id.clone().or_else(|| current_sid.clone());
                     if let Some(sid) = sid {
+                        // The admitted prompt is now a real message: retire its
+                        // pending input row by the same id.
+                        let _ = zap_capabilities::session::inputs::mark_promoted_global(
+                            &sid,
+                            &[(client_input_id.clone(), message_id.clone())],
+                        );
                         publish_global(GlobalWireEvent::Activity {
                             session_id: sid,
                             running: true,
                             terminal: None,
                             status: None,
+                        });
+                    }
+                }
+                ChatEvent::Steered {
+                    inputs,
+                    client_input_ids,
+                    anchor_message_id,
+                    ..
+                } => {
+                    // 中途转向已并入本轮：异地客户端即使没在看这个会话，也要把这条
+                    // 提问写进它自己的本地画布缓存（切过去 / 冷启动时气泡已在）。
+                    if let Some(sid) = current_sid.clone() {
+                        // The kernel folded these steers into persisted user
+                        // messages: retire their pending input rows by client id
+                        // and bind the kernel message id for later reconciliation.
+                        let pairs: Vec<(Option<String>, Option<String>)> = client_input_ids
+                            .iter()
+                            .cloned()
+                            .zip(inputs.iter().map(|input| input.message_id.clone()))
+                            .collect();
+                        let _ = zap_capabilities::session::inputs::mark_promoted_global(
+                            &sid, &pairs,
+                        );
+                        retire_folded_steers_from_queue(&sid, &pairs).await;
+                        publish_global(GlobalWireEvent::SteerFolded {
+                            session_id: sid,
+                            inputs: inputs
+                                .iter()
+                                .map(SteerFoldedInputWire::from_kernel)
+                                .collect(),
+                            client_input_ids: client_input_ids.clone(),
+                            anchor_message_id: anchor_message_id.clone(),
                         });
                     }
                 }
@@ -2467,22 +5760,20 @@ pub(crate) fn fanout_chat_events_for_session(
                     if current_sid.is_none() {
                         current_sid = Some(session_id.clone());
                     }
-                    publish_global(GlobalWireEvent::Activity {
+                    deferred_activity = Some(GlobalWireEvent::Activity {
                         session_id: session_id.clone(),
                         running: false,
                         terminal: Some(chat_done_terminal_label(stop_reason.as_deref())),
                         status: None,
                     });
-                    if let Some(wd) = current_wd.clone() {
-                        publish_session_upsert(&wd, session_id);
-                    }
+                    deferred_upsert_sid = Some(session_id.clone());
                 }
                 ChatEvent::Stopped | ChatEvent::Error { .. } => {
                     if matches!(event, ChatEvent::Stopped) {
                         tracing::info!("chat: turn stopped");
                     }
                     if let Some(sid) = current_sid.clone() {
-                        publish_global(GlobalWireEvent::Activity {
+                        deferred_activity = Some(GlobalWireEvent::Activity {
                             session_id: sid,
                             running: false,
                             terminal: Some("stopped"),
@@ -2490,17 +5781,30 @@ pub(crate) fn fanout_chat_events_for_session(
                         });
                     }
                 }
-                ChatEvent::ToolCallResult { name, success, .. } => {
+                ChatEvent::ToolCallResult {
+                    id, name, success, ..
+                } => {
                     tracing::info!(tool = %name, success, "chat: tool result");
+                    // shell 的 git 变更命令已执行完毕（关键节点）：向本项目全部会话广播一次
+                    // Git 刷新；远端/引用类命令让客户端再按节流补一次 `git fetch`。
+                    if let Some(intent) = pending_git.remove(id) {
+                        if auto_git_sync_enabled() {
+                            if let Some(dir) = current_wd.as_deref() {
+                                api_git::invalidate_git_cache(dir);
+                                publish_global(GlobalWireEvent::GitUpdated {
+                                    cwd: dir.to_string_lossy().to_string(),
+                                    fetch: intent.needs_fetch(),
+                                });
+                            }
+                        }
+                    }
                 }
                 ChatEvent::SessionAssigned { session_id }
                 | ChatEvent::SessionRenamed { session_id, .. } => {
                     if current_sid.is_none() {
                         current_sid = Some(session_id.clone());
                     }
-                    if let Some(wd) = current_wd.clone() {
-                        publish_session_upsert(&wd, session_id);
-                    }
+                    deferred_upsert_sid = Some(session_id.clone());
                 }
                 _ => {}
             }
@@ -2513,16 +5817,25 @@ pub(crate) fn fanout_chat_events_for_session(
             if let Some(sid) = effective_sid {
                 mirror_chat_event_to_registry(sid, &event);
             }
-            if let Some(ref replay) = replay {
+            let seq = if let Some(ref replay) = replay {
                 let mut guard = replay
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                push_chat_replay(&mut guard, event.clone());
-                let _ = bus.send(event.clone());
+                push_chat_replay(&mut guard, event.clone())
             } else {
-                let _ = bus.send(event.clone());
-            }
+                no_replay_seq = no_replay_seq.saturating_add(1);
+                no_replay_seq
+            };
+            let _ = bus.send((seq, event.clone()));
             let _ = primary.send(event);
+            // 终态必须先写入 replay 并投递到 /chat/watch 总线，随后才能在全局 /events 上广播
+            // running: false 与执行磁盘扫描，避免前端收到 Activity 信号时 /chat/watch 尚未收到 Done。
+            if let Some(activity) = deferred_activity {
+                publish_global(activity);
+            }
+            if let (Some(wd), Some(sid)) = (current_wd.as_deref(), deferred_upsert_sid.as_deref()) {
+                publish_session_upsert(wd, sid);
+            }
         }
     });
     tx
@@ -2699,12 +6012,16 @@ impl AppState {
         let map = get_session_queues_map().await;
         let mut writer = map.write().await;
         let list = writer.entry(sid.clone()).or_default();
+        let client_input_id = uuid::Uuid::new_v4().to_string();
         list.push(QueuedMessageItem {
-            id: serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+            id: serde_json::Value::String(client_input_id.clone()),
+            client_input_id: Some(client_input_id),
             text: text.to_string(),
             images: None,
             kind: "queue".to_string(),
             approval_mode: None,
+            created_at: None,
+            force_send: None,
         });
         let cloned_list = list.clone();
         if let Some(path) = session_queue_file_path(&sid) {
@@ -2725,6 +6042,9 @@ impl AppState {
                 },
             )
             .await;
+        // 会话总线只覆盖“正Watch着这个会话”的客户端。正在看其它会话的实例
+        // 也必须知道卡片变了，否则切过去时看到的是过期队列。
+        publish_global(GlobalWireEvent::QueueUpdated { session_id: sid });
     }
 }
 
@@ -2834,7 +6154,7 @@ pub struct ArtifactInfo {
 }
 
 /// Tool call info for API response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
@@ -2843,7 +6163,7 @@ pub struct ToolCallInfo {
 }
 
 /// Tool result info for API response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolResultInfo {
     pub call_id: String,
     pub success: bool,
@@ -2852,7 +6172,7 @@ pub struct ToolResultInfo {
 }
 
 /// Message info for API response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct MessageInfo {
     pub role: String,
     /// Stable per-message identity from the kernel `Message.id` (SIDECAR). Lets
@@ -2860,6 +6180,22 @@ pub struct MessageInfo {
     /// persisted before the field existed. ADDITIVE: `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Durable client-input correlation id (`SessionInput.id`) for user rows.
+    /// The kernel message id alone is not enough after a reconnect: a queued
+    /// steer card carries the client id, so both halves must be on the row to
+    /// dedupe without text heuristics. ADDITIVE: absent on old daemons/rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input_id: Option<String>,
+    /// Session-global v4 display order. Additive: absent for snapshot-only rows
+    /// and old daemons. `after_seq` deltas use this cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Kernel turn id of the round that produced this row. Persisted so the WebUI
+    /// can distinguish a steer folded into a RUNNING turn from a steer-delivered
+    /// NEW turn after a terminal, even after a refresh. `None` for backfilled
+    /// rows / legacy snapshots where the turn id is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<u64>,
     pub content: String,
     /// The model's reasoning/thinking for an ASSISTANT message — persisted
     /// losslessly in the kernel `Message.reasoning` but until now dropped at
@@ -2876,6 +6212,19 @@ pub struct MessageInfo {
     pub synthetic: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_origin: Option<String>,
+    /// User-facing text. For user rows the display pipeline already unwraps the
+    /// user envelope and strips injected reminders; clients must render THIS
+    /// instead of re-parsing protocol strings out of `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+    /// Server-authored visibility flag. A row is hidden from the transcript when
+    /// this is true (synthetic reminders, verify-cadence narration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+    /// Whether the UI may edit / delete / rewind this row. Display-only archive
+    /// and presentation rows are never editable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     /// Tool result summary (for tool role messages)
@@ -2920,7 +6269,8 @@ impl ImageData {
     fn missing_placeholder() -> Self {
         Self {
             media_type: "image/png".to_string(),
-            data: String::new(),
+            // 采用标准合法 1x1 透明 PNG Base64 占位，彻底杜绝浏览器 Data URI 为空时触发左上角小裂图坏图标
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string(),
             missing: true,
         }
     }
@@ -3000,7 +6350,7 @@ impl MessageInfo {
                 .map(|call| ToolCallInfo {
                     id: call.id.clone(),
                     name: call.name.clone(),
-                    arguments: cap_display_field(call.arguments.clone()),
+                    arguments: call.arguments.clone(),
                     display: format_tool_args(&call.name, &call.arguments),
                 })
                 .collect()
@@ -3020,7 +6370,7 @@ impl MessageInfo {
                 .iter()
                 .map(|call| (call.name.as_str(), call.arguments.as_str())),
         );
-        let mut content = cap_display_field(msg.text.clone());
+        let mut content = msg.text.clone();
         let mut images = (!msg.images.is_empty()).then(|| {
             msg.images
                 .iter()
@@ -3042,13 +6392,31 @@ impl MessageInfo {
                 }
             }
         }
+        let display_text = (msg.role == Role::User).then(|| content.clone());
+        let internal = msg.synthetic || msg.internal_origin.as_deref() == Some("verify_cadence");
+        let editable = (msg.role == Role::User).then(|| {
+            !msg.synthetic
+                && !matches!(
+                    msg.internal_origin.as_deref(),
+                    Some("transcript_archive") | Some("presentation") | Some("pending_input")
+                )
+        });
         Self {
+            seq: None,
+            turn_id: msg
+                .meta
+                .as_ref()
+                .and_then(|meta| (meta.turn_id > 0).then_some(meta.turn_id)),
             role: role.into(),
             id: msg.id.clone(),
+            client_input_id: None,
             content,
-            reasoning: msg.reasoning.clone().map(cap_display_field),
+            reasoning: msg.reasoning.clone(),
             synthetic: msg.synthetic,
             internal_origin: msg.internal_origin.clone(),
+            display_text,
+            internal: Some(internal),
+            editable,
             tool_calls,
             tool_result,
             artifacts,
@@ -3409,6 +6777,77 @@ fn dangerous_tools_enabled() -> bool {
     std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
 }
 
+fn compression_layer() -> CompressionLayer<impl Predicate + Clone> {
+    CompressionLayer::new().gzip(true).br(true).compress_when(
+        DefaultPredicate::new()
+            .and(NotForContentType::new("text/event-stream"))
+            .and(CompressibleContentType),
+    )
+}
+
+/// Binary payloads are already compressed (or incompressible): gzip/brotli only
+/// burns CPU and can enlarge them. SSE is excluded separately above.
+#[derive(Clone, Copy, Default)]
+struct CompressibleContentType;
+
+fn is_binary_content_type(content_type: &str) -> bool {
+    let value = content_type.trim().to_ascii_lowercase();
+    value.starts_with("image/")
+        || value.starts_with("video/")
+        || value.starts_with("audio/")
+        || value.starts_with("font/")
+        || value.starts_with("application/zip")
+        || value.starts_with("application/gzip")
+        || value.starts_with("application/x-gzip")
+        || value.starts_with("application/octet-stream")
+        || value.starts_with("application/pdf")
+        || value.starts_with("application/wasm")
+}
+
+impl Predicate for CompressibleContentType {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: axum::body::HttpBody,
+    {
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        !is_binary_content_type(content_type)
+    }
+}
+
+#[cfg(test)]
+mod compression_predicate_tests {
+    use super::is_binary_content_type;
+
+    #[test]
+    fn binary_content_types_are_excluded_from_compression() {
+        for content_type in [
+            "image/png",
+            "video/mp4",
+            "audio/mpeg",
+            "font/woff2",
+            "application/zip",
+            "application/gzip",
+            "application/octet-stream",
+            "application/pdf",
+            "application/wasm",
+        ] {
+            assert!(is_binary_content_type(content_type), "{content_type}");
+        }
+        for content_type in [
+            "application/json",
+            "text/html; charset=utf-8",
+            "text/event-stream",
+            "application/javascript",
+        ] {
+            assert!(!is_binary_content_type(content_type), "{content_type}");
+        }
+    }
+}
+
 fn cors_layer() -> CorsLayer {
     // Loopback-only was correct when the daemon only ever bound 127.0.0.1.
     // `jeikcode serve --host 0.0.0.0` (and LAN binds) serve the SPA from a
@@ -3422,9 +6861,41 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
+            header::IF_NONE_MATCH,
             HeaderName::from_static("x-zap-client"),
         ])
+        .expose_headers([header::ETAG])
         .allow_credentials(true)
+}
+
+fn is_legacy_live_transport(path: &str) -> bool {
+    matches!(
+        path,
+        "/live" | "/live/message" | "/live/stop" | "/live/compact" | "/live/switch_session"
+    )
+}
+
+/// Mark the retired `/live` transport without breaking older clients. The
+/// current WebUI uses `/chat` + `/chat/watch`; these endpoints remain for an
+/// external compatibility window.
+async fn legacy_live_deprecation_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    let mut response = next.run(req).await;
+    if is_legacy_live_transport(&path) {
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("deprecation"),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("link"),
+            axum::http::HeaderValue::from_static("</chat>; rel=\"successor-version\""),
+        );
+        tracing::warn!(path = %path, "deprecated /live transport used");
+    }
+    response
 }
 
 /// Middleware that updates `last_activity` timestamp on every request except
@@ -3528,9 +6999,8 @@ fn is_private_network_authority(authority: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64; // RFC 6598 100.64.0.0/10 (Tailscale)
-                v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified() || is_cgnat
+                let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_unspecified() || is_cgnat
             }
             std::net::IpAddr::V6(v6) => {
                 let seg0 = v6.segments()[0];
@@ -3667,10 +7137,34 @@ fn effective_chat_approval_mode(
     effective_chat_approval_mode_scoped(request_mode, None)
 }
 
+/// Final approval mode for one `/chat` turn.
+///
+/// 优先级：策略强制（API / YOLO）> 全局开关 > 会话级 > 请求体 > 进程级默认。
+/// `forced` 必须压过全局开关：否则 WebUI 切到全局 Plan 会连累 `/v1/*` 自动化。
+fn resolve_turn_approval_mode(
+    forced: Option<crate::approval_mode::ApprovalMode>,
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+    session_id: Option<&str>,
+) -> crate::approval_mode::ApprovalMode {
+    match forced {
+        Some(forced) => forced,
+        None => effective_chat_approval_mode_scoped(request_mode, session_id),
+    }
+}
+
 fn effective_chat_approval_mode_scoped(
     request_mode: Option<crate::approval_mode::ApprovalMode>,
     session_id: Option<&str>,
 ) -> crate::approval_mode::ApprovalMode {
+    // 全局开关开启：所有会话统一，请求体里的旧副本也不再影响。
+    if live_api::live_global_mode_enabled() {
+        return live_api::live_current_approval_mode();
+    }
+    // 会话级模式优先：它来自用户显式切换（含异地广播）。请求体里的
+    // `approval_mode` 可能是另一实例上的陈旧副本，绝不能反向覆盖。
+    if let Some(mode) = live_api::live_session_approval_mode_cached(session_id) {
+        return mode;
+    }
     request_mode.unwrap_or_else(|| live_api::live_session_approval_mode(session_id))
 }
 
@@ -3727,16 +7221,6 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     list_projects_in_root(&sessions_root, active.as_ref())
 }
 
-/// Global default workspace for standalone sessions (not bound to any specific project).
-pub(crate) fn global_standalone_workspace() -> PathBuf {
-    let home = zap_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let ws = home.join(".zap").join("workspace");
-    if !ws.exists() {
-        let _ = std::fs::create_dir_all(&ws);
-    }
-    ws
-}
-
 fn list_projects_in_root(
     sessions_root: &std::path::Path,
     active: Option<&zap_capabilities::session::CatalogLocation>,
@@ -3746,9 +7230,8 @@ fn list_projects_in_root(
         String,
         Vec<zap_capabilities::session::CatalogEntry>,
     >::new();
-    let global_ws = global_standalone_workspace();
     for entry in scan.entries {
-        if is_system_temp_dir(&entry.working_dir) || entry.working_dir == global_ws {
+        if is_system_temp_dir(&entry.working_dir) {
             continue;
         }
         if !catalog_entry_is_visible(sessions_root, &entry, active) {
@@ -3839,6 +7322,17 @@ pub struct SessionSummary {
     pub message_count: usize,
     #[serde(default)]
     pub file_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    /// Internal protocol-key lookup only; never exposed on the session wire.
+    #[serde(skip)]
+    pub protocol_key: Option<String>,
 }
 
 fn catalog_scan_in_root(
@@ -3859,6 +7353,12 @@ fn catalog_scan_in_root(
 fn catalog_entry_to_session_summary(
     entry: &zap_capabilities::session::CatalogEntry,
 ) -> SessionSummary {
+    // Catalog entries already carry the four session-scoped config fields, so
+    // the list path does not re-open `<id>.meta` for every row.
+    let preferred_model = entry.preferred_model.clone();
+    // 全局开关优先，其余情况磁盘元数据 > 内存热态（不再回扫会话目录）。
+    let approval_mode =
+        live_api::live_display_approval_mode_wire(&entry.id, entry.approval_mode.as_deref());
     SessionSummary {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -3867,6 +7367,11 @@ fn catalog_entry_to_session_summary(
         updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
         message_count: entry.message_count,
         file_size: 0,
+        approval_mode: Some(approval_mode),
+        preferred_model,
+        reasoning_effort: entry.reasoning_effort.clone(),
+        thinking_budget: entry.thinking_budget,
+        protocol_key: None,
     }
 }
 
@@ -4405,6 +7910,26 @@ async fn resolve_session(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// POST /sessions/:id/seen — 广播「该会话已被用户查看」。
+///
+/// 侧栏的绿色「刚完成」徽标由全局 `activity` 广播点亮；熄灭也必须走同一条
+/// 全局总线，否则只清当前标签页会在其它标签页 / 浏览器上留下幽灵勾。
+/// 本接口不读写会话数据，只发一条跨实例失效信号。
+async fn mark_session_seen(Path(id): Path<String>) -> impl IntoResponse {
+    let session_id = id.trim();
+    if session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "session_id is required" })),
+        )
+            .into_response();
+    }
+    publish_global(GlobalWireEvent::SessionSeen {
+        session_id: session_id.to_string(),
+    });
+    Json(serde_json::json!({ "success": true })).into_response()
+}
+
 /// GET /sessions/by-working-dir?working_dir=/path - List sessions for an explicit working directory
 async fn get_sessions_by_working_dir(
     Query(query): Query<SessionsByWorkingDirQuery>,
@@ -4500,25 +8025,157 @@ async fn get_session_freshness(
     Json(freshness)
 }
 
+const SESSION_DETAIL_WARN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Stable, dependency-free ETag for a JSON response body.
+fn response_etag(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("\"{hash:016x}\"")
+}
+
+fn log_response_size(route: &str, bytes: usize) {
+    tracing::debug!(target: "jeikcode::http", route, bytes, "response_size");
+    if bytes > SESSION_DETAIL_WARN_BYTES {
+        tracing::warn!(target: "jeikcode::http", route, bytes, "large_response_body");
+    }
+}
+
+fn session_detail_response(headers: &HeaderMap, detail: SessionDetail) -> axum::response::Response {
+    let body = match serde_json::to_vec(&detail) {
+        Ok(body) => body,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let etag = response_etag(&body);
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || candidate == etag
+                    || candidate
+                        .strip_prefix("W/")
+                        .is_some_and(|weak| weak == etag)
+            })
+        });
+    if not_modified {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        return response;
+    }
+
+    log_response_size("session_detail", body.len());
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
+fn session_todo_snapshot(session_id: &str) -> (Vec<zap_capabilities::tools::TodoItem>, u64) {
+    // The slot revision survives close/clear. Reading `board.revision` here would
+    // report 0 for every closed board and defeat client-side revision arbitration.
+    zap_capabilities::tools::read_todo_snapshot(session_id)
+}
+
+#[cfg(test)]
+mod session_todo_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn closing_or_clearing_reports_an_empty_snapshot_with_newer_revision() {
+        let session_id = format!("session-todo-close-{}", std::process::id());
+        zap_capabilities::tools::purge_todo_board(&session_id);
+
+        let open = vec![zap_capabilities::tools::TodoItem {
+            id: None,
+            content: "work".into(),
+            status: zap_capabilities::tools::todo::TodoStatus::InProgress,
+        }];
+        let first = zap_capabilities::tools::commit_todo_board(&session_id, &open);
+
+        // In-progress board cannot close yet.
+        assert!(zap_capabilities::tools::close_todo_board_if_complete(&session_id).is_none());
+        assert_eq!(
+            session_todo_snapshot(&session_id),
+            (first.items.clone(), first.revision)
+        );
+
+        let done = vec![zap_capabilities::tools::TodoItem {
+            id: None,
+            content: "work".into(),
+            status: zap_capabilities::tools::todo::TodoStatus::Completed,
+        }];
+        let completed = zap_capabilities::tools::commit_todo_board(&session_id, &done);
+        let closed = zap_capabilities::tools::close_todo_board_if_complete(&session_id)
+            .expect("all-completed board must close");
+
+        // Empty snapshot must be strictly newer than the last non-empty one, or
+        // clients reject it and keep the stale list forever.
+        assert!(closed.revision > completed.revision);
+        assert_eq!(
+            session_todo_snapshot(&session_id),
+            (Vec::new(), closed.revision)
+        );
+
+        // Explicit /todo clear also keeps the watermark visible while empty.
+        zap_capabilities::tools::commit_todo_board(&session_id, &open);
+        zap_capabilities::tools::clear_todo_board(&session_id);
+        let (items, revision) = session_todo_snapshot(&session_id);
+        assert!(items.is_empty());
+        assert!(revision > closed.revision);
+
+        zap_capabilities::tools::purge_todo_board(&session_id);
+    }
+
+    #[test]
+    fn completed_board_read_does_not_settle_or_close_it() {
+        let session_id = format!("session-todo-read-{}", std::process::id());
+        zap_capabilities::tools::purge_todo_board(&session_id);
+        let items = vec![zap_capabilities::tools::TodoItem {
+            id: None,
+            content: "done but not terminal yet".into(),
+            status: zap_capabilities::tools::todo::TodoStatus::Completed,
+        }];
+        let board = zap_capabilities::tools::commit_todo_board(&session_id, &items);
+
+        assert_eq!(
+            session_todo_snapshot(&session_id),
+            (board.items.clone(), board.revision)
+        );
+        assert_eq!(
+            zap_capabilities::tools::read_todo_board(&session_id)
+                .unwrap()
+                .items,
+            board.items
+        );
+        zap_capabilities::tools::purge_todo_board(&session_id);
+    }
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(
     State(state): State<AppState>,
     Path((hash, id)): Path<(String, String)>,
     Query(query): Query<SessionDetailQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
             let _ = crate::native_live::take_session_draft(&id);
-            let messages = match merge_catalog_session_messages_for_display(&session) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    let msg = format!("Failed to load session: {error}");
-                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-                }
-            };
-            let turns = session_user_outline(&messages);
-            let (message_count, offset, messages) = apply_session_message_window(messages, &query);
-            let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
             let turn_running = state
                 .active_chats
                 .active_session_ids()
@@ -4530,10 +8187,288 @@ async fn get_session_detail(
                     .live_turn_session_ids()
                     .iter()
                     .any(|sid| sid == &id);
-            let _ = turn_running;
-            let todos = zap_capabilities::tools::read_todo_board(&id)
-                .map(|board| board.items)
-                .unwrap_or_default();
+            let display_manager =
+                NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&hash));
+            let snapshot_last_turn = session
+                .meta
+                .turn_stats
+                .iter()
+                .filter(|stat| stat.position_valid)
+                .map(|stat| stat.turn_id)
+                .max()
+                .unwrap_or(0);
+            let current_operation = if turn_running {
+                state
+                    .active_chats
+                    .admitted_user_for_session(&id)
+                    .await
+                    .and_then(|user| user.client_input_id)
+            } else {
+                None
+            };
+            // First-paint `tail=N`: use the v4 offset index to seek directly into
+            // the tail. Only for an idle, settled v4 session; running sessions need
+            // the snapshot-tail overlay and keep the full read path.
+            let tail_view = if query.offset.is_none() && query.after_seq.is_none() {
+                query.tail.and_then(|tail| {
+                    read_display_tail_view(
+                        &display_manager,
+                        &session,
+                        tail,
+                        current_operation.as_deref(),
+                        turn_running,
+                        snapshot_last_turn,
+                    )
+                })
+            } else {
+                None
+            };
+            // Prefer the append-only display transcript: it is never compacted,
+            // so it keeps every turn, image, reasoning block and tool card. A log
+            // that is behind the snapshot (failed write / old session) falls back
+            // to the snapshot projection and is backfilled below.
+            let display = if tail_view.is_some() {
+                None
+            } else {
+                read_display_cached(&display_manager, &session.meta.id).filter(|(meta, records)| {
+                    if meta.v == zap_capabilities::session::DISPLAY_VERSION {
+                        // v4 normal path: exact prompt-identity coverage; no text
+                        // reconciliation. A gap (including a dropped tail whose
+                        // turn id was reused after a rewind) falls through to the
+                        // one-time canonical rebuild below.
+                        meta.complete
+                            && v4_display_covers_completed_user_turns(
+                                meta,
+                                &display_record_ids(records),
+                                &session.snapshot.messages,
+                                &session.meta.turn_stats,
+                                snapshot_last_turn,
+                            )
+                    } else {
+                        // v3 is migration input only.
+                        meta.last_turn_id >= snapshot_last_turn
+                            && display_covers_completed_user_rows(
+                                records,
+                                &session.snapshot.messages,
+                                &session.meta.turn_stats,
+                                snapshot_last_turn,
+                            )
+                    }
+                })
+            };
+            let display_is_v4 = display
+                .as_ref()
+                .is_some_and(|(meta, _)| meta.v == zap_capabilities::session::DISPLAY_VERSION);
+            let (turns, message_count, offset, messages, pinned_user_index) = if let Some(view) =
+                tail_view
+            {
+                (
+                    view.turns,
+                    view.message_count,
+                    view.offset,
+                    view.messages,
+                    view.pinned_user_index,
+                )
+            } else if let Some((meta, records)) = display {
+                let elapsed = display_turn_elapsed_overrides(&records, &session.meta.turn_stats);
+                // A hook-created log begins at the first user turn; a backfill
+                // already contains the session-start prefix. Prepend the prefix
+                // only in the former case so indices stay stable across upgrades.
+                let already_prefixed = meta.backfilled
+                    || records.first().is_some_and(|record| {
+                        record.role.eq_ignore_ascii_case("system")
+                            || (record.role.eq_ignore_ascii_case("user") && record.synthetic)
+                    });
+                let prefix = if already_prefixed {
+                    Vec::new()
+                } else {
+                    display_prefix_messages(&session)
+                };
+                let prefix_len = prefix.len();
+
+                // 1. 全会话大纲零开销提取：直接从 DisplayRecord 提炼，确保右栏大纲与 "(13 questions left)" 100% 精确，
+                // 并且无需将整仓几千行无用工具行堆分配转化为 MessageInfo。
+                let mut turns = session_user_outline(&prefix);
+                let record_turns = session_records_user_outline(&records, prefix_len);
+                let turns_offset = turns.len();
+                turns.extend(record_turns.into_iter().map(|mut t| {
+                    t.ordinal += turns_offset;
+                    t
+                }));
+
+                let mut full_messages = prefix;
+                full_messages.extend(records.iter().enumerate().map(|(index, record)| {
+                    let mut message = display_record_to_message_info(record);
+                    if let Some(duration) = elapsed.get(&index) {
+                        message.elapsed_ms = Some(*duration);
+                    }
+                    message
+                }));
+                let snapshot_ids: std::collections::HashSet<&str> = session
+                    .snapshot
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.id.as_deref())
+                    .collect();
+                mark_display_only_archive_rows(
+                    records.as_slice(),
+                    &mut full_messages[prefix_len..],
+                    &snapshot_ids,
+                    snapshot_last_turn,
+                    !turn_running && meta.last_turn_id <= snapshot_last_turn,
+                );
+                // 展示日志在 turn_complete 才落盘。运行中/刚停止/硬杀死的尾巴只存在于
+                // inflight 快照：按最后一条共享 id 之后整段投影，画布与大纲共用
+                // 同一套绝对下标，刷新后与直播看到的完全一致。
+                // The append is idempotent (only rows after the last shared id), so
+                // a fully settled v4 log is untouched; an idle crashed turn (no
+                // completed `turn_stat`, so `v4_display_covers...` cannot see it)
+                // still gets its checkpointed tail back.
+                append_snapshot_tail(
+                    &mut full_messages,
+                    &mut turns,
+                    &session.snapshot.messages,
+                    std::path::Path::new(&session.meta.working_dir),
+                );
+                if !display_is_v4 && !turn_running && !full_messages.is_empty() {
+                    // Lazy v3 -> v4 migration: the current merged projection is
+                    // complete enough to become the v4 source of truth. The next
+                    // read never re-enters this branch.
+                    let records: Vec<_> = full_messages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, message)| {
+                            display_record_from_message_info(&session.meta.id, index, message)
+                        })
+                        .collect();
+                    let _ = display_manager.write_display_backfill(
+                        &session.meta.id,
+                        &records,
+                        snapshot_last_turn,
+                    );
+                }
+                append_streaming_before_pending(
+                    &mut full_messages,
+                    &mut turns,
+                    &session.meta.id,
+                    current_operation.as_deref(),
+                    std::path::Path::new(&session.meta.working_dir),
+                    0,
+                );
+                annotate_client_input_ids(&mut full_messages, &session.meta.id);
+                attach_display_images(
+                    &mut full_messages,
+                    std::path::Path::new(&session.meta.working_dir),
+                    &session.meta.id,
+                );
+                repair_display_clock(&mut full_messages);
+                let (message_count, offset, window, pinned) =
+                    if let Some(after_seq) = query.after_seq {
+                        take_session_after(full_messages, after_seq)
+                    } else {
+                        take_session_page(full_messages, &query)
+                    };
+                (turns, message_count, offset, window, pinned)
+            } else {
+                // v4 missing/incomplete: one-time migration or explicit-mutation
+                // rebuild. This branch writes v4 before returning; a normal
+                // settled session never re-enters it.
+                let mut messages = match merge_catalog_session_messages_for_display(&session) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let msg = format!("Failed to load session: {error}");
+                        return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                    }
+                };
+                // 旧快照可能没有 message id（功能引入前写入）：补确定性 id，
+                // 保证新契约下的右栏锚点 / 编辑 / 删除不退化。
+                mint_legacy_message_ids(&mut messages);
+                // Compaction drains model context from the snapshot, but the raw
+                // transcript is append-only. Rebuild the pre-compaction display
+                // prefix from it so the question rail and canvas never lose turns
+                // after a refresh. Presentation entries already merged into the
+                // list are display-only rows: the splice keeps any that are not
+                // covered by the rebuilt transcript.
+                if let Some(anchor) = messages.iter().position(|message| {
+                    message.role.eq_ignore_ascii_case("user")
+                        && message.synthetic
+                        && zap_capabilities::compaction::is_compaction_anchor_text(
+                            &message.content,
+                        )
+                }) {
+                    if let Some(turns) = load_display_transcript(&hash, &session.meta.id) {
+                        let boundary = messages[anchor + 1..].iter().find(|message| {
+                            message.role.eq_ignore_ascii_case("user") && !message.synthetic
+                        });
+                        let prefix = display_prefix_from_transcript(
+                            &turns,
+                            boundary.and_then(|message| message.created_at),
+                            boundary.map(|message| message.content.as_str()),
+                        );
+                        messages = splice_compacted_display(messages, prefix);
+                    }
+                }
+                // One-time upgrade path for sessions created before the display
+                // log existed. Only settled sessions are materialized so a live
+                // turn is never frozen into the log half-way. If an existing log
+                // is already beyond the readable ceiling, do not rewrite it on
+                // every read (the next read would fail the same way).
+                let display_too_large = display_manager
+                    .display_path(&session.meta.id)
+                    .ok()
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .is_some_and(|metadata| {
+                        metadata.len()
+                            > zap_capabilities::session::display::MAX_DISPLAY_READ_BYTES as u64
+                    });
+                if !turn_running && !messages.is_empty() && !display_too_large {
+                    let records: Vec<_> = messages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, message)| {
+                            display_record_from_message_info(&session.meta.id, index, message)
+                        })
+                        .collect();
+                    let _ = display_manager.write_display_backfill(
+                        &session.meta.id,
+                        &records,
+                        snapshot_last_turn,
+                    );
+                }
+                let mut turns = session_user_outline(&messages);
+                append_streaming_before_pending(
+                    &mut messages,
+                    &mut turns,
+                    &id,
+                    current_operation.as_deref(),
+                    std::path::Path::new(&session.meta.working_dir),
+                    0,
+                );
+                annotate_client_input_ids(&mut messages, &id);
+                repair_display_clock(&mut messages);
+                let (message_count, offset, messages, pinned_user_index) =
+                    if let Some(after_seq) = query.after_seq {
+                        take_session_after(messages, after_seq)
+                    } else {
+                        take_session_page(messages, &query)
+                    };
+                (turns, message_count, offset, messages, pinned_user_index)
+            };
+            let token_usage = session_token_usage_from_session(&session.meta, &session.snapshot);
+            let (todos, todos_revision) = session_todo_snapshot(&id);
+            let cursor = SessionCursor {
+                oldest_seq: messages.iter().find_map(|message| message.seq),
+                total: message_count,
+            };
+            // 大纲单取：右栏唤醒时只需要 turns（每轮提问的标签/序号/seq），
+            // 正文、工具输出、图片一律不传。弱网下把一次大纲刷新从几十 KB
+            // 降到几百字节；`message_count` / `cursor` 仍然保留，客户端可以
+            // 用它做“是否需要拉正文”的对账。
+            let messages = if query.turns_only.unwrap_or(false) {
+                Vec::new()
+            } else {
+                messages
+            };
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
@@ -4541,38 +8476,73 @@ async fn get_session_detail(
                 created_at: u64::try_from(session.meta.created_at.max(0)).unwrap_or(0),
                 updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
                 message_count,
+                revision: session.snapshot.cache_epoch,
+                caps: session_capabilities(),
+                cursor,
                 offset,
+                pinned_user_index,
                 turns,
+                input_cursor: zap_capabilities::session::inputs::cursor_global(&id),
                 messages,
-                preferred_model: session.meta.preferred_model.clone(),
+                preferred_model: session.meta.preferred_model.clone().or_else(|| {
+                    session
+                        .meta
+                        .turn_stats
+                        .iter()
+                        .rev()
+                        .find_map(|s| s.model_usage.first().map(|m| m.provider_id.clone()))
+                }),
+                approval_mode: Some(live_api::live_display_approval_mode_wire(
+                    &id,
+                    session.meta.approval_mode.as_deref(),
+                )),
+                reasoning_effort: session.meta.reasoning_effort.clone(),
+                thinking_budget: session.meta.thinking_budget,
                 token_usage,
                 origin: session.meta.origin,
                 todos,
-                turn_stats: session.meta.turn_stats.clone(),
+                todos_revision,
+                daemon_instance_id: state.daemon_instance_id.to_string(),
             };
-            Json(detail).into_response()
+            session_detail_response(&headers, detail)
         }
         Ok(None) if crate::native_live::is_session_draft(&id) => {
             // OpenCode draft: allocated via POST /sessions but not catalog-persisted yet.
             let working_dir = crate::native_live::session_draft_working_dir(&id)
                 .unwrap_or_else(|| PathBuf::from("."));
             let detail = SessionDetail {
+                cursor: SessionCursor {
+                    oldest_seq: None,
+                    total: 0,
+                },
                 id: id.clone(),
                 name: format!("session-{id}"),
                 working_dir,
                 created_at: 0,
                 updated_at: 0,
                 message_count: 0,
+                revision: 0,
+                caps: session_capabilities(),
                 offset: 0,
+                pinned_user_index: None,
                 turns: Vec::new(),
+                input_cursor: zap_capabilities::session::inputs::cursor_global(&id),
                 messages: Vec::new(),
                 preferred_model: None,
+                approval_mode: Some(
+                    live_api::live_session_approval_mode(Some(&id))
+                        .wire()
+                        .to_string(),
+                ),
+                reasoning_effort: None,
+                thinking_budget: None,
                 token_usage: None,
                 origin: zap_capabilities::session::SessionOrigin::Manual,
                 todos: Vec::new(),
-                turn_stats: Vec::new(),
+                todos_revision: 0,
+                daemon_instance_id: state.daemon_instance_id.to_string(),
             };
-            Json(detail).into_response()
+            session_detail_response(&headers, detail)
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
         Err(e) => {
@@ -4676,8 +8646,14 @@ pub(crate) fn attach_display_images(
     attach_image_sets(messages, sets);
 }
 
+fn is_steer_user_message(msg: &MessageInfo) -> bool {
+    msg.role == "user"
+        && (msg.content.contains("[jeikcode-steer]")
+            || (msg.content.contains("<user-query>") && msg.content.contains("</user-query>")))
+}
+
 fn is_visible_user_turn_start(msg: &MessageInfo) -> bool {
-    msg.role == "user" && !msg.synthetic
+    msg.role == "user" && !msg.synthetic && !is_steer_user_message(msg)
 }
 
 fn is_visible_assistant_reply(msg: &MessageInfo) -> bool {
@@ -4694,6 +8670,11 @@ pub(crate) fn stamp_turn_elapsed_on_last_assistants(
     messages: &mut [MessageInfo],
     turn_stats: &[zap_capabilities::session::TurnStat],
 ) {
+    let total_root_turns = messages
+        .iter()
+        .filter(|m| is_visible_user_turn_start(m))
+        .count();
+    let mut extra_stats = turn_stats.len().saturating_sub(total_root_turns);
     let mut i = 0usize;
     let mut turn_i = 0usize;
     while i < messages.len() {
@@ -4703,27 +8684,44 @@ pub(crate) fn stamp_turn_elapsed_on_last_assistants(
         }
         let user_ts = messages[i].created_at;
         let mut last_asst = None;
+        let mut steer_count = 0usize;
         let mut j = i + 1;
         while j < messages.len() && !is_visible_user_turn_start(&messages[j]) {
+            if is_steer_user_message(&messages[j]) {
+                steer_count += 1;
+            }
             if is_visible_assistant_reply(&messages[j]) {
                 last_asst = Some(j);
             }
             j += 1;
         }
+        let consumed_extra = steer_count.min(extra_stats);
+        extra_stats -= consumed_extra;
+        let stats_for_turn = 1 + consumed_extra;
         if let Some(ai) = last_asst {
             let from_ts = match (user_ts, messages[ai].created_at) {
                 (Some(user), Some(asst)) if asst > user => Some(asst - user),
                 _ => None,
             };
-            let from_stat = turn_stats
-                .get(turn_i)
-                .map(|stat| stat.duration_ms)
-                .filter(|ms| *ms > 0);
-            if let Some(total) = from_stat.or(from_ts) {
+            let slice_end = (turn_i + stats_for_turn).min(turn_stats.len());
+            let from_stat = if turn_i < slice_end {
+                let sum: u64 = turn_stats[turn_i..slice_end]
+                    .iter()
+                    .map(|stat| stat.duration_ms)
+                    .sum();
+                (sum > 0).then_some(sum)
+            } else {
+                None
+            };
+            let total = match (from_stat, from_ts) {
+                (Some(stat_ms), Some(ts_ms)) if steer_count > 0 => Some(stat_ms.max(ts_ms)),
+                (stat_ms, ts_ms) => stat_ms.or(ts_ms),
+            };
+            if let Some(total) = total {
                 messages[ai].elapsed_ms = Some(total);
             }
         }
-        turn_i += 1;
+        turn_i += stats_for_turn;
         i = j;
     }
 }
@@ -4735,7 +8733,23 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     if sets.is_empty() {
         return;
     }
-    let mut next = sets.into_iter();
+    // The sidecar is append-only and holds ALL VL submissions, while the
+    // message list may have lost the oldest placeholder rows to compaction.
+    // Match the TAIL of the sidecar (newest submissions) to the surviving
+    // placeholders; matching from the head would attach an old image to a
+    // newer question.
+    let placeholders = messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .images
+                    .as_ref()
+                    .is_some_and(|images| images.iter().any(|image| image.missing))
+        })
+        .count();
+    let skip = sets.len().saturating_sub(placeholders);
+    let mut next = sets.into_iter().skip(skip);
     for message in messages.iter_mut() {
         let is_missing_placeholder = message.role == "user"
             && message
@@ -4750,6 +8764,860 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
             }
         }
     }
+}
+
+/// The display log is also read on every history page. Keep a small LRU across
+/// sessions so warm-switching does not re-read + re-parse a multi-megabyte JSONL
+/// per page. Both the per-entry and total budgets are bounded.
+const MAX_CACHED_DISPLAY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CACHED_DISPLAY_ENTRIES: usize = 8;
+const MAX_CACHED_DISPLAY_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+struct DisplayLogCacheEntry {
+    key: String,
+    log_mtime: Option<std::time::SystemTime>,
+    log_len: u64,
+    meta_mtime: Option<std::time::SystemTime>,
+    meta_len: u64,
+    meta: zap_capabilities::session::DisplayMeta,
+    records: Arc<Vec<zap_capabilities::session::DisplayRecord>>,
+}
+
+#[derive(Default)]
+struct DisplayLogCache {
+    entries: HashMap<String, DisplayLogCacheEntry>,
+    order: std::collections::VecDeque<String>,
+    total_bytes: u64,
+}
+
+impl DisplayLogCache {
+    fn get(
+        &mut self,
+        key: &str,
+        log_mtime: Option<std::time::SystemTime>,
+        log_len: u64,
+        meta_mtime: Option<std::time::SystemTime>,
+        meta_len: u64,
+    ) -> Option<(
+        zap_capabilities::session::DisplayMeta,
+        Arc<Vec<zap_capabilities::session::DisplayRecord>>,
+    )> {
+        let entry = self.entries.get(key)?;
+        if entry.log_mtime != log_mtime
+            || entry.log_len != log_len
+            || entry.meta_mtime != meta_mtime
+            || entry.meta_len != meta_len
+        {
+            return None;
+        }
+        let meta = entry.meta.clone();
+        let records = entry.records.clone();
+        self.order.retain(|item| item != key);
+        self.order.push_back(key.to_string());
+        Some((meta, records))
+    }
+
+    fn insert(&mut self, entry: DisplayLogCacheEntry) {
+        let key = entry.key.clone();
+        let bytes = entry.log_len.saturating_add(entry.meta_len);
+        if let Some(previous) = self.entries.remove(&key) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(previous.log_len.saturating_add(previous.meta_len));
+        }
+        self.order.retain(|item| item != &key);
+        self.order.push_back(key.clone());
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.entries.insert(key, entry);
+        while self.entries.len() > MAX_CACHED_DISPLAY_ENTRIES
+            || self.total_bytes > MAX_CACHED_DISPLAY_TOTAL_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(evicted.log_len.saturating_add(evicted.meta_len));
+            }
+        }
+    }
+}
+
+fn display_log_cache() -> &'static std::sync::Mutex<DisplayLogCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DisplayLogCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(DisplayLogCache::default()))
+}
+
+/// Read a complete display log with an mtime+length guarded cache. The log is
+/// append-only; both the log and its meta sidecar are part of the fingerprint,
+/// so a new turn (or a backfill/invalidation) misses the cache immediately.
+fn read_display_cached(
+    manager: &NativeSessionManager,
+    id: &str,
+) -> Option<(
+    zap_capabilities::session::DisplayMeta,
+    Arc<Vec<zap_capabilities::session::DisplayRecord>>,
+)> {
+    read_display_with_cache(manager, id, display_log_cache())
+}
+
+fn read_display_with_cache(
+    manager: &NativeSessionManager,
+    id: &str,
+    cache: &std::sync::Mutex<DisplayLogCache>,
+) -> Option<(
+    zap_capabilities::session::DisplayMeta,
+    Arc<Vec<zap_capabilities::session::DisplayRecord>>,
+)> {
+    let log_path = manager.display_path(id).ok()?;
+    let meta_path = manager.display_meta_path(id).ok()?;
+    let log_metadata = std::fs::metadata(&log_path).ok()?;
+    let meta_metadata = std::fs::metadata(&meta_path).ok()?;
+    let log_mtime = log_metadata.modified().ok();
+    let meta_mtime = meta_metadata.modified().ok();
+    let log_len = log_metadata.len();
+    let meta_len = meta_metadata.len();
+    let key = log_path.to_string_lossy().into_owned();
+
+    // Do not cache an oversized log: the read itself is the memory risk.
+    if log_len > MAX_CACHED_DISPLAY_BYTES {
+        return manager
+            .read_display(id)
+            .ok()
+            .flatten()
+            .map(|(meta, records)| (meta, Arc::new(records)));
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key, log_mtime, log_len, meta_mtime, meta_len) {
+            return Some(hit);
+        }
+    }
+
+    let (meta, records) = manager.read_display(id).ok().flatten()?;
+    let records = Arc::new(records);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(DisplayLogCacheEntry {
+            key,
+            log_mtime,
+            log_len,
+            meta_mtime,
+            meta_len,
+            meta: meta.clone(),
+            records: records.clone(),
+        });
+    }
+    Some((meta, records))
+}
+
+/// Single-entry cache for the parsed raw transcript. `getSession` is called on
+/// every history page (48 rows) and by background reconciliation, so re-reading
+/// a multi-megabyte JSONL each time would stall the timeline. The fingerprint
+/// (mtime + length) invalidates the entry as soon as a turn is flushed.
+struct DisplayTranscriptCache {
+    key: String,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    turns: Arc<Vec<zap_capabilities::session::TurnRecord>>,
+}
+
+fn display_transcript_cache() -> &'static std::sync::Mutex<Option<DisplayTranscriptCache>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<DisplayTranscriptCache>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Read the append-only transcript for display reconstruction, with a
+/// fingerprint-guarded single-entry cache. `None` means the transcript cannot
+/// be read (no file / corrupt); callers then keep the snapshot-only projection.
+fn load_display_transcript(
+    project_hash: &str,
+    id: &str,
+) -> Option<Arc<Vec<zap_capabilities::session::TurnRecord>>> {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_hash));
+    let path = manager.jsonl_path(id).ok()?;
+    let metadata = std::fs::metadata(&path).ok();
+    let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
+    let len = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let key = format!("{project_hash}/{id}");
+
+    let mut guard = display_transcript_cache().lock().ok()?;
+    if let Some(cache) = guard.as_ref() {
+        if cache.key == key && cache.mtime == mtime && cache.len == len {
+            return Some(cache.turns.clone());
+        }
+    }
+    let turns = Arc::new(manager.read_transcript_turns(id).ok()?);
+    *guard = Some(DisplayTranscriptCache {
+        key,
+        mtime,
+        len,
+        turns: turns.clone(),
+    });
+    Some(turns)
+}
+
+fn normalized_display_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Rebuild display rows for every transcript turn before `boundary`. The raw
+/// transcript is never compacted; this is the authoritative pre-compaction
+/// display history. Timestamps are intentionally omitted for user rows because
+/// `TurnRecord.ts` is the turn's FLUSH time, not the prompt time.
+fn display_prefix_from_transcript(
+    turns: &[zap_capabilities::session::TurnRecord],
+    boundary_ts: Option<u64>,
+    boundary_user: Option<&str>,
+) -> Vec<MessageInfo> {
+    let boundary_text = boundary_user.map(normalized_display_text);
+    let split = turns
+        .iter()
+        .position(|turn| match boundary_ts {
+            Some(ts) if ts > 0 => u64::try_from(turn.ts).map(|t| t >= ts).unwrap_or(false),
+            _ => boundary_text
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .is_some_and(|text| {
+                    let user = normalized_display_text(&turn.user);
+                    !user.is_empty() && (text.starts_with(&user) || user.starts_with(text))
+                }),
+        })
+        .unwrap_or(turns.len());
+
+    const ID_PREFIX: &str = "transcript";
+    // Display-only reconstruction: these rows have no kernel counterpart, so
+    // mutation APIs (edit/delete/regenerate by array index) must stay disabled.
+    const DISPLAY_ORIGIN: &str = "transcript_archive";
+    let mut rows = Vec::new();
+    for turn in &turns[..split] {
+        if !turn.user.trim().is_empty() {
+            rows.push(message_info! {
+                seq: None,
+                turn_id: (turn.turn_id > 0).then_some(turn.turn_id),
+                role: "user".into(),
+                id: Some(format!("{ID_PREFIX}-{}-user", turn.turn_id)),
+                content: turn.user.clone(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: Some(DISPLAY_ORIGIN.into()),
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: None,
+                elapsed_ms: None,
+            });
+        }
+        let calls: Vec<ToolCallInfo> = turn
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| ToolCallInfo {
+                id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
+                name: tool.name.clone(),
+                arguments: tool.args.clone(),
+                display: format_tool_args(&tool.name, &tool.args),
+            })
+            .collect();
+        let has_tools = !calls.is_empty();
+        let has_text = !turn.assistant.trim().is_empty();
+        let has_reasoning = !turn.reasoning.trim().is_empty();
+        if !has_tools && !has_text && !has_reasoning {
+            continue;
+        }
+        if has_tools {
+            // Phase 1: Tool execution message (thinking + tool calls)
+            rows.push(message_info! {
+                seq: None,
+                turn_id: (turn.turn_id > 0).then_some(turn.turn_id),
+                role: "assistant".into(),
+                id: Some(format!("{ID_PREFIX}-{}-assistant-tools", turn.turn_id)),
+                content: String::new(),
+                reasoning: has_reasoning.then(|| turn.reasoning.clone()),
+                synthetic: false,
+                internal_origin: Some(DISPLAY_ORIGIN.into()),
+                tool_calls: Some(calls),
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: u64::try_from(turn.ts).ok(),
+                elapsed_ms: None,
+            });
+            for (index, tool) in turn.tools.iter().enumerate() {
+                rows.push(message_info! {
+                    seq: None,
+                    turn_id: (turn.turn_id > 0).then_some(turn.turn_id),
+                    role: "tool".into(),
+                    id: Some(format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id)),
+                    content: tool.result.clone(),
+                    reasoning: None,
+                    synthetic: false,
+                    internal_origin: Some(DISPLAY_ORIGIN.into()),
+                    tool_calls: None,
+                    tool_result: Some(ToolResultInfo {
+                        call_id: format!("{ID_PREFIX}-{}-tool-{index}", turn.turn_id),
+                        success: !tool.is_error,
+                        summary: tool_result_summary(&tool.result),
+                        line_count: tool.result.lines().count(),
+                    }),
+                    artifacts: None,
+                    images: None,
+                    created_at: u64::try_from(turn.ts).ok(),
+                    elapsed_ms: None,
+                });
+            }
+            // Phase 2: Final reply message (concluding answer text)
+            if has_text {
+                rows.push(message_info! {
+                    seq: None,
+                    turn_id: (turn.turn_id > 0).then_some(turn.turn_id),
+                    role: "assistant".into(),
+                    id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
+                    content: turn.assistant.clone(),
+                    reasoning: None,
+                    synthetic: false,
+                    internal_origin: Some(DISPLAY_ORIGIN.into()),
+                    tool_calls: None,
+                    tool_result: None,
+                    artifacts: None,
+                    images: None,
+                    created_at: u64::try_from(turn.ts).ok(),
+                    elapsed_ms: None,
+                });
+            }
+        } else {
+            rows.push(message_info! {
+                seq: None,
+                turn_id: (turn.turn_id > 0).then_some(turn.turn_id),
+                role: "assistant".into(),
+                id: Some(format!("{ID_PREFIX}-{}-assistant", turn.turn_id)),
+                content: turn.assistant.clone(),
+                reasoning: has_reasoning.then(|| turn.reasoning.clone()),
+                synthetic: false,
+                internal_origin: Some(DISPLAY_ORIGIN.into()),
+                tool_calls: None,
+                tool_result: None,
+                artifacts: None,
+                images: None,
+                created_at: u64::try_from(turn.ts).ok(),
+                elapsed_ms: None,
+            });
+        }
+    }
+    rows
+}
+
+/// Splice the transcript-rebuilt prefix ahead of the snapshot's retained tail.
+/// The compaction anchor itself is model context, not a display row; the real
+/// rows before it are covered by the transcript and are dropped to avoid a
+/// duplicate "你好啊". Invisible scaffolding and display-only presentation rows
+/// are preserved. Tool rows before the anchor are always covered by the prefix.
+fn splice_compacted_display(
+    mut messages: Vec<MessageInfo>,
+    prefix: Vec<MessageInfo>,
+) -> Vec<MessageInfo> {
+    if prefix.is_empty() {
+        return messages;
+    }
+    let Some(anchor) = messages.iter().position(|m| {
+        m.role.eq_ignore_ascii_case("user")
+            && m.synthetic
+            && zap_capabilities::compaction::is_compaction_anchor_text(&m.content)
+    }) else {
+        return messages;
+    };
+
+    let prefix_users: Vec<String> = prefix
+        .iter()
+        .filter(|m| m.role.eq_ignore_ascii_case("user"))
+        .map(|m| m.content.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+    let prefix_assistants: Vec<String> = prefix
+        .iter()
+        .filter(|m| m.role.eq_ignore_ascii_case("assistant"))
+        .map(|m| m.content.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    let (head, rest) = messages.split_at(anchor);
+    let tail = rest.get(1..).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(prefix.len() + head.len() + tail.len());
+    out.extend(prefix);
+    for message in head {
+        if message.role.eq_ignore_ascii_case("system") || message.synthetic {
+            out.push(message.clone());
+            continue;
+        }
+        let text = message.content.trim();
+        if message.role.eq_ignore_ascii_case("user")
+            && prefix_users.iter().any(|prefix_text| {
+                !prefix_text.is_empty()
+                    && (text.starts_with(prefix_text.as_str()) || prefix_text.starts_with(text))
+            })
+        {
+            continue;
+        }
+        if message.role.eq_ignore_ascii_case("assistant")
+            && prefix_assistants
+                .iter()
+                .any(|prefix_text| prefix_text == text)
+        {
+            continue;
+        }
+        if message.role.eq_ignore_ascii_case("tool") {
+            continue;
+        }
+        out.push(message.clone());
+    }
+    out.extend(tail.iter().cloned());
+    out
+}
+
+/// Full agent-loop duration for each turn's last assistant display record.
+/// Compaction preserves full turn durations only for the recent turn stats;
+/// older turns keep their per-round `MessageMeta.elapsed_ms`. Returns an index
+/// map instead of mutating the cached display records.
+fn display_turn_elapsed_overrides(
+    records: &[zap_capabilities::session::DisplayRecord],
+    stats: &[zap_capabilities::session::TurnStat],
+) -> std::collections::HashMap<usize, u64> {
+    use std::collections::HashMap;
+    let durations: HashMap<u64, u64> = stats
+        .iter()
+        .filter(|stat| stat.position_valid && stat.turn_id != 0 && stat.duration_ms > 0)
+        .map(|stat| (stat.turn_id, stat.duration_ms))
+        .collect();
+    let mut last_assistant: HashMap<u64, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.role.eq_ignore_ascii_case("assistant") && record.turn_id != 0 {
+            last_assistant.insert(record.turn_id, index);
+        }
+    }
+    last_assistant
+        .into_iter()
+        .filter_map(|(turn_id, index)| durations.get(&turn_id).map(|duration| (index, *duration)))
+        .collect()
+}
+
+/// The invisible session-start prefix (system prompts + synthetic instructions)
+/// that precedes the first real user turn. A hook-created display log starts at
+/// that user, so the read path prepends this prefix to keep `sourceIndex` aligned
+/// with the snapshot fallback (old caches, right-rail indices, jump anchors).
+fn display_prefix_messages(
+    session: &crate::legacy_convert::CatalogSessionView,
+) -> Vec<MessageInfo> {
+    let working_dir = std::path::Path::new(&session.meta.working_dir);
+    let mut out = Vec::new();
+    for message in &session.snapshot.messages {
+        if message.role == zap_kernel::message::Role::User && !message.synthetic {
+            break;
+        }
+        out.push(MessageInfo::from_kernel_in(message, Some(working_dir)));
+    }
+    mint_legacy_message_ids(&mut out);
+    out
+}
+
+/// 跨版本兼容：旧日志（id 字段引入前写入）可能没有 `id`。读取时铸造一个
+/// **确定性** id：`m-<turn_id>-<index>`。它稳定、可重复，且永远不会与内核
+/// `m-<uuid>` 撞车；于是历史会话无需重写日志就能被新架构按 id 寻址。
+fn display_record_identity(record: &zap_capabilities::session::DisplayRecord) -> String {
+    record
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("m-{}-{}", record.turn_id, record.index))
+}
+
+/// 给没有 id 的旧快照行补确定性 id，保证右栏/编辑/删除在新契约下仍可用。
+fn mint_legacy_message_ids(messages: &mut [MessageInfo]) {
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.id.is_none() {
+            message.id = Some(format!("m-legacy-{index}"));
+        }
+    }
+}
+
+/// Convert one display-log record to the API shape the WebUI/TUI already render.
+fn display_record_to_message_info(
+    record: &zap_capabilities::session::DisplayRecord,
+) -> MessageInfo {
+    let mut content = record.content.clone();
+    let mut images = (!record.images.is_empty()).then(|| {
+        record
+            .images
+            .iter()
+            .map(|image| ImageData {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+                missing: image.missing,
+            })
+            .collect::<Vec<_>>()
+    });
+    if record.role.eq_ignore_ascii_case("user") {
+        let (display, had_vision_marker) = strip_vision_marker(&content);
+        if had_vision_marker {
+            content = display;
+            if images.is_none() {
+                images = Some(vec![ImageData::missing_placeholder()]);
+            }
+        }
+    }
+    let tool_calls = (!record.tool_calls.is_empty()).then(|| {
+        record
+            .tool_calls
+            .iter()
+            .map(|call| ToolCallInfo {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                display: format_tool_args(&call.name, &call.arguments),
+            })
+            .collect::<Vec<_>>()
+    });
+    let tool_result = record
+        .role
+        .eq_ignore_ascii_case("tool")
+        .then(|| ToolResultInfo {
+            call_id: record.tool_call_id.clone().unwrap_or_default(),
+            success: !record.is_error,
+            summary: tool_result_summary(&record.content),
+            line_count: record.content.lines().count(),
+        });
+    let artifacts = extract_artifacts_from_call_fields(
+        record
+            .tool_calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.arguments.as_str())),
+    );
+    let display_text = record
+        .role
+        .eq_ignore_ascii_case("user")
+        .then(|| content.clone());
+    let internal = record.synthetic || record.internal_origin.as_deref() == Some("verify_cadence");
+    let editable = record.role.eq_ignore_ascii_case("user").then(|| {
+        !record.synthetic
+            && !matches!(
+                record.internal_origin.as_deref(),
+                Some("transcript_archive") | Some("presentation") | Some("pending_input")
+            )
+    });
+    message_info! {
+        turn_id: (record.turn_id > 0).then_some(record.turn_id),
+        seq: (record.seq > 0).then_some(record.seq),
+        role: record.role.clone(),
+        id: Some(display_record_identity(record)),
+        content,
+        reasoning: record.reasoning.clone(),
+        synthetic: record.synthetic,
+        internal_origin: record.internal_origin.clone(),
+        display_text,
+        internal: Some(internal),
+        editable,
+        tool_calls,
+        tool_result,
+        artifacts,
+        images,
+        created_at: record.created_at,
+        elapsed_ms: record.elapsed_ms,
+    }
+}
+
+/// Attach the durable client-input id to user rows. A steer has two identities:
+/// the client-minted `SessionInput.id` and the kernel `message_id`; the display
+/// log only persists the latter, so after a reload a queue card carrying the
+/// former could not be recognized as already folded. The durable input ledger
+/// is the single source for this mapping; no text matching is needed.
+fn client_input_identity_map(
+    inputs: impl IntoIterator<Item = zap_capabilities::session::SessionInput>,
+) -> std::collections::HashMap<String, String> {
+    let mut by_message: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for input in inputs {
+        let input_id = input.id;
+        // A promoted input has both ids; an admitted one may already be keyed
+        // by its client id when it is rendered as a pending row.
+        by_message.insert(input_id.clone(), input_id.clone());
+        if let Some(message_id) = input.message_id.filter(|id| !id.trim().is_empty()) {
+            by_message.insert(message_id, input_id);
+        }
+    }
+    by_message
+}
+
+fn annotate_client_input_ids_with(
+    messages: &mut [MessageInfo],
+    by_message: &std::collections::HashMap<String, String>,
+) {
+    if by_message.is_empty() {
+        return;
+    }
+    for message in messages {
+        if !message.role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        let Some(id) = message.id.as_deref() else {
+            continue;
+        };
+        if let Some(client_input_id) = by_message.get(id) {
+            message.client_input_id = Some(client_input_id.clone());
+        }
+    }
+}
+
+fn annotate_client_input_ids(messages: &mut [MessageInfo], session_id: &str) {
+    let inputs = zap_capabilities::session::inputs::list_global(session_id);
+    let by_message = client_input_identity_map(inputs);
+    annotate_client_input_ids_with(messages, &by_message);
+}
+
+/// Mark display-log rows that no longer exist in the kernel snapshot as
+/// display-only/read-only. Compaction drains model context while the display
+/// log stays append-only; editing such a row by id would return "message not
+/// found". The WebUI already renders `transcript_archive` rows as read-only.
+fn mark_display_only_archive_rows(
+    records: &[zap_capabilities::session::DisplayRecord],
+    messages: &mut [MessageInfo],
+    snapshot_ids: &std::collections::HashSet<&str>,
+    persisted_last_turn: u64,
+    mark_latest: bool,
+) {
+    for (record, message) in records.iter().zip(messages.iter_mut()) {
+        // A turn beyond the persisted boundary is ahead of the snapshot; the
+        // latest turn may also race a snapshot save. Only mark it when the
+        // caller has proved the session is idle and the log is not ahead.
+        if record.turn_id > persisted_last_turn {
+            continue;
+        }
+        if record.turn_id == persisted_last_turn && !mark_latest {
+            continue;
+        }
+        if message.internal_origin.is_some() {
+            continue;
+        }
+        let Some(id) = message.id.as_deref() else {
+            continue;
+        };
+        if !snapshot_ids.contains(id) {
+            message.internal_origin = Some("transcript_archive".to_string());
+        }
+    }
+}
+
+/// Project an already-computed fallback display list into the append-only log.
+/// Used once for old sessions; future turns are written by `DisplayHook`.
+fn display_record_from_message_info(
+    session_id: &str,
+    index: usize,
+    message: &MessageInfo,
+) -> zap_capabilities::session::DisplayRecord {
+    zap_capabilities::session::DisplayRecord {
+        v: zap_capabilities::session::DISPLAY_VERSION,
+        session_id: session_id.to_string(),
+        // Carry the kernel turn identity when the source row knows it (snapshot
+        // meta / live display rows). Legacy rows without it stay 0; the WebUI
+        // then falls back to steer-root penetration for the timer boundary.
+        turn_id: message.turn_id.unwrap_or(0),
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        seq: message.seq.unwrap_or(0),
+        role: message.role.clone(),
+        id: message.id.clone().or_else(|| {
+            if message.internal_origin.as_deref() == Some("turn_diagnostic") {
+                Some(format!("diag-{}", uuid::Uuid::new_v4()))
+            } else if message.role == "system" {
+                Some(format!("sys-{}", uuid::Uuid::new_v4()))
+            } else {
+                Some(format!("msg-{}", uuid::Uuid::new_v4()))
+            }
+        }),
+        content: message.content.clone(),
+        reasoning: message.reasoning.clone(),
+        synthetic: message.synthetic,
+        internal_origin: message.internal_origin.clone(),
+        tool_calls: message
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| zap_capabilities::session::DisplayToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tool_call_id: message
+            .tool_result
+            .as_ref()
+            .map(|result| result.call_id.clone()),
+        is_error: message
+            .tool_result
+            .as_ref()
+            .is_some_and(|result| !result.success),
+        images: message
+            .images
+            .as_ref()
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| zap_capabilities::session::DisplayImage {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                        missing: image.missing,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        created_at: message.created_at,
+        elapsed_ms: message.elapsed_ms,
+    }
+}
+
+pub(crate) enum DisplayMutation<'a> {
+    Patch {
+        target_id: Option<&'a str>,
+        text: &'a str,
+        images: &'a [ImageData],
+        truncate_after: bool,
+    },
+    Truncate {
+        target_id: Option<&'a str>,
+        inclusive: bool,
+    },
+    Delete {
+        target_id: Option<&'a str>,
+        delete_turn: bool,
+    },
+}
+
+/// Rewrite the v4 log in place for an explicit mutation, preserving every row
+/// before the target (including display-only/presentation rows that are absent
+/// from the model snapshot). Falls back to invalidation + canonical rebuild only
+/// when the v4 log or the target identity is unavailable.
+pub(crate) fn rewrite_display_for_mutation(
+    manager: &NativeSessionManager,
+    id: &str,
+    mutation: DisplayMutation<'_>,
+    last_turn_id: u64,
+    completed_turns: &[u64],
+) -> bool {
+    let Some((_meta, mut records)) = manager.read_display(id).ok().flatten() else {
+        return false;
+    };
+    let target_id = match &mutation {
+        DisplayMutation::Patch { target_id, .. }
+        | DisplayMutation::Truncate { target_id, .. }
+        | DisplayMutation::Delete { target_id, .. } => *target_id,
+    };
+    let Some(target_id) = target_id else {
+        return false;
+    };
+    let Some(idx) = records
+        .iter()
+        .position(|record| record.id.as_deref() == Some(target_id))
+    else {
+        return false;
+    };
+    match mutation {
+        DisplayMutation::Patch {
+            text,
+            images,
+            truncate_after,
+            ..
+        } => {
+            if truncate_after {
+                let target_turn = records[idx].turn_id;
+                let presentation_tail: Vec<_> = records[idx + 1..]
+                    .iter()
+                    .filter(|record| {
+                        record.turn_id == target_turn
+                            && record.internal_origin.as_deref() == Some("presentation")
+                    })
+                    .cloned()
+                    .collect();
+                records.truncate(idx + 1);
+                records.extend(presentation_tail);
+            }
+            if let Some(record) = records.get_mut(idx) {
+                record.content = text.to_string();
+                record.images = images
+                    .iter()
+                    .map(|image| zap_capabilities::session::DisplayImage {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                        missing: image.missing,
+                    })
+                    .collect();
+            }
+        }
+        DisplayMutation::Truncate { inclusive, .. } => {
+            // `inclusive=false` means “remove the target and everything after it”;
+            // keep ends at the target. `inclusive=true` keeps the target itself.
+            let keep = if inclusive { idx + 1 } else { idx };
+            let target_turn = records[idx].turn_id;
+            // Presentation-only rows belong to the turn; keep them only when the
+            // target row itself survives (inclusive truncate). An exclusive
+            // rewind removes the whole target turn, including its display rows.
+            let presentation_tail: Vec<_> = if inclusive {
+                records[keep..]
+                    .iter()
+                    .filter(|record| {
+                        record.turn_id == target_turn
+                            && record.internal_origin.as_deref() == Some("presentation")
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            records.truncate(keep);
+            records.extend(presentation_tail);
+        }
+        DisplayMutation::Delete { delete_turn, .. } => {
+            let is_user = records[idx].role.eq_ignore_ascii_case("user");
+            if delete_turn {
+                let end = records
+                    .iter()
+                    .enumerate()
+                    .skip(idx + 1)
+                    .find(|(_, record)| {
+                        record.role.eq_ignore_ascii_case("user") && !record.synthetic
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(records.len());
+                records.drain(idx..end);
+            } else if !is_user {
+                // Assistant/tool delete keeps the preceding user row and removes
+                // the whole agent run up to the next user turn.
+                let start = records[..idx]
+                    .iter()
+                    .rposition(|record| record.role.eq_ignore_ascii_case("user"))
+                    .map(|position| position + 1)
+                    .unwrap_or(0);
+                let end = records
+                    .iter()
+                    .enumerate()
+                    .skip(idx + 1)
+                    .find(|(_, record)| {
+                        record.role.eq_ignore_ascii_case("user") && !record.synthetic
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(records.len());
+                records.drain(start..end);
+            } else {
+                records.remove(idx);
+            }
+        }
+    }
+    manager
+        .rewrite_display_rows(id, &records, last_turn_id, completed_turns, false)
+        .is_ok()
 }
 
 fn merge_catalog_session_messages_for_display(
@@ -4783,7 +9651,6 @@ fn merge_catalog_session_messages_for_display(
         };
         presentation.entry(after_message).or_default().push(entry);
     }
-    let timestamp = Some(u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0));
     let working_dir = std::path::Path::new(&session.meta.working_dir);
     let mut messages =
         Vec::with_capacity(runtime_messages.len() + session.presentation.entries.len());
@@ -4799,7 +9666,9 @@ fn merge_catalog_session_messages_for_display(
             if zap_capabilities::reminder::is_system_reminder(&entry.text) {
                 continue;
             }
-            messages.push(MessageInfo {
+            messages.push(message_info! {
+                turn_id: None,
+                seq: None,
                 role: match entry.role {
                     PresentationRole::User => "user",
                     PresentationRole::Assistant => "assistant",
@@ -4809,22 +9678,19 @@ fn merge_catalog_session_messages_for_display(
                 content: unwrap_presentation_text(entry.role, &entry.text),
                 reasoning: None,
                 synthetic: false,
-                internal_origin: None,
+                internal_origin: Some("presentation".into()),
                 tool_calls: None,
                 tool_result: None,
                 artifacts: None,
                 images: None,
-                created_at: timestamp,
+                created_at: None,
                 elapsed_ms: None,
             });
         }
     };
     append_presentation(0, &mut messages);
     for (index, message) in runtime_messages.into_iter().enumerate() {
-        let mut info = MessageInfo::from_kernel_in(message, Some(working_dir));
-        if info.created_at.is_none() {
-            info.created_at = timestamp;
-        }
+        let info = MessageInfo::from_kernel_in(message, Some(working_dir));
         messages.push(info);
         append_presentation(index + 1, &mut messages);
     }
@@ -4833,7 +9699,9 @@ fn merge_catalog_session_messages_for_display(
             if zap_capabilities::reminder::is_system_reminder(&entry.text) {
                 continue;
             }
-            messages.push(MessageInfo {
+            messages.push(message_info! {
+                turn_id: None,
+                seq: None,
                 role: match entry.role {
                     PresentationRole::User => "user",
                     PresentationRole::Assistant => "assistant",
@@ -4843,16 +9711,23 @@ fn merge_catalog_session_messages_for_display(
                 content: unwrap_presentation_text(entry.role, &entry.text),
                 reasoning: None,
                 synthetic: false,
-                internal_origin: None,
+                internal_origin: Some("presentation".into()),
                 tool_calls: None,
                 tool_result: None,
                 artifacts: None,
                 images: None,
-                created_at: timestamp,
+                created_at: None,
                 elapsed_ms: None,
             });
         }
     }
+    // 缺时间的行（tool 结果 / system / 展示条目）继承**上一条**已知时间，
+    // 绝不能拿会话 `updated_at`（≈ 现在）当戳：那会让这些行声称比它后面的
+    // 助手正文更晚发布，界面就会出现“最后一次回复的时间比上一次还早”的倒流。
+    fill_missing_display_clock(
+        &mut messages,
+        u64::try_from(session.meta.created_at.max(0)).unwrap_or(0),
+    );
     // Re-attach display-only images (VL-preprocessed originals) stashed out of band, so a
     // reloaded session shows the thumbnail instead of the "missing image" placeholder.
     attach_display_images(
@@ -4862,6 +9737,45 @@ fn merge_catalog_session_messages_for_display(
     );
     stamp_turn_elapsed_on_last_assistants(&mut messages, &session.meta.turn_stats);
     Ok(messages)
+}
+
+/// 按行序补齐缺失的展示时间戳：缺时间的行继承**上一条**已知时间。
+///
+/// 行序就是时间序，所以继承前一条是安全的；用会话 `updated_at`（≈ 写入时刻）
+/// 补洞则会让旧行的时刻晚于它后面的正文，界面上表现为时间倒流。
+fn fill_missing_display_clock(messages: &mut [MessageInfo], seed: u64) {
+    let mut clock = seed;
+    for message in messages.iter_mut() {
+        match message.created_at {
+            Some(ts) => clock = ts,
+            None => message.created_at = Some(clock),
+        }
+    }
+}
+
+/// 展示时间戳校准：把旧版本已落盘、比下一行还晚的伪造时间拉回行序。
+///
+/// 转录行序本身就是时间序，所以只做「向下拉平」：一个比下一行更晚的时刻只可能
+/// 来自旧版本用会话 `updated_at` 补洞的伪造值（注入提示的 user 行也会命中）。
+fn repair_display_clock(messages: &mut [MessageInfo]) {
+    let mut next_known: Option<u64> = None;
+    for message in messages.iter_mut().rev() {
+        match message.created_at {
+            Some(ts) => {
+                let repaired = match next_known {
+                    Some(next) if ts > next => next,
+                    _ => ts,
+                };
+                message.created_at = Some(repaired);
+                next_known = Some(repaired);
+            }
+            None => {
+                if let Some(next) = next_known {
+                    message.created_at = Some(next);
+                }
+            }
+        }
+    }
 }
 
 /// GET /sessions - List all sessions across all projects
@@ -4882,12 +9796,11 @@ async fn create_session(
 ) -> impl IntoResponse {
     // Determine working directory
     let mut working_dir = match req.working_dir {
-        Some(dir) if !dir.as_os_str().is_empty() && dir.to_string_lossy() != "__global__" => {
+        Some(dir) => {
             let mut proj = state.project.write().await;
             update_project_state(&mut proj, &dir);
             dir
         }
-        Some(_) => global_standalone_workspace(),
         None => {
             // Use current project's working directory
             let project = state.project.read().await;
@@ -4962,10 +9875,22 @@ async fn append_session_messages(
     }
 
     let project_hash = response_project_hash(&working_dir);
+    let client_request_id = req
+        .client_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| {
+            !key.is_empty()
+                && key.len() <= 128
+                && key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        });
     let message_count = match crate::legacy_convert::append_catalog_presentation_in_project(
         &project_hash,
         &session_id,
         &messages,
+        client_request_id,
     ) {
         Ok(count) => count,
         Err(error) => {
@@ -4973,6 +9898,9 @@ async fn append_session_messages(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
         }
     };
+
+    // The manager writes UI-only presentation rows into the v4 display log at
+    // the anchor turn (or invalidates it itself when the anchor is legacy).
 
     let response = AppendSessionMessagesResponse {
         success: true,
@@ -5388,8 +10316,13 @@ async fn delete_session(
                 .await;
         match deleted {
             Ok(Ok(())) => {
+                // Global sidecars are session-id keyed and are not under the
+                // project bucket; delete them with the session.
+                zap_capabilities::session::inputs::clear_global(&id);
+                zap_capabilities::session::partial::clear_global(&id);
                 let working_dir = state_clone.project.read().await.working_dir.clone();
                 let id_for_cleanup = id.clone();
+                let active_chats_cleanup = state_clone.active_chats.clone();
                 // Session files are already gone. Reap MCP, kill session background tasks,
                 // and clean up session background log files asynchronously.
                 tokio::spawn(async move {
@@ -5405,6 +10338,9 @@ async fn delete_session(
 
                     // Release session-scoped approval mode override
                     crate::live_api::live_clear_session_approval_mode(&id_for_cleanup);
+
+                    // Clean up active chat registry state (session seq, terminal frames, standby watchers)
+                    active_chats_cleanup.clear_session(&id_for_cleanup).await;
                 });
                 state_clone.telemetry.track(Event::UseCommand {
                     type_: "delete_session".into(),
@@ -5510,6 +10446,11 @@ pub struct PatchMessageRequest {
     pub expected_message_id: Option<String>,
     #[serde(default)]
     pub expected_role: Option<String>,
+    /// Edit = rewrite the turn: after applying the new text, remove every
+    /// message after the edited row from the model context and every
+    /// downstream projection. Defaults to false for legacy clients.
+    #[serde(default)]
+    pub truncate_after: Option<bool>,
 }
 
 /// Query parameters for deleting a session message
@@ -5576,7 +10517,23 @@ fn resolve_target_message_index(
     target_index: usize,
     expected_text: Option<&str>,
     expected_role: Option<&str>,
+    expected_message_id: Option<&str>,
 ) -> Option<usize> {
+    // The display list and the kernel snapshot are different coordinate
+    // systems: compaction, filtered system rows and reconstructed prefix rows
+    // make `sourceIndex` differ from the snapshot array index. A persisted
+    // message id is the only unambiguous identity. If the caller supplied one
+    // but it is gone (stale view), fail closed instead of fuzzy-matching and
+    // editing the wrong neighbour.
+    if let Some(id) = expected_message_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return messages
+            .iter()
+            .position(|message| message.id.as_deref() == Some(id));
+    }
+
     let role_matches = |role: &zap_kernel::message::Role| -> bool {
         expected_role.map_or(true, |r| match role {
             zap_kernel::message::Role::System => r.eq_ignore_ascii_case("system"),
@@ -5717,6 +10674,33 @@ fn resolve_target_message_index(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SessionInputsQuery {
+    #[serde(default)]
+    after_seq: u64,
+}
+
+/// GET /projects/:hash/sessions/:id/inputs?after_seq=N
+///
+/// Durable prompt/steer admission rows. The session detail already projects
+/// pending rows onto the canvas/rail; this endpoint is the `after_seq` delta
+/// for reconnecting clients (no full transcript reload).
+async fn get_session_inputs(
+    Path((_hash, id)): Path<(String, String)>,
+    Query(query): Query<SessionInputsQuery>,
+) -> impl IntoResponse {
+    let cursor = zap_capabilities::session::inputs::cursor_global(&id);
+    let inputs: Vec<_> = zap_capabilities::session::inputs::list_global(&id)
+        .into_iter()
+        .filter(|input| input.seq > query.after_seq)
+        .collect();
+    Json(serde_json::json!({
+        "success": true,
+        "cursor": cursor,
+        "inputs": inputs,
+    }))
+}
+
 /// PATCH /projects/:hash/sessions/:id/messages/:index - Mutate message in place
 async fn patch_session_message(
     State(state): State<AppState>,
@@ -5771,15 +10755,29 @@ async fn patch_session_message(
             index,
             req.expected_text.as_deref(),
             req.expected_role.as_deref(),
+            req.expected_message_id.as_deref(),
         );
-        let Some(real_index) = target_idx else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "success": false, "error": "message not found" })),
-            )
-                .into_response();
+        let real_index = match target_idx {
+            Some(idx) => idx,
+            None => {
+                if req.expected_role.as_deref() == Some("user") || req.expected_message_id.is_some() {
+                    let mut user_msg = zap_kernel::message::Message::user(req.expected_text.as_deref().unwrap_or(""));
+                    user_msg.id = req.expected_message_id.clone();
+                    snapshot.messages.push(user_msg);
+                    snapshot.messages.len() - 1
+                } else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "success": false, "error": "message not found" })),
+                    )
+                    .into_response();
+                }
+            }
         };
-
+        let display_target_id = snapshot.messages[real_index]
+            .id
+            .clone()
+            .or_else(|| req.expected_message_id.clone());
         snapshot.messages[real_index].text = req.text.clone();
         if let Some(imgs) = req.images.as_ref() {
             snapshot.messages[real_index].images = imgs
@@ -5790,8 +10788,28 @@ async fn patch_session_message(
                 })
                 .collect();
         }
+        let truncate_after = req.truncate_after.unwrap_or(false);
+        let mut derived_turns: Option<std::collections::BTreeSet<u64>> = None;
+        if truncate_after {
+            // Edit = rewrite: the edited prompt is now the tail of the model
+            // context. Every later message, stat, display-only row, transcript
+            // turn and presentation anchor must disappear with it.
+            let keep_count = real_index + 1;
+            snapshot.messages.truncate(keep_count);
+            let (turn_c, req_c) =
+                zap_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
+            snapshot.turn_counter = turn_c;
+            snapshot.request_counter = req_c;
+            derived_turns = prune_rewound_turn_stats(&mut meta, keep_count);
+        }
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        // 显式变更改写了上下文：压缩估算的占用不再成立。
+        meta.compacted_context_tokens = None;
         meta.updated_at = zap_capabilities::session::now_ms();
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
+        if truncate_after {
+            resync_todo_board_after_rewind(&id, &snapshot.messages);
+        }
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -5800,7 +10818,73 @@ async fn patch_session_message(
                 .into_response();
         }
         manager.clear_inflight_snapshot(&id);
+        if truncate_after {
+            // Identity, not timestamp: any durable input whose user row is not
+            // in the surviving snapshot belongs to a removed branch. This also
+            // cleans a stale branch left by an EARLIER rewind whose rows can be
+            // older than the current target.
+            let surviving_ids: std::collections::HashSet<String> = snapshot
+                .messages
+                .iter()
+                .filter_map(|message| message.id.clone())
+                .collect();
+            let _ = zap_capabilities::session::inputs::mark_rewound_not_in_global(
+                &id,
+                &surviving_ids,
+            );
+            zap_capabilities::session::partial::clear_global(&id);
+            zap_capabilities::session::partial::clear_archived_global(&id);
+        }
         let _ = manager.write_meta(&meta);
+        if let Some(surviving) = derived_turns.as_ref() {
+            prune_derived_turns(&manager, &id, surviving);
+        }
+        // In-place v4 mutation: preserve every row before the edit (including
+        // display-only/presentation rows), drop the downstream tail, refresh the
+        // edited row. Only fall back to invalidation when the log/target id is
+        // unavailable (legacy/missing v4).
+        let display_images: Vec<ImageData> = req
+            .images
+            .as_ref()
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| ImageData {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                        missing: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let surviving_last_turn = meta
+            .turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid)
+            .map(|stat| stat.turn_id)
+            .max()
+            .unwrap_or(0);
+        let completed_turns: Vec<u64> = meta
+            .turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid && stat.turn_id != 0)
+            .map(|stat| stat.turn_id)
+            .collect();
+        let rewritten = rewrite_display_for_mutation(
+            &manager,
+            &id,
+            DisplayMutation::Patch {
+                target_id: display_target_id.as_deref(),
+                text: &req.text,
+                images: &display_images,
+                truncate_after,
+            },
+            surviving_last_turn,
+            &completed_turns,
+        );
+        if !rewritten {
+            let _ = manager.invalidate_display(&id);
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5818,13 +10902,26 @@ async fn patch_session_message(
             delete_turn: None,
             target_index: None,
             target_message_id: None,
+            truncate_after: Some(truncate_after),
             ts: Some(now),
         };
         state_clone.active_chats.broadcast_to_session(&id, event).await;
+        // 跨实例：没有活跃订阅者的标签页也必须作废本地缓存，因此除会话总线外
+        // 再走一条全局失效总线（只带 revision，不背 payload）。
+        publish_global(GlobalWireEvent::SessionMutated {
+            session_id: id.clone(),
+            revision: snapshot.cache_epoch,
+        });
 
         (
             StatusCode::OK,
-            Json(serde_json::json!({ "success": true, "revision": snapshot.cache_epoch, "source_index": real_index })),
+            Json(serde_json::json!({
+                "success": true,
+                "revision": snapshot.cache_epoch,
+                "source_index": real_index,
+                "message_count": snapshot.messages.len(),
+                "truncated": truncate_after,
+            })),
         )
             .into_response()
     })
@@ -5885,6 +10982,7 @@ async fn delete_session_message(
             index,
             query.expected_text.as_deref(),
             query.expected_role.as_deref(),
+            query.expected_message_id.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -5893,8 +10991,13 @@ async fn delete_session_message(
             )
                 .into_response();
         };
+        let display_target_id = snapshot.messages[real_index]
+            .id
+            .clone()
+            .or_else(|| query.expected_message_id.clone());
 
         let delete_turn = query.delete_turn.unwrap_or(false);
+        let before_len = snapshot.messages.len();
         let mutation_start_idx;
         if delete_turn {
             // 用户消息删除（整回合删除：删除该用户消息以及随后的整轮 Agent 中间输出和回答）
@@ -5931,14 +11034,19 @@ async fn delete_session_message(
             }
         }
 
+        let removed_count = before_len.saturating_sub(snapshot.messages.len());
+        let derived_turns =
+            prune_deleted_turn_stats(&mut meta, mutation_start_idx, removed_count);
         let (turn_c, req_c) =
             zap_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
         snapshot.turn_counter = turn_c;
         snapshot.request_counter = req_c;
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        // 显式变更改写了上下文：压缩估算的占用不再成立。
+        meta.compacted_context_tokens = None;
         meta.updated_at = zap_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
-        meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        resync_todo_board_after_rewind(&id, &snapshot.messages);
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -5947,7 +11055,50 @@ async fn delete_session_message(
                 .into_response();
         }
         manager.clear_inflight_snapshot(&id);
+        // Deleting a user turn removes its input identity; deleting a model run
+        // keeps the user prompt. In both cases only inputs represented in the
+        // surviving snapshot may remain projectable.
+        let surviving_ids: std::collections::HashSet<String> = snapshot
+            .messages
+            .iter()
+            .filter_map(|message| message.id.clone())
+            .collect();
+        let _ = zap_capabilities::session::inputs::mark_rewound_not_in_global(
+            &id,
+            &surviving_ids,
+        );
+        zap_capabilities::session::partial::clear_global(&id);
+        zap_capabilities::session::partial::clear_archived_global(&id);
         let _ = manager.write_meta(&meta);
+        if let Some(surviving) = derived_turns.as_ref() {
+            prune_derived_turns(&manager, &id, surviving);
+        }
+        let surviving_last_turn = meta
+            .turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid)
+            .map(|stat| stat.turn_id)
+            .max()
+            .unwrap_or(0);
+        let completed_turns: Vec<u64> = meta
+            .turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid && stat.turn_id != 0)
+            .map(|stat| stat.turn_id)
+            .collect();
+        let rewritten = rewrite_display_for_mutation(
+            &manager,
+            &id,
+            DisplayMutation::Delete {
+                target_id: display_target_id.as_deref(),
+                delete_turn,
+            },
+            surviving_last_turn,
+            &completed_turns,
+        );
+        if !rewritten {
+            let _ = manager.invalidate_display(&id);
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5963,11 +11114,16 @@ async fn delete_session_message(
             text: None,
             images: None,
             delete_turn: Some(delete_turn),
+            truncate_after: None,
             target_index: None,
             target_message_id: None,
             ts: Some(now),
         };
         state_clone.active_chats.broadcast_to_session(&id, event).await;
+        publish_global(GlobalWireEvent::SessionMutated {
+            session_id: id.clone(),
+            revision: snapshot.cache_epoch,
+        });
 
         (
             StatusCode::OK,
@@ -6032,15 +11188,30 @@ async fn truncate_session(
             req.target_index,
             req.expected_text.as_deref(),
             req.expected_role.as_deref(),
+            req.target_message_id.as_deref(),
         );
-        let Some(real_index) = target_idx else {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({ "success": true, "notFound": true })),
-            )
-                .into_response();
+        let real_index = match target_idx {
+            Some(idx) => idx,
+            None => {
+                if req.expected_role.as_deref() == Some("user") || req.target_message_id.is_some() {
+                    let mut user_msg = zap_kernel::message::Message::user(req.expected_text.as_deref().unwrap_or(""));
+                    user_msg.id = req.target_message_id.clone();
+                    snapshot.messages.push(user_msg);
+                    snapshot.messages.len() - 1
+                } else {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "notFound": true })),
+                    )
+                    .into_response();
+                }
+            }
         };
 
+        let display_target_id = snapshot.messages[real_index]
+            .id
+            .clone()
+            .or_else(|| req.target_message_id.clone());
         let keep_count = if req.inclusive.unwrap_or(false) {
             (real_index + 1).min(snapshot.messages.len())
         } else {
@@ -6048,14 +11219,17 @@ async fn truncate_session(
         };
 
         snapshot.messages.truncate(keep_count);
+        let derived_turns = prune_rewound_turn_stats(&mut meta, keep_count);
         let (turn_c, req_c) =
             zap_kernel::message::SessionSnapshot::derive_counters(&snapshot.messages);
         snapshot.turn_counter = turn_c;
         snapshot.request_counter = req_c;
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+        // 显式变更改写了上下文：压缩估算的占用不再成立。
+        meta.compacted_context_tokens = None;
         meta.updated_at = zap_capabilities::session::now_ms();
         meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
-        meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        resync_todo_board_after_rewind(&id, &snapshot.messages);
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6064,7 +11238,50 @@ async fn truncate_session(
                 .into_response();
         }
         manager.clear_inflight_snapshot(&id);
+        // Identity-based cleanup: the target survives or disappears according
+        // to `inclusive`; either way, only rows represented in the surviving
+        // snapshot may remain projectable.
+        let surviving_ids: std::collections::HashSet<String> = snapshot
+            .messages
+            .iter()
+            .filter_map(|message| message.id.clone())
+            .collect();
+        let _ = zap_capabilities::session::inputs::mark_rewound_not_in_global(
+            &id,
+            &surviving_ids,
+        );
+        zap_capabilities::session::partial::clear_global(&id);
+        zap_capabilities::session::partial::clear_archived_global(&id);
         let _ = manager.write_meta(&meta);
+        if let Some(surviving) = derived_turns.as_ref() {
+            prune_derived_turns(&manager, &id, surviving);
+        }
+        let surviving_last_turn = meta
+            .turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid)
+            .map(|stat| stat.turn_id)
+            .max()
+            .unwrap_or(0);
+        let completed_turns: Vec<u64> = meta
+            .turn_stats
+            .iter()
+            .filter(|stat| stat.position_valid && stat.turn_id != 0)
+            .map(|stat| stat.turn_id)
+            .collect();
+        let rewritten = rewrite_display_for_mutation(
+            &manager,
+            &id,
+            DisplayMutation::Truncate {
+                target_id: display_target_id.as_deref(),
+                inclusive: req.inclusive.unwrap_or(false),
+            },
+            surviving_last_turn,
+            &completed_turns,
+        );
+        if !rewritten {
+            let _ = manager.invalidate_display(&id);
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6080,11 +11297,16 @@ async fn truncate_session(
             text: None,
             images: None,
             delete_turn: None,
+            truncate_after: None,
             target_index: Some(keep_count),
             target_message_id: req.target_message_id,
             ts: Some(now),
         };
         state_clone.active_chats.broadcast_to_session(&id, event).await;
+        publish_global(GlobalWireEvent::SessionMutated {
+            session_id: id.clone(),
+            revision: snapshot.cache_epoch,
+        });
 
         (
             StatusCode::OK,
@@ -6155,6 +11377,7 @@ async fn fork_session(
                 target_index,
                 req.expected_text.as_deref(),
                 req.expected_role.as_deref(),
+                req.target_message_id.as_deref(),
             ) {
                 if req.inclusive.unwrap_or(true) {
                     (real_index + 1).min(source.snapshot.messages.len())
@@ -6181,6 +11404,11 @@ async fn fork_session(
             };
 
         forked.meta.updated_at = now.saturating_add(1);
+        // A fork is a new manual conversation. It must never steal the source
+        // session's protocol key (or its protocol origin), otherwise a later
+        // `/v1/*` request could resume the fork instead of the original.
+        forked.meta.protocol_key = None;
+        forked.meta.origin = zap_capabilities::session::SessionOrigin::Manual;
         if let Some(title) = req
             .title
             .as_deref()
@@ -6427,8 +11655,9 @@ pub struct ChatRequest {
     /// Session ID to continue (optional, creates new if not provided)
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Per-request cancellation key supplied by the webui. Unlike `session_id`,
-    /// this is available during the first turn of a brand-new conversation.
+    /// Per-request correlation id. WebUI/IDE clients usually supply it;
+    /// `admit_chat_turn` mints one when the wire omits it (compat endpoints).
+    /// Unlike `session_id`, this is available during the first turn.
     #[serde(default)]
     pub request_id: Option<String>,
     /// Attached images (base64). Empty = text-only. The native `/chat` path forwards
@@ -6485,6 +11714,16 @@ pub enum ChatEvent {
     #[serde(rename = "user")]
     User {
         content: String,
+        /// Server-rendered user-facing text. Clients render THIS; the raw
+        /// `content` remains the exact model/runtime text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        /// Server-authored visibility flag (synthetic reminders).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        internal: Option<bool>,
+        /// Whether the UI may edit/rewind this row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        editable: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         /// Epoch ms the user message was authored. Lets a mid-turn refresh keep
@@ -6497,6 +11736,13 @@ pub enum ChatEvent {
         order: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_ordinal: Option<u32>,
+        /// 客户端关联键（`/chat` 的 `request_id`）：发送端据此按身份认领自己的乐观
+        /// 气泡，而不是靠文本比对；缺失时才退化为文本密等（legacy / 第三方客户端）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_input_id: Option<String>,
+        /// 多模态图片附件列表，确保广播到全网订阅端（如 PC 端观察者）时完整渲染图片缩略图
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageData>>,
     },
     /// The STORED identity of the real user prompt this turn runs on (from the
     /// kernel `UserMessage` boundary). Identity-only — the visible bubble is
@@ -6525,6 +11771,10 @@ pub enum ChatEvent {
         /// Monotonic part counter within the message (bumped on kind change).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         part_seq: Option<u32>,
+        /// Monotonic revision inside THIS part; live deltas and the coalesced
+        /// replay frame carry it so the client applies each part event once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_rev: Option<u64>,
     },
     /// LLM reasoning/thinking content
     #[serde(rename = "reasoning")]
@@ -6536,6 +11786,8 @@ pub enum ChatEvent {
         part_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         part_seq: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_rev: Option<u64>,
     },
     /// Tool call started
     #[serde(rename = "tool_start")]
@@ -6568,6 +11820,11 @@ pub enum ChatEvent {
         /// steer card/bubble to the persisted message by id across a refresh.
         #[serde(default)]
         client_input_ids: Vec<Option<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        timestamps: Vec<Option<u64>>,
+        /// Assistant row directly before the causal fold point.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor_message_id: Option<String>,
     },
     /// Tool call completed
     #[serde(rename = "tool_result")]
@@ -6578,6 +11835,13 @@ pub enum ChatEvent {
         success: bool,
         duration_ms: u64,
     },
+    /// Tool EXECUTION returned for this call, emitted BEFORE the authoritative
+    /// `tool_result` (which still lands once the whole parallel batch is applied,
+    /// in emission order). Clients settle the row here so a fast tool stops
+    /// spinning while a slow sibling keeps running; `output`/`duration_ms` stay
+    /// on the later `tool_result` frame. Purely observational.
+    #[serde(rename = "tool_finished")]
+    ToolFinished { id: String, success: bool },
     /// Token usage update
     #[serde(rename = "tokens")]
     TokenUsage {
@@ -6622,6 +11886,12 @@ pub enum ChatEvent {
         /// Last runtime error associated with this terminal, when available.
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Assistant (or turn-opening user) message this terminal's yellow
+        /// incomplete notice belongs to. Without it the client can only append
+        /// to the latest assistant, so a late terminal from turn N lands on the
+        /// tail of turn N+1's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// A tool requires user approval. The browser must POST the decision back
     /// to `/chat/permission`, correlated by `session_id` and `approval_id`.
@@ -6649,11 +11919,49 @@ pub enum ChatEvent {
     Stopped,
     /// Error occurred
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        message: String,
+        /// Same anchor contract as `done`/`warning`: keep a late error on its
+        /// own turn instead of the newest assistant bubble.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// Non-fatal advisory (e.g. "conversation compacted"). A distinct severity from
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
-    Warning { message: String },
+    Warning {
+        message: String,
+        /// 提示所属的 assistant 消息 id（管线身份）。客户端据此把提示挂回它所属的
+        /// 回合，而不是盲写“最后一条”落到时间线尾部；重放时也能幂等去重。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Context pressure changed WITHOUT a new model response (a committed
+    /// compaction). Clients update the live context meter immediately instead of
+    /// waiting for the next usage event — otherwise the footer keeps showing the
+    /// pre-compaction number until the next turn.
+    #[serde(rename = "context_compacted")]
+    ContextCompacted {
+        session_id: String,
+        /// Post-compaction estimated context tokens (summary + kept recent turns).
+        tokens: u32,
+    },
+    /// A display-only notice that is ALREADY persisted in the session display log
+    /// (e.g. the manual compaction boundary). Carries the record's authoritative
+    /// identity so every observer places it as a standalone transcript row in the
+    /// same order a cold load would, and dedupes it by `id`.
+    ///
+    /// `display_seq` is the display-log `seq`; it is deliberately not named `seq`
+    /// because `/chat/watch` frames overwrite `seq` with the replay cursor.
+    #[serde(rename = "display_notice")]
+    DisplayNotice {
+        session_id: String,
+        id: String,
+        display_seq: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<u64>,
+    },
     /// Auxiliary session persistence failed. Clients must display this outside
     /// the assistant message timeline.
     #[serde(rename = "persistence_warning")]
@@ -6672,6 +11980,9 @@ pub enum ChatEvent {
         /// Provider's own 429 message (no `HTTP …:` prefix), for the generic pause.
         #[serde(default)]
         server_message: Option<String>,
+        /// 同 `Warning`：提示所属的 assistant 消息 id，供客户端定向挂载与重放去重。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// AI session title generated / renamed
     #[serde(rename = "session_renamed")]
@@ -6702,6 +12013,9 @@ pub enum ChatEvent {
         images: Option<Vec<ImageInput>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         delete_turn: Option<bool>,
+        /// Patch action: the edit also removed every message after the row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncate_after: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         target_index: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -6997,6 +12311,13 @@ mod session_token_usage_tests {
             usage.total < 300_000,
             "must not restore the 1.7M billing sum"
         );
+
+        // 压缩提交后的占用是比快照最后一条 assistant 的旧 usage 更新的事实。
+        meta.compacted_context_tokens = Some(1_234);
+        let compacted = session_token_usage_from_session(&meta, &snapshot).unwrap();
+        assert_eq!(compacted.prompt, 1_234);
+        assert_eq!(compacted.completion, 0);
+        assert_eq!(compacted.total, 1_234);
     }
 }
 
@@ -7005,6 +12326,9 @@ struct ChatSteerCancelRequest {
     pub session_id: String,
     #[serde(default)]
     pub message: Option<String>,
+    /// Stable steer identity; takes precedence over the text fallback.
+    #[serde(default)]
+    pub client_input_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -7021,12 +12345,38 @@ async fn chat_steer_cancel(
 ) -> impl IntoResponse {
     let mut _cancelled = false;
 
+    // Retire the cancelled steer from the operation's in-memory metadata FIFO
+    // and the durable input log so a subsequent steer fold or session detail
+    // pull never resurrects or misattributes the cancelled steer.
+    state
+        .active_chats
+        .cancel_steer_metadata(&req.session_id, req.client_input_id.as_deref())
+        .await;
+    let resolved_sid = state
+        .active_chats
+        .session_id(&req.session_id)
+        .await
+        .unwrap_or_else(|| req.session_id.clone());
+    let _ = zap_capabilities::session::inputs::mark_cancelled_global(
+        &resolved_sid,
+        req.client_input_id.as_deref(),
+        req.message.as_deref(),
+    );
+    if resolved_sid != req.session_id {
+        let _ = zap_capabilities::session::inputs::mark_cancelled_global(
+            &req.session_id,
+            req.client_input_id.as_deref(),
+            req.message.as_deref(),
+        );
+    }
+
     // 1. 若存在活跃的 /chat 通道，通过 steer 信号通道发送撤回
     if let Some(tx) = state.active_chats.steer_sender(&req.session_id).await {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         if tx
             .send(live_api::ChatSteerSignal::Cancel {
                 text: req.message.clone(),
+                message_id: req.client_input_id.clone(),
                 done: done_tx,
             })
             .is_ok()
@@ -7041,7 +12391,11 @@ async fn chat_steer_cancel(
 
     // 2. 若存在全局活跃 runner handle（Live / 共享会话模式），通过 handle 撤回
     if let Some(handle) = crate::native_live::existing_runner_handle(&req.session_id) {
-        if handle.cancel_steer(req.message).await.is_ok() {
+        if handle
+            .cancel_steer(req.message, req.client_input_id)
+            .await
+            .is_ok()
+        {
             _cancelled = true;
         }
     }
@@ -7057,7 +12411,7 @@ async fn chat_steer_cancel(
 
 #[cfg(test)]
 mod chat_event_type_tests {
-    use super::{ChatEvent, ChatRuntimeProjector};
+    use super::{compaction_started_at, finish_compaction_phase, ChatEvent, ChatRuntimeProjector};
 
     #[test]
     fn runtime_info_serializes_the_exact_resolved_selection() {
@@ -7100,8 +12454,51 @@ mod chat_event_type_tests {
     }
 
     #[test]
+    fn runtime_compaction_start_registers_phase_and_finish_clears_it() {
+        use zap_coding::runtime::{CompactionCompletion, CompactionOutcome};
+        use zap_coding::CodingRuntimeEvent;
+        use zap_kernel::message::CompactTrigger;
+
+        let sid = "runtime-compaction-phase-test";
+        let _ = finish_compaction_phase(sid, crate::COMPACTION_OWNER_TURN, false);
+        let mut projector = ChatRuntimeProjector::default();
+        let started = projector.project_runtime(
+            CodingRuntimeEvent::CompactionStarted {
+                trigger: CompactTrigger::Auto { utilization: 0.95 },
+            },
+            sid,
+        );
+        assert!(matches!(
+            started.as_slice(),
+            [ChatEvent::SessionStatus { status, .. }] if status == "compacting"
+        ));
+        assert!(compaction_started_at(sid).is_some());
+
+        // 自动触发器的空操作也必须清掉阶段，否则刷新后 `Compacting…` 会复活。
+        let finished = projector.project_runtime(
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(CompactionOutcome {
+                    trigger: CompactTrigger::Auto { utilization: 0.95 },
+                    epoch: 1,
+                    removed_messages: 0,
+                    bytes_before: 100,
+                    bytes_after: 100,
+                    committed: false,
+                    estimated_tokens_before: 30,
+                    estimated_tokens_after: 30,
+                    committed_snapshot: None,
+                }),
+            },
+            sid,
+        );
+        assert!(finished.is_empty());
+        assert_eq!(compaction_started_at(sid), None);
+    }
+
+    #[test]
     fn native_steered_event_reaches_chat_projection() {
         let mut projector = ChatRuntimeProjector::default();
+        projector.current_message_id = Some("assistant-before-steer".into());
         let events = projector.project_agent(
             zap_kernel::event::AgentEvent::Steered {
                 count: 1,
@@ -7115,7 +12512,12 @@ mod chat_event_type_tests {
         );
         assert!(matches!(
             events.as_slice(),
-            [ChatEvent::Steered { count: 1, inputs, .. }] if inputs[0].text == "next instruction"
+            [ChatEvent::Steered {
+                count: 1,
+                inputs,
+                anchor_message_id: Some(anchor),
+                ..
+            }] if inputs[0].text == "next instruction" && anchor == "assistant-before-steer"
         ));
     }
 
@@ -7275,6 +12677,16 @@ mod chat_event_type_tests {
     #[test]
     fn agent_error_is_diagnostic_until_turn_finished_is_authoritative() {
         let mut projector = ChatRuntimeProjector::default();
+        // A turn that already streamed an assistant round must anchor its
+        // warning/terminal notice to that round.
+        let _ = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::Agent(
+                zap_kernel::event::AgentEvent::AssistantMessage {
+                    message_id: "m-anchor".into(),
+                },
+            ),
+            "session-1",
+        );
         let diagnostic = projector.project_runtime(
             zap_coding::CodingRuntimeEvent::Agent(zap_kernel::event::AgentEvent::Error {
                 message: "provider failed".into(),
@@ -7283,7 +12695,13 @@ mod chat_event_type_tests {
             }),
             "session-1",
         );
-        assert!(matches!(diagnostic.as_slice(), [ChatEvent::Warning { .. }]));
+        assert!(matches!(
+            diagnostic.as_slice(),
+            [ChatEvent::Warning {
+                message_id: Some(anchor),
+                ..
+            }] if anchor == "m-anchor"
+        ));
 
         let terminal = projector.project_runtime(
             zap_coding::CodingRuntimeEvent::TurnFinished(
@@ -7303,8 +12721,44 @@ mod chat_event_type_tests {
             [ChatEvent::Done {
                 stop_reason: Some(reason),
                 message: Some(message),
+                message_id: Some(anchor),
                 ..
-            }] if reason == "provider_error" && message == "provider failed"
+            }] if reason == "provider_error"
+                && message == "provider failed"
+                && anchor == "m-anchor"
+        ));
+    }
+
+    #[test]
+    fn terminal_error_keeps_its_turn_anchor() {
+        let mut projector = ChatRuntimeProjector::default();
+        let _ = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::Agent(
+                zap_kernel::event::AgentEvent::AssistantMessage {
+                    message_id: "m-error-anchor".into(),
+                },
+            ),
+            "session-1",
+        );
+        let events = projector.project_runtime(
+            zap_coding::CodingRuntimeEvent::TurnFinished(
+                zap_coding::TurnCompletion::SnapshotUnavailable {
+                    turn_id: 9,
+                    reason: zap_kernel::event::StopReason::ProviderError,
+                    error: zap_coding::RuntimeSnapshotError {
+                        message: "provider failed".into(),
+                    },
+                    stats: zap_coding::RuntimeTurnStats::default(),
+                },
+            ),
+            "session-1",
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::Error {
+                message_id: Some(anchor),
+                ..
+            }] if anchor == "m-error-anchor"
         ));
     }
 
@@ -7333,7 +12787,7 @@ mod chat_event_type_tests {
         );
         assert!(matches!(
             events.as_slice(),
-            [ChatEvent::Error { message }]
+            [ChatEvent::Error { message, .. }]
                 if message.contains("already in use by another runtime")
         ));
     }
@@ -7357,6 +12811,9 @@ enum ArtifactDetectorState {
         artifact_type: String,
         fence_len: usize,
         depth: usize,
+        /// Whether a top-level outline heading may heal a missing close fence.
+        /// Markdown / plain-text containers legitimately hold headings.
+        heal_on_heading: bool,
     },
     /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
     InHtml { id: String, content: String },
@@ -7431,10 +12888,13 @@ impl ArtifactDetector {
                                 message_id: None,
                                 part_id: None,
                                 part_seq: None,
+                                part_rev: None,
                             });
                         }
 
                         let (artifact_type, title) = Self::artifact_type_for_language(&language);
+                        let heal_on_heading = artifact_type != "markdown"
+                            && !Self::is_text_container_language(&language);
                         let id = self.next_id();
                         events.push(ChatEvent::ArtifactStart {
                             id: id.clone(),
@@ -7453,6 +12913,7 @@ impl ArtifactDetector {
                             artifact_type,
                             fence_len,
                             depth: 1,
+                            heal_on_heading,
                         };
                         remaining = &remaining[content_start..];
                     }
@@ -7504,6 +12965,7 @@ impl ArtifactDetector {
                             message_id: None,
                             part_id: None,
                             part_seq: None,
+                            part_rev: None,
                         });
                         remaining = "";
                     }
@@ -7513,6 +12975,7 @@ impl ArtifactDetector {
                     artifact_type,
                     fence_len,
                     mut depth,
+                    heal_on_heading,
                 } => match Self::find_next_fence_in_block(
                     remaining,
                     fence_len,
@@ -7544,6 +13007,7 @@ impl ArtifactDetector {
                             artifact_type,
                             fence_len,
                             depth,
+                            heal_on_heading,
                         };
                         remaining = &remaining[after_fence_line..];
                     }
@@ -7558,12 +13022,13 @@ impl ArtifactDetector {
                             artifact_type,
                             fence_len,
                             depth,
+                            heal_on_heading,
                         };
                         remaining = &remaining[after_fence_line..];
                     }
                     None => {
-                        // 结构性终结自愈：如果当前非 markdown 代码块内部遇到了明确的顶层大纲结构（如 `\n### 第二步`）
-                        if artifact_type != "markdown" {
+                        // 结构性终结自愈：如果当前代码块（非 markdown / 纯文本容器）内部遇到了明确的顶层大纲结构（如 `\n### 第二步`）
+                        if heal_on_heading {
                             if let Some(term_pos) = Self::find_structural_terminator(remaining) {
                                 if term_pos > 0 {
                                     events.push(ChatEvent::ArtifactContent {
@@ -7587,6 +13052,7 @@ impl ArtifactDetector {
                             artifact_type,
                             fence_len,
                             depth,
+                            heal_on_heading,
                         };
                         remaining = "";
                     }
@@ -7751,7 +13217,7 @@ impl ArtifactDetector {
             let line_end = text[line_start..]
                 .find('\n')
                 .map_or(text.len(), |idx| line_start + idx);
-            let line = text[line_start..line_end].trim();
+            let line = &text[line_start..line_end];
             if Self::is_structural_heading(line) {
                 return Some(line_start);
             }
@@ -7760,14 +13226,60 @@ impl ArtifactDetector {
         None
     }
 
+    /// Fence languages whose body is prose and may legitimately contain
+    /// headings. Mirrors `TEXT_CONTAINER_LANGS` in `webui/src/lib/markdownPrep.ts`:
+    /// the WebUI renderer never heals those blocks, so the stream split must not
+    /// either, or the live canvas diverges from the persisted transcript.
+    fn is_text_container_language(language: &str) -> bool {
+        const TEXT_CONTAINER_LANGS: &[&str] = &[
+            "",
+            "text",
+            "plain",
+            "plaintext",
+            "txt",
+            "prompt",
+            "prompts",
+            "rules",
+            "guide",
+            "instructions",
+            "chat",
+            "chatml",
+            "system",
+            "user",
+            "assistant",
+            "doc",
+            "docs",
+            "documentation",
+            "output",
+            "console",
+            "log",
+            "logs",
+            "terminal",
+            "shell-session",
+            "error",
+            "err",
+            "markdown",
+            "md",
+            "mdx",
+            "mkd",
+        ];
+        let lower = language.trim().to_lowercase();
+        TEXT_CONTAINER_LANGS.contains(&lower.as_str())
+    }
+
+    /// A heading that ends an unclosed code block. Must stay a subset of the
+    /// WebUI rule (`isStructuralTerminator`): a single `#` is a comment in
+    /// python / bash / yaml / toml / C (`# 1. 解析与格式化`, `#include`), and an
+    /// indented `##` is code body. Only an unindented `##`..`######` outline
+    /// heading counts; healing anything else here splits the block mid-stream
+    /// and the rest of the code streams out as prose.
     fn is_structural_heading(line: &str) -> bool {
-        let trimmed = line.trim();
-        let heading = trimmed.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
+        let heading = line.trim_end();
         if !heading.starts_with('#') {
             return false;
         }
         let hashes = heading.chars().take_while(|&c| c == '#').count();
-        if hashes < 1 || hashes > 6 {
+        if !(2..=6).contains(&hashes) {
             return false;
         }
         let after_hashes = &heading[hashes..];
@@ -7867,6 +13379,200 @@ impl ArtifactDetector {
     }
 }
 
+/// Localize the kernel's user-facing yellow notices.
+///
+/// The kernel is i18n-neutral (it has no `zap-config` dependency), so it
+/// emits stable message templates. The daemon owns the locale, and translates the
+/// known liveness/retry/progress templates here; anything unrecognized passes
+/// through unchanged (provider-supplied text, already-localized notices, …).
+pub(crate) fn localize_agent_warning(message: &str) -> String {
+    localize_agent_warning_with(zap_config::i18n::current_locale(), message)
+}
+
+fn localize_agent_warning_with(locale: zap_config::locale::Locale, message: &str) -> String {
+    use zap_config::i18n::{t_with, Msg};
+
+    /// `"{wait} 秒后重试({n}/{max})..."` or `"正在重试({n}/{max})..."` (wait = 0).
+    fn retry_tail(rest: &str) -> Option<(u64, u32, u32)> {
+        let open = rest.find("重试(")?;
+        let after = &rest[open + "重试(".len()..];
+        let close = after.find(')')?;
+        let (attempt, max) = after[..close].split_once('/')?;
+        let attempt = attempt.trim().parse::<u32>().ok()?;
+        let max = max.trim().parse::<u32>().ok()?;
+        let wait = match rest[..open].find(" 秒后") {
+            Some(pos) => rest[..pos]
+                .trim()
+                .trim_end_matches('，')
+                .trim()
+                .parse::<u64>()
+                .ok()?,
+            None => 0,
+        };
+        Some((wait, attempt, max))
+    }
+
+    if let Some(rest) = message.strip_prefix("模型返回空响应，") {
+        if let Some((wait, attempt, max)) = retry_tail(rest) {
+            return t_with(locale, Msg::AgentRetryEmpty { attempt, max, wait }).into_owned();
+        }
+    }
+    if let Some(rest) = message.strip_prefix("模型只返回了思考，") {
+        if let Some((wait, attempt, max)) = retry_tail(rest) {
+            return t_with(locale, Msg::AgentRetryThinking { attempt, max, wait }).into_owned();
+        }
+    }
+    if let Some(rest) = message.strip_prefix("响应格式异常，") {
+        if let Some((wait, attempt, max)) = retry_tail(rest) {
+            return t_with(locale, Msg::AgentRetryMalformed { attempt, max, wait }).into_owned();
+        }
+    }
+    if let Some(rest) = message.strip_prefix("API error ") {
+        if let Some((reason, tail)) = rest.split_once('，') {
+            if let Some((wait, attempt, max)) = retry_tail(tail) {
+                return t_with(
+                    locale,
+                    Msg::AgentRetryApi {
+                        reason,
+                        wait,
+                        attempt,
+                        max,
+                    },
+                )
+                .into_owned();
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("模型延迟高:") {
+        if let Some(pos) = rest.find(" 秒内无响应") {
+            if let Ok(secs) = rest[..pos].trim().parse::<u64>() {
+                if let Some((_, attempt, max)) = retry_tail(&rest[pos..]) {
+                    return t_with(locale, Msg::AgentRetryFirstToken { secs, attempt, max })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("请求约 ") {
+        if let Some((estimate, tail)) = rest.split_once("K tokens 已达上下文水位（窗口约 ")
+        {
+            if let Some((window, tail)) = tail.split_once("K − 水位缓冲 ") {
+                if let Some((buffer, _)) = tail.split_once("K）") {
+                    if let (Ok(estimate_k), Ok(window_k), Ok(buffer_k)) = (
+                        estimate.trim().parse::<u32>(),
+                        window.trim().parse::<u32>(),
+                        buffer.trim().parse::<u32>(),
+                    ) {
+                        return t_with(
+                            locale,
+                            Msg::AgentOverWindow {
+                                estimate_k,
+                                window_k,
+                                buffer_k,
+                            },
+                        )
+                        .into_owned();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("context overflow on round ") {
+        if let Some((round, tail)) = rest.split_once(" (attempt ") {
+            if let Some((attempt, _)) = tail.split_once(')') {
+                if let (Ok(round), Ok(attempt)) =
+                    (round.trim().parse::<u32>(), attempt.trim().parse::<u32>())
+                {
+                    return t_with(locale, Msg::AgentContextOverflow { round, attempt })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if let Some(rest) = message.strip_prefix("stream idle timeout — reconnecting (") {
+        if let Some((nums, _)) = rest.split_once(')') {
+            if let Some((attempt, max)) = nums.split_once('/') {
+                if let (Ok(attempt), Ok(max)) =
+                    (attempt.trim().parse::<u32>(), max.trim().parse::<u32>())
+                {
+                    return t_with(locale, Msg::AgentStreamReconnecting { attempt, max })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if message == "response truncated: finish_reason=length" {
+        return t_with(locale, Msg::AgentResponseTruncated).into_owned();
+    }
+    if let Some(rest) = message.strip_prefix("unsupported snapshot version ") {
+        if let Some((version, tail)) = rest.split_once(" (kernel supports ") {
+            if let Some((supported, _)) = tail.split_once(')') {
+                if let (Ok(version), Ok(supported)) = (
+                    version.trim().parse::<u32>(),
+                    supported.trim().parse::<u32>(),
+                ) {
+                    return t_with(locale, Msg::AgentUnsupportedSnapshot { version, supported })
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if let Some(rest) = message
+        .strip_prefix("pre_request is not append-only: the outgoing prefix diverges from the ")
+    {
+        if let Some((stored, _)) = rest.split_once(" stored message(s)") {
+            if let Ok(stored) = stored.trim().parse::<usize>() {
+                return t_with(locale, Msg::AgentPreRequestNotAppendOnly { stored }).into_owned();
+            }
+        }
+    }
+    message.to_string()
+}
+
+#[cfg(test)]
+mod agent_warning_i18n_tests {
+    use super::localize_agent_warning_with;
+    use zap_config::locale::Locale;
+
+    #[test]
+    fn translates_known_kernel_templates_and_passes_unknown_through() {
+        let zh = localize_agent_warning_with(Locale::ZhCn, "模型返回空响应，3 秒后重试(2/5)...");
+        assert!(zh.contains("3 秒后重试"), "{zh}");
+        assert!(zh.contains("2/5"), "{zh}");
+
+        let en = localize_agent_warning_with(Locale::En, "模型返回空响应，3 秒后重试(2/5)...");
+        assert!(en.contains("empty response"), "{en}");
+        assert!(en.contains("3s"), "{en}");
+        assert!(en.contains("2/5"), "{en}");
+
+        let thinking =
+            localize_agent_warning_with(Locale::En, "模型只返回了思考，正在重试(1/5)...");
+        assert!(thinking.contains("only reasoning"), "{thinking}");
+
+        let api = localize_agent_warning_with(
+            Locale::En,
+            "API error server overloaded，6 秒后重试(1/3)...",
+        );
+        assert!(api.contains("server overloaded"), "{api}");
+
+        let over = localize_agent_warning_with(
+            Locale::En,
+            "请求约 950K tokens 已达上下文水位（窗口约 1048K − 水位缓冲 20K）：请精简输入或换用更大窗口的模型。",
+        );
+        assert!(over.contains("950K"), "{over}");
+        assert!(over.contains("watermark"), "{over}");
+
+        let reconnecting =
+            localize_agent_warning_with(Locale::En, "stream idle timeout — reconnecting (2/4)");
+        assert!(reconnecting.contains("reconnecting"), "{reconnecting}");
+
+        assert_eq!(
+            localize_agent_warning_with(Locale::En, "provider says hi"),
+            "provider says hi"
+        );
+    }
+}
+
 struct ChatRuntimeProjector {
     artifacts: ArtifactDetector,
     live_tools: HashMap<String, (String, std::time::Instant)>,
@@ -7883,10 +13589,29 @@ struct ChatRuntimeProjector {
     /// `AgentEvent::AssistantMessage`). Tags text/reasoning deltas with the same
     /// identity the persisted `Message` carries.
     current_message_id: Option<String>,
+    /// Stored identity of the turn's user prompt (`AgentEvent::UserMessage`).
+    /// A turn that fails *before* its first assistant boundary (provider error on
+    /// the opening call) must still anchor its notice to this prompt, otherwise
+    /// the bubble lands under the previous answer or the next agent loop.
+    current_user_message_id: Option<String>,
     /// Monotonic per-message part counter; bumped when the streaming part KIND
     /// changes (reasoning → text → …) so each part gets a unique `part_id`.
     part_seq: u32,
+    /// Monotonic revision within the current part. Reset when a new part id is
+    /// allocated; incremented for every live delta. The replay log coalesces
+    /// deltas but keeps the LAST revision, so the client can apply a part once.
+    part_rev: u64,
     last_part_kind: Option<String>,
+    /// Current streaming assistant content for crash recovery. Rewritten at a
+    /// small throttle; cleared when the canonical snapshot commits.
+    partial_text: String,
+    partial_reasoning: String,
+    partial_session_id: Option<String>,
+    partial_message_id: Option<String>,
+    partial_part_id: Option<String>,
+    partial_last_save: Option<std::time::Instant>,
+    partial_bytes_since_save: usize,
+    partial_tools: Vec<zap_capabilities::session::PartialToolCall>,
 }
 
 impl Default for ChatRuntimeProjector {
@@ -7901,13 +13626,178 @@ impl Default for ChatRuntimeProjector {
             last_error: None,
             keep_raw_markdown: false,
             current_message_id: None,
+            current_user_message_id: None,
             part_seq: 0,
+            part_rev: 0,
             last_part_kind: None,
+            partial_text: String::new(),
+            partial_reasoning: String::new(),
+            partial_session_id: None,
+            partial_message_id: None,
+            partial_part_id: None,
+            partial_last_save: None,
+            partial_bytes_since_save: 0,
+            partial_tools: Vec::new(),
         }
     }
 }
 
+/// 保证在压缩改写 `snapshot.json` 或追加独立显示通知之前，会话的 v4 `display.jsonl`
+/// 已经完整落地。若该会话此前因 `/undo`、编辑、删除或旧格式导入而缺少完整 v4 日志，
+/// 直接调 `append_display_notice` 会返回 `Ok(None)`，导致压缩标记既写不进磁盘、
+/// 也不会广播给其它实例。
+pub(crate) fn ensure_v4_display_for_session(
+    manager: &NativeSessionManager,
+    loaded: &zap_capabilities::session::LoadedSession,
+) {
+    let snapshot_last_turn = loaded
+        .meta
+        .turn_stats
+        .iter()
+        .filter(|stat| stat.position_valid)
+        .map(|stat| stat.turn_id)
+        .max()
+        .unwrap_or(0);
+    let already_valid = manager
+        .read_display(&loaded.meta.id)
+        .ok()
+        .flatten()
+        .is_some_and(|(meta, records)| {
+            meta.v == zap_capabilities::session::DISPLAY_VERSION
+                && meta.complete
+                && v4_display_covers_completed_user_turns(
+                    &meta,
+                    &display_record_ids(&records),
+                    &loaded.snapshot.messages,
+                    &loaded.meta.turn_stats,
+                    snapshot_last_turn,
+                )
+        });
+    if already_valid {
+        return;
+    }
+    let view = crate::legacy_convert::CatalogSessionView {
+        snapshot: loaded.snapshot.clone(),
+        meta: loaded.meta.clone(),
+        presentation: loaded.presentation.clone(),
+    };
+    let Ok(mut messages) = merge_catalog_session_messages_for_display(&view) else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    mint_legacy_message_ids(&mut messages);
+    let records: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| display_record_from_message_info(&loaded.meta.id, index, message))
+        .collect();
+    let _ = manager.write_display_backfill(&loaded.meta.id, &records, snapshot_last_turn);
+}
+
+pub(crate) fn persist_session_display_notice(
+    session_id: &str,
+    message: &str,
+    notice_id: Option<String>,
+) -> Option<zap_capabilities::session::DisplayRecord> {
+    if session_id.trim().is_empty() || message.trim().is_empty() {
+        return None;
+    }
+    let resolved = resolve_session_by_id(session_id).ok().flatten()?;
+    let mgr = NativeSessionManager::with_root(
+        NativeSessionManager::sessions_root().join(&resolved.project_hash),
+    );
+    if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+        ensure_v4_display_for_session(&mgr, &loaded);
+    }
+    let record = mgr
+        .append_display_notice(&resolved.meta.id, message, notice_id)
+        .ok()
+        .flatten();
+    if record.is_some() {
+        publish_global(GlobalWireEvent::DisplayAppended {
+            session_id: resolved.meta.id,
+        });
+    }
+    record
+}
+
 impl ChatRuntimeProjector {
+    fn reset_partial_stream(&mut self) {
+        self.partial_text.clear();
+        self.partial_reasoning.clear();
+        self.partial_message_id = None;
+        self.partial_part_id = None;
+        self.partial_last_save = None;
+        self.partial_bytes_since_save = 0;
+        self.partial_tools.clear();
+    }
+
+    fn note_partial_delta(
+        &mut self,
+        kind: &str,
+        message_id: &Option<String>,
+        part_id: &Option<String>,
+        content: &str,
+    ) {
+        if self.terminal_seen {
+            return;
+        }
+        if let Some(message_id) = message_id {
+            if self.partial_message_id.as_deref() != Some(message_id.as_str()) {
+                // A new assistant round supersedes the previous partial: the
+                // previous round is checkpointed by SnapshotHook at the boundary.
+                self.partial_text.clear();
+                self.partial_reasoning.clear();
+                self.partial_message_id = Some(message_id.clone());
+            }
+        }
+        if let Some(part_id) = part_id {
+            self.partial_part_id = Some(part_id.clone());
+        }
+        if kind == "reasoning" {
+            self.partial_reasoning.push_str(content);
+        } else {
+            self.partial_text.push_str(content);
+        }
+        self.partial_bytes_since_save = self.partial_bytes_since_save.saturating_add(content.len());
+        self.maybe_save_partial();
+    }
+
+    fn maybe_save_partial(&mut self) {
+        if self.terminal_seen {
+            return;
+        }
+        let Some(session_id) = self.partial_session_id.clone() else {
+            return;
+        };
+        // Canonical daemon sessions are UUIDs. Non-UUID ids come from legacy
+        // imports/tests; do not create recovery files outside a real session.
+        if uuid::Uuid::parse_str(&session_id).is_err() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self.partial_last_save.map_or(true, |last| {
+            now.duration_since(last) >= std::time::Duration::from_millis(100)
+        });
+        if !due && self.partial_bytes_since_save < 4096 {
+            return;
+        }
+        self.partial_last_save = Some(now);
+        self.partial_bytes_since_save = 0;
+        let partial = zap_capabilities::session::PartialStream {
+            session_id,
+            message_id: self.partial_message_id.clone(),
+            part_id: self.partial_part_id.clone(),
+            text: self.partial_text.clone(),
+            reasoning: self.partial_reasoning.clone(),
+            tool_calls: self.partial_tools.clone(),
+            updated_at: u64::try_from(zap_capabilities::session::now_ms()).unwrap_or(0),
+        };
+        let _ = zap_capabilities::session::partial::save_global(&partial);
+    }
+
     fn project_runtime(
         &mut self,
         event: CodingRuntimeEvent,
@@ -7957,31 +13847,74 @@ impl ChatRuntimeProjector {
             }
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
-            } if outcome.committed => vec![ChatEvent::Warning {
-                message: zap_config::i18n::format_compaction_mark(
+            } if outcome.committed => {
+                // Clear the driver's "compacting" status (the kernel announced it for
+                // every pass) and refresh the footer meter with the post-compaction size.
+                crate::finish_compaction_phase(
+                    permission_session_id,
+                    crate::COMPACTION_OWNER_TURN,
+                    true,
+                );
+                let mark = zap_config::i18n::format_compaction_mark(
                     outcome.removed_messages,
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
-                ),
-            }],
+                );
+                let notice_event =
+                    match persist_session_display_notice(permission_session_id, &mark, None) {
+                        Some(record) => ChatEvent::DisplayNotice {
+                            session_id: permission_session_id.to_string(),
+                            id: record.id.unwrap_or_default(),
+                            display_seq: record.seq,
+                            text: record.content,
+                            created_at: record.created_at,
+                        },
+                        None => ChatEvent::Warning {
+                            message: mark,
+                            message_id: self.notice_anchor(),
+                        },
+                    };
+                vec![
+                    notice_event,
+                    ChatEvent::ContextCompacted {
+                        session_id: permission_session_id.to_string(),
+                        tokens: outcome.estimated_tokens_after as u32,
+                    },
+                    ChatEvent::SessionStatus {
+                        session_id: permission_session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                ]
+            }
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
             } if outcome.is_manual() => {
+                crate::finish_compaction_phase(
+                    permission_session_id,
+                    crate::COMPACTION_OWNER_TURN,
+                    true,
+                );
                 let text = zap_config::i18n::format_compaction_noop(
                     outcome.estimated_tokens_before,
                     outcome.estimated_tokens_after,
                     outcome.summary_would_grow(),
                 );
-                if self.keep_raw_markdown {
+                let mut events = if self.keep_raw_markdown {
                     vec![ChatEvent::TextDelta {
                         content: text,
                         message_id: None,
                         part_id: None,
                         part_seq: None,
+                        part_rev: None,
                     }]
                 } else {
                     self.artifacts.process(&text)
-                }
+                };
+                events.push(ChatEvent::SessionStatus {
+                    session_id: permission_session_id.to_string(),
+                    status: "running".to_string(),
+                });
+                events
             }
             CodingRuntimeEvent::CompactionFinished {
                 completion:
@@ -7989,18 +13922,56 @@ impl ChatRuntimeProjector {
                         trigger: zap_kernel::message::CompactTrigger::Manual { .. },
                         ..
                     },
-            } => vec![ChatEvent::Warning {
-                message: zap_config::i18n::format_compaction_interrupted(),
-            }],
+            } => {
+                crate::finish_compaction_phase(
+                    permission_session_id,
+                    crate::COMPACTION_OWNER_TURN,
+                    true,
+                );
+                vec![
+                    ChatEvent::Warning {
+                        message: zap_config::i18n::format_compaction_interrupted(),
+                        message_id: self.notice_anchor(),
+                    },
+                    ChatEvent::SessionStatus {
+                        session_id: permission_session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                ]
+            }
             CodingRuntimeEvent::CompactionFinished {
                 completion:
                     CompactionCompletion::Failed {
                         trigger: zap_kernel::message::CompactTrigger::Manual { .. },
                         error,
                     },
-            } => vec![ChatEvent::Error {
-                message: format!("compact failed: {error}"),
-            }],
+            } => {
+                crate::finish_compaction_phase(
+                    permission_session_id,
+                    crate::COMPACTION_OWNER_TURN,
+                    true,
+                );
+                vec![
+                    ChatEvent::Error {
+                        message: format!("compact failed: {error}"),
+                        message_id: self.notice_anchor(),
+                    },
+                    ChatEvent::SessionStatus {
+                        session_id: permission_session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                ]
+            }
+            CodingRuntimeEvent::CompactionFinished { .. } => {
+                // 自动触发器上的空操作 / 失败 / 中断也必须结束阶段：否则上一个
+                // CompactionStarted 留下的 `Compacting…` 会一直挂到回合终态。
+                crate::finish_compaction_phase(
+                    permission_session_id,
+                    crate::COMPACTION_OWNER_TURN,
+                    true,
+                );
+                Vec::new()
+            }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                 reason, stats, ..
             }) => {
@@ -8024,6 +13995,7 @@ impl ChatRuntimeProjector {
                     session_id: permission_session_id.to_string(),
                     stop_reason: Some(stop_reason_wire(reason).to_string()),
                     message: self.last_error.clone(),
+                    message_id: self.notice_anchor(),
                 });
                 if reason == zap_kernel::event::StopReason::Cancelled {
                     // Legacy clients still understand `stopped`; typed clients latch
@@ -8049,11 +14021,15 @@ impl ChatRuntimeProjector {
                 }
                 events.push(ChatEvent::Error {
                     message: error.message,
+                    message_id: self.notice_anchor(),
                 });
                 events
             }
             CodingRuntimeEvent::ControllerWarning(message) => {
-                vec![ChatEvent::Warning { message }]
+                vec![ChatEvent::Warning {
+                    message: localize_agent_warning(&message),
+                    message_id: self.notice_anchor(),
+                }]
             }
             CodingRuntimeEvent::PersistenceWarning(message) => {
                 vec![ChatEvent::PersistenceWarning { message }]
@@ -8065,18 +14041,64 @@ impl ChatRuntimeProjector {
                     name,
                 }]
             }
-            CodingRuntimeEvent::CompactionStarted { .. }
-            | CodingRuntimeEvent::CompactionFinished { .. }
-            | CodingRuntimeEvent::RuntimeStopped(_)
-            | CodingRuntimeEvent::ModeChanged { .. }
+            CodingRuntimeEvent::LoopChanged(progress) => {
+                // `/loop` 的控制器状态是服务端权威运行态的一部分：wakeup 等待期间
+                // 没有回合在跑，但下一轮随时开始，客户端不能据此熄灭 busy。
+                crate::note_loop_state(
+                    permission_session_id,
+                    progress.active,
+                    progress.round,
+                    &progress.label,
+                );
+                // 控制器变化双向广播：armed → 点亮（wakeup 等待期也算在跑），
+                // released → 熄灭。若释放时当前回合还在收尾，下一帧直播内容会
+                // 立即把它点亮回来（`noteRunningProofFrame`），不会留下假停止态。
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: permission_session_id.to_string(),
+                    running: progress.active,
+                    terminal: None,
+                    status: None,
+                });
+                Vec::new()
+            }
+            CodingRuntimeEvent::GoalChanged(progress) => {
+                crate::note_goal_state(permission_session_id, progress.active);
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: permission_session_id.to_string(),
+                    running: progress.active,
+                    terminal: None,
+                    status: None,
+                });
+                Vec::new()
+            }
+            CodingRuntimeEvent::CompactionStarted { .. } => {
+                // 内核事件在 runtime 层已经转换成 CodingRuntimeEvent::CompactionStarted
+                // （AgentEvent 不再下传），自动压缩的“Compacting…”必须在这里登记。
+                crate::note_compaction_started(permission_session_id, crate::COMPACTION_OWNER_TURN);
+                vec![ChatEvent::SessionStatus {
+                    session_id: permission_session_id.to_string(),
+                    status: "compacting".to_string(),
+                }]
+            }
+            CodingRuntimeEvent::RuntimeStopped(_) => {
+                // runtime 已经死了：控制器不可能再续轮，立即从权威运行态移除，
+                // 否则 `/chat/active` 会把一个不存在的循环永久报成运行中。
+                crate::finish_compaction_phase(
+                    permission_session_id,
+                    crate::COMPACTION_OWNER_TURN,
+                    false,
+                );
+                crate::note_loop_state(permission_session_id, false, 0, "");
+                crate::note_goal_state(permission_session_id, false);
+                Vec::new()
+            }
+            CodingRuntimeEvent::ModeChanged { .. }
             | CodingRuntimeEvent::Reconfiguring { .. }
             | CodingRuntimeEvent::Reconfigured { .. }
             | CodingRuntimeEvent::ProviderChanged { .. }
             | CodingRuntimeEvent::ProviderUnavailable { .. }
             | CodingRuntimeEvent::SessionChanged(_)
             | CodingRuntimeEvent::WorkingDirectoryChanged(_)
-            | CodingRuntimeEvent::GoalChanged(_)
-            | CodingRuntimeEvent::LoopChanged(_)
             | CodingRuntimeEvent::UndoFinished(_)
             | CodingRuntimeEvent::ContextStatsRefreshed(_)
             | CodingRuntimeEvent::SnapshotRestoreFinished { .. }
@@ -8090,17 +14112,28 @@ impl ChatRuntimeProjector {
     /// `part_seq` when the kind changes). `None` ids when no assistant-message
     /// boundary has been seen (older driver / non-boundary text such as a
     /// compaction advisory).
-    fn next_part_stamp(&mut self, kind: &str) -> (Option<String>, Option<String>, Option<u32>) {
+    fn next_part_stamp(
+        &mut self,
+        kind: &str,
+    ) -> (Option<String>, Option<String>, Option<u32>, Option<u64>) {
         let message_id = self.current_message_id.clone();
         if self.last_part_kind.as_deref() != Some(kind) {
             self.part_seq += 1;
+            self.part_rev = 1;
             self.last_part_kind = Some(kind.to_string());
+        } else {
+            self.part_rev = self.part_rev.saturating_add(1);
         }
         let has_id = message_id.is_some();
         let part_id = message_id
             .as_ref()
             .map(|m| format!("{m}:{}:{kind}", self.part_seq));
-        (message_id, part_id, has_id.then_some(self.part_seq))
+        (
+            message_id,
+            part_id,
+            has_id.then_some(self.part_seq),
+            has_id.then_some(self.part_rev),
+        )
     }
 
     /// Close the current streaming part so the next delta opens a fresh one.
@@ -8110,6 +14143,17 @@ impl ChatRuntimeProjector {
         self.last_part_kind = None;
     }
 
+    /// Anchor for a non-fatal notice (`warning` / `rate_limited`).
+    ///
+    /// Prefer the streaming assistant round; fall back to the turn's user message
+    /// so a failure that happened BEFORE any assistant boundary still anchors to
+    /// its own prompt instead of the previous answer's tail.
+    fn notice_anchor(&self) -> Option<String> {
+        self.current_message_id
+            .clone()
+            .or_else(|| self.current_user_message_id.clone())
+    }
+
     fn project_agent(
         &mut self,
         event: zap_kernel::event::AgentEvent,
@@ -8117,43 +14161,66 @@ impl ChatRuntimeProjector {
     ) -> Vec<ChatEvent> {
         use zap_kernel::event::AgentEvent as Agent;
 
+        self.partial_session_id = Some(session_id.to_string());
         match event {
             Agent::AssistantMessage { message_id } => {
                 // Boundary marker: tag subsequent deltas with this identity.
-                self.current_message_id = Some(message_id);
+                self.current_message_id = Some(message_id.clone());
                 self.part_seq = 0;
+                self.part_rev = 0;
                 self.last_part_kind = None;
+                self.reset_partial_stream();
+                self.partial_message_id = Some(message_id);
                 Vec::new()
             }
             Agent::UserMessage {
                 message_id,
                 turn_ordinal,
+                ..
             } => {
                 // Identity-only boundary: the `user` echo already painted the
                 // bubble; this binds it to the stored message id.
+                //
+                // 新回合开始：记住本轮的 user 身份，并清掉上一轮的 assistant id。
+                // 失败轮（尚未产生 assistant 边界）的提示必须锚到这轮提问上，
+                // 否则会挂到上一轮回答底部 / 下一条 loop 下面。
+                self.current_user_message_id = Some(message_id.clone());
+                self.current_message_id = None;
+                // A new turn starts: the previous turn's partial must have been
+                // committed/cleared; drop any stale checkpoint.
+                self.reset_partial_stream();
+                let _ = zap_capabilities::session::partial::archive_global(session_id);
+                zap_capabilities::session::partial::clear_global(session_id);
                 vec![ChatEvent::UserIdentified {
                     message_id,
                     turn_ordinal,
                 }]
             }
             Agent::TextDelta(text) => {
-                let (message_id, part_id, part_seq) = self.next_part_stamp("text");
+                let (message_id, part_id, part_seq, part_rev) = self.next_part_stamp("text");
+                self.note_partial_delta("text", &message_id, &part_id, &text);
                 let mut events = if self.keep_raw_markdown {
                     vec![ChatEvent::TextDelta {
                         content: text,
                         message_id: message_id.clone(),
                         part_id: part_id.clone(),
                         part_seq,
+                        part_rev,
                     }]
                 } else {
                     self.artifacts.process(&text)
                 };
-                // ArtifactDetector emits TextDelta without ids — stamp them here.
+                // ArtifactDetector may split ONE model delta into several
+                // TextDelta events (prose before/after a code fence). Every
+                // emitted event must get its OWN part_rev; reusing the model
+                // delta's revision would make the client drop all but the first.
+                let mut next_rev = part_rev;
                 for ev in events.iter_mut() {
                     if let ChatEvent::TextDelta {
                         message_id: m,
                         part_id: p,
                         part_seq: s,
+                        part_rev: r,
                         ..
                     } = ev
                     {
@@ -8166,17 +14233,28 @@ impl ChatRuntimeProjector {
                         if s.is_none() {
                             *s = part_seq;
                         }
+                        if let Some(rev) = next_rev {
+                            *r = Some(rev);
+                            next_rev = Some(rev.saturating_add(1));
+                        }
+                    }
+                }
+                if let Some(last) = next_rev {
+                    if part_rev.is_some() {
+                        self.part_rev = last.saturating_sub(1);
                     }
                 }
                 events
             }
             Agent::Reasoning(content) => {
-                let (message_id, part_id, part_seq) = self.next_part_stamp("reasoning");
+                let (message_id, part_id, part_seq, part_rev) = self.next_part_stamp("reasoning");
+                self.note_partial_delta("reasoning", &message_id, &part_id, &content);
                 vec![ChatEvent::ReasoningDelta {
                     content,
                     message_id,
                     part_id,
                     part_seq,
+                    part_rev,
                 }]
             }
             Agent::ToolBatchStarted { calls, .. } => {
@@ -8185,11 +14263,74 @@ impl ChatRuntimeProjector {
                 // post-tool prose indistinguishable on replay, so the browser cannot
                 // converge the part in place and re-appends it instead.
                 self.end_streaming_part();
+                self.partial_tools = calls
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, call)| zap_capabilities::session::PartialToolCall {
+                            index: u32::try_from(index).unwrap_or(u32::MAX),
+                            id: Some(call.id.clone()),
+                            name: Some(call.name.clone()),
+                            arguments: call.arguments.clone(),
+                        },
+                    )
+                    .collect();
+                self.maybe_save_partial();
                 vec![ChatEvent::ToolBatchStarted { calls }]
             }
             Agent::ToolStarted { call } => {
+                if let Some(existing) = self
+                    .partial_tools
+                    .iter_mut()
+                    .find(|tool| tool.id.as_deref() == Some(call.id.as_str()))
+                {
+                    existing.name = Some(call.name.clone());
+                    existing.arguments = call.arguments.clone();
+                } else {
+                    self.partial_tools
+                        .push(zap_capabilities::session::PartialToolCall {
+                            index: u32::try_from(self.partial_tools.len()).unwrap_or(u32::MAX),
+                            id: Some(call.id.clone()),
+                            name: Some(call.name.clone()),
+                            arguments: call.arguments.clone(),
+                        });
+                }
+                self.maybe_save_partial();
                 self.end_streaming_part();
                 self.project_tool_started(call)
+            }
+            Agent::ToolCallStreaming {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
+                let argument_len = arguments.len();
+                if let Some(existing) = self
+                    .partial_tools
+                    .iter_mut()
+                    .find(|tool| tool.index == index)
+                {
+                    if id.is_some() {
+                        existing.id = id;
+                    }
+                    if name.is_some() {
+                        existing.name = name;
+                    }
+                    existing.arguments.push_str(&arguments);
+                } else {
+                    self.partial_tools
+                        .push(zap_capabilities::session::PartialToolCall {
+                            index,
+                            id,
+                            name,
+                            arguments,
+                        });
+                }
+                self.partial_bytes_since_save =
+                    self.partial_bytes_since_save.saturating_add(argument_len);
+                self.maybe_save_partial();
+                Vec::new()
             }
             Agent::ToolProgress { call_id, message } => {
                 if let Some(progress) = message.strip_prefix('\u{1e}') {
@@ -8204,6 +14345,10 @@ impl ChatRuntimeProjector {
                     }]
                 }
             }
+            Agent::ToolFinished { call_id, is_error } => vec![ChatEvent::ToolFinished {
+                id: call_id,
+                success: !is_error,
+            }],
             Agent::ToolResult { result } => {
                 let (name, started) = self
                     .live_tools
@@ -8234,9 +14379,24 @@ impl ChatRuntimeProjector {
                 self.last_error = Some(message.clone());
                 // Agent errors are diagnostics until the runtime emits TurnFinished.
                 // Emitting a terminal HTTP error here would create Error + Done for one turn.
-                vec![ChatEvent::Warning { message }]
+                vec![ChatEvent::Warning {
+                    message,
+                    message_id: self.notice_anchor(),
+                }]
             }
-            Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::Warning(message) => {
+                // Liveness / retry advisories are TRANSIENT: they belong to the
+                // live turn, not the durable transcript. Persisting them here put
+                // them at the end of display.jsonl (assistant rounds are flushed
+                // only at turn_complete), where every later refresh rendered
+                // them below the final answer. Keep only the live wire event;
+                // durable boundary notices use `Compacted`/`DisplayNotice`.
+                let localized = localize_agent_warning(&message);
+                vec![ChatEvent::Warning {
+                    message: localized,
+                    message_id: self.notice_anchor(),
+                }]
+            }
             Agent::RateLimited {
                 reset_at_display,
                 reset_label,
@@ -8249,26 +14409,33 @@ impl ChatRuntimeProjector {
                 secs_until_reset,
                 auto_resuming,
                 server_message,
+                message_id: self.notice_anchor(),
             }],
             Agent::Steered { count, inputs } => {
+                let anchor_message_id = self.current_message_id.clone();
                 let mut events = Vec::new();
                 if let Some(event) = self.finish() {
                     events.push(event);
                 }
+                if let Some(last_id) = inputs.last().and_then(|input| input.message_id.clone()) {
+                    self.current_user_message_id = Some(last_id);
+                }
+                self.current_message_id = None;
+                self.part_seq = 0;
+                self.part_rev = 0;
+                self.last_part_kind = None;
+                self.reset_partial_stream();
                 events.push(ChatEvent::Steered {
                     count,
                     inputs,
                     client_input_ids: Vec::new(),
+                    timestamps: Vec::new(),
+                    anchor_message_id,
                 });
                 events
             }
             Agent::CompactionStarted { .. } => {
-                crate::publish_global(crate::GlobalWireEvent::Activity {
-                    session_id: session_id.to_string(),
-                    running: true,
-                    terminal: None,
-                    status: Some("compacting".to_string()),
-                });
+                crate::note_compaction_started(session_id, crate::COMPACTION_OWNER_TURN);
                 vec![ChatEvent::SessionStatus {
                     session_id: session_id.to_string(),
                     status: "compacting".to_string(),
@@ -8281,33 +14448,38 @@ impl ChatRuntimeProjector {
                 committed: true,
                 ..
             } => {
-                crate::publish_global(crate::GlobalWireEvent::Activity {
-                    session_id: session_id.to_string(),
-                    running: true,
-                    terminal: None,
-                    status: None,
-                });
+                crate::finish_compaction_phase(session_id, crate::COMPACTION_OWNER_TURN, true);
                 let est_before = (bytes_before as f32 / 3.5).ceil() as usize;
                 let est_after = (bytes_after as f32 / 3.5).ceil() as usize;
+                let mark =
+                    zap_config::i18n::format_compaction_mark(removed, est_before, est_after);
+                let notice_event = match persist_session_display_notice(session_id, &mark, None) {
+                    Some(record) => ChatEvent::DisplayNotice {
+                        session_id: session_id.to_string(),
+                        id: record.id.unwrap_or_default(),
+                        display_seq: record.seq,
+                        text: record.content,
+                        created_at: record.created_at,
+                    },
+                    None => ChatEvent::Warning {
+                        message: mark,
+                        message_id: self.notice_anchor(),
+                    },
+                };
                 vec![
                     ChatEvent::SessionStatus {
                         session_id: session_id.to_string(),
                         status: "running".to_string(),
                     },
-                    ChatEvent::Warning {
-                        message: zap_config::i18n::format_compaction_mark(
-                            removed, est_before, est_after,
-                        ),
+                    notice_event,
+                    ChatEvent::ContextCompacted {
+                        session_id: session_id.to_string(),
+                        tokens: est_after as u32,
                     },
                 ]
             }
             Agent::CompactionFailed { error, .. } => {
-                crate::publish_global(crate::GlobalWireEvent::Activity {
-                    session_id: session_id.to_string(),
-                    running: true,
-                    terminal: None,
-                    status: None,
-                });
+                crate::finish_compaction_phase(session_id, crate::COMPACTION_OWNER_TURN, true);
                 vec![
                     ChatEvent::SessionStatus {
                         session_id: session_id.to_string(),
@@ -8315,11 +14487,22 @@ impl ChatRuntimeProjector {
                     },
                     ChatEvent::Warning {
                         message: format!("Compaction failed: {error}"),
+                        message_id: self.notice_anchor(),
                     },
                 ]
             }
+            // A no-op / refused compaction still announced `CompactionStarted`; clear
+            // the "compacting" status so the driver does not stay stuck on it.
+            Agent::Compacted {
+                committed: false, ..
+            } => {
+                crate::finish_compaction_phase(session_id, crate::COMPACTION_OWNER_TURN, true);
+                vec![ChatEvent::SessionStatus {
+                    session_id: session_id.to_string(),
+                    status: "running".to_string(),
+                }]
+            }
             Agent::TurnStarted
-            | Agent::ToolCallStreaming { .. }
             | Agent::ToolBatchCompleted { .. }
             | Agent::Request { .. }
             | Agent::Snapshot { .. }
@@ -8395,6 +14578,199 @@ impl ChatRuntimeProjector {
     }
 }
 
+/// How a new turn is admitted when the session already owns a running turn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChatAdmissionMode {
+    /// Native /chat: reject with 409 instead of stopping another turn.
+    RejectIfBusy,
+    /// Compat /v1/*: latest-wins. Stop the running turn, wait for its
+    /// snapshot/display flush, then admit this one.
+    Preempt { timeout: Duration },
+}
+
+/// One admitted turn plus the transport-neutral event stream. Both `/chat` and
+/// the OpenAI/Anthropic compat surfaces MUST come through here; this is the
+/// single "user clicked send" boundary.
+pub(crate) struct AdmittedChatTurn {
+    pub request: ChatRequest,
+    pub operation_id: String,
+    pub session_id: String,
+    pub client_input_id: String,
+    pub cancellation: CancellationToken,
+    pub rx: mpsc::UnboundedReceiver<ChatEvent>,
+    pub fan_tx: mpsc::UnboundedSender<ChatEvent>,
+    pub terminal_sent: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Persist the admitted prompt before any model request. This is the exact
+/// behavior of a WebUI send: the prompt gets an identity, an input-log row and
+/// a display admission row even if the client disconnects before the first frame.
+fn persist_admitted_user(request: &ChatRequest, session_id: &str, client_input_id: &str) {
+    let created_at = u64::try_from(zap_capabilities::session::now_ms()).unwrap_or(0);
+    let mut input = zap_capabilities::session::SessionInput {
+        id: client_input_id.to_string(),
+        seq: 0,
+        session_id: session_id.to_string(),
+        delivery: "prompt".into(),
+        status: "admitted".into(),
+        text: request.message.clone(),
+        images: request
+            .images
+            .iter()
+            .map(|image| zap_kernel::message::ImageContent {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            })
+            .collect(),
+        created_at,
+        message_id: Some(client_input_id.to_string()),
+        operation_id: Some(client_input_id.to_string()),
+    };
+    if let Err(error) = zap_capabilities::session::inputs::append_global(&mut input) {
+        tracing::warn!(
+            session_id = %session_id,
+            client_input_id = %client_input_id,
+            error = %error,
+            "chat admission: input log append failed"
+        );
+    }
+
+    let bucket = if let Some(dir) = request.working_dir.as_deref() {
+        NativeSessionManager::project_hash(dir)
+    } else if let Ok(Some(resolved)) = resolve_session_by_id(session_id) {
+        resolved.project_hash
+    } else {
+        String::new()
+    };
+    if bucket.is_empty() {
+        return;
+    }
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&bucket));
+    let display_images: Vec<zap_capabilities::session::DisplayImage> = request
+        .images
+        .iter()
+        .map(|image| zap_capabilities::session::DisplayImage {
+            media_type: image.media_type.clone(),
+            data: image.data.clone(),
+            missing: false,
+        })
+        .collect();
+    if let Err(error) = manager.append_display_user(
+        session_id,
+        client_input_id,
+        &request.message,
+        &display_images,
+        Some(created_at),
+    ) {
+        tracing::warn!(
+            session_id = %session_id,
+            client_input_id = %client_input_id,
+            error = %error,
+            "chat admission: display admission append failed"
+        );
+    }
+}
+
+/// The one admission pipeline for every chat transport.
+///
+/// It mints the internal identity when the wire did not provide one, admits the
+/// ActiveChat operation, persists the prompt before the model runs, and returns
+/// the fan-out stream the transport should project.
+pub(crate) async fn admit_chat_turn(
+    state: &AppState,
+    mut request: ChatRequest,
+    mode: ChatAdmissionMode,
+    occupancy: Option<String>,
+) -> Result<AdmittedChatTurn, ActiveChatAdmissionError> {
+    if request
+        .session_id
+        .as_deref()
+        .map_or(true, |session_id| session_id.trim().is_empty())
+    {
+        request.session_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let session_id = request
+        .session_id
+        .clone()
+        .expect("session id was just ensured");
+
+    // Identity is minted HERE, never at the wire boundary. Compat endpoints do
+    // not (and should not) require a request_id from third-party clients.
+    let client_input_id = request
+        .request_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(zap_kernel::message::new_message_id);
+    request.request_id = Some(client_input_id.clone());
+
+    let admission = match mode {
+        ChatAdmissionMode::RejectIfBusy => {
+            state
+                .active_chats
+                .admit_occupied(
+                    Some(session_id.clone()),
+                    Some(client_input_id.clone()),
+                    occupancy.clone(),
+                )
+                .await
+        }
+        ChatAdmissionMode::Preempt { timeout } => {
+            state
+                .active_chats
+                .clone()
+                .admit_or_preempt(
+                    Some(session_id.clone()),
+                    Some(client_input_id.clone()),
+                    occupancy.clone(),
+                    timeout,
+                )
+                .await
+        }
+    }?;
+
+    persist_admitted_user(&request, &session_id, &client_input_id);
+
+    let (client_tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+    let event_bus = state
+        .active_chats
+        .event_bus(&admission.operation_id)
+        .await
+        .expect("just admitted operation always has an event bus");
+    let replay = state
+        .active_chats
+        .event_bus_with_replay(&admission.operation_id)
+        .await
+        .map(|(_, replay)| replay);
+    let fan_tx = fanout_chat_events_for_session(
+        client_tx,
+        event_bus,
+        replay,
+        Some(session_id.clone()),
+        request.working_dir.clone(),
+    );
+
+    tracing::info!(
+        session_id = %session_id,
+        client_input_id = %client_input_id,
+        operation_id = %admission.operation_id,
+        occupancy = occupancy.as_deref().unwrap_or(""),
+        preempt = matches!(mode, ChatAdmissionMode::Preempt { .. }),
+        "chat admission: turn admitted"
+    );
+
+    Ok(AdmittedChatTurn {
+        request,
+        operation_id: admission.operation_id,
+        session_id,
+        client_input_id,
+        cancellation: admission.cancellation,
+        rx,
+        fan_tx,
+        terminal_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    })
+}
+
 /// POST /chat - Stream chat response with SSE
 async fn chat_stream(
     State(state): State<AppState>,
@@ -8402,90 +14778,20 @@ async fn chat_stream(
     headers: axum::http::HeaderMap,
     Json(mut req): Json<ChatRequest>,
 ) -> axum::response::Response {
-    // Ensure a valid session_id exists ahead of admission so RPC response and event bus always bind cleanly.
-    if req
-        .session_id
-        .as_deref()
-        .map_or(true, |s| s.trim().is_empty())
-    {
-        req.session_id = Some(uuid::Uuid::new_v4().to_string());
-    }
-
-    // Parse session UUID for telemetry scope
-    let session_uuid = req
-        .session_id
-        .as_deref()
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
-
     // Use current project working directory if not specified
-    if let Some(ref dir) = req.working_dir {
-        if dir.as_os_str().is_empty() || dir.to_string_lossy() == "__global__" {
-            req.working_dir = Some(global_standalone_workspace());
-        }
-    } else {
+    if req.working_dir.is_none() {
         let project = state.project.read().await;
         req.working_dir = Some(project.working_dir.clone());
     }
 
-    let admission = match state
-        .active_chats
-        .admit(req.session_id.as_deref(), req.request_id.as_deref())
-        .await
-    {
-        Ok(admission) => admission,
-        Err(error) => {
-            let (code, message) = match error {
-                ActiveChatAdmissionError::SessionBusy => (
-                    "session_busy",
-                    "This session already has an active chat operation",
-                ),
-                ActiveChatAdmissionError::RequestBusy => (
-                    "request_busy",
-                    "This request id already has an active chat operation",
-                ),
-            };
-            return (
-                StatusCode::CONFLICT,
-                Json(ApiError {
-                    success: false,
-                    error: message.to_string(),
-                    code: Some(code.to_string()),
-                    retryable: Some(true),
-                }),
-            )
-                .into_response();
+    // Expand user-invoked command templates (`/name args`) before the message is
+    // persisted or sent to the model. Skills are never expanded here.
+    if let Some(dir) = req.working_dir.as_deref() {
+        if let Some(rendered) = render_user_command(dir, &req.message) {
+            req.message = rendered;
         }
-    };
+    }
 
-    let (client_tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
-    let operation_id = admission.operation_id.clone();
-    let cancel_token = admission.cancellation;
-    let event_bus = state
-        .active_chats
-        .event_bus(&admission.operation_id)
-        .await
-        .expect("just admitted operation always has an event bus");
-    // Fan-out so /chat/watch (WebUI reattach) sees the same events as this SSE,
-    // including a full replay log for mid-turn page refresh.
-    let replay = state
-        .active_chats
-        .event_bus_with_replay(&admission.operation_id)
-        .await
-        .map(|(_, r)| r);
-    let fan_tx = fanout_chat_events_for_session(
-        client_tx.clone(),
-        event_bus,
-        replay,
-        req.session_id.clone(),
-        req.working_dir.clone(),
-    );
-
-    // Clone state for the spawned task
-    let active_chats = state.active_chats.clone();
-    let mcp_pool = state.mcp_pool.clone();
-    let telemetry = state.telemetry.clone();
-    let pending_permissions = state.pending_permissions.clone();
-    let pending_user_inputs = state.pending_user_inputs.clone();
     // POST /chat is always a *native* owner turn (WebUI / channel / IDE).
     // Observers of API turns use GET /chat/watch and do not enter here.
     // YOLO forces automation on every surface; otherwise honor native UX.
@@ -8511,6 +14817,50 @@ async fn chat_stream(
         "chat_stream: native turn policy"
     );
 
+    let admitted = match admit_chat_turn(&state, req, ChatAdmissionMode::RejectIfBusy, None).await {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            let (code, message) = match error {
+                ActiveChatAdmissionError::SessionBusy => (
+                    "session_busy",
+                    "This session already has an active chat operation",
+                ),
+                ActiveChatAdmissionError::RequestBusy => (
+                    "request_busy",
+                    "This request id already has an active chat operation",
+                ),
+            };
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    success: false,
+                    error: message.to_string(),
+                    code: Some(code.to_string()),
+                    retryable: Some(true),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let AdmittedChatTurn {
+        request: req,
+        operation_id,
+        session_id,
+        client_input_id: _,
+        cancellation: cancel_token,
+        rx,
+        fan_tx,
+        terminal_sent,
+    } = admitted;
+    let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
+
+    // Clone state for the spawned task
+    let active_chats = state.active_chats.clone();
+    let mcp_pool = state.mcp_pool.clone();
+    let telemetry = state.telemetry.clone();
+    let pending_permissions = state.pending_permissions.clone();
+    let pending_user_inputs = state.pending_user_inputs.clone();
+
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
     // startup-time cached value), because the user may switch projects via /cd.
@@ -8528,12 +14878,15 @@ async fn chat_stream(
 
     let chat_session_id = session_uuid.map(|u| u.to_string()).unwrap_or_default();
     let task_session_id = chat_session_id.clone();
+    // Client correlation id (= persisted user message id). Stamped on terminal
+    // frames so a late `done`/`stopped` from a displaced turn can be ignored by
+    // the browser instead of clearing the replacement turn's busy state.
+    let stream_operation_id = req.request_id.clone();
     let cleanup_op = operation_id.clone();
     let rpc_op_id = operation_id.clone();
     let rpc_sid = chat_session_id.clone();
     let cleanup_chats = active_chats.clone();
     let inner_event_tx = fan_tx.clone();
-    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let inner_terminal_sent = terminal_sent.clone();
 
     tokio::spawn(async move {
@@ -8553,6 +14906,8 @@ async fn chat_stream(
                     interactive_user_input,
                     inner_terminal_sent,
                     false,
+                    // YOLO/native policy wins over the WebUI global switch.
+                    policy.force_approval_mode,
                 )
                 .await
             })
@@ -8596,7 +14951,12 @@ async fn chat_stream(
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let stream_session_id = chat_session_id.clone();
+    let stream_operation_id = stream_operation_id.clone();
     let stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        let terminal = matches!(
+            &event,
+            ChatEvent::Done { .. } | ChatEvent::Stopped | ChatEvent::Error { .. }
+        );
         let mut val = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
         if let serde_json::Value::Object(ref mut map) = val {
             if !map.contains_key("session_id") {
@@ -8604,6 +14964,14 @@ async fn chat_stream(
                     "session_id".to_string(),
                     serde_json::Value::String(stream_session_id.clone()),
                 );
+            }
+            if terminal {
+                if let Some(operation_id) = stream_operation_id.as_deref() {
+                    map.insert(
+                        "operation_id".to_string(),
+                        serde_json::Value::String(operation_id.to_string()),
+                    );
+                }
             }
         }
         let json = serde_json::to_string(&val).unwrap_or_default();
@@ -8653,6 +15021,7 @@ async fn finalize_chat_task(
         Ok(Err(e)) => {
             let _ = event_tx.send(ChatEvent::Error {
                 message: e.to_string(),
+                message_id: None,
             });
         }
         Err(join_error) => {
@@ -8664,6 +15033,7 @@ async fn finalize_chat_task(
             );
             let _ = event_tx.send(ChatEvent::Error {
                 message: "chat task failed".into(),
+                message_id: None,
             });
             if !terminal_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 let session_id = cleanup_chats
@@ -8671,6 +15041,7 @@ async fn finalize_chat_task(
                     .await
                     .unwrap_or_else(|| requested_session_id.to_string());
                 let _ = event_tx.send(ChatEvent::Done {
+                    message_id: None,
                     tokens: 0,
                     tool_calls: 0,
                     session_id,
@@ -8680,7 +15051,49 @@ async fn finalize_chat_task(
             }
         }
     }
+    let session_id = cleanup_chats
+        .session_id(cleanup_operation_id)
+        .await
+        .unwrap_or_else(|| requested_session_id.to_string());
     cleanup_chats.complete(cleanup_operation_id).await;
+    if cleanup_chats.steer_sender(&session_id).await.is_none() {
+        reconcile_stale_steer_queue(&session_id).await;
+    }
+}
+
+/// Whether the last conversation row is a real, non-empty user turn. Every
+/// driver must satisfy this before starting a runtime; an empty prompt is a
+/// transport/admission bug, never a valid model turn.
+fn turn_input_is_real_user_message(message: &zap_kernel::message::Message) -> bool {
+    message.role == zap_kernel::message::Role::User
+        && !message.synthetic
+        && (!message.text.trim().is_empty() || !message.images.is_empty())
+}
+
+#[cfg(test)]
+mod admission_identity_tests {
+    use super::turn_input_is_real_user_message;
+    use zap_kernel::message::Message;
+
+    #[test]
+    fn synthetic_and_empty_rows_never_start_a_turn() {
+        let mut synthetic = Message::user("<available_skills>");
+        synthetic.synthetic = true;
+        assert!(!turn_input_is_real_user_message(&synthetic));
+
+        let empty = Message::user("   ");
+        assert!(!turn_input_is_real_user_message(&empty));
+
+        let assistant = Message::assistant("previous answer", Vec::new());
+        assert!(!turn_input_is_real_user_message(&assistant));
+    }
+
+    #[test]
+    fn a_real_user_prompt_is_valid_even_without_a_caller_id() {
+        let real = Message::user("Q2: continue");
+        assert!(real.id.is_none());
+        assert!(turn_input_is_real_user_message(&real));
+    }
 }
 
 /// Process a chat request and stream events
@@ -8700,9 +15113,15 @@ pub(crate) async fn process_chat_request(
     interactive_user_input: bool,
     terminal_sent: Arc<std::sync::atomic::AtomicBool>,
     keep_raw_markdown: bool,
+    // 策略强制的审批模式（API / YOLO）。非空时压过一切：包括全局开关与会话级
+    // 模式，保证 `/v1/*` 等 API 端点不受 WebUI 全局开关影响。
+    forced_approval_mode: Option<crate::approval_mode::ApprovalMode>,
 ) -> anyhow::Result<()> {
-    let approval_mode =
-        effective_chat_approval_mode_scoped(req.approval_mode, req.session_id.as_deref());
+    let approval_mode = resolve_turn_approval_mode(
+        forced_approval_mode,
+        req.approval_mode,
+        req.session_id.as_deref(),
+    );
     // Load config
     let config = zap_config::ConfigStore::default_store().read()?.config;
     zap_config::proxy::apply_process_proxy_config(&config.network.proxy);
@@ -8721,10 +15140,9 @@ pub(crate) async fn process_chat_request(
     });
 
     // Get working directory
-    let mut working_dir = match req.working_dir {
-        Some(dir) if !dir.as_os_str().is_empty() && dir.to_string_lossy() != "__global__" => dir,
-        _ => global_standalone_workspace(),
-    };
+    let mut working_dir = req
+        .working_dir
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let (session_id, initial_messages, is_new_session) =
         if let Some(ref session_id_str) = req.session_id {
@@ -8773,9 +15191,17 @@ pub(crate) async fn process_chat_request(
         } else {
             (uuid::Uuid::new_v4().to_string(), Vec::new(), true)
         };
+    let is_first_turn_for_default = is_new_session || initial_messages.is_empty();
     active_chats
         .bind_session(&operation_id, &session_id)
         .await?;
+    let initial_preferred = if is_new_session {
+        crate::native_live::take_session_draft_provider(&session_id)
+            .or_else(|| Some(provider_name.clone()))
+    } else {
+        live_api::persist_session_preferred_model(&working_dir, &session_id, &provider_name);
+        None
+    };
     publish_chat_session_assignment(
         &working_dir,
         &session_id,
@@ -8783,6 +15209,7 @@ pub(crate) async fn process_chat_request(
         &event_tx,
         req.session_title.as_deref(),
         Some(&req.message),
+        initial_preferred.as_deref(),
     )?;
     if !is_new_session
         && req
@@ -8791,7 +15218,7 @@ pub(crate) async fn process_chat_request(
             .map(str::trim)
             .is_some_and(|title| !title.is_empty())
     {
-        mark_protocol_origin(&working_dir, &session_id);
+        mark_protocol_origin(&working_dir, &session_id, req.session_title.as_deref());
     }
 
     // AI session title is owned exclusively by CodingRuntime (first-submit
@@ -8823,13 +15250,21 @@ pub(crate) async fn process_chat_request(
                 data: i.data.clone(),
             })
             .collect();
+        let base_message = if req.message.contains("[jeikcode-steer]")
+            && !steer_prompt::is_steer_wrapped(&req.message)
+        {
+            let clean = req.message.replace("[jeikcode-steer]", "");
+            steer_prompt::compose_steer_text(&clean)
+        } else {
+            req.message.clone()
+        };
         let runtime_text = live_api::preprocess_image_caption(
             &config,
             &provider_config.model,
             &working_dir,
             telemetry.clone(),
             Some(&session_id),
-            &req.message,
+            &base_message,
             &images,
         )
         .await;
@@ -8838,14 +15273,52 @@ pub(crate) async fn process_chat_request(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let display_images: Vec<ImageData> = images
+            .iter()
+            .map(|i| ImageData {
+                media_type: i.media_type.clone(),
+                data: i.data.clone(),
+                missing: false,
+            })
+            .collect();
         let mut conv = conversation.lock().await;
+        // Per-token crash recovery: if the previous process died mid-stream, the
+        // canonical snapshot stops at the last round boundary. Overlay the
+        // partial assistant content now, BEFORE the new user prompt, so the next
+        // turn continues with the interrupted context instead of starting over.
+        if let Some(partial) = zap_capabilities::session::partial::load_global(&session_id) {
+            let _ = overlay_partial_stream(&mut conv, &partial);
+            // Keep the sidecar until Agent::UserMessage archives it; clearing on
+            // a read/resume attachment loses the half answer before display flushes.
+        }
         let mut user_msg = if images.is_empty() {
             Message::user(runtime_text.clone())
         } else {
             Message::user_with_images(runtime_text.clone(), images)
         };
         user_msg.created_at_ms = created_at;
+        user_msg.id = req.request_id.clone();
+        // 一条真实用户提问就是一条历史行。兼容端点的 request_id 是 None，
+        // 而 None 不是身份；这里绝不能把 None 当成“已存在”的匹配键。
+        // 内核 Conversation::push 已经对 Some(id) 的真实用户消息幂等，
+        // daemon 侧不再重复实现一层去重。
         conv.push(user_msg);
+        // 输入准入硬不变量：任何真实回合都必须从一条非空 user 行开始。
+        // 一旦上游把提问丢掉，这里立刻失败，而不是让模型对着空 prompt 复读问候。
+        let admitted_turn_is_valid = conv
+            .last()
+            .is_some_and(|message| turn_input_is_real_user_message(message));
+        if !admitted_turn_is_valid {
+            anyhow::bail!(
+                "refusing to start a turn without a real user message (session {session_id})"
+            );
+        }
+        // 会话历史只有一个写入方——内核。这里只把刚受理的提问放进**本回合的内存投影**
+        // （`run_chat_turn_v2` 依赖它取 prefix/正文，早停路径也据此落盘），绝不提前写
+        // canonical `.snapshot`：运行时会以 `Resume` 语义从该快照起步，随后又 submit
+        // 同一条提问，于是同 id 的用户消息在历史里存了两条（第二条才被追加
+        // `<system-reminder>` 日期），一条提问直接翻倍 token。
+        // 中途刷新/崩溃恢复由内核的 inflight 快照 + `/chat/watch` 的 admitted 回放兜住。
         drop(conv);
         // Emit the admitted user message to the fan-out bus so `/chat/watch`
         // observers (WebUI detached) render it in real time, instead of only
@@ -8854,19 +15327,46 @@ pub(crate) async fn process_chat_request(
         // Record it FIRST: broadcast has no replay window, so late watchers
         // (connected after this send) get the message back from
         // `chat_watch`'s Live replay. A watcher attaching between the record
-        // and the send may receive both — the WebUI dedups identical user text.
+        // and the send may receive both — the WebUI dedups it by the echoed
+        // client correlation id (text matching only as a legacy fallback).
         let created_at = (created_at > 0).then_some(created_at);
+        // Server-owned display text: the live echo must not make every client
+        // re-parse the steer envelope / reminders / VL annotation.
+        let display_text = {
+            let (display, _) = strip_vision_marker(
+                &zap_capabilities::session::user_text_for_display(&working_dir, &runtime_text),
+            );
+            display
+        };
         active_chats
-            .record_user_message(&operation_id, runtime_text.clone(), created_at)
+            .record_user_message(
+                &operation_id,
+                runtime_text.clone(),
+                display_text.clone(),
+                created_at,
+                display_images.clone(),
+            )
             .await;
-        let _ = event_tx.send(ChatEvent::User {
+        // 回传客户端关联键（`/chat` 的 `request_id`）：发送端据此按身份认领自己的
+        // 乐观气泡，无需要靠文本比对（文本只作 legacy / 无 id 的兜底）。
+        let client_input_id = active_chats
+            .admitted_user_message(&operation_id)
+            .await
+            .and_then(|admitted| admitted.client_input_id);
+        let user_event = ChatEvent::User {
             content: runtime_text,
+            display_text: Some(display_text),
+            internal: Some(false),
+            editable: Some(true),
             session_id: Some(session_id.clone()),
             created_at,
-            message_id: None,
+            message_id: client_input_id.clone(),
             order: None,
             turn_ordinal: None,
-        });
+            client_input_id,
+            images: (!display_images.is_empty()).then_some(display_images),
+        };
+        let _ = event_tx.send(user_event);
     }
     // Interactive approval bridged over HTTP: interactive local clients (WebUI,
     // channel, VSCode, JetBrains) in Build and Accept Edits modes route
@@ -8924,6 +15424,7 @@ pub(crate) async fn process_chat_request(
         let shared_mcp_reg = Some(mcp_pool.registry(&working_dir).await);
         let mut runtime_cfg =
             live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry.clone());
+        live_api::apply_session_effort_override(&mut runtime_cfg, &working_dir, Some(&session_id));
         runtime_cfg.shared_mcp_registry = shared_mcp_reg;
         runtime_cfg.extra_system_append = req.extra_system_append.clone();
         runtime_cfg.session_display_name = req.session_title.clone();
@@ -8945,6 +15446,11 @@ pub(crate) async fn process_chat_request(
         let runtime_user_inputs = pending_user_inputs.clone();
         let (steer_tx, steer_rx) = mpsc::unbounded_channel();
         active_chats.install_steer(&operation_id, steer_tx).await;
+        // 本回合的客户端关联键 = 落盘消息 id：在 spawn 之前取出，供内核沿用。
+        let turn_client_input_id = active_chats
+            .admitted_user_message(&operation_id)
+            .await
+            .and_then(|admitted| admitted.client_input_id);
         tokio::spawn(async move {
             CurrentContext::scope(tel_ctx, || async move {
                 live_api::run_chat_turn_v2(
@@ -8962,6 +15468,7 @@ pub(crate) async fn process_chat_request(
                     },
                     approval_mode,
                     steer_rx,
+                    turn_client_input_id,
                 )
                 .await;
             })
@@ -8973,20 +15480,91 @@ pub(crate) async fn process_chat_request(
         keep_raw_markdown,
         ..ChatRuntimeProjector::default()
     };
+    let mut first_ttft_promoted = false;
+    let effective_provider_for_default = provider_name.clone();
+    let opening_client_input_id = active_chats
+        .admitted_user_message(&operation_id)
+        .await
+        .and_then(|admitted| admitted.client_input_id);
+
     while let Some(event) = runtime_event_rx.recv().await {
         for mut chat_event in projector.project_runtime(event, &perm_session_key) {
+            if !first_ttft_promoted && is_first_turn_for_default {
+                if matches!(
+                    chat_event,
+                    ChatEvent::TextDelta { .. }
+                        | ChatEvent::ReasoningDelta { .. }
+                        | ChatEvent::ToolCallStarted { .. }
+                        | ChatEvent::ToolBatchStarted { .. }
+                ) {
+                    first_ttft_promoted = true;
+                    let target_prov = effective_provider_for_default.clone();
+                    let _ = zap_config::ConfigStore::default_store().update(|cfg| {
+                        if cfg.selection_exists(&target_prov) {
+                            cfg.default_model = Some(target_prov.clone());
+                            cfg.default_provider = target_prov.clone();
+                        }
+                        Ok(())
+                    });
+                    publish_global(GlobalWireEvent::ConfigReloaded);
+                }
+            }
             // Echo the recorded client correlation ids on a steer fold, so the
             // WebUI can reconcile an in-flight steer (id → persisted message).
             if let ChatEvent::Steered {
                 count,
+                inputs,
                 client_input_ids,
+                timestamps,
                 ..
             } = &mut chat_event
             {
                 if client_input_ids.is_empty() {
-                    *client_input_ids = active_chats
-                        .take_steer_client_ids(&operation_id, *count)
+                    let (ids, ts) = active_chats
+                        .take_steer_metadata_for_inputs(&operation_id, *count, inputs)
                         .await;
+                    *client_input_ids = ids;
+                    *timestamps = ts;
+                }
+            }
+            // Natural turn-end steer drain (`drain_pending`): the kernel emits
+            // `UserMessage` (`UserIdentified`) without `Steered`. Synthesize
+            // `Steered` from the durable input record so remote observers that
+            // do not hold the local queue card still paint the steered bubble.
+            if let ChatEvent::UserIdentified { ref message_id, .. } = chat_event {
+                if opening_client_input_id.as_deref() != Some(message_id.as_str()) {
+                    if let Some(steered_input) =
+                        zap_capabilities::session::inputs::list_global(&perm_session_key)
+                            .into_iter()
+                            .rev()
+                            .find(|item| item.id == *message_id && item.delivery == "steer")
+                    {
+                        let k_input = zap_kernel::event::SteeredInput {
+                            text: steered_input.text,
+                            images: steered_input.images,
+                            message_id: Some(message_id.clone()),
+                        };
+                        let inputs_slice = std::slice::from_ref(&k_input);
+                        let (ids, ts) = active_chats
+                            .take_steer_metadata_for_inputs(&operation_id, 1, inputs_slice)
+                            .await;
+                        let effective_ts = if ts.first().copied().flatten().is_some() {
+                            ts
+                        } else {
+                            vec![(steered_input.created_at > 0).then_some(steered_input.created_at)]
+                        };
+                        let _ = event_tx.send(ChatEvent::Steered {
+                            count: 1,
+                            inputs: vec![k_input],
+                            client_input_ids: if ids.is_empty() {
+                                vec![Some(message_id.clone())]
+                            } else {
+                                ids
+                            },
+                            timestamps: effective_ts,
+                            anchor_message_id: projector.current_message_id.clone(),
+                        });
+                    }
                 }
             }
             if matches!(
@@ -8994,7 +15572,9 @@ pub(crate) async fn process_chat_request(
                 ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
             ) {
                 terminal_sent.store(true, std::sync::atomic::Ordering::Release);
-                active_chats.mark_terminal(&operation_id).await;
+                // Record the terminal frame on the session before the flag becomes
+                // visible, so a watcher attaching right now can always be told.
+                active_chats.mark_terminal(&operation_id, &chat_event).await;
             }
             let _ = event_tx.send(chat_event);
         }
@@ -9010,7 +15590,10 @@ pub(crate) async fn process_chat_request(
             .last_error
             .clone()
             .unwrap_or_else(|| "coding runtime event stream closed before turn terminal".into());
-        let _ = event_tx.send(ChatEvent::Error { message });
+        let _ = event_tx.send(ChatEvent::Error {
+            message,
+            message_id: None,
+        });
     }
 
     // The native runtime owns turn boundaries, mid-turn cancel cleanup
@@ -9035,13 +15618,23 @@ pub(crate) async fn process_chat_request(
 /// they were loaded above. Keeping persistence and notification in one helper
 /// prevents clients from binding an id that a later request cannot resume.
 ///
-/// `session_title`: OpenAI/Anthropic `user` (or `"default"` when omitted). When
-/// set, the durable display name is that title with `user_renamed=true` so
-/// first-prompt auto-naming does not overwrite it.
-fn mark_protocol_origin(working_dir: &std::path::Path, session_id: &str) {
+/// `session_title`: OpenAI/Anthropic `user` (or an ephemeral `api-<uuid>` when
+/// omitted). When set, the durable display name is that title with
+/// `user_renamed=true` so first-prompt auto-naming does not overwrite it. The
+/// same value is stored as the immutable `protocol_key`.
+fn mark_protocol_origin(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    protocol_key: Option<&str>,
+) {
     let manager = NativeSessionManager::for_project(working_dir);
     let _ = manager.update_meta(session_id, |meta| {
         meta.origin = zap_capabilities::session::SessionOrigin::Protocol;
+        if let Some(key) = protocol_key.map(str::trim).filter(|key| !key.is_empty()) {
+            if meta.protocol_key.is_none() {
+                meta.protocol_key = Some(key.to_string());
+            }
+        }
     });
 }
 
@@ -9052,6 +15645,7 @@ fn publish_chat_session_assignment(
     event_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_title: Option<&str>,
     first_user_prompt: Option<&str>,
+    preferred_model: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut provisional_name = None;
     if is_new_session {
@@ -9064,12 +15658,26 @@ fn publish_chat_session_assignment(
             now,
         );
         meta.owner = zap_capabilities::session::StorageOwner::Native;
+        meta.preferred_model = preferred_model.map(str::to_string);
+        let has_protocol_title = session_title
+            .map(str::trim)
+            .is_some_and(|title| !title.is_empty());
+        // Protocol sessions are automation-owned: their durable mode is Auto.
+        // Native WebUI sessions keep the live session/global mode.
+        meta.approval_mode = Some(if has_protocol_title {
+            crate::approval_mode::ApprovalMode::Auto.wire().to_string()
+        } else {
+            live_api::live_session_approval_mode(Some(session_id))
+                .wire()
+                .to_string()
+        });
         meta.message_count = 1;
         if let Some(title) = session_title.map(str::trim).filter(|t| !t.is_empty()) {
             meta.name = title.to_string();
-            // Pin API / client-provided titles (including the stable "default"
-            // key) so turn-complete auto-name and AI naming leave them alone.
+            // Pin API / client-provided titles (including ephemeral api-<uuid>
+            // keys) so turn-complete auto-name and AI naming leave them alone.
             meta.user_renamed = true;
+            meta.protocol_key = Some(title.to_string());
             meta.origin = zap_capabilities::session::SessionOrigin::Protocol;
         } else if let Some(provisional) = first_user_prompt
             .and_then(zap_coding::session_title::provisional_title_from_user_input)
@@ -9130,12 +15738,28 @@ struct StopChatResponse {
 
 /// One `/chat/watch` replay frame.
 ///
-/// `seq` is the frame's position in the turn replay buffer (the resume cursor).
-/// Only REPLAYED frames carry it: a frame without `seq` is a live delta and is
-/// always new to the client. The browser stores the highest `seq` it applied and
-/// sends it back as `after_seq` on reconnect, so a reconnect never re-paints what
-/// is already on screen (and never has to guess by content).
-fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) -> String {
+/// `seq` is the turn log's monotonic cursor. EVERY frame (replayed or live)
+/// carries it; `replay` only says which delivery path produced the frame. The
+/// browser applies each seq once and sends the highest back as `after_seq` on
+/// reconnect, so it never guesses by content.
+fn chat_watch_frame_json(
+    event: &ChatEvent,
+    session_id: &str,
+    seq: Option<u64>,
+    replay: bool,
+    operation_id: Option<&str>,
+) -> String {
+    chat_watch_frame_json_with_tail(event, session_id, seq, replay, false, operation_id)
+}
+
+fn chat_watch_frame_json_with_tail(
+    event: &ChatEvent,
+    session_id: &str,
+    seq: Option<u64>,
+    replay: bool,
+    replay_last: bool,
+    operation_id: Option<&str>,
+) -> String {
     let mut val = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = val {
         if !map.contains_key("session_id") {
@@ -9144,8 +15768,26 @@ fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) 
                 serde_json::Value::String(session_id.to_string()),
             );
         }
+        // Terminal frames carry the client correlation id (= persisted user
+        // message id). A late terminal from a displaced turn must not clear the
+        // replacement turn; clients compare this against their active turn id.
+        if matches!(
+            event,
+            ChatEvent::Done { .. } | ChatEvent::Stopped | ChatEvent::Error { .. }
+        ) {
+            if let Some(operation_id) = operation_id {
+                map.insert(
+                    "operation_id".to_string(),
+                    serde_json::Value::String(operation_id.to_string()),
+                );
+            }
+        }
         if let Some(seq) = seq {
             map.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+        }
+        map.insert("replay".to_string(), serde_json::Value::Bool(replay));
+        if replay_last {
+            map.insert("replay_last".to_string(), serde_json::Value::Bool(true));
         }
     }
     serde_json::to_string(&val).unwrap_or_default()
@@ -9160,6 +15802,7 @@ fn chat_watch_session_start_json(session_id: &str, cursor: u64) -> String {
         "type": "session_start",
         "session_id": session_id,
         "cursor": cursor,
+        "caps": session_capabilities(),
     })
     .to_string()
 }
@@ -9174,23 +15817,81 @@ mod chat_watch_frame_tests {
             message_id: Some("m-round-2".into()),
             part_id: Some("m-round-2:2:text".into()),
             part_seq: Some(2),
+            part_rev: None,
         }
     }
 
     #[test]
-    fn replayed_frames_carry_the_cursor_and_live_frames_do_not() {
-        let replayed: serde_json::Value =
-            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", Some(7))).unwrap();
+    fn replayed_and_live_frames_carry_the_cursor_and_replay_flag() {
+        let replayed: serde_json::Value = serde_json::from_str(&chat_watch_frame_json(
+            &text_delta(),
+            "s-1",
+            Some(7),
+            true,
+            None,
+        ))
+        .unwrap();
         assert_eq!(replayed["seq"], serde_json::Value::Number(7.into()));
+        assert_eq!(replayed["replay"], serde_json::Value::Bool(true));
         assert_eq!(replayed["type"], "text");
         assert_eq!(replayed["session_id"], "s-1");
         assert_eq!(replayed["part_id"], "m-round-2:2:text");
 
-        // A live delta carries no cursor: it is always new, never re-painted.
-        let live: serde_json::Value =
-            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", None)).unwrap();
-        assert!(live.get("seq").is_none());
+        // Live frames use the SAME cursor; `replay` only describes delivery.
+        let live: serde_json::Value = serde_json::from_str(&chat_watch_frame_json(
+            &text_delta(),
+            "s-1",
+            Some(8),
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(live["seq"], serde_json::Value::Number(8.into()));
+        assert_eq!(live["replay"], serde_json::Value::Bool(false));
         assert_eq!(live["content"], "正文 2");
+    }
+
+    #[test]
+    fn terminal_frames_carry_the_operation_id() {
+        let stopped: serde_json::Value = serde_json::from_str(&chat_watch_frame_json(
+            &ChatEvent::Stopped,
+            "s-1",
+            None,
+            false,
+            Some("req-1"),
+        ))
+        .unwrap();
+        assert_eq!(stopped["operation_id"], "req-1");
+        assert_eq!(stopped["type"], "stopped");
+
+        let done: serde_json::Value = serde_json::from_str(&chat_watch_frame_json(
+            &ChatEvent::Done {
+                tokens: 0,
+                tool_calls: 0,
+                session_id: "s-1".into(),
+                stop_reason: Some("cancelled".into()),
+                message: None,
+                message_id: None,
+            },
+            "s-1",
+            None,
+            false,
+            Some("req-1"),
+        ))
+        .unwrap();
+        assert_eq!(done["operation_id"], "req-1");
+
+        // Streaming frames stay lean: the terminal identity is only needed at
+        // turn boundaries.
+        let live: serde_json::Value = serde_json::from_str(&chat_watch_frame_json(
+            &text_delta(),
+            "s-1",
+            Some(9),
+            false,
+            Some("req-1"),
+        ))
+        .unwrap();
+        assert!(live.get("operation_id").is_none());
     }
 
     #[test]
@@ -9206,6 +15907,67 @@ mod chat_watch_frame_tests {
 #[cfg(test)]
 mod chat_part_identity_tests {
     use super::*;
+
+    #[test]
+    fn notice_anchors_to_the_turn_user_message_before_any_assistant_round() {
+        use zap_kernel::event::AgentEvent as Agent;
+        let mut projector = ChatRuntimeProjector::default();
+        // 上一轮已经开过 assistant 回合：此时提示应锚到该回合。
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-prev".into(),
+            },
+            "sess-1",
+        );
+        assert_eq!(projector.notice_anchor().as_deref(), Some("m-prev"));
+
+        // 新回合开始（提问已落盘），provider 在首个 assistant 边界前就失败：
+        // 锚点必须切到本轮提问，绝不能再挂到上一轮回答上。
+        let identified = projector.project_agent(
+            Agent::UserMessage {
+                message_id: "m-user".into(),
+                turn_ordinal: 2,
+                message_index: 7,
+            },
+            "sess-1",
+        );
+        match identified.as_slice() {
+            [ChatEvent::UserIdentified { message_id, .. }] => {
+                assert_eq!(
+                    message_id, "m-user",
+                    "identity frame carries the stored message id only"
+                );
+            }
+            other => panic!("expected one user_identified, got {other:?}"),
+        }
+        assert_eq!(
+            projector.current_message_id, None,
+            "stale assistant id must be cleared at turn start"
+        );
+        let events = projector.project_agent(
+            Agent::Error {
+                message: "HTTP 400: {\"model\":\"x\"}".into(),
+                http_status: Some(400),
+                code: None,
+            },
+            "sess-1",
+        );
+        match events.as_slice() {
+            [ChatEvent::Warning { message_id, .. }] => {
+                assert_eq!(message_id.as_deref(), Some("m-user"));
+            }
+            other => panic!("expected one warning, got {other:?}"),
+        }
+
+        // assistant 边界出现后，提示回到该回合。
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-round".into(),
+            },
+            "sess-1",
+        );
+        assert_eq!(projector.notice_anchor().as_deref(), Some("m-round"));
+    }
 
     #[test]
     fn tool_boundary_opens_a_new_text_part() {
@@ -9252,6 +16014,9 @@ struct ChatWatchQuery {
     /// - 缺省：全量补发（无游标兜底，前端按身份幂等收敛）。
     #[serde(default)]
     after_seq: Option<i64>,
+    /// 观察端唯一客户端标识（例如浏览器标签页 UUID），防止单页面刷新堆积，同时允许跨设备/多屏幕并发待机观察。
+    #[serde(default)]
+    client_id: Option<String>,
 }
 
 /// GET /chat/watch?session_id=… — reattach to a turn owned by another client.
@@ -9276,15 +16041,14 @@ async fn chat_watch(
             .into_response();
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
-    // 断点续传：回放帧带 seq（回合缓冲序号 = 游标），实时帧不带。
+    let (tx, rx) = mpsc::unbounded_channel::<(u64, ChatEvent)>();
+    // 断点续传：回放帧和实时帧都带同一个全局 seq；replay 布尔只说明送达路径。
     // 帧语义由「这次连接请求了什么」决定 —— 前端自己就知道，不需要逐帧猜：
     //   after_seq = -1 → 新会话/空画布：不补发，只回 session_start 后转实时
     //   after_seq = N  → 只补 seq >= N 的回放帧，然后转实时
     //   缺省           → 全量补发（无游标兜底，前端按身份幂等收敛）
     let mut replay_head: Vec<(u64, ChatEvent)> = Vec::new();
     let mut handshake: Option<String> = None;
-    let mut buffer_len = 0u64;
     // Prefer atomic snapshot+subscribe when a turn is live so a mid-stream
     // browser refresh gets the full thinking/text/tool history, not only
     // deltas after reconnect. Idle standby watchers skip this so a leftover
@@ -9295,39 +16059,89 @@ async fn chat_watch(
             .subscribe_live_with_replay(&session_id)
             .await
         {
-            buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+            let buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
             tracing::debug!(
                 session_id = %session_id,
                 replay_events = snapshot.len(),
                 after_seq = ?q.after_seq,
                 "chat_watch: LIVE with replay"
             );
-            let maybe_user = snapshot
+            let opening_user = snapshot
                 .iter()
                 .find(|(_, e)| matches!(e, ChatEvent::User { .. }))
                 .cloned();
 
             match q.after_seq {
-                Some(-1) => {
-                    // 新会话：画布本来就是空的，补发毫无意义；只给一个起始游标。
-                    // 但是如果本轮存在活跃用户提问，必须在头部送达，防止刷新后用户提问丢失！
+                Some(-1) if snapshot.is_empty() => {
+                    // 新会话且当前无在途输出：只给一个起始游标。
                     handshake = Some(chat_watch_session_start_json(&session_id, buffer_len));
-                    if let Some(user) = maybe_user {
+                    if let Some(user) = opening_user {
                         replay_head = vec![user];
                     }
                 }
                 // 游标有效（没越过缓冲末尾）：只补它之后的帧。
-                // 核心防线：当前回合的活跃用户提问（ChatEvent::User）必须始终放在头部，
-                // 绝不受 after_seq 过滤丢弃，确保断线重连或 F5 刷新后用户消息绝不丢失！
+                // 开场提问的 seq 可能已经小于游标（页把提问切掉了）。把它补回头部，
+                // 游标之后的提问（中途 steer）原样保留，不再把所有 User 事件剥掉。
                 Some(after) if after >= 0 && (after as u64) <= buffer_len => {
+                    let snapshot_for_tools = snapshot.clone();
                     let mut filtered: Vec<(u64, ChatEvent)> = snapshot
                         .into_iter()
-                        .filter(|(seq, e)| {
-                            !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64
-                        })
+                        .filter(|(seq, _)| *seq > after as u64)
                         .collect();
-                    if let Some(user) = maybe_user {
-                        filtered.insert(0, user);
+                    if let Some((user_seq, user)) = opening_user {
+                        if !filtered.iter().any(|(seq, _)| *seq == user_seq) {
+                            filtered.insert(0, (user_seq, user));
+                        }
+                    }
+                    // 工具调用原子性守卫：如果续传切片中包含某个工具的输出、结果或完成帧，
+                    // 但该工具的 ToolCallStarted 帧落在游标之前被过滤，必须将 ToolCallStarted 一并补回！
+                    // 绝不能下发丢失了名称和参数的无头工具帧，导致客户端被迫捏造空参数！
+                    let mut missing_tool_starts: Vec<(usize, (u64, ChatEvent))> = Vec::new();
+                    for (idx, (_, event)) in filtered.iter().enumerate() {
+                        let tool_id = match event {
+                            ChatEvent::ToolOutputChunk { id, .. }
+                            | ChatEvent::ToolCallResult { id, .. }
+                            | ChatEvent::ToolFinished { id, .. } => Some(id.as_str()),
+                            _ => None,
+                        };
+                        if let Some(tid) = tool_id {
+                            let already_has_start = filtered.iter().any(|(_, ev)| matches!(ev, ChatEvent::ToolCallStarted { id, .. } if id == tid));
+                            if !already_has_start && !missing_tool_starts.iter().any(|(_, (_, ev))| matches!(ev, ChatEvent::ToolCallStarted { id, .. } if id == tid)) {
+                                if let Some((s_seq, s_ev)) = snapshot_for_tools.iter().find(|(_, ev)| matches!(ev, ChatEvent::ToolCallStarted { id, .. } if id == tid)) {
+                                    missing_tool_starts.push((idx, (*s_seq, s_ev.clone())));
+                                }
+                            }
+                        }
+                    }
+                    for (insert_idx, item) in missing_tool_starts.into_iter().rev() {
+                        filtered.insert(insert_idx, item);
+                    }
+                    // 在途工具守卫：若某个工具的 `ToolCallStarted` 落在 `seq <= after`，且当前
+                    // `snapshot` 中尚无对应的 `ToolCallResult`（说明该工具仍在后台执行中，
+                    // 磁盘 `snapshot.json` 尚未在批次边界落盘，而它的 `ToolCallResult` 稍后会从
+                    // `bus_rx` 实时推下），必须把 `ToolCallStarted` 补进回放头部！
+                    // 否则客户端切回会话重置画布后，稍后收到实时 `ToolCallResult` 时会退化为无参空工具。
+                    let inflight_insert_pos = usize::from(
+                        filtered
+                            .first()
+                            .is_some_and(|(_, ev)| matches!(ev, ChatEvent::User { .. })),
+                    );
+                    let mut inflight_starts: Vec<(u64, ChatEvent)> = Vec::new();
+                    for (s_seq, s_ev) in &snapshot_for_tools {
+                        if let ChatEvent::ToolCallStarted { id: tid, .. } = s_ev {
+                            let has_result = snapshot_for_tools.iter().any(|(_, ev)| {
+                                matches!(ev, ChatEvent::ToolCallResult { id, .. } if id == tid)
+                            });
+                            let already_in_filtered = filtered.iter().any(|(_, ev)| {
+                                matches!(ev, ChatEvent::ToolCallStarted { id, .. } if id == tid)
+                            });
+                            if !has_result && !already_in_filtered {
+                                inflight_starts.push((*s_seq, s_ev.clone()));
+                            }
+                        }
+                    }
+                    for item in inflight_starts.into_iter().rev() {
+                        filtered.insert(inflight_insert_pos, item);
                     }
                     replay_head = filtered;
                 }
@@ -9348,14 +16162,14 @@ async fn chat_watch(
                 tokio::spawn(async move {
                     loop {
                         match bus_rx.recv().await {
-                            Ok(event) => {
+                            Ok((seq, event)) => {
                                 let terminal = matches!(
                                     event,
                                     ChatEvent::Done { .. }
                                         | ChatEvent::Error { .. }
                                         | ChatEvent::Stopped
                                 );
-                                if tx.send(event).is_err() {
+                                if tx.send((seq, event)).is_err() {
                                     break;
                                 }
                                 if terminal {
@@ -9375,7 +16189,7 @@ async fn chat_watch(
         } else {
             match state
                 .active_chats
-                .subscribe_or_standby(&session_id, &tx)
+                .subscribe_or_standby(&session_id, q.client_id.as_deref(), &tx, true)
                 .await
             {
                 WatchOutcome::Live(mut bus_rx) => {
@@ -9392,14 +16206,14 @@ async fn chat_watch(
                     tokio::spawn(async move {
                         loop {
                             match bus_rx.recv().await {
-                                Ok(event) => {
+                                Ok((seq, event)) => {
                                     let terminal = matches!(
                                         event,
                                         ChatEvent::Done { .. }
                                             | ChatEvent::Error { .. }
                                             | ChatEvent::Stopped
                                     );
-                                    if tx.send(event).is_err() {
+                                    if tx.send((seq, event)).is_err() {
                                         break;
                                     }
                                     if terminal {
@@ -9425,7 +16239,7 @@ async fn chat_watch(
     } else {
         match state
             .active_chats
-            .subscribe_or_standby(&session_id, &tx)
+            .subscribe_or_standby(&session_id, q.client_id.as_deref(), &tx, false)
             .await
         {
             WatchOutcome::Live(mut bus_rx) => {
@@ -9444,14 +16258,14 @@ async fn chat_watch(
                 tokio::spawn(async move {
                     loop {
                         match bus_rx.recv().await {
-                            Ok(event) => {
+                            Ok((seq, event)) => {
                                 let terminal = matches!(
                                     event,
                                     ChatEvent::Done { .. }
                                         | ChatEvent::Error { .. }
                                         | ChatEvent::Stopped
                                 );
-                                if tx.send(event).is_err() {
+                                if tx.send((seq, event)).is_err() {
                                     break;
                                 }
                                 if terminal {
@@ -9477,37 +16291,45 @@ async fn chat_watch(
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let head_session_id = session_id.clone();
     let live_session_id = session_id.clone();
-    // 补发/握手帧在前（带 seq），实时帧在后（同样携带单调递增 seq）。
-    // 前端每收到一帧就实时推进本地游标，断线/刷新重连带回来续传 —— 精准无缝续接，不重复、不重播！
-    let last_head_seq = replay_head
-        .iter()
-        .map(|(seq, _)| *seq)
-        .max()
-        .unwrap_or(buffer_len);
-
+    // Client correlation id of the running turn (= persisted user message id).
+    // Stamped on terminal frames so a late terminal for a displaced turn is
+    // ignorable by the reattached browser.
+    let watch_operation_id = state
+        .active_chats
+        .admitted_user_for_session(&session_id)
+        .await
+        .and_then(|user| user.client_input_id);
+    let live_operation_id = watch_operation_id.clone();
+    // live 与 replay 共用同一个 session 级 seq；replay 布尔只描述送达路径。
+    // 前端按 seq 只应用一次，live 追加、replay 替换。
+    let replay_len = replay_head.len();
     let head_json: Vec<String> = handshake
         .into_iter()
-        .chain(
-            replay_head
-                .iter()
-                .map(|(seq, event)| chat_watch_frame_json(event, &head_session_id, Some(*seq))),
-        )
+        .chain(replay_head.iter().enumerate().map(|(idx, (seq, event))| {
+            chat_watch_frame_json_with_tail(
+                event,
+                &head_session_id,
+                Some(*seq),
+                true,
+                idx + 1 == replay_len,
+                watch_operation_id.as_deref(),
+            )
+        }))
         .collect();
     let head_stream = futures::stream::iter(head_json).map(|json| {
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
 
-    let live_seq_counter =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
-    let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
-        let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok::<_, std::convert::Infallible>(
-            axum::response::sse::Event::default().data(chat_watch_frame_json(
+    let live_stream = UnboundedReceiverStream::new(rx).map(move |(seq, event)| {
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(
+            chat_watch_frame_json(
                 &event,
                 &live_session_id,
                 Some(seq),
-            )),
-        )
+                false,
+                live_operation_id.as_deref(),
+            ),
+        ))
     });
     let stream = head_stream.chain(live_stream);
     let conn_guard = SseConnectionGuard(active_conns);
@@ -9619,18 +16441,33 @@ struct ChatSteerRequest {
     /// WebUI can promote an optimistic steer to the persisted message by id.
     #[serde(default)]
     client_input_id: Option<String>,
+    #[serde(default)]
+    created_at: Option<u64>,
+    #[serde(default)]
+    approval_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedMessageItem {
     pub id: serde_json::Value,
+    /// Stable client correlation id. Minted by the WebUI when the card is
+    /// created; the atomic `/chat/queue/claim` key (and the eventual prompt id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input_id: Option<String>,
     pub text: String,
     #[serde(default)]
     pub images: Option<serde_json::Value>,
     #[serde(default)]
-    pub kind: String, // "queue" | "steering" | "steered"
+    pub kind: String, // "queue" | "steering" | "steer"
     #[serde(default)]
     pub approval_mode: Option<String>,
+    /// 卡片创建时间（epoch ms）。webui 的 `createdAt`：跨端 / 刷新恢复时保留
+    /// 原始排队时间，不要因为一次中转就重置成“现在”。
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<u64>,
+    /// 立即发送已画上气泡、但投递被退回的卡片必须照发（webui 的 `forceSend`）。
+    #[serde(default, rename = "forceSend")]
+    pub force_send: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9642,11 +16479,105 @@ struct ChatQueueQuery {
 struct ChatQueueUpdateRequest {
     session_id: String,
     items: Vec<QueuedMessageItem>,
+    /// Queue revision the caller last observed. Present ⇒ compare-and-swap:
+    /// a mismatch returns 409 with the current revision and items.
+    #[serde(default)]
+    base_revision: Option<u64>,
 }
 
 static SESSION_QUEUES: tokio::sync::OnceCell<
     tokio::sync::RwLock<HashMap<String, Vec<QueuedMessageItem>>>,
 > = tokio::sync::OnceCell::const_new();
+
+/// Permanent (bounded) tombstones for delivered queue cards. A stale tab that
+/// still has the card locally must never resurrect or deliver it again.
+static SESSION_QUEUE_CLAIMS: tokio::sync::OnceCell<
+    tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+> = tokio::sync::OnceCell::const_new();
+
+/// Serializes claim/release/update so two tabs cannot both "win" the same card.
+static QUEUE_CLAIM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const MAX_QUEUE_CLAIMS: usize = 512;
+
+fn decode_queue_file(content: &str) -> Option<(Vec<QueuedMessageItem>, u64)> {
+    serde_json::from_str::<QueueFile>(content)
+        .map(|file| (file.items, file.revision))
+        .or_else(|_| {
+            serde_json::from_str::<Vec<QueuedMessageItem>>(content).map(|items| (items, 0u64))
+        })
+        .ok()
+}
+
+/// Must be called while holding `QUEUE_CLAIM_LOCK`, so the first read cannot
+/// race a claim or whole-list update for this session.
+async fn ensure_session_queue_loaded(session_id: &str) {
+    let map = get_session_queues_map().await;
+    if map.read().await.contains_key(session_id) {
+        return;
+    }
+
+    let loaded = if let Some(path) = session_queue_file_path(session_id) {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => decode_queue_file(&content),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let (items, revision) = loaded.unwrap_or_default();
+    map.write().await.insert(session_id.to_string(), items);
+    set_queue_revision(session_id, revision).await;
+}
+
+/// Queue content whether the snapshot is the current versioned document or a
+/// legacy bare array. Kept pure so cold-start compatibility is testable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QueueFile {
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    items: Vec<QueuedMessageItem>,
+}
+
+static SESSION_QUEUE_REVISIONS: tokio::sync::OnceCell<tokio::sync::RwLock<HashMap<String, u64>>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn get_session_queue_revisions_map() -> &'static tokio::sync::RwLock<HashMap<String, u64>> {
+    SESSION_QUEUE_REVISIONS
+        .get_or_init(|| async { tokio::sync::RwLock::new(HashMap::new()) })
+        .await
+}
+
+async fn queue_revision(session_id: &str) -> u64 {
+    get_session_queue_revisions_map()
+        .await
+        .read()
+        .await
+        .get(session_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+async fn set_queue_revision(session_id: &str, revision: u64) {
+    get_session_queue_revisions_map()
+        .await
+        .write()
+        .await
+        .insert(session_id.to_string(), revision);
+}
+
+async fn bump_queue_revision(session_id: &str) -> u64 {
+    let map = get_session_queue_revisions_map().await;
+    let mut writer = map.write().await;
+    let next = writer
+        .get(session_id)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
+    writer.insert(session_id.to_string(), next);
+    next
+}
 
 async fn get_session_queues_map(
 ) -> &'static tokio::sync::RwLock<HashMap<String, Vec<QueuedMessageItem>>> {
@@ -9660,129 +16591,814 @@ fn session_queue_file_path(session_id: &str) -> Option<PathBuf> {
     if clean.is_empty() {
         return None;
     }
-    let home = zap_config::util::real_home_dir()?;
-    let dir = home.join(".zap").join("state").join("queues");
+    let dir = zap_config::Config::config_dir()
+        .join("state")
+        .join("queues");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join(format!("{clean}.json")))
+}
+
+fn session_queue_claims_path(session_id: &str) -> Option<PathBuf> {
+    let clean = session_id.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let dir = zap_config::Config::config_dir()
+        .join("state")
+        .join("queues");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join(format!("{clean}.claimed.json")))
+}
+
+async fn get_session_queue_claims_map() -> &'static tokio::sync::RwLock<HashMap<String, Vec<String>>>
+{
+    SESSION_QUEUE_CLAIMS
+        .get_or_init(|| async { tokio::sync::RwLock::new(HashMap::new()) })
+        .await
+}
+
+async fn load_queue_claims(session_id: &str) -> Vec<String> {
+    let map = get_session_queue_claims_map().await;
+    {
+        let reader = map.read().await;
+        if let Some(claims) = reader.get(session_id) {
+            return claims.clone();
+        }
+    }
+    let mut claims = Vec::new();
+    if let Some(path) = session_queue_claims_path(session_id) {
+        if let Ok(text) = tokio::fs::read_to_string(&path).await {
+            claims = serde_json::from_str::<Vec<String>>(&text).unwrap_or_default();
+        }
+    }
+    let mut writer = map.write().await;
+    writer.insert(session_id.to_string(), claims.clone());
+    claims
+}
+
+async fn save_queue_claims(session_id: &str, claims: &[String]) {
+    let map = get_session_queue_claims_map().await;
+    {
+        let mut writer = map.write().await;
+        if claims.is_empty() {
+            writer.remove(session_id);
+        } else {
+            writer.insert(session_id.to_string(), claims.to_vec());
+        }
+    }
+    if let Some(path) = session_queue_claims_path(session_id) {
+        if claims.is_empty() {
+            let _ = tokio::fs::remove_file(path).await;
+        } else if let Ok(text) = serde_json::to_string(claims) {
+            let _ = tokio::fs::write(path, text).await;
+        }
+    }
+}
+
+/// The stable claim key of a queue item: client correlation id, else its wire id.
+fn queue_claim_id(item: &QueuedMessageItem) -> Option<String> {
+    item.client_input_id.clone().or_else(|| match &item.id {
+        serde_json::Value::String(value) => Some(value.clone()),
+        value => Some(value.to_string()),
+    })
+}
+
+/// Drop already-claimed cards from any queue snapshot. A stale tab's whole-list
+/// write or an old queue_updated pull must never resurrect a delivered card.
+fn drop_claimed_queue_items(
+    items: Vec<QueuedMessageItem>,
+    claims: &[String],
+) -> Vec<QueuedMessageItem> {
+    items
+        .into_iter()
+        .filter(|item| {
+            queue_claim_id(item)
+                .map(|id| !claims.iter().any(|claimed| claimed == &id))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Merge explicit queue claim tombstones with durable input ledger entries that
+/// have already been promoted into the transcript (e.g. folded steers) or cancelled.
+async fn load_effective_queue_claims(session_id: &str) -> Vec<String> {
+    let mut claims = load_queue_claims(session_id).await;
+    for input in zap_capabilities::session::inputs::list_global(session_id) {
+        if input.status == "promoted" || input.status == "cancelled" {
+            if !input.id.is_empty() && !claims.iter().any(|c| c == &input.id) {
+                claims.push(input.id);
+            }
+            if let Some(mid) = input.message_id.filter(|m| !m.is_empty()) {
+                if !claims.iter().any(|c| c == &mid) {
+                    claims.push(mid);
+                }
+            }
+        }
+    }
+    claims
+}
+
+/// Retire folded steers from the server-side queue and record their claim tombstones
+/// so a subsequent refresh or stale client queue write can never resurrect them.
+async fn retire_folded_steers_from_queue(
+    session_id: &str,
+    pairs: &[(Option<String>, Option<String>)],
+) {
+    let sid = session_id.trim();
+    if sid.is_empty() || pairs.is_empty() {
+        return;
+    }
+    let mut retired_ids: Vec<String> = Vec::new();
+    for (cid, mid) in pairs {
+        if let Some(id) = cid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !retired_ids.iter().any(|existing| existing == id) {
+                retired_ids.push(id.to_string());
+            }
+        }
+        if let Some(id) = mid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !retired_ids.iter().any(|existing| existing == id) {
+                retired_ids.push(id.to_string());
+            }
+        }
+    }
+    if retired_ids.is_empty() {
+        return;
+    }
+    let _claim_guard = QUEUE_CLAIM_LOCK.lock().await;
+    ensure_session_queue_loaded(sid).await;
+    let mut claims = load_queue_claims(sid).await;
+    let mut claims_changed = false;
+    for id in &retired_ids {
+        if !claims.iter().any(|claimed| claimed == id) {
+            claims.push(id.clone());
+            claims_changed = true;
+        }
+    }
+    if claims_changed {
+        if claims.len() > MAX_QUEUE_CLAIMS {
+            let drop = claims.len() - MAX_QUEUE_CLAIMS;
+            claims.drain(..drop);
+        }
+        save_queue_claims(sid, &claims).await;
+    }
+    let map = get_session_queues_map().await;
+    let queue_changed = {
+        let mut writer = map.write().await;
+        if let Some(current) = writer.remove(sid) {
+            let before = current.len();
+            let filtered = drop_claimed_queue_items(current, &retired_ids);
+            let changed = filtered.len() != before;
+            if !filtered.is_empty() {
+                writer.insert(sid.to_string(), filtered);
+            }
+            changed
+        } else {
+            false
+        }
+    };
+    if queue_changed {
+        bump_queue_revision(sid).await;
+        persist_session_queue(sid).await;
+    }
+}
+
+/// Try to take ownership of one card. `has_payload` covers a card the server
+/// has not mirrored yet (the browser may still be racing its first queue write).
+fn claim_queue_item(
+    items: &mut Vec<QueuedMessageItem>,
+    claims: &mut Vec<String>,
+    client_input_id: &str,
+    has_payload: bool,
+) -> bool {
+    if claims.iter().any(|claimed| claimed == client_input_id) {
+        return false;
+    }
+    match items
+        .iter()
+        .position(|item| queue_claim_id(item).as_deref() == Some(client_input_id))
+    {
+        Some(index) => {
+            items.remove(index);
+        }
+        None if has_payload => {
+            // Local-only card: the caller owns this id; accept it once.
+        }
+        None => return false,
+    }
+    claims.push(client_input_id.to_string());
+    if claims.len() > MAX_QUEUE_CLAIMS {
+        let drop = claims.len() - MAX_QUEUE_CLAIMS;
+        claims.drain(..drop);
+    }
+    true
+}
+
+fn set_queued_steer_kind(
+    items: &mut Vec<QueuedMessageItem>,
+    client_input_id: &str,
+    kind: &str,
+    fallback: Option<QueuedMessageItem>,
+) -> bool {
+    if let Some(item) = items
+        .iter_mut()
+        .find(|item| queue_claim_id(item).as_deref() == Some(client_input_id))
+    {
+        if item.kind == kind {
+            return false;
+        }
+        item.kind = kind.to_string();
+        return true;
+    }
+    let Some(mut fallback) = fallback else {
+        return false;
+    };
+    fallback.kind = kind.to_string();
+    items.push(fallback);
+    true
+}
+
+async fn update_chat_queue_steer_state(
+    session_id: &str,
+    client_input_id: &str,
+    kind: &str,
+    fallback: Option<QueuedMessageItem>,
+) {
+    let sid = session_id.trim();
+    let cid = client_input_id.trim();
+    if sid.is_empty() || cid.is_empty() {
+        return;
+    }
+    let guard = QUEUE_CLAIM_LOCK.lock().await;
+    ensure_session_queue_loaded(sid).await;
+    let claims = load_effective_queue_claims(sid).await;
+    if claims.iter().any(|claimed| claimed == cid) {
+        drop(guard);
+        return;
+    }
+    let map = get_session_queues_map().await;
+    let changed = {
+        let mut writer = map.write().await;
+        let items = writer.entry(sid.to_string()).or_default();
+        set_queued_steer_kind(items, cid, kind, fallback)
+    };
+    if changed {
+        bump_queue_revision(sid).await;
+        persist_session_queue(sid).await;
+    }
+    drop(guard);
+    if changed {
+        publish_global(GlobalWireEvent::QueueUpdated {
+            session_id: sid.to_string(),
+        });
+    }
+}
+
+async fn reconcile_stale_steer_queue(session_id: &str) {
+    let guard = QUEUE_CLAIM_LOCK.lock().await;
+    ensure_session_queue_loaded(session_id).await;
+    let claims = load_effective_queue_claims(session_id).await;
+    let status_by_id: HashMap<String, String> =
+        zap_capabilities::session::inputs::list_global(session_id)
+            .into_iter()
+            .map(|row| (row.id, row.status))
+            .collect();
+    let map = get_session_queues_map().await;
+    let mut downgraded = Vec::new();
+    let changed = {
+        let mut writer = map.write().await;
+        let items = writer.entry(session_id.to_string()).or_default();
+        let before = items.len();
+        items.retain_mut(|item| {
+            let Some(id) = queue_claim_id(item) else {
+                return true;
+            };
+            if claims.iter().any(|claimed| claimed == &id) {
+                return true;
+            }
+            match status_by_id.get(&id).map(String::as_str) {
+                Some("promoted") | Some("cancelled") => false,
+                _ if item.kind == "steering" || item.kind == "steer" => {
+                    item.kind = "queue".into();
+                    downgraded.push(id);
+                    true
+                }
+                _ => true,
+            }
+        });
+        items.len() != before || !downgraded.is_empty()
+    };
+    if changed {
+        bump_queue_revision(session_id).await;
+        persist_session_queue(session_id).await;
+    }
+    drop(guard);
+    for id in downgraded {
+        let _ = zap_capabilities::session::inputs::mark_rejected_global(session_id, &id);
+    }
+    if changed {
+        publish_global(GlobalWireEvent::QueueUpdated {
+            session_id: session_id.to_string(),
+        });
+    }
+}
+
+/// Startup recovery: no turn can be active before the listener is up, so every
+/// `steering`/`steer` card left on disk is an orphan from a crash/restart.
+async fn reconcile_all_stale_steer_queues() {
+    let dir = zap_config::Config::config_dir()
+        .join("state")
+        .join("queues");
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") || name.ends_with(".claimed.json") {
+            continue;
+        }
+        let session_id = name.trim_end_matches(".json");
+        if !session_id.is_empty() {
+            reconcile_stale_steer_queue(session_id).await;
+        }
+    }
 }
 
 async fn get_chat_queue(Query(q): Query<ChatQueueQuery>) -> impl IntoResponse {
     let sid = q.session_id.trim();
     if sid.is_empty() {
-        return Json(serde_json::json!([]));
+        return Json(serde_json::json!({ "revision": 0, "items": [] }));
     }
+    let _claim_guard = QUEUE_CLAIM_LOCK.lock().await;
+    ensure_session_queue_loaded(sid).await;
+    let claims = load_effective_queue_claims(sid).await;
     let map = get_session_queues_map().await;
-    {
-        let reader = map.read().await;
-        if let Some(items) = reader.get(sid) {
-            return Json(serde_json::to_value(items).unwrap_or_default());
+    let items = map.read().await.get(sid).cloned().unwrap_or_default();
+    let items = drop_claimed_queue_items(items, &claims);
+    let revision = queue_revision(sid).await;
+    Json(serde_json::json!({ "revision": revision, "items": items }))
+}
+
+async fn persist_session_queue(session_id: &str) {
+    let map = get_session_queues_map().await;
+    let items = map
+        .read()
+        .await
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default();
+    let revision = queue_revision(session_id).await;
+    if let Some(path) = session_queue_file_path(session_id) {
+        if let Ok(json_str) = serde_json::to_string_pretty(&QueueFile { revision, items }) {
+            let _ = tokio::fs::write(path, json_str).await;
         }
     }
-    if let Some(path) = session_queue_file_path(sid) {
-        if path.exists() {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                if let Ok(items) = serde_json::from_str::<Vec<QueuedMessageItem>>(&content) {
-                    let mut writer = map.write().await;
-                    writer.insert(sid.to_string(), items.clone());
-                    return Json(serde_json::to_value(items).unwrap_or_default());
-                }
-            }
-        }
+}
+
+/// 队列内容是否实质变化。跨端“广播 → 对端拉取 → 原样回写”会造成回声，
+/// 因此只在内容真的变了才广播。
+fn queue_content_changed(
+    previous: Option<&Vec<QueuedMessageItem>>,
+    next: &[QueuedMessageItem],
+) -> bool {
+    match previous {
+        Some(prev) => prev.as_slice() != next,
+        None => !next.is_empty(),
     }
-    Json(serde_json::json!([]))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatQueueClaimRequest {
+    session_id: String,
+    client_input_id: String,
+    /// Present when the card may not have reached the server yet (save race).
+    #[serde(default)]
+    item: Option<QueuedMessageItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatQueueReleaseRequest {
+    session_id: String,
+    client_input_id: String,
+    /// Restore the card if the claimed delivery failed (busy/transport).
+    #[serde(default)]
+    item: Option<QueuedMessageItem>,
 }
 
 async fn update_chat_queue(Json(req): Json<ChatQueueUpdateRequest>) -> impl IntoResponse {
     let sid = req.session_id.trim().to_string();
     if !sid.is_empty() {
-        let map = get_session_queues_map().await;
-        let mut writer = map.write().await;
-        if req.items.is_empty() {
-            writer.remove(&sid);
-            if let Some(path) = session_queue_file_path(&sid) {
-                let _ = tokio::fs::remove_file(path).await;
+        // Serialize with claim/release: a stale whole-list write must not
+        // resurrect a card another tab already claimed.
+        let _claim_guard = QUEUE_CLAIM_LOCK.lock().await;
+        ensure_session_queue_loaded(&sid).await;
+        // CAS: a stale tab's whole-list write is rejected instead of overwriting
+        // a newer queue. The caller re-pulls and merges.
+        let current = queue_revision(&sid).await;
+        if let Some(base) = req.base_revision {
+            if base != current {
+                let map = get_session_queues_map().await;
+                let items = map.read().await.get(&sid).cloned().unwrap_or_default();
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "revision": current,
+                        "items": items,
+                    })),
+                )
+                    .into_response();
             }
+        }
+        let claims = load_effective_queue_claims(&sid).await;
+        let items = drop_claimed_queue_items(req.items, &claims);
+        let map = get_session_queues_map().await;
+        let changed = {
+            let mut writer = map.write().await;
+            let changed = queue_content_changed(writer.get(&sid), &items);
+            if items.is_empty() {
+                writer.remove(&sid);
+            } else {
+                writer.insert(sid.clone(), items.clone());
+            }
+            changed
+        };
+        let revision = if changed {
+            bump_queue_revision(&sid).await
         } else {
-            writer.insert(sid.clone(), req.items.clone());
-            if let Some(path) = session_queue_file_path(&sid) {
-                if let Ok(json_str) = serde_json::to_string_pretty(&req.items) {
-                    let _ = tokio::fs::write(path, json_str).await;
-                }
+            current
+        };
+        if changed {
+            persist_session_queue(&sid).await;
+            // 广播放在锁外：对端收到信号会再拉 `/chat/queue`，绝不能在持锁期间等它。
+            // 只带会话 id：卡片里的图片可能是整张 base64，不背进全局通道。
+            publish_global(GlobalWireEvent::QueueUpdated {
+                session_id: sid.clone(),
+            });
+        }
+        return Json(serde_json::json!({ "success": true, "revision": revision })).into_response();
+    }
+    Json(serde_json::json!({ "success": true, "revision": 0 })).into_response()
+}
+
+/// Atomically take ownership of one queued card. Exactly one caller wins; the
+/// tombstone prevents a stale tab (or a resurrected mirror) from delivering it
+/// again. The claim id is also the prompt id the winning tab will submit.
+async fn claim_chat_queue(Json(req): Json<ChatQueueClaimRequest>) -> impl IntoResponse {
+    let sid = req.session_id.trim().to_string();
+    let cid = req.client_input_id.trim().to_string();
+    if sid.is_empty() || cid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "claimed": false, "error": "session_id/client_input_id required" })),
+        )
+            .into_response();
+    }
+    let _claim_guard = QUEUE_CLAIM_LOCK.lock().await;
+    ensure_session_queue_loaded(&sid).await;
+    let mut claims = load_queue_claims(&sid).await;
+    let map = get_session_queues_map().await;
+    let claimed;
+    {
+        let mut writer = map.write().await;
+        let mut items = writer.remove(&sid).unwrap_or_default();
+        claimed = claim_queue_item(&mut items, &mut claims, &cid, req.item.is_some());
+        if !items.is_empty() {
+            writer.insert(sid.clone(), items);
+        }
+    }
+    if !claimed {
+        return Json(serde_json::json!({ "claimed": false })).into_response();
+    }
+    save_queue_claims(&sid, &claims).await;
+    let revision = bump_queue_revision(&sid).await;
+    persist_session_queue(&sid).await;
+    // Broadcast even for a local-only claim: other tabs must drop their stale
+    // copy even though the server queue never contained it.
+    publish_global(GlobalWireEvent::QueueUpdated {
+        session_id: sid.clone(),
+    });
+    Json(serde_json::json!({ "claimed": true, "revision": revision })).into_response()
+}
+
+/// Undo a claim when the winning tab could not deliver (busy/transport). The
+/// card is restored so a later drain can try again; the tombstone is removed.
+async fn release_chat_queue(Json(req): Json<ChatQueueReleaseRequest>) -> impl IntoResponse {
+    let sid = req.session_id.trim().to_string();
+    let cid = req.client_input_id.trim().to_string();
+    if sid.is_empty() || cid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "released": false, "error": "session_id/client_input_id required" })),
+        )
+            .into_response();
+    }
+    let _claim_guard = QUEUE_CLAIM_LOCK.lock().await;
+    let mut claims = load_queue_claims(&sid).await;
+    claims.retain(|claimed| claimed != &cid);
+    save_queue_claims(&sid, &claims).await;
+    let mut added = false;
+    if let Some(mut item) = req.item {
+        if item.client_input_id.is_none() {
+            item.client_input_id = Some(cid.clone());
+        }
+        let map = get_session_queues_map().await;
+        {
+            let mut writer = map.write().await;
+            let mut items = writer.remove(&sid).unwrap_or_default();
+            if !items
+                .iter()
+                .any(|existing| queue_claim_id(existing).as_deref() == Some(cid.as_str()))
+            {
+                items.push(item);
+                added = true;
+            }
+            if !items.is_empty() {
+                writer.insert(sid.clone(), items);
             }
         }
     }
-    Json(serde_json::json!({ "success": true }))
+    let revision = bump_queue_revision(&sid).await;
+    persist_session_queue(&sid).await;
+    if added {
+        publish_global(GlobalWireEvent::QueueUpdated {
+            session_id: sid.clone(),
+        });
+    }
+    Json(serde_json::json!({ "released": true, "revision": revision })).into_response()
+}
+
+#[cfg(test)]
+mod chat_queue_tests {
+    use super::*;
+
+    fn item(text: &str, kind: &str) -> QueuedMessageItem {
+        QueuedMessageItem {
+            id: serde_json::Value::String(text.to_string()),
+            client_input_id: None,
+            text: text.to_string(),
+            images: None,
+            kind: kind.to_string(),
+            approval_mode: None,
+            created_at: None,
+            force_send: None,
+        }
+    }
+
+    #[test]
+    fn queue_file_decoder_restores_revision_and_reads_legacy_arrays() {
+        let versioned = serde_json::json!({
+            "revision": 17,
+            "items": [serde_json::to_value(item("kept", "steer")).unwrap()],
+        });
+        let (items, revision) = decode_queue_file(&versioned.to_string()).unwrap();
+        assert_eq!(revision, 17);
+        assert_eq!(items, vec![item("kept", "steer")]);
+
+        let legacy = serde_json::to_string(&vec![item("legacy", "queue")]).unwrap();
+        let (items, revision) = decode_queue_file(&legacy).unwrap();
+        assert_eq!(revision, 0);
+        assert_eq!(items, vec![item("legacy", "queue")]);
+    }
+
+    /// 广播 → 对端拉取 → 原样回写：内容没变就绝不能再广播，否则回声不止。
+    /// 而卡片的三个阶段（创建 / 点转向 / 自然销毁）只要内容真的变了就必须广播。
+    #[test]
+    fn queue_broadcast_only_fires_on_a_real_change() {
+        let empty: Vec<QueuedMessageItem> = Vec::new();
+        assert!(!queue_content_changed(None, &empty), "空队列不是变化");
+        assert!(!queue_content_changed(Some(&empty), &empty));
+
+        let card = item("帮我看看这份日志", "steer");
+        assert!(
+            queue_content_changed(None, std::slice::from_ref(&card)),
+            "新建卡片"
+        );
+        assert!(queue_content_changed(
+            Some(&empty),
+            std::slice::from_ref(&card)
+        ));
+
+        let same = vec![card.clone()];
+        assert!(
+            !queue_content_changed(Some(&same), std::slice::from_ref(&card)),
+            "对端回写同一份队列不得再广播"
+        );
+
+        let steering = vec![item("帮我看看这份日志", "steering")];
+        assert!(
+            queue_content_changed(Some(&same), &steering),
+            "点转向：卡片状态变化要广播"
+        );
+
+        assert!(
+            queue_content_changed(Some(&same), &empty),
+            "自然销毁：卡片消失要广播"
+        );
+    }
+
+    #[test]
+    fn steer_admission_lock_is_shared_per_identity() {
+        let first = steer_admission_lock("s-1", "cid-1");
+        let same = steer_admission_lock("s-1", "cid-1");
+        let other = steer_admission_lock("s-1", "cid-2");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn server_steer_acknowledgement_persists_card_transitions() {
+        let mut card = item("steer request", "queue");
+        card.client_input_id = Some("cid-1".into());
+        let mut items = vec![card];
+
+        assert!(set_queued_steer_kind(&mut items, "cid-1", "steering", None));
+        assert_eq!(items[0].kind, "steering");
+        assert!(set_queued_steer_kind(&mut items, "cid-1", "steer", None));
+        assert_eq!(items[0].kind, "steer");
+        assert!(set_queued_steer_kind(&mut items, "cid-1", "queue", None));
+        assert_eq!(items[0].kind, "queue");
+        assert!(!set_queued_steer_kind(
+            &mut items, "missing", "steering", None
+        ));
+
+        let mut recovered = Vec::new();
+        let mut fallback = item("recovered", "queue");
+        fallback.client_input_id = Some("cid-2".into());
+        assert!(set_queued_steer_kind(
+            &mut recovered,
+            "cid-2",
+            "steering",
+            Some(fallback),
+        ));
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].kind, "steering");
+    }
+
+    /// 全局 `steer_folded` 只带轻量字段：图片本体（可能是一整张 base64）
+    /// 绝不跟着广播跑到每个实例，否则一次带图转向会把所有连接打爆。
+    #[test]
+    fn steer_folded_broadcast_drops_image_bodies() {
+        let input = zap_kernel::event::SteeredInput {
+            text: "<user-query>\n看这张图\n</user-query>\n\n[jeikcode-steer]\n".into(),
+            images: vec![zap_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "BASE64-BODY-SHOULD-STAY-LOCAL".into(),
+            }],
+            message_id: Some("m-steer".into()),
+        };
+        let event = GlobalWireEvent::SteerFolded {
+            session_id: "s-1".into(),
+            inputs: vec![SteerFoldedInputWire::from_kernel(&input)],
+            client_input_ids: vec![Some("web-1".into())],
+            anchor_message_id: Some("assistant-before-steer".into()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "steer_folded");
+        assert_eq!(json["session_id"], "s-1");
+        assert_eq!(json["inputs"][0]["message_id"], "m-steer");
+        assert_eq!(json["anchor_message_id"], "assistant-before-steer");
+        assert_eq!(json["inputs"][0]["has_images"], true);
+        assert!(json["inputs"][0].get("images").is_none());
+        assert!(!json.to_string().contains("BASE64-BODY-SHOULD-STAY-LOCAL"));
+    }
+
+    #[test]
+    fn queue_claim_has_one_winner_and_a_permanent_tombstone() {
+        let mut card = item("queued", "queue");
+        card.client_input_id = Some("cid-1".into());
+        let mut items = vec![card];
+        let mut claims = Vec::new();
+
+        assert!(claim_queue_item(&mut items, &mut claims, "cid-1", true));
+        assert!(items.is_empty(), "the winner consumes the server card");
+        assert_eq!(claims, vec!["cid-1"]);
+
+        // A second tab with the same (stale) card, even with a payload, loses.
+        assert!(!claim_queue_item(&mut items, &mut claims, "cid-1", true));
+
+        // A card the server has not mirrored yet can still be claimed once by
+        // the tab that owns its payload.
+        assert!(!claim_queue_item(&mut items, &mut claims, "cid-2", false));
+        assert!(claim_queue_item(&mut items, &mut claims, "cid-2", true));
+        assert!(!claim_queue_item(&mut items, &mut claims, "cid-2", true));
+    }
+
+    #[test]
+    fn claimed_cards_are_filtered_from_any_queue_snapshot() {
+        let mut a = item("a", "queue");
+        a.client_input_id = Some("a".into());
+        let mut b = item("b", "queue");
+        b.client_input_id = Some("b".into());
+
+        let filtered = drop_claimed_queue_items(vec![a, b], &["a".to_string()]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].client_input_id.as_deref(), Some("b"));
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct RevealPathRequest {
     path: String,
+    cwd: Option<String>,
 }
 
-async fn reveal_file_or_folder(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
-    let p = std::path::PathBuf::from(req.path.trim());
-    if !p.exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
-        );
-    }
-    // 异步后台线程拉起系统文件管理器，无桌面环境或异地请求时静默忽略，杜绝挂起卡死
-    tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "windows")]
-        {
-            if p.is_file() {
-                let _ = std::process::Command::new("explorer")
-                    .arg(format!("/select,{}", p.display()))
-                    .spawn();
+async fn reveal_file_or_folder(
+    State(state): State<AppState>,
+    Json(req): Json<RevealPathRequest>,
+) -> impl IntoResponse {
+    let raw = req.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        if let Some(ref cwd_str) = req.cwd {
+            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
+            if candidate_cwd.exists() {
+                p = candidate_cwd;
             } else {
-                let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                let candidate = state.bind_working_dir.join(raw);
+                if candidate.exists() {
+                    p = candidate;
+                }
+            }
+        } else {
+            let candidate = state.bind_working_dir.join(raw);
+            if candidate.exists() {
+                p = candidate;
             }
         }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(&p).spawn();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if std::env::var_os("DISPLAY").is_some()
-                || std::env::var_os("WAYLAND_DISPLAY").is_some()
-            {
-                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
-            }
-        }
-    });
-    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
-}
+    }
+    let p = p.canonicalize().unwrap_or(p);
+    let p = zap_capabilities::pathnorm::strip_verbatim_path(&p);
 
-async fn open_file_with_os(Json(req): Json<RevealPathRequest>) -> impl IntoResponse {
-    let p = std::path::PathBuf::from(req.path.trim());
     if !p.exists() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "success": false, "error": "Path does not exist" })),
+            Json(serde_json::json!({ "success": false, "error": shell_open::PATH_NOT_FOUND })),
         );
     }
-    tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("cmd")
-                .args(["/c", "start", "", &p.to_string_lossy()])
-                .spawn();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(&p).spawn();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if std::env::var_os("DISPLAY").is_some()
-                || std::env::var_os("WAYLAND_DISPLAY").is_some()
-            {
-                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+    let is_dir = p.is_dir();
+    // 异步派发到一次性后台线程，接口立即返回；线程内失败只记日志，由前端静默忽略。
+    if let Err(err) = shell_open::reveal(&p) {
+        tracing::warn!(
+            error = %err,
+            path = %p.display(),
+            "fs/reveal: failed to dispatch shell reveal"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": shell_open::SHELL_OPEN_FAILED })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "is_dir": is_dir })),
+    )
+}
+
+async fn open_file_with_os(
+    State(state): State<AppState>,
+    Json(req): Json<RevealPathRequest>,
+) -> impl IntoResponse {
+    let raw = req.path.trim();
+    let mut p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        if let Some(ref cwd_str) = req.cwd {
+            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
+            if candidate_cwd.exists() {
+                p = candidate_cwd;
+            } else {
+                let candidate = state.bind_working_dir.join(raw);
+                if candidate.exists() {
+                    p = candidate;
+                }
+            }
+        } else {
+            let candidate = state.bind_working_dir.join(raw);
+            if candidate.exists() {
+                p = candidate;
             }
         }
-    });
+    }
+    let p = p.canonicalize().unwrap_or(p);
+    let p = zap_capabilities::pathnorm::strip_verbatim_path(&p);
+
+    if !p.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": shell_open::PATH_NOT_FOUND })),
+        );
+    }
+    // 异步派发到一次性后台线程，接口立即返回；线程内失败只记日志，由前端静默忽略。
+    if let Err(err) = shell_open::open(&p) {
+        tracing::warn!(
+            error = %err,
+            path = %p.display(),
+            "fs/open: failed to dispatch shell open"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": shell_open::SHELL_OPEN_FAILED })),
+        );
+    }
     (StatusCode::OK, Json(serde_json::json!({ "success": true })))
 }
 
@@ -9822,9 +17438,7 @@ async fn fs_raw_handler(Query(q): Query<FsRawQuery>) -> impl IntoResponse {
                 "bmp" => "image/bmp",
                 "pdf" => "application/pdf",
                 "mp4" => "video/mp4",
-                "webm" => "video/webm",
                 "mp3" => "audio/mpeg",
-                "wav" => "audio/wav",
                 _ => "application/octet-stream",
             };
             let mut headers = axum::http::HeaderMap::new();
@@ -9969,16 +17583,59 @@ struct FsEntryDto {
     is_ignored: bool,
 }
 
+fn load_fs_tree_gitignore(
+    root: &std::path::Path,
+    current_dir: &std::path::Path,
+) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    // 兼容多种标准与项目级忽略文件：.gitignore, .ignore, .jeikcodeignore, .git/info/exclude
+    for name in [
+        ".gitignore",
+        ".ignore",
+        ".jeikcodeignore",
+        ".git/info/exclude",
+    ] {
+        let p = root.join(name);
+        if p.is_file() {
+            let _ = builder.add(&p);
+        }
+    }
+    // 沿途递归加载从 root 到 current_dir 路径上各级子目录中的局部忽略文件
+    if let Ok(rel) = current_dir.strip_prefix(root) {
+        let mut cur = root.to_path_buf();
+        for component in rel.components() {
+            cur.push(component);
+            for name in [".gitignore", ".ignore", ".jeikcodeignore"] {
+                let p = cur.join(name);
+                if p.is_file() {
+                    let _ = builder.add(&p);
+                }
+            }
+        }
+    }
+    builder.build().unwrap_or_else(|_| {
+        ignore::gitignore::GitignoreBuilder::new(root)
+            .build()
+            .expect("empty gitignore")
+    })
+}
+
 async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) -> impl IntoResponse {
+    let root = state
+        .bind_working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state.bind_working_dir.clone());
+    let root = zap_capabilities::pathnorm::strip_verbatim_path(&root);
+
     let req_path = q.path.as_deref().unwrap_or("").trim();
     let abs_dir = if req_path.is_empty() || req_path == "." {
-        state.bind_working_dir.clone()
+        root.to_path_buf()
     } else {
         let p = std::path::PathBuf::from(req_path);
         if p.is_absolute() {
             p
         } else {
-            state.bind_working_dir.join(p)
+            root.join(p)
         }
     };
     let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
@@ -9997,6 +17654,8 @@ async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) ->
         );
     }
 
+    let gitignore = load_fs_tree_gitignore(&root, &abs_dir);
+
     let mut entries_res: Vec<FsEntryDto> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
@@ -10009,11 +17668,28 @@ async fn fs_tree(State(state): State<AppState>, Query(q): Query<FsTreeQuery>) ->
             }
             let file_type = entry.file_type();
             let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
-            let full_p = abs_dir.join(&name).to_string_lossy().replace('\\', "/");
-            let is_ignored = name == "target"
-                || name == "node_modules"
-                || name == "dist"
-                || name.starts_with('.');
+            let entry_path = abs_dir.join(&name);
+            let full_p = entry_path.to_string_lossy().replace('\\', "/");
+
+            let is_ignored = {
+                let rel_opt = entry_path.strip_prefix(&root).ok();
+                let matched = if let Some(rel) = rel_opt {
+                    gitignore.matched_path_or_any_parents(rel, is_dir)
+                } else {
+                    gitignore.matched_path_or_any_parents(&entry_path, is_dir)
+                };
+                match matched {
+                    ignore::Match::Ignore(_) => true,
+                    ignore::Match::Whitelist(_) => false,
+                    ignore::Match::None => {
+                        name == "target"
+                            || name == "node_modules"
+                            || name == "dist"
+                            || name == ".jeikcode_store"
+                            || name.starts_with('.')
+                    }
+                }
+            };
 
             if is_dir {
                 dirs.push(name.clone());
@@ -10060,40 +17736,53 @@ struct FsReadQuery {
     cwd: Option<String>,
 }
 
-async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
-    let raw = q.path.trim().trim_start_matches("./");
+#[derive(Debug, Deserialize)]
+struct FsStatQuery {
+    path: String,
+    cwd: Option<String>,
+}
+
+/// `/fs/read` 与 `/fs/stat` 共用的路径解析：相对路径依次尝试显式 cwd、绑定工作目录、进程当前目录。
+fn resolve_fs_target(
+    raw_path: &str,
+    cwd: Option<&str>,
+    bind_working_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    let raw = raw_path.trim().trim_start_matches("./");
     let mut p = std::path::PathBuf::from(raw);
     if !p.is_absolute() {
-        if let Some(ref cwd_str) = q.cwd {
-            let candidate_cwd = std::path::PathBuf::from(cwd_str).join(raw);
-            if candidate_cwd.exists() {
-                p = candidate_cwd;
-            } else {
-                let candidate = state.bind_working_dir.join(raw);
-                if candidate.exists() {
-                    p = candidate;
-                } else if let Ok(cur) = std::env::current_dir() {
-                    let candidate2 = cur.join(raw);
-                    if candidate2.exists() {
-                        p = candidate2;
-                    }
-                }
+        let existing = |candidate: std::path::PathBuf| candidate.exists().then_some(candidate);
+        let mut resolved =
+            cwd.and_then(|cwd_str| existing(std::path::PathBuf::from(cwd_str).join(raw)));
+        if resolved.is_none() {
+            resolved = existing(bind_working_dir.join(raw));
+        }
+        if resolved.is_none() {
+            if let Ok(cur) = std::env::current_dir() {
+                resolved = existing(cur.join(raw));
             }
-        } else {
-            let candidate = state.bind_working_dir.join(raw);
-            if candidate.exists() {
-                p = candidate;
-            } else if let Ok(cur) = std::env::current_dir() {
-                let candidate2 = cur.join(raw);
-                if candidate2.exists() {
-                    p = candidate2;
-                }
-            }
+        }
+        if let Some(found) = resolved {
+            p = found;
         }
     }
 
     let p = p.canonicalize().unwrap_or(p);
-    let p = zap_capabilities::pathnorm::strip_verbatim_path(&p);
+    zap_capabilities::pathnorm::strip_verbatim_path(&p)
+}
+
+/// 文件戳（大小 + 修改时间）：编辑器用它判断磁盘内容是否真的变过。
+fn fs_stamp(meta: &std::fs::Metadata) -> (u64, Option<u64>) {
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    (meta.len(), modified_ms)
+}
+
+async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) -> impl IntoResponse {
+    let p = resolve_fs_target(&q.path, q.cwd.as_deref(), &state.bind_working_dir);
 
     if !p.exists() || !p.is_file() {
         return (
@@ -10102,10 +17791,19 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
                 "path": q.path,
                 "content": "",
                 "success": false,
-                "error": "File not found"
+                "error": "File not found",
+                "size": 0,
+                "modified_ms": null
             })),
         );
     }
+
+    // 先取戳再读内容：宁可文件在 read 期间又被改一次（下一轮多刷一次），
+    // 也不能让戳比内容更旧，否则轮询会误判“磁盘没变”而留下旧内容。
+    let (size, modified_ms) = tokio::fs::metadata(&p)
+        .await
+        .map(|m| fs_stamp(&m))
+        .unwrap_or((0, None));
 
     match tokio::fs::read_to_string(&p).await {
         Ok(content) => (
@@ -10113,7 +17811,9 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
             Json(serde_json::json!({
                 "path": p.to_string_lossy().replace('\\', "/"),
                 "content": content,
-                "success": true
+                "success": true,
+                "size": size,
+                "modified_ms": modified_ms
             })),
         ),
         Err(_) => match tokio::fs::read(&p).await {
@@ -10122,7 +17822,9 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
                 Json(serde_json::json!({
                     "path": p.to_string_lossy().replace('\\', "/"),
                     "content": String::from_utf8_lossy(&bytes).to_string(),
-                    "success": true
+                    "success": true,
+                    "size": size,
+                    "modified_ms": modified_ms
                 })),
             ),
             Err(e) => (
@@ -10131,10 +17833,43 @@ async fn fs_read(State(state): State<AppState>, Query(q): Query<FsReadQuery>) ->
                     "path": q.path,
                     "content": "",
                     "success": false,
-                    "error": format!("{e}")
+                    "error": format!("{e}"),
+                    "size": 0,
+                    "modified_ms": null
                 })),
             ),
         },
+    }
+}
+
+/// 轻量文件戳查询：编辑器前台标签轮询它，只有大小/修改时间变化才重新拉全文。
+async fn fs_stat(State(state): State<AppState>, Query(q): Query<FsStatQuery>) -> impl IntoResponse {
+    let p = resolve_fs_target(&q.path, q.cwd.as_deref(), &state.bind_working_dir);
+    match tokio::fs::metadata(&p).await {
+        Ok(meta) => {
+            let (size, modified_ms) = fs_stamp(&meta);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "path": p.to_string_lossy().replace('\\', "/"),
+                    "exists": true,
+                    "is_file": meta.is_file(),
+                    "size": size,
+                    "modified_ms": modified_ms
+                })),
+            )
+        }
+        // 不返回 404：客户端需要区分“文件被删/改名”和“网络故障”。
+        Err(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "path": q.path,
+                "exists": false,
+                "is_file": false,
+                "size": 0,
+                "modified_ms": null
+            })),
+        ),
     }
 }
 
@@ -10158,13 +17893,22 @@ async fn fs_write(
     }
     let content = body.content.unwrap_or_default();
     match tokio::fs::write(&p, content.as_bytes()).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "message": "File saved successfully"
-            })),
-        ),
+        Ok(()) => {
+            // 返回写入后的文件戳：客户端用它推进轮询基线，避免把自己的保存误判成外部更新。
+            let (size, modified_ms) = tokio::fs::metadata(&p)
+                .await
+                .map(|m| fs_stamp(&m))
+                .unwrap_or((content.len() as u64, None));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "message": "File saved successfully",
+                    "size": size,
+                    "modified_ms": modified_ms
+                })),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -10528,9 +18272,18 @@ async fn handle_terminal_socket(
     }
 
     let mut send_task = tokio::spawn(async move {
-        while let Ok(text) = rx.recv().await {
-            if ws_sender.send(Message::Text(text)).await.is_err() {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(text) => {
+                    if ws_sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                // 订阅端落后（浏览器后台节流 / 长时间挂起导致 TCP 背压）时，
+                // 只能丢弃过期消息，绝不能因此结束循环：一旦 send_task 结束，
+                // select! 会中止 recv_task 并关闭整条 WebSocket，前端终端就再也收不到输出（黑屏）。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
             }
         }
     });
@@ -10584,13 +18337,27 @@ struct TerminalCreatePayload {
 }
 
 async fn terminal_create(Json(req): Json<TerminalCreatePayload>) -> impl IntoResponse {
-    let shell = req.shell.unwrap_or_else(|| {
-        if cfg!(windows) {
-            "powershell".to_string()
-        } else {
-            "bash".to_string()
+    let shell = match req.shell {
+        Some(s) if !s.is_empty() => {
+            let lower = s.to_ascii_lowercase();
+            if cfg!(not(windows))
+                && (lower.contains("power") || lower.contains("pwsh") || lower.contains("cmd"))
+            {
+                "bash".to_string()
+            } else if cfg!(windows) && lower == "bash" {
+                "gitbash".to_string()
+            } else {
+                s
+            }
         }
-    });
+        _ => {
+            if cfg!(windows) {
+                "powershell".to_string()
+            } else {
+                "bash".to_string()
+            }
+        }
+    };
     let cwd = req.cwd.unwrap_or_else(|| ".".to_string());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10628,7 +18395,7 @@ struct TerminalListQuery {
 
 async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse {
     let guard = daemon_terminals().lock().unwrap_or_else(|e| e.into_inner());
-    let list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
+    let mut list: Vec<DaemonTerminalItem> = if let Some(req_cwd) = q.cwd {
         let norm_req = req_cwd
             .replace('\\', "/")
             .trim_end_matches('/')
@@ -10653,6 +18420,9 @@ async fn terminal_list(Query(q): Query<TerminalListQuery>) -> impl IntoResponse 
     } else {
         guard.values().cloned().collect()
     };
+    // HashMap 的迭代顺序是不确定的，直接返回会让前端终端标签顺序在每次同步后随机抖动。
+    // 统一按创建时间（其次按 id）排序，保证多端 / 多标签页看到的标签顺序完全一致。
+    list.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
     let platform = if cfg!(windows) {
         "windows"
     } else if cfg!(target_os = "macos") {
@@ -10768,6 +18538,254 @@ struct ChatSteerResponse {
     error: Option<String>,
 }
 
+fn steer_queue_item(req: &ChatSteerRequest, client_id: String, kind: &str) -> QueuedMessageItem {
+    QueuedMessageItem {
+        id: serde_json::Value::String(client_id.clone()),
+        client_input_id: Some(client_id),
+        text: req.message.clone(),
+        images: (!req.images.is_empty()).then(|| {
+            serde_json::Value::Array(
+                req.images
+                    .iter()
+                    .map(|image| {
+                        serde_json::json!({
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        })
+                    })
+                    .collect(),
+            )
+        }),
+        kind: kind.to_string(),
+        approval_mode: req.approval_mode.clone(),
+        created_at: req.created_at,
+        force_send: None,
+    }
+}
+
+/// POST /chat/steer/admit — durably reserve the steer intent + queue card
+/// before the client tries to submit it. This is the only client write needed;
+/// a refresh can then render the server-owned `steering` card and replay
+/// `/chat/steer` idempotently.
+async fn admit_chat_steer(
+    State(state): State<AppState>,
+    Json(req): Json<ChatSteerRequest>,
+) -> impl IntoResponse {
+    if req.message.trim().is_empty() && req.images.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("steer message is empty".into()),
+            }),
+        );
+    }
+    let Some(client_id) = req
+        .client_input_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("client_input_id is required".into()),
+            }),
+        );
+    };
+    let lock = steer_admission_lock(&req.session_id, &client_id);
+    let _guard = lock.lock().await;
+    let active_turn = state
+        .active_chats
+        .steer_sender(&req.session_id)
+        .await
+        .is_some();
+    if let Some(existing) =
+        zap_capabilities::session::inputs::find_global(&req.session_id, &client_id)
+    {
+        match existing.status.as_str() {
+            "promoted" => {
+                retire_folded_steers_from_queue(
+                    &req.session_id,
+                    &[(Some(client_id), existing.message_id)],
+                )
+                .await;
+                return (
+                    StatusCode::OK,
+                    Json(ChatSteerResponse {
+                        accepted: true,
+                        error: None,
+                    }),
+                );
+            }
+            "submitted" => {
+                if !active_turn {
+                    let _ = zap_capabilities::session::inputs::mark_rejected_global(
+                        &req.session_id,
+                        &client_id,
+                    );
+                    update_chat_queue_steer_state(
+                        &req.session_id,
+                        &client_id,
+                        "queue",
+                        Some(steer_queue_item(&req, client_id.clone(), "queue")),
+                    )
+                    .await;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ChatSteerResponse {
+                            accepted: false,
+                            error: Some("turn ended before the steer was submitted".into()),
+                        }),
+                    );
+                }
+
+                update_chat_queue_steer_state(
+                    &req.session_id,
+                    &client_id,
+                    "steer",
+                    Some(steer_queue_item(&req, client_id.clone(), "steer")),
+                )
+                .await;
+                return (
+                    StatusCode::OK,
+                    Json(ChatSteerResponse {
+                        accepted: true,
+                        error: None,
+                    }),
+                );
+            }
+            "cancelled" => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ChatSteerResponse {
+                        accepted: false,
+                        error: Some("steer was cancelled".into()),
+                    }),
+                );
+            }
+            "admitted" => {
+                if !active_turn {
+                    let _ = zap_capabilities::session::inputs::mark_rejected_global(
+                        &req.session_id,
+                        &client_id,
+                    );
+                    update_chat_queue_steer_state(
+                        &req.session_id,
+                        &client_id,
+                        "queue",
+                        Some(steer_queue_item(&req, client_id.clone(), "queue")),
+                    )
+                    .await;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ChatSteerResponse {
+                            accepted: false,
+                            error: Some("no active turn to steer".into()),
+                        }),
+                    );
+                }
+
+                update_chat_queue_steer_state(
+                    &req.session_id,
+                    &client_id,
+                    "steering",
+                    Some(steer_queue_item(&req, client_id.clone(), "steering")),
+                )
+                .await;
+                return (
+                    StatusCode::OK,
+                    Json(ChatSteerResponse {
+                        accepted: true,
+                        error: None,
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    if !active_turn {
+        return (
+            StatusCode::CONFLICT,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("no active turn to steer".into()),
+            }),
+        );
+    }
+    let operation_id = state
+        .active_chats
+        .admitted_user_for_session(&req.session_id)
+        .await
+        .and_then(|user| user.client_input_id);
+    let mut input = zap_capabilities::session::SessionInput {
+        id: client_id.clone(),
+        seq: 0,
+        session_id: req.session_id.clone(),
+        delivery: "steer".into(),
+        status: "admitted".into(),
+        text: req.message.clone(),
+        images: req
+            .images
+            .iter()
+            .map(|image| zap_kernel::message::ImageContent {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            })
+            .collect(),
+        created_at: req.created_at.unwrap_or_else(|| {
+            u64::try_from(zap_capabilities::session::now_ms()).unwrap_or(0)
+        }),
+        message_id: None,
+        operation_id,
+    };
+    if zap_capabilities::session::inputs::append_global(&mut input).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ChatSteerResponse {
+                accepted: false,
+                error: Some("failed to persist steer intent".into()),
+            }),
+        );
+    }
+    update_chat_queue_steer_state(
+        &req.session_id,
+        &client_id,
+        "steering",
+        Some(steer_queue_item(&req, client_id.clone(), "steering")),
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(ChatSteerResponse {
+            accepted: true,
+            error: None,
+        }),
+    )
+}
+
+/// Serialize duplicate submissions for one `(session, client_input_id)` across
+/// refreshes/tabs. Weak values let completed keys disappear once the guard drops.
+fn steer_admission_lock(session_id: &str, client_input_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let key = format!("{session_id}\u{1f}{client_input_id}");
+    let mut locks = LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if locks.len() > 512 {
+        locks.retain(|_, weak| weak.strong_count() > 0);
+    }
+    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
 /// POST /chat/steer — fold a queued follow-up into the running turn.
 ///
 /// Does not cancel the in-flight model call or tool batch. The kernel drains
@@ -10786,6 +18804,90 @@ async fn chat_steer(
             }),
         );
     }
+    let make_queue_item = |client_id: String, kind: &str| QueuedMessageItem {
+        id: serde_json::Value::String(client_id.clone()),
+        client_input_id: Some(client_id),
+        text: req.message.clone(),
+        images: (!req.images.is_empty()).then(|| {
+            serde_json::Value::Array(
+                req.images
+                    .iter()
+                    .map(|image| {
+                        serde_json::json!({
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        })
+                    })
+                    .collect(),
+            )
+        }),
+        kind: kind.to_string(),
+        approval_mode: req.approval_mode.clone(),
+        created_at: req.created_at,
+        force_send: None,
+    };
+    let admission_lock = req
+        .client_input_id
+        .as_deref()
+        .map(|client_id| steer_admission_lock(&req.session_id, client_id));
+    let _admission_guard = match &admission_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    // Idempotent admission state machine: submitted/promoted requests are already
+    // owned by the kernel and must never be appended or submitted a second time.
+    let existing = req.client_input_id.as_deref().and_then(|client_id| {
+        zap_capabilities::session::inputs::find_global(&req.session_id, client_id)
+    });
+    if let Some(existing) = &existing {
+        match existing.status.as_str() {
+            "promoted" => {
+                retire_folded_steers_from_queue(
+                    &req.session_id,
+                    &[(req.client_input_id.clone(), existing.message_id.clone())],
+                )
+                .await;
+                return (
+                    StatusCode::OK,
+                    Json(ChatSteerResponse {
+                        accepted: true,
+                        error: None,
+                    }),
+                );
+            }
+            "submitted" => {
+                if let Some(client_id) = req.client_input_id.as_deref() {
+                    update_chat_queue_steer_state(
+                        &req.session_id,
+                        client_id,
+                        "steer",
+                        Some(make_queue_item(client_id.to_string(), "steer")),
+                    )
+                    .await;
+                }
+                return (
+                    StatusCode::OK,
+                    Json(ChatSteerResponse {
+                        accepted: true,
+                        error: None,
+                    }),
+                );
+            }
+            "cancelled" => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ChatSteerResponse {
+                        accepted: false,
+                        error: Some("steer was cancelled".into()),
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    let existing_admitted = existing
+        .as_ref()
+        .is_some_and(|row| row.status == "admitted");
     let Some(tx) = state.active_chats.steer_sender(&req.session_id).await else {
         return (
             StatusCode::CONFLICT,
@@ -10795,11 +18897,51 @@ async fn chat_steer(
             }),
         );
     };
-    // Record the client correlation id BEFORE submitting, so a fast round-boundary
-    // fold cannot emit `steered` before the id is available to echo.
+    // Durable steer admission: visible in the rail even before the kernel folds
+    // it, and recovered after a refresh. Promotion by the `Steered` fan-out
+    // retires this row by the same client id.
+    let fallback_queue_item = if let Some(client_id) = req.client_input_id.clone() {
+        let operation_id = state
+            .active_chats
+            .admitted_user_for_session(&req.session_id)
+            .await
+            .and_then(|user| user.client_input_id);
+        let mut input = zap_capabilities::session::SessionInput {
+            id: client_id.clone(),
+            seq: 0,
+            session_id: req.session_id.clone(),
+            delivery: "steer".into(),
+            status: "admitted".into(),
+            text: req.message.clone(),
+            images: req
+                .images
+                .iter()
+                .map(|image| zap_kernel::message::ImageContent {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                })
+                .collect(),
+            created_at: req.created_at.unwrap_or_else(|| {
+                u64::try_from(zap_capabilities::session::now_ms()).unwrap_or(0)
+            }),
+            message_id: None,
+            operation_id,
+        };
+        if !existing_admitted {
+            let _ = zap_capabilities::session::inputs::append_global(&mut input);
+        }
+        Some(make_queue_item(client_id, "steering"))
+    } else {
+        None
+    };
+    if let Some(client_id) = req.client_input_id.as_deref() {
+        update_chat_queue_steer_state(&req.session_id, client_id, "steering", fallback_queue_item)
+            .await;
+    }
+    // Record the client correlation id and timestamp BEFORE submitting
     state
         .active_chats
-        .record_steer_client_id(&req.session_id, req.client_input_id.clone())
+        .record_steer_metadata(&req.session_id, req.client_input_id.clone(), req.created_at)
         .await;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let pending = live_api::PendingChatSteer {
@@ -10812,9 +18954,17 @@ async fn chat_steer(
                 data: image.data,
             })
             .collect(),
+        client_input_id: req.client_input_id.clone(),
         done: done_tx,
     };
     if tx.send(live_api::ChatSteerSignal::Submit(pending)).is_err() {
+        if let Some(client_id) = req.client_input_id.as_deref() {
+            let _ = zap_capabilities::session::inputs::mark_rejected_global(
+                &req.session_id,
+                client_id,
+            );
+            update_chat_queue_steer_state(&req.session_id, client_id, "queue", None).await;
+        }
         return (
             StatusCode::CONFLICT,
             Json(ChatSteerResponse {
@@ -10829,20 +18979,46 @@ async fn chat_steer(
         Err(_) => Err("timed out waiting for the running turn to accept the steer".into()),
     };
     match outcome {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ChatSteerResponse {
-                accepted: true,
-                error: None,
-            }),
-        ),
-        Err(error) => (
-            StatusCode::CONFLICT,
-            Json(ChatSteerResponse {
-                accepted: false,
-                error: Some(error),
-            }),
-        ),
+        Ok(()) => {
+            if let Some(client_id) = req.client_input_id.as_deref() {
+                let _ = zap_capabilities::session::inputs::mark_submitted_global(
+                    &req.session_id,
+                    client_id,
+                );
+                update_chat_queue_steer_state(&req.session_id, client_id, "steer", None).await;
+            }
+            // 服务端已将转向接收进运行中的回合：这是「会话仍在干活」的权威证据，
+            // 广播出去让任何一端（包括刚清过 busy 的观察者）立即回到运行态。
+            crate::publish_global(crate::GlobalWireEvent::Activity {
+                session_id: req.session_id.clone(),
+                running: true,
+                terminal: None,
+                status: None,
+            });
+            (
+                StatusCode::OK,
+                Json(ChatSteerResponse {
+                    accepted: true,
+                    error: None,
+                }),
+            )
+        }
+        Err(error) => {
+            if let Some(client_id) = req.client_input_id.as_deref() {
+                let _ = zap_capabilities::session::inputs::mark_rejected_global(
+                    &req.session_id,
+                    client_id,
+                );
+                update_chat_queue_steer_state(&req.session_id, client_id, "queue", None).await;
+            }
+            (
+                StatusCode::CONFLICT,
+                Json(ChatSteerResponse {
+                    accepted: false,
+                    error: Some(error),
+                }),
+            )
+        }
     }
 }
 
@@ -10867,7 +19043,125 @@ async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoRespons
     for id in SessionRuntimeRegistry::global().live_turn_session_ids() {
         ids.insert(id);
     }
+    // `/loop` / `/goal` 在两次唤醒之间没有执行中的回合，但控制器还挂着：
+    // 对客户端而言这也是「正在干活」，否则按钮会在两轮之间闪回发送态。
+    for id in crate::controller_running_session_ids() {
+        ids.insert(id);
+    }
+    for id in crate::compaction_running_session_ids() {
+        ids.insert(id);
+    }
     Json(ids.into_iter().collect::<Vec<_>>())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ChatRuntimeQuery {
+    session_id: String,
+}
+
+/// GET /chat/runtime?session_id=… — the single server-side authority for
+/// 「这个会话现在有没有人在干活」.
+///
+/// `/chat/active` 只是一个 id 列表，且口径只覆盖「有回合在执行」。本接口把
+/// `/chat` 占用、native live 回合、运行时注册表与 `/loop`·`/goal` 控制器并成
+/// 一份每会话快照，客户端据此（而不是本地启发式）决定发送/停止按钮、呼吸点与
+/// 实时计时。`status` 是当前阶段（如 `compacting`），`compaction_started_at`
+/// 是该阶段的墙钟起点；两者都由服务端压缩阶段登记表支撑，刷新后照样可恢复。
+/// 旧客户端不读它，因此这是纯增量接口。
+async fn chat_runtime(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ChatRuntimeQuery>,
+) -> axum::response::Response {
+    use zap_coding::session_runtime_registry::SessionRuntimeRegistry;
+
+    let session_id = q.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "session_id is required",
+            })),
+        )
+            .into_response();
+    }
+    let (chat_active, chat_status, chat_started_at) = {
+        let guard = state.active_chats.inner.read().await;
+        if let Some(op_id) = guard.aliases.get(&session_id) {
+            if let Some(op) = guard.operations.get(op_id) {
+                (true, op.status.clone(), Some(op.started_at))
+            } else {
+                (true, None, None)
+            }
+        } else {
+            (false, None, None)
+        }
+    };
+    let live_running =
+        crate::native_live::live_running_session_id().as_deref() == Some(session_id.as_str());
+    let registry_live = SessionRuntimeRegistry::global()
+        .live_turn_session_ids()
+        .iter()
+        .any(|id| id == &session_id);
+    let controller = crate::controller_state_for(&session_id).unwrap_or_default();
+    let meta = SessionRuntimeRegistry::global()
+        .list_all()
+        .into_iter()
+        .find(|entry| entry.session_id == session_id);
+    let turn_id = state
+        .active_chats
+        .admitted_user_for_session(&session_id)
+        .await
+        .and_then(|user| user.client_input_id);
+    let compaction_phase_started_at = compaction_started_at(&session_id);
+    let compaction_owner = compaction_owner(&session_id);
+    let execution_revision = execution_phase_revision(&session_id);
+    let running = chat_active
+        || live_running
+        || registry_live
+        || controller.loop_active
+        || controller.goal_active
+        // 阶段登记本身就是“有人在跑”的证据：手动 `/live/compact` 在空闲 runtime
+        // 上执行时，上述四个信号都可能为假。
+        || compaction_phase_started_at.is_some();
+    // `/chat` 操作自己的 status 与压缩登记表取并集：自动压缩过去只广播事件、
+    // 不写操作状态，刷新后客户端就丢了 `Compacting…`；native live 更没有操作状态。
+    let status =
+        chat_status.or_else(|| compaction_phase_started_at.map(|_| "compacting".to_string()));
+    let source = if chat_active {
+        "chat"
+    } else if live_running || registry_live {
+        "live"
+    } else if controller.loop_active {
+        "loop"
+    } else if controller.goal_active {
+        "goal"
+    } else if compaction_phase_started_at.is_some() {
+        "compaction"
+    } else {
+        "idle"
+    };
+    Json(serde_json::json!({
+        "running": running,
+        "source": source,
+        "status": status,
+        "phase": compaction_phase_started_at.map(|_| "compacting"),
+        "phase_started_at": compaction_phase_started_at,
+        "owner": compaction_owner,
+        "revision": execution_revision,
+        "started_at": chat_started_at,
+        "compaction_started_at": compaction_phase_started_at,
+        "turn_id": turn_id,
+        "loop": {
+            "active": controller.loop_active,
+            "round": controller.loop_round,
+            "label": controller.loop_label,
+        },
+        "goal": { "active": controller.goal_active },
+        "last_terminal": meta.as_ref().and_then(|entry| entry.last_terminal.clone()),
+        "terminal_seq": meta.as_ref().map(|entry| entry.terminal_seq).unwrap_or(0),
+    }))
+    .into_response()
 }
 
 #[derive(serde::Serialize)]
@@ -11132,8 +19426,8 @@ async fn chat_pending(
     let (permission, user_input) = state.active_chats.pending_interactive(&session_id).await;
     // Auto never parks on tool approval. A leftover pending_permission.json from
     // Build must not resurrect a ghost card after the user switched to Auto.
-    let auto_mode =
-        live_api::live_current_approval_mode() == crate::approval_mode::ApprovalMode::Auto;
+    let auto_mode = live_api::live_session_approval_mode(Some(&session_id))
+        == crate::approval_mode::ApprovalMode::Auto;
     let mut permission_json = if auto_mode {
         None
     } else {
@@ -11229,6 +19523,11 @@ pub struct PermissionDecisionRequest {
     pub tool_name: Option<String>,
 }
 
+/// How long `/chat/permission` waits for the running turn to actually consume the
+/// queued decision before reporting an unconfirmed (retryable) outcome. The runtime
+/// consumes in microseconds; this only fires for a wedged turn.
+const PERMISSION_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 async fn chat_permission(
     State(state): State<AppState>,
     Json(req): Json<PermissionDecisionRequest>,
@@ -11269,17 +19568,37 @@ async fn chat_permission(
             // A queued oneshot value can still lose a race with the driver's
             // request timeout. Report success only after the driver consumes
             // this exact decision; timeout/cancel drops the acknowledgement.
-            return match accepted.await {
-                Ok(()) => Json(serde_json::json!({ "success": true })),
-                Err(_) => Json(serde_json::json!({
+            // Bound that wait: an unbounded await turns a wedged runtime into a
+            // browser request that never settles, and the card's buttons stay
+            // disabled with no way back.
+            return match tokio::time::timeout(PERMISSION_ACK_WAIT, accepted).await {
+                Ok(Ok(())) => Json(serde_json::json!({ "success": true })),
+                Ok(Err(_)) => Json(serde_json::json!({
                     "success": false,
+                    "expired": true,
                     "error": "permission request expired"
                 })),
+                Err(_) => Json(serde_json::json!({
+                    "success": false,
+                    "error": "permission decision was not acknowledged in time; retry"
+                })),
             };
+        }
+        permission_bridge::PermissionDelivery::AlreadyResolved { decision: applied } => {
+            // Idempotent replay of an approval that already took effect this turn
+            // (lost HTTP reply over a long-idle connection, a second WebUI
+            // instance, a retried click). Never deliver twice and never mutate
+            // MCP/config policy here — just let the stale card retire.
+            return Json(serde_json::json!({
+                "success": true,
+                "already_resolved": true,
+                "applied": permission_bridge::decision_wire(applied),
+            }));
         }
         permission_bridge::PermissionDelivery::Expired => {
             return Json(serde_json::json!({
                 "success": false,
+                "expired": true,
                 "error": "permission request expired"
             }));
         }
@@ -11292,6 +19611,7 @@ async fn chat_permission(
     if active_operation.is_some() {
         return Json(serde_json::json!({
             "success": false,
+            "expired": true,
             "error": "stale or unknown permission request"
         }));
     }
@@ -11308,6 +19628,7 @@ async fn chat_permission(
             if permission_bridge::approval_id_for_pending(&pending) != approval_id {
                 return Json(serde_json::json!({
                     "success": false,
+                    "expired": true,
                     "error": "stale or unknown permission request"
                 }));
             }
@@ -11316,6 +19637,7 @@ async fn chat_permission(
     }
     Json(serde_json::json!({
         "success": false,
+        "expired": true,
         "error": "permission request is no longer active; retry the operation"
     }))
 }
@@ -11384,30 +19706,61 @@ fn merge_configured_mcp_statuses(
     by_name.into_iter().collect()
 }
 
-async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
-    Json(build_mcp_status(&state).await)
+async fn mcp_status(
+    State(state): State<AppState>,
+    Query(query): Query<CapQuery>,
+) -> Json<McpStatusResponse> {
+    let working_dir = resolve_capability_project(&state, query.working_dir.as_deref()).await;
+    Json(build_mcp_status_for(&state, working_dir).await)
 }
 
-/// Build the full MCP status response. Shared by `GET /mcp/status` and the MCP half
-/// of `GET /capabilities`.
+/// Query for the capability surfaces. `working_dir` lets the WebUI ask about the
+/// project of the session it is VIEWING rather than the daemon's last `cd`
+/// target — after a restart those differ (the daemon starts in its process cwd),
+/// and the panel would otherwise list/edit another project's MCP + skills.
+#[derive(serde::Deserialize, Default)]
+struct CapQuery {
+    working_dir: Option<String>,
+}
+
+/// Resolve the project a capability request is about. An explicitly requested,
+/// existing directory wins; otherwise fall back to the daemon's current project.
+async fn resolve_capability_project(
+    state: &AppState,
+    requested: Option<&str>,
+) -> std::path::PathBuf {
+    if let Some(dir) = requested.map(str::trim).filter(|dir| !dir.is_empty()) {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    state.project.read().await.working_dir.clone()
+}
+
+/// Build the MCP status response for the daemon's current project.
 async fn build_mcp_status(state: &AppState) -> McpStatusResponse {
+    let working_dir = state.project.read().await.working_dir.clone();
+    build_mcp_status_for(state, working_dir).await
+}
+
+/// Build the full MCP status response for ONE project. Shared by `GET /mcp/status`
+/// and the MCP half of `GET /capabilities`.
+async fn build_mcp_status_for(
+    state: &AppState,
+    working_dir: std::path::PathBuf,
+) -> McpStatusResponse {
     // Agent `zap_config_reload` dirties the daemon MCP cache; rebuild it
     // here so the WebUI sidebar reflects newly written mcp.json. Live-runtime
     // remount happens at TurnFinished (reload_capabilities is Busy mid-turn).
     if zap_capabilities::config_reload::take_pending_mcp_cache_reload() {
-        let working_dir = state.project.read().await.working_dir.clone();
         let registry = state.mcp_pool.reload_full(&working_dir).await;
         *state.mcp_registry.write().await = registry;
     }
-    // Prefer the per-project `/chat` registry when it exists; otherwise report
-    // the daemon registry. Live runtime capability changes use the awaitable
-    // CodingRuntime boundary and are reported on the live event stream.
-    let working_dir = state.project.read().await.working_dir.clone();
-    let registry = if let Some(reg) = state.mcp_pool.cached_registry(&working_dir).await {
-        reg
-    } else {
-        state.mcp_registry.read().await.clone()
-    };
+    // The per-project pool is the source of truth. `registry()` initializes a
+    // project that has no cached slot yet (the caller is viewing it, so its
+    // servers are about to be needed anyway).
+    let registry = state.mcp_pool.registry(&working_dir).await;
 
     let session_schema = zap_capabilities::mcp::ensure_session_mcp_schema(&working_dir).await;
     let session_registry = if let Some(session_id) = crate::native_live::live_view_session_id() {
@@ -11566,13 +19919,35 @@ pub(crate) async fn replace_project_mcp_registry(
 }
 
 /// Rebuild the per-project MCP registry from disk and remount live capabilities.
-/// Shared by `POST /mcp/reload` and `POST /config/reload`.
-pub(crate) async fn reload_mcp_and_live_runtime(state: &AppState) -> bool {
-    let project = state.project.read().await;
-    let project_dir = project.working_dir.clone();
-    drop(project);
-    let registry = state.mcp_pool.reload_full(&project_dir).await;
-    *state.mcp_registry.write().await = registry;
+/// Shared by `POST /mcp/reload`, `POST /config/reload` and capability toggles.
+///
+/// `all_projects` rebuilds the target project and EVICTS every other cached
+/// project registry. An MCP toggle or an explicit MCP reload is process-wide in
+/// intent: each `ProjectMcpPool` slot holds its own registry, so leaving the other
+/// slots in place keeps a disabled server's tools on the wire for sessions in
+/// those projects until the process restarts. Evicted slots rebuild from the new
+/// on-disk config on their next lookup (no eager re-spawn storm). Skill toggles
+/// pass `false` — they must not touch other projects' MCP registries at all.
+pub(crate) async fn reload_mcp_and_live_runtime(
+    state: &AppState,
+    all_projects: bool,
+    target: Option<std::path::PathBuf>,
+) -> bool {
+    let daemon_dir = state.project.read().await.working_dir.clone();
+    let project_dir = target
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| daemon_dir.clone());
+    let registry = if all_projects {
+        state.mcp_pool.reload_all(&project_dir).await
+    } else {
+        state.mcp_pool.reload_full(&project_dir).await
+    };
+    // `state.mcp_registry` is the legacy fallback for the daemon's OWN project;
+    // never point it at a project the caller merely happens to be viewing (and do
+    // not rebuild the daemon project just to refresh a fallback nobody reads).
+    if project_dir == daemon_dir {
+        *state.mcp_registry.write().await = registry;
+    }
     match crate::native_live::binding() {
         Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
         Err(_) => true,
@@ -11580,12 +19955,250 @@ pub(crate) async fn reload_mcp_and_live_runtime(state: &AppState) -> bool {
 }
 
 async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    let runtime_reloaded = reload_mcp_and_live_runtime(&state, true, None).await;
     Json(serde_json::json!({
         "ok": runtime_reloaded,
         "status": "reloading",
         "runtime_reloaded": runtime_reloaded,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct McpAddRequest {
+    pub name: String,
+    #[serde(default, alias = "type")]
+    pub transport: Option<String>,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    pub env: Option<std::collections::BTreeMap<String, String>>,
+    pub trust: Option<bool>,
+    #[serde(default, rename = "autoApprove", alias = "auto_approve")]
+    pub auto_approve: Option<Vec<String>>,
+    pub global: Option<bool>,
+    #[serde(default, rename = "projectDir", alias = "project_dir")]
+    pub project_dir: Option<PathBuf>,
+}
+
+async fn mcp_add(
+    State(state): State<AppState>,
+    Json(payload): Json<McpAddRequest>,
+) -> axum::response::Response {
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "Server name must not be empty" })),
+        )
+            .into_response();
+    }
+
+    let daemon_dir = state.project.read().await.working_dir.clone();
+    let project_dir = payload
+        .project_dir
+        .filter(|p| p.is_dir())
+        .unwrap_or(daemon_dir);
+
+    let is_global = payload.global.unwrap_or(false);
+    let path = if is_global {
+        Config::config_dir().join("mcp.json")
+    } else {
+        project_dir.join(".mcp.json")
+    };
+
+    let transport_lower = payload
+        .transport
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase());
+    let is_http = matches!(
+        transport_lower.as_deref(),
+        Some("http") | Some("sse") | Some("streamable-http")
+    ) || (payload
+        .url
+        .as_deref()
+        .map(|u| !u.trim().is_empty())
+        .unwrap_or(false)
+        && payload
+            .command
+            .as_deref()
+            .map(|c| c.trim().is_empty())
+            .unwrap_or(true));
+
+    let merge_res = if is_http {
+        let url = payload.url.as_deref().unwrap_or("").trim();
+        if url.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "URL must not be empty for HTTP transport"
+                })),
+            )
+                .into_response();
+        }
+        zap_capabilities::mcp::merge_http_mcp_server_with_options_into_json_file(
+            &path,
+            name,
+            url,
+            payload.headers.as_ref(),
+            payload.trust,
+            payload.auto_approve.as_deref(),
+        )
+    } else {
+        let command = payload.command.as_deref().unwrap_or("").trim();
+        if command.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Command must not be empty for stdio transport"
+                })),
+            )
+                .into_response();
+        }
+        zap_capabilities::mcp::merge_stdio_mcp_server_with_options_into_json_file(
+            &path,
+            name,
+            command,
+            &payload.args,
+            payload.env.as_ref(),
+            payload.trust,
+            payload.auto_approve.as_deref(),
+        )
+    };
+
+    if let Err(e) = merge_res {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    let runtime_reloaded = reload_mcp_and_live_runtime(&state, true, Some(project_dir)).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": name,
+            "path": path.display().to_string(),
+            "runtime_reloaded": runtime_reloaded,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct McpRemoveRequest {
+    pub name: String,
+    pub global: Option<bool>,
+    #[serde(default, rename = "projectDir", alias = "project_dir")]
+    pub project_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct McpDeleteQuery {
+    pub global: Option<bool>,
+    #[serde(default, rename = "projectDir", alias = "project_dir")]
+    pub project_dir: Option<PathBuf>,
+}
+
+async fn mcp_remove_internal(
+    state: &AppState,
+    name: &str,
+    global: Option<bool>,
+    project_dir_param: Option<PathBuf>,
+) -> axum::response::Response {
+    let name = name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "Server name must not be empty" })),
+        )
+            .into_response();
+    }
+
+    let daemon_dir = state.project.read().await.working_dir.clone();
+    let project_dir = project_dir_param
+        .filter(|p| p.is_dir())
+        .unwrap_or(daemon_dir);
+
+    let remove_result = match global {
+        Some(true) => {
+            let path = Config::config_dir().join("mcp.json");
+            zap_capabilities::mcp::remove_mcp_server_from_json_file(&path, name)
+        }
+        Some(false) => {
+            let path = project_dir.join(".mcp.json");
+            zap_capabilities::mcp::remove_mcp_server_from_json_file(&path, name)
+        }
+        None => {
+            let proj_path = project_dir.join(".mcp.json");
+            match zap_capabilities::mcp::remove_mcp_server_from_json_file(&proj_path, name) {
+                Ok(true) => Ok(true),
+                Ok(false) => {
+                    let glob_path = Config::config_dir().join("mcp.json");
+                    zap_capabilities::mcp::remove_mcp_server_from_json_file(&glob_path, name)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    let removed = match remove_result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    if !removed {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("MCP server '{}' not found", name),
+                "name": name,
+                "removed": false,
+            })),
+        )
+            .into_response();
+    }
+
+    let runtime_reloaded = reload_mcp_and_live_runtime(state, true, Some(project_dir)).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "removed": true,
+            "name": name,
+            "runtime_reloaded": runtime_reloaded,
+        })),
+    )
+        .into_response()
+}
+
+async fn mcp_remove(
+    State(state): State<AppState>,
+    Json(payload): Json<McpRemoveRequest>,
+) -> axum::response::Response {
+    mcp_remove_internal(&state, &payload.name, payload.global, payload.project_dir).await
+}
+
+async fn mcp_delete_by_param(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<McpDeleteQuery>,
+) -> axum::response::Response {
+    mcp_remove_internal(&state, &name, query.global, query.project_dir).await
 }
 
 // ---------------------------------------------------------------------------
@@ -11609,6 +20222,30 @@ struct CapItemResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dir: Option<String>,
+    /// Skills only: TRUE when the project's skill-state file IS the global one
+    /// (the active project is the user's home directory, so
+    /// `<project>/.jeikcode/skills.json` == `$JEIKCODE_HOME/skills.json`).
+    /// The WebUI hides the project toggle then — both scopes would edit one file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    project_scope_shared: bool,
+}
+
+/// TRUE when `<working_dir>/.jeikcode/skills.json` resolves to the GLOBAL skills
+/// file. Happens when the active project is the user's home directory.
+fn skills_project_scope_shared(working_dir: &std::path::Path) -> bool {
+    use zap_capabilities::skills::controls;
+    let project = controls::project_state_path(working_dir);
+    let global = controls::global_state_path();
+    if project == global {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(&project),
+        std::fs::canonicalize(&global),
+    ) {
+        (Ok(project), Ok(global)) => project == global,
+        _ => false,
+    }
 }
 
 /// Bare skill name without its namespace prefix (`skills:foo` → `foo`).
@@ -11619,11 +20256,14 @@ fn bare_skill_name(name: &str) -> &str {
 /// GET /capabilities — unified MCP + skills inventory with per-scope disable state.
 /// The WebUI renders ONE toggle component for both families, so switching projects
 /// surfaces each project's own disable differences.
-async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let working_dir = { state.project.read().await.working_dir.clone() };
+async fn capabilities(
+    State(state): State<AppState>,
+    Query(query): Query<CapQuery>,
+) -> Json<serde_json::Value> {
+    let working_dir = resolve_capability_project(&state, query.working_dir.as_deref()).await;
 
     // MCP: disable state from mcp.json (global + project), enriched with live status.
-    let mcp_status = build_mcp_status(&state).await;
+    let mcp_status = build_mcp_status_for(&state, working_dir.clone()).await;
     let mut items: Vec<CapItemResponse> = Vec::new();
     for item in zap_capabilities::control::mcp_items(&working_dir) {
         let row = mcp_status
@@ -11642,6 +20282,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
             tool_count: row.and_then(|r| r.tool_count),
             error: row.and_then(|r| r.error.clone()),
             dir: None,
+            project_scope_shared: false,
         });
     }
 
@@ -11650,6 +20291,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
     zap_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     let global = zap_capabilities::skills::controls::load_global();
     let project = zap_capabilities::skills::controls::load_project(&working_dir);
+    let project_scope_shared = skills_project_scope_shared(&working_dir);
     for skill in registry.user_invocable() {
         let global_disabled =
             zap_capabilities::skills::controls::is_skill_disabled(&global, &skill.name);
@@ -11667,6 +20309,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> 
             tool_count: None,
             error: None,
             dir: Some(skill.skill_dir.to_string_lossy().to_string()),
+            project_scope_shared,
         });
     }
 
@@ -11679,6 +20322,10 @@ struct CapToggleRequest {
     id: String,
     scope: zap_capabilities::control::CapScope,
     disabled: bool,
+    /// Project whose config the caller is viewing (the active session's dir).
+    /// Omitted ⇒ the daemon's current project.
+    #[serde(default)]
+    working_dir: Option<String>,
 }
 
 /// POST /capabilities/toggle — persist a capability's disabled flag at the chosen
@@ -11688,7 +20335,7 @@ async fn capabilities_toggle(
     State(state): State<AppState>,
     Json(req): Json<CapToggleRequest>,
 ) -> axum::response::Response {
-    let working_dir = { state.project.read().await.working_dir.clone() };
+    let working_dir = resolve_capability_project(&state, req.working_dir.as_deref()).await;
     if let Err(error) = zap_capabilities::control::set_disabled(
         &working_dir,
         req.kind,
@@ -11702,7 +20349,12 @@ async fn capabilities_toggle(
         )
             .into_response();
     }
-    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    let runtime_reloaded = reload_mcp_and_live_runtime(
+        &state,
+        matches!(req.kind, zap_capabilities::control::CapKind::Mcp),
+        Some(working_dir),
+    )
+    .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "runtime_reloaded": runtime_reloaded })),
@@ -11904,7 +20556,11 @@ async fn try_terminate_stale_daemon_on_port(port: u16) -> bool {
             if let Ok(text) = resp.text().await {
                 if text.contains("zap-daemon") {
                     let shutdown_url = format!("http://127.0.0.1:{port}/shutdown");
-                    let _ = client.post(&shutdown_url).send().await;
+                    let mut req = client.post(&shutdown_url);
+                    if let Some(token) = api_config::saved_listen_token() {
+                        req = req.bearer_auth(token);
+                    }
+                    let _ = req.send().await;
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     return true;
                 }
@@ -11962,6 +20618,14 @@ fn bind_failure_is_busy(err: &anyhow::Error) -> bool {
         || text.contains("occupied")
         || text.contains("os error 98")
         || text.contains("os error 10048")
+        || text.contains("os error 10013")
+}
+
+fn is_bind_in_use_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AddrInUse
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+        || err.raw_os_error() == Some(10013)
+        || err.raw_os_error() == Some(10048)
 }
 
 /// `serve` 不走端口扫描。升级后继进程在前代刚退出时重试同一地址，失败就退出，
@@ -11997,6 +20661,13 @@ async fn bind_scanning_ports(
     u16,
 )> {
     if reclaim_stale && start_port > 0 {
+        // 桌面端启动时，若存在之前脱离桌面壳的孤儿子进程占用持久化端口，先行清理回收，
+        // 避免新启动的桌面端因旧孤儿进程霸占端口而被迫将端口 +1 顺延覆盖用户配置。
+        if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
+            if api_config::kill_zombie_processes_all() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
         let _ = try_terminate_stale_daemon_on_port(start_port).await;
     }
     let mut last_err: Option<std::io::Error> = None;
@@ -12024,7 +20695,7 @@ async fn bind_scanning_ports(
                 Ok(probe) => {
                     drop(probe);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -12034,7 +20705,7 @@ async fn bind_scanning_ports(
             let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
             let primary = match api_config::bind_listener(v4, false) {
                 Ok(listener) => listener,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -12071,7 +20742,7 @@ async fn bind_scanning_ports(
                 Ok(probe) => {
                     drop(probe);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -12080,7 +20751,7 @@ async fn bind_scanning_ports(
             let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
             let primary = match api_config::bind_listener(v6, true) {
                 Ok(listener) => listener,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -12105,7 +20776,7 @@ async fn bind_scanning_ports(
                     let actual = listener.local_addr()?.port();
                     return Ok((listener, None, actual));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -12118,7 +20789,7 @@ async fn bind_scanning_ports(
                     let actual = listener.local_addr()?.port();
                     return Ok((listener, None, actual));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(e) if is_bind_in_use_error(&e) => {
                     last_err = Some(e);
                     continue;
                 }
@@ -12283,7 +20954,11 @@ pub async fn ensure_webui(
     };
     // 开局启动绑定成功后（特别是因端口冲突自动累加到了 actual_port），同步写回配置，
     // 确保 webui-listen.json 里的端口与实际绑定的端口一致，界面输入框不会残留冲突前的旧端口。
-    let _ = api_config::save_webui_listen_pref(actual_port, Some(token.clone()));
+    let _ = api_config::save_webui_listen_pref(
+        Some(bound_host.clone()),
+        actual_port,
+        Some(token.clone()),
+    );
     // 选择自动打开浏览器用的本机地址：
     // - 回环（127.0.0.1/localhost/::1）或通配（0.0.0.0/::）绑定时，回环都在监听集合内，用 127.0.0.1；
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
@@ -12335,35 +21010,63 @@ pub async fn ensure_webui(
         local_url.push_str(&short);
     }
     let opened = open_browser && zap_auth::oauth::open_browser(&local_url).is_ok();
+    let (started_msg, opened_msg, manual_msg) = match zap_config::i18n::current_locale() {
+        zap_config::locale::Locale::ZhCn => (
+            format!("webui 已启动：{local_url}"),
+            format!("已在浏览器打开 webui：{local_url}"),
+            format!("请手动在浏览器打开：{local_url}"),
+        ),
+        zap_config::locale::Locale::Vi => (
+            format!("webui đã khởi động: {local_url}"),
+            format!("Đã mở webui trong trình duyệt: {local_url}"),
+            format!("Vui lòng mở thủ công trong trình duyệt: {local_url}"),
+        ),
+        _ => (
+            format!("webui started: {local_url}"),
+            format!("Opened webui in browser: {local_url}"),
+            format!("Please open manually in browser: {local_url}"),
+        ),
+    };
     let mut msg = if !open_browser {
-        format!("webui 已启动：{local_url}")
+        started_msg
     } else if opened {
-        format!("已在浏览器打开 webui：{local_url}")
+        opened_msg
     } else {
-        format!("请手动在浏览器打开：{local_url}")
+        manual_msg
     };
 
     // 复用了一个绑定地址不同的运行实例：提示如何换绑。
     if bound_host.as_str() != host {
-        msg.push_str(&format!(
-            "\n（webui 已在运行，绑定 {bound_host}；如需改绑 {host}，请先 /webui stop 再重试）"
-        ));
+        let rebind_hint = match zap_config::i18n::current_locale() {
+            zap_config::locale::Locale::ZhCn => format!(
+                "\n（webui 已在运行，绑定 {bound_host}；如需改绑 {host}，请先 /webui stop 再重试）"
+            ),
+            zap_config::locale::Locale::Vi => format!(
+                "\n(webui đang chạy, liên kết {bound_host}; để liên kết lại {host}, vui lòng chạy /webui stop trước)"
+            ),
+            _ => format!(
+                "\n(webui is already running on {bound_host}; to bind to {host}, run /webui stop first)"
+            ),
+        };
+        msg.push_str(&rebind_hint);
     }
 
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
-        if is_wildcard {
-            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
-            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
-            msg.push_str(
-                "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
-            );
+        let warn = if is_wildcard {
+            match zap_config::i18n::current_locale() {
+                zap_config::locale::Locale::ZhCn => "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
+                zap_config::locale::Locale::Vi => "\n⚠️ Địa chỉ chính là IP mạng cục bộ, chỉ các thiết bị trong cùng mạng mới có thể truy cập; dùng tunnel (như cloudflared / Tailscale) để truy cập Internet. Không có TLS, bất kỳ ai truy cập được đều có thể vào bằng token.",
+                _ => "\n⚠️ Primary address is a LAN IP, accessible only to devices on the same network; use a tunnel (e.g. cloudflared / Tailscale) for public access. No TLS, anyone with network access and the token can enter.",
+            }
         } else {
-            // 显式指定了具体地址：local_url 已是该地址，这里仅补安全提示。
-            msg.push_str(
-                "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
-            );
-        }
+            match zap_config::i18n::current_locale() {
+                zap_config::locale::Locale::ZhCn => "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
+                zap_config::locale::Locale::Vi => "\n⚠️ Đã liên kết địa chỉ không phải loopback: bất kỳ ai truy cập được địa chỉ này đều có thể vào bằng token, vui lòng chỉ sử dụng trên mạng đáng tin cậy (không có TLS).",
+                _ => "\n⚠️ Bound to a non-loopback address: anyone who can reach this address can enter with this token, use only on trusted networks (no TLS).",
+            }
+        };
+        msg.push_str(warn);
     }
 
     msg
@@ -12374,9 +21077,17 @@ pub fn stop_server() -> String {
     let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         handle.abort.abort();
-        "已停止 webui server".to_string()
+        match zap_config::i18n::current_locale() {
+            zap_config::locale::Locale::ZhCn => "已停止 webui server".to_string(),
+            zap_config::locale::Locale::Vi => "Đã dừng webui server".to_string(),
+            _ => "Stopped webui server".to_string(),
+        }
     } else {
-        "webui server 未在运行".to_string()
+        match zap_config::i18n::current_locale() {
+            zap_config::locale::Locale::ZhCn => "webui server 未在运行".to_string(),
+            zap_config::locale::Locale::Vi => "webui server không chạy".to_string(),
+            _ => "webui server is not running".to_string(),
+        }
     }
 }
 
@@ -12683,7 +21394,7 @@ async fn get_tunnel_status(
 }
 
 // ============================================================================
-// GET /skills — 列出 user-invocable 技能（webui 技能选择器）
+// GET /skills + /commands — user-invocable capabilities for the WebUI
 // ============================================================================
 
 /// Skill info for API response.
@@ -12714,6 +21425,74 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
     Json(skills)
+}
+
+/// User-command info for API response.
+#[derive(serde::Serialize)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    pub args_requirement: String,
+}
+
+/// GET /commands - List user-invoked slash-command templates for the current project.
+async fn get_commands(State(state): State<AppState>) -> impl IntoResponse {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let registry = zap_capabilities::commands::UserCommandRegistry::load(&working_dir);
+    let commands: Vec<CommandInfo> = registry
+        .list()
+        .into_iter()
+        .map(|command| CommandInfo {
+            // Use the registry key (`plugin:name` when namespaced) so the WebUI
+            // inserts an unambiguous slash command.
+            name: command.key(),
+            description: command.description.clone(),
+            args_requirement: match command.args_requirement {
+                zap_capabilities::commands::ArgsRequirement::Required => "required",
+                zap_capabilities::commands::ArgsRequirement::Optional => "optional",
+                zap_capabilities::commands::ArgsRequirement::None => "none",
+            }
+            .to_string(),
+        })
+        .collect();
+    Json(commands)
+}
+
+/// Expand `/name args` from the standard command dirs. Returns `None` when the
+/// text is not a known user command (built-ins/unknown slash text pass through).
+fn render_user_command(working_dir: &std::path::Path, text: &str) -> Option<String> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let args = rest[name_end..].trim_start();
+    let registry = zap_capabilities::commands::UserCommandRegistry::load(working_dir);
+    registry.render_invocation_in(name, args, Some(working_dir))
+}
+
+#[cfg(test)]
+mod user_command_tests {
+    use super::render_user_command;
+
+    #[test]
+    fn renders_configured_command_with_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd_dir = dir.path().join(".jeikcode/commands");
+        std::fs::create_dir_all(&cmd_dir).unwrap();
+        std::fs::write(
+            cmd_dir.join("review.md"),
+            "---\nname: review\ndescription: review\nargs: optional\n---\nReview $ARGUMENTS",
+        )
+        .unwrap();
+        assert_eq!(
+            render_user_command(dir.path(), "/review src/lib.rs").as_deref(),
+            Some("Review src/lib.rs")
+        );
+        assert_eq!(render_user_command(dir.path(), "/unknown x"), None);
+        assert_eq!(render_user_command(dir.path(), "plain text"), None);
+    }
 }
 
 // ============================================================================
@@ -13356,6 +22135,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let project_store = Arc::new(RwLock::new(project_state));
     *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
 
+    let inherited_no_token = zap_updater::take_restart_no_token() == Some(true);
+    let initial_enforce_token = webui_tokens.is_some() && !inherited_no_token;
     let state = AppState {
         project: project_store,
         active_chats: ActiveChatRegistry::default(),
@@ -13367,8 +22148,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         shutdown_tx: shutdown_tx.clone(),
         last_activity: last_activity.clone(),
         active_connections: active_connections.clone(),
-        enforce_token: Arc::new(std::sync::atomic::AtomicBool::new(webui_tokens.is_some())),
-        initial_enforce_token: webui_tokens.is_some(),
+        enforce_token: Arc::new(std::sync::atomic::AtomicBool::new(initial_enforce_token)),
+        initial_enforce_token,
         webui_tokens: webui_tokens.unwrap_or_default(),
         app_user_id: app_user_id.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
@@ -13381,10 +22162,15 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // instances get distinct cookie names.
         webui_cookie_name: auth_token::webui_cookie_name(port),
         yolo,
-        token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        token_optional: Arc::new(std::sync::atomic::AtomicBool::new(inherited_no_token)),
         http_router: Arc::new(std::sync::OnceLock::new()),
         extra_remote: Arc::new(std::sync::Mutex::new(None)),
     };
+
+    // Crash recovery before accepting traffic: no active turn survives a daemon
+    // restart, so orphaned steering/steer queue cards must be reconciled here,
+    // never as a side effect of GET /chat/queue.
+    reconcile_all_stale_steer_queues().await;
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查 + 外部 Git Webhook 回调（由 HMAC 专有验签保护）。
     let public = Router::new()
@@ -13403,13 +22189,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             post(api_git_webhook::handle_git_webhook_api)
                 .get(api_git_webhook::get_git_webhook_info_api),
         )
-        // 外部本地扩展插件 RPC 服务接口（如 DevOrbit 工作台本地数据同步）
-        .route(
-            "/api/plugins-rpc/:plugin_id",
-            post(plugin_rpc::handle_plugin_rpc),
-        )
-        // 插件市场、插件安装卸载与隔离存储 API
-        .merge(plugins_api::router())
         // WebUI static assets + SPA fallback (Task 3/4). The `/` route
         // does the one-time-token → HttpOnly-cookie handoff (CWE-598); the
         // fallback serves SPA routes/assets and never carries a token.
@@ -13449,6 +22228,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         )
         .route("/projects/:hash/sessions", get(get_project_sessions))
         .route("/sessions/:id/messages", post(append_session_messages))
+        .route("/sessions/:id/seen", post(mark_session_seen))
         .route(
             "/projects/:hash/sessions/:id/freshness",
             get(get_session_freshness),
@@ -13460,6 +22240,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/projects/:hash/sessions/:id",
             get(get_session_detail).delete(delete_session),
+        )
+        .route(
+            "/projects/:hash/sessions/:id/inputs",
+            get(get_session_inputs),
         )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))
@@ -13487,6 +22271,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/fs/action", post(fs_action_handler))
         .route("/fs/tree", get(fs_tree))
         .route("/fs/read", get(fs_read))
+        .route("/fs/stat", get(fs_stat))
         .route("/fs/write", post(fs_write))
         .route("/fs/search", get(fs_search))
         .route("/fs/locate", get(fs_locate))
@@ -13496,6 +22281,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/terminal/close", post(terminal_close))
         .route("/terminal/ws", get(terminal_ws_handler))
         .route("/chat/queue", get(get_chat_queue).post(update_chat_queue))
+        .route("/chat/queue/claim", post(claim_chat_queue))
+        .route("/chat/queue/release", post(release_chat_queue))
         .route(
             "/chat/steer",
             post(chat_steer)
@@ -13503,10 +22290,15 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/chat/steer/admit",
+            post(admit_chat_steer).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/chat/steer/cancel",
             post(chat_steer_cancel).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route("/chat/active", get(active_chat_sessions))
+        .route("/chat/runtime", get(chat_runtime))
         .route("/runtime/sessions", get(runtime_sessions))
         .route("/system-notify", post(system_notify))
         .route("/notify-focus", get(get_notify_focus))
@@ -13576,9 +22368,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/live/reasoning_effort",
             post(live_api::live_reasoning_effort),
         )
-        // Skills API
+        // Skills + user commands API
         .route("/skills", get(get_skills))
         .route("/api/skills", get(get_skills))
+        .route("/commands", get(get_commands))
+        .route("/api/commands", get(get_commands))
         // Filesystem API
         .route("/fs/list", get(fs_tree))
         .route("/fs/mkdir", post(fs_mkdir))
@@ -13618,9 +22412,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/mcp", get(mcp_status))
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
+        .route("/mcp/add", post(mcp_add))
+        .route("/mcp/remove", post(mcp_remove))
         .route("/api/mcp", get(mcp_status))
         .route("/api/mcp/status", get(mcp_status))
         .route("/api/mcp/reload", post(mcp_reload))
+        .route("/api/mcp/add", post(mcp_add))
+        .route("/api/mcp/remove", post(mcp_remove))
+        .route("/api/mcp/:name", delete(mcp_delete_by_param))
         // Unified capability surface (MCP + skills, GLOBAL + PROJECT scopes)
         .route("/capabilities", get(capabilities))
         .route("/capabilities/toggle", post(capabilities_toggle))
@@ -13628,9 +22427,22 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/config", get(api_config::get_config))
         .route("/config/reload", post(api_config::reload_config))
         .route("/config/language", post(api_config::set_language))
+        .route("/config/auto-git-sync", post(api_config::set_auto_git_sync))
         .route(
             "/api/remote-access",
             get(api_config::get_remote_access).post(api_config::post_remote_access),
+        )
+        .route(
+            "/api/system/legacy-status",
+            get(api_config::get_legacy_status),
+        )
+        .route(
+            "/api/system/migrate-legacy",
+            post(api_config::post_migrate_legacy),
+        )
+        .route(
+            "/api/system/desktop-settings",
+            get(api_config::get_desktop_settings).post(api_config::post_desktop_settings),
         )
         // Provider API (P0)
         .route(
@@ -13677,10 +22489,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let router_slot = state.http_router.clone();
     let app = public
         .merge(protected)
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(
+            legacy_live_deprecation_middleware,
+        ))
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))
-        .layer(cors_layer());
+        .layer(cors_layer())
+        .layer(compression_layer());
     let _ = router_slot.set(app.clone());
 
     // Spawn idle timeout watchdog task
@@ -13890,6 +22706,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     )
     .await;
 
+    // Step 12: Start background Git platform polling engine
+    let polling_task = git_adapter::polling::start_git_polling_engine(state.clone());
+
     // Step 13: Serve with graceful shutdown (R10.1-R10.5).
     // Optional second listener for IPv6 when dual-stack was requested.
     // Keep a JoinHandle so if the primary (IPv4) serve returns for any reason
@@ -13918,6 +22737,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         handle.abort();
         let _ = handle.await;
     }
+
+    // Stop background Git platform polling engine
+    polling_task.abort();
+    let _ = polling_task.await;
 
     // Reap project-scoped and session-scoped stdio MCP trees with this host.
     zap_capabilities::mcp::shutdown_all_mcp_pools().await;
@@ -14044,6 +22867,15 @@ mod fs_list_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sequenced(events: &[ChatEvent]) -> Vec<(u64, ChatEvent)> {
+        events
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, event)| (index as u64 + 1, event))
+            .collect()
+    }
 
     #[test]
     fn chat_turn_policy_api_is_low_confirm() {
@@ -14555,6 +23387,10 @@ mod tests {
                 _home: home,
             }
         }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
     }
 
     fn chat_test_telemetry(home: &ScopedChatHome) -> Arc<Telemetry> {
@@ -14619,6 +23455,7 @@ mod tests {
             &event_tx,
             Some("jeik"),
             None,
+            None,
         )
         .unwrap();
 
@@ -14666,6 +23503,7 @@ mod tests {
             &event_tx,
             None,
             Some("帮我写一个快速排序算法"),
+            None,
         )
         .unwrap();
 
@@ -14699,6 +23537,7 @@ mod tests {
             true,
             &event_tx,
             Some("default"),
+            None,
             None,
         );
 
@@ -14749,7 +23588,7 @@ mod tests {
         let pool = Arc::new(zap_capabilities::mcp::ProjectMcpPool::new());
         let oldest = tempfile::tempdir().unwrap();
         let oldest_registry = pool.registry(oldest.path()).await;
-        for index in 1..MCP_CACHE_MAX {
+        for _index in 1..MCP_CACHE_MAX {
             let dir = tempfile::tempdir().unwrap();
             let _ = pool.registry(dir.path()).await;
             std::mem::forget(dir);
@@ -14936,6 +23775,32 @@ mod tests {
             .unwrap();
         let accepted_body: serde_json::Value = serde_json::from_slice(&accepted_bytes).unwrap();
         assert_eq!(accepted_body["success"], true);
+
+        // A retried POST for the same approval (its reply was lost over a long-idle
+        // connection, the app was suspended, or another WebUI instance clicked too)
+        // must report the truth instead of "stale or unknown permission request" —
+        // otherwise the card can never be dismissed again.
+        let replay_response = chat_permission(
+            State(state.clone()),
+            Json(PermissionDecisionRequest {
+                session_id: session_id.into(),
+                approval_id: "approval-accept".into(),
+                decision: "deny".into(),
+                tool_name: None,
+            }),
+        )
+        .await
+        .into_response();
+        let replay_bytes = axum::body::to_bytes(replay_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replay_body: serde_json::Value = serde_json::from_slice(&replay_bytes).unwrap();
+        assert_eq!(replay_body["success"], true);
+        assert_eq!(replay_body["already_resolved"], true);
+        assert_eq!(
+            replay_body["applied"], "allow",
+            "a retry reports the decision that actually took effect, never the retried one"
+        );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.pending_permissions.register(
@@ -15263,22 +24128,219 @@ mod tests {
         assert_eq!(active_ids, vec![session_id.to_string()]);
     }
 
+    fn done_event(session_id: &str) -> ChatEvent {
+        ChatEvent::Done {
+            tokens: 0,
+            tool_calls: 0,
+            session_id: session_id.to_string(),
+            stop_reason: Some("stopped".into()),
+            message: None,
+            message_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn terminated_chat_operation_is_not_treated_as_live_by_watch() {
         let registry = ActiveChatRegistry::default();
         let admission = registry.admit(Some("session-term"), None).await.unwrap();
-        registry.mark_terminal(&admission.operation_id).await;
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-term"))
+            .await;
 
-        // subscribe_live_with_replay should return None for terminated turn
-        assert!(registry
-            .subscribe_live_with_replay("session-term")
-            .await
-            .is_none());
+        // A terminated turn is never handed back as a live subscription the
+        // client could wait on forever. The watcher still gets the turn's bus so
+        // an in-flight terminal frame reaches it.
+        assert!(
+            registry
+                .subscribe_live_with_replay("session-term")
+                .await
+                .is_some(),
+            "a terminated turn must still hand its watcher a way to learn the terminal"
+        );
 
-        // subscribe_or_standby should return Standby and remove stale alias
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = registry.subscribe_or_standby("session-term", &tx).await;
+        // subscribe_or_standby parks (the alias is stale) and hands over the
+        // recorded terminal, so the watcher is not left with keepalives only.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("session-term", None, &tx, true)
+            .await;
         assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(matches!(
+            rx.try_recv()
+                .expect("the recorded terminal must be delivered"),
+            (_, ChatEvent::Done { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_watcher_attaching_after_the_turn_ended_still_receives_the_terminal_frame() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-gone"), None).await.unwrap();
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-gone"))
+            .await;
+        // The turn is over: the operation and its frame log are gone.
+        assert!(registry.complete(&admission.operation_id).await);
+
+        // A watcher that attaches now — a page refresh, a switch back to this
+        // session, or a long disconnect coming back — must still learn that the
+        // turn ended. Otherwise the WebUI stays in "running" forever: red stop
+        // button, clock still ticking, checklist frozen.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("session-gone", None, &tx, true)
+            .await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(
+            matches!(
+                rx.try_recv().expect(
+                    "a watcher attaching after the turn ended must receive the terminal frame"
+                ),
+                (_, ChatEvent::Done { .. })
+            ),
+            "the terminal frame must outlive the operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_idle_standby_watcher_is_never_given_the_terminal_frame() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-idle"), None).await.unwrap();
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-idle"))
+            .await;
+        assert!(registry.complete(&admission.operation_id).await);
+
+        // The idle standby watcher re-arms on every focus/switch. Handing it the
+        // same terminal again would make it spin, so it must stay silent.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry
+            .subscribe_or_standby("session-idle", None, &tx, false)
+            .await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+        assert!(
+            rx.try_recv().is_err(),
+            "the idle standby watcher must stay silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_chat_registry_clear_session_evicts_all_session_state() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-evict"), None).await.unwrap();
+        registry
+            .mark_terminal(&admission.operation_id, &done_event("session-evict"))
+            .await;
+        assert!(registry.complete(&admission.operation_id).await);
+
+        // Before clear_session: attaching with replay_terminal=true yields the recorded terminal frame
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let outcome1 = registry
+            .subscribe_or_standby("session-evict", None, &tx1, true)
+            .await;
+        assert!(matches!(outcome1, WatchOutcome::Standby));
+        assert!(matches!(
+            rx1.try_recv()
+                .expect("recorded terminal present before clear"),
+            (_, ChatEvent::Done { .. })
+        ));
+
+        // Evict session on delete
+        registry.clear_session("session-evict").await;
+
+        // After clear_session: attaching with replay_terminal=true finds no lingering terminal
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let outcome2 = registry
+            .subscribe_or_standby("session-evict", None, &tx2, true)
+            .await;
+        assert!(matches!(outcome2, WatchOutcome::Standby));
+        assert!(
+            rx2.try_recv().is_err(),
+            "cleared session must not replay lingering terminal frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_client_standby_preserves_concurrent_watchers_and_prunes_dead_senders() {
+        let registry = ActiveChatRegistry::default();
+        let session_id = "session-multi-client";
+
+        // 1. 本机端 client-local 注册待机
+        let (tx_local, _rx_local) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .subscribe_or_standby(session_id, Some("client-local"), &tx_local, false)
+            .await;
+
+        // 2. 异地端 client-remote 注册待机（必须并存，绝不能被 clear 踢掉）
+        let (tx_remote, mut rx_remote) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .subscribe_or_standby(session_id, Some("client-remote"), &tx_remote, false)
+            .await;
+
+        {
+            let index = registry.inner.read().await;
+            let watchers = index.standby_watchers.get(session_id).unwrap();
+            assert_eq!(
+                watchers.len(),
+                2,
+                "both local and remote standby watchers must be kept concurrently"
+            );
+            assert!(watchers.contains_key("client-local"));
+            assert!(watchers.contains_key("client-remote"));
+        }
+
+        // 3. 本机端 client-local 刷新页面，重新注册（相同的 client_id 必须原地覆盖，不堆积多余连接）
+        let (tx_local_refresh, mut rx_local_refresh) = tokio::sync::mpsc::unbounded_channel();
+        registry
+            .subscribe_or_standby(session_id, Some("client-local"), &tx_local_refresh, false)
+            .await;
+
+        {
+            let index = registry.inner.read().await;
+            let watchers = index.standby_watchers.get(session_id).unwrap();
+            assert_eq!(
+                watchers.len(),
+                2,
+                "same client_id must update existing slot without leaking"
+            );
+        }
+
+        // 4. 任务 admit：唤醒所有并发 standby watchers 并分发给两者
+        let admission = registry.admit(Some(session_id), None).await.unwrap();
+        let bus = registry.event_bus(&admission.operation_id).await.unwrap();
+
+        // 发送第一帧 User 提问
+        let user_event = ChatEvent::User {
+            content: "帮我写冒泡排序".into(),
+            display_text: Some("帮我写冒泡排序".into()),
+            internal: Some(false),
+            editable: Some(true),
+            session_id: Some(session_id.to_string()),
+            created_at: Some(12345),
+            message_id: None,
+            order: None,
+            turn_ordinal: None,
+            client_input_id: None,
+            images: None,
+        };
+        let _ = bus.send((1, user_event));
+
+        // 验证异地端和本机端在同一时刻都能无遗漏地收到该 User 事件！
+        let remote_received = rx_remote
+            .recv()
+            .await
+            .expect("remote client must receive live user event");
+        assert!(
+            matches!(remote_received, (_, ChatEvent::User { ref content, .. }) if content == "帮我写冒泡排序")
+        );
+
+        let local_received = rx_local_refresh
+            .recv()
+            .await
+            .expect("local client must receive live user event");
+        assert!(
+            matches!(local_received, (_, ChatEvent::User { ref content, .. }) if content == "帮我写冒泡排序")
+        );
     }
 
     #[tokio::test]
@@ -15339,7 +24401,7 @@ mod tests {
 
         let second = registry
             .clone()
-            .admit_or_preempt(Some("session-1".into()), None, Duration::from_secs(2))
+            .admit_or_preempt(Some("session-1".into()), None, None, Duration::from_secs(2))
             .await
             .expect("preempt should admit after previous turn completes");
         assert_ne!(second.operation_id, first.operation_id);
@@ -15372,6 +24434,7 @@ mod tests {
             .clone()
             .admit_or_preempt(
                 Some("unbound-uuid".into()),
+                None,
                 Some("compat-user:alice".into()),
                 Duration::from_secs(2),
             )
@@ -15383,29 +24446,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_admitted_user_includes_created_at() {
+    async fn replay_admitted_user_includes_created_at_and_client_id() {
         let registry = ActiveChatRegistry::default();
-        let admission = registry.admit(Some("session-1"), None).await.unwrap();
+        let admission = registry
+            .admit(Some("session-1"), Some("req-1"))
+            .await
+            .unwrap();
         registry
             .record_user_message(
                 &admission.operation_id,
                 "hello".into(),
+                "hello".into(),
                 Some(1_700_000_000_000),
+                Vec::new(),
             )
             .await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.replay_admitted_user("session-1", &tx).await;
         let event = rx.try_recv().expect("admitted user should replay");
         match event {
-            ChatEvent::User {
-                content,
-                session_id,
-                created_at,
-                ..
-            } => {
+            (
+                _,
+                ChatEvent::User {
+                    content,
+                    session_id,
+                    created_at,
+                    client_input_id,
+                    ..
+                },
+            ) => {
                 assert_eq!(content, "hello");
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(created_at, Some(1_700_000_000_000));
+                // 关联键必须回传，发送端才能按身份认领乐观气泡。
+                assert_eq!(client_input_id.as_deref(), Some("req-1"));
             }
             other => panic!("expected user event, got {other:?}"),
         }
@@ -15416,15 +24490,28 @@ mod tests {
     fn user_event_serializes_created_at() {
         let json = serde_json::to_value(ChatEvent::User {
             content: "hi".into(),
+            display_text: Some("hi".into()),
+            internal: Some(false),
+            editable: Some(true),
             session_id: Some("s1".into()),
             created_at: Some(42),
             message_id: None,
             order: None,
             turn_ordinal: None,
+            client_input_id: Some("req-9".into()),
+            images: Some(vec![ImageData {
+                media_type: "image/png".into(),
+                data: "abc123base64".into(),
+                missing: false,
+            }]),
         })
         .unwrap();
         assert_eq!(json["type"], "user");
         assert_eq!(json["created_at"], 42);
+        assert_eq!(json["client_input_id"], "req-9");
+        assert_eq!(json["images"][0]["media_type"], "image/png");
+        assert_eq!(json["images"][0]["data"], "abc123base64");
+        assert_eq!(json["client_input_id"], "req-9");
 
         // 身份回传事件：与可见气泡分离的纯身份通道。
         let identified = serde_json::to_value(ChatEvent::UserIdentified {
@@ -15435,6 +24522,10 @@ mod tests {
         assert_eq!(identified["type"], "user_identified");
         assert_eq!(identified["message_id"], "m-user-1");
         assert_eq!(identified["turn_ordinal"], 3);
+        assert!(
+            identified.get("absolute_index").is_none(),
+            "absolute_index 是内核 snapshot 下标，不是 display 下标，不得下发"
+        );
     }
 
     #[tokio::test]
@@ -15532,7 +24623,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, ChatEvent::Error { message } if message == "chat task failed")),
+                .any(|event| matches!(event, ChatEvent::Error { message, .. } if message == "chat task failed")),
             "panic must produce a redacted Error event"
         );
         assert!(
@@ -15727,6 +24818,7 @@ mod tests {
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -16145,6 +25237,10 @@ mod tests {
             updated_at_ms: 1,
             message_count: 0,
             turn_count: 0,
+            preferred_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            thinking_budget: None,
             presence: CatalogPresence::NativeOnly,
         };
 
@@ -16383,6 +25479,7 @@ mod tests {
     fn chat_warning_serializes_as_its_own_type_not_error() {
         let json = serde_json::to_string(&ChatEvent::Warning {
             message: "conversation compacted".into(),
+            message_id: None,
         })
         .unwrap();
         assert_eq!(
@@ -16451,6 +25548,7 @@ mod tests {
             false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             false,
+            None,
         )
         .await
         .expect("chat request succeeds");
@@ -16487,6 +25585,7 @@ mod tests {
             secs_until_reset: Some(7200),
             auto_resuming: false,
             server_message: None,
+            message_id: None,
         })
         .unwrap();
         // auto_resuming=false serializes as false (not omitted, since serde(default) only affects deserialization)
@@ -16553,7 +25652,9 @@ mod tests {
     }
 
     fn history_msg(role: &str, elapsed_ms: Option<u64>) -> MessageInfo {
-        MessageInfo {
+        message_info! {
+            turn_id: None,
+            seq: None,
             role: role.into(),
             content: role.into(),
             reasoning: None,
@@ -16641,6 +25742,120 @@ mod tests {
     }
 
     #[test]
+    fn stamp_turn_elapsed_penetrates_mid_turn_steers_and_preserves_root_elapsed() {
+        use zap_capabilities::session::TurnStat;
+
+        let mut messages = vec![
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_000_000);
+                m.content = "最初提问".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(5_000));
+                m.created_at = Some(1_005_000);
+                m
+            },
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_060_000);
+                m.content = "<user-query>\n中途转向\n</user-query>\n\n[jeikcode-steer]\n".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(10_000));
+                m.created_at = Some(1_120_000);
+                m
+            },
+        ];
+        let stats = vec![TurnStat {
+            after_message: 4,
+            position_valid: true,
+            turn_id: 1,
+            round_count: 2,
+            tool_call_count: 1,
+            duration_ms: 120_000,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1,
+            model_usage: vec![],
+        }];
+        stamp_turn_elapsed_on_last_assistants(&mut messages, &stats);
+        // messages[1]（中间阶段 Assistant）保留自身单轮耗时，不被整体覆盖
+        assert_eq!(messages[1].elapsed_ms, Some(5_000));
+        // messages[3]（最终回复）必须是穿透 steer 后的整轮回合总耗时 120s！
+        assert_eq!(messages[3].elapsed_ms, Some(120_000));
+    }
+
+    #[test]
+    fn stamp_turn_elapsed_accumulates_multi_subturn_steers_instead_of_last_subturn() {
+        use zap_capabilities::session::TurnStat;
+
+        // 模拟中途多次 steer / 立即发送 steer 卡片产生多个小轮次 TurnStat，
+        // 最终 stop 结束落盘时必须取叠加后的总耗时 (180s)，绝不能退化为最后一个小轮次的 25s。
+        let mut messages = vec![
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_000_000);
+                m.content = "初始大任务".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(12_000));
+                m.created_at = Some(1_060_000);
+                m
+            },
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_060_000);
+                m.content =
+                    "<user-query>\n第一个 steer\n</user-query>\n\n[jeikcode-steer]\n".into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(15_000));
+                m.created_at = Some(1_155_000);
+                m
+            },
+            {
+                let mut m = history_msg("user", None);
+                m.created_at = Some(1_155_000);
+                m.content =
+                    "<user-query>\n立即发送的第二个 steer\n</user-query>\n\n[jeikcode-steer]\n"
+                        .into();
+                m
+            },
+            {
+                let mut m = history_msg("assistant", Some(8_000));
+                m.created_at = Some(1_180_000);
+                m
+            },
+        ];
+        // 即使 turn_stats 里只有某一个小轮次的统计（比如最后一个小轮次 25s），或者拆成了多段 (60s + 95s + 25s)
+        let stats_single_last = vec![TurnStat {
+            after_message: 6,
+            position_valid: true,
+            turn_id: 3,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 25_000,
+            total_tokens: 1,
+            errored: false,
+            used_tokens: 1,
+            ctx_window: 1,
+            model_usage: vec![],
+        }];
+        stamp_turn_elapsed_on_last_assistants(&mut messages, &stats_single_last);
+        assert_eq!(
+            messages[5].elapsed_ms,
+            Some(180_000),
+            "must stamp cumulative 180s from root user, not the last 25s sub-turn"
+        );
+    }
+
+    #[test]
     fn message_info_preserves_internal_origin() {
         use zap_kernel::message::Message;
 
@@ -16649,6 +25864,133 @@ mod tests {
         let info = MessageInfo::from_kernel(&msg);
 
         assert_eq!(info.internal_origin.as_deref(), Some("verify_cadence"));
+    }
+
+    #[test]
+    fn display_backfill_round_trip_preserves_read_only_origin() {
+        use zap_kernel::message::Message;
+
+        // Reconstructed prefix rows are display-only; the WebUI disables
+        // edit/delete/regenerate from `internal_origin`. A backfill must not
+        // drop that marker when it projects MessageInfo into DisplayRecord and
+        // back (otherwise the UI could edit a row the kernel does not have).
+        let mut msg = Message::assistant("archived answer", Vec::new());
+        msg.id = Some("m-archive".to_string());
+        msg.internal_origin = Some("transcript_archive".to_string());
+        let info = MessageInfo::from_kernel(&msg);
+        let record = display_record_from_message_info("s1", 0, &info);
+        let round = display_record_to_message_info(&record);
+
+        assert_eq!(round.id.as_deref(), Some("m-archive"));
+        assert_eq!(round.internal_origin.as_deref(), Some("transcript_archive"));
+    }
+
+    fn archive_record(turn_id: u64, id: &str) -> zap_capabilities::session::DisplayRecord {
+        zap_capabilities::session::DisplayRecord {
+            v: zap_capabilities::session::DISPLAY_VERSION,
+            session_id: "s1".into(),
+            turn_id,
+            index: 0,
+            seq: 0,
+            role: "user".into(),
+            id: Some(id.into()),
+            content: id.into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            is_error: false,
+            images: Vec::new(),
+            created_at: None,
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn display_log_cache_hits_until_the_log_or_meta_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = NativeSessionManager::with_root(dir.path());
+        mgr.write_display_backfill("s-cache", &[archive_record(1, "m-a")], 1)
+            .unwrap();
+        let cache = std::sync::Mutex::new(DisplayLogCache::default());
+
+        let (_, first) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
+        let (_, second) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged log must be a cache hit"
+        );
+
+        // A backfill rewrites both the log and its meta; the fingerprint must
+        // invalidate instead of serving the old transcript.
+        mgr.write_display_backfill(
+            "s-cache",
+            &[archive_record(1, "m-a"), archive_record(2, "m-b")],
+            2,
+        )
+        .unwrap();
+        let (_, third) = read_display_with_cache(&mgr, "s-cache", &cache).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "changed log must bypass the cache"
+        );
+        assert_eq!(third.len(), 2);
+    }
+
+    #[test]
+    fn display_log_cache_keeps_multiple_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = NativeSessionManager::with_root(dir.path());
+        mgr.write_display_backfill("s-a", &[archive_record(1, "m-a")], 1)
+            .unwrap();
+        mgr.write_display_backfill("s-b", &[archive_record(1, "m-b")], 1)
+            .unwrap();
+        let cache = std::sync::Mutex::new(DisplayLogCache::default());
+
+        let (_, a1) = read_display_with_cache(&mgr, "s-a", &cache).unwrap();
+        let (_, b1) = read_display_with_cache(&mgr, "s-b", &cache).unwrap();
+        let (_, a2) = read_display_with_cache(&mgr, "s-a", &cache).unwrap();
+        let (_, b2) = read_display_with_cache(&mgr, "s-b", &cache).unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2), "session A must stay cached");
+        assert!(Arc::ptr_eq(&b1, &b2), "session B must stay cached");
+    }
+
+    #[test]
+    fn compacted_display_rows_are_marked_read_only() {
+        let mut old = archive_record(1, "m-old");
+        old.index = 0;
+        let mut current = archive_record(2, "m-current");
+        current.index = 1;
+        let mut transient = archive_record(2, "m-transient");
+        transient.index = 2;
+        let records = vec![old, current, transient];
+        let mut messages = records
+            .iter()
+            .map(display_record_to_message_info)
+            .collect::<Vec<_>>();
+        let snapshot_ids = std::collections::HashSet::from(["m-current"]);
+
+        mark_display_only_archive_rows(&records, &mut messages, &snapshot_ids, 2, false);
+
+        // Drained by compaction, absent from the snapshot -> read-only.
+        assert_eq!(
+            messages[0].internal_origin.as_deref(),
+            Some("transcript_archive")
+        );
+        // Still present in the snapshot -> editable.
+        assert_eq!(messages[1].internal_origin, None);
+        // Latest turn may race the snapshot save; do not flash read-only.
+        assert_eq!(messages[2].internal_origin, None);
+
+        // Once the caller proves the session is idle and the log is not ahead,
+        // a missing id on the last turn is genuinely drained: mark it too.
+        mark_display_only_archive_rows(&records, &mut messages, &snapshot_ids, 2, true);
+        assert_eq!(
+            messages[2].internal_origin.as_deref(),
+            Some("transcript_archive")
+        );
+        assert_eq!(messages[1].internal_origin, None);
     }
 
     #[test]
@@ -16808,6 +26150,45 @@ mod tests {
     }
 
     #[test]
+    fn artifact_detector_keeps_hash_comments_inside_code_block() {
+        // `# 1. xxx` 是 python 注释，缩进的 `##` 是代码体；都不能提前闭合代码块，
+        // 否则后续代码会以正文 TextDelta 流出，真正的闭合 ``` 反而被当成新代码块开启。
+        let mut detector = ArtifactDetector::new();
+        let mut events = detector.process("```python\nimport sys\n");
+        events.extend(detector.process(
+            "\n# ---------------------------\n# 1. 解析与格式化\n# ---------------------------\n",
+        ));
+        events.extend(detector.process("def f():\n    ## 步骤 1：内部注释\n    pass\n"));
+        events.extend(detector.process("```\n运行效果："));
+
+        let ends = events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::ArtifactEnd { .. }))
+            .count();
+        assert_eq!(ends, 1, "Events: {events:#?}");
+        let prose: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::TextDelta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prose, "运行效果：");
+    }
+
+    #[test]
+    fn artifact_detector_never_heals_text_container_blocks() {
+        let mut detector = ArtifactDetector::new();
+        let events = detector.process("```text\n日志\n\n### 第二步：继续\n");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::ArtifactEnd { .. })),
+            "Events: {events:#?}"
+        );
+    }
+
+    #[test]
     fn first_query_value_extracts_token() {
         assert_eq!(first_query_value("token=abc", "token"), Some("abc".into()));
         assert_eq!(
@@ -16943,7 +26324,9 @@ mod tests {
     #[test]
     fn attach_image_sets_replaces_placeholders_in_order_only() {
         fn msg(role: &str, images: Option<Vec<ImageData>>) -> MessageInfo {
-            MessageInfo {
+            message_info! {
+                turn_id: None,
+                seq: None,
                 role: role.into(),
                 content: String::new(),
                 reasoning: None,
@@ -16989,6 +26372,35 @@ mod tests {
             "keep-me",
             "a real image is never overwritten"
         );
+    }
+
+    #[test]
+    fn attach_image_sets_uses_the_newest_sets_after_compaction() {
+        let image = |data: &str| ImageData {
+            media_type: "image/png".into(),
+            data: data.into(),
+            missing: false,
+        };
+        let mut messages = vec![message_info! {
+            turn_id: None,
+            seq: None,
+            role: "user".into(),
+            id: None,
+            content: "new question".into(),
+            reasoning: None,
+            synthetic: false,
+            internal_origin: None,
+            tool_calls: None,
+            tool_result: None,
+            artifacts: None,
+            images: Some(vec![ImageData::missing_placeholder()]),
+            created_at: None,
+            elapsed_ms: None,
+        }];
+        // Two sidecar sets accumulated; the oldest placeholder was drained by
+        // compaction. The surviving question must receive the NEWEST image.
+        attach_image_sets(&mut messages, vec![vec![image("old")], vec![image("new")]]);
+        assert_eq!(messages[0].images.as_ref().unwrap()[0].data, "new");
     }
 
     #[test]
@@ -17276,11 +26688,411 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
         .into_response();
         assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
     }
+
+    /// Real-session stability probe. Skipped by default; run with:
+    /// `JEIKCODE_REAL_SESSION_DIR=<bucket> JEIKCODE_REAL_SESSION_ID=<id> \
+    ///  cargo test -p zap-daemon --lib real_session_display_projection_stability -- --ignored`
+    #[ignore = "requires a real session bucket via JEIKCODE_REAL_SESSION_DIR"]
+    #[tokio::test]
+    async fn real_session_display_projection_stability() {
+        use zap_kernel::message::Message;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let (Ok(source_dir), Ok(id)) = (
+            std::env::var("JEIKCODE_REAL_SESSION_DIR"),
+            std::env::var("JEIKCODE_REAL_SESSION_ID"),
+        ) else {
+            return;
+        };
+        let source_dir = std::path::PathBuf::from(source_dir);
+        let Some(project_hash) = source_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let sessions_root = NativeSessionManager::sessions_root();
+        let dest = sessions_root.join(&project_hash);
+        std::fs::create_dir_all(&dest).unwrap();
+        for entry in std::fs::read_dir(&source_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&id) || name.ends_with(".lease") || name.ends_with(".meta.lock") {
+                continue;
+            }
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dest.join(&name)).unwrap();
+            }
+        }
+
+        let read = |tail: Option<usize>, offset: Option<usize>, limit: Option<usize>| {
+            let state = state.clone();
+            let hash = project_hash.clone();
+            let id = id.clone();
+            async move {
+                let response = get_session_detail(
+                    State(state),
+                    Path((hash, id)),
+                    Query(session_query! {
+                        tail,
+                        offset,
+                        limit,
+                        after_seq: None,
+                    }),
+                    HeaderMap::new(),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        // 1. Cold start without a display log: fallback projection + backfill.
+        let first = read(Some(48), None, None).await;
+        let first_count = first["message_count"].as_u64().unwrap();
+        let first_turns = first["turns"].as_array().unwrap().clone();
+        assert!(first_count > 100, "real session should be long");
+        assert!(!first_turns.is_empty());
+        let manager = NativeSessionManager::with_root(dest.clone());
+        let (display_meta, _) = manager.read_display(&id).unwrap().expect("backfill");
+        assert!(display_meta.backfilled);
+
+        // 2. Second read must use the display log and produce the same projection.
+        let second = read(Some(48), None, None).await;
+        assert_eq!(second["message_count"].as_u64().unwrap(), first_count);
+        assert_eq!(second["turns"].as_array().unwrap().len(), first_turns.len());
+        assert_eq!(
+            second["messages"], first["messages"],
+            "display-log projection must match the backfill's first paint"
+        );
+
+        // 3. Page all the way back. Every absolute row must appear exactly once,
+        // every turn outline index must be a user row, and every tool result must
+        // pair with a tool call.
+        let collect = |page: &serde_json::Value, merged: &mut BTreeMap<i64, serde_json::Value>| {
+            let offset = page["offset"].as_i64().unwrap();
+            let pinned = page["pinned_user_index"].as_i64();
+            for (index, message) in page["messages"].as_array().unwrap().iter().enumerate() {
+                let absolute = if index == 0 {
+                    pinned.unwrap_or(offset)
+                } else if pinned.is_some() {
+                    offset + index as i64 - 1
+                } else {
+                    offset + index as i64
+                };
+                // Turn-aligned pages may overlap a previous raw page. The UI's
+                // mergeOlderMessages dedups by sourceIndex; overlapping copies
+                // must be byte-identical, otherwise the projection is unstable.
+                if let Some(previous) = merged.get(&absolute) {
+                    assert_eq!(
+                        previous, message,
+                        "overlapping row {absolute} changed between pages"
+                    );
+                } else {
+                    merged.insert(absolute, message.clone());
+                }
+            }
+        };
+        let mut merged = BTreeMap::new();
+        collect(&first, &mut merged);
+        let mut offset = first["offset"].as_u64().unwrap() as usize;
+        let mut pages = 1usize;
+        while offset > 0 {
+            let request = offset.saturating_sub(48);
+            let page = read(None, Some(request), Some(48)).await;
+            let next = page["offset"].as_u64().unwrap() as usize;
+            assert!(next < offset, "paging cursor must move backwards");
+            collect(&page, &mut merged);
+            offset = next;
+            pages += 1;
+            assert!(pages < 10_000, "paging runaway");
+        }
+        assert_eq!(
+            merged.len() as u64,
+            first_count,
+            "paged union must cover every transcript row"
+        );
+        let mut tool_calls = BTreeSet::new();
+        let mut result_calls = Vec::new();
+        let mut user_indices = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        for (absolute, message) in &merged {
+            if message["role"] == "user" {
+                user_indices.insert(*absolute);
+            }
+            if let Some(id) = message["id"].as_str() {
+                assert!(ids.insert(id.to_string()), "duplicate message id {id}");
+            }
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                if let Some(call_id) = call["id"].as_str() {
+                    tool_calls.insert(call_id.to_string());
+                }
+            }
+            if let Some(result) = message["tool_result"].as_object() {
+                if let Some(call_id) = result.get("call_id").and_then(|value| value.as_str()) {
+                    result_calls.push(call_id.to_string());
+                }
+            }
+        }
+        for turn in &first_turns {
+            let index = turn["index"].as_i64().unwrap();
+            assert!(
+                user_indices.contains(&index),
+                "turn outline index {index} is missing from the paged union"
+            );
+        }
+        for call_id in result_calls {
+            assert!(
+                tool_calls.contains(&call_id),
+                "tool result {call_id} has no tool call"
+            );
+        }
+
+        // 4. Compaction must not change the display projection.
+        let original = manager.load_native_session(&id).unwrap();
+        let mut compacted = original.snapshot.clone();
+        compacted.messages = vec![
+            Message::synthetic_user("<!-- jeikcode:anchor v1 -->\nsummary"),
+            original.snapshot.messages.last().cloned().unwrap(),
+        ];
+        manager.save_snapshot(&id, &compacted).unwrap();
+        let after_compaction = read(Some(48), None, None).await;
+        assert_eq!(
+            after_compaction["message_count"].as_u64().unwrap(),
+            first_count
+        );
+        assert_eq!(
+            after_compaction["turns"].as_array().unwrap().len(),
+            first_turns.len()
+        );
+        assert_eq!(after_compaction["messages"], first["messages"]);
+        manager.save_snapshot(&id, &original.snapshot).unwrap();
+
+        // 5. An explicit mutation invalidates the log; the next read rebuilds.
+        manager.invalidate_display(&id).unwrap();
+        let rebuilt = read(Some(48), None, None).await;
+        assert_eq!(rebuilt["message_count"].as_u64().unwrap(), first_count);
+        assert_eq!(
+            rebuilt["turns"].as_array().unwrap().len(),
+            first_turns.len()
+        );
+        assert_eq!(rebuilt["messages"], first["messages"]);
+        assert!(manager.read_display(&id).unwrap().unwrap().0.backfilled);
+
+        // 6. A partial final line (crash) must not hide the complete log.
+        let display_path = manager.display_path(&id).unwrap();
+        let mut bytes = std::fs::read(&display_path).unwrap();
+        bytes.extend_from_slice(b"{\"v\":1");
+        std::fs::write(&display_path, bytes).unwrap();
+        let after_partial = read(Some(48), None, None).await;
+        assert_eq!(
+            after_partial["message_count"].as_u64().unwrap(),
+            first_count
+        );
+        assert_eq!(after_partial["messages"], first["messages"]);
+    }
+
+    #[tokio::test]
+    async fn session_detail_backfills_then_prefers_the_display_log() {
+        use zap_capabilities::session::{
+            DisplayRecord, PresentationFile, SessionMeta, StorageOwner, DISPLAY_VERSION,
+        };
+        use zap_kernel::message::{Message, SessionSnapshot};
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let project_hash = NativeSessionManager::project_hash(&working_dir);
+        let manager = NativeSessionManager::for_project(&working_dir);
+        let id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let lease = manager.acquire_lease(id).unwrap();
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("SNAPSHOT Q"),
+            Message::assistant("SNAPSHOT A", Vec::new()),
+        ]);
+        let mut meta = SessionMeta::new(id, working_dir.to_string_lossy(), 100);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 2;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        let read = |state: AppState, project_hash: String, id: &'static str| async move {
+            let response = get_session_detail(
+                State(state),
+                Path((project_hash, id.to_string())),
+                Query(session_query! {
+                    tail: Some(48),
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        // First read: no display log -> snapshot fallback, then a backfill.
+        let value = read(state.clone(), project_hash.clone(), id).await;
+        let texts: Vec<String> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str().map(str::to_string))
+            .collect();
+        assert!(texts.iter().any(|text| text == "SNAPSHOT Q"));
+        let (display_meta, _) = manager.read_display(id).unwrap().unwrap();
+        assert!(display_meta.backfilled);
+        assert_eq!(display_meta.v, DISPLAY_VERSION);
+        assert_eq!(display_meta.last_seq, 2);
+
+        // Replace the log with a distinctive projection; the next read must
+        // prefer it over the snapshot (proves the display source is wired).
+        let records = vec![
+            DisplayRecord {
+                v: DISPLAY_VERSION,
+                session_id: id.into(),
+                turn_id: 0,
+                index: 0,
+                seq: 0,
+                role: "user".into(),
+                id: None,
+                content: "DISPLAY ONLY Q".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(1),
+                elapsed_ms: None,
+            },
+            DisplayRecord {
+                v: DISPLAY_VERSION,
+                session_id: id.into(),
+                turn_id: 0,
+                index: 1,
+                seq: 0,
+                role: "assistant".into(),
+                id: None,
+                content: "DISPLAY ONLY A".into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(2),
+                elapsed_ms: None,
+            },
+        ];
+        manager.write_display_backfill(id, &records, 0).unwrap();
+        let value = read(state.clone(), project_hash.clone(), id).await;
+        let texts: Vec<String> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str().map(str::to_string))
+            .collect();
+        assert!(texts.iter().any(|text| text == "DISPLAY ONLY Q"));
+        assert!(!texts.iter().any(|text| text == "SNAPSHOT Q"));
+
+        // Explicit mutation invalidates the v4 log; the next read must rebuild
+        // it from the canonical snapshot (the same path edit/delete/rewind uses).
+        manager.invalidate_display(id).unwrap();
+        let rebuilt = read(state.clone(), project_hash.clone(), id).await;
+        let rebuilt_texts: Vec<String> = rebuilt["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str().map(str::to_string))
+            .collect();
+        assert!(rebuilt_texts.iter().any(|text| text == "SNAPSHOT Q"));
+        let (rebuilt_meta, _) = manager.read_display(id).unwrap().unwrap();
+        assert_eq!(rebuilt_meta.v, DISPLAY_VERSION);
+        assert!(rebuilt_meta.backfilled);
+
+        // Simulate an old v3 log written before this migration: the next read
+        // must use it as the migration source and write a v4 log.
+        std::fs::write(
+            manager.display_meta_path(id).unwrap(),
+            serde_json::json!({
+                "v": 3,
+                "complete": true,
+                "last_turn_id": 0,
+                "completed_turns": [0],
+                "backfilled": false,
+                "updated_at": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let v3_row = serde_json::json!({
+            "v": 3,
+            "session_id": id,
+            "turn_id": 0,
+            "index": 0,
+            "role": "user",
+            "id": "v3-question",
+            "content": "V3 MIGRATED Q",
+            "reasoning": null,
+            "synthetic": false,
+            "internal_origin": null,
+            "tool_calls": [],
+            "tool_call_id": null,
+            "is_error": false,
+            "images": [],
+            "created_at": 1,
+            "elapsed_ms": null
+        });
+        std::fs::write(manager.display_path(id).unwrap(), format!("{}\n", v3_row)).unwrap();
+        let migrated = read(state, project_hash, id).await;
+        let migrated_texts: Vec<String> = migrated["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str().map(str::to_string))
+            .collect();
+        assert!(migrated_texts.iter().any(|text| text == "V3 MIGRATED Q"));
+        let (migrated_meta, migrated_rows) = manager.read_display(id).unwrap().unwrap();
+        assert_eq!(migrated_meta.v, DISPLAY_VERSION);
+        assert_eq!(migrated_meta.last_seq, migrated_rows.len() as u64);
+        assert_eq!(migrated_rows[0].seq, 1);
+    }
 }
 
 #[cfg(test)]
 mod channel_mode_tests {
     use super::*;
+
+    fn sequenced(events: &[ChatEvent]) -> Vec<(u64, ChatEvent)> {
+        events
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, event)| (index as u64 + 1, event))
+            .collect()
+    }
 
     #[test]
     fn resolve_channel_header() {
@@ -17362,6 +27174,74 @@ mod channel_mode_tests {
         );
     }
 
+    /// Regression: switching one session to Auto must gate THAT session's turns,
+    /// even while another instance still posts a stale `approval_mode: build`.
+    /// Previously the request copy won, so the pill said Auto while the runtime
+    /// kept asking for approvals.
+    #[test]
+    fn session_scoped_mode_overrides_a_stale_request_mode() {
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_mode(crate::approval_mode::ApprovalMode::Build);
+        live_api::live_set_session_approval_mode(
+            Some("sess-auto"),
+            crate::approval_mode::ApprovalMode::Auto,
+        );
+
+        assert_eq!(
+            effective_chat_approval_mode_scoped(
+                Some(crate::approval_mode::ApprovalMode::Build),
+                Some("sess-auto"),
+            ),
+            crate::approval_mode::ApprovalMode::Auto
+        );
+        // A sibling session keeps its own (unset → global) truth.
+        assert_eq!(
+            effective_chat_approval_mode_scoped(
+                Some(crate::approval_mode::ApprovalMode::Build),
+                Some("sess-other"),
+            ),
+            crate::approval_mode::ApprovalMode::Build
+        );
+        live_api::live_clear_session_approval_mode("sess-auto");
+    }
+
+    /// API isolation: the WebUI global switch must never change `/v1/*` behaviour.
+    /// Forced (API / YOLO) wins over the global switch; native turns follow it.
+    #[test]
+    fn forced_api_mode_is_immune_to_the_global_switch() {
+        use crate::approval_mode::ApprovalMode;
+        let _mode_guard = live_api::ScopedApprovalModeForTest::new();
+        live_api::live_set_global_mode_enabled(true, Some(ApprovalMode::Plan));
+
+        // Compat API: forced Auto must survive a global Plan switch.
+        assert_eq!(
+            resolve_turn_approval_mode(
+                Some(ApprovalMode::Auto),
+                Some(ApprovalMode::Build),
+                Some("s1")
+            ),
+            ApprovalMode::Auto
+        );
+        // WebUI turn: follows the global switch, ignoring session/request copies.
+        assert_eq!(
+            resolve_turn_approval_mode(None, Some(ApprovalMode::Build), Some("s1")),
+            ApprovalMode::Plan
+        );
+
+        // Global off: the session's own mode is back in charge.
+        live_api::live_set_global_mode_enabled(false, None);
+        live_api::live_set_session_approval_mode(Some("s1"), ApprovalMode::AcceptEdits);
+        assert_eq!(
+            resolve_turn_approval_mode(None, Some(ApprovalMode::Build), Some("s1")),
+            ApprovalMode::AcceptEdits
+        );
+        // Forced still wins.
+        assert_eq!(
+            resolve_turn_approval_mode(Some(ApprovalMode::Auto), None, Some("s1")),
+            ApprovalMode::Auto
+        );
+    }
+
     #[test]
     fn interactive_responder_is_required_for_all_non_auto_modes() {
         use crate::approval_mode::ApprovalMode;
@@ -17391,7 +27271,7 @@ mod channel_mode_tests {
                 arguments: "{}".into(),
             },
         ];
-        let (perm, user) = pending_interactive_from_replay(&events);
+        let (perm, user) = pending_interactive_from_replay(&sequenced(&events));
         assert!(matches!(
             perm,
             Some(ChatEvent::PermissionRequest { call_id, .. }) if call_id == "c1"
@@ -17418,7 +27298,7 @@ mod channel_mode_tests {
                 duration_ms: 1,
             },
         ];
-        let (perm, _) = pending_interactive_from_replay(&events);
+        let (perm, _) = pending_interactive_from_replay(&sequenced(&events));
         assert!(perm.is_none(), "resolved call must not restore a card");
     }
 
@@ -17438,10 +27318,10 @@ mod channel_mode_tests {
                 chunk: "writing".into(),
             },
         ];
-        let (perm, _) = pending_interactive_from_replay(&events);
+        let (perm, _) = pending_interactive_from_replay(&sequenced(&events));
         assert!(perm.is_none(), "output means approval already granted");
-        assert!(replay_resolves_call(&events, "c1"));
-        assert!(!replay_resolves_call(&events, "other"));
+        assert!(replay_resolves_call(&sequenced(&events), "c1"));
+        assert!(!replay_resolves_call(&sequenced(&events), "other"));
     }
 
     #[test]
@@ -17461,9 +27341,10 @@ mod channel_mode_tests {
                 session_id: "s1".into(),
                 stop_reason: None,
                 message: None,
+                message_id: None,
             },
         ];
-        let (perm, user) = pending_interactive_from_replay(&events);
+        let (perm, user) = pending_interactive_from_replay(&sequenced(&events));
         assert!(perm.is_none());
         assert!(user.is_none());
     }
@@ -17489,7 +27370,7 @@ mod channel_mode_tests {
                 duration_ms: 1,
             },
         ];
-        let (perm, user) = pending_interactive_from_replay(&events);
+        let (perm, user) = pending_interactive_from_replay(&sequenced(&events));
         assert!(perm.is_none());
         assert!(
             user.is_none(),
@@ -17600,8 +27481,13 @@ mod channel_mode_tests {
         ];
 
         // 1. 通过正文匹配
-        let idx1 =
-            resolve_target_message_index(&messages, 1, Some("这是正式回答"), Some("assistant"));
+        let idx1 = resolve_target_message_index(
+            &messages,
+            1,
+            Some("这是正式回答"),
+            Some("assistant"),
+            None,
+        );
         assert_eq!(idx1, Some(1));
 
         // 2. 通过思考过程匹配
@@ -17610,17 +27496,49 @@ mod channel_mode_tests {
             1,
             Some("这是详细的思考过程"),
             Some("assistant"),
+            None,
         );
         assert_eq!(idx2, Some(1));
 
         // 3. 通过前端拼接的全文（思考过程 + 正文）匹配
         let combined = "这是详细的思考过程\n这是正式回答";
-        let idx3 = resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"));
+        let idx3 =
+            resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"), None);
         assert_eq!(idx3, Some(1));
 
         // 4. 第二轮助手匹配
-        let idx4 = resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"));
+        let idx4 =
+            resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"), None);
         assert_eq!(idx4, Some(3));
+
+        // Display indices are not snapshot indices. The persisted id must win
+        // even when an older index points at a different message with the same
+        // text, and a stale id must fail closed instead of editing a neighbour.
+        let mut first = Message::user("同一句");
+        first.id = Some("m-first".into());
+        let mut second = Message::user("同一句");
+        second.id = Some("m-second".into());
+        let duplicate_text = vec![first, second];
+        assert_eq!(
+            resolve_target_message_index(
+                &duplicate_text,
+                0,
+                Some("同一句"),
+                Some("user"),
+                Some("m-second"),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_target_message_index(
+                &duplicate_text,
+                0,
+                Some("同一句"),
+                Some("user"),
+                Some("m-gone"),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -17643,9 +27561,14 @@ mod channel_mode_tests {
         ];
 
         // 模拟删除问题1的 Agent 回复（从中间输出到最终回答，保留问题1的 User 消息）
-        let target_idx =
-            resolve_target_message_index(&messages, 3, Some("问题1最终回答"), Some("assistant"))
-                .unwrap();
+        let target_idx = resolve_target_message_index(
+            &messages,
+            3,
+            Some("问题1最终回答"),
+            Some("assistant"),
+            None,
+        )
+        .unwrap();
         assert_eq!(target_idx, 3);
 
         // 模拟 delete_turn: false 下的 Agent 范围清理逻辑
@@ -17763,4 +27686,752 @@ mod channel_mode_tests {
         assert_eq!(artifacts[4].artifact_type, "html");
         assert_eq!(artifacts[4].title.as_deref(), Some("results.html"));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_add_and_remove_api_updates_config_and_triggers_reload() {
+        use crate::tests::{chat_test_state, ScopedChatHome};
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = state.project.read().await.working_dir.clone();
+
+        // 1. Add stdio MCP server to project
+        let add_req = McpAddRequest {
+            name: "local-tool".to_string(),
+            transport: Some("stdio".to_string()),
+            command: Some("python".to_string()),
+            args: vec!["tool.py".to_string()],
+            url: None,
+            headers: None,
+            env: None,
+            trust: Some(true),
+            auto_approve: None,
+            global: Some(false),
+            project_dir: Some(working_dir.clone()),
+        };
+        let res = mcp_add(State(state.clone()), Json(add_req))
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["name"], "local-tool");
+
+        // Verify file written to project .mcp.json
+        let proj_mcp = working_dir.join(".mcp.json");
+        assert!(proj_mcp.exists());
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&proj_mcp).unwrap()).unwrap();
+        assert_eq!(content["mcpServers"]["local-tool"]["command"], "python");
+        assert_eq!(content["mcpServers"]["local-tool"]["trust"], true);
+
+        // 2. Add HTTP MCP server to project
+        let mut hdrs = std::collections::BTreeMap::new();
+        hdrs.insert("Authorization".to_string(), "Bearer secret".to_string());
+        let add_http = McpAddRequest {
+            name: "remote-tool".to_string(),
+            transport: Some("http".to_string()),
+            command: None,
+            args: vec![],
+            url: Some("https://example.com/sse".to_string()),
+            headers: Some(hdrs),
+            env: None,
+            trust: None,
+            auto_approve: None,
+            global: Some(false),
+            project_dir: Some(working_dir.clone()),
+        };
+        let res2 = mcp_add(State(state.clone()), Json(add_http))
+            .await
+            .into_response();
+        assert_eq!(res2.status(), StatusCode::OK);
+
+        let content2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&proj_mcp).unwrap()).unwrap();
+        assert_eq!(
+            content2["mcpServers"]["remote-tool"]["url"],
+            "https://example.com/sse"
+        );
+
+        // 3. Remove via mcp_remove
+        let rm_req = McpRemoveRequest {
+            name: "local-tool".to_string(),
+            global: Some(false),
+            project_dir: Some(working_dir.clone()),
+        };
+        let res3 = mcp_remove(State(state.clone()), Json(rm_req))
+            .await
+            .into_response();
+        assert_eq!(res3.status(), StatusCode::OK);
+        let bytes3 = axum::body::to_bytes(res3.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body3: serde_json::Value = serde_json::from_slice(&bytes3).unwrap();
+        assert_eq!(body3["removed"], true);
+
+        let content3: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&proj_mcp).unwrap()).unwrap();
+        assert!(content3["mcpServers"].get("local-tool").is_none());
+        assert!(content3["mcpServers"].get("remote-tool").is_some());
+
+        // 4. Remove via mcp_delete_by_param
+        let res4 = mcp_delete_by_param(
+            State(state.clone()),
+            Path("remote-tool".to_string()),
+            Query(McpDeleteQuery {
+                global: Some(false),
+                project_dir: Some(working_dir.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(res4.status(), StatusCode::OK);
+
+        let content4: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&proj_mcp).unwrap()).unwrap();
+        assert!(content4["mcpServers"].get("remote-tool").is_none());
+
+        // 5. Deleting a non-existent server returns 404 NOT_FOUND
+        let res5 = mcp_delete_by_param(
+            State(state.clone()),
+            Path("non-existent-tool".to_string()),
+            Query(McpDeleteQuery {
+                global: Some(false),
+                project_dir: Some(working_dir.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(res5.status(), StatusCode::NOT_FOUND);
+
+        // 6. Test JSON camelCase payload with autoApprove, projectDir, and transport: "SSE"
+        let raw_json = serde_json::json!({
+            "name": "camel-tool",
+            "transport": "SSE",
+            "url": "https://example.com/events",
+            "autoApprove": ["ping", "pong"],
+            "projectDir": working_dir.to_string_lossy(),
+            "global": false,
+            "trust": true
+        });
+        let add_camel: McpAddRequest = serde_json::from_value(raw_json).unwrap();
+        let res6 = mcp_add(State(state.clone()), Json(add_camel))
+            .await
+            .into_response();
+        assert_eq!(res6.status(), StatusCode::OK);
+
+        let content6: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&proj_mcp).unwrap()).unwrap();
+        assert_eq!(
+            content6["mcpServers"]["camel-tool"]["url"],
+            "https://example.com/events"
+        );
+        assert_eq!(content6["mcpServers"]["camel-tool"]["trust"], true);
+        assert_eq!(
+            content6["mcpServers"]["camel-tool"]["autoApprove"],
+            serde_json::json!(["ping", "pong"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod rewind_consistency_tests {
+    use super::*;
+    use zap_capabilities::session::{
+        DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionMeta,
+        StorageOwner, TurnStat,
+    };
+
+    fn stat(after_message: usize, turn_id: u64) -> TurnStat {
+        TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 0,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: Vec::new(),
+        }
+    }
+
+    fn meta_with(id: &str) -> SessionMeta {
+        let mut meta = SessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        meta.turn_stats = vec![stat(2, 1), stat(4, 2), stat(6, 3)];
+        meta.turn_count = 3;
+        meta
+    }
+
+    fn entry(turn_id: u64) -> PresentationEntry {
+        PresentationEntry {
+            anchor: DisplayAnchor::AfterTurn { turn_id },
+            role: PresentationRole::User,
+            text: format!("display-{turn_id}"),
+        }
+    }
+
+    fn transcript_line(id: &str, turn_id: u64) -> String {
+        serde_json::json!({
+            "v": 1,
+            "ts": 1,
+            "iso": "x",
+            "session_id": id,
+            "turn_id": turn_id,
+            "user": format!("user-{turn_id}"),
+            "assistant": format!("answer-{turn_id}"),
+            "usage": {}
+        })
+        .to_string()
+    }
+
+    fn seed(mgr: &NativeSessionManager, id: &str, meta: &SessionMeta) {
+        mgr.write_meta(meta).unwrap();
+        let mut presentation = PresentationFile::default();
+        presentation.entries = vec![entry(1), entry(2), entry(3)];
+        mgr.write_presentation(id, &presentation).unwrap();
+        std::fs::write(
+            mgr.jsonl_path(id).unwrap(),
+            format!(
+                "{}\n{}\n{}\n",
+                transcript_line(id, 1),
+                transcript_line(id, 2),
+                transcript_line(id, 3)
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rewrite_prunes_every_downstream_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = NativeSessionManager::with_root(dir.path());
+        let id = "rewrite-prune";
+        let mut meta = meta_with(id);
+        seed(&mgr, id, &meta);
+
+        // Keep turns 1 and 2 (after_message <= 4); turn 3 is downstream.
+        let surviving = prune_rewound_turn_stats(&mut meta, 4).unwrap();
+        prune_derived_turns(&mgr, id, &surviving);
+        assert_eq!(meta.turn_stats.len(), 2);
+        assert_eq!(meta.turn_count, 2);
+        let presentation = mgr.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 2);
+        assert!(presentation.entries.iter().all(|e| e.text != "display-3"));
+        let transcript = std::fs::read_to_string(mgr.jsonl_path(id).unwrap()).unwrap();
+        assert!(transcript.contains("\"turn_id\":2"));
+        assert!(!transcript.contains("\"turn_id\":3"));
+    }
+
+    #[test]
+    fn partial_overlay_is_idempotent_and_resumes_before_the_new_prompt() {
+        let partial = zap_capabilities::session::PartialStream {
+            session_id: "s1".into(),
+            message_id: Some("m-1".into()),
+            part_id: Some("m-1:1:text".into()),
+            text: "half an answer".into(),
+            reasoning: "thinking".into(),
+            tool_calls: vec![zap_capabilities::session::PartialToolCall {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some("bash".into()),
+                arguments: "{\"cmd\":\"ls\"}".into(),
+            }],
+            updated_at: 1,
+        };
+        let mut conv = Vec::new();
+        assert!(overlay_partial_stream(&mut conv, &partial));
+        assert_eq!(conv.len(), 2, "assistant + interrupted tool result");
+        assert_eq!(conv[1].tool_call_id.as_deref(), Some("call-1"));
+        assert!(conv[1].is_error);
+        assert_eq!(conv[0].text, "half an answer");
+        assert_eq!(conv[0].reasoning.as_deref(), Some("thinking"));
+        assert_eq!(
+            conv[0].internal_origin.as_deref(),
+            Some("interrupted_partial")
+        );
+
+        // The canonical snapshot already contains this assistant message: a
+        // second resume must not append a duplicate.
+        let mut persisted =
+            zap_kernel::message::Message::assistant("half an answer".to_string(), Vec::new());
+        persisted.id = Some("m-1".into());
+        let mut existing = vec![persisted];
+        assert!(!overlay_partial_stream(&mut existing, &partial));
+        assert_eq!(existing.len(), 1);
+    }
+
+    #[test]
+    fn single_turn_delete_keeps_later_turns_and_reindexes_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = NativeSessionManager::with_root(dir.path());
+        let id = "delete-one-turn";
+        let mut meta = meta_with(id);
+        seed(&mgr, id, &meta);
+
+        // Delete the first turn (2 rows) while turns 2 and 3 stay.
+        let surviving = prune_deleted_turn_stats(&mut meta, 0, 2).unwrap();
+        prune_derived_turns(&mgr, id, &surviving);
+        assert_eq!(meta.turn_stats.len(), 2);
+        assert_eq!(meta.turn_stats[0].turn_id, 2);
+        assert_eq!(meta.turn_stats[0].after_message, 2);
+        assert_eq!(meta.turn_stats[1].turn_id, 3);
+        assert_eq!(meta.turn_stats[1].after_message, 4);
+        assert_eq!(meta.turn_count, 2);
+        let presentation = mgr.read_presentation(id).unwrap();
+        assert_eq!(presentation.entries.len(), 2);
+        assert!(presentation.entries.iter().all(|e| e.text != "display-1"));
+        let transcript = std::fs::read_to_string(mgr.jsonl_path(id).unwrap()).unwrap();
+        assert!(!transcript.contains("\"turn_id\":1"));
+        assert!(transcript.contains("\"turn_id\":2"));
+        assert!(transcript.contains("\"turn_id\":3"));
+    }
+}
+
+#[cfg(test)]
+mod live_deprecation_tests {
+    use super::*;
+
+    #[test]
+    fn only_retired_live_transport_paths_are_marked() {
+        for path in [
+            "/live",
+            "/live/message",
+            "/live/stop",
+            "/live/compact",
+            "/live/switch_session",
+        ] {
+            assert!(is_legacy_live_transport(path), "{path}");
+        }
+        for path in [
+            "/live/provider",
+            "/live/mode",
+            "/live/reasoning_effort",
+            "/live/permission",
+            "/live/user-input",
+            "/chat",
+            "/chat/watch",
+        ] {
+            assert!(!is_legacy_live_transport(path), "{path}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod v4_coverage_tests {
+    use super::*;
+    use zap_capabilities::session::{DisplayMeta, TurnStat};
+    use zap_kernel::message::Message;
+
+    fn stat(after_message: usize, turn_id: u64) -> TurnStat {
+        TurnStat {
+            after_message,
+            position_valid: true,
+            turn_id,
+            round_count: 1,
+            tool_call_count: 0,
+            duration_ms: 1,
+            total_tokens: 0,
+            errored: false,
+            used_tokens: 0,
+            ctx_window: 0,
+            model_usage: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn v4_mutation_rewrites_in_place_and_preserves_prefix_rows() {
+        use zap_capabilities::session::DisplayRecord;
+
+        fn row(id: &str, role: &str, content: &str, turn_id: u64, index: u32) -> DisplayRecord {
+            DisplayRecord {
+                v: zap_capabilities::session::DISPLAY_VERSION,
+                session_id: "s1".into(),
+                turn_id,
+                index,
+                seq: 0,
+                role: role.into(),
+                id: Some(id.into()),
+                content: content.into(),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(1),
+                elapsed_ms: None,
+            }
+        }
+
+        let seed = |dir: &std::path::Path| {
+            let manager = NativeSessionManager::with_root(dir);
+            manager
+                .rewrite_display_rows(
+                    "s1",
+                    &[
+                        row("u1", "user", "Q1", 1, 0),
+                        row("a1", "assistant", "A1", 1, 1),
+                        row("p-1", "assistant", "DISPLAY ONLY", 1, 2),
+                        row("u2", "user", "Q2", 2, 0),
+                        {
+                            let mut display_only = row("p-2", "assistant", "DISPLAY TAIL", 2, 2);
+                            display_only.internal_origin = Some("presentation".into());
+                            display_only
+                        },
+                        row("a2", "assistant", "A2", 2, 1),
+                        row("u3", "user", "Q3", 3, 0),
+                        row("a3", "assistant", "A3", 3, 1),
+                    ],
+                    3,
+                    &[1, 2, 3],
+                    false,
+                )
+                .unwrap();
+            manager
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = seed(dir.path());
+        assert!(rewrite_display_for_mutation(
+            &manager,
+            "s1",
+            DisplayMutation::Truncate {
+                target_id: Some("u2"),
+                inclusive: true,
+            },
+            2,
+            &[1, 2],
+        ));
+        let (meta, rows) = manager.read_display("s1").unwrap().unwrap();
+        assert_eq!(meta.last_turn_id, 2);
+        assert_eq!(meta.completed_turns, vec![1, 2]);
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().any(|row| row.id.as_deref() == Some("p-1")));
+        assert!(rows.iter().any(|row| row.id.as_deref() == Some("u2")));
+        assert!(
+            rows.iter().any(|row| row.id.as_deref() == Some("p-2")),
+            "presentation rows anchored to the surviving turn must not be cut"
+        );
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("u3")));
+        assert_eq!(rows.last().unwrap().seq, rows.len() as u64);
+
+        // Exclusive truncate is what “回溯并提交” uses: the target user row and
+        // its whole turn must disappear before the replacement prompt is sent.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = seed(dir.path());
+        assert!(rewrite_display_for_mutation(
+            &manager,
+            "s1",
+            DisplayMutation::Truncate {
+                target_id: Some("u2"),
+                inclusive: false,
+            },
+            2,
+            &[1, 2],
+        ));
+        let (_, rows) = manager.read_display("s1").unwrap().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("u2")));
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("p-2")));
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("u3")));
+        assert_eq!(rows.last().unwrap().seq, rows.len() as u64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = seed(dir.path());
+        let images: Vec<ImageData> = Vec::new();
+        assert!(rewrite_display_for_mutation(
+            &manager,
+            "s1",
+            DisplayMutation::Patch {
+                target_id: Some("u2"),
+                text: "EDITED Q2",
+                images: &images,
+                truncate_after: true,
+            },
+            2,
+            &[1, 2],
+        ));
+        let (_, rows) = manager.read_display("s1").unwrap().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows
+            .iter()
+            .any(|row| row.id.as_deref() == Some("u2") && row.content == "EDITED Q2"));
+        assert!(rows.iter().any(|row| row.id.as_deref() == Some("p-2")));
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("a3")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = seed(dir.path());
+        assert!(rewrite_display_for_mutation(
+            &manager,
+            "s1",
+            DisplayMutation::Delete {
+                target_id: Some("u2"),
+                delete_turn: true,
+            },
+            2,
+            &[1, 3],
+        ));
+        let (_, rows) = manager.read_display("s1").unwrap().unwrap();
+        assert!(rows.iter().any(|row| row.id.as_deref() == Some("u3")));
+        assert!(rows.iter().any(|row| row.id.as_deref() == Some("p-1")));
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("u2")));
+        assert!(!rows.iter().any(|row| row.id.as_deref() == Some("a2")));
+    }
+
+    #[test]
+    fn v4_large_log_roundtrips_with_monotonic_seq() {
+        use zap_capabilities::session::DisplayRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = NativeSessionManager::with_root(dir.path());
+        let rows: Vec<DisplayRecord> = (0..2000)
+            .map(|index| DisplayRecord {
+                v: zap_capabilities::session::DISPLAY_VERSION,
+                session_id: "s1".into(),
+                turn_id: index / 2,
+                index: u32::try_from(index % 2).unwrap_or(0),
+                seq: 0,
+                role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
+                id: Some(format!("m-{index}")),
+                content: format!("row {index}"),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(index as u64),
+                elapsed_ms: None,
+            })
+            .collect();
+        manager.write_display_backfill("s1", &rows, 1000).unwrap();
+        let (meta, read) = manager.read_display("s1").unwrap().unwrap();
+        assert_eq!(read.len(), 2000);
+        assert_eq!(meta.last_seq, 2000);
+        assert_eq!(read.first().unwrap().seq, 1);
+        assert_eq!(read.last().unwrap().seq, 2000);
+    }
+
+    #[test]
+    fn display_log_cache_is_bounded_and_hits() {
+        let mut cache = DisplayLogCache::default();
+        for index in 0..(MAX_CACHED_DISPLAY_ENTRIES + 4) {
+            cache.insert(DisplayLogCacheEntry {
+                key: format!("k-{index}"),
+                log_mtime: None,
+                log_len: 1,
+                meta_mtime: None,
+                meta_len: 1,
+                meta: Default::default(),
+                records: std::sync::Arc::new(Vec::new()),
+            });
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED_DISPLAY_ENTRIES);
+        assert!(!cache.entries.contains_key("k-0"));
+        let hit = cache.get("k-9", None, 1, None, 1);
+        assert!(hit.is_some(), "recently inserted entries must hit");
+    }
+
+    #[test]
+    fn v4_tail_view_seeks_to_the_requested_window() {
+        use zap_capabilities::session::{
+            DisplayRecord, PresentationFile, SessionMeta, StorageOwner,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = NativeSessionManager::with_root(dir.path());
+        let id = "tail-view";
+        let rows: Vec<DisplayRecord> = (0..100usize)
+            .map(|index| DisplayRecord {
+                v: zap_capabilities::session::DISPLAY_VERSION,
+                session_id: id.into(),
+                turn_id: (index / 2) as u64,
+                index: (index % 2) as u32,
+                seq: 0,
+                role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
+                id: Some(format!("m-{index}")),
+                content: format!("row {index}"),
+                reasoning: None,
+                synthetic: false,
+                internal_origin: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                is_error: false,
+                images: Vec::new(),
+                created_at: Some(index as u64),
+                elapsed_ms: None,
+            })
+            .collect();
+        manager.write_display_backfill(id, &rows, 50).unwrap();
+        let mut meta = SessionMeta::new(id, "/p", 1);
+        meta.owner = StorageOwner::Native;
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: zap_kernel::message::SessionSnapshot::new(Vec::new()),
+            meta,
+            presentation: PresentationFile::default(),
+        };
+        let view = read_display_tail_view(&manager, &session, 10, None, false, 0).unwrap();
+        assert_eq!(view.message_count, 100);
+        assert_eq!(view.offset, 90);
+        assert_eq!(view.messages.len(), 10);
+        assert_eq!(view.turns.len(), 50);
+        assert_eq!(view.messages[0].content, "row 90");
+        assert_eq!(view.turns.last().unwrap().index, 98);
+    }
+
+    fn prompt(text: &str, id: &str) -> Message {
+        let mut message = Message::user(text);
+        message.id = Some(id.into());
+        message
+    }
+
+    fn assistant(text: &str, id: &str) -> Message {
+        let mut message = Message::assistant(text, Vec::new());
+        message.id = Some(id.into());
+        message
+    }
+
+    fn ids(values: &[&str]) -> std::collections::HashSet<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn v4_requires_both_turn_boundaries_in_the_display_log() {
+        let messages = vec![
+            prompt("q1", "u1"),
+            assistant("a1", "a1"),
+            prompt("q2", "u2"),
+            assistant("a2", "a2"),
+        ];
+        let stats = vec![stat(2, 1), stat(4, 2)];
+        let mut meta = DisplayMeta {
+            complete: true,
+            last_turn_id: 2,
+            completed_turns: vec![1],
+            ..DisplayMeta::default()
+        };
+        // Turn 1 is complete; turn 2 is missing entirely.
+        let mut present = ids(&["u1", "a1"]);
+        assert!(!v4_display_covers_completed_user_turns(
+            &meta, &present, &messages, &stats, 2
+        ));
+        present.extend(ids(&["u2", "a2"]));
+        meta.completed_turns.push(2);
+        assert!(v4_display_covers_completed_user_turns(
+            &meta, &present, &messages, &stats, 2
+        ));
+
+        // The prompt landed (e.g. a mid-turn backfill) but the terminal assistant
+        // slice did not: still incomplete.
+        present.remove("a2");
+        assert!(!v4_display_covers_completed_user_turns(
+            &meta, &present, &messages, &stats, 2
+        ));
+
+        // A backfilled log is not exempt: its rows must still carry the ids.
+        meta.backfilled = true;
+        meta.completed_turns.clear();
+        assert!(!v4_display_covers_completed_user_turns(
+            &meta, &present, &messages, &stats, 2
+        ));
+        present.insert("a2".into());
+        assert!(v4_display_covers_completed_user_turns(
+            &meta, &present, &messages, &stats, 2
+        ));
+        meta.last_turn_id = 1;
+        assert!(!v4_display_covers_completed_user_turns(
+            &meta, &present, &messages, &stats, 2
+        ));
+
+        // A pre-id snapshot cannot be reconciled by identity; the legacy
+        // turn-id contract still applies to it.
+        let legacy = vec![Message::user("q1"), Message::assistant("a1", Vec::new())];
+        let legacy_stats = vec![stat(2, 1)];
+        meta.last_turn_id = 1;
+        meta.completed_turns = vec![1];
+        assert!(v4_display_covers_completed_user_turns(
+            &meta,
+            &std::collections::HashSet::new(),
+            &legacy,
+            &legacy_stats,
+            1
+        ));
+    }
+
+    #[test]
+    fn v4_reused_turn_id_does_not_mask_a_missing_final_turn() {
+        // A rewind restored the kernel counter, so the final turn reused id 41
+        // while the archived stat for the earlier 41 is still present. The turn
+        // id is already in `completed_turns`, but the NEW turn never reached the
+        // display log. Coverage must fail so the read path rebuilds.
+        let messages = vec![
+            prompt("q1", "u1"),
+            assistant("a1", "a1"),
+            prompt("q2", "u2"),
+            assistant("a2", "a2"),
+        ];
+        let stats = vec![stat(2, 41), stat(4, 41)];
+        let meta = DisplayMeta {
+            complete: true,
+            last_turn_id: 41,
+            completed_turns: vec![41],
+            ..DisplayMeta::default()
+        };
+        let present = ids(&["u1", "a1"]);
+        assert!(
+            !v4_display_covers_completed_user_turns(&meta, &present, &messages, &stats, 41),
+            "the reused turn id must not hide the missing final turn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod client_identity_tests {
+    use super::*;
+
+    #[test]
+    fn folded_steer_client_id_is_attached_to_its_kernel_message() {
+        let inputs = vec![zap_capabilities::session::SessionInput {
+            id: "client-steer-1".into(),
+            seq: 1,
+            session_id: "sess-1".into(),
+            delivery: "steer".into(),
+            status: "promoted".into(),
+            text: "继续".into(),
+            images: Vec::new(),
+            created_at: 1,
+            message_id: Some("m-kernel-1".into()),
+            operation_id: None,
+        }];
+        let map = client_input_identity_map(inputs);
+        let mut rows = vec![
+            MessageInfo {
+                role: "user".into(),
+                id: Some("m-kernel-1".into()),
+                ..Default::default()
+            },
+            MessageInfo {
+                role: "assistant".into(),
+                id: Some("m-kernel-1".into()),
+                ..Default::default()
+            },
+        ];
+        annotate_client_input_ids_with(&mut rows, &map);
+        assert_eq!(rows[0].client_input_id.as_deref(), Some("client-steer-1"));
+        assert_eq!(rows[1].client_input_id, None);
+    }
+}
+
+pub(crate) fn global_standalone_workspace() -> std::path::PathBuf {
+    zap_config::util::real_home_dir()
+        .map(|h| h.join(".zap").join("workspace"))
+        .unwrap_or_else(|| std::env::temp_dir().join("zap_workspace"))
 }

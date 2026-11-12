@@ -1,12 +1,28 @@
 import DOMPurify from 'dompurify';
-import { useMemo, useRef, useEffect, useState } from 'preact/hooks';
+import { useMemo, useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { render } from 'preact';
 import { createPortal } from 'preact/compat';
 import { markdownToHtml } from '../lib/markdownRender';
+import { enhanceMarkdownTables } from '../lib/markdownTables';
 import { MermaidDiagram } from './MermaidDiagram';
 import { useSettings } from '../settings';
 import { showToast } from './Toast';
 import { parseFilePathAndLines } from '../lib/displayPath';
+import { revealInFileExplorer, openFileWithOs } from '../api';
+import { getPageZoom } from '../lib/pageZoom';
+import {
+  isFilePathSnippet,
+  isLikelyDirPath,
+  isSystemDefaultAppFile,
+  computeFileContextMenuPosition,
+} from '../lib/markdownPathSnippet';
+
+export {
+  isFilePathSnippet,
+  isLikelyDirPath,
+  isSystemDefaultAppFile,
+  computeFileContextMenuPosition,
+} from '../lib/markdownPathSnippet';
 
 export { preprocessMarkdown, markdownToHtml } from '../lib/markdownRender';
 
@@ -72,84 +88,15 @@ function normalizePath(rawPath: string): string {
   return (hasDrive ? '' : lineCleaned.startsWith('/') ? '/' : '') + stack.join('/');
 }
 
-const ALL_FILE_EXTS = 'kt|kts|java|c|cpp|cc|cxx|h|hpp|hxx|cs|swift|m|mm|scala|clj|cljs|rs|go|py|pyw|rb|php|pl|pm|lua|r|dart|ts|tsx|js|jsx|mjs|cjs|json|json5|jsonc|toml|yaml|yml|xml|html|htm|xhtml|css|scss|sass|less|styl|sh|bash|zsh|fish|ps1|psm1|bat|cmd|sql|prisma|proto|graphql|gql|vue|svelte|astro|md|markdown|mdx|txt|text|log|diff|patch|env|properties|ini|conf|cfg|lock|svg|png|jpg|jpeg|gif|webp|ico|bmp|avif|gradle|cmake|dockerfile|containerfile|nix';
-const EXT_REGEX = new RegExp(`\\.(${ALL_FILE_EXTS})$`, 'i');
-const ROOT_DIRS_REGEX = /^(crates|src|webui|packages|desktop|docs|scripts|extensions|functions|plans|tests|assets|public|internal|cmd|api|lib)\/[\w.\-\\/]+$/i;
-
-const CLI_COMMAND_STARTS = new Set([
-  'npm', 'npx', 'pnpm', 'yarn', 'bun', 'node', 'deno',
-  'cargo', 'rustc', 'rustup',
-  'git', 'gh', 'svn', 'hg',
-  'python', 'python3', 'py', 'pip', 'pip3', 'pytest',
-  'go', 'gofmt',
-  'docker', 'docker-compose', 'podman', 'kubectl', 'helm',
-  'bash', 'sh', 'zsh', 'fish', 'source', 'export',
-  'cat', 'grep', 'find', 'awk', 'sed', 'cd', 'ls', 'dir',
-  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown',
-  'curl', 'wget', 'ssh', 'scp', 'tar', 'zip', 'unzip',
-  'make', 'cmake', 'ninja', 'mvn', 'gradle',
-  'vite', 'tsc', 'eslint', 'prettier', 'jest', 'vitest',
-]);
-
-/**
- * 智能识别一段文本是否是 CLI 终端命令行，防止命令代码被误当成文件路径
- */
-export function isCommandSnippet(text: string): boolean {
-  const t = (text || '').trim().replace(/^['"`]|['"`]$/g, '');
-  if (!t) return false;
-
-  // 1. 包含命令行连接符、管道符、分号或重定向符
-  if (/(\s+&&\s+|\s+\|\|\s+|\s+\|\s+|\s+>>?\s+|\s+<<?\s+|;\s*)/.test(t)) return true;
-
-  // 2. 包含典型的命令行参数标志 (如 --test, -v, -p, --save-dev, -rf)
-  if (/\s+--?[a-zA-Z0-9]/.test(t)) return true;
-
-  // 3. 以常见 CLI 命令关键字开头且附带参数 (如 npm run, git status, node --test)
-  const firstWord = t.split(/[\s/\\:]/)[0]?.toLowerCase();
-  if (firstWord && CLI_COMMAND_STARTS.has(firstWord) && /\s+/.test(t)) {
-    return true;
+// 转换为项目相对路径
+function toRelativePath(absPath: string, cwd?: string): string {
+  const normAbs = absPath.trim().replace(/\\/g, '/');
+  if (!cwd) return normAbs;
+  const normCwd = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normAbs.toLowerCase().startsWith(normCwd.toLowerCase() + '/')) {
+    return normAbs.slice(normCwd.length + 1);
   }
-
-  // 4. 包含空格且含常见命令行动词 (run build, test, install 等)
-  if (/\s+(?:run|build|test|start|install|add|commit|checkout|push|pull|revert|fetch|merge|diff|status|serve|watch)\b/i.test(t)) {
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * 智能识别一段文本是否是 Web 网址或域名 (如 https://..., //..., www...., viewer.autodesk.com)
- */
-export function isWebUrlSnippet(text: string): boolean {
-  const t = (text || '').trim().replace(/^['"`]|['"`]$/g, '');
-  if (!t || /\s/.test(t)) return false;
-  if (/^(https?:|\/\/)/i.test(t) || /^www\./i.test(t)) return true;
-  return /^([a-zA-Z0-9-]+\.)+(com|cn|org|net|edu|gov|io|ai|dev|co|me|app|top|xyz|info|vip|cc|tv|site|online|tech|cloud|icu|club|fun|art|link|biz)(?::\d+)?(?:[/?#]|$)/i.test(t);
-}
-
-/**
- * 智能识别一段文本是否是项目源码/资源文件路径（支持健壮提取附带的行号与行范围）
- */
-export function isFilePathSnippet(text: string): boolean {
-  if (isCommandSnippet(text)) return false;
-
-  const { filePath } = parseFilePathAndLines(text);
-  const t = filePath.trim().replace(/^['"`]|['"`]$/g, '');
-  if (t.length < 2 || t.length > 350) return false;
-  if (/^(https?:|\/\/)/i.test(t) || /^www\./i.test(t) || isWebUrlSnippet(t)) return false;
-
-  // 1. 标准扩展名匹配 (全语言源码、脚本、配置、文本及资源)
-  if (EXT_REGEX.test(t)) return true;
-
-  // 2. 绝对路径特征
-  if (/^[a-zA-Z]:[\\/][\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t)) return true;
-  if (/^\/[\w.\-\\/]+?\.[a-zA-Z0-9]+$/i.test(t)) return true;
-
-  // 3. 常见工程目录层级结构
-  if (ROOT_DIRS_REGEX.test(t)) return true;
-
-  return false;
+  return normAbs;
 }
 
 // 解析目标文件路径 (全面支持 Windows/POSIX 绝对路径与基于 basePath / cwd 的相对路径)
@@ -195,6 +142,22 @@ function rewriteImageSources(html: string, basePath?: string, cwd?: string): str
   return doc.body.innerHTML;
 }
 
+/** Deepest trailing text node of a rendered markdown root (append target). */
+function lastTextNode(root: Element): Text | null {
+  let node: Node | null = root.lastChild;
+  while (node) {
+    if (node.nodeType === Node.TEXT_NODE) return node as Text;
+    if (node.lastChild) {
+      node = node.lastChild;
+      continue;
+    }
+    while (node && node !== root && !node.previousSibling) node = node.parentNode;
+    if (!node || node === root) return null;
+    node = node.previousSibling;
+  }
+  return null;
+}
+
 export function Markdown({
   content,
   search,
@@ -212,12 +175,16 @@ export function Markdown({
   onMatchCountChange?: (count: number) => void;
   targetContext?: 'main' | 'right' | 'chat';
 }) {
-  const { theme, lang, t } = useSettings();
-  const isDark = (theme === 'dark') ||
-    (theme === 'system' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) ||
-    (typeof document !== 'undefined' && document.documentElement.dataset.theme === 'dark');
+  const { theme, effectiveTheme, lang, t } = useSettings();
+  const isDark = effectiveTheme ? effectiveTheme === 'dark' : (theme === 'dark');
 
   const rootRef = useRef<HTMLDivElement>(null);
+  // 表格列宽拖拽的 a11y 文案：用 ref 传给命令式增强器，避免语言切换时重建表格。
+  const tableLabelsRef = useRef({ resize: '', reset: '' });
+  tableLabelsRef.current = {
+    resize: t('markdown.resizeColumn'),
+    reset: t('markdown.resetColumnWidth'),
+  };
 
   const { renderedHtml, matchCount } = useMemo(() => {
     const raw = markdownToHtml(content ?? '', { highlight: true });
@@ -237,9 +204,54 @@ export function Markdown({
     return { renderedHtml: prepped, matchCount: 0 };
   }, [content, search, basePath, cwd]);
 
+  /**
+   * Streaming markdown must NOT replace the whole subtree on every token.
+   * A plain-text append only extends the last text node; keeping the nodes
+   * (and their layout) intact is what stops the per-character vertical
+   * jitter, the collapsed images, and the "formatting flickers while
+   * streaming" symptom. Structural changes still fall back to innerHTML.
+   */
+  const appliedHtmlRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const next = renderedHtml;
+    const prev = appliedHtmlRef.current;
+    appliedHtmlRef.current = next;
+    if (prev === null) {
+      root.innerHTML = next;
+      enhanceMarkdownTables(root, tableLabelsRef.current);
+      return;
+    }
+    if (prev === next) return;
+    // Pure append of inactive text: extend the trailing text node only.
+    if (prev.length > 0 && next.startsWith(prev) && prev[prev.length - 1] !== '>') {
+      const suffix = next.slice(prev.length);
+      if (suffix && suffix.length <= 64 && !/[<>&"'*_`\[\]#|~{}$\\]/.test(suffix)) {
+        const tail = lastTextNode(root);
+        if (tail) {
+          tail.appendData(suffix);
+          return;
+        }
+      }
+    }
+    root.innerHTML = next;
+    enhanceMarkdownTables(root, tableLabelsRef.current);
+  }, [renderedHtml]);
+
   useEffect(() => {
     onMatchCountChange?.(matchCount);
   }, [matchCount, onMatchCountChange]);
+
+  // 语言切换后刷新已有列宽拖拽把手的提示文案（表格 DOM 本身不重建）。
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    root.querySelectorAll<HTMLElement>('.md-col-resizer').forEach((handle) => {
+      handle.setAttribute('aria-label', tableLabelsRef.current.resize);
+      handle.title = tableLabelsRef.current.reset;
+    });
+  }, [lang]);
 
   // 当前激活选中的匹配项切换时，添加 .is-current-match 并平滑滚动居中定位！
   useEffect(() => {
@@ -286,35 +298,88 @@ export function Markdown({
     };
   }, [renderedHtml, isDark, lang, basePath]);
 
-  const lastDragTimeRef = useRef(0);
-
   // 智能扫描并标记画布上的文件引用胶囊徽章与 Web 链接，赋予高级胶囊动效、手形与无障碍聚焦
-  useEffect(() => {
+  // useLayoutEffect：类名必须在本次绘制前落好，否则每个 token 会先画一帧无徽章、
+  // 再画一帧有徽章（两帧布局差 = 流式期间的“格式抖动”）。
+  useLayoutEffect(() => {
     if (!rootRef.current) return;
     const codes = rootRef.current.querySelectorAll<HTMLElement>(':not(pre) > code');
     codes.forEach((code) => {
       const text = (code.textContent || '').trim();
-      if (isWebUrlSnippet(text)) {
+      if (/^(https?:|\/\/)/i.test(text) || /^www\./i.test(text)) {
         code.classList.add('file-path-badge', 'web-link-badge');
         code.setAttribute('title', `${text} (${t('preview.clickToOpenExternal')})`);
         code.setAttribute('tabindex', '0');
         code.setAttribute('role', 'link');
-        code.setAttribute('draggable', 'false');
       } else if (isFilePathSnippet(text)) {
         code.classList.add('file-path-badge');
-        code.setAttribute('title', `${text} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`);
+        const isDir = isLikelyDirPath(text);
+        if (isDir) {
+          code.classList.add('dir-path-badge');
+          code.setAttribute(
+            'title',
+            t('preview.dirBadgeTooltip', { text, action: t('preview.clickToOpenDir') }) ||
+              `${text} (${t('preview.clickToOpenDir')})`,
+          );
+        } else if (isSystemDefaultAppFile(text)) {
+          code.classList.add('system-app-badge');
+          code.setAttribute(
+            'title',
+            t('preview.systemAppBadgeTooltip', {
+              text,
+              action: t('preview.openWithDefaultApp'),
+            }) || `${text} (${t('preview.openWithDefaultApp')})`,
+          );
+        } else {
+          code.setAttribute(
+            'title',
+            t('preview.fileBadgeTooltip', {
+              text,
+              preview: t('preview.clickToPreview'),
+              main: t('preview.openInMain'),
+            }) || `${text} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`,
+          );
+        }
         code.setAttribute('tabindex', '0');
         code.setAttribute('role', 'button');
-        code.setAttribute('draggable', 'false');
       }
     });
 
     const links = rootRef.current.querySelectorAll<HTMLElement>('a[href]');
     links.forEach((a) => {
       a.classList.add('markdown-link-pill');
-      a.setAttribute('draggable', 'false');
+      const href = a.getAttribute('href') || '';
+      if (!href.startsWith('#') && !/^(https?:|mailto:|\/\/)/i.test(href)) {
+        const isDir = isLikelyDirPath(href);
+        if (isDir) {
+          a.classList.add('dir-path-badge');
+          a.setAttribute(
+            'title',
+            t('preview.dirBadgeTooltip', { text: href, action: t('preview.clickToOpenDir') }) ||
+              `${href} (${t('preview.clickToOpenDir')})`,
+          );
+        } else if (isSystemDefaultAppFile(href)) {
+          a.classList.add('system-app-badge');
+          a.setAttribute(
+            'title',
+            t('preview.systemAppBadgeTooltip', {
+              text: href,
+              action: t('preview.openWithDefaultApp'),
+            }) || `${href} (${t('preview.openWithDefaultApp')})`,
+          );
+        } else {
+          a.setAttribute(
+            'title',
+            t('preview.fileBadgeTooltip', {
+              text: href,
+              preview: t('preview.clickToPreview'),
+              main: t('preview.openInMain'),
+            }) || `${href} (${t('preview.clickToPreview')}, Ctrl+Click: ${t('preview.openInMain')})`,
+          );
+        }
+      }
     });
-  }, [renderedHtml]);
+  }, [renderedHtml, lang, t]);
 
   // 监听鼠标长按拖拽划词事件：拖选文字时光标自适应切换为点击形 (text)，松开即恢复
   useEffect(() => {
@@ -322,17 +387,14 @@ export function Markdown({
     if (!root) return;
 
     let isMouseDown = false;
-    let didDrag = false;
     let downX = 0;
     let downY = 0;
     let activeBadge: HTMLElement | null = null;
 
     const handleMouseDown = (e: MouseEvent) => {
-      if (e.button !== 0) return;
       const badge = (e.target as HTMLElement)?.closest('.file-path-badge, a[href]') as HTMLElement | null;
       if (badge) {
         isMouseDown = true;
-        didDrag = false;
         downX = e.clientX;
         downY = e.clientY;
         activeBadge = badge;
@@ -344,16 +406,12 @@ export function Markdown({
       const dx = Math.abs(e.clientX - downX);
       const dy = Math.abs(e.clientY - downY);
       if (dx > 3 || dy > 3) {
-        didDrag = true;
         activeBadge.classList.add('is-selecting');
       }
     };
 
     const handleMouseUp = () => {
       isMouseDown = false;
-      if (didDrag) {
-        lastDragTimeRef.current = Date.now();
-      }
       if (activeBadge) {
         activeBadge.classList.remove('is-selecting');
         activeBadge = null;
@@ -405,31 +463,27 @@ export function Markdown({
       // 如果点击的是行内 code 标签，智能检测其内容是否是 Web 链接或文件路径
       if (!href && clickable.tagName?.toLowerCase() === 'code') {
         const text = (clickable.textContent || '').trim();
-        if (isWebUrlSnippet(text)) {
+        if (/^(https?:|\/\/)/i.test(text) || /^www\./i.test(text)) {
           href = text;
         } else if (isFilePathSnippet(text)) {
           href = text;
         }
       }
 
-      // 如果用户刚刚进行过拖拽划词选择（250ms 内），或者当前窗口已有文本被划选，绝不触发跳转/打开
-      if (Date.now() - lastDragTimeRef.current < 250) {
-        return;
-      }
-      const sel = window.getSelection()?.toString().trim();
-      if (sel && sel.length > 0) {
-        return;
-      }
-
       // (A) 外部 Web 链接：在系统默认原始浏览器中弹出打开 (Tauri 桌面壳自动由 on_new_window 接管)
-      if (href && (isWebUrlSnippet(href) || /^(https?:|\/\/)/i.test(href) || /^www\./i.test(href))) {
+      if (href && (/^(https?:|\/\/)/i.test(href) || /^www\./i.test(href))) {
+        const sel = window.getSelection()?.toString().trim();
+        if (sel && sel.length > 0) {
+          return;
+        }
+
         e.preventDefault();
         e.stopPropagation();
 
         let targetUrl = href.trim();
         if (targetUrl.startsWith('//')) {
           targetUrl = 'https:' + targetUrl;
-        } else if (!/^https?:\/\//i.test(targetUrl)) {
+        } else if (/^www\./i.test(targetUrl)) {
           targetUrl = 'https://' + targetUrl;
         }
 
@@ -441,12 +495,44 @@ export function Markdown({
 
       // (B) 本地文件路径引用：在预览或主编辑区打开
       if (href && !href.startsWith('#') && !/^(https?:|mailto:|\/\/)/i.test(href)) {
+        // 如果用户正在划词选择复制文字，或者刚刚拖选了文字，绝不触发打开文件，保护复制体验
+        const sel = window.getSelection()?.toString().trim();
+        if (sel && sel.length > 0) {
+          return;
+        }
+
         e.preventDefault();
         e.stopPropagation();
 
         const { filePath: cleanHref, startLine, endLine } = parseFilePathAndLines(href);
         const resolved = resolveTargetFile(cleanHref, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
+        const isDir = isLikelyDirPath(cleanHref);
+
+        // (B.1) 目录路径点击：无论是绝对路径还是相对路径，末尾带不带 /，直接在系统资源管理器中打开！
+        if (isDir) {
+          revealInFileExplorer(resolved, cwd)
+            .then(() => {
+              showToast(t('preview.revealDirSuccess', { path: cleanHref }), 'success');
+            })
+            .catch(() => {
+              // 系统外壳调用失败时静默忽略
+            });
+          return;
+        }
+
+        // (B.2) 系统默认应用打开的文件 (.exe, .zip, .rar, .iso, .doc, .ppt, .xlsx 等程序/归档/办公文档/镜像)
+        // 默认左键单击即以系统默认应用打开！
+        if (isSystemDefaultAppFile(cleanHref)) {
+          openFileWithOs(resolved, cwd)
+            .then(() => {
+              showToast(t('preview.openWithDefaultAppSuccess', { path: fileName }), 'success');
+            })
+            .catch(() => {
+              // 系统外壳调用失败时静默忽略
+            });
+          return;
+        }
 
         if (e.ctrlKey || e.metaKey || e.altKey) {
           // 按住 Ctrl / Cmd / Alt 点击：直接在中间主编辑区打开并定位行号！
@@ -479,15 +565,26 @@ export function Markdown({
       }
     }
 
-    // 2. 处理代码块 Copy 按钮
-    const t = targetEl?.closest('.copy-button') as HTMLElement | null;
-    if (t?.dataset.copy) {
-      const text = decodeURIComponent(t.dataset.copy);
-      const prev = t.textContent;
+    // 2. 点击图片：在全屏相册级灯箱中打开大图浏览，支持手机双指缩放与自由拖拽看细节
+    const imgEl = targetEl?.closest('img') as HTMLImageElement | null;
+    if (imgEl && imgEl.src) {
+      e.preventDefault();
+      e.stopPropagation();
+      window.dispatchEvent(new CustomEvent('jeikcode:preview:image', {
+        detail: { src: imgEl.src }
+      }));
+      return;
+    }
+
+    // 3. 处理代码块 Copy 按钮
+    const copyBtn = targetEl?.closest('.copy-button') as HTMLElement | null;
+    if (copyBtn?.dataset.copy) {
+      const text = decodeURIComponent(copyBtn.dataset.copy);
+      const prev = copyBtn.textContent;
       const mark = (ok: boolean) => {
-        t.textContent = ok ? 'Copied' : 'Failed';
+        copyBtn.textContent = ok ? 'Copied' : 'Failed';
         setTimeout(() => {
-          t.textContent = prev;
+          copyBtn.textContent = prev;
         }, 1200);
       };
       void (async () => {
@@ -527,98 +624,84 @@ export function Markdown({
     }
   }
 
-  const [badgeMenu, setBadgeMenu] = useState<{
+  const [fileBadgeMenu, setFileBadgeMenu] = useState<{
     x: number;
     y: number;
-    type: 'file' | 'link';
-    url?: string;
-    text: string;
-    filePath?: string;
-    fileName?: string;
+    filePath: string;
+    relPath: string;
+    fileName: string;
+    isDir: boolean;
+    isSystemApp?: boolean;
     startLine?: number;
     endLine?: number;
   } | null>(null);
 
   useEffect(() => {
-    if (!badgeMenu) return;
-    const close = () => setBadgeMenu(null);
+    if (!fileBadgeMenu) return;
+    const close = () => setFileBadgeMenu(null);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setBadgeMenu(null);
+      if (e.key === 'Escape') setFileBadgeMenu(null);
     };
     window.addEventListener('click', close);
     window.addEventListener('contextmenu', close);
     window.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    window.addEventListener('jeikcode:zoom_change', close);
     return () => {
       window.removeEventListener('click', close);
       window.removeEventListener('contextmenu', close);
       window.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('jeikcode:zoom_change', close);
     };
-  }, [badgeMenu]);
+  }, [fileBadgeMenu]);
 
   function onContextMenu(e: MouseEvent) {
     const targetEl = e.target as HTMLElement;
+    // 无论是文件/目录胶囊、文件链接、还是 Markdown 文本中的相对/绝对路径，均完整支持右键上下文菜单
     const clickable = targetEl?.closest('a[href], .file-path-badge, .file-preview-link, code') as HTMLElement | null;
     if (clickable) {
       let href = clickable.getAttribute('href') || clickable.dataset.filePath || '';
-      const text = (clickable.textContent || '').trim();
       if (!href && clickable.tagName?.toLowerCase() === 'code') {
-        if (isWebUrlSnippet(text)) {
-          href = text;
-        } else if (isFilePathSnippet(text)) {
+        const text = (clickable.textContent || '').trim();
+        if (isFilePathSnippet(text)) {
           href = text;
         }
       }
-
-      if (!href) return;
-
-      const menuWidth = 180;
-      const menuHeight = 160;
-      let x = e.clientX;
-      let y = e.clientY;
-      if (typeof window !== 'undefined') {
-        if (x + menuWidth > window.innerWidth) x = Math.max(10, window.innerWidth - menuWidth - 10);
-        if (y + menuHeight > window.innerHeight) y = Math.max(10, window.innerHeight - menuHeight - 10);
-      }
-
-      // (A) Web 链接
-      if (isWebUrlSnippet(href) || /^(https?:|\/\/)/i.test(href) || /^www\./i.test(href)) {
-        e.preventDefault();
-        e.stopPropagation();
-        let targetUrl = href.trim();
-        if (targetUrl.startsWith('//')) {
-          targetUrl = 'https:' + targetUrl;
-        } else if (!/^https?:\/\//i.test(targetUrl)) {
-          targetUrl = 'https://' + targetUrl;
-        }
-
-        setBadgeMenu({
-          x,
-          y,
-          type: 'link',
-          url: targetUrl,
-          text: text || targetUrl,
-        });
-        return;
-      }
-
-      // (B) 本地文件路径引用
-      if (!href.startsWith('#') && !/^(https?:|mailto:|\/\/)/i.test(href)) {
+      if (href && !href.startsWith('#') && !/^(https?:|\/\/)/i.test(href)) {
         e.preventDefault();
         e.stopPropagation();
         const { filePath: cleanHref, startLine, endLine } = parseFilePathAndLines(href);
         const resolved = resolveTargetFile(cleanHref, basePath, cwd);
         const fileName = resolved.split(/[\\/]/).pop() || resolved;
-        setBadgeMenu({
-          x,
-          y,
-          type: 'file',
+        const isDir = isLikelyDirPath(cleanHref);
+        const isSystemApp = !isDir && isSystemDefaultAppFile(cleanHref);
+        const relPath = toRelativePath(resolved, cwd);
+
+        // 缩放比例感知与视口边界保护，杜绝缩放或高 DPR 下右键菜单位置漂移
+        const zoom = getPageZoom() || 1.0;
+        const pos = computeFileContextMenuPosition(
+          e.clientX,
+          e.clientY,
+          zoom,
+          isDir,
+          window.innerWidth || 1024,
+          window.innerHeight || 768,
+        );
+
+        setFileBadgeMenu({
+          x: pos.x,
+          y: pos.y,
           filePath: resolved,
+          relPath,
           fileName,
-          text: text || fileName,
+          isDir,
+          isSystemApp,
           startLine,
           endLine,
         });
-        return;
       }
     }
   }
@@ -631,75 +714,105 @@ export function Markdown({
         onClick={onClick}
         onContextMenu={onContextMenu}
         onKeyDown={onKeyDown}
-        dangerouslySetInnerHTML={{ __html: renderedHtml }}
       />
-      {badgeMenu && typeof document !== 'undefined' && createPortal(
+      {fileBadgeMenu && typeof document !== 'undefined' && createPortal(
         <div
           class="file-context-menu"
-          style={{ top: `${badgeMenu.y}px`, left: `${badgeMenu.x}px` }}
+          style={{ top: `${fileBadgeMenu.y}px`, left: `${fileBadgeMenu.x}px` }}
           onClick={(e) => e.stopPropagation()}
         >
-          {badgeMenu.type === 'link' ? (
+          {fileBadgeMenu.isDir ? (
             <>
               <button
                 type="button"
                 class="context-menu-btn"
                 onClick={() => {
-                  if (badgeMenu.url) {
-                    try {
-                      window.open(badgeMenu.url, '_blank', 'noopener,noreferrer');
-                    } catch {}
-                  }
-                  setBadgeMenu(null);
+                  revealInFileExplorer(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('preview.revealDirSuccess', { path: fileBadgeMenu.fileName }), 'success');
+                    })
+                    .catch(() => {
+                      // 系统外壳调用失败时静默忽略
+                    });
+                  setFileBadgeMenu(null);
                 }}
               >
-                <span>🌐 {t('preview.openInBrowser')}</span>
+                <span>📁 {t('preview.openDirInExplorer')}</span>
+              </button>
+              <div class="context-menu-divider" />
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.relPath);
+                  showToast(t('explorer.copyRelativePath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyRelativePath')}</span>
               </button>
               <button
                 type="button"
                 class="context-menu-btn"
                 onClick={() => {
-                  if (badgeMenu.url) {
-                    void navigator.clipboard?.writeText(badgeMenu.url);
-                    showToast(t('copy.copied'), 'success');
-                  }
-                  setBadgeMenu(null);
+                  navigator.clipboard?.writeText(fileBadgeMenu.filePath);
+                  showToast(t('explorer.copyFullPath'), 'success');
+                  setFileBadgeMenu(null);
                 }}
               >
-                <span>🔗 {t('preview.copyLink')}</span>
-              </button>
-              <button
-                type="button"
-                class="context-menu-btn"
-                onClick={() => {
-                  if (badgeMenu.text) {
-                    void navigator.clipboard?.writeText(badgeMenu.text);
-                    showToast(t('copy.copied'), 'success');
-                  }
-                  setBadgeMenu(null);
-                }}
-              >
-                <span>📋 {t('preview.copyText')}</span>
+                <span>📋 {t('explorer.copyFullPath')}</span>
               </button>
             </>
-          ) : (
+          ) : fileBadgeMenu.isSystemApp ? (
             <>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  openFileWithOs(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('preview.openWithDefaultAppSuccess', { path: fileBadgeMenu.fileName }), 'success');
+                    })
+                    .catch(() => {
+                      // 系统外壳调用失败时静默忽略
+                    });
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>🚀 {t('preview.openWithDefaultApp')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  revealInFileExplorer(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('explorer.revealInOs'), 'success');
+                    })
+                    .catch(() => {
+                      // 系统外壳调用失败时静默忽略
+                    });
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📁 {t('preview.revealFileInExplorer')}</span>
+              </button>
               <button
                 type="button"
                 class="context-menu-btn"
                 onClick={() => {
                   window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
                     detail: {
-                      filePath: badgeMenu.filePath,
-                      fileName: badgeMenu.fileName,
-                      startLine: badgeMenu.startLine,
-                      endLine: badgeMenu.endLine,
+                      filePath: fileBadgeMenu.filePath,
+                      fileName: fileBadgeMenu.fileName,
+                      startLine: fileBadgeMenu.startLine,
+                      endLine: fileBadgeMenu.endLine,
                     }
                   }));
                   window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
                     detail: 'preview'
                   }));
-                  setBadgeMenu(null);
+                  setFileBadgeMenu(null);
                 }}
               >
                 <span>👁️ {t('preview.openInRight')}</span>
@@ -710,12 +823,74 @@ export function Markdown({
                 onClick={() => {
                   window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
                     detail: {
-                      path: badgeMenu.filePath,
-                      startLine: badgeMenu.startLine,
-                      endLine: badgeMenu.endLine,
+                      path: fileBadgeMenu.filePath,
+                      startLine: fileBadgeMenu.startLine,
+                      endLine: fileBadgeMenu.endLine,
                     }
                   }));
-                  setBadgeMenu(null);
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📑 {t('preview.openInMain')}</span>
+              </button>
+              <div class="context-menu-divider" />
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.relPath);
+                  showToast(t('explorer.copyRelativePath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyRelativePath')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.filePath);
+                  showToast(t('explorer.copyFullPath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyFullPath')}</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('jeikcode:preview:open_file', {
+                    detail: {
+                      filePath: fileBadgeMenu.filePath,
+                      fileName: fileBadgeMenu.fileName,
+                      startLine: fileBadgeMenu.startLine,
+                      endLine: fileBadgeMenu.endLine,
+                    }
+                  }));
+                  window.dispatchEvent(new CustomEvent('jeikcode:switch_right_tab', {
+                    detail: 'preview'
+                  }));
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>👁️ {t('preview.openInRight')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('jeikcode:open_file', {
+                    detail: {
+                      path: fileBadgeMenu.filePath,
+                      startLine: fileBadgeMenu.startLine,
+                      endLine: fileBadgeMenu.endLine,
+                    }
+                  }));
+                  setFileBadgeMenu(null);
                 }}
               >
                 <span>📑 {t('preview.openInMain')}</span>
@@ -724,27 +899,56 @@ export function Markdown({
                 type="button"
                 class="context-menu-btn"
                 onClick={() => {
-                  if (badgeMenu.filePath) {
-                    void navigator.clipboard?.writeText(badgeMenu.filePath);
-                    showToast(t('explorer.copyFullPath'), 'success');
-                  }
-                  setBadgeMenu(null);
+                  openFileWithOs(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('preview.openWithDefaultAppSuccess', { path: fileBadgeMenu.fileName }), 'success');
+                    })
+                    .catch(() => {
+                      // 系统外壳调用失败时静默忽略
+                    });
+                  setFileBadgeMenu(null);
                 }}
               >
-                <span>📋 {t('explorer.copyFullPath')}</span>
+                <span>🚀 {t('preview.openWithDefaultApp')}</span>
               </button>
               <button
                 type="button"
                 class="context-menu-btn"
                 onClick={() => {
-                  if (badgeMenu.text) {
-                    void navigator.clipboard?.writeText(badgeMenu.text);
-                    showToast(t('copy.copied'), 'success');
-                  }
-                  setBadgeMenu(null);
+                  revealInFileExplorer(fileBadgeMenu.filePath, cwd)
+                    .then(() => {
+                      showToast(t('explorer.revealInOs'), 'success');
+                    })
+                    .catch(() => {
+                      // 系统外壳调用失败时静默忽略
+                    });
+                  setFileBadgeMenu(null);
                 }}
               >
-                <span>📋 {t('preview.copyText')}</span>
+                <span>📁 {t('preview.revealFileInExplorer')}</span>
+              </button>
+              <div class="context-menu-divider" />
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.relPath);
+                  showToast(t('explorer.copyRelativePath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyRelativePath')}</span>
+              </button>
+              <button
+                type="button"
+                class="context-menu-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(fileBadgeMenu.filePath);
+                  showToast(t('explorer.copyFullPath'), 'success');
+                  setFileBadgeMenu(null);
+                }}
+              >
+                <span>📋 {t('explorer.copyFullPath')}</span>
               </button>
             </>
           )}

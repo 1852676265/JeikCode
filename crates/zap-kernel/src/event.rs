@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// the fuse pauses the turn and asks the driver "continue past the cap?").
 /// The driver answers `{"continue": bool}`; any non-object / missing / Null
 /// response degrades to `false` (stop). Distinct from `request_user_input`
-/// (model-initiated, in zap-capabilities).
+/// (model-initiated, in jeikcode-capabilities).
 pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
 
 pub type RequestId = u64;
@@ -87,6 +87,19 @@ pub enum AgentCommand {
         #[serde(default)]
         images: Vec<ImageContent>,
     },
+    /// Same execution path as [`SendMessage`], but the stored user message keeps
+    /// the caller-minted identity (`message_id`). ADDITIVE: drivers that do not
+    /// need cross-end identity keep sending `SendMessage` unchanged.
+    ///
+    /// `Conversation::push` only assigns an id when the message has none, so the
+    /// id supplied here survives into the snapshot, the display transcript and
+    /// the wire — that is the whole point of the contract.
+    SendMessageWithId {
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageContent>,
+        message_id: String,
+    },
     /// One real user prompt with host-owned synthetic context prepended to the
     /// SAME turn. The context is stored as `Message::synthetic_user`, then the
     /// real prompt is stored normally; one command therefore has one turn and one
@@ -126,6 +139,10 @@ pub enum AgentCommand {
     CancelSteer {
         #[serde(default)]
         text: Option<String>,
+        /// Stable client identity. When present it wins over `text`; text
+        /// fallback is kept for older clients that only send the message.
+        #[serde(default)]
+        message_id: Option<String>,
     },
     Shutdown,
 }
@@ -166,6 +183,11 @@ pub enum AgentEvent {
     UserMessage {
         message_id: String,
         turn_ordinal: u32,
+        /// Absolute index of the stored prompt in the conversation/snapshot array
+        /// (the client's `sourceIndex`). Replay clients use it to put a prompt that
+        /// was cut off by the history page fold back at its real position instead
+        /// of guessing from text. A hint: compaction may renumber later rows.
+        message_index: usize,
     },
     TextDelta(String),
     /// A STREAMING fragment of a tool call the model is still emitting — live display of
@@ -204,6 +226,16 @@ pub enum AgentEvent {
     ToolProgress {
         call_id: String,
         message: String,
+    },
+    /// This call's EXECUTION returned (its Phase ② future resolved) — emitted the
+    /// moment it happens, per call, so a driver can settle that row while a SLOW
+    /// sibling in the same concurrent batch is still running. Purely
+    /// observational: the AUTHORITATIVE [`AgentEvent::ToolResult`] (post
+    /// `after`-middleware chain + size cap, and the only carrier of the result
+    /// content) still follows in batch emission order. A driver may ignore it.
+    ToolFinished {
+        call_id: String,
+        is_error: bool,
     },
     ToolResult {
         result: ToolResult,

@@ -66,6 +66,7 @@ pub enum LiveViewEvent {
         count: usize,
         inputs: Vec<zap_kernel::event::SteeredInput>,
         client_input_ids: Vec<Option<String>>,
+        anchor_message_id: Option<String>,
     },
     CommandOutput(String),
     /// A driver successfully delivered the response for a previously published
@@ -221,6 +222,23 @@ impl HubState {
             Some(stashed) => &mut stashed.snapshot_error,
             None => &mut self.snapshot_error,
         }
+    }
+
+    fn exec_last_assistant_message_id(&self) -> Option<String> {
+        let replay = self
+            .stashed_execution
+            .as_ref()
+            .map(|stashed| &stashed.replay)
+            .unwrap_or(&self.replay);
+        replay
+            .iter()
+            .rev()
+            .find_map(|observation| match &observation.event {
+                LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                    zap_kernel::event::AgentEvent::AssistantMessage { message_id },
+                )) => Some(message_id.clone()),
+                _ => None,
+            })
     }
 
     fn execution_session_id(&self) -> Option<&str> {
@@ -642,10 +660,15 @@ impl LiveViewHub {
     /// user actually typed instead of the machine-generated caption overwriting it.
     pub async fn submit_confirmed_with_echo(
         &self,
-        runtime_input: UserInput,
+        mut runtime_input: UserInput,
         echo_input: UserInput,
         client_input_id: Option<String>,
     ) -> Result<SubmitReceipt, HubError> {
+        // 身份契约：客户端关联键即落盘消息 id。没有显式 id 时才采用它；
+        // 必须在 pending steer 登记之前设置，否则折叠路径会丢身份。
+        if runtime_input.id.is_none() {
+            runtime_input.id = client_input_id.clone();
+        }
         let (binding, handle) = self.bound_handle()?;
         let correlation_registered = if let Some(client_input_id) = client_input_id.clone() {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1337,18 +1360,21 @@ impl LiveViewHub {
             })
             .flatten();
         let mapped_steer = match &event {
-            CodingRuntimeEvent::Agent(AgentEvent::Steered { count, inputs }) => Some((
-                *count,
-                inputs.clone(),
-                correlate_web_steers_locked(&mut state, inputs),
-            )),
+            CodingRuntimeEvent::Agent(AgentEvent::Steered { count, inputs }) => {
+                let anchor = state.exec_last_assistant_message_id();
+                let client_ids = correlate_web_steers_locked(&mut state, inputs);
+                Some((*count, inputs.clone(), client_ids, anchor))
+            }
             _ => None,
         };
         let mut replay = state.exec_turn_active();
+        // 是否有「回合开始/结束或控制器变化」需要向所有实例广播权威运行态。
+        let mut runtime_edge = false;
         match &event {
             CodingRuntimeEvent::Agent(AgentEvent::TurnStarted) => {
                 state.set_exec_turn_active(true);
                 replay = true;
+                runtime_edge = true;
             }
             CodingRuntimeEvent::Request(request) => {
                 state.set_exec_turn_active(true);
@@ -1356,6 +1382,7 @@ impl LiveViewHub {
                     .exec_pending_mut()
                     .insert(request.id, request.kind.clone());
                 replay = true;
+                runtime_edge = true;
             }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { snapshot, .. }) => {
                 *state.exec_snapshot_mut() = Some(snapshot.clone());
@@ -1365,6 +1392,7 @@ impl LiveViewHub {
                 state.exec_steers_mut().clear();
                 state.set_exec_turn_active(false);
                 replay = false;
+                runtime_edge = true;
             }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
                 error, ..
@@ -1374,6 +1402,7 @@ impl LiveViewHub {
                 state.exec_steers_mut().clear();
                 state.set_exec_turn_active(false);
                 replay = false;
+                runtime_edge = true;
             }
             CodingRuntimeEvent::RuntimeStopped(_) => {
                 *state.exec_snapshot_error_mut() = Some("runtime stopped".into());
@@ -1381,6 +1410,22 @@ impl LiveViewHub {
                 state.exec_steers_mut().clear();
                 state.set_exec_turn_active(false);
                 replay = false;
+                runtime_edge = true;
+            }
+            CodingRuntimeEvent::LoopChanged(progress) => {
+                crate::note_loop_state(
+                    state.execution_session_id().unwrap_or(""),
+                    progress.active,
+                    progress.round,
+                    &progress.label,
+                );
+                runtime_edge = true;
+            }
+            CodingRuntimeEvent::GoalChanged(progress) => {
+                if let Some(sid) = state.execution_session_id() {
+                    crate::note_goal_state(sid, progress.active);
+                }
+                runtime_edge = true;
             }
             CodingRuntimeEvent::SessionChanged(changed) => {
                 let execution_sid = state.execution_session_id().map(str::to_string);
@@ -1430,14 +1475,28 @@ impl LiveViewHub {
             }
             _ => {}
         }
+        // 权威运行态推送：live 回合的开始/结束与 `/loop`·`/goal` 控制器变化都会
+        // 立即广播，WebUI 只需听事件，不再轮询 `/chat/active` 猜状态。
+        if runtime_edge {
+            if let Some(sid) = state.execution_session_id().map(str::to_string) {
+                let running = state.exec_turn_active() || crate::session_controller_running(&sid);
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: sid,
+                    running,
+                    terminal: None,
+                    status: None,
+                });
+            }
+        }
         self.publish_view_locked(&mut state, LiveViewEvent::Runtime(event), replay);
-        if let Some((count, inputs, client_input_ids)) = mapped_steer {
+        if let Some((count, inputs, client_input_ids, anchor_message_id)) = mapped_steer {
             self.publish_view_locked(
                 &mut state,
                 LiveViewEvent::Steered {
                     count,
                     inputs,
                     client_input_ids,
+                    anchor_message_id: anchor_message_id.clone(),
                 },
                 replay,
             );
@@ -1656,6 +1715,25 @@ impl LiveViewHub {
                     terminal: None,
                     status: None,
                 });
+                // 中途转向已并入本轮：广播到全局，让没在看该会话的客户端也把它
+                // 写进本地画布缓存（切过去 / 冷启动时用户气泡已在）。
+                if let LiveViewEvent::Steered {
+                    inputs,
+                    client_input_ids,
+                    anchor_message_id,
+                    ..
+                } = &event
+                {
+                    crate::publish_global(crate::GlobalWireEvent::SteerFolded {
+                        session_id: session_id.clone(),
+                        inputs: inputs
+                            .iter()
+                            .map(crate::SteerFoldedInputWire::from_kernel)
+                            .collect(),
+                        client_input_ids: client_input_ids.clone(),
+                        anchor_message_id: anchor_message_id.clone(),
+                    });
+                }
             }
             _ => {}
         }
@@ -1721,10 +1799,12 @@ fn session_view_from_live(
             count,
             inputs,
             client_input_ids,
+            anchor_message_id,
         } => Some(SessionViewEvent::Steered {
             count: *count,
             inputs: inputs.clone(),
             client_input_ids: client_input_ids.clone(),
+            anchor_message_id: anchor_message_id.clone(),
         }),
         LiveViewEvent::CommandOutput(text) => Some(SessionViewEvent::CommandOutput(text.clone())),
         LiveViewEvent::RequestResolved { request_id, kind } => {
@@ -1767,6 +1847,7 @@ mod tests {
     #[test]
     fn web_steer_correlation_uses_runtime_payload_and_returns_client_identity() {
         let runtime_input = UserInput {
+            id: None,
             text: "look\n\n[图片内容（由 vl 识别）]\na cat".into(),
             images: Vec::new(),
         };
@@ -1903,6 +1984,7 @@ mod tests {
         let hub = LiveViewHub::new();
         let error = hub
             .submit(UserInput {
+                id: None,
                 text: "hello".into(),
                 images: Vec::new(),
             })
@@ -2251,6 +2333,7 @@ mod tests {
         assert_eq!(hub.cancel().unwrap_err(), HubError::NoActiveTurn);
 
         hub.submit(UserInput {
+            id: None,
             text: "hello".into(),
             images: Vec::new(),
         })
@@ -2308,6 +2391,7 @@ mod tests {
         )
         .unwrap();
         hub.submit(UserInput {
+            id: None,
             text: "running".into(),
             images: Vec::new(),
         })
@@ -2389,6 +2473,7 @@ mod tests {
         hub.unbind(&second).unwrap();
         assert_eq!(
             hub.submit(UserInput {
+                id: None,
                 text: "orphan".into(),
                 images: Vec::new(),
             })

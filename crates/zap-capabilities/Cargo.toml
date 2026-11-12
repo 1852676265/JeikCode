@@ -17,13 +17,18 @@ zstd = "0.13"
 tar = "0.4"
 
 [dependencies]
-# L0 only.
+# L0 only. NEVER add jeikcode-core or any L2/L3 crate here (layering is compile-enforced).
 zap-kernel = { path = "../zap-kernel" }
 zap-auth = { path = "../zap-auth", optional = true }
-# Leaf config crate.
+# Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
+# the config crate is explicitly designed so every stack layer can read config without an
+# jeikcode-core dep. Optional + behind the `notify` feature so a provider-only / lean
+# embedder that never wants desktop notifications does not drag config→telemetry (and its
+# reqwest/rustls/flate2 stack) into the build — same optionality discipline as reqwest above.
 zap-config = { path = "../zap-config", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+flate2 = "1"
 futures = "0.3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
@@ -142,7 +147,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:bytes", "dep:async-stream", "dep:httpdate", "dep:zap-auth", "dep:zap-config", "dep:getrandom", "dep:fs2", "dep:hyper"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:zap-config", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:zap-config", "dep:fs2", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
@@ -173,8 +178,11 @@ notify = ["dep:zap-config"]
 # Pulls the config leaf (i18n + Config) + the light serde/anyhow/sha2/chrono/thiserror/fs2
 # stack. Opt-in (NOT default) — only CLI/TUI hosts that run `jeikcode setup` enable it.
 setup = ["dep:zap-config", "dep:anyhow", "dep:sha2", "dep:chrono", "chrono/serde", "dep:fs2", "dep:thiserror", "dep:sysinfo", "dep:zstd", "dep:tar"]
-# Skills: markdown/frontmatter skill loader + use_skill / list_skills tools. No new deps.
+# Skills: */SKILL.md loader + use_skill tool. No new deps beyond the config leaf.
 skills = ["dep:zap-config"]
+# User-invoked slash commands: commands/*.md loader + $ARGUMENTS/$N/shell renderer.
+# Separate from `skills`: a SKILL.md body is never expanded.
+commands = ["dep:zap-config"]
 # CC-compatible external hooks: run the user's hooks.json commands on the kernel
 # seams (LifecycleHooks + ToolMiddleware). Spawns subprocesses, so it pulls the
 # process/io tokio features; `dirs` resolves $JEIKCODE_HOME. Opt-in (NOT default).
@@ -199,7 +207,7 @@ mcp = [
 # coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
-session = ["dep:chrono", "dep:fs2", "dep:zap-config"]
+session = ["dep:chrono", "dep:fs2", "dep:uuid", "dep:zap-config"]
 # User-driven persistent memory: the production memory.md store (global
 # $JEIKCODE_HOME/memory.md + per-project <root>/.jeikcode/memory.md, same files so
 # old/new coexist) + a MemoryHook that injects the merged entries at session_start.
@@ -212,13 +220,14 @@ memory = []
 offline = ["dep:zap-config"]
 # The plugin subsystem (loader / installer / marketplace / manifest / trust store),
 # ported from core::plugin as a v2 migration target. Synchronous (shells out to `git`
-# via std::process — no async runtime). Opt-in (NOT default). Enables `skills` so the
-# loader can build a SkillRegistry, plus the auth/config leaves and fs/home helpers.
+# via std::process — no async runtime). Opt-in (NOT default). Enables `skills` and
+# `commands` so the loader can build both registries, plus the auth/config leaves
+# and fs/home helpers.
 plugin = [
     "dep:anyhow", "dep:sha2", "dep:url", "dep:toml",
     "dep:chrono",
     "dep:zap-auth", "dep:zap-config",
-    "skills",
+    "skills", "commands",
 ]
 
 [target.'cfg(unix)'.dependencies]

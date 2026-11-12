@@ -4,8 +4,8 @@
 
 ## 1. Configuration File Paths
 
-- **Workspace Project-Level**: `<workspace>/.zap/thesaurus/*.txt` (Loaded with highest precedence)
-- **User Global-Level**: `~/.zap/thesaurus/*.txt`
+- **Workspace Project-Level**: `<workspace>/.jeikcode/thesaurus/*.txt` (Loaded with highest precedence)
+- **User Global-Level**: `~/.jeikcode/thesaurus/*.txt`
 
 ---
 
@@ -23,7 +23,7 @@ Chinese_word1, Chinese_word2 = en_word1, en_word2
 - Supports 1:1, 1:N, and N:M term mappings.
 
 ### Configuration Example
-Create `.zap/thesaurus/biz.txt`:
+Create `.jeikcode/thesaurus/biz.txt`:
 ```text
 风控, 反欺诈, 黑名单 = risk_control, anti_fraud, blacklist
 积分商城, 积分兑换 = points_mall, point_exchange

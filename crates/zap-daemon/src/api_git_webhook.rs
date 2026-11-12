@@ -6,7 +6,6 @@
 //! - `POST /api/git/binding`
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
@@ -20,9 +19,7 @@ use crate::git_adapter::{
     find_binding_by_repo, get_binding_by_project, get_platform_adapter, save_binding,
     GitAdapterConfig, GitEventKind, GitPlatformAdapter, NormalizedGitEvent,
 };
-use crate::{
-    fanout_chat_events_for_session, process_chat_request, AppState, ChatEvent, ChatRequest,
-};
+use crate::{process_chat_request, AppState, ChatEvent, ChatRequest};
 use zap_telemetry::{CurrentContext, SessionMode};
 
 #[derive(Debug, Deserialize)]
@@ -36,7 +33,8 @@ pub async fn get_git_binding_api(Query(q): Query<BindingQuery>) -> impl IntoResp
         return (StatusCode::BAD_REQUEST, "Missing project_hash").into_response();
     };
 
-    if let Some(config) = get_binding_by_project(&hash) {
+    if let Some(mut config) = get_binding_by_project(&hash) {
+        config.sanitize_security_constraints();
         Json(config).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
@@ -44,10 +42,11 @@ pub async fn get_git_binding_api(Query(q): Query<BindingQuery>) -> impl IntoResp
 }
 
 /// POST /api/git/binding
-pub async fn save_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl IntoResponse {
+pub async fn save_git_binding_api(Json(mut config): Json<GitAdapterConfig>) -> impl IntoResponse {
     if config.project_hash.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing project_hash in payload").into_response();
     }
+    config.sanitize_security_constraints();
     save_binding(config);
     Json(serde_json::json!({ "success": true })).into_response()
 }
@@ -60,64 +59,9 @@ pub async fn test_git_binding_api(Json(mut config): Json<GitAdapterConfig>) -> i
         Some(config.custom_api_base.as_str())
     };
 
-    // 如果配置了 GitHub App 认证凭据，由纯 Rust 原生在内存中自动签发或轮换最新的官方 [bot] 令牌！
-    if config.channel == "github" {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let token_still_valid = config
-            .token_expires_at
-            .is_some_and(|exp| now + 300 < exp && !config.access_token.trim().is_empty());
-
-        if !token_still_valid {
-            if let Some(app_id_str) = config.github_app_id.as_deref() {
-                if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
-                    let pem_res = if let Some(content) = config
-                        .github_app_private_key
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        Some(content.to_string())
-                    } else if let Some(path) = config
-                        .github_app_private_key_path
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        std::fs::read_to_string(path.trim()).ok()
-                    } else {
-                        None
-                    };
-
-                    if let Some(pem) = pem_res {
-                        if let Ok((fresh_token, _)) =
-                            crate::git_adapter::github_app::fetch_installation_token(
-                                app_id,
-                                &pem,
-                                &config.repo_identifier,
-                            )
-                            .await
-                        {
-                            config.access_token = fresh_token.clone();
-                            config.token_expires_at = Some(now + 3300);
-                            // 顺带同步持久化，确保后续请求直接复用有效令牌
-                            if let Some(mut existing) =
-                                crate::git_adapter::get_binding_by_project(&config.project_hash)
-                            {
-                                existing.access_token = fresh_token;
-                                existing.token_expires_at = Some(now + 3300);
-                                existing.github_app_id = Some(app_id.to_string());
-                                if let Some(p) = &config.github_app_private_key_path {
-                                    existing.github_app_private_key_path = Some(p.clone());
-                                }
-                                crate::git_adapter::save_binding(existing);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 如果配置了 GitHub App 认证凭据，由纯 Rust 原生自动签发或轮换最新的官方 [bot] 令牌！
+    let fresh_token = crate::git_adapter::ensure_fresh_github_app_token(&config).await;
+    config.access_token = fresh_token;
 
     let adapter = get_platform_adapter(&config.channel);
     match adapter
@@ -254,8 +198,20 @@ pub async fn generate_app_token_api(Json(req): Json<GenerateAppTokenRequest>) ->
 }
 
 /// GET /api/webhooks/git & GET /api/webhooks/github
-/// 当用户或浏览器直接以 GET 方式访问该链接时，返回友好的就绪状态提示（替代冰冷的 HTTP 405 Method Not Allowed）
+/// 当用户或浏览器直接以 GET 方式访问该链接时：若未开启自动化审查则阻断探测返回 404；若已开启则返回友好的就绪状态提示
 pub async fn get_git_webhook_info_api() -> impl IntoResponse {
+    if !crate::git_adapter::is_any_git_automation_active() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "Not Found",
+        )
+            .into_response();
+    }
+
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -279,6 +235,11 @@ pub async fn handle_git_webhook_api(
     headers: HeaderMap,
     body_bytes: Bytes,
 ) -> impl IntoResponse {
+    // 0. 全局阻断门禁：若当前未启用任何 Git 自动化审查，直接阻断外部一切探测与 Hook 请求，返回 404 Not Found
+    if !crate::git_adapter::is_any_git_automation_active() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
     let Ok(payload) = serde_json::from_slice::<Value>(&body_bytes) else {
         return (StatusCode::BAD_REQUEST, "Invalid JSON payload").into_response();
     };
@@ -290,7 +251,7 @@ pub async fn handle_git_webhook_api(
         .trim();
 
     if repo_full_name.is_empty() {
-        // ping 事件可能没有具体 repo
+        // ping 事件：若没有具体 repo 且全局有启用的 App，响应 Pong，否则阻断
         if headers.get("x-github-event").and_then(|v| v.to_str().ok()) == Some("ping") {
             return (StatusCode::OK, "Pong").into_response();
         }
@@ -299,15 +260,31 @@ pub async fn handle_git_webhook_api(
 
     // 2. 匹配该项目绑定配置
     let Some(binding_config) = find_binding_by_repo(repo_full_name) else {
-        // 未绑定该仓库，安全忽略
-        return (StatusCode::OK, "Repository not bound to any local project").into_response();
+        // 未绑定该仓库，直接阻断并返回 404，不泄漏内部状态
+        return (
+            StatusCode::NOT_FOUND,
+            "Repository not found or automation disabled",
+        )
+            .into_response();
     };
 
-    // 检查项目是否启用了自动化联动（默认关闭）
+    // 检查项目是否启用了自动化联动（默认关闭），关闭时必须直接阻断返回 403 Forbidden
     if !binding_config.enabled {
         return (
-            StatusCode::OK,
+            StatusCode::FORBIDDEN,
             "Git automation is disabled for this project",
+        )
+            .into_response();
+    }
+
+    // 安全铁律：强制永久禁用 PAT 模式，仅允许 GitHub App 模式运行自动化审查
+    if !binding_config.is_github_app_mode() {
+        tracing::warn!(
+            "[git_webhook] Rejecting webhook for `{repo_full_name}`: PAT mode is permanently disabled."
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "PAT mode is permanently disabled. Only GitHub App mode is supported.",
         )
             .into_response();
     }
@@ -339,17 +316,61 @@ pub async fn handle_git_webhook_api(
             )
                 .into_response();
         }
-        // 若开启，检查唤醒词
+        // 若开启，检查唤醒词（支持全角/半角逗号及竖线分隔的多唤醒词，任一匹配即可触发）
         let body = event.body_text.as_deref().unwrap_or("");
-        let keyword = binding_config.trigger_keyword.trim();
-        if !keyword.is_empty() && !body.contains(keyword) {
+        if !crate::git_adapter::comment_matches_trigger_keywords(
+            body,
+            &binding_config.trigger_keyword,
+        ) {
             return (StatusCode::OK, "Comment does not contain trigger keyword").into_response();
         }
     }
 
-    // 8. 过滤新 PR 自动审查开关
-    if event.event_kind == GitEventKind::PullRequestOpened && !binding_config.auto_review_new_pr {
-        return (StatusCode::OK, "Auto review on new PR is disabled").into_response();
+    // 8. 过滤 Pull Request 事件（检查开关、有效动作与 SHA 去重）
+    if event.is_pull_request && event.event_kind != GitEventKind::IssueCommentCreated {
+        if !binding_config.events.pull_request {
+            return (
+                StatusCode::OK,
+                "Pull request review is disabled by project config",
+            )
+                .into_response();
+        }
+
+        match &event.event_kind {
+            GitEventKind::PullRequestOpened => {
+                if !binding_config.auto_review_new_pr {
+                    return (StatusCode::OK, "Auto review on new PR is disabled").into_response();
+                }
+            }
+            GitEventKind::PullRequestSynchronize => {
+                // 代码提交更新，继续执行增量审查
+            }
+            _ => {
+                // 过滤非代码改动事件（如 pr_labeled, pr_assigned, pr_edited, pr_review_requested 等）
+                return (StatusCode::OK, "Non-code PR event ignored").into_response();
+            }
+        }
+
+        // 统一对齐 Head SHA 去重逻辑，根除重复审查
+        if let (Some(pr_number), Some(ref head_sha)) =
+            (event.issue_or_pr_number, event.head_sha.as_deref())
+        {
+            if !crate::git_adapter::polling::check_and_update_pr_sha(
+                &event.repo_full_name,
+                pr_number,
+                head_sha,
+            ) {
+                tracing::info!(
+                    "[git_webhook] PR #{pr_number} in `{}` already reviewed at SHA {head_sha}. Skipping duplicate review.",
+                    event.repo_full_name
+                );
+                return (
+                    StatusCode::OK,
+                    "PR commit SHA already reviewed (deduplicated)",
+                )
+                    .into_response();
+            }
+        }
     }
 
     // 9. 立即向远端返回 HTTP 202 Accepted，避免 GitHub 超时重发
@@ -367,7 +388,7 @@ pub async fn handle_git_webhook_api(
 }
 
 /// 核心工作流：动态组装提示词、唤醒独立 Session 并执行回写
-async fn execute_git_workflow(
+pub(crate) async fn execute_git_workflow(
     state: AppState,
     adapter: Arc<dyn GitPlatformAdapter>,
     config: GitAdapterConfig,
@@ -379,58 +400,8 @@ async fn execute_git_workflow(
     };
 
     let repo = &event.repo_full_name;
-    let mut token = config.access_token.trim().to_string();
-
-    // 如果是 GitHub 渠道，并且配置了 GitHub App 凭据，由纯 Rust 原生在内存中自动确保令牌为最新鲜有效状态！
-    if config.channel == "github" {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let token_still_valid = config
-            .token_expires_at
-            .is_some_and(|exp| now + 300 < exp && !token.trim().is_empty());
-
-        if !token_still_valid {
-            if let Some(app_id_str) = config.github_app_id.as_deref() {
-                if let Ok(app_id) = app_id_str.trim().parse::<u64>() {
-                    let pem_res = if let Some(content) = config
-                        .github_app_private_key
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        Some(content.to_string())
-                    } else if let Some(path) = config
-                        .github_app_private_key_path
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                    {
-                        std::fs::read_to_string(path.trim()).ok()
-                    } else {
-                        None
-                    };
-
-                    if let Some(pem) = pem_res {
-                        if let Ok((fresh_token, _)) =
-                            crate::git_adapter::github_app::fetch_installation_token(
-                                app_id, &pem, repo,
-                            )
-                            .await
-                        {
-                            token = fresh_token.clone();
-                            if let Some(mut existing) =
-                                crate::git_adapter::get_binding_by_project(&config.project_hash)
-                            {
-                                existing.access_token = fresh_token;
-                                existing.token_expires_at = Some(now + 3300);
-                                crate::git_adapter::save_binding(existing);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 如果是 GitHub 渠道且配置了 GitHub App 凭据，由纯 Rust 原生自动确保令牌为最新鲜有效状态！
+    let token = crate::git_adapter::ensure_fresh_github_app_token(&config).await;
 
     let session_id = format!("git_pr_{}_{}", config.project_hash, pr_or_issue_number);
     let pr_url = event.resolve_html_url();
@@ -531,30 +502,15 @@ async fn execute_git_workflow(
         return Ok(());
     }
 
-    // 3. 若未在运行，若配置了有效 Token，先发出即时看板进度卡（方案 C：无尾注，带 🌟，工整紧凑）
+    // 3. 若未在运行，若配置了有效 Token，先发出即时看板进度卡（全语种统一英文占位，简洁紧凑）
+    //    注意：正文必须保留 "JeikCode" 关键字，供 git_adapter 的 find_bot_primary_comment 定位并原地更新。
     if !token.is_empty() {
-        let ack_message = if is_zh {
-            format!(
-                "### 🌟 JeikCode Code Review\n\
-                - **状态 (Status)**: ⏳ 正在审查 / In Progress\n\
-                - **目标 (Target)**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
-                > *(审查完成后，完整报告将在此直接更新呈现)*"
-            )
-        } else if is_vi {
-            format!(
-                "### 🌟 JeikCode Code Review\n\
-                - **Trạng thái (Status)**: ⏳ Đang tiến hành đánh giá / In Progress\n\
-                - **Mục tiêu (Target)**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
-                > *(Sau khi hoàn thành đánh giá, báo cáo đầy đủ sẽ được cập nhật trực tiếp tại đây)*"
-            )
-        } else {
-            format!(
-                "### 🌟 JeikCode Code Review\n\
-                - **Status**: ⏳ In Progress\n\
-                - **Target**: [{kind_label} #{pr_or_issue_number}]({pr_url})\n\n\
-                > *(The complete review report will be updated here shortly)*"
-            )
-        };
+        let ack_message = format!(
+            "### 🌟 JeikCode Code Review\n\n\
+            ⏳ Reviewing, please hold on…\n\
+            📄 The full report will be published right here once ready\n\n\
+            > Target: [{kind_label} #{pr_or_issue_number}]({pr_url})"
+        );
         let _ = adapter
             .post_comment(
                 &token,
@@ -600,13 +556,16 @@ async fn execute_git_workflow(
         )),
     };
 
-    // 6. 调用活跃会话准入
-    let admission = match state
-        .active_chats
-        .admit(Some(&session_id), chat_req.request_id.as_deref())
-        .await
+    // 6. Shared admission: same identity, input-log and display rows as /chat.
+    let admitted = match crate::admit_chat_turn(
+        &state,
+        chat_req,
+        crate::ChatAdmissionMode::RejectIfBusy,
+        None,
+    )
+    .await
     {
-        Ok(adm) => adm,
+        Ok(admitted) => admitted,
         Err(e) => {
             tracing::warn!(
                 "[git_webhook] Could not admit chat turn for session `{session_id}`: {e:?}"
@@ -617,31 +576,20 @@ async fn execute_git_workflow(
             return Ok(());
         }
     };
-
-    let (client_tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
-    let operation_id = admission.operation_id.clone();
-    let cancel_token = admission.cancellation;
-    let event_bus = state
-        .active_chats
-        .event_bus(&admission.operation_id)
-        .await
-        .ok_or_else(|| "Failed to acquire event bus for admitted operation".to_string())?;
-    let replay = state
-        .active_chats
-        .event_bus_with_replay(&admission.operation_id)
-        .await
-        .map(|(_, r)| r);
-    let fan_tx = fanout_chat_events_for_session(
-        client_tx.clone(),
-        event_bus,
-        replay,
-        Some(session_id.clone()),
-        Some(working_dir.clone()),
-    );
+    let crate::AdmittedChatTurn {
+        request: chat_req,
+        operation_id,
+        session_id: admitted_session_id,
+        cancellation: cancel_token,
+        rx: mut rx,
+        fan_tx,
+        terminal_sent,
+        ..
+    } = admitted;
+    let _ = admitted_session_id;
 
     let cleanup_chats = state.active_chats.clone();
     let cleanup_op = operation_id.clone();
-    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let terminal_sent_inner = terminal_sent.clone();
     let mcp_pool = state.mcp_pool.clone();
     let telemetry = state.telemetry.clone();
@@ -673,6 +621,9 @@ async fn execute_git_workflow(
                 false, // interactive_user_input
                 terminal_sent_inner,
                 true, // keep_raw_markdown
+                // Webhook-driven automation is API-owned: forced Auto, never the
+                // interactive global mode switch.
+                Some(crate::approval_mode::ApprovalMode::Auto),
             )
             .await
         })
@@ -698,7 +649,7 @@ async fn execute_git_workflow(
                 }
                 break;
             }
-            ChatEvent::Error { message } => {
+            ChatEvent::Error { message, .. } => {
                 tracing::warn!("[git_webhook] Review turn returned error: {message}");
                 if collected_review.trim().is_empty() {
                     collected_review = format!("Review encountered an error: {message}");
@@ -726,6 +677,7 @@ async fn execute_git_workflow(
                         custom_api_base,
                         repo,
                         existing_id,
+                        Some(pr_or_issue_number),
                         &final_review_output,
                     )
                     .await;

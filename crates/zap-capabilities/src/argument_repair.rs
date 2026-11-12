@@ -302,11 +302,26 @@ fn repair_and_route_shell_args(tool_name: &str, args: &str) -> String {
         }
     }
 
-    // 2. 引号平衡自愈：自动修复如 python -c "... 尾部缺失闭合引号，阻断 Bash unexpected EOF
+    // 2. 引号平衡与跨语言内联脚本转义自愈：
+    //    a) 自动自愈内联解释器脚本（Python, Node/Vue, C/C++, Java, C#, Rust, Go 等）单引号内的非合规 \' 转义为标准 '\''
+    //    b) 自动自愈双引号内的孤立反引号（`），阻断 Bash 命令替换 EOF 错误
+    //    c) 自动修复尾部缺失的闭合引号，阻断 Bash unexpected EOF
     if let Some(command) = object.get("command").and_then(serde_json::Value::as_str) {
-        if let Some(healed_cmd) = heal_unclosed_quotes(command) {
-            object.insert("command".into(), serde_json::Value::String(healed_cmd));
+        let mut cur = command.to_string();
+        if let Some(healed_cmd) = crate::process_utils::heal_inline_script_single_quotes(&cur) {
+            cur = healed_cmd;
             changed = true;
+        }
+        if let Some(healed_cmd) = heal_inline_script_backticks(&cur) {
+            cur = healed_cmd;
+            changed = true;
+        }
+        if let Some(healed_cmd) = heal_unclosed_quotes(&cur) {
+            cur = healed_cmd;
+            changed = true;
+        }
+        if changed {
+            object.insert("command".into(), serde_json::Value::String(cur));
         }
     }
 
@@ -400,6 +415,11 @@ fn heal_unclosed_quotes(cmd: &str) -> Option<String> {
         return Some(fixed);
     }
     None
+}
+
+/// 自动转义双引号内包含的孤立反引号（`），阻断 Bash 命令替换引发的 `unexpected EOF while looking for matching ``'`
+fn heal_inline_script_backticks(cmd: &str) -> Option<String> {
+    crate::process_utils::escape_unquoted_backticks_in_inline_script(cmd)
 }
 
 fn looks_unmistakably_powershell(command: &str) -> bool {
@@ -631,7 +651,7 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
     // drive-label + newline like `print('C:\ndone')` became literal `\n`).
     // `file_path`/`path` are the file-targeting keys where a lone-backslash drive
     // path is genuinely ambiguous and worth disambiguating.
-    const PATH_KEYS: &[&str] = &["file_path", "path"];
+    const PATH_KEYS: &[&str] = &["path", "file_path", "target_file", "filePath", "filename"];
 
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
@@ -1551,21 +1571,27 @@ fn extract_simple_string_field(raw: &str, key: &str) -> Option<String> {
 /// Models often generate old_string/new_string with unescaped quotes/newlines.
 /// This parser uses the known field order to extract content by position.
 pub fn extract_edit_file_args(raw: &str) -> Option<serde_json::Value> {
-    let file_path = extract_simple_string_field(raw, "file_path")
-        .or_else(|| extract_simple_string_field(raw, "path"))?;
+    // Preserve whichever path field the model used; Args accepts every alias.
+    let (path_key, file_path) = ["path", "file_path", "target_file", "filePath", "filename"]
+        .iter()
+        .find_map(|key| {
+            extract_simple_string_field(raw, key).map(|value| ((*key).to_string(), value))
+        })?;
     let hunks = extract_edit_hunks_from_text(raw);
     if hunks.is_empty() {
         // Truncated or missing hunks: never salvage a cut-off new_string.
         return None;
     }
-    let first = &hunks[0];
-    Some(serde_json::json!({
-        "file_path": file_path,
-        "edits": hunks,
-        "old_string": first["old_string"],
-        "new_string": first["new_string"],
-        "replace_all": first["replace_all"],
-    }))
+    let first_old = hunks[0]["old_string"].clone();
+    let first_new = hunks[0]["new_string"].clone();
+    let first_replace = hunks[0]["replace_all"].clone();
+    let mut out = serde_json::Map::new();
+    out.insert(path_key, serde_json::Value::String(file_path));
+    out.insert("edits".into(), serde_json::Value::Array(hunks));
+    out.insert("old_string".into(), first_old);
+    out.insert("new_string".into(), first_new);
+    out.insert("replace_all".into(), first_replace);
+    Some(serde_json::Value::Object(out))
 }
 
 /// Absorb common model/provider shape mistakes for `edit_file` without changing
@@ -1835,14 +1861,9 @@ pub(crate) fn normalize_edit_file_args(args: &str) -> String {
         return args.to_string();
     }
 
-    if !obj.contains_key("file_path") {
-        for alias in ["path", "target_file", "filePath", "filename"] {
-            if let Some(v) = obj.remove(alias) {
-                obj.insert("file_path".into(), v);
-                break;
-            }
-        }
-    }
+    // Path aliases are accepted by the tool's serde Args. Do NOT rewrite the
+    // incoming parameter name here: rewriting would retrain models to call
+    // `file_path` even though the public schema exposes `path`.
 
     let mut hunks: Vec<serde_json::Value> = Vec::new();
     if let Some(edits) = obj.get("edits").cloned() {
@@ -1877,7 +1898,9 @@ pub(crate) fn normalize_edit_file_args(args: &str) -> String {
 pub(crate) fn edit_file_coalesce_key(args: &str) -> Option<String> {
     let normalized = normalize_edit_file_args(args);
     let v: serde_json::Value = serde_json::from_str(&normalized).ok()?;
-    let path = v.get("file_path").and_then(|x| x.as_str())?;
+    let path = ["path", "file_path", "target_file", "filePath", "filename"]
+        .iter()
+        .find_map(|key| v.get(*key).and_then(|x| x.as_str()))?;
     let path = path.trim();
     if path.is_empty() {
         return None;
@@ -1893,16 +1916,20 @@ pub(crate) fn merge_edit_file_args(args_list: &[&str]) -> Option<String> {
     if args_list.len() < 2 {
         return None;
     }
-    let mut file_path = None::<String>;
+    let mut path_field = None::<(String, String)>;
     let mut hunks = Vec::new();
     for args in args_list {
         let normalized = normalize_edit_file_args(args);
         let v: serde_json::Value = serde_json::from_str(&normalized).ok()?;
         let obj = v.as_object()?;
-        if file_path.is_none() {
-            let p = obj.get("file_path").and_then(|x| x.as_str()).unwrap_or("");
-            if !p.is_empty() {
-                file_path = Some(p.to_string());
+        if path_field.is_none() {
+            for key in ["path", "file_path", "target_file", "filePath", "filename"] {
+                if let Some(p) = obj.get(key).and_then(|x| x.as_str()) {
+                    if !p.is_empty() {
+                        path_field = Some((key.to_string(), p.to_string()));
+                        break;
+                    }
+                }
             }
         }
         let before = hunks.len();
@@ -1914,14 +1941,11 @@ pub(crate) fn merge_edit_file_args(args_list: &[&str]) -> Option<String> {
             return None;
         }
     }
-    let file_path = file_path?;
-    Some(
-        serde_json::json!({
-            "file_path": file_path,
-            "edits": hunks,
-        })
-        .to_string(),
-    )
+    let (path_key, path_value) = path_field?;
+    let mut out = serde_json::Map::new();
+    out.insert(path_key, serde_json::Value::String(path_value));
+    out.insert("edits".into(), serde_json::Value::Array(hunks));
+    Some(serde_json::Value::Object(out).to_string())
 }
 
 fn canonicalize_edit_path_key(path: &str) -> String {
@@ -2846,6 +2870,60 @@ mod tests {
     }
 
     #[test]
+    fn shell_repair_heals_inline_script_backticks_preventing_bash_substitution_eof() {
+        // 双引号内部未转义的 Markdown 三反引号 ``` 阻断 Bash EOF
+        let raw = r#"{"command":"python -c \"content = '```'; print(len(content))\""}"#;
+        let out = repair_and_route_shell_args("run_command", raw);
+        let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            val["command"],
+            r#"python -c "content = '\`\`\`'; print(len(content))""#
+        );
+
+        // 已经转义过的反引号不重复转义 (JSON 中字面量反斜杠为 \\)
+        let already_escaped =
+            r#"{"command":"python -c \"content = '\\`\\`\\`'; print(len(content))\""}"#;
+        let out_escaped = repair_and_route_shell_args("run_command", already_escaped);
+        let val_escaped: serde_json::Value = serde_json::from_str(&out_escaped).unwrap();
+        assert_eq!(
+            val_escaped["command"],
+            r#"python -c "content = '\`\`\`'; print(len(content))""#
+        );
+    }
+
+    #[test]
+    fn shell_repair_heals_inline_script_single_quotes_cross_languages() {
+        let q = r#"'\''"#;
+
+        // Python 单引号错误转义被自动修复为 POSIX '\''
+        let raw_py = r#"{"command":"python -c 'import json; print(\\'hello\\')'"}"#;
+        let out_py = repair_and_route_shell_args("run_command", raw_py);
+        let val_py: serde_json::Value = serde_json::from_str(&out_py).unwrap();
+        assert_eq!(
+            val_py["command"],
+            format!("python -c 'import json; print({q}hello{q})'")
+        );
+
+        // Node.js / Vue 单引号错误转义被自动修复
+        let raw_node = r#"{"command":"node -e 'console.log(\\'vue-template\\')'"}"#;
+        let out_node = repair_and_route_shell_args("run_command", raw_node);
+        let val_node: serde_json::Value = serde_json::from_str(&out_node).unwrap();
+        assert_eq!(
+            val_node["command"],
+            format!("node -e 'console.log({q}vue-template{q})'")
+        );
+
+        // C / C++ 内联源码字符字面量自愈
+        let raw_c = r#"{"command":"gcc -x c - <<< 'int main() { char c = \\'z\\'; return 0; }'"}"#;
+        let out_c = repair_and_route_shell_args("run_command", raw_c);
+        let val_c: serde_json::Value = serde_json::from_str(&out_c).unwrap();
+        assert_eq!(
+            val_c["command"],
+            format!("gcc -x c - <<< 'int main() {{ char c = {q}z{q}; return 0; }}'")
+        );
+    }
+
+    #[test]
     fn repair_json_heals_chinese_quotes_and_fullwidth_punctuation() {
         let input = "{\u{201C}command\u{201D}\u{FF1A} \u{201C}git status\u{201D}\u{FF0C} \u{201C}shell\u{201D}\u{FF1A} \u{201C}default\u{201D}}";
         let out = repair_json(input);
@@ -3627,7 +3705,7 @@ mod hardening_tests {
         // Exact shape from a high-capability model: outer JSON is valid, `edits` is a
         // truncated stringified array, and the real hunk sits in `new_string` as an object.
         let args = serde_json::json!({
-            "file_path": "crates/zap-capabilities/src/tools/mod.rs",
+            "path": "crates/zap-capabilities/src/tools/mod.rs",
             "edits": r#"[{"old_string":"            \"todowrite\","#,
             "new_string": {
                 "old_string": "            \"todowrite\",",
@@ -3643,7 +3721,7 @@ mod hardening_tests {
     #[test]
     fn normalize_wraps_single_hunk_object_and_numeric_key_map() {
         let single = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": {"old_string": "foo", "new_string": "bar"}
         })
         .to_string();
@@ -3661,37 +3739,46 @@ mod hardening_tests {
         .to_string();
         let v: serde_json::Value =
             serde_json::from_str(&normalize_edit_file_args(&numbered)).unwrap();
-        assert_eq!(v["file_path"], "a.rs");
+        assert_eq!(v["path"], "a.rs");
         assert_eq!(v["edits"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn merge_edit_file_args_concatenates_single_hunk_calls() {
         let a = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": [{"old_string": "aaa", "new_string": "AAA"}]
         })
         .to_string();
         let b = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": [{"old_string": "bbb", "new_string": "BBB"}]
         })
         .to_string();
         let merged = merge_edit_file_args(&[a.as_str(), b.as_str()]).expect("merge");
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["path"], "a.rs");
         assert_eq!(v["edits"].as_array().unwrap().len(), 2);
         assert_eq!(v["edits"][0]["old_string"], "aaa");
         assert_eq!(v["edits"][1]["old_string"], "bbb");
     }
 
     #[test]
+    fn normalize_edit_file_args_preserves_legacy_file_path() {
+        let input = r#"{"file_path":"a.rs","edits":[{"old_string":"a","new_string":"b"}]}"#;
+        let v: serde_json::Value = serde_json::from_str(&normalize_edit_file_args(input)).unwrap();
+        assert_eq!(v["file_path"], "a.rs");
+        assert!(v.get("path").is_none());
+    }
+
+    #[test]
     fn merge_edit_file_args_aborts_when_one_call_has_no_hunk() {
         let a = serde_json::json!({
-            "file_path": "a.rs",
+            "path": "a.rs",
             "edits": [{"old_string": "aaa", "new_string": "AAA"}]
         })
         .to_string();
-        let bad = r#"{"file_path":"a.rs","edits":"[{\"old_string\":\"cut"}"#;
+        let bad = r#"{"path":"a.rs","edits":"[{\"old_string\":\"cut"}"#;
         assert!(merge_edit_file_args(&[a.as_str(), bad]).is_none());
     }
 }

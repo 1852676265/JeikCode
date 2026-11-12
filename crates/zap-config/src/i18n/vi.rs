@@ -62,7 +62,6 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
             "  Tệp chỉ dẫn:\n".into(),
         Msg::StatusInstructionScopeGlobal => "Người dùng toàn cục".into(),
         Msg::StatusInstructionScopeProject => "Dùng chung trong dự án".into(),
-        Msg::StatusInstructionScopeUser => "Ghi đè riêng của người dùng cho dự án".into(),
         Msg::StatusInstructionPresent { path, label, scope } =>
             format!("    ✓ {scope} ({label}): {path}\n").into(),
         Msg::StatusInstructionMissing { path, label, scope } =>
@@ -171,7 +170,7 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderDefaultSet { name } =>
             format!("Đã đặt mặc định thành {name}.").into(),
         Msg::ProviderAdded { name } =>
-            format!("Đã thêm tài khoản \"{name}\" và mở danh sách mô hình; nhấn Ctrl+A để thêm mô hình.").into(),
+            format!("Đã thêm nhà cung cấp \"{name}\" và mở danh sách mô hình; nhấn Ctrl+A để thêm mô hình.").into(),
         Msg::ProviderUpdated { name } =>
             format!("Đã cập nhật \"{name}\".").into(),
         Msg::ProviderStepName => "Tên nhà cung cấp?".into(),
@@ -222,8 +221,8 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelTabAccounts => "Tài khoản".into(),
         Msg::ProviderPanelTabModels => "Mô hình".into(),
         Msg::ProviderPanelEmptyAccounts =>
-            "(Chưa có tài khoản nhà cung cấp — nhấn Ctrl+A để thêm)".into(),
-        Msg::ProviderPanelNoMatchingAccounts => "(Không có tài khoản nhà cung cấp phù hợp)".into(),
+            "(Chưa có nhà cung cấp — nhấn Ctrl+A để thêm)".into(),
+        Msg::ProviderPanelNoMatchingAccounts => "(Không có nhà cung cấp phù hợp)".into(),
         Msg::ProviderPanelEmptyModels =>
             "(Chưa có mô hình — nhấn Ctrl+A để thêm; lấy danh sách /models từ nhà cung cấp)".into(),
         Msg::ProviderPanelNoMatchingModels => "(Không có mô hình phù hợp)".into(),
@@ -232,6 +231,7 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelModelCount { count } =>
             format!("{count} mô hình{}", if count == 1 { "" } else { "" }).into(),
         Msg::ProviderPanelAddModelRow => "+ Thêm mô hình".into(),
+        Msg::ProviderPanelAddProviderRow => "+ Thêm nhà cung cấp tùy chỉnh".into(),
         Msg::ProviderPanelAccountsHint =>
             "Lọc · ↑↓ chọn · ↵ mô hình · Ctrl+A thêm · Ctrl+E sửa · Ctrl+Dx2 xóa · Tab chuyển · Esc đóng".into(),
         Msg::ProviderPanelModelsHint =>
@@ -242,13 +242,17 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelImageDirectWhileVlSet => {
             "Ảnh được gửi đến mô hình này; tắt đầu vào ảnh để dùng VL.".into()
         }
-        Msg::ProviderPanelAddTitle => "[Thêm tài khoản nhà cung cấp]".into(),
+        Msg::ProviderPanelAddTitle => "[Thêm nhà cung cấp]".into(),
         Msg::ProviderPanelEditAccountTitle { account } =>
             format!("[Sửa tài khoản {account}]").into(),
         Msg::ProviderPanelAddModelTitle => "[Thêm mô hình]".into(),
         Msg::ProviderPanelEditModelTitle => "[Sửa mô hình]".into(),
         Msg::ProviderPanelFieldVendor => "Nhà cung cấp".into(),
         Msg::ProviderPanelFieldAccount => "Tài khoản".into(),
+        Msg::ProviderPanelFieldName => "Tên".into(),
+        Msg::ProviderPanelFieldProtocol => "Giao thức".into(),
+        Msg::ProviderPanelRequired => "(bắt buộc)".into(),
+        Msg::ProviderPanelLocked => "(đã khóa)".into(),
         Msg::ProviderPanelFieldBaseUrl => "URL gốc".into(),
         Msg::ProviderPanelFieldApiKey => "Khóa API".into(),
         Msg::ProviderPanelFieldModel => "Mô hình".into(),
@@ -267,6 +271,13 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelProviderFormHint =>
             "Tab Tiếp  ←→ Đổi nhà cung cấp  Space Bật/tắt  ↵ Lưu  Esc Quay lại".into(),
         Msg::ProviderPanelAccountFormHint => "Tab Chuyển  ↵ Lưu  Esc Quay lại".into(),
+        Msg::ProviderPanelAddAccountHint =>
+            "Tab Tiếp  ←→ Đổi giao thức  ↵ Lưu  Esc Quay lại  (Tên bắt buộc; thêm mô hình ở tab Mô hình)".into(),
+        Msg::ProviderPanelEditAccountLockedHint =>
+            "Tab Tiếp  ↵ Lưu  Esc Quay lại  (Giao thức nhà cung cấp đã khóa)".into(),
+        Msg::ProviderPanelEditAccountHint =>
+            "Tab Tiếp  ←→ Đổi giao thức  ↵ Lưu  Esc Quay lại".into(),
+        Msg::ProviderPanelAccountNeedsKeyHint => "(nhà cung cấp này chưa được định cấu hình)".into(),
         Msg::ProviderPanelModelFormHint =>
             "Mở danh sách từ nhà cung cấp  Gõ để lọc  ↑↓ chọn  Tab/↵ điền  ←→ tài khoản (mô hình trống)  Space bật/tắt  Esc quay lại".into(),
         Msg::ProviderPanelModelPlaceholder => "(gõ để lọc danh sách từ nhà cung cấp)".into(),
@@ -280,8 +291,13 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelUpstreamFailed { error } =>
             format!("Không lấy được danh sách từ nhà cung cấp ({error}) — nhập mã mô hình").into(),
         Msg::ProviderPanelUpstreamNoUrl =>
-            "Chưa có URL nhà cung cấp — nhập mã mô hình".into(),
-
+            "Không có URL của nhà cung cấp — nhập mã mô hình".into(),
+        // ── Model picker ──
+        Msg::ModelPickerNoModelsConfigured =>
+            "(chưa cấu hình mô hình — dùng /provider để thêm)".into(),
+        Msg::ModelPickerNoModelsMatch => "(không có mô hình phù hợp)".into(),
+        Msg::ModelPickerNoModelsMatchQuery { query } =>
+            format!("(không có mô hình khớp với \"{query}\" — nhấn Backspace để xóa)").into(),
         Msg::ModelSwitched { provider, model } =>
             format!("  Đã chuyển sang {provider} · {model} cho phiên này\n").into(),
         Msg::ModelSwitchedAndDefault { provider, model } =>
@@ -572,7 +588,7 @@ pub(super) fn vi(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SkillUnknown { name } =>
             format!("Kỹ năng không xác định: {} (dùng /skills để liệt kê)", name).into(),
         Msg::SkillsLoaded { names } =>
-            format!("  Kỹ năng đã tải: {}\n", names).into(),
+            format!("  Đã yêu cầu tải kỹ năng: {}\n", names).into(),
 
         Msg::McpReloading { count } =>
             format!("  Đang tải lại máy chủ MCP... (đã cấu hình {})\n", count).into(),
@@ -880,7 +896,7 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         Msg::SaveInvalidPath { path } => format!("Đường dẫn không hợp lệ — thư mục không tồn tại: {path}").into(),
         Msg::SaveRefuseOverwrite { path } => format!("Đích đã tồn tại và không phải tệp markdown — từ chối ghi đè để tránh mất mã nguồn/cấu hình: {path}. Dùng tên tệp .md hoặc đường dẫn mới.").into(),
         Msg::CodeBlockCopied => "📋 Đã sao chép khối mã vào bộ nhớ tạm".into(),
-        Msg::CmdDescGuide => "Hỏi cách dùng/cấu hình JeikCode qua zap_config_guide".into(),
+        Msg::CmdDescGuide => "Hỏi cách dùng/cấu hình JeikCode qua jeikcode_config_guide".into(),
         Msg::CmdDescView => "Xem nội dung tệp trong hộp thoại nổi".into(),
         Msg::CmdDescApp => "Chia sẻ phiên này với ứng dụng di động qua chuyển tiếp (ghép đôi QR; /app stop để ngắt)".into(),
         Msg::CmdDescReview => "Rà soát mã của thay đổi hiện tại (/review · /review staged · /review <base>)".into(),
@@ -913,7 +929,7 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         Msg::GuideMenuTip => "   Mẹo: nhập /guide <câu hỏi của bạn> để nhận trả lời cụ thể.   Ví dụ: /guide Cách đặt mô hình mặc định ".into(),
         Msg::GuideMenuDocUrl => "".into(),
         Msg::CmdGuideFallbackPrompt { question } => format!(
-            "Trả lời câu hỏi cách dùng/cấu hình JeikCode của người dùng. TRƯỚC TIÊN gọi công cụ `zap_config_guide` với `topic` phù hợp nhất (overview, prompts, models, mcp, skills, thesaurus, tools, directories, project, updates, hoặc all). SAU ĐÓ trả lời ngắn gọn bằng ngôn ngữ của người dùng, chỉ dựa trên kết quả công cụ. Không bịa thiết lập và không quảng bá kho kỹ năng bên thứ ba.\n\nCâu hỏi của người dùng: {question}"
+            "Trả lời câu hỏi cách dùng/cấu hình JeikCode của người dùng. TRƯỚC TIÊN gọi công cụ `jeikcode_config_guide` với `topic` phù hợp nhất (overview, prompts, models, mcp, skills, thesaurus, tools, directories, project, updates, hoặc all). SAU ĐÓ trả lời ngắn gọn bằng ngôn ngữ của người dùng, chỉ dựa trên kết quả công cụ. Không bịa thiết lập và không quảng bá kho kỹ năng bên thứ ba.\n\nCâu hỏi của người dùng: {question}"
         ).into(),
         Msg::CmdGuideInstalling => "Đang chuẩn bị trả lời hướng dẫn, vui lòng chờ...".into(),
         Msg::CmdGuideAutoInstall => "Chưa cài kỹ năng hỏi tùy chọn — dùng hướng dẫn tích hợp.".into(),
@@ -959,7 +975,7 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
         Msg::OnboardingLanguageOptionZhCn => "简体中文".into(),
         Msg::OnboardingSetupTitle => "Bạn muốn thiết lập như thế nào?".into(),
         Msg::OnboardingNavHint =>
-            "1-3 chọn · Enter xác nhận · ← quay lại · Esc bỏ qua".into(),
+            "↑↓ chọn · Enter xác nhận · ← quay lại · Esc bỏ qua".into(),
         Msg::OnboardingConfirmClear =>
             "/welcome sẽ xóa màn hình. Tiếp tục? [y/N]".into(),
         Msg::CmdWelcomeDescription => "Chạy lại trình hướng dẫn ban đầu".into(),
@@ -1232,5 +1248,37 @@ Msg::CmdDescBackground => "Chạy tác vụ một lần trong ngữ cảnh nền
                 .into(),
         Msg::ServeNoTokenSecurityWarning =>
             "[CẢNH BÁO AN NINH NGHIÊM TRỌNG] Phát hiện bạn chưa sử dụng mã truy cập (Token)!\nNếu hiện tại chưa thiết lập tường lửa tương ứng, vui lòng nhờ AI của JeikCode hỗ trợ thiết lập tường lửa và danh sách IP trắng, nếu không máy chủ của bạn rất dễ bị hacker xâm nhập!".into(),
+        // Kernel liveness/retry advisories: fall back to the English catalog.
+        Msg::AgentRetryEmpty { .. }
+        | Msg::AgentRetryThinking { .. }
+        | Msg::AgentRetryMalformed { .. }
+        | Msg::AgentRetryFirstToken { .. }
+        | Msg::AgentRetryApi { .. }
+        | Msg::AgentOverWindow { .. }
+        | Msg::AgentContextOverflow { .. }
+        | Msg::AgentStreamReconnecting { .. }
+        | Msg::AgentResponseTruncated
+        | Msg::AgentUnsupportedSnapshot { .. }
+        | Msg::AgentPreRequestNotAppendOnly { .. }
+        | Msg::AgentEchoLoopNudge
+        | Msg::AgentEchoLoopWarning
+        | Msg::AgentModelHighLatencyTerminal { .. }
+        | Msg::AgentExhaustedMalformed { .. }
+        | Msg::AgentExhaustedThinkingOverWindowIntro { .. }
+        | Msg::AgentExhaustedThinkingOverWindowSize { .. }
+        | Msg::AgentExhaustedThinkingGeneric { .. }
+        | Msg::AgentExhaustedEmptyOverWindowIntro { .. }
+        | Msg::AgentExhaustedEmptyOverWindowSize { .. }
+        | Msg::AgentExhaustedEmptyGeneric { .. }
+        | Msg::AgentStatusRateLimited
+        | Msg::AgentStatusUpstreamUnavailable
+        | Msg::AgentStatusResponseTimeout
+        | Msg::AgentStatusConnectionFailed
+        | Msg::AgentStatusInsufficientBalance
+        | Msg::AgentStatusUnauthorized
+        | Msg::StreamReadRetryExhausted { .. }
+        | Msg::StreamReadPartialResponse
+        | Msg::StreamReadResetHint
+        | Msg::StreamReadDetailsPrefix => super::en::en(msg),
     }
 }

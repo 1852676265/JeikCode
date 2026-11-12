@@ -1,4 +1,4 @@
-//! Configuration for assembling a review agent. Mirrors `zap-coding`'s config but
+//! Configuration for assembling a review agent. Mirrors `jeikcode-coding`'s config but
 //! for a READ-ONLY reviewer: provider creds, the repo working dir the read tools are
 //! scoped to, and liveness bounds.
 
@@ -63,11 +63,12 @@ pub struct ReviewAgentConfig {
     /// Engineering callers (e.g. the service, which reviews huge repos on NFS) set a bound
     /// like `8000` so a kernel-scale repo degrades automatically. `0` ⇒ never mount.
     pub graph_max_indexed_files: usize,
-    /// Skill directories to load `use_skill` / `list_skills` tools from. Empty (default)
-    /// ⇒ NO skill tools mounted, matching bare-CLI behavior: only some deployments / repos
-    /// opt into skills via `--skill-dir`. Each dir is scanned for `SKILL.md` (directory
-    /// skill with bundled `scripts/` / `references/`) or single `<name>.md` files.
-    /// LOW→HIGH priority order (later dirs override earlier on name collision).
+    /// Skill directories to load the `use_skill` tool from. Empty (default) ⇒ NO skill
+    /// tool mounted, matching bare-CLI behavior: only some deployments / repos opt into
+    /// skills via `--skill-dir`. Each dir is scanned for `*/SKILL.md` or `*/skill.md`
+    /// (case-insensitive; directory skill with bundled `scripts/` / `references/`).
+    /// Flat `*.md` files are commands, not skills. LOW→HIGH priority order (later dirs
+    /// override earlier on name collision).
     pub skill_dirs: Vec<PathBuf>,
 }
 
@@ -114,10 +115,10 @@ impl ReviewAgentConfig {
 
 fn default_tool_loop_policy() -> Option<ToolLoopPolicy> {
     resolve_tool_loop_policy(
-        std::env::var("JEIKCODE_TOOL_LOOP_WARNING_THRESHOLD")
+        std::env::var("ZAP_TOOL_LOOP_WARNING_THRESHOLD").or_else(|_| std::env::var("JEIKCODE_TOOL_LOOP_WARNING_THRESHOLD"))
             .ok()
             .as_deref(),
-        std::env::var("JEIKCODE_TOOL_LOOP_STOP_THRESHOLD")
+        std::env::var("ZAP_TOOL_LOOP_STOP_THRESHOLD").or_else(|_| std::env::var("JEIKCODE_TOOL_LOOP_STOP_THRESHOLD"))
             .ok()
             .as_deref(),
     )

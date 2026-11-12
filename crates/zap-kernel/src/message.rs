@@ -390,7 +390,7 @@ impl Message {
     /// always comes from the provider's usage when present; this keeps utilization —
     /// and thus auto-compaction — tracking when it is absent (without it, a non-
     /// reporting provider records utilization 0.0 forever and never compacts).
-    /// Mirrors the legacy estimate heuristic (see `zap-coding`'s telemetry copy).
+    /// Mirrors the legacy estimate heuristic (see `jeikcode-coding`'s telemetry copy).
     pub fn estimate_tokens(&self) -> u32 {
         // Images dominate when present (vision ≈ 1600 tok each).
         if !self.images.is_empty() {
@@ -409,6 +409,45 @@ impl Message {
             self.text.len()
         };
         ((byte_count / 4).max(1) + 4) as u32
+    }
+
+    /// Conservative token estimate for the OUTPUT-BUDGET clamp (never for pressure
+    /// math). ASCII runs count at 4 chars/token; every NON-ASCII char counts as a
+    /// full token, because CJK is ~0.6–1 token/char while `bytes/4` underestimates
+    /// it by roughly 2×.
+    ///
+    /// Overestimating here only SHRINKS the per-request output budget; an
+    /// underestimate would let `prompt + max_tokens` exceed the gateway window and
+    /// produce an opaque HTTP 400. So this is the safe direction to be wrong in.
+    pub fn estimate_tokens_conservative(&self) -> u32 {
+        // Images dominate when present (vision ≈ 1600 tok each).
+        if !self.images.is_empty() {
+            return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
+        }
+        let mut ascii: usize = 0;
+        let mut non_ascii: usize = 0;
+        {
+            let mut add = |text: &str| {
+                for ch in text.chars() {
+                    if ch.is_ascii() {
+                        ascii += 1;
+                    } else {
+                        non_ascii += 1;
+                    }
+                }
+            };
+            add(&self.text);
+            for call in &self.tool_calls {
+                add(&call.name);
+                add(&call.arguments);
+            }
+            if let Some(reasoning) = &self.reasoning {
+                add(reasoning);
+            }
+        }
+        // Mirror `estimate_tokens`' small per-shape overheads.
+        let overhead = self.tool_calls.len() * 20 + if self.role == Role::Tool { 10 } else { 1 };
+        (non_ascii + ascii.div_ceil(4) + overhead + 4) as u32
     }
 
     /// Stored for WebUI/TUI replay only — never forwarded on the provider wire.
@@ -450,6 +489,26 @@ impl Conversation {
         Self::default()
     }
     pub fn push(&mut self, mut m: Message) {
+        // Identity uniqueness for admitted user turns. ONE real user message (one
+        // caller-minted id) is ONE history row — even when the transport delivers it
+        // more than once: a client retry, a driver that already persisted the prompt
+        // into the snapshot this runtime resumed from, a steer re-submitted while the
+        // kernel still holds it, or a resume replaying the interrupted prompt. A second
+        // copy would make every later request carry the turn twice (bare, plus a
+        // later-reminder twin) and silently double its prompt tokens. Synthetic and
+        // id-less messages are NOT deduped: they have no admitted identity.
+        if m.role == Role::User && !m.synthetic {
+            if let Some(id) = m.id.as_deref() {
+                let already_stored = self.messages.iter().any(|existing| {
+                    existing.role == Role::User
+                        && !existing.synthetic
+                        && existing.id.as_deref() == Some(id)
+                });
+                if already_stored {
+                    return;
+                }
+            }
+        }
         // Wall-clock sidecar for WebUI send/reply labels. User = send time;
         // assistant = the moment this round is persisted (turn complete for
         // that bubble). Never sent to the model.
@@ -471,13 +530,25 @@ impl Conversation {
     ///
     /// NOTE: No compression happens here. Oversized tool results were already
     /// rewritten at EXECUTION time by the artifact middleware (capabilities):
-    /// head/tail preview + `fetch_output` artifact handle. The stored message —
+    /// preview + `read(path="artifact://...")` artifact handle. The stored message —
     /// and therefore this wire view — already carries that compressed text, so
     /// the kernel must not rewrite it a second time.
+    ///
+    /// 核心铁律：所有黄色/蓝色/紫色/系统通知或带内部标记的行，通通一律不得进入模型上下文！
     pub fn model_history(&self) -> Vec<Message> {
         self.messages
             .iter()
             .filter(|message| !message.is_display_only())
+            .filter(|message| message.internal_origin.is_none())
+            // An empty assistant round (failed / interrupted stream that persisted
+            // only reasoning) has nothing the provider can continue from, and strict
+            // gateways reject `content:null` without `tool_calls`. Drop it at the
+            // SINGLE wire-projection boundary; storage keeps it for display.
+            .filter(|message| {
+                !(message.role == Role::Assistant
+                    && message.text.is_empty()
+                    && message.tool_calls.is_empty())
+            })
             .cloned()
             .collect()
     }
@@ -705,7 +776,9 @@ impl Conversation {
 fn system_block_order(text: &str) -> u8 {
     if text.starts_with("<environment>") {
         10
-    } else if text.starts_with("<workflow_and_execution_discipline>") {
+    } else if text.starts_with("<system_rules>")
+        || text.starts_with("<workflow_and_execution_discipline>")
+    {
         20
     } else if text.starts_with("<available_skills>") || text.starts_with("=== AVAILABLE SKILLS") {
         30
@@ -733,6 +806,8 @@ fn frozen_user_block_order(text: &str) -> u8 {
         40
     } else if text.starts_with("<memory>") || text.starts_with("=== MEMORY ===") {
         50
+    } else if text.starts_with("<user_preferences>") {
+        55
     } else if text.starts_with("<project_instructions>")
         || text.starts_with("=== AUTHORITATIVE PROJECT INSTRUCTIONS")
     {
@@ -780,7 +855,7 @@ impl Conversation {
     /// Insert, refresh, or remove a frozen synthetic-user prefix block identified
     /// by a stable header (`<memory>`, skill catalog, MCP instructions, project instructions).
     ///
-    /// Preserves canonical ordering (skills 30 -> MCP 40 -> memory 50 -> project instructions 60)
+    /// Preserves canonical ordering (skills 30 -> MCP 40 -> memory 50 -> user preferences 55 -> project instructions 60)
     /// within the synthetic user run after leading systems and before the first real user.
     ///
     /// A leftover `Role::System` copy from older sessions is converted (removed
@@ -901,6 +976,25 @@ impl Conversation {
             .and_then(|m| m.meta.as_ref())
             .map(|meta| (meta.ctx_window, meta.used_tokens, meta.utilization))
             .unwrap_or((0, 0, 0.0))
+    }
+
+    /// Provider-reported size of the context AFTER the most recent successful
+    /// response: `prompt + completion` (the assistant output becomes part of the
+    /// NEXT prompt). 0 when no usage has been recorded yet.
+    ///
+    /// [`last_pressure`](Self::last_pressure) reports the PROMPT side only, which
+    /// is the right input for utilization/pressure math but undercounts the room
+    /// the next request needs by the previous response's output. The output-budget
+    /// clamp wants THIS figure: `max_tokens` must leave room for the whole next
+    /// prompt, including that already-generated assistant text.
+    pub fn last_context_tokens(&self) -> u32 {
+        self.messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == Role::Assistant)
+            .find_map(|m| m.meta.as_ref())
+            .map(|meta| meta.tokens.prompt.saturating_add(meta.tokens.completion))
+            .unwrap_or(0)
     }
 
     /// Prepare a compaction [`CompactionPlan`] without changing this conversation.
@@ -1054,6 +1148,7 @@ impl Conversation {
                 {
                     meta.utilization = (meta.utilization as f64 * ratio) as f32;
                     meta.used_tokens = (meta.used_tokens as f64 * ratio).round() as u32;
+                    meta.tokens.prompt = (meta.tokens.prompt as f64 * ratio).round() as u32;
                 }
             }
             let epoch_after = epoch_before + 1;
@@ -1276,6 +1371,11 @@ pub struct SessionSnapshot {
     /// defaults it to 0; `from_conversation` copies the live value.
     #[serde(default)]
     pub cache_epoch: u64,
+    /// Model id the persona was last assembled for. ADDITIVE: `serde(default)` keeps
+    /// older snapshots loadable; `/model` reconciliation uses this field to detect a
+    /// switch without embedding a marker in the prompt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// ID HIGH-WATER MARKS: how many `turn_id`s / `request_id`s the session had
     /// minted when this snapshot was taken. A resume seeds the kernel's counters
     /// from these so a resumed session CONTINUES the monotonic id sequence instead
@@ -1299,6 +1399,7 @@ impl SessionSnapshot {
             version: SNAPSHOT_VERSION,
             messages,
             cache_epoch: 0,
+            model: None,
             turn_counter,
             request_counter,
         }
@@ -1315,6 +1416,7 @@ impl SessionSnapshot {
             version: SNAPSHOT_VERSION,
             messages: convo.messages.clone(),
             cache_epoch: convo.cache_epoch,
+            model: None,
             turn_counter,
             request_counter,
         }
@@ -1333,6 +1435,87 @@ impl SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conservative_estimate_counts_cjk_as_full_tokens() {
+        // 100 ASCII chars ≈ 25 tokens; 100 CJK chars ≈ 100 tokens (not ~75).
+        let ascii = Message::user(&"a".repeat(400));
+        let cjk = Message::user(&"中".repeat(100));
+        let ascii_est = ascii.estimate_tokens() as i64;
+        let ascii_cons = ascii.estimate_tokens_conservative() as i64;
+        assert!(
+            (ascii_cons - ascii_est).abs() <= 2,
+            "ASCII must estimate the same in both estimators (4 chars/token): \
+             {ascii_est} vs {ascii_cons}"
+        );
+        let conservative = cjk.estimate_tokens_conservative();
+        assert!(
+            conservative >= 100,
+            "each CJK char must count as at least one token; got {conservative}"
+        );
+        assert!(
+            conservative > cjk.estimate_tokens(),
+            "the byte estimate must be the smaller one for CJK"
+        );
+    }
+
+    /// Regression: one admitted prompt must stay ONE row. The `/chat` driver used to
+    /// persist the turn's prompt into the canonical snapshot and then submit it again,
+    /// so history carried the same id twice — once bare, once with the injected
+    /// `<system-reminder>` tail — doubling that turn's prompt tokens on every request.
+    #[test]
+    fn push_keeps_one_row_per_admitted_user_identity() {
+        let mut c = Conversation::new();
+        let mut first = Message::user("再讲清楚点");
+        first.id = Some("req-1".into());
+        c.push(first);
+
+        // Second delivery of the SAME identity, already carrying the reminder tail.
+        let mut second = Message::user(
+            "再讲清楚点\n\n<system-reminder>\nCurrent date: 2026-11-08 (Sun)\n</system-reminder>",
+        );
+        second.id = Some("req-1".into());
+        c.push(second);
+        assert_eq!(
+            c.messages.len(),
+            1,
+            "one admitted identity => one history row"
+        );
+        assert_eq!(c.messages[0].text, "再讲清楚点", "the stored row wins");
+
+        // A different admitted prompt still appends normally.
+        let mut third = Message::user("再说一遍");
+        third.id = Some("req-2".into());
+        c.push(third);
+        assert_eq!(c.messages.len(), 2);
+
+        // Synthetic context and id-less user rows have no admitted identity: keep them.
+        c.push(Message::synthetic_user(
+            "<system-reminder>\nambient\n</system-reminder>",
+        ));
+        c.push(Message::user("no identity"));
+        assert_eq!(c.messages.len(), 4);
+    }
+
+    #[test]
+    fn model_history_drops_reasoning_only_assistant_round() {
+        let mut c = Conversation::new();
+        c.push(Message::user("first"));
+        let mut lost = Message::assistant("", Vec::new());
+        lost.reasoning = Some("partial thinking".into());
+        c.push(lost);
+        c.push(Message::user("retry"));
+
+        let wire = c.model_history();
+        assert_eq!(
+            wire.len(),
+            2,
+            "empty assistant round must not reach the wire"
+        );
+        assert!(wire.iter().all(|m| m.role == Role::User));
+        // Storage still keeps the reasoning row for display/replay.
+        assert_eq!(c.messages.len(), 3);
+    }
 
     #[test]
     fn model_history_keeps_tool_results_verbatim() {
@@ -1373,6 +1556,32 @@ mod tests {
         });
         c.push(a);
         assert_eq!(c.last_pressure(), (128_000, 40_000, 0.3125));
+    }
+
+    #[test]
+    fn last_context_tokens_includes_the_response_output() {
+        let mut c = Conversation::new();
+        assert_eq!(
+            c.last_context_tokens(),
+            0,
+            "no assistant meta yet → no anchor"
+        );
+        let mut a = Message::assistant("ans", vec![]);
+        a.meta = Some(MessageMeta {
+            used_tokens: 40_000,
+            tokens: crate::stream::TokenUsage {
+                prompt: 40_000,
+                completion: 5_000,
+                cached: 0,
+            },
+            ..Default::default()
+        });
+        c.push(a);
+        assert_eq!(
+            c.last_context_tokens(),
+            45_000,
+            "the response output is part of the NEXT prompt"
+        );
     }
 
     #[test]
@@ -1480,6 +1689,32 @@ mod tests {
         let old_block = r#"{"text":"t","opaque":"sig","provider":"anthropic"}"#;
         let b: ReasoningBlock = serde_json::from_str(old_block).unwrap();
         assert_eq!(b.id, None);
+    }
+
+    /// 身份契约：调用方铸造的 id 必须被 `push` 原样保留（只在缺省时才自动分配）。
+    /// wire / display / 大纲跨端一致全靠这一条。
+    #[test]
+    fn push_preserves_a_caller_minted_message_id() {
+        let mut conversation = Conversation::new();
+        let mut user = Message::user("hello");
+        user.id = Some("u-client-1".into());
+        conversation.push(user);
+        assert_eq!(
+            conversation.messages[0].id.as_deref(),
+            Some("u-client-1"),
+            "a caller-minted id must survive the single append seam"
+        );
+
+        let mut auto = Message::user("auto");
+        auto.id = None;
+        conversation.push(auto);
+        assert!(
+            conversation.messages[1]
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("m-")),
+            "an absent id is still auto-assigned at the append seam"
+        );
     }
 
     // Mirrors production `cancel_backfills_missing_tool_results`: an assistant
@@ -1912,9 +2147,7 @@ mod tests {
     fn reconcile_frozen_user_block_in_place_and_ordered() {
         let mut c = Conversation::new();
         c.push(Message::system("<environment>\npersona"));
-        c.push(Message::system(
-            "<workflow_and_execution_discipline>\nrules",
-        ));
+        c.push(Message::system("<system_rules>\nrules"));
         c.push(Message::user("first real user task"));
 
         // Insert project instructions (order 60)
@@ -1937,9 +2170,7 @@ mod tests {
 
         assert_eq!(c.messages.len(), 7);
         assert!(c.messages[0].text.starts_with("<environment>"));
-        assert!(c.messages[1]
-            .text
-            .starts_with("<workflow_and_execution_discipline>"));
+        assert!(c.messages[1].text.starts_with("<system_rules>"));
         assert!(c.messages[2].text.starts_with("<available_skills>"));
         assert!(c.messages[3].text.starts_with("<mcp_server_instructions>"));
         assert!(c.messages[4].text.starts_with("<memory>"));

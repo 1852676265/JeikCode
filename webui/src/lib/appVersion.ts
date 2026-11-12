@@ -17,25 +17,3 @@ export function bakedAppVersion(): string {
     return '';
   }
 }
-
-export function parseSemVer(v: string) {
-  const clean = String(v || '').replace(/^v/i, '').trim();
-  const [core, ...pre] = clean.split('-');
-  const parts = core.split('.').map((n) => parseInt(n, 10) || 0);
-  while (parts.length < 3) parts.push(0);
-  return { raw: clean, parts, pre: pre.join('-') };
-}
-
-export function compareSemVer(v1: string, v2: string): number {
-  const s1 = parseSemVer(v1);
-  const s2 = parseSemVer(v2);
-  for (let i = 0; i < 3; i++) {
-    if (s1.parts[i] > s2.parts[i]) return 1;
-    if (s1.parts[i] < s2.parts[i]) return -1;
-  }
-  // No prerelease is newer than prerelease with same major.minor.patch
-  if (!s1.pre && s2.pre) return 1;
-  if (s1.pre && !s2.pre) return -1;
-  if (s1.pre && s2.pre) return s1.pre.localeCompare(s2.pre, undefined, { numeric: true });
-  return 0;
-}

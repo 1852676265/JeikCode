@@ -42,13 +42,13 @@ use base64::Engine;
 use zap_kernel::message::ImageContent;
 
 use crate::commands::{parse_bash_command, parse_slash_line, CommandRegistry};
-use crate::custom_commands::ArgsRequirement;
 use crate::input::history::History;
 use crate::input::key_action::{classify, is_ctrl_letter, Action};
 use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::{reasoning_summary, ThinkStripper};
+use zap_capabilities::commands::ArgsRequirement;
 
 fn runtime_mode(mode: crate::state::AgentMode) -> zap_coding::RuntimeMode {
     match mode {
@@ -71,7 +71,11 @@ fn apply_startup_bypass(
 }
 
 fn runtime_user_input(text: String, images: Vec<ImageContent>) -> zap_coding::UserInput {
-    zap_coding::UserInput { text, images }
+    zap_coding::UserInput {
+        text,
+        images,
+        id: None,
+    }
 }
 
 fn submit_foreground_runtime(ctx: &LoopCtx, input: zap_coding::UserInput) -> bool {
@@ -164,12 +168,20 @@ pub(crate) fn deactivate_runtime_provider_after_logout(
 
 /// Encode raw RGBA pixel data as a PNG image in memory.
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    let slice = if rgba.len() >= expected {
+        &rgba[..expected]
+    } else {
+        return None;
+    };
     let mut buf = Vec::new();
     let mut encoder = png::Encoder::new(&mut buf, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().ok()?;
-    writer.write_image_data(rgba).ok()?;
+    writer.write_image_data(slice).ok()?;
     drop(writer);
     Some(buf)
 }
@@ -3755,12 +3767,12 @@ pub struct LoopCtx {
     /// `<project>/.jeikcode/commands/`. Queried by the slash-command
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
-    pub custom_commands: crate::custom_commands::CustomCommandRegistry,
+    pub custom_commands: zap_capabilities::commands::UserCommandRegistry,
     /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
     /// the agent loop holds, so `reload(...)` there is visible here
     /// without extra plumbing. Used by the slash-command palette to
-    /// surface user-invocable skills, and by the dispatcher to expand
-    /// `/skill_name [args]` into a SendMessage.
+    /// surface user-invocable skills, and by the dispatcher to build a
+    /// `use_skill(<name>)` request for `/skill_name [args]`.
     pub skill_registry:
         std::sync::Arc<std::sync::RwLock<zap_capabilities::skills::SkillRegistry>>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
@@ -5366,8 +5378,8 @@ mod buffer_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
-    use crate::custom_commands::CustomCommand;
-    use crate::custom_commands::CustomCommandRegistry;
+    use zap_capabilities::commands::UserCommand;
+    use zap_capabilities::commands::UserCommandRegistry;
 
     #[test]
     fn pending_transition_routes_enter_through_common_commit_gate() {
@@ -5421,14 +5433,14 @@ mod menu_tests {
     #[test]
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         assert!(build_menu_items("hello world", 0, &reg, &custom, None, None).is_none());
     }
 
     #[test]
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let items =
             build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
@@ -5437,7 +5449,7 @@ mod menu_tests {
     #[test]
     fn slash_with_filter_narrows_list() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let all = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
         let filtered = build_menu_items("/he", 0, &reg, &custom, None, None).unwrap_or_default();
         assert!(
@@ -5459,7 +5471,7 @@ mod menu_tests {
         // Once the user types args, menu goes away so arrow keys don't
         // start navigating a stale palette.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         assert!(build_menu_items("/cd ", 0, &reg, &custom, None, None).is_none());
         assert!(build_menu_items("/cd /tmp", 0, &reg, &custom, None, None).is_none());
     }
@@ -5467,14 +5479,14 @@ mod menu_tests {
     #[test]
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         assert!(build_menu_items("/zzznomatch", 0, &reg, &custom, None, None).is_none());
     }
 
     #[test]
     fn at_directory_completion_can_build_child_menu() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let index = file_index::FileIndex::from_entries(
             std::path::PathBuf::from("/tmp"),
             vec![
@@ -5484,23 +5496,23 @@ mod menu_tests {
                     depth: 1,
                 },
                 file_index::Entry {
-                    rel_path: "crates/zap-bridge/".into(),
+                    rel_path: "crates/jeikcode-bridge/".into(),
                     is_dir: true,
                     depth: 2,
                 },
                 file_index::Entry {
-                    rel_path: "crates/zap-bridge/src/".into(),
+                    rel_path: "crates/jeikcode-bridge/src/".into(),
                     is_dir: true,
                     depth: 3,
                 },
                 file_index::Entry {
-                    rel_path: "crates/zap-bridge/Cargo.toml".into(),
+                    rel_path: "crates/jeikcode-bridge/Cargo.toml".into(),
                     is_dir: false,
                     depth: 3,
                 },
             ],
         );
-        let replacement = file_index::format_at_mention_replacement("crates/zap-bridge/");
+        let replacement = file_index::format_at_mention_replacement("crates/jeikcode-bridge/");
 
         let items = build_menu_items(
             &replacement,
@@ -5518,8 +5530,8 @@ mod menu_tests {
                 .map(|(path, _)| path.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "crates/zap-bridge/src/",
-                "crates/zap-bridge/Cargo.toml",
+                "crates/jeikcode-bridge/src/",
+                "crates/jeikcode-bridge/Cargo.toml",
             ]
         );
     }
@@ -5590,9 +5602,8 @@ mod menu_tests {
         zap_capabilities::skills::Skill {
             name: name.to_string(),
             description: desc.to_string(),
-            template: "do thing".to_string(),
+            content: "do thing".to_string(),
             user_invocable,
-            allowed_tools: vec![],
             skill_dir: std::path::PathBuf::new(),
             source_path: std::path::PathBuf::new(),
         }
@@ -5604,7 +5615,7 @@ mod menu_tests {
         // bare-name prefix must NOT surface skills. They live behind
         // the `/skills` gateway so the top palette stays uncluttered.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
@@ -5638,7 +5649,7 @@ mod menu_tests {
         // switches to second-level: bare skill names, ready to commit
         // as `/skills <name>`.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
@@ -5660,7 +5671,7 @@ mod menu_tests {
         // /skills bra narrows to brainstorming. /skills web narrows
         // to web-access. /skills zz returns no menu at all.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
@@ -5684,7 +5695,7 @@ mod menu_tests {
         // /skills brainstorming why X — user is typing skill args now,
         // menu should disappear so arrow keys don't navigate stale entries.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
@@ -5705,7 +5716,7 @@ mod menu_tests {
         // user_invocable=false skills must not surface in the sub-menu
         // either — they're LLM-only via the use_skill tool.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:visible", "shown", true));
         skills.register(skill_fixture("skills:hidden", "hidden", false));
@@ -5723,7 +5734,7 @@ mod menu_tests {
     #[test]
     fn skills_sub_mode_multi_fragment_filters_then_closes_on_complete_skill() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:jeikcode-smoke-test", "smoke", true));
         skills.register(skill_fixture(
@@ -5769,7 +5780,7 @@ mod menu_tests {
         // `/effort` at the top level surfaces the gateway entry, not the
         // individual high/max/off choices (those live behind `/effort `).
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let items = build_menu_items("/effort", 0, &reg, &custom, None, None)
             .expect("/effort gateway must appear");
         assert!(items.iter().any(|(n, _)| n == "effort"));
@@ -5781,7 +5792,7 @@ mod menu_tests {
     #[test]
     fn effort_sub_mode_lists_and_filters_choices() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         // `/effort ` (trailing space) → all three choices.
         let all = build_menu_items("/effort ", 0, &reg, &custom, None, None)
             .expect("/effort sub-mode must list choices");
@@ -5805,7 +5816,7 @@ mod menu_tests {
     fn no_skill_registry_is_no_op() {
         // Ensures the legacy call path (None) keeps working.
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
         let empty_skills =
             std::sync::RwLock::new(zap_capabilities::skills::SkillRegistry::new());
@@ -5868,7 +5879,7 @@ mod menu_tests {
     #[test]
     fn dollar_trigger_lists_all_user_invocable_skills() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
@@ -5888,7 +5899,7 @@ mod menu_tests {
     #[test]
     fn dollar_trigger_filters_and_parity_with_skills_submode() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         skills.register(skill_fixture("skills:web-access", "Web", true));
@@ -5909,7 +5920,7 @@ mod menu_tests {
     #[test]
     fn dollar_trigger_only_at_start_and_closes_on_space() {
         let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
+        let custom = UserCommandRegistry::empty();
         let mut skills = zap_capabilities::skills::SkillRegistry::new();
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
@@ -6663,8 +6674,8 @@ mod menu_tests {
     #[test]
     fn custom_command_required_triggers_needs_args() {
         let reg = CommandRegistry::builtin();
-        let mut custom = CustomCommandRegistry::empty();
-        custom.register(CustomCommand {
+        let mut custom = UserCommandRegistry::empty();
+        custom.register(UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Required,
@@ -6686,8 +6697,8 @@ mod menu_tests {
     #[test]
     fn custom_command_optional_triggers_needs_args() {
         let reg = CommandRegistry::builtin();
-        let mut custom = CustomCommandRegistry::empty();
-        custom.register(CustomCommand {
+        let mut custom = UserCommandRegistry::empty();
+        custom.register(UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::Optional,
@@ -6709,8 +6720,8 @@ mod menu_tests {
     #[test]
     fn custom_command_none_executes_immediately() {
         let reg = CommandRegistry::builtin();
-        let mut custom = CustomCommandRegistry::empty();
-        custom.register(CustomCommand {
+        let mut custom = UserCommandRegistry::empty();
+        custom.register(UserCommand {
             name: "myreview".into(),
             description: "".into(),
             args_requirement: ArgsRequirement::None,
@@ -8199,6 +8210,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
     // Draw welcome + initial prompt
     let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    // 水合初始会话的活跃待办（对齐 WebUI 的 session load 水合）
+    app.state.active_todos = todo_progress_from_board(&ctx.current_session.id)
+        .filter(|p| p.total > 0 && p.completed < p.total);
+    sync_todo_titles(&mut app.state);
     renderer.render(UiLine::Welcome {
         model: ctx.model_name.clone(),
         working_dir: dir_display.clone(),
@@ -11688,7 +11703,7 @@ fn build_menu_items(
     buf: &str,
     cursor: usize,
     commands: &CommandRegistry,
-    custom: &crate::custom_commands::CustomCommandRegistry,
+    custom: &zap_capabilities::commands::UserCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<zap_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
@@ -12112,8 +12127,8 @@ fn handle_idle_key(
                         // `/skills ` so backspace still recovers.
                         renderer.render(UiLine::CommandOutput(
                             "  \u{24d8} No user-invocable skills installed yet.\n    \
-                            \u{2022} Drop SKILL.md into ~/.zap/skills/<name>/ \n      \
-                              (Windows: %USERPROFILE%\\.zap\\skills\\<name>\\)\n    \
+                            \u{2022} Drop SKILL.md into ~/.jeikcode/skills/<name>/ \n      \
+                              (Windows: %USERPROFILE%\\.jeikcode\\skills\\<name>\\)\n    \
                             \u{2022} Or install a plugin that ships skills via /plugin install <git-url>\n\n"
                                 .into(),
                         ));
@@ -13551,7 +13566,8 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
         warnings = reload_skill_registry(&mut guard, &ctx.working_dir);
         loaded = guard.all().count();
     }
-    ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
+    ctx.custom_commands =
+        zap_capabilities::commands::UserCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
@@ -13894,11 +13910,7 @@ pub(crate) fn save_language_and_reload(
             }
         };
         ctx.observed_config_revision = Some(commit.snapshot.revision);
-        let label = match locale {
-            zap_config::locale::Locale::En => "English",
-            zap_config::locale::Locale::Vi => "Tiếng Việt",
-            zap_config::locale::Locale::ZhCn => "简体中文",
-        };
+        let label = locale.native_name();
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
                 label,
@@ -16492,7 +16504,7 @@ pub(super) fn handle_plugin_job_event(
             // If `/guide <topic>` was waiting for this install, auto-invoke
             // the "ask" skill with the stashed topic.
             if let Some(topic) = ctx.pending_guide_topic.take() {
-                if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
+                if let Some(rendered) = commands::skill_invocation(ctx, "ask", &topic) {
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke { topic: &topic })
                             .into_owned(),
@@ -16567,7 +16579,7 @@ pub(super) fn handle_plugin_job_event(
             // the UI registry and runtime capability graph.
             let _ = reload_plugins(ctx);
             if let Some(topic) = ctx.pending_guide_topic.take() {
-                if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
+                if let Some(rendered) = commands::skill_invocation(ctx, "ask", &topic) {
                     renderer.render(UiLine::CommandOutput(
                         crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke { topic: &topic })
                             .into_owned(),
@@ -18389,9 +18401,11 @@ fn install_pending_rewind_modal(app: &mut App, ctx: &mut LoopCtx, renderer: &mut
         Ok(catalog) if catalog.points.is_empty() => {
             renderer.render(UiLine::CommandOutput(
                 match crate::i18n::current_locale() {
-                    crate::i18n::Locale::ZhCn => "当前会话还没有可回退的回合。",
-                    crate::i18n::Locale::En => "This session has no Rewind points yet.",
+                    crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw => {
+                        "当前会话还没有可回退的回合。"
+                    }
                     crate::i18n::Locale::Vi => "Phiên này chưa có điểm quay lại.",
+                    _ => "This session has no Rewind points yet.",
                 }
                 .to_string(),
             ));
@@ -18407,9 +18421,9 @@ fn install_pending_rewind_modal(app: &mut App, ctx: &mut LoopCtx, renderer: &mut
             renderer.render(UiLine::Error(format!(
                 "{}: {error}",
                 match crate::i18n::current_locale() {
-                    crate::i18n::Locale::ZhCn => "加载回退点失败",
-                    crate::i18n::Locale::En => "Failed to load Rewind points",
+                    crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw => "加载回退点失败",
                     crate::i18n::Locale::Vi => "Không tải được điểm quay lại",
+                    _ => "Failed to load Rewind points",
                 }
             )));
             renderer.flush();
@@ -18980,9 +18994,10 @@ fn handle_runtime_event(
                             renderer.render(UiLine::Error(format!(
                                 "{}: {error}",
                                 match crate::i18n::current_locale() {
-                                    crate::i18n::Locale::ZhCn => "回退失败",
-                                    crate::i18n::Locale::En => "Rewind failed",
+                                    crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw =>
+                                        "回退失败",
                                     crate::i18n::Locale::Vi => "Quay lại thất bại",
+                                    _ => "Rewind failed",
                                 }
                             )));
                             renderer.flush();
@@ -19251,11 +19266,7 @@ fn handle_runtime_event(
                     } else {
                         if language_change_notice.should_render(language_changed) {
                             let locale = crate::i18n::current_locale();
-                            let label = match locale {
-                                zap_config::locale::Locale::En => "English",
-                                zap_config::locale::Locale::Vi => "Tiếng Việt",
-                                zap_config::locale::Locale::ZhCn => "简体中文",
-                            };
+                            let label = locale.native_name();
                             renderer.render(UiLine::CommandOutput(
                                 crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
                                     label,
@@ -19785,7 +19796,8 @@ fn commit_native_session_changed(
     state.thinking_idx = 0;
     state.on_turn_complete();
     state.on_session_replaced();
-    state.active_todos = None;
+    state.active_todos =
+        todo_progress_from_board(&session_id).filter(|p| p.total > 0 && p.completed < p.total);
     state.active_subtasks = None;
     sync_todo_titles(state);
     state.approval_panel = None;
@@ -19995,16 +20007,21 @@ fn handle_rewind_success(
         (crate::i18n::Locale::Vi, zap_coding::RewindScope::ConversationAndCode) => {
             "hội thoại và mã"
         }
-        (crate::i18n::Locale::ZhCn, zap_coding::RewindScope::Conversation) => "对话",
-        (crate::i18n::Locale::ZhCn, zap_coding::RewindScope::Code) => "代码",
-        (crate::i18n::Locale::ZhCn, zap_coding::RewindScope::ConversationAndCode) => {
-            "对话和代码"
-        }
-        (crate::i18n::Locale::En, zap_coding::RewindScope::Conversation) => "conversation",
-        (crate::i18n::Locale::En, zap_coding::RewindScope::Code) => "code",
-        (crate::i18n::Locale::En, zap_coding::RewindScope::ConversationAndCode) => {
-            "conversation and code"
-        }
+        (
+            crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw,
+            zap_coding::RewindScope::Conversation,
+        ) => "对话",
+        (
+            crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw,
+            zap_coding::RewindScope::Code,
+        ) => "代码",
+        (
+            crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw,
+            zap_coding::RewindScope::ConversationAndCode,
+        ) => "对话和代码",
+        (_, zap_coding::RewindScope::Conversation) => "conversation",
+        (_, zap_coding::RewindScope::Code) => "code",
+        (_, zap_coding::RewindScope::ConversationAndCode) => "conversation and code",
     };
     let message = match crate::i18n::current_locale() {
         crate::i18n::Locale::Vi => format!(
@@ -20016,7 +20033,7 @@ fn handle_rewind_success(
                 format!(" (đã khôi phục {} tệp)", result.restored_files.len())
             }
         ),
-        crate::i18n::Locale::ZhCn => format!(
+        crate::i18n::Locale::ZhCn | crate::i18n::Locale::ZhTw => format!(
             "↩ 已将{scope}回退到“{}”之前{}。",
             result.point.prompt_preview,
             if result.restored_files.is_empty() {
@@ -20025,7 +20042,7 @@ fn handle_rewind_success(
                 format!("（恢复 {} 个文件）", result.restored_files.len())
             }
         ),
-        crate::i18n::Locale::En => format!(
+        _ => format!(
             "↩ Rewound {scope} to before “{}”{}.",
             result.point.prompt_preview,
             if result.restored_files.is_empty() {
@@ -20813,7 +20830,7 @@ fn handle_agent_event(
             // generic tool path). Unlike a full-list plan we do NOT suppress the row; the compact
             // `#N → status` line is a useful marker.
             if is_todo_action {
-                patch_live_todos_from_action(state, &arguments);
+                patch_live_todos_from_action(state, &ctx.current_session.id, &arguments);
             }
 
             // A full-list PLAN (`{todos:[…]}`) must populate the footer panel HERE —
@@ -21030,7 +21047,11 @@ fn handle_agent_event(
             // never clears, so it can't clobber the derived titles (a delta result yields no
             // matching lines and is a no-op).
             if is_todo_tool_name(&name) {
+                if success {
+                    sync_todo_panel_from_board(state, &ctx.current_session.id);
+                }
                 parse_todo_titles_into(&mut state.todo_titles, &output);
+                sync_todo_titles(state);
             }
             // If this call belongs to an active batch, the group header
             // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
@@ -22295,6 +22316,7 @@ fn handle_agent_event(
                     state.call_id_to_batch.remove(&cid);
                 }
             }
+            sync_todo_panel_from_board(state, &ctx.current_session.id);
         }
         AgentEvent::SubAgentDispatchStart { tasks } => {
             let n = tasks.len();
@@ -22506,15 +22528,13 @@ fn handle_agent_event(
         }
         AgentEvent::Steered { count: _, inputs } => {
             let confirmed = state.on_steered(&inputs);
-            if ctx.live_binding.is_none() {
-                for pending in confirmed {
-                    renderer.render(UiLine::UserWithAttachments {
-                        text: pending.message.text,
-                        attachments: pending.message.image_markers,
-                    });
-                }
-                renderer.flush();
+            for pending in confirmed {
+                renderer.render(UiLine::UserWithAttachments {
+                    text: pending.message.text,
+                    attachments: pending.message.image_markers,
+                });
             }
+            renderer.flush();
         }
     }
 }
@@ -23371,13 +23391,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0),
         });
-    // Todo panel source: the persistent `active_todos` cache. Hidden when the
-    // list is empty (`total == 0`) or fully done (`completed == total`) so a
-    // finished panel disappears — otherwise it stands across turns and resume.
-    let todo = state
-        .active_todos
-        .clone()
-        .filter(|p| p.total > 0 && p.completed < p.total);
+    // Todo panel source: the persistent `active_todos` cache.
+    // 对齐 WebUI：在轮次运行期间，展示完整的待办进度（包括全部勾选完成的 5/5 态）。
+    // 只有在 total == 0 时才不展示。全完成态将在 TurnComplete 阶段自动收敛。
+    let todo = state.active_todos.clone().filter(|p| p.total > 0);
     let approval = state
         .approval_panel
         .as_ref()
@@ -24951,9 +24968,13 @@ pub(crate) fn sync_todo_titles(state: &mut crate::state::UiState) {
 
 /// Fold ONE incremental `todo` action into the live footer panel + title cache, mirroring the
 /// canonical `reduce_todos`. Called for EVERY dispatch path so the panel never goes stale. A
-/// `todo update` while the panel is empty is a no-op (unknown id); a `todo add` from empty
+/// `todo update` while the panel is empty reads baseline from the session TodoBoard; a `todo add`
 /// creates the panel.
-pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, args: &str) {
+pub(crate) fn patch_live_todos_from_action(
+    state: &mut crate::state::UiState,
+    session_id: &str,
+    args: &str,
+) {
     use zap_capabilities::tools::todo::{apply_todo_action, TodoItem};
     let mut items: Vec<TodoItem> = state
         .active_todos
@@ -24962,10 +24983,18 @@ pub(crate) fn patch_live_todos_from_action(state: &mut crate::state::UiState, ar
             p.items
                 .iter()
                 .map(|(s, c)| TodoItem {
+                    id: None,
                     status: *s,
                     content: c.clone(),
                 })
                 .collect()
+        })
+        .or_else(|| {
+            if session_id.is_empty() {
+                None
+            } else {
+                zap_capabilities::tools::read_todo_board(session_id).map(|b| b.items)
+            }
         })
         .unwrap_or_default();
     apply_todo_action(&mut items, args);
@@ -24992,20 +25021,19 @@ pub(crate) fn todo_progress_from_board(session_id: &str) -> Option<crate::render
     Some(todo_progress_from_items(&board.items))
 }
 
-/// Historical helper kept for tests that build a transcript without a board.
-pub(crate) fn todo_progress_from_messages(
-    messages: &[zap_kernel::message::Message],
-) -> Option<crate::render::TodoProgress> {
-    let calls: Vec<(&str, &str)> = messages
-        .iter()
-        .flat_map(|m| m.tool_calls.iter())
-        .map(|c| (c.name.as_str(), c.arguments.as_str()))
-        .collect();
-    let todos = zap_capabilities::tools::todo::reduce_todos(calls);
-    if todos.is_empty() {
-        return None;
-    }
-    Some(todo_progress_from_items(&todos))
+/// Bind the footer todo panel to the session board, including the authoritative empty
+/// state. A cleared/closed board must remove the panel and its id→title cache; only
+/// non-empty boards should keep a panel.
+fn sync_todo_panel_from_board(state: &mut crate::state::UiState, session_id: &str) {
+    let items = zap_capabilities::tools::read_todo_board(session_id)
+        .map(|board| board.items)
+        .unwrap_or_default();
+    state.active_todos = if items.is_empty() {
+        None
+    } else {
+        Some(todo_progress_from_items(&items))
+    };
+    sync_todo_titles(state);
 }
 
 #[cfg(test)]
@@ -25050,105 +25078,6 @@ mod todo_block_tests {
         assert_eq!(p.items[1], (TodoStatus::InProgress, "b".to_string()));
         assert_eq!(p.items[2], (TodoStatus::Pending, "c".to_string()));
         assert_eq!((p.completed, p.total), (1, 3));
-    }
-
-    #[test]
-    fn todo_progress_from_messages_last_valid_wins() {
-        use zap_kernel::message::Message;
-        use zap_kernel::tool::ToolCall;
-        let mk = |id: &str, args: &str| {
-            Message::assistant(
-                "",
-                vec![ToolCall {
-                    id: id.into(),
-                    name: "todowrite".into(),
-                    arguments: args.into(),
-                }],
-            )
-        };
-        let msgs = vec![
-            mk("1", r#"{"todos":[{"content":"old","status":"pending"}]}"#),
-            mk(
-                "2",
-                r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#,
-            ),
-        ];
-        let p = todo_progress_from_messages(&msgs).expect("last valid todowrite → Some");
-        assert_eq!((p.completed, p.total), (1, 2)); // LAST call wins
-        assert_eq!(p.current.as_deref(), Some("b"));
-        assert_eq!(p.items.len(), 2);
-        assert!(todo_progress_from_messages(&[]).is_none()); // no todowrite → None
-    }
-
-    #[test]
-    fn todo_progress_from_messages_folds_incremental_todo_events() {
-        // Replay parity: a resumed session must reflect `todo` add/update events, not just the
-        // last full-list todowrite (this was the gap the incremental tool introduced).
-        use zap_kernel::message::Message;
-        use zap_kernel::tool::ToolCall;
-        let call = |id: &str, name: &str, args: &str| {
-            Message::assistant(
-                "",
-                vec![ToolCall {
-                    id: id.into(),
-                    name: name.into(),
-                    arguments: args.into(),
-                }],
-            )
-        };
-        let msgs = vec![
-            call(
-                "1",
-                "todowrite",
-                r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}"#,
-            ),
-            call(
-                "2",
-                "todo",
-                r#"{"action":"update","id":1,"status":"completed"}"#,
-            ),
-            call("3", "todo", r#"{"action":"add","content":"c"}"#),
-            call(
-                "4",
-                "todo",
-                r#"{"action":"update","id":3,"status":"in_progress"}"#,
-            ),
-        ];
-        use zap_capabilities::tools::todo::TodoStatus;
-        let p = todo_progress_from_messages(&msgs).expect("Some");
-        assert_eq!(p.total, 3, "the added task is counted");
-        assert_eq!(p.completed, 1);
-        assert_eq!(
-            p.current.as_deref(),
-            Some("c"),
-            "the in_progress item is #3 'c'"
-        );
-        assert_eq!(p.items[0], (TodoStatus::Completed, "a".to_string()));
-    }
-
-    #[test]
-    fn todo_progress_from_messages_folds_actions_array() {
-        use zap_kernel::message::Message;
-        use zap_kernel::tool::ToolCall;
-        let mk = |args: &str| {
-            Message::assistant(
-                "",
-                vec![ToolCall {
-                    id: "1".into(),
-                    name: "todowrite".into(),
-                    arguments: args.into(),
-                }],
-            )
-        };
-        let msgs = vec![
-            mk(r#"{"actions":[{"action":"add","content":"a"},{"action":"add","content":"b"}]}"#),
-            mk(
-                r#"{"actions":[{"action":"update","id":1,"status":"completed"},{"action":"update","id":2,"status":"in_progress"}]}"#,
-            ),
-        ];
-        let p = todo_progress_from_messages(&msgs).expect("actions fold");
-        assert_eq!((p.completed, p.total), (1, 2));
-        assert_eq!(p.current.as_deref(), Some("b"));
     }
 }
 

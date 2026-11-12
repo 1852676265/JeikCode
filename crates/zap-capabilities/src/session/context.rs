@@ -1,21 +1,25 @@
-//! `SessionContextHook` — injects Block 5 (Authoritative Project Instructions & Knowledge)
-//! as a frozen synthetic User message inside `sacred_floor`, and Block 6 (Session Baseline)
-//! as an independent leading `Role::System` message.
+//! `SessionContextHook` — injects two independent frozen synthetic User blocks inside
+//! `sacred_floor`: `<user_preferences>` (GLOBAL tier) and `<project_instructions>`
+//! (PROJECT tier + knowledge packs). Environment facts + the session-start Git snapshot
+//! are folded into the leading persona Block 1 (`<environment>`), so no separate baseline
+//! message is injected.
 //!
 //! ## Hot-reload (every user turn)
 //!
-//! On **each** user message (`turn_start`), GLOBAL/PROJECT/USER instructions +
+//! On **each** user message (`turn_start`), the GLOBAL + PROJECT instruction tiers +
 //! knowledge packs are re-checked by mtime/length. Unchanged files reuse the
-//! cached body (byte-identical → prefix cache holds). An edit is picked up on
-//! the next send without restart.
+//! cached body (byte-identical → prefix cache holds). An edit is picked up on the
+//! next send without restart.
 //!
 //! - Unchanged files → re-render is byte-identical → prefix cache still holds.
-//! - Changed instruction/glossary bytes → Block 5 invalidates, but earlier blocks (1-4)
-//!   remain cached!
-//! - **Block 6 (Baseline + Git snapshot) stays 100% frozen** at session-start: live `git status`
-//!   drifts every commit and would bust the cache every turn if refreshed.
+//! - Changed instruction/glossary bytes → that block invalidates, but the earlier leading
+//!   persona System run remains cached!
+//! - Both blocks stay off `Role::System`, so a downstream consecutive-system merger can
+//!   never fold user-owned bytes into the persona prefix.
 
-use super::instructions::render_instructions;
+use super::instructions::{
+    render_project_instructions, render_user_preferences, warn_legacy_user_tier_once,
+};
 use async_trait::async_trait;
 use zap_kernel::hook::LifecycleHooks;
 use zap_kernel::message::Conversation;
@@ -24,7 +28,10 @@ use zap_kernel::message::Conversation;
 use zap_kernel::message::{Message, Role};
 use std::path::PathBuf;
 
-/// Header for Block 5: Authoritative Project Instructions & Knowledge
+/// Header for the GLOBAL tier block: cross-project user preferences.
+pub const USER_PREFERENCES_HEADER: &str = super::instructions::USER_PREFERENCES_HEADER;
+
+/// Header for the PROJECT tier block: project instructions + knowledge packs.
 pub const INSTRUCTIONS_HEADER: &str = super::instructions::INSTRUCTIONS_HEADER;
 
 /// Header for Block 6: Session Baseline (environment + git snapshot)
@@ -83,10 +90,20 @@ impl SessionContextHook {
         self
     }
 
-    /// Render Block 5: Authoritative Project Instructions & Knowledge (if any).
-    /// Returns None if no instructions or client extras are present.
-    pub fn render_instructions_block(&self) -> Option<String> {
-        let mut instr = render_instructions(&self.home, &self.working_dir);
+    /// Render the GLOBAL tier block (`<user_preferences>`), if any.
+    pub fn render_user_preferences_block(&self) -> Option<String> {
+        render_user_preferences(&self.home)
+    }
+
+    /// Render the PROJECT tier block (`<project_instructions>`), if any.
+    /// Returns None if no project instructions or client extras are present.
+    ///
+    /// A client-supplied system prompt (OpenAI/Anthropic compat) is appended AFTER the
+    /// project packs so it sits at the bottom of the instruction stack.
+    pub fn render_project_instructions_block(&self) -> Option<String> {
+        // One-time migration notice when the removed `.jeikcode.user.md` tier is still present.
+        warn_legacy_user_tier_once(&self.working_dir);
+        let mut instr = render_project_instructions(&self.working_dir).unwrap_or_default();
         if let Some(extra) = &self.extra_append {
             if instr.is_empty() {
                 instr = format!("{INSTRUCTIONS_HEADER}\n\n# CLIENT SYSTEM INSTRUCTIONS\n{extra}\n</project_instructions>");
@@ -199,9 +216,10 @@ impl SessionContextHook {
 #[async_trait]
 impl LifecycleHooks for SessionContextHook {
     async fn session_start(&self, convo: &mut Conversation, _resumed: bool) {
-        // Reconcile instructions as frozen synthetic user block (inside sacred_floor),
-        // cleaning up any legacy System-role instructions and legacy headers.
+        // Reconcile user preferences + project instructions as frozen synthetic user
+        // blocks (inside sacred_floor), cleaning up any legacy System-role copies.
         convo.reconcile_system_block(INSTRUCTIONS_HEADER, None);
+        convo.reconcile_system_block(USER_PREFERENCES_HEADER, None);
         convo.reconcile_system_block(
             "=== AUTHORITATIVE PROJECT INSTRUCTIONS & KNOWLEDGE (*.md) ===",
             None,
@@ -212,7 +230,14 @@ impl LifecycleHooks for SessionContextHook {
             None,
         );
         convo.reconcile_frozen_user_block("=== AUTHORITATIVE PROJECT INSTRUCTIONS", None);
-        convo.reconcile_frozen_user_block(INSTRUCTIONS_HEADER, self.render_instructions_block());
+        convo.reconcile_frozen_user_block(
+            INSTRUCTIONS_HEADER,
+            self.render_project_instructions_block(),
+        );
+        convo.reconcile_frozen_user_block(
+            USER_PREFERENCES_HEADER,
+            self.render_user_preferences_block(),
+        );
 
         // Operating environment facts (Platform, Command habit, Working directory, Git branch)
         // are now directly injected into Block 1 (<environment>).
@@ -225,6 +250,7 @@ impl LifecycleHooks for SessionContextHook {
         // Hot-reload: mtime cache makes unchanged files free; reconcile is a
         // no-op when the rendered block is byte-identical.
         convo.reconcile_system_block(INSTRUCTIONS_HEADER, None);
+        convo.reconcile_system_block(USER_PREFERENCES_HEADER, None);
         convo.reconcile_system_block(
             "=== AUTHORITATIVE PROJECT INSTRUCTIONS & KNOWLEDGE (*.md) ===",
             None,
@@ -235,7 +261,14 @@ impl LifecycleHooks for SessionContextHook {
             None,
         );
         convo.reconcile_frozen_user_block("=== AUTHORITATIVE PROJECT INSTRUCTIONS", None);
-        convo.reconcile_frozen_user_block(INSTRUCTIONS_HEADER, self.render_instructions_block());
+        convo.reconcile_frozen_user_block(
+            INSTRUCTIONS_HEADER,
+            self.render_project_instructions_block(),
+        );
+        convo.reconcile_frozen_user_block(
+            USER_PREFERENCES_HEADER,
+            self.render_user_preferences_block(),
+        );
         convo.reconcile_system_block(BASELINE_HEADER, None);
         convo.reconcile_system_block(LEGACY_CONTEXT_HEADER, None);
     }
@@ -331,7 +364,7 @@ mod tests {
         std::fs::write(d.path().join("AGENTS.md"), "project rule X").unwrap();
         let hook = SessionContextHook::with_home(d.path(), d.path().join("nohome"));
         let instr = hook
-            .render_instructions_block()
+            .render_project_instructions_block()
             .expect("instructions rendered");
         assert!(instr.contains("PROJECT INSTRUCTIONS"));
         assert!(instr.contains("project rule X"));
@@ -431,9 +464,9 @@ mod tests {
     #[tokio::test]
     async fn turn_start_hot_reloads_agents_and_glossary() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join(".zap")).unwrap();
+        std::fs::create_dir_all(d.path().join(".jeikcode")).unwrap();
         std::fs::write(d.path().join("AGENTS.md"), "rule-v1").unwrap();
-        std::fs::write(d.path().join(".zap/glossary.md"), "term-v1").unwrap();
+        std::fs::write(d.path().join(".jeikcode/glossary.md"), "term-v1").unwrap();
         let hook = SessionContextHook::with_home(d.path(), d.path().join("nohome"));
 
         let mut convo = Conversation::new();
@@ -447,7 +480,7 @@ mod tests {
 
         // Mid-session edits on disk.
         std::fs::write(d.path().join("AGENTS.md"), "rule-v2-hot").unwrap();
-        std::fs::write(d.path().join(".zap/glossary.md"), "term-v2-hot").unwrap();
+        std::fs::write(d.path().join(".jeikcode/glossary.md"), "term-v2-hot").unwrap();
         convo.push(Message::user("next turn"));
         hook.turn_start(&mut convo).await;
 

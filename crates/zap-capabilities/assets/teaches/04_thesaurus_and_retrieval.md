@@ -4,8 +4,8 @@
 
 ## 1. 配置文件路径
 
-- **工作区项目级**：`<workspace>/.zap/thesaurus/*.txt`（优先加载）
-- **用户全局级**：`~/.zap/thesaurus/*.txt`
+- **工作区项目级**：`<workspace>/.jeikcode/thesaurus/*.txt`（优先加载）
+- **用户全局级**：`~/.jeikcode/thesaurus/*.txt`
 
 ---
 
@@ -23,7 +23,7 @@
 - 支持 1:1、1:N、N:M 映射。
 
 ### 配置示例
-新建 `.zap/thesaurus/biz.txt`：
+新建 `.jeikcode/thesaurus/biz.txt`：
 ```text
 风控, 反欺诈, 黑名单 = risk_control, anti_fraud, blacklist
 积分商城, 积分兑换 = points_mall, point_exchange

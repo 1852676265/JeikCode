@@ -186,6 +186,34 @@ pub fn session_draft_working_dir(session_id: &str) -> Option<PathBuf> {
         .cloned()
 }
 
+static SESSION_DRAFT_PROVIDERS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
+
+fn session_draft_providers() -> &'static StdMutex<HashMap<String, String>> {
+    SESSION_DRAFT_PROVIDERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub fn set_session_draft_provider(session_id: String, provider: String) {
+    session_draft_providers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id, provider);
+}
+
+pub fn get_session_draft_provider(session_id: &str) -> Option<String> {
+    session_draft_providers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+}
+
+pub fn take_session_draft_provider(session_id: &str) -> Option<String> {
+    session_draft_providers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id)
+}
+
 pub(crate) fn runtime_start_is_session_in_use(error: &zap_coding::RuntimeStartError) -> bool {
     matches!(
         error,
@@ -350,8 +378,13 @@ pub async fn ensure_registry_runner(
         return Err(format!("provider {provider_name:?} not found"));
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
-    let runtime_config: CodingRuntimeConfig =
+    let mut runtime_config: CodingRuntimeConfig =
         crate::live_api::live_runtime_config(&config, &provider_name, &working_dir, telemetry);
+    crate::live_api::apply_session_effort_override(
+        &mut runtime_config,
+        &working_dir,
+        Some(&session_id),
+    );
 
     let session_mode = if let Ok(snapshot) = load_snapshot(&working_dir, &session_id) {
         let _ = take_session_draft(&session_id);
@@ -518,10 +551,14 @@ pub fn registry_session_snapshot(
 /// Submit to a session owned by the L2 registry (TUI background / non-hub view).
 pub async fn submit_via_registry(
     session_id: &str,
-    runtime_input: UserInput,
+    mut runtime_input: UserInput,
     echo_input: UserInput,
     client_input_id: Option<String>,
 ) -> Result<zap_coding::SubmitReceipt, String> {
+    // 身份契约：客户端关联键即落盘消息 id（与 hub 路径保持一致）。
+    if runtime_input.id.is_none() {
+        runtime_input.id = client_input_id.clone();
+    }
     let handle = zap_coding::session_runtime_registry::SessionRuntimeRegistry::global()
         .handle(&session_id.to_string())
         .ok_or_else(|| format!("session {session_id} has no live registry handle for submit"))?;
@@ -1122,8 +1159,13 @@ pub async fn ensure_headless_runtime(
         return Err(format!("provider {provider_name:?} not found"));
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
-    let runtime_config: CodingRuntimeConfig =
+    let mut runtime_config: CodingRuntimeConfig =
         crate::live_api::live_runtime_config(&config, &provider_name, &working_dir, telemetry);
+    crate::live_api::apply_session_effort_override(
+        &mut runtime_config,
+        &working_dir,
+        requested_session_id.as_deref(),
+    );
     let (session_mode, initial_snapshot) = match requested_session_id {
         Some(id) => {
             let snapshot = load_snapshot(&working_dir, &id)?;

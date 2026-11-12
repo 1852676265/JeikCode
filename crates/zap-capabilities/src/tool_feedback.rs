@@ -327,6 +327,7 @@ pub struct PathNotFoundHint {
     pub suggestion: Option<PathBuf>,
     pub similar: Vec<PathBuf>,
     pub cwd_note: String,
+    pub display: Option<String>,
 }
 
 impl PathNotFoundHint {
@@ -338,15 +339,14 @@ impl PathNotFoundHint {
                 "\nDid you mean {}?",
                 crate::pathnorm::to_display(s)
             ));
+        } else if self.similar.len() == 1 {
+            let display_name = self.render_similar_entry(&self.similar[0]);
+            out.push_str(&format!("\nDid you mean {display_name}?"));
         } else if !self.similar.is_empty() {
             let names: Vec<String> = self
                 .similar
                 .iter()
-                .map(|p| {
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| crate::pathnorm::to_display(p))
-                })
+                .map(|p| self.render_similar_entry(p))
                 .collect();
             out.push_str(&format!(
                 "\nDid you mean one of these?\n  - {}",
@@ -356,29 +356,56 @@ impl PathNotFoundHint {
         out.push_str(&format!("\n{}", self.cwd_note));
         out
     }
+
+    fn render_similar_entry(&self, p: &Path) -> String {
+        if let Some(ref display) = self.display {
+            if let Some(parent) = Path::new(display).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let file_name = p.file_name().unwrap_or_else(|| p.as_os_str());
+                    let joined = parent.join(file_name);
+                    return crate::pathnorm::to_display(&joined);
+                }
+            }
+        }
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| crate::pathnorm::to_display(p))
+    }
 }
 
 /// Build path-not-found hints for `resolved` (absolute or joined path).
 pub fn path_not_found_hint(resolved: &Path, cwd: &Path) -> PathNotFoundHint {
+    path_not_found_hint_with_display(resolved, cwd, None)
+}
+
+/// Build path-not-found hints for `resolved` with the caller-supplied `display` string.
+pub fn path_not_found_hint_with_display(
+    resolved: &Path,
+    cwd: &Path,
+    display: Option<&str>,
+) -> PathNotFoundHint {
+    let norm_resolved = crate::pathnorm::lexical_normalize(resolved);
     let cwd_note = format!(
         "Note: your current working directory is {}",
         crate::pathnorm::to_display(cwd)
     );
-    let (suggestion, similar) = collect_path_hints(resolved, cwd);
+    let (suggestion, similar) = collect_path_hints(&norm_resolved, cwd);
     PathNotFoundHint {
         suggestion,
         similar,
         cwd_note,
+        display: display.map(str::to_string),
     }
 }
 
 /// Full model-facing "path does not exist" error with Did-you-mean enrichment.
 pub fn format_path_not_found(tool: &str, display: &str, resolved: &Path, cwd: &Path) -> String {
+    let norm_resolved = crate::pathnorm::lexical_normalize(resolved);
     let base = format!(
         "{tool}: path does not exist: {display} (resolved to {})",
-        crate::pathnorm::to_display(resolved)
+        crate::pathnorm::to_display(&norm_resolved)
     );
-    let hint = path_not_found_hint(resolved, cwd);
+    let hint = path_not_found_hint_with_display(&norm_resolved, cwd, Some(display));
     format!("{base}{}", hint.format_suffix())
 }
 
@@ -646,5 +673,34 @@ mod tests {
         let known = ["CouponService", "OrderService", "ApplyCoupon", "User"];
         let hits = similar_symbol_names("coupon", known.into_iter(), 5);
         assert!(hits.iter().any(|h| h.contains("Coupon")), "{hits:?}");
+    }
+
+    #[test]
+    fn format_path_not_found_normalizes_dotdot_and_preserves_display_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_dir = root.path().join("jeikcode");
+        let sibling_dir = root.path().join("cc-switch").join("src").join("config");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        std::fs::write(
+            sibling_dir.join("appConfig.tsx"),
+            "export const config = {};",
+        )
+        .unwrap();
+
+        let display = "../cc-switch/src/config/appConfig.ts";
+        let raw_resolved = repo_dir.join(display);
+        let out = format_path_not_found("read", display, &raw_resolved, &repo_dir);
+
+        // 1. Must NOT contain unnormalized /../ in (resolved to ...)
+        assert!(
+            !out.contains("/../"),
+            "resolved path in error message should not contain uncollapsed /../: {out}"
+        );
+        // 2. Must suggest the full relative path with caller's directory prefix
+        assert!(
+            out.contains("Did you mean ../cc-switch/src/config/appConfig.tsx?"),
+            "suggestion should preserve input directory prefix and singular grammar: {out}"
+        );
     }
 }

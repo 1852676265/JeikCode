@@ -25,15 +25,15 @@ pub fn installed_plugins_file() -> Option<PathBuf> {
 
 /// Project-level plugins directory for a given working directory and scope.
 ///
-/// - `Project` scope: `<working_dir>/.zap/plugins/`
-/// - `Local` scope: `<working_dir>/.zap/plugins/local/`
+/// - `Project` scope: `<working_dir>/.jeikcode/plugins/`
+/// - `Local` scope: `<working_dir>/.jeikcode/plugins/local/`
 ///
 /// Returns `None` for `User` scope (user scope uses the global `plugins_root()`).
 pub fn project_plugins_root(
     working_dir: &std::path::Path,
     scope: &InstallScope,
 ) -> Option<PathBuf> {
-    let base = ".zap/plugins";
+    let base = ".jeikcode/plugins";
     match scope {
         InstallScope::Project => Some(working_dir.join(base)),
         InstallScope::Local => Some(working_dir.join(base).join("local")),
@@ -78,7 +78,7 @@ mod tests {
         let root = project_plugins_root(dir, &InstallScope::Project).unwrap();
         assert_eq!(
             root,
-            std::path::PathBuf::from("/tmp/myproject/.zap/plugins")
+            std::path::PathBuf::from("/tmp/myproject/.jeikcode/plugins")
         );
     }
 
@@ -88,7 +88,7 @@ mod tests {
         let root = project_plugins_root(dir, &InstallScope::Local).unwrap();
         assert_eq!(
             root,
-            std::path::PathBuf::from("/tmp/myproject/.zap/plugins/local")
+            std::path::PathBuf::from("/tmp/myproject/.jeikcode/plugins/local")
         );
     }
 

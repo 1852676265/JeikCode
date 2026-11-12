@@ -43,6 +43,48 @@ pub(crate) fn expand_tilde(raw: &str) -> Option<PathBuf> {
     expand_tilde_with_home(raw, home_dir().as_deref())
 }
 
+/// Clean model-supplied path variations:
+/// - Leading/trailing whitespace and newlines
+/// - Balanced quotes, backticks, or angle brackets (`"path"`, `'path'`, `` `path` ``, `<path>`)
+/// - `file://` and `file://localhost/` schemes
+/// - Windows leading slash before drive letter (`/C:/path` -> `C:/path`, `\C:\path` -> `C:\path`)
+/// - URL percent-encoded spaces (`%20` -> ` `)
+pub(crate) fn clean_model_path_input(raw: &str) -> String {
+    let mut s = raw.trim();
+    for _ in 0..2 {
+        let trimmed = s.trim();
+        if (trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() >= 2)
+            || (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+            || (trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 2)
+        {
+            s = trimmed[1..trimmed.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        s = rest;
+    }
+
+    if s.len() >= 3 && (s.starts_with('/') || s.starts_with('\\')) {
+        let mut chars = s[1..].chars();
+        if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
+            if first.is_ascii_alphabetic() && (second == ':' || second == '\u{FF1A}') {
+                s = &s[1..];
+            }
+        }
+    }
+
+    if s.contains("%20") {
+        return s.replace("%20", " ");
+    }
+
+    s.to_string()
+}
+
 /// Resolve a model-supplied path on every platform: `$VAR`/`${VAR}` (and `%VAR%`
 /// on Windows) expanded FIRST — against the very values the `bash` tool exports to
 /// shell children, so `"$TMPDIR/x"` resolves identically in a shell and in a tool
@@ -53,6 +95,8 @@ pub(crate) fn expand_tilde(raw: &str) -> Option<PathBuf> {
 /// native location so they do not become `{cwd_drive}:\tmp\foo`. On Unix those
 /// strings are already native absolute paths and are left unchanged.
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
+    let cleaned = clean_model_path_input(raw);
+    let raw = &cleaned;
     // Env expansion runs BEFORE the tilde/absolute tests so a variable holding a
     // `~` form still expands, and a prompt-quoted `"$TMPDIR/x"` still resolves.
     // Undefined names stay verbatim (`special_dirs::expand`), leaving the
@@ -319,8 +363,8 @@ mod tests {
     fn backslash_expands_on_windows() {
         let home = Path::new(r"C:\Users\csdn");
         assert_eq!(
-            expand_tilde_with_home(r"~\.zap\x", Some(home)),
-            Some(PathBuf::from(r"C:\Users\csdn\.zap\x"))
+            expand_tilde_with_home(r"~\.jeikcode\x", Some(home)),
+            Some(PathBuf::from(r"C:\Users\csdn\.jeikcode\x"))
         );
         // Doubled separator must not escape to the drive root.
         assert_eq!(
@@ -518,5 +562,23 @@ mod tests {
             // With no process `HOME`, the special-dir fallback uses the same home as `~`.
             _ => assert_eq!(via_env, home.join("x")),
         }
+    }
+
+    #[test]
+    fn clean_model_path_handles_quirks() {
+        assert_eq!(clean_model_path_input(" `src/main.rs` \n"), "src/main.rs");
+        assert_eq!(clean_model_path_input("\"src/main.rs\""), "src/main.rs");
+        assert_eq!(
+            clean_model_path_input("file:///E:/code/file.rs"),
+            "E:/code/file.rs"
+        );
+        assert_eq!(
+            clean_model_path_input("/C:/code/file.rs"),
+            "C:/code/file.rs"
+        );
+        assert_eq!(
+            clean_model_path_input("my%20folder/note.md"),
+            "my folder/note.md"
+        );
     }
 }

@@ -43,8 +43,6 @@ const SENSITIVE_MARKERS: &[&str] = &[
     ".git-credentials",
     "/.jeikcode/auth.toml",
     "/.jeikcode/auth/",
-    "/.zap/auth.toml",
-    "/.zap/auth/",
     "/.docker/config",
     ".npmrc",
     ".pypirc",
@@ -401,6 +399,50 @@ pub(crate) fn resolved_target_sensitivity(raw: &str, cwd: &Path) -> (bool, PathB
     )
 }
 
+/// Match a path against the project/user `.codegraphignore.graph` sensitive list.
+/// This is the same source grep/glob use, so `read` and search agree on what is
+/// a credential path. The matcher is rebuilt per call; the gate only runs for
+/// sensitive candidates and reads a couple of small ignore files.
+fn codegraph_sensitive_match(cwd: &Path, target: &Path) -> bool {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(cwd);
+    let cfg = crate::paths::config_dir();
+    let mut added = false;
+    for name in [".codegraphignore.graph", ".codegraignore.graph"] {
+        for path in [
+            cwd.join(name),
+            cwd.join(".jeikcode").join(name),
+            cfg.join(name),
+        ] {
+            if path.is_file() {
+                let _ = builder.add(&path);
+                added = true;
+            }
+        }
+    }
+    if !added {
+        return false;
+    }
+    let Ok(gi) = builder.build() else {
+        return false;
+    };
+    // `target` is canonicalized by the caller, while `cwd` may still carry the
+    // non-canonical temp prefix (`/var` vs `/private/var`, Windows short paths).
+    // Never pass an absolute/out-of-root path to `ignore`: it panics instead of
+    // returning a miss.
+    let rel = target.strip_prefix(cwd).ok().or_else(|| {
+        let cwd_canon = std::fs::canonicalize(cwd).ok()?;
+        target.strip_prefix(cwd_canon).ok()
+    });
+    let Some(rel) = rel else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    gi.matched_path_or_any_parents(rel, target.is_dir())
+        .is_ignore()
+}
+
 fn local_read_target_sensitivity(tool: &str, args: &str, cwd: &Path) -> Option<(bool, PathBuf)> {
     let target = local_read_target(tool, args, cwd)?;
     let identity = resolved_filesystem_path(&target);
@@ -409,7 +451,9 @@ fn local_read_target_sensitivity(tool: &str, args: &str, cwd: &Path) -> Option<(
     })
     .to_string();
     Some((
-        path_is_sensitive(&identity) || references_sensitive_path(&marker_args),
+        path_is_sensitive(&identity)
+            || references_sensitive_path(&marker_args)
+            || codegraph_sensitive_match(cwd, &identity),
         identity,
     ))
 }
@@ -462,8 +506,19 @@ impl ToolMiddleware for SensitivePathGate {
             tool.name(),
             "read" | "read_file" | "grep" | "glob" | "code_explore"
         );
+        // `include_sensitive` is the explicit approval switch for directory
+        // searches; the walker cannot see individual credential files before
+        // the call, so gate the whole search here.
+        let includes_sensitive = matches!(tool.name(), "grep" | "glob")
+            && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.get("include_sensitive")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(false);
 
-        let mut sensitive = raw_sensitive;
+        let mut sensitive = raw_sensitive || includes_sensitive;
         let mut canonical_identity = None::<String>;
         let mut rememberable = true;
 
@@ -565,19 +620,10 @@ mod tests {
             "real secret variant"
         );
         assert!(references_sensitive_path(
-            r#"{"file_path":"/home/u/.zap/auth.toml"}"#
-        ));
-        assert!(references_sensitive_path(
             r#"{"file_path":"/home/u/.jeikcode/auth.toml"}"#
         ));
         assert!(references_sensitive_path(
-            r#"{"command":"cat ~/.zap/auth.toml"}"#
-        ));
-        assert!(references_sensitive_path(
             r#"{"command":"cat ~/.jeikcode/auth.toml"}"#
-        ));
-        assert!(references_sensitive_path(
-            r#"{"file_path":"C:\\Users\\u\\.zap\\auth.toml"}"#
         ));
         assert!(references_sensitive_path(
             r#"{"file_path":"C:\\Users\\u\\.jeikcode\\auth.toml"}"#
@@ -624,6 +670,35 @@ mod tests {
         RequestCtx::new(tx, Some(Duration::from_millis(20)))
     }
 
+    #[test]
+    fn codegraph_graph_rules_flag_custom_sensitive_reads() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".codegraphignore.graph"), "secrets/*.txt\n").unwrap();
+        std::fs::create_dir_all(d.path().join("secrets")).unwrap();
+        std::fs::write(d.path().join("secrets/token.txt"), "x").unwrap();
+
+        let (sensitive, _) =
+            local_read_target_sensitivity("read", r#"{"path":"secrets/token.txt"}"#, d.path())
+                .expect("target");
+        assert!(sensitive, "graph rules must flag custom credential paths");
+    }
+
+    #[tokio::test]
+    async fn include_sensitive_search_requires_approval() {
+        let gate = SensitivePathGate::pinned(std::env::temp_dir());
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::GrepTool);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "grep".into(),
+            arguments: r#"{"pattern":"x","include_sensitive":true}"#.into(),
+        };
+        let res = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            res.is_deny(),
+            "include_sensitive must request approval (silent driver fails closed)"
+        );
+    }
+
     #[tokio::test]
     async fn safe_ordinary_read_passes_without_round_trip() {
         let gate = SensitivePathGate::pinned(std::env::temp_dir());
@@ -631,10 +706,20 @@ mod tests {
         let mut call = ToolCall {
             id: "1".into(),
             name: "read_file".into(),
-            arguments: r#"{"file_path":"src/main.rs"}"#.into(),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
         };
         // Ordinary path → Proceed WITHOUT awaiting the (silent) driver.
         assert!(!gate.before(&mut call, &tool, &silent_rt()).await.is_deny());
+    }
+
+    #[test]
+    fn graph_match_outside_root_returns_false_instead_of_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        assert!(!codegraph_sensitive_match(
+            root.path(),
+            &outside.path().join("src/main.rs")
+        ));
     }
 
     #[tokio::test]
@@ -658,7 +743,7 @@ mod tests {
         let mut call = ToolCall {
             id: "1".into(),
             name: "read_file".into(),
-            arguments: r#"{"file_path":"/home/u/.ssh/id_rsa"}"#.into(),
+            arguments: r#"{"path":"/home/u/.ssh/id_rsa"}"#.into(),
         };
         let res = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(
@@ -849,13 +934,7 @@ mod tests {
     #[test]
     fn the_default_credential_markers_survive_relocation() {
         assert!(references_sensitive_path(
-            r#"{"file_path":"/home/u/.zap/auth.toml"}"#
-        ));
-        assert!(references_sensitive_path(
             r#"{"file_path":"/home/u/.jeikcode/auth.toml"}"#
-        ));
-        assert!(references_sensitive_path(
-            r#"{"command":"cat ~/.zap/auth/token.json"}"#
         ));
         assert!(references_sensitive_path(
             r#"{"command":"cat ~/.jeikcode/auth/token.json"}"#

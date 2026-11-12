@@ -13,6 +13,78 @@ import { gitPanelFingerprint, toolTouchesWorktree } from './gitRefresh.ts';
 
 export { toolTouchesWorktree };
 
+export interface SessionRepoRecord {
+  index: number;
+  name?: string;
+  root: string;
+}
+
+function getSafeLocalStorage(): Storage | null {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return window.localStorage;
+  }
+  if (typeof globalThis !== 'undefined' && (globalThis as any).localStorage) {
+    return (globalThis as any).localStorage;
+  }
+  return null;
+}
+
+export function getSessionActiveRepo(sessionId?: string | null, repos?: GitRepoInfo[]): string | null {
+  if (!sessionId || !repos || repos.length === 0) return null;
+  try {
+    const storage = getSafeLocalStorage();
+    const raw = storage ? storage.getItem(`jeikcode:session_repo:${sessionId}`) : null;
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<SessionRepoRecord>;
+      // 1. 优先按 root 绝对路径匹配
+      if (parsed.root && repos.some((r) => r.root === parsed.root)) {
+        return parsed.root;
+      }
+      // 2. 其次按仓库名匹配（防路径或排序漂移）
+      if (parsed.name) {
+        const byName = repos.find((r) => r.name.toLowerCase() === parsed.name!.toLowerCase());
+        if (byName) return byName.root;
+      }
+      // 3. 索引平滑兜底
+      if (typeof parsed.index === 'number' && parsed.index >= 0 && parsed.index < repos.length) {
+        return repos[parsed.index].root;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function saveSessionActiveRepo(
+  sessionId: string | null | undefined,
+  repoRoot: string,
+  repos: GitRepoInfo[],
+): void {
+  const storage = getSafeLocalStorage();
+  if (!sessionId || !storage) return;
+  try {
+    const idx = repos.findIndex((r) => r.root === repoRoot);
+    const item = idx !== -1 ? repos[idx] : undefined;
+    const record: SessionRepoRecord = {
+      index: idx !== -1 ? idx : 0,
+      name: item?.name,
+      root: repoRoot,
+    };
+    storage.setItem(`jeikcode:session_repo:${sessionId}`, JSON.stringify(record));
+  } catch {}
+}
+
+export function resolveDefaultRepoRoot(repos: GitRepoInfo[]): string | null {
+  if (!repos || repos.length === 0) return null;
+  // 1. 优先匹配核心主力仓（如 JeikCode，不区分大小写）
+  const core = repos.find((r) => r.name.toLowerCase() === 'jeikcode');
+  if (core) return core.root;
+  // 2. 其次匹配标记为 is_root 的仓
+  const rootRepo = repos.find((r) => r.is_root);
+  if (rootRepo) return rootRepo.root;
+  // 3. 默认以第 0 个子仓为基准
+  return repos[0].root;
+}
+
 export interface GitProjectState {
   branches: GitBranchesResponse | null;
   commits: GitCommitItem[];
@@ -40,7 +112,7 @@ class ProjectGitManager {
   private inflights = new Map<string, InflightControl>();
   private pendingVersions = new Map<string, number>();
   private lastFetchTimes = new Map<string, number>();
-  private fetchInflight = new Map<string, boolean>();
+  private fetchInflight = new Map<string, Promise<boolean>>();
 
   private normalizeKey(cwd?: string): string {
     return cwd ? cwd.trim() : '';
@@ -153,6 +225,39 @@ class ProjectGitManager {
     return Boolean(set && set.size > 0);
   }
 
+  /**
+   * 0ms 瞬间乐观更新：立即同步修改内存与缓存状态，并通知全量订阅者（GitPanel、标签计数徽章等），杜绝任何网络延迟带来的卡顿视觉
+   */
+  public setOptimisticState(
+    cwd: string | undefined,
+    updater: (prev: GitProjectState) => GitProjectState,
+  ): void {
+    const key = this.normalizeKey(cwd);
+    const cur = this.getState(key);
+    const updated = updater(cur);
+    const fingerprint = gitPanelFingerprint({
+      branch: updated.branches?.current || updated.gitStatus?.current_branch || '',
+      ahead: updated.gitStatus?.ahead,
+      behind: updated.gitStatus?.behind,
+      staged: updated.gitStatus?.staged || [],
+      unstaged: updated.gitStatus?.unstaged || [],
+      untracked: updated.gitStatus?.untracked || [],
+      commits: updated.commits.map((c) => ({
+        hash: c.hash,
+        message: c.message,
+        refs: c.refs,
+      })),
+    });
+    const finalState: GitProjectState = {
+      ...updated,
+      fingerprint,
+      version: cur.version + 1,
+    };
+    this.states.set(key, finalState);
+    this.saveToStorage(key, finalState);
+    this.notify(key);
+  }
+
   private notify(key: string): void {
     const state = this.states.get(key);
     if (!state) return;
@@ -238,6 +343,15 @@ class ProjectGitManager {
           shouldFetchGraph = true;
         }
 
+        // 如果 ahead / behind 变化了，说明有新增 commit 或远端更新，必须拉取 Graph
+        if (
+          prevState.gitStatus &&
+          (prevState.gitStatus.ahead !== statusRes.ahead ||
+            prevState.gitStatus.behind !== statusRes.behind)
+        ) {
+          shouldFetchGraph = true;
+        }
+
         let newCommits = prevState.commits;
         if (shouldFetchGraph) {
           const graphRes = await fetchGitGraph({
@@ -263,12 +377,17 @@ class ProjectGitManager {
           })),
         });
 
+        const curState = this.getState(key);
         const nextState: GitProjectState = {
           branches: branchRes,
           commits: newCommits,
           gitStatus: statusRes,
-          repos: prevState.repos,
-          activeRepoRoot: prevState.activeRepoRoot,
+          // 动态继承最新内存中的 repos 与 activeRepoRoot，坚决防止被请求前的旧快照覆盖重置
+          repos: curState.repos && curState.repos.length > 0 ? curState.repos : prevState.repos,
+          activeRepoRoot:
+            curState.activeRepoRoot !== undefined && curState.activeRepoRoot !== null
+              ? curState.activeRepoRoot
+              : prevState.activeRepoRoot,
           filterBranch: effectiveBranchFilter,
           loading: false,
           error: null,
@@ -313,16 +432,24 @@ class ProjectGitManager {
   /**
    * 异步轻量更新 repos 列表（仅在初次或确有需要时调用，不阻断主视图渲染）
    */
-  public async refreshRepos(cwd?: string): Promise<void> {
+  public async refreshRepos(cwd?: string, sessionId?: string | null): Promise<void> {
     const key = this.normalizeKey(cwd);
     try {
       const res = await fetchGitRepos(key);
       const cur = this.getState(key);
       let nextActive = cur.activeRepoRoot;
       if (res.repos.length > 0) {
-        if (!nextActive || !res.repos.some((r) => r.root === nextActive)) {
-          const rootRepo = res.repos.find((r) => r.is_root) || res.repos[0];
-          nextActive = rootRepo ? rootRepo.root : null;
+        // 1. 优先尝试从当前会话绑定的历史记忆中恢复（老会话精准还原）
+        const fromSession = getSessionActiveRepo(sessionId, res.repos);
+        if (fromSession) {
+          nextActive = fromSession;
+        } else if (!nextActive || !res.repos.some((r) => r.root === nextActive)) {
+          // 2. 新会话或尚未绑定：自动默认激活主力子仓（如 JeikCode 或 0 号仓）
+          const defRoot = resolveDefaultRepoRoot(res.repos);
+          nextActive = defRoot;
+          if (sessionId && defRoot) {
+            saveSessionActiveRepo(sessionId, defRoot, res.repos);
+          }
         }
       }
       const switchedRepo = nextActive !== cur.activeRepoRoot;
@@ -351,7 +478,7 @@ class ProjectGitManager {
    * - 可见性守卫（后台隐藏标签页绝不偷跑网络请求）
    * - Fetch 成功后自动级联 scheduleRefresh(forceAll: true) 刷新全部远端分支与提交图
    */
-  public async triggerAutoFetch(
+  public triggerAutoFetch(
     cwd: string | undefined,
     options: {
       force?: boolean;
@@ -364,56 +491,67 @@ class ProjectGitManager {
 
     // 1. 节流：非强制时，距上次成功未满 60 秒直接跳过
     if (!options.force && now - last < 60_000) {
-      return false;
+      return Promise.resolve(false);
     }
 
     // 2. 避免后台未激活标签偷跑
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-      return false;
+      return Promise.resolve(false);
     }
 
-    // 3. 避免并发碰撞
-    if (this.fetchInflight.get(key)) {
-      return false;
+    // 3. 并发 Promise 共享池：已有在飞请求直接复用该 Promise，等待同一网络响应，绝不返回 false 误报失败
+    const existing = this.fetchInflight.get(key);
+    if (existing) {
+      return existing;
     }
 
     const cur = this.getState(key);
     const targetDir = cur.activeRepoRoot || key;
 
-    this.fetchInflight.set(key, true);
-    try {
-      const res = await gitFetch({ cwd: targetDir, prune: options.prune ?? true });
-      this.lastFetchTimes.set(key, Date.now());
+    const fetchPromise = (async () => {
+      try {
+        const res = await gitFetch({ cwd: targetDir, prune: options.prune ?? true });
+        this.lastFetchTimes.set(key, Date.now());
 
-      // Fetch 成功后，远程引用 (refs/remotes/*) 和 FETCH_HEAD 已经更新，
-      // 级联拉取最新的 status 与完整的 graph，更新 UI 和 sessionStorage
-      this.scheduleRefresh(key, {
-        immediate: true,
-        forceAll: true,
-        reason: 'autofetch_complete',
-      });
-      return res.success;
-    } catch (err) {
-      // 静默处理网络错误/超时，不污染主界面
-      console.debug('[GitStore] Silent fetch skipped or failed:', err);
-      return false;
-    } finally {
-      this.fetchInflight.set(key, false);
-    }
+        // Fetch 成功后，远程引用 (refs/remotes/*) 和 FETCH_HEAD 已经更新，
+        // 级联拉取最新的 status 与完整的 graph，更新 UI 并触发后端以最新 FETCH_HEAD 重新落缓存
+        await this.scheduleRefresh(key, {
+          immediate: true,
+          forceAll: true,
+          reason: 'autofetch_complete',
+        });
+        return res.success;
+      } catch (err) {
+        console.debug('[GitStore] Silent fetch skipped or failed:', err);
+        return false;
+      } finally {
+        this.fetchInflight.delete(key);
+      }
+    })();
+
+    this.fetchInflight.set(key, fetchPromise);
+    return fetchPromise;
   }
 
   public isFetching(cwd?: string): boolean {
     const key = this.normalizeKey(cwd);
-    return Boolean(this.fetchInflight.get(key));
+    return this.fetchInflight.has(key);
   }
 
-  public setActiveRepoRoot(cwd: string | undefined, repoRoot: string | null): void {
+  public setActiveRepoRoot(
+    cwd: string | undefined,
+    repoRoot: string | null,
+    sessionId?: string | null,
+  ): void {
     const key = this.normalizeKey(cwd);
     const cur = this.getState(key);
     const updated: GitProjectState = {
       ...cur,
       activeRepoRoot: repoRoot,
     };
+    if (sessionId && repoRoot && cur.repos && cur.repos.length > 0) {
+      saveSessionActiveRepo(sessionId, repoRoot, cur.repos);
+    }
     this.states.set(key, updated);
     this.saveToStorage(key, updated);
     this.notify(key);
@@ -423,7 +561,7 @@ class ProjectGitManager {
   /**
    * 接收来自 /events SSE 广播的增量事件（支持异地多设备协同）
    */
-  public handleRemoteUpdate(data: { cwd?: string; version?: number; force?: boolean }): void {
+  public handleRemoteUpdate(data: { cwd?: string; version?: number; force?: boolean; fetch?: boolean }): void {
     const key = this.normalizeKey(data.cwd);
     const remoteVer = data.version ?? 0;
     const cur = this.getState(key);
@@ -435,6 +573,11 @@ class ProjectGitManager {
     if (this.hasSubscribers(key)) {
       // 当前设备正打开着 Git 面板，立即强制刷新
       void this.scheduleRefresh(key, { immediate: true, forceAll: true, reason: 'remote_broadcast' });
+      // 分支/远端引用可能已变：按既有 60s 节流补一次静默 fetch（不强制、绝不 pull），
+      // 与后端「关键节点触发、不做高频轮询」的温和策略保持一致。
+      if (data.fetch) {
+        void this.triggerAutoFetch(key);
+      }
     } else {
       // 当前设备处于折叠状态，仅记下版本号，0次网络开销，等用户点开时才拉取
       this.pendingVersions.set(key, remoteVer || cur.version + 1);

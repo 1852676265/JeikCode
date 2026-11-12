@@ -60,7 +60,10 @@ pub struct AnthropicConfig {
     /// Explicit thinking enabled/disabled flag from model config.
     pub thinking_enabled: Option<bool>,
     /// Maximum tokens allocated to the thinking phase (`thinking.budget_tokens`).
-    /// Defaults to 10000 (or derived from effort / max_tokens clamp) when thinking is enabled.
+    /// Defaults to 10000 (or the effort table) when thinking is enabled. The
+    /// resolved value is a downstream constraint: it shrinks to leave
+    /// [`MIN_ANSWER_TOKENS`](super::thinking::MIN_ANSWER_TOKENS) and never
+    /// expands `max_tokens`.
     pub thinking_budget: Option<u32>,
     /// Thinking mode: `"enabled"` (default) or `"adaptive"`.
     pub thinking_type: Option<String>,
@@ -136,23 +139,15 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn resolve_policy(cfg: &AnthropicConfig) -> ReasoningPolicy {
-        cfg.reasoning_policy
-            .or_else(|| {
-                cfg.reasoning_model.map(|rm| {
-                    if rm {
-                        ReasoningPolicy::Include
-                    } else {
-                        ReasoningPolicy::Exclude
-                    }
-                })
-            })
-            .unwrap_or_else(|| {
-                if cfg.thinking {
-                    ReasoningPolicy::Include
-                } else {
-                    ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
-                }
-            })
+        cfg.reasoning_policy.unwrap_or_else(|| {
+            if cfg.reasoning_model == Some(false) {
+                ReasoningPolicy::Exclude
+            } else if cfg.thinking {
+                ReasoningPolicy::Include
+            } else {
+                ReasoningPolicy::derive(&cfg.model, &cfg.base_url)
+            }
+        })
     }
 
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
@@ -247,7 +242,7 @@ impl LlmProvider for AnthropicProvider {
             // 1 initial open + up to 2 transparent reopens — a gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            const MAX_STREAM_ATTEMPTS: u32 = 6;
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -364,10 +359,7 @@ async fn open_stream(
             .header("anthropic-version", anthropic_version)
             .json(body);
         // Stable session id → gateway prefix-cache affinity. Empty ⇒ omitted.
-        if !session_id.is_empty() {
-            req = req.header("x-jeikcode-session-id", session_id);
-            req = req.header("x-session-id", session_id);
-        }
+        req = super::apply_session_affinity(req, session_id);
         // TTFB watchdog for THIS attempt (mirrors openai_compat): bounds only the
         // silent-gateway wait, never a slow streaming body.
         let send = match retry::send_with_ttfb(req, open_timeout).await {
@@ -485,7 +477,9 @@ fn build_request_body(
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     // `max_tokens` is REQUIRED. Per-call override wins; else the cfg default.
-    let mut max_tokens = options.max_tokens.unwrap_or(cfg.max_tokens);
+    // This is the kernel-resolved per-request output budget; thinking may shrink
+    // to fit inside it, but must never inflate it.
+    let max_tokens = options.max_tokens.unwrap_or(cfg.max_tokens);
     body.insert("max_tokens".into(), json!(max_tokens));
     body.insert("stream".into(), json!(true));
 
@@ -542,79 +536,47 @@ fn build_request_body(
     // Anthropic rejects extended/adaptive thinking combined with forced tool use.
     // Suppress thinking for this one request; the session config remains unchanged,
     // so the following round resumes thinking automatically.
-    let is_effort_off = options.reasoning_effort.as_ref().is_some_and(|e| {
-        matches!(e, ReasoningEffort::Off)
-            || e.as_str().eq_ignore_ascii_case("off")
-            || e.as_str().eq_ignore_ascii_case("none")
-    });
-
-    let is_thinking_disabled = is_effort_off
+    let is_thinking_disabled = super::thinking::is_effort_off(options.reasoning_effort.as_ref())
         || cfg.thinking_type.as_deref() == Some("disabled")
         || cfg.thinking_enabled == Some(false);
 
-    if is_thinking_disabled {
-        body.insert(
-            "thinking".into(),
-            json!({
-                "type": "disabled",
-                "budget_tokens": 0,
-            }),
-        );
-    } else {
-        let thinking_enabled =
-            (cfg.thinking || policy == ReasoningPolicy::Include) && !forces_tool_use;
-        if thinking_enabled {
-            if cfg.thinking_type.as_deref() == Some("adaptive") {
-                body.insert("thinking".into(), json!({ "type": "adaptive" }));
-            } else {
-                let mut budget = if let Some(b) = cfg.thinking_budget {
-                    b
-                } else if let Some(effort) = &options.reasoning_effort {
-                    match effort {
-                        ReasoningEffort::Off => 0,
-                        ReasoningEffort::Low => 2048,
-                        ReasoningEffort::Medium => 5120,
-                        ReasoningEffort::High => 16384,
-                        ReasoningEffort::XHigh => 32768,
-                        ReasoningEffort::Max => 65536,
-                        ReasoningEffort::Custom(ref s) => s.parse::<u32>().unwrap_or(10000),
-                    }
-                } else {
-                    10000
-                };
+    let thinking_enabled = (cfg.thinking || policy == ReasoningPolicy::Include) && !forces_tool_use;
 
-                // Anthropic requires budget_tokens < max_tokens.
-                // When user explicitly sets a high thinking budget or effort (e.g. 16384, 32768, 65536),
-                // automatically expand max_tokens so the user's budget is fully preserved
-                // without being artificially discounted or truncated to 12288!
-                let has_explicit_budget_request =
-                    cfg.thinking_budget.is_some() || options.reasoning_effort.is_some();
-                if budget > 0 {
-                    if has_explicit_budget_request && budget >= max_tokens {
-                        let expanded = (budget + 8192)
-                            .min(cfg.context_window.saturating_sub(1024).max(budget + 1));
-                        max_tokens = max_tokens.max(expanded);
-                    }
-                    if max_tokens > 1 && budget >= max_tokens {
-                        if has_explicit_budget_request {
-                            budget = max_tokens.saturating_sub(1);
-                        } else {
-                            budget = (max_tokens * 3 / 4).clamp(1, max_tokens.saturating_sub(1));
-                        }
-                    }
-                    body.insert("max_tokens".into(), json!(max_tokens));
-                }
-                body.insert(
-                    "thinking".into(),
-                    json!({
-                        "type": "enabled",
-                        "budget_tokens": budget,
-                    }),
-                );
-            }
+    // Claude 4.7+ requires adaptive thinking; older models keep the manual
+    // `enabled + budget_tokens` shape. The model generation wins over a stale
+    // `thinking_type = "enabled"` so a 4.7+ request never 400s.
+    let adaptive = matches!(
+        super::thinking::anthropic_family(model),
+        super::thinking::ThinkingFamily::AnthropicAdaptive
+    ) || cfg.thinking_type.as_deref() == Some("adaptive");
+
+    if is_thinking_disabled {
+        // Official shape: the disabled variant carries no `budget_tokens`.
+        body.insert("thinking".into(), json!({ "type": "disabled" }));
+    } else if thinking_enabled {
+        if adaptive {
+            body.insert("thinking".into(), json!({ "type": "adaptive" }));
+        } else if let Some(plan) = super::thinking::resolve_budget(
+            super::thinking::ThinkingFamily::AnthropicLegacy,
+            cfg.thinking_budget,
+            options.reasoning_effort.as_ref(),
+            max_tokens,
+        ) {
+            // The budget is a DOWNSTREAM constraint: it shrinks to leave
+            // `MIN_ANSWER_TOKENS`, but `max_tokens` is never expanded.
+            body.insert(
+                "thinking".into(),
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": plan.tokens,
+                }),
+            );
         }
     }
-    if !is_thinking_disabled {
+    // Adaptive models steer depth through `output_config.effort`; legacy models
+    // use the budget itself. Keep the effort sideband even when forced tool use
+    // suppresses the `thinking` block for one request.
+    if !is_thinking_disabled && adaptive {
         if let Some(effort) = super::openai_compat::resolve_wire_effort(model, options) {
             if !effort.eq_ignore_ascii_case("off") && !effort.eq_ignore_ascii_case("none") {
                 body.insert("output_config".into(), json!({ "effort": effort }));
@@ -628,7 +590,10 @@ fn build_request_body(
                 json!({
                     "name": td.name,
                     "description": td.description,
-                    "input_schema": super::sanitize_schema_for_wire(&td.parameters),
+                    "input_schema": super::tool_schema::project(
+                        super::sanitize_schema_for_wire(&td.parameters),
+                        super::tool_schema::family_for(&cfg.model, None),
+                    ),
                 })
             })
             .collect();
@@ -699,7 +664,14 @@ fn format_messages(
                 continue;
             }
             Role::Assistant => {
-                out.push(format_assistant_message(m, echo_thinking, is_official));
+                // An empty model round (failed / interrupted stream that persisted nothing
+                // replayable) is dropped instead of becoming `content:""` — Anthropic rejects
+                // empty content, and dropping it keeps the surrounding user turns adjacent so
+                // `merge_consecutive_user` reconstructs one user block (the lost reply never
+                // happened).
+                if let Some(msg) = format_assistant_message(m, echo_thinking, is_official) {
+                    out.push(msg);
+                }
                 i += 1;
                 continue;
             }
@@ -710,10 +682,11 @@ fn format_messages(
                 while i < messages.len() && messages[i].role == Role::Tool {
                     let tr = &messages[i];
                     if let Some(id) = tr.tool_call_id.as_deref().filter(|s| !s.is_empty()) {
+                        let model_content = super::strip_tool_result_diff_for_model(&tr.text);
                         blocks.push(json!({
                             "type": "tool_result",
                             "tool_use_id": id,
-                            "content": tr.text,
+                            "content": model_content,
                             "is_error": tr.is_error,
                         }));
                     }
@@ -821,7 +794,17 @@ fn format_user_message(m: &Message) -> Value {
 /// An `assistant` message. Plain text (no tool calls, no echoed thinking) → `content`
 /// STRING. Otherwise an ARRAY in Anthropic's required order: signed thinking blocks
 /// (only when `echo_thinking`), then the text block, then `tool_use` blocks.
-fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool) -> Value {
+/// `None` when the message carries nothing for the wire (a lost reply).
+fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool) -> Option<Value> {
+    // Empty model round (failed / interrupted stream that persisted nothing
+    // replayable). Drop it BEFORE thinking synthesis: on a third-party gateway
+    // `echo_thinking` would otherwise turn the stored reasoning into a
+    // thinking-only assistant turn, which strict gateways reject ("content or
+    // tool_calls must be set"). A tool-loop round always carries tool_calls, so
+    // dropping a text-less/tool-less message never breaks signature replay.
+    if m.text.is_empty() && m.tool_calls.is_empty() {
+        return None;
+    }
     let mut parts: Vec<Value> = Vec::new();
     let mut has_thinking_blocks = false;
 
@@ -884,7 +867,10 @@ fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool)
 
     if m.tool_calls.is_empty() && !has_thinking_blocks {
         // Pure-text assistant turn without thinking — keep it a STRING.
-        return json!({ "role": "assistant", "content": m.text });
+        if m.text.is_empty() {
+            return None;
+        }
+        return Some(json!({ "role": "assistant", "content": m.text }));
     }
 
     if !m.text.is_empty() {
@@ -899,7 +885,10 @@ fn format_assistant_message(m: &Message, echo_thinking: bool, is_official: bool)
             .unwrap_or_else(|| json!({}));
         parts.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.name, "input": input }));
     }
-    json!({ "role": "assistant", "content": parts })
+    if parts.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": "assistant", "content": parts }))
 }
 
 fn effort_str(e: &ReasoningEffort) -> &str {
@@ -1763,7 +1752,8 @@ mod tests {
         c.max_tokens = 16384;
         c.thinking_budget = Some(5000);
         let body = build_request_body(
-            "claude-opus-4-8",
+            // 4.6 and earlier keep the legacy manual budget shape.
+            "claude-sonnet-4-5",
             &[Message::user("hi")],
             &[],
             &ChatOptions::default(),
@@ -1800,33 +1790,34 @@ mod tests {
         c.max_tokens = 8192;
         c.reasoning_policy = Some(ReasoningPolicy::Include);
         let body = build_request_body(
-            "claude-opus-4-8",
+            "claude-sonnet-4-5",
             &[Message::user("hi")],
             &[],
             &ChatOptions::default(),
             &c,
         );
         assert_eq!(body["thinking"]["type"], "enabled");
-        // default budget clamped to max_tokens - 1 (or 75%): 8192 * 3 / 4 = 6144
-        assert_eq!(body["thinking"]["budget_tokens"], 6144);
+        // Default 10000 shrinks to leave MIN_ANSWER_TOKENS (1024): 8192 - 1024.
+        assert_eq!(body["thinking"]["budget_tokens"], 7168);
     }
 
     #[test]
-    fn high_budget_preserves_full_amount_and_expands_max_tokens() {
+    fn high_budget_is_clamped_to_answer_room_without_expanding_max_tokens() {
         let mut c = cfg();
         c.thinking = true;
         c.max_tokens = 16384;
         c.thinking_budget = Some(16384);
         let body = build_request_body(
-            "claude-opus-4-8",
+            "claude-sonnet-4-5",
             &[Message::user("hi")],
             &[],
             &ChatOptions::default(),
             &c,
         );
-        // Budget must NOT be discounted to 12288 (3/4 of 16384)!
-        assert_eq!(body["thinking"]["budget_tokens"], 16384);
-        assert!(body["max_tokens"].as_u64().unwrap() > 16384);
+        // The budget is a downstream constraint: 16384 - MIN_ANSWER_TOKENS.
+        assert_eq!(body["thinking"]["budget_tokens"], 15360);
+        // ... and max_tokens must stay exactly the kernel-resolved budget.
+        assert_eq!(body["max_tokens"].as_u64(), Some(16384));
     }
 
     #[test]
@@ -1837,13 +1828,7 @@ mod tests {
         let mut opts = ChatOptions::default();
         opts.reasoning_effort = Some(ReasoningEffort::Off);
         let body = build_request_body("claude-opus-4-8", &[Message::user("hi")], &[], &opts, &c);
-        assert_eq!(
-            body["thinking"],
-            json!({
-                "type": "disabled",
-                "budget_tokens": 0,
-            })
-        );
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
         assert!(body.get("output_config").is_none());
     }
 
@@ -2673,6 +2658,39 @@ mod tests {
             head.contains("user-agent: jeikcode/9.9.9"),
             "product UA must be sent: {head}"
         );
+    }
+
+    #[test]
+    fn reasoning_only_model_round_is_dropped_on_gateways() {
+        let mut lost = Message::assistant("", vec![]);
+        lost.reasoning = Some("partial thinking".into());
+        let msgs = vec![Message::user("first"), lost, Message::user("retry")];
+        // echo_thinking=true + non-official gateway used to synthesize a
+        // thinking-only assistant block from `reasoning`.
+        let (_sys, out) = super::format_messages(&msgs, true, false);
+        assert_eq!(out.len(), 1, "thinking-only assistant must be dropped");
+        assert_eq!(out[0]["role"], "user");
+    }
+
+    #[test]
+    fn lost_model_round_is_dropped_and_users_merge() {
+        let msgs = vec![
+            Message::user("first"),
+            Message::assistant("", vec![]),
+            Message::user("retry"),
+        ];
+        let (sys, out) = format_messages(&msgs, false);
+        assert!(sys.is_empty());
+        assert_eq!(out.len(), 1, "an empty assistant turn must be dropped");
+        assert_eq!(out[0]["role"], "user");
+        let content = out[0]["content"].as_array().expect("must be blocks");
+        assert_eq!(
+            content.len(),
+            2,
+            "both user messages stay as discrete blocks"
+        );
+        assert_eq!(content[0]["text"], "first");
+        assert_eq!(content[1]["text"], "retry");
     }
 
     #[test]

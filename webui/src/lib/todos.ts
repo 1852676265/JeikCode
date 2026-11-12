@@ -5,12 +5,14 @@
  * plan (`{"todos":[…]}`), an incremental batch (`{"actions":[…]}`), or a single
  * incremental action (`{"action":"add|update|...",…}`).
  * Current list is folded over the transcript the same way as
- * `zap_capabilities::tools::todo::reduce_todos`.
+ * `jeikcode_capabilities::tools::todo::reduce_todos`.
  */
 
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 
 export interface TodoItem {
+  /** Stable server identity; legacy transcript-derived rows may omit it. */
+  id?: string;
   content: string;
   status: TodoStatus;
 }
@@ -82,6 +84,9 @@ function validateActionsMix(actions: Record<string, unknown>[]): boolean {
   for (const item of actions) {
     const kind = actionKind(item);
     if (!kind) return false;
+    if (kind === 'clear' && typeof item.content === 'string' && item.content.trim() !== '') {
+      return false;
+    }
     kinds.add(kind);
   }
   if (kinds.has('delete') && [...kinds].some((kind) => kind !== 'delete')) return false;
@@ -187,7 +192,10 @@ export function parseTodosFromOutput(output?: string | null): TodoItem[] | null 
       items.push({ content, status });
     }
   }
-  return items.length > 0 ? items : null;
+  if (items.length > 0) return items;
+  // Canonical empty-list rendering: an explicit authoritative empty snapshot.
+  // `null` means "could not parse"; `[]` means "the backend says the list is empty".
+  return lines.some((line) => line.trim() === '(no tasks)') ? [] : null;
 }
 
 /** Full-list plan shape. Returns null when args are not a valid plan. */
@@ -203,7 +211,7 @@ export function parseTodoPlan(args: string): TodoItem[] | null {
   // `actions` takes precedence over leftover `todos` field (same as Rust backend).
   if (Array.isArray(value.actions)) return null;
 
-  let todos = value.todos;
+  let todos = value.plan !== undefined ? value.plan : value.todos;
   // Tolerate a single-layer stringified array (same as Rust parse_todos).
   if (typeof todos === 'string') {
     try {
@@ -216,15 +224,20 @@ export function parseTodoPlan(args: string): TodoItem[] | null {
   if (!Array.isArray(todos)) return null;
   const out: TodoItem[] = [];
   for (const raw of todos) {
+    if (typeof raw === 'string') {
+      const content = normalizeTodoContent(raw);
+      if (content) {
+        out.push({ content, status: 'pending' });
+      }
+      continue;
+    }
     if (!isRecord(raw)) return null;
     const content = typeof raw.content === 'string' ? normalizeTodoContent(raw.content) : '';
     const status = typeof raw.status === 'string' ? parseStatus(raw.status) : null;
-    if (!content || !status) return null;
-    const next = upsertTodo(out, content, status, null);
-    out.length = 0;
-    out.push(...next.list);
+    if (!content) continue;
+    out.push({ content, status: status ?? 'pending' });
   }
-  return out;
+  return out.length > 0 ? out : null;
 }
 
 function applyOne(list: TodoItem[], v: Record<string, unknown>): TodoItem[] {
@@ -357,6 +370,7 @@ export function applyTodoAction(list: TodoItem[], args: string): TodoItem[] {
     return applyBatch(list, actions);
   }
 
+  if (!validateActionsMix([v])) return list;
   return applyOne(list, v);
 }
 
@@ -556,6 +570,12 @@ export function reduceLiveTodo(
   };
 }
 
+export function liveTodoPanelItems(
+  items: TodoItem[] | null | undefined,
+): TodoItem[] | null {
+  return Array.isArray(items) && items.length > 0 ? items : null;
+}
+
 /**
  * Turn reply has stopped (not an in-flight SSE delta).
  * A fully checked list leaves the live document and is archived once.
@@ -594,19 +614,70 @@ export function restoreStickyTodos(input: {
  */
 export function placeArchivedTodos<T extends {
   role: string;
-  parts: Array<{ kind: string; tool?: { id?: string }; items?: TodoItem[] }>;
+  isSteer?: boolean;
+  parts: Array<{ kind: string; text?: string; tool?: { id?: string }; items?: TodoItem[] }>;
 }>(
   messages: T[],
   items: TodoItem[],
   _revision: string | null,
 ): T[] {
   if (items.length === 0 || !items.every((item) => item.status === 'completed')) return messages;
-  let index = -1;
+  // A steer/new turn can already have an EMPTY assistant placeholder when the
+  // previous turn's terminal arrives. Attaching the completed plan to that
+  // placeholder makes it look glued to the top of the next loop. Prefer the
+  // latest assistant that actually owns content (final text first, then
+  // reasoning/tools), and fall back to a bare assistant only when nothing else
+  // exists.
+  const hasText = (index: number): boolean =>
+    messages[index]!.parts.some(
+      (part) => part.kind === 'text' && (part.text || '').trim().length > 0,
+    );
+  let lastUser = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === 'assistant') {
-      index = i;
+    if (messages[i]!.role === 'user') {
+      lastUser = i;
       break;
     }
+  }
+  let withText = -1;
+  let withContent = -1;
+  let lastAssistant = -1;
+  let afterLastUser = -1;
+  let beforeLastUserWithText = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== 'assistant') continue;
+    if (lastAssistant < 0) lastAssistant = i;
+    const meaningful = message.parts.filter((part) => part.kind !== 'todo_list');
+    const text = hasText(i);
+    if (withText < 0 && text) withText = i;
+    if (
+      withContent < 0 &&
+      (text || meaningful.some((part) => part.kind === 'tool' || part.kind === 'reasoning'))
+    ) {
+      withContent = i;
+    }
+    if (lastUser >= 0) {
+      if (i > lastUser) {
+        if (afterLastUser < 0) afterLastUser = i;
+      } else if (i < lastUser && text && beforeLastUserWithText < 0) {
+        beforeLastUserWithText = i;
+      }
+    }
+  }
+  // Normal completion: the assistant after the last user owns the answer.
+  // A steer/new turn may already have an EMPTY placeholder after that user;
+  // in that case the plan belongs to the previous answer instead.
+  const lastUserIsSteer =
+    lastUser >= 0 && (messages[lastUser] as { isSteer?: boolean }).isSteer === true;
+  let index = -1;
+  if (afterLastUser >= 0) {
+    index =
+      beforeLastUserWithText >= 0 && (lastUserIsSteer || !hasText(afterLastUser))
+        ? beforeLastUserWithText
+        : afterLastUser;
+  } else {
+    index = withText >= 0 ? withText : withContent >= 0 ? withContent : lastAssistant;
   }
   if (index < 0) return messages;
   const current = messages[index]!;

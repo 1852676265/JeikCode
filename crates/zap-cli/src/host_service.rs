@@ -25,9 +25,9 @@ fn host_msg_for_locale<'a>(
     locale: zap_config::locale::Locale,
 ) -> &'a str {
     match locale {
-        zap_config::locale::Locale::En => en,
-        zap_config::locale::Locale::ZhCn => zh,
+        zap_config::locale::Locale::ZhCn | zap_config::locale::Locale::ZhTw => zh,
         zap_config::locale::Locale::Vi => vi,
+        _ => en,
     }
 }
 use is_terminal::IsTerminal;
@@ -196,7 +196,6 @@ pub fn prompt_host_service_setup(opts: &HostServiceSetupOptions<'_>) -> Result<b
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
-#[allow(dead_code)]
 fn read_prompt_line(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     io::stderr().flush().ok();
@@ -250,7 +249,6 @@ fn serve_args(opts: &HostServiceSetupOptions<'_>) -> Vec<String> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
-#[allow(dead_code)]
 fn print_banner(banner: &str) {
     print!("{banner}");
     if !banner.ends_with('\n') {
@@ -429,6 +427,8 @@ fn render_launchd_plist(label: &str, executable: &Path, args: &[String], workdir
     <string>{home}</string>
     <key>PATH</key>
     <string>{path}</string>
+    <key>JEIKCODE_HOST_SERVICE</key>
+    <string>{label}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -487,7 +487,14 @@ fn prompt_launchd_setup(opts: &HostServiceSetupOptions<'_>) -> Result<bool> {
         input
     };
     if !valid_service_name(&label, "com.jeikcode-") {
-        bail!("launchd 服务名必须以 com.jeikcode- 开头，且只能包含字母、数字、点、横线或下划线")
+        bail!(
+            "{}",
+            host_msg(
+                "launchd service name must begin with 'com.jeikcode-' and contain only letters, digits, dots, dashes, or underscores",
+                "launchd 服务名必须以 com.jeikcode- 开头，且只能包含字母、数字、点、横线或下划线",
+                "Tên dịch vụ launchd phải bắt đầu bằng 'com.jeikcode-' và chỉ chứa chữ cái, chữ số, dấu chấm, dấu gạch nối hoặc dấu gạch dưới",
+            )
+        );
     }
 
     let home = dirs::home_dir().context("cannot resolve home directory for LaunchAgents")?;
@@ -527,14 +534,49 @@ fn prompt_launchd_setup(opts: &HostServiceSetupOptions<'_>) -> Result<bool> {
         .output();
 
     println!("\n========================================================================");
-    println!("✨ launchd 服务 [{label}] 配置成功并已在后台运行！");
+    println!(
+        "{}",
+        host_msg(
+            &format!("launchd service [{label}] is configured and running in the background."),
+            &format!("✨ launchd 服务 [{label}] 配置成功并已在后台运行！"),
+            &format!("Dịch vụ launchd [{label}] đã được định cấu hình và đang chạy nền."),
+        )
+    );
     println!("------------------------------------------------------------------------");
     print_banner(opts.banner);
     println!("------------------------------------------------------------------------");
-    println!("📌 服务管理命令:");
-    println!("  查看状态: launchctl print {target}");
-    println!("  重启服务: launchctl kickstart -k {target}");
-    println!("  卸载服务: jeikcode server uninstall <ID>");
+    println!(
+        "{}",
+        host_msg(
+            "Service management commands:",
+            "📌 服务管理命令:",
+            "Các lệnh quản lý dịch vụ:"
+        )
+    );
+    println!(
+        "  {}",
+        host_msg(
+            &format!("View status: launchctl print {target}"),
+            &format!("查看状态: launchctl print {target}"),
+            &format!("Xem trạng thái: launchctl print {target}"),
+        )
+    );
+    println!(
+        "  {}",
+        host_msg(
+            &format!("Restart service: launchctl kickstart -k {target}"),
+            &format!("重启服务: launchctl kickstart -k {target}"),
+            &format!("Khởi động lại: launchctl kickstart -k {target}"),
+        )
+    );
+    println!(
+        "  {}",
+        host_msg(
+            "Uninstall service: jeikcode server uninstall <ID>",
+            "卸载服务: jeikcode server uninstall <ID>",
+            "Gỡ cài đặt: jeikcode server uninstall <ID>",
+        )
+    );
     println!("========================================================================\n");
     Ok(true)
 }
@@ -672,11 +714,20 @@ fn windows_task_command(executable: &Path, args: &[String]) -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn render_windows_launcher(executable: &Path, workdir: &Path, args: &[String]) -> String {
+fn render_windows_launcher(
+    executable: &Path,
+    workdir: &Path,
+    args: &[String],
+    service_name: Option<&str>,
+) -> String {
     let mut body = String::from("@echo off\r\n");
     body.push_str("cd /d ");
     body.push_str(&quote_windows_arg(&workdir.display().to_string()));
     body.push_str("\r\n");
+    // 标记自己由哪个登录自启项拉起，异地换端口/Token 时据此精确回写本文件
+    if let Some(name) = service_name {
+        body.push_str(&format!("set \"JEIKCODE_HOST_SERVICE={name}\"\r\n"));
+    }
     body.push_str(&quote_windows_arg(&executable.display().to_string()));
     for arg in args {
         body.push(' ');
@@ -690,7 +741,7 @@ fn render_windows_launcher(executable: &Path, workdir: &Path, args: &[String]) -
 fn windows_service_dir() -> std::path::PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".zap")
+        .join(".jeikcode")
         .join("services")
 }
 
@@ -710,7 +761,12 @@ fn install_windows_logon(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let cmd_path = dir.join(format!("{task_name}.cmd"));
     let executable = crate::systemd::resolve_service_exe();
-    let body = render_windows_launcher(&executable, opts.workdir, &serve_args(opts));
+    let body = render_windows_launcher(
+        &executable,
+        opts.workdir,
+        &serve_args(opts),
+        Some(task_name),
+    );
     std::fs::write(&cmd_path, body).with_context(|| format!("writing {}", cmd_path.display()))?;
 
     // Drop a previous Task Scheduler entry. It did not start on logon, and
@@ -1137,8 +1193,10 @@ mod tests {
                 "--token".into(),
                 "secret".into(),
             ],
+            Some("JeikCode-4096"),
         );
         assert!(body.starts_with("@echo off\r\ncd /d E:\\code\\jeikcode\r\n"));
+        assert!(body.contains("set \"JEIKCODE_HOST_SERVICE=JeikCode-4096\"\r\n"));
         assert!(body.contains(r#""C:\Program Files\JeikCode\jeikcode.exe""#));
         assert!(body.contains("--host 0.0.0.0 --port 4096 --token secret"));
     }

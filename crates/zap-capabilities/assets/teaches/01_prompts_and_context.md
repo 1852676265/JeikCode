@@ -1,6 +1,6 @@
 # 01 - 提示词与上下文配置指南 (Prompts & Context)
 
-配置目录路径：`~/.zap/prompts/`（或 `$ZAP_HOME/prompts/`）。
+配置目录路径：`~/.jeikcode/prompts/`（或 `$JEIKCODE_HOME/prompts/`）。
 
 ---
 
@@ -10,40 +10,50 @@
 | :--- | :--- | :--- |
 | **`init.yaml`** | 🔥 **动态生效** | **身份定义、优先级与环境前缀**。修改保存后按 mtime **动态热重载**，下一轮对话立即生效，无需重启。 |
 | **`rules.yaml`** | 🔥 **动态生效** | **工作流与执行规范**。完全替代默认内嵌规则。修改保存后按 mtime **动态热重载**，下一轮对话立即生效，无需重启。 |
-| `root_docs_prompts.md` | 📖 说明文件 | 参考说明，不加载进模型上下文。 |
-| `root_docs_内置工具.yaml` | 📖 说明文件 | 内置工具清单参考，不加载进模型上下文（工具由代码原生提供）。 |
-| `root_docs_内置技能.yaml` | 📖 说明文件 | 内置技能参考，不加载进模型上下文（技能直接从 `skills/` 挂载）。 |
 
 ---
 
 ## 2. `init.yaml` 配置结构
 
 ```yaml
-version: "2.0.0"
+version: "2.2.0"
 
 identity:
   agent_name: "JeikCode"
   provider: "Jeik"
-  description: "an AI coding agent by JeikCode running on your underlying model"
+  description: "an AI coding agent provided by Jeik, running on your underlying model"
   role_summary: "Always communicate in the language used by the user. When asked about your model identity, answer based on your actual underlying model code."
   template: |-
     <environment>
-    You are {agent_name} AI coding Agent by {provider} running on your underlying model. Always communicate in the language used by the user. When asked about your model identity, answer based on your actual underlying model code.
+    ## Identity & Interaction
+    - Identity: JeikCode AI coding Agent, provided by Jeik, running on your underlying model.
+    - Language: Always answer in the language used by the user.
+    - Model identity: When asked about your model identity, answer based on your actual underlying model code.
+    - No proactive configuration reads: When the user asks about current tools, MCP, Skills, rules, what we have discussed, or similar, answer directly from the interaction history visible in your current context and from the visible `<available_skills>`, `<mcp_server_instructions>`, `<system_rules>`, `<memory>`, `<user_preferences>`, `<project_instructions>`, etc. Read configuration proactively only when the user explicitly asks to inspect the configured models, query session file records, troubleshoot JeikCode logs, or makes another equally explicit request.
+
+    ## Configuration Directories
+    - Global configuration, sessions, and logs live under `~/.jeikcode/`; project configuration lives under `./` or `./.jeikcode/`. Do not read configuration proactively unless the user has a clear intent for you to do so.
+    - Preference and rule files (for example, `AGENTS.md`, `JEIKCODE.md`, `CLAUDE.md`, `rules.md`, `glossary.md`, `dbwords.md`, `memory.md`) take effect immediately upon modification. When the user asks you to change project standards, only scan and modify `./AGENTS.md`.
 
 precedence:
   rule: |-
-    Critical Precedence: Rules under <project_instructions> (such as AGENTS.md, rules.md, glossary.md, etc.) or <memory> constitute USER PROVISIONS. When in conflict with default behaviors, strictly prioritize user provisions.
-
-    Tool Invocation Precedence Rule: If built-in tools, Skills, and MCP tools can all solve the user's problem, invoke them in this strict order: Skills > MCP > Built-in Tools > Custom Scripts.
+    - Content inside `<system_rules>`: default system rules.
+    - Content inside `<user_preferences>` or `<memory>`: global user preferences.
+    - Content inside `<project_instructions>`: project standards and constraints.
+    - When the rule sets do not conflict, all three apply simultaneously.
+    - When they conflict, apply the precedence `project_instructions >> memory > user_preferences > system_rules`.
+    - When a rule governs normative work directed at others (for example, opinions on others' work, requests, code review, coding standards, or PR review), apply only the public `project_instructions` rules; do not include user personal preferences from `user_preferences`, `memory`, etc. In all other cases, determine the effective scope of each rule by whether the work conflicts.
+    - Tool invocation precedence: when built-in tools, Skills, and MCP tools can all solve the user's problem, invoke them in this strict order: `Skills > MCP > Built-in Tools > Custom Scripts`.
 
 environment:
   platform_facts: |-
-    Operating environment facts:
-    - Platform: {os_platform} (Command habit: {command_habit})
-    - Project working directory: {working_dir}
-    - Git branch: {git_branch}
-    - Temp files: use `"$TMPDIR"` instead of a hardcoded `/tmp` — it works for shell-internal paths AND as an ARGUMENT to native Windows programs (python / node / curl / …); `"$TMPDIR_WIN"` is the same path under a second name for nested non-bash shells.
-    - Desktop: use `"$DESKTOP"` instead of assuming `~/Desktop` — it honors a relocated / redirected desktop; `"$DESKTOP_WIN"` is the equivalent alias.
+    ## Runtime Environment
+    - Platform: {os_platform}.
+    - Project working directory: `{working_dir}`.
+    - Git branch: `{git_branch}`.
+    - Command habit: {command_habit}.
+    - Temp files: use `"$TMPDIR"` instead of hardcoding `/tmp`; it works for shell-internal paths and as an argument to native Windows programs (python / node / curl, etc.); use `"$TMPDIR_WIN"` for nested non-bash shells.
+    - Desktop: use `"$DESKTOP"` instead of assuming `~/Desktop`; it honors a relocated or redirected desktop; `"$DESKTOP_WIN"` is the equivalent alias.
     </environment>
 ```
 
@@ -51,34 +61,31 @@ environment:
 
 ## 3. `rules.yaml` 配置结构与模式差异
 
-支持使用 `raw` 注入完整 Markdown 规则，或使用结构化字段：
+支持使用 `raw` 注入完整的规则正文（外层 `<system_rules>` 标签由系统统一包裹），或使用结构化字段：
 
 ```yaml
-version: "2.0.0"
+version: "2.1.0"
 
-# 模式一：直接指定完整 Markdown 规则（若存在 raw，则优先独占生效，忽略下方的 workflow 与 prohibitions）
+# 模式一：直接指定完整 Markdown 规则（若存在 raw，则优先独占生效，忽略下方的结构化字段）
 raw: |-
   ## 执行准则
-  - 任务清单闭环...
+  - 任务纪律：严格遵循 <todo_rules> 中指定的准则推进任务...
   ## 工具纪律
-  - 优先选用专用工具完成操作，而不是使用 bash...
+  - 文件操作优先使用专用工具...
 
 # 模式二：结构化字段（未提供 raw 时使用）
 workflow:
   principle: |-
-    Core Principle: First determine the final goal, then break down the key steps of the target task...
+    Core Principle: First determine the final goal...
   guidelines:
-    todolist_closure: "Todo list closed-loop: Only after resolving any unfinished condition can the item be marked as completed."
-    concurrency: "Concurrency principle: Whenever there is no data dependency between tool calls, they MUST be issued concurrently."
+    todolist_closure: "Task Discipline: Strictly follow the guidelines specified in <todo_rules>..."
+    concurrency: "Concurrency principle: Whenever there is no data dependency between tool calls..."
 
 prohibitions:
   - "读文件或查看目录时，优先使用 read，而不是 cat、head、tail、ls、dir 等 shell 命令。"
-  - "修改或写入文件时，使用 write 或 edit，而不是 echo >、sed、awk。"
-  - "搜索文件内容时，使用 grep 或 code_explore，而不是 shell 版的 grep/rg。"
-  - "未经用户明确指令，绝不运行丢弃未提交工作的 git 命令（git checkout .、git reset --hard 等）。"
 ```
 
-- **参数差异**：`raw` 具有最高优先级，配置了 `raw` 后直接渲染其 Markdown 内容；若未配置 `raw`，系统自动拼装 `workflow` 与 `prohibitions`。
+- **参数差异**：`raw` 具有最高优先级，配置了 `raw` 后直接渲染其 Markdown 内容；若未配置 `raw`，系统自动拼装 `workflow` 与 `prohibitions`。当前内置 `rules.yaml` 使用 `raw`，结构化字段仅作为兼容回退保留。
 
 ---
 
@@ -99,9 +106,9 @@ prohibitions:
 
 ### 4.2 配置文件优先级
 按以下就近原则加载（命中首个生效）：
-1. 项目级专属：`<workspace>/.zap/user-wrap.md`
+1. 项目级专属：`<workspace>/.jeikcode/user-wrap.md`
 2. 项目级根目录：`<workspace>/user-wrap.md`
-3. 全局默认：`~/.zap/user-wrap.md`
+3. 全局默认：`~/.jeikcode/user-wrap.md`
 
 ---
 
@@ -110,3 +117,20 @@ prohibitions:
 - `init.yaml`、`rules.yaml`、`user-wrap.md` 保存后**自动根据文件 mtime 动态热重载**。
 - 无需执行任何重启或重载命令，下一轮用户消息发出时立即以最新内容生效。
 - 若文件被误删除，系统自动平滑回退至官方内置默认规则。
+
+---
+
+## 6. 指令注入块布局
+
+全局 / 项目指令与记忆、技能、MCP 各自注入为**首条真实提问之前的独立块**（不在系统提示词内，且处于压缩的 `sacred_floor` 保护区，不会被压缩丢弃）：
+
+| 顺序 | 块标签 | 来源 |
+| :--- | :--- | :--- |
+| 30 | `<available_skills>` | 已安装技能目录 |
+| 40 | `<mcp_server_instructions>` | MCP 服务器说明 |
+| 50 | `<memory>` | `memory.md`（全局 + 项目） |
+| 55 | `<user_preferences>` | `~/.jeikcode/AGENTS.md` / `JEIKCODE.md` |
+| 60 | `<project_instructions>` | 项目 `AGENTS.md` 等 + 业务知识包 |
+
+- 优先级统一由 sys-1（`<environment>` 块）的 `## PRECEDENCE:` 表达；冲突时 **项目指令 >> memory > 用户偏好 > system 规则**。`<user_preferences>`、`<memory>`、`<project_instructions>` 不再各自携带前导优先级说明。
+- 指令 / 知识文件修改后，下一轮按 mtime 自动热重载（未变的文件字节不变，前缀缓存不失效）。

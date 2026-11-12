@@ -659,12 +659,12 @@ mod tests {
 
     #[test]
     fn directory_at_mention_replacement_keeps_token_active() {
-        let replacement = format_at_mention_replacement("crates/zap-bridge/");
+        let replacement = format_at_mention_replacement("crates/jeikcode-bridge/");
 
-        assert_eq!(replacement, "@crates/zap-bridge/");
+        assert_eq!(replacement, "@crates/jeikcode-bridge/");
         assert_eq!(
             detect_at_mention(&replacement, replacement.len()),
-            Some("crates/zap-bridge/".to_string())
+            Some("crates/jeikcode-bridge/".to_string())
         );
     }
 

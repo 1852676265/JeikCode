@@ -19,6 +19,27 @@ const TURN_SPACING_PX = 10;
 /** 顶端和底端边缘留白 (px) */
 const RAIL_INSET_PX = 6;
 
+const TURN_NAV_STRINGS: Record<string, string> = {
+  label: '轮次导航',
+  jump: '跳转到第 {turn} 轮',
+  jumpLoad: '加载并跳转到第 {turn} 轮',
+  turn: '第 {turn} 轮',
+  turnPrefix: '本轮 ',
+  totalPrefix: '累计 ',
+  tokensTooltip: '本轮消耗 / 截止本轮会话累计 Token',
+  inProgress: '计算中',
+};
+
+function tNav(key: string, params?: Record<string, string | number>): string {
+  let val = TURN_NAV_STRINGS[key] || key;
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      val = val.replace(`{${k}}`, String(v));
+    }
+  }
+  return val;
+}
+
 export const TurnNavigator = memo(function TurnNavigator({
   items,
   activeId,
@@ -27,7 +48,6 @@ export const TurnNavigator = memo(function TurnNavigator({
   activeTurnDeltaTokens,
   onNavigate,
 }: TurnNavigatorProps) {
-  const t = useT();
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const pointerInsideRef = useRef(false);
@@ -105,7 +125,7 @@ export const TurnNavigator = memo(function TurnNavigator({
     <div class="turn-navigator-slot">
       <nav
         class="turn-navigator-frame"
-        aria-label={t('chat.turnNavigation.label')}
+        aria-label={tNav('label')}
         onPointerEnter={() => {
           pointerInsideRef.current = true;
         }}
@@ -128,6 +148,7 @@ export const TurnNavigator = memo(function TurnNavigator({
               const busy = item.id === busyId;
               const isPreview = index === previewIndex;
 
+              const turnNum = item.turn ?? (item.ordinal != null ? item.ordinal + 1 : index + 1);
               const markClasses = ['turn-navigator-mark'];
               if (item.unloaded) markClasses.push('turn-mark-unloaded');
               if (active) markClasses.push('turn-mark-active');
@@ -140,9 +161,9 @@ export const TurnNavigator = memo(function TurnNavigator({
                   type="button"
                   class={markClasses.join(' ')}
                   style={{ top: `${index * TURN_SPACING_PX + RAIL_INSET_PX - 5}px` }}
-                  aria-label={t(
-                    item.unloaded ? 'chat.turnNavigation.jumpLoad' : 'chat.turnNavigation.jump',
-                    { turn: String(item.turn) },
+                  aria-label={tNav(
+                    item.unloaded ? 'jumpLoad' : 'jump',
+                    { turn: String(turnNum) },
                   )}
                   aria-current={active ? 'true' : undefined}
                   aria-busy={busy ? 'true' : undefined}
@@ -183,41 +204,41 @@ export const TurnNavigator = memo(function TurnNavigator({
             >
               <div class="turn-navigator-preview-header">
                 <span class="turn-navigator-preview-turn">
-                  {t('chat.turnNavigation.turn', { turn: String(preview.turn) })}
+                  {tNav('turn', { turn: String(preview.turn ?? (preview.ordinal != null ? preview.ordinal + 1 : (previewIndex ?? 0) + 1)) })}
                 </span>
                 {hasTokens && (
                   <span
                     class={`turn-navigator-preview-tokens turn-status-${tokenState.status}`}
                     title={
                       tokenState.status === 'in_progress'
-                        ? `${t('chat.turnNavigation.inProgress')} · ${t('chat.turnNavigation.tokensTooltip')}`
-                        : t('chat.turnNavigation.tokensTooltip')
+                        ? `${tNav('inProgress')} · ${tNav('tokensTooltip')}`
+                        : tNav('tokensTooltip')
                     }
                   >
                     <span class="turn-tokens-icon">⚡</span>
                     {turnTokens != null && cumulativeTokens != null && turnTokens !== cumulativeTokens ? (
                       <>
                         <span class="turn-tokens-val">
-                          {t('chat.turnNavigation.turnPrefix')}{formatTokenMetric(turnTokens)}
+                          {tNav('turnPrefix')}{formatTokenMetric(turnTokens)}
                         </span>
                         <span class="turn-tokens-total">
-                          ({t('chat.turnNavigation.totalPrefix')}{formatTokenMetric(cumulativeTokens)})
+                          ({tNav('totalPrefix')}{formatTokenMetric(cumulativeTokens)})
                         </span>
                       </>
                     ) : turnTokens != null ? (
                       <span class="turn-tokens-val">
-                        {t('chat.turnNavigation.turnPrefix')}{formatTokenMetric(turnTokens)}
+                        {tNav('turnPrefix')}{formatTokenMetric(turnTokens)}
                       </span>
                     ) : cumulativeTokens != null ? (
                       <span class="turn-tokens-val">
-                        {t('chat.turnNavigation.totalPrefix')}{formatTokenMetric(cumulativeTokens)}
+                        {tNav('totalPrefix')}{formatTokenMetric(cumulativeTokens)}
                       </span>
                     ) : null}
                   </span>
                 )}
               </div>
               <div class="turn-navigator-preview-prompt">
-                {preview.prompt || t('chat.turnNavigation.turn', { turn: String(preview.turn) })}
+                {preview.prompt || preview.label || preview.text || tNav('turn', { turn: String(preview.turn ?? (preview.ordinal != null ? preview.ordinal + 1 : (previewIndex ?? 0) + 1)) })}
               </div>
               {turnActions.length > 0 && (
                 <div class="turn-navigator-preview-actions">

@@ -21,6 +21,10 @@ use std::sync::{LazyLock, Mutex};
 
 const DEFAULT_READ_LIMIT: usize = 1500;
 const MAX_LINE_LEN: usize = 2000;
+/// Bound the per-path state map so a long-lived daemon editing thousands of
+/// files across sessions cannot grow it without limit. Oldest turns are pruned
+/// first; a pruned file simply loses its read confirmation (fail-closed).
+const MAX_TRACKED_FILES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileOpKind {
@@ -35,6 +39,10 @@ pub struct FileTurnState {
     pub read_confirmed: bool,
     /// Last file operation performed on this file in this turn.
     pub last_op: Option<FileOpKind>,
+    /// Turn ID at which an unread write intercept returned the full file content and
+    /// granted read confirmation. Survives into the immediately following turn (grace
+    /// period) so the model can retry `write` in the next turn as prompted.
+    pub confirmed_at_turn: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -64,6 +72,22 @@ fn canon(path: &Path) -> PathBuf {
     crate::pathnorm::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn prune_files(state: &mut WriteStateMachine) {
+    if state.files.len() <= MAX_TRACKED_FILES {
+        return;
+    }
+    let mut entries: Vec<(u64, PathBuf)> = state
+        .files
+        .iter()
+        .map(|(path, (turn, _))| (*turn, path.clone()))
+        .collect();
+    entries.sort_by_key(|(turn, _)| *turn);
+    let remove = state.files.len() - MAX_TRACKED_FILES;
+    for (_, path) in entries.into_iter().take(remove) {
+        state.files.remove(&path);
+    }
+}
+
 fn get_turn_for_path(p: &Path, state: &WriteStateMachine) -> u64 {
     let mut matched_turn = None;
     let mut longest_len = 0;
@@ -82,6 +106,7 @@ pub fn advance_turn_for_dir(dir: &Path) {
     let mut lock = STATE_MACHINE.lock().unwrap();
     let entry = lock.workspace_turns.entry(d).or_insert(1);
     *entry += 1;
+    prune_files(&mut lock);
 }
 
 /// Advance the global turn counter (and all registered workspaces), resetting all read states to unread.
@@ -91,6 +116,7 @@ pub fn advance_turn() {
     for turn in lock.workspace_turns.values_mut() {
         *turn += 1;
     }
+    prune_files(&mut lock);
 }
 
 /// Reset all state (useful for unit test isolation).
@@ -116,10 +142,12 @@ pub fn record_read(path: &Path) {
             FileTurnState {
                 read_confirmed: false,
                 last_op: Some(FileOpKind::Read),
+                confirmed_at_turn: Some(turn),
             },
         );
     } else {
         entry.1.last_op = Some(FileOpKind::Read);
+        entry.1.confirmed_at_turn = Some(turn);
     }
 }
 
@@ -138,6 +166,7 @@ pub fn record_edit(path: &Path) {
             FileTurnState {
                 read_confirmed: false,
                 last_op: Some(FileOpKind::Edit),
+                confirmed_at_turn: None,
             },
         );
     } else {
@@ -157,6 +186,7 @@ pub fn record_write_success(path: &Path) {
     entry.0 = turn;
     entry.1.read_confirmed = true;
     entry.1.last_op = Some(FileOpKind::Write);
+    entry.1.confirmed_at_turn = None;
 }
 
 /// Record that a file has been confirmed read in this turn (e.g. by returning its full content on write intercept).
@@ -171,6 +201,7 @@ pub fn record_read_confirmed(path: &Path) {
     entry.0 = turn;
     entry.1.read_confirmed = true;
     entry.1.last_op = Some(FileOpKind::Read);
+    entry.1.confirmed_at_turn = Some(turn);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +226,20 @@ pub fn check_write_permitted(path: &Path) -> WritePermission {
         .entry(p)
         .or_insert((turn, FileTurnState::default()));
     if entry.0 != turn {
+        // If the immediately preceding turn granted a read confirmation (e.g. from an intercept
+        // that returned the full file content to the model), grant a one-turn grace period
+        // so the model's next-turn retry write succeeds as promised in the interception message.
+        let has_intercept_grace = (entry.1.read_confirmed
+            || entry.1.last_op == Some(FileOpKind::Read))
+            && entry.1.confirmed_at_turn.map_or(false, |t| t + 1 >= turn);
+
+        if has_intercept_grace {
+            entry.0 = turn;
+            entry.1.read_confirmed = true;
+            entry.1.last_op = Some(FileOpKind::Read);
+            return WritePermission::Allowed;
+        }
+
         // Reset for new turn
         *entry = (turn, FileTurnState::default());
         return WritePermission::RefusedUnread;
@@ -220,18 +265,18 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
         Ok(b) => b,
         Err(e) => {
             return format!(
-                "❌ **[写入拦截：目标文件未读取确认]**\n\
-                 欲写入的文件已存在（`{display_path}`），但处于【未读取状态】。\n\
-                 请读取确认欲写入文件内容后再写入！（无法读取磁盘内容: {e}）"
+                "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+                 The target file `{display_path}` already exists and has not been read in this conversation.\n\
+                 Please read and confirm the file contents before overwriting it. (Failed to read disk contents: {e})"
             );
         }
     };
 
     if super::looks_binary(&bytes) {
         return format!(
-            "❌ **[写入拦截：目标文件未读取确认]**\n\
-             欲写入的文件已存在（`{display_path}`，二进制文件 {} 字节），且处于【未读取状态】。\n\
-             请读取确认欲写入文件内容后再写入！",
+            "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+             The target file `{display_path}` already exists (binary file, {} bytes) and has not been read in this conversation.\n\
+             Please read and confirm the file contents before overwriting it.",
             bytes.len()
         );
     }
@@ -242,9 +287,9 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
             Some(s) => std::borrow::Cow::Owned(s),
             None => {
                 return format!(
-                    "❌ **[写入拦截：目标文件未读取确认]**\n\
-                     欲写入的文件已存在（`{display_path}`，无法解析为文本），且处于【未读取状态】。\n\
-                     请读取确认欲写入文件内容后再写入！"
+                    "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+                     The target file `{display_path}` already exists (cannot be parsed as text) and has not been read in this conversation.\n\
+                     Please read and confirm the file contents before overwriting it."
                 );
             }
         },
@@ -276,23 +321,23 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
         let remaining = total - DEFAULT_READ_LIMIT;
         format!(
             "[Showing lines 1-{display_count} of {total}. {remaining} lines remaining.]\n\
-             ⚠️ **提示**：目标文件共有 {total} 行，当前已截断显示前 {display_count} 行，尚有 {remaining} 行未读取。\
-             请全部读取完（使用 `read` 配合 offset={}, limit=1500）确认后再写入！",
+             ⚠️ **Note**: The target file contains {total} lines in total; currently showing the first {display_count} lines ({remaining} lines remaining).\
+             Please read the complete file (using `read` with offset={}, limit=1500) before writing.",
             DEFAULT_READ_LIMIT + 1
         )
     } else {
         record_read_confirmed(path);
         format!(
-            "[Showing lines 1-{total} of {total} (全量内容)]\n\
-             提示：以上为目标文件的全量内容（共 {total} 行）。当前已将该文件状态更新为【已读】，请确认欲写入文件内容后直接再次调用 `write` 写入。"
+            "[Showing lines 1-{total} of {total} (complete content)]\n\
+             Note: The above displays the complete content of the target file ({total} lines total). The file state has now been marked as read. Please confirm your intended changes and call `write` again to proceed."
         )
     };
 
     format!(
-        "❌ **[写入拦截：目标文件未读取确认]**\n\
-         欲写入的文件已存在（`{display_path}`），且当前处于【未读取状态】。\n\
-         根据安全规范：在覆盖写入已存在的文件之前，必须先使用 `read` 读取确认该文件的当前内容！请读取确认欲写入文件内容后再写入。\n\n\
-         已直接为你返回目标文件最新前 {display_count} 行内容：\n\
+        "❌ **[Write Intercepted: File Unread Confirmation Required]**\n\
+         The target file `{display_path}` already exists and has not been read in this conversation.\n\
+         Safety rule: Before overwriting an existing file, you must first inspect its current content using `read`! Please verify the existing content before writing.\n\n\
+         The first {display_count} lines of the current file content have been returned below for your inspection:\n\
          ```\n\
          {rendered_lines}```\n\
          {footer}"

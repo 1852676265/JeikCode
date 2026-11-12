@@ -1,16 +1,3 @@
-//! 嵌入式 webui 静态资源服务。
-//!
-//! 编译期把 `webui/dist/` 打进二进制；运行期 `GET /` 与未匹配的非 API 路径
-//! 都回退到 `index.html`，交给前端 SPA 路由。
-//!
-//! dev 模式（设置 `JEIKCODE_WEBUI_DEV=http://localhost:5173`）下应改为反代/
-//! 重定向到 vite dev server——后续任务实现。
-
-use axum::{
-    http::{header, StatusCode, Uri},
-    response::{IntoResponse, Response},
-};
-
 /// 尝试从本地插件目录提供静态资源服务。
 ///
 /// 允许外部扩展插件（如 DevOrbit 等独立项目编译产物）直接由 Daemon 托管。
@@ -142,6 +129,19 @@ pub async fn try_serve_plugin_asset(path: &str) -> Option<Response> {
     // 严禁 fallback 到 Zap 的 index.html！对插件路径严格返回 404
     Some((StatusCode::NOT_FOUND, format!("plugin '{plugin_id}' asset '{clean_subpath}' not found")).into_response())
 }
+
+//! 嵌入式 webui 静态资源服务。
+//!
+//! 编译期把 `webui/dist/` 打进二进制；运行期 `GET /` 与未匹配的非 API 路径
+//! 都回退到 `index.html`，交给前端 SPA 路由。
+//!
+//! dev 模式（设置 `JEIKCODE_WEBUI_DEV=http://localhost:5173`）下应改为反代/
+//! 重定向到 vite dev server——后续任务实现。
+
+use axum::{
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
@@ -168,12 +168,10 @@ pub async fn serve_webui(uri: Uri) -> Response {
     }
 
     let path = uri.path();
-
-    // 优先拦截本地扩展插件静态资源（/plugins/{plugin_id}/* 或 /plugins-local/{plugin_id}/*）
-    if let Some(resp) = try_serve_plugin_asset(path).await {
-        return resp;
+    // 优先拦截外部扩展插件静态资源
+    if let Some(plugin_response) = try_serve_plugin_asset(path).await {
+        return plugin_response;
     }
-
     let p = path.trim_start_matches('/');
     let lookup = if p.is_empty() { "index.html" } else { p };
     match WebuiAssets::get(lookup) {

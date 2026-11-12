@@ -16,7 +16,7 @@ JeikCode 默认从官方 GitHub 仓库拉取更新与版本清单：
 
 ## 2. 在 `config.toml` 中持久化更新源
 
-在 `~/.zap/config.toml` **最顶部（所有 `[table]` 之前）** 配置：
+在 `~/.jeikcode/config.toml` **最顶部（所有 `[table]` 之前）** 配置：
 
 ```toml
 # ==============================================================================
@@ -78,7 +78,7 @@ jeikcode --host 0.0.0.0 --port 13457
 - **Linux**：生成并注册为 systemd 服务。
 - **macOS**：注册为 launchd 服务。
 - **Windows**：写入注册表当前用户启动项。
-- 端口与 Token 配置持久化于 `~/.zap/webui-listen.json`。
+- 端口与 Token 配置持久化于 `~/.jeikcode/webui-listen.json`。
 
 ---
 

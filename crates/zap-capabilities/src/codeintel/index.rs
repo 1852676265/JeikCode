@@ -1112,10 +1112,7 @@ const SKIP_DIR_NAMES: &[&str] = &[
     ".cache",
     "publish",
     "out",
-    // Zap internal data & store
-    ".zap",
-    ".jeikcode",
-    ".zap_store",
+    // WebUI user uploads: gitignored attachments, not project source.
     ".jeikcode_store",
 ];
 
@@ -1142,9 +1139,9 @@ fn load_codegraph_ignore(root: &Path) -> ignore::gitignore::Gitignore {
     let cfg = crate::paths::config_dir();
     for p in [
         // `.codegraphignore` = noise rules shared with glob/grep search;
-        // `.codegraphignore.graph` = GRAPH-ONLY sensitive rules (`.env*`, keys, SSH) —
-        // search must still find what the user explicitly asks for, so those rules are
-        // never registered with the search walker. Two scopes, two files, no duplication.
+        // `.codegraphignore.graph` = sensitive rules (`.env*`, keys, SSH), applied to
+        // code graph indexing and as the default glob/grep exclusion. `include_ignored`
+        // never exposes them; `include_sensitive` is approval-gated.
         root.join(".codegraphignore"),
         root.join(".codegraignore"),
         root.join(".codegraphignore.graph"),
@@ -1167,8 +1164,8 @@ fn load_codegraph_ignore(root: &Path) -> ignore::gitignore::Gitignore {
     })
 }
 
-/// The GRAPH-ONLY sensitive list must keep credentials out of indexing while the SHARED
-/// noise list stays search-visible (see `assets/.codegraphignore.graph`).
+/// The sensitive list must keep credentials out of indexing and default search while the
+/// shared noise list stays search-visible (see `assets/.codegraphignore.graph`).
 #[cfg(test)]
 mod graph_ignore_scope_tests {
     use super::load_codegraph_ignore;
@@ -1491,10 +1488,10 @@ fn collect_files_fallback(root: &Path) -> Vec<Walked> {
         builder.add_ignore(global_ignore2);
     }
 
-    // Also check .zap/.codegraphignore inside project root
-    let project_zap_ignore = root.join(".zap").join(".codegraphignore");
-    if project_zap_ignore.is_file() {
-        builder.add_ignore(project_zap_ignore);
+    // Also check .jeikcode/.codegraphignore inside project root
+    let project_jeikcode_ignore = root.join(".zap").join(".codegraphignore");
+    if project_jeikcode_ignore.is_file() {
+        builder.add_ignore(project_jeikcode_ignore);
     }
 
     for entry in builder
@@ -1585,9 +1582,9 @@ pub fn disk_cache_path(root: &Path) -> PathBuf {
     super::index_db::disk_cache_path_db(root)
 }
 
-/// True when `{root}/.zap/codegraph/index.v1.db` exists and contains at
+/// True when `{root}/.jeikcode/codegraph/index.v1.db` exists and contains at
 /// least one file unit. Empty or missing graphs must not be auto-created —
-/// the user runs `zap init` for a first index.
+/// the user runs `jeikcode init` for a first index.
 pub fn has_nonempty_codegraph(root: &Path) -> bool {
     load_disk_cache(&super::canonical(root)).is_some()
 }
@@ -1888,12 +1885,12 @@ fn load_idf_stats_sqlite(root: &Path) -> Option<super::retrieval::IdfStats> {
 fn cleanup_legacy_sidecars(root: &Path) {
     let root = super::canonical(root);
     for rel in [
-        ".zap/codegraph/units.v3.json",
-        ".zap/codegraph/units.v4.bin",
-        ".zap/codegraph/dirindex.v1.json",
-        ".zap/codegraph/stats.v1.json",
-        ".zap/codegraph/units.v3.json.tmp",
-        ".zap/codegraph/units.v4.bin.tmp",
+        ".jeikcode/codegraph/units.v3.json",
+        ".jeikcode/codegraph/units.v4.bin",
+        ".jeikcode/codegraph/dirindex.v1.json",
+        ".jeikcode/codegraph/stats.v1.json",
+        ".jeikcode/codegraph/units.v3.json.tmp",
+        ".jeikcode/codegraph/units.v4.bin.tmp",
     ] {
         let _ = std::fs::remove_file(root.join(rel));
     }
@@ -4215,7 +4212,7 @@ export function CouponPanel() {
         );
         assert!(
             !d.path().join(".zap").join("codegraph").exists(),
-            "missing codegraph must not be auto-created; user runs `zap init`"
+            "missing codegraph must not be auto-created; user runs `jeikcode init`"
         );
         assert!(!has_nonempty_codegraph(d.path()));
         crate::codeintel::prewarm_code_index(d.path());
@@ -5097,7 +5094,7 @@ public class OrderController
         assert_eq!(g.node_count(), 0);
         assert!(
             idx.inner.lock().unwrap().units.is_empty(),
-            "query-time must not create a first index; run `zap init`"
+            "query-time must not create a first index; run `jeikcode init`"
         );
         assert!(!d.path().join(".zap").join("codegraph").exists());
     }

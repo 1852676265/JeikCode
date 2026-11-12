@@ -3,8 +3,9 @@
 // instant subfolder filtering, breadcrumbs navigation, and global language safety.
 
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, getSidebarProjects, changeDir, deleteProject, mkdir, ProjectInfo, FsShortcut } from '../api';
+import { listDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo, FsShortcut } from '../api';
 import { fsBreadcrumbs, joinFsChild, stripExtendedPathPrefix } from '../lib/displayPath';
+import { useBackdropDismiss } from '../lib/backdropDismiss';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -17,6 +18,8 @@ interface CwdPickerProps {
 
 export function CwdPicker({ current, onPick, onClose, title }: CwdPickerProps) {
   const t = useT();
+  // 遮罩空白处点击关闭：避免弹窗内拖拽划词（左滑选中）时被误判为外部点击而秒关。
+  const backdropDismiss = useBackdropDismiss(onClose);
   const initialPath = stripExtendedPathPrefix(current || '~');
   const [inputPath, setInputPath] = useState(initialPath);
   const [browsePath, setBrowsePath] = useState(initialPath);
@@ -59,34 +62,8 @@ export function CwdPicker({ current, onPick, onClose, title }: CwdPickerProps) {
 
   // Load recent projects once
   useEffect(() => {
-    Promise.all([
-      getProjects().catch(() => [] as ProjectInfo[]),
-      getSidebarProjects().catch(() => ({ hidden: [], pinned: [] })),
-    ])
-      .then(([projs, sidebarData]) => {
-        const hidden = new Set(sidebarData.hidden || []);
-        const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-        const result: ProjectInfo[] = [];
-
-        if (Array.isArray(projs)) {
-          for (const p of projs) {
-            if (!p.working_dir || hidden.has(p.hash)) continue;
-            result.push(p);
-          }
-        }
-
-        if (Array.isArray(sidebarData.pinned)) {
-          for (const pinned of sidebarData.pinned) {
-            if (!pinned.working_dir || hidden.has(pinned.hash)) continue;
-            const pinnedNorm = norm(pinned.working_dir);
-            if (!result.some((p) => p.hash === pinned.hash || norm(p.working_dir) === pinnedNorm)) {
-              result.push(pinned);
-            }
-          }
-        }
-
-        setProjects(result);
-      })
+    getProjects()
+      .then(setProjects)
       .catch(() => setProjects([]));
   }, []);
 
@@ -204,9 +181,7 @@ export function CwdPicker({ current, onPick, onClose, title }: CwdPickerProps) {
   return (
     <div
       class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...backdropDismiss}
     >
       <div class="modal-card cwd-picker-modal">
         <div class="modal-header">

@@ -1,11 +1,19 @@
+mod ar;
+mod de;
 mod en;
+mod es;
+mod fr;
+mod ja;
+mod ko;
 mod messages;
+mod ru;
 #[cfg(test)]
 mod terminal_tests;
 mod vi;
 #[cfg(test)]
 mod vi_tests;
 mod zh_cn;
+mod zh_tw;
 
 pub use crate::locale::Locale;
 pub use messages::{ConfigSyncChange, Msg};
@@ -30,6 +38,14 @@ pub fn t_with(locale: Locale, msg: Msg<'_>) -> Cow<'static, str> {
         Locale::En => en::en(msg),
         Locale::Vi => vi::vi(msg),
         Locale::ZhCn => zh_cn::zh_cn(msg),
+        Locale::ZhTw => zh_tw::zh_tw(msg),
+        Locale::Ja => ja::ja(msg),
+        Locale::Ko => ko::ko(msg),
+        Locale::Ru => ru::ru(msg),
+        Locale::Fr => fr::fr(msg),
+        Locale::Es => es::es(msg),
+        Locale::De => de::de(msg),
+        Locale::Ar => ar::ar(msg),
     }
 }
 
@@ -107,6 +123,139 @@ pub fn format_compaction_noop(
 /// interrupted by runtime replacement or shutdown.
 pub fn format_compaction_interrupted() -> String {
     t(Msg::CompactInterrupted).into_owned()
+}
+
+pub fn format_agent_retry_empty(attempt: u32, max: u32, wait: u64) -> String {
+    t(Msg::AgentRetryEmpty { attempt, max, wait }).into_owned()
+}
+
+pub fn format_agent_retry_thinking(attempt: u32, max: u32, wait: u64) -> String {
+    t(Msg::AgentRetryThinking { attempt, max, wait }).into_owned()
+}
+
+pub fn format_agent_retry_malformed(attempt: u32, max: u32, wait: u64) -> String {
+    t(Msg::AgentRetryMalformed { attempt, max, wait }).into_owned()
+}
+
+pub fn format_agent_retry_first_token(secs: u64, attempt: u32, max: u32) -> String {
+    t(Msg::AgentRetryFirstToken { secs, attempt, max }).into_owned()
+}
+
+pub fn format_agent_retry_api(reason: &str, wait: u64, attempt: u32, max: u32) -> String {
+    t(Msg::AgentRetryApi {
+        reason,
+        wait,
+        attempt,
+        max,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_over_window(estimate_k: u32, window_k: u32, buffer_k: u32) -> String {
+    t(Msg::AgentOverWindow {
+        estimate_k,
+        window_k,
+        buffer_k,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_echo_loop_nudge() -> String {
+    t(Msg::AgentEchoLoopNudge).into_owned()
+}
+
+pub fn format_agent_echo_loop_warning() -> String {
+    t(Msg::AgentEchoLoopWarning).into_owned()
+}
+
+pub fn format_agent_model_high_latency_terminal(retries: u32, secs: u64) -> String {
+    t(Msg::AgentModelHighLatencyTerminal { retries, secs }).into_owned()
+}
+
+pub fn format_agent_exhausted_malformed(max: u32) -> String {
+    t(Msg::AgentExhaustedMalformed { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_thinking_over_window_intro(max: u32) -> String {
+    t(Msg::AgentExhaustedThinkingOverWindowIntro { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_thinking_over_window_size(
+    max: u32,
+    prompt_k: u32,
+    window_k: u32,
+) -> String {
+    t(Msg::AgentExhaustedThinkingOverWindowSize {
+        max,
+        prompt_k,
+        window_k,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_exhausted_thinking_generic(max: u32) -> String {
+    t(Msg::AgentExhaustedThinkingGeneric { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_empty_over_window_intro(max: u32) -> String {
+    t(Msg::AgentExhaustedEmptyOverWindowIntro { max }).into_owned()
+}
+
+pub fn format_agent_exhausted_empty_over_window_size(
+    max: u32,
+    prompt_k: u32,
+    window_k: u32,
+) -> String {
+    t(Msg::AgentExhaustedEmptyOverWindowSize {
+        max,
+        prompt_k,
+        window_k,
+    })
+    .into_owned()
+}
+
+pub fn format_agent_exhausted_empty_generic(max: u32) -> String {
+    t(Msg::AgentExhaustedEmptyGeneric { max }).into_owned()
+}
+
+pub fn format_agent_status_rate_limited() -> String {
+    t(Msg::AgentStatusRateLimited).into_owned()
+}
+
+pub fn format_agent_status_upstream_unavailable() -> String {
+    t(Msg::AgentStatusUpstreamUnavailable).into_owned()
+}
+
+pub fn format_agent_status_response_timeout() -> String {
+    t(Msg::AgentStatusResponseTimeout).into_owned()
+}
+
+pub fn format_agent_status_connection_failed() -> String {
+    t(Msg::AgentStatusConnectionFailed).into_owned()
+}
+
+pub fn format_agent_status_insufficient_balance() -> String {
+    t(Msg::AgentStatusInsufficientBalance).into_owned()
+}
+
+pub fn format_agent_status_unauthorized() -> String {
+    t(Msg::AgentStatusUnauthorized).into_owned()
+}
+
+pub fn format_stream_read_retry_exhausted(attempts: u32) -> String {
+    t(Msg::StreamReadRetryExhausted { attempts }).into_owned()
+}
+
+pub fn format_stream_read_partial_response() -> String {
+    t(Msg::StreamReadPartialResponse).into_owned()
+}
+
+pub fn format_stream_read_reset_hint() -> String {
+    t(Msg::StreamReadResetHint).into_owned()
+}
+
+pub fn format_stream_read_details_prefix() -> String {
+    t(Msg::StreamReadDetailsPrefix).into_owned()
 }
 
 fn fmt_compaction_tokens(tokens: usize) -> String {
@@ -232,14 +381,62 @@ fn get_native_os_locale() -> Option<String> {
 
 fn classify_env_locale(value: &str) -> Locale {
     let lower = value.to_ascii_lowercase();
-    // Chinese variants (zh_CN, zh_TW, zh_HK, ...)
-    if lower == "zh"
+    if lower.starts_with("zh_tw")
+        || lower.starts_with("zh-tw")
+        || lower.starts_with("zh_hk")
+        || lower.starts_with("zh-hk")
+        || lower.starts_with("zh_hant")
+        || lower.starts_with("zh-hant")
+    {
+        Locale::ZhTw
+    } else if lower == "zh"
         || lower.starts_with("zh_")
         || lower.starts_with("zh-")
         || lower.starts_with("zh.")
     {
         Locale::ZhCn
-    // Vietnamese variants (vi_VN, vi, ...)
+    } else if lower == "ja"
+        || lower.starts_with("ja_")
+        || lower.starts_with("ja-")
+        || lower.starts_with("ja.")
+    {
+        Locale::Ja
+    } else if lower == "ko"
+        || lower.starts_with("ko_")
+        || lower.starts_with("ko-")
+        || lower.starts_with("ko.")
+    {
+        Locale::Ko
+    } else if lower == "ru"
+        || lower.starts_with("ru_")
+        || lower.starts_with("ru-")
+        || lower.starts_with("ru.")
+    {
+        Locale::Ru
+    } else if lower == "fr"
+        || lower.starts_with("fr_")
+        || lower.starts_with("fr-")
+        || lower.starts_with("fr.")
+    {
+        Locale::Fr
+    } else if lower == "es"
+        || lower.starts_with("es_")
+        || lower.starts_with("es-")
+        || lower.starts_with("es.")
+    {
+        Locale::Es
+    } else if lower == "de"
+        || lower.starts_with("de_")
+        || lower.starts_with("de-")
+        || lower.starts_with("de.")
+    {
+        Locale::De
+    } else if lower == "ar"
+        || lower.starts_with("ar_")
+        || lower.starts_with("ar-")
+        || lower.starts_with("ar.")
+    {
+        Locale::Ar
     } else if lower == "vi"
         || lower.starts_with("vi_")
         || lower.starts_with("vi-")
@@ -258,7 +455,7 @@ fn classify_env_locale(value: &str) -> Locale {
 /// default `En`.
 ///
 /// Exposed unconditionally (not `#[cfg(test)]`-gated) because tests in
-/// downstream crates (zap-tuix, etc.) need to take this lock too,
+/// downstream crates (jeikcode-tuix, etc.) need to take this lock too,
 /// and `cfg(test)` only applies to the crate currently being tested.
 /// The lock is a `OnceLock` so it costs nothing at runtime until first
 /// use.
@@ -486,7 +683,7 @@ mod tests {
         let env_empty = |_: &str| None;
         let os_zh = || Some("zh-CN".to_string());
         let os_vi = || Some("vi-VN".to_string());
-        let os_unsupported = || Some("de-DE".to_string());
+        let os_unsupported = || Some("it-IT".to_string());
 
         assert_eq!(
             resolve_initial_locale_with_sources(None, None, &env_empty, &os_zh),
@@ -503,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn env_zh_tw_maps_to_zh_cn() {
+    fn env_zh_tw_resolves_to_zh_tw() {
         let env = |k: &str| {
             if k == "LANG" {
                 Some("zh_TW".into())
@@ -513,7 +710,7 @@ mod tests {
         };
         assert_eq!(
             resolve_initial_locale_with_env(None, None, &env),
-            Locale::ZhCn
+            Locale::ZhTw
         );
     }
 
@@ -536,7 +733,7 @@ mod tests {
     fn env_unsupported_falls_back_to_en() {
         let env = |k: &str| {
             if k == "LANG" {
-                Some("fr_FR.UTF-8".into())
+                Some("it_IT.UTF-8".into())
             } else {
                 None
             }
@@ -669,11 +866,11 @@ mod tests {
     fn cli_flag_unparseable_falls_through() {
         let env = |_: &str| None;
         assert_eq!(
-            resolve_initial_locale_with_env(Some("fr"), Some(Locale::ZhCn), &env),
+            resolve_initial_locale_with_env(Some("xx_unsupported"), Some(Locale::ZhCn), &env),
             Locale::ZhCn
         );
         assert_eq!(
-            resolve_initial_locale_with_env(Some("fr"), None, &env),
+            resolve_initial_locale_with_env(Some("xx_unsupported"), None, &env),
             Locale::En
         );
     }
@@ -770,6 +967,44 @@ mod tests {
         assert_eq!(
             t_with(Locale::ZhCn, Msg::ProviderPanelAddModelRow),
             "＋ 添加模型"
+        );
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelAddProviderRow),
+            "+ Add custom provider"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelAddProviderRow),
+            "＋ 添加自定义 provider"
+        );
+        assert_eq!(t_with(Locale::En, Msg::ProviderPanelFieldName), "Name");
+        assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelFieldName), "名称");
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelFieldProtocol),
+            "Protocol"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelFieldProtocol),
+            "协议"
+        );
+        assert_eq!(t_with(Locale::En, Msg::ProviderPanelRequired), "(required)");
+        assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelRequired), "(必填)");
+        assert_eq!(t_with(Locale::En, Msg::ProviderPanelLocked), "(locked)");
+        assert_eq!(t_with(Locale::ZhCn, Msg::ProviderPanelLocked), "(锁定)");
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelAddTitle),
+            "[Add provider]"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelAddTitle),
+            "【添加 Provider】"
+        );
+        assert_eq!(
+            t_with(Locale::En, Msg::ProviderPanelEmptyAccounts),
+            "(No providers yet — press Ctrl+A to add one)"
+        );
+        assert_eq!(
+            t_with(Locale::ZhCn, Msg::ProviderPanelEmptyAccounts),
+            "（尚无 Provider — 按 Ctrl+A 添加）"
         );
 
         assert_eq!(

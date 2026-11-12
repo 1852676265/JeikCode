@@ -1,15 +1,40 @@
 // crates/zap-core/src/config/instructions.rs
 //
-// Three-tier layered instruction system: global → project → user.
+// Two-tier layered instruction system: global → project. (The former
+// `.zap.user.md` user tier was removed; the ACTIVE prompt loader lives in
+// `zap-capabilities/src/session/instructions.rs` — this module backs the
+// `/status` + `/init` display only.)
 //
-// 1. Global:  ~/.jeikcode/JEIKCODE.md — personal preferences across all projects
-// 2. Project: <project>/.jeikcode.md, JEIKCODE.md, AGENTS.md, CLAUDE.md,
-//             or claude.md (first match wins; AGENTS.md is the open standard
-//             for AI coding agents; CLAUDE.md/claude.md are accepted for
-//             compatibility with projects migrating from Claude Code)
-// 3. User:    <project>/.jeikcode.user.md — personal per-project, in .gitignore
+// 1. Global:  ~/.zap/AGENTS.md or ~/.zap/ZAP.md — personal preferences
+//             across all projects
+// 2. Project: <project>/AGENTS.md (open standard), .zap.md, ZAP.md,
+//             CLAUDE.md, or claude.md (first match wins; CLAUDE.md/claude.md are
+//             accepted for compatibility with projects migrating from Claude Code)
 
 use std::path::{Path, PathBuf};
+
+/// Canonical GLOBAL-tier instruction file names under the config root (`~/.zap/`),
+/// highest precedence first.
+///
+/// SINGLE SOURCE OF TRUTH: shared by this `/status` display loader and the ACTIVE prompt
+/// loader in `zap-capabilities/src/session/instructions.rs`, so their precedence
+/// tables can never drift apart.
+pub const GLOBAL_INSTRUCTION_FILES: [&str; 4] = ["AGENTS.md", "ZAP.md", "JEIKCODE.md", "CLAUDE.md"];
+
+/// Canonical PROJECT-tier instruction file names under the workspace root, highest
+/// precedence first: `AGENTS.md` (the open standard) wins, then the native JeikCode names,
+/// then the Claude Code compatibility names.
+///
+/// SINGLE SOURCE OF TRUTH: shared with the ACTIVE prompt loader (see above).
+pub const PROJECT_INSTRUCTION_FILES: [&str; 7] = [
+    "AGENTS.md",
+    ".zap.md",
+    "ZAP.md",
+    ".jeikcode.md",
+    "JEIKCODE.md",
+    "CLAUDE.md",
+    "claude.md",
+];
 
 #[derive(Debug)]
 pub struct InstructionFile {
@@ -22,7 +47,6 @@ pub struct InstructionFile {
 pub enum InstructionLevel {
     Global,
     Project,
-    User,
 }
 
 impl InstructionLevel {
@@ -30,7 +54,6 @@ impl InstructionLevel {
         match self {
             Self::Global => "GLOBAL",
             Self::Project => "PROJECT",
-            Self::User => "USER",
         }
     }
 }
@@ -44,44 +67,26 @@ impl std::fmt::Display for InstructionLevel {
 pub struct LayeredInstructions {
     pub global: Option<InstructionFile>,
     pub project: Option<InstructionFile>,
-    pub user: Option<InstructionFile>,
 }
 
 impl LayeredInstructions {
-    /// Load all three instruction tiers from disk.
+    /// Load both instruction tiers from disk.
     ///
-    /// - Global:  `~/.zap/ZAP.md`
-    /// - Project: `<project_root>/.zap.md`, `ZAP.md`, `AGENTS.md`,
-    ///   `CLAUDE.md`, or `claude.md` (first match wins)
-    /// - User:    `<project_root>/.zap.user.md`
+    /// - Global:  `~/.zap/AGENTS.md` → `~/.zap/ZAP.md`
+    /// - Project: `<project_root>/AGENTS.md` (open standard), `.zap.md`,
+    ///   `ZAP.md`, `CLAUDE.md`, or `claude.md` (first match wins)
     pub fn load(project_root: &Path) -> Self {
         let config_dir = crate::config::Config::config_dir();
-        let global = Self::try_load(&config_dir.join("AGENTS.md"), InstructionLevel::Global)
-            .or_else(|| Self::try_load(&config_dir.join("ZAP.md"), InstructionLevel::Global))
-            .or_else(|| Self::try_load(&config_dir.join("JEIKCODE.md"), InstructionLevel::Global));
+        let global = GLOBAL_INSTRUCTION_FILES
+            .iter()
+            .find_map(|name| Self::try_load(&config_dir.join(name), InstructionLevel::Global));
 
-        // Lookup order: native Zap names first, then AGENTS.md (open standard),
-        // then Claude Code names.
-        let project = [
-            ".zap.md",
-            "ZAP.md",
-            "AGENTS.md",
-            "CLAUDE.md",
-            "claude.md",
-        ]
-        .iter()
-        .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
+        // Lookup order matches the ACTIVE prompt loader (shared `PROJECT_INSTRUCTION_FILES`).
+        let project = PROJECT_INSTRUCTION_FILES
+            .iter()
+            .find_map(|name| Self::try_load(&project_root.join(name), InstructionLevel::Project));
 
-        let user = Self::try_load(
-            &project_root.join(".zap.user.md"),
-            InstructionLevel::User,
-        );
-
-        Self {
-            global,
-            project,
-            user,
-        }
+        Self { global, project }
     }
 
     fn try_load(path: &Path, level: InstructionLevel) -> Option<InstructionFile> {
@@ -97,8 +102,8 @@ impl LayeredInstructions {
         })
     }
 
-    /// Merge all levels into prompt text. Low priority first, high last
-    /// (recency effect: user > project > global).
+    /// Merge both levels into prompt text. Low priority first, high last
+    /// (recency effect: project > global).
     pub fn merged(&self) -> String {
         let mut parts = Vec::new();
         if let Some(ref g) = self.global {
@@ -117,41 +122,28 @@ impl LayeredInstructions {
                 p.content.trim()
             ));
         }
-        if let Some(ref u) = self.user {
-            parts.push(format!(
-                "=== {} INSTRUCTIONS ({}) ===\n{}",
-                u.level.label(),
-                u.path.display(),
-                u.content.trim()
-            ));
-        }
         parts.join("\n\n")
     }
 
-    /// Return status for all three levels with either the loaded path or the
+    /// Return status for both levels with either the loaded path or the
     /// preferred path to create when that level is missing.
     pub fn status_lines(&self, project_root: &Path) -> Vec<InstructionStatusLine> {
         vec![
             InstructionStatusLine::new(
                 InstructionLevel::Global,
                 self.global.as_ref(),
-                crate::config::Config::config_dir().join("ZAP.md"),
+                crate::config::Config::config_dir().join(GLOBAL_INSTRUCTION_FILES[0]),
             ),
             InstructionStatusLine::new(
                 InstructionLevel::Project,
                 self.project.as_ref(),
-                project_root.join(".zap.md"),
-            ),
-            InstructionStatusLine::new(
-                InstructionLevel::User,
-                self.user.as_ref(),
-                project_root.join(".zap.user.md"),
+                project_root.join(PROJECT_INSTRUCTION_FILES[0]),
             ),
         ]
     }
 
     pub fn has_any(&self) -> bool {
-        self.global.is_some() || self.project.is_some() || self.user.is_some()
+        self.global.is_some() || self.project.is_some()
     }
 }
 
@@ -192,10 +184,6 @@ mod tests {
                 &tmp.path().join(".zap.md"),
                 InstructionLevel::Project,
             ),
-            user: LayeredInstructions::try_load(
-                &tmp.path().join(".zap.user.md"),
-                InstructionLevel::User,
-            ),
         };
         assert!(!instructions.has_any());
         assert!(instructions.merged().is_empty());
@@ -229,6 +217,16 @@ mod tests {
     }
 
     #[test]
+    fn agents_md_preferred_over_zap_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "agents wins").unwrap();
+        fs::write(tmp.path().join(".zap.md"), "zap loses").unwrap();
+        let instructions = LayeredInstructions::load(tmp.path());
+        let project = instructions.project.expect("project tier should load");
+        assert!(project.content.contains("agents wins"));
+    }
+
+    #[test]
     fn claude_md_used_as_project_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("CLAUDE.md"), "from Claude Code").unwrap();
@@ -250,16 +248,6 @@ mod tests {
             .project
             .expect("claude.md should be loaded as project tier");
         assert!(project.content.contains("lowercase claude"));
-    }
-
-    #[test]
-    fn zap_md_preferred_over_agents_md() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".zap.md"), "zap wins").unwrap();
-        fs::write(tmp.path().join("AGENTS.md"), "agents loses").unwrap();
-        let instructions = LayeredInstructions::load(tmp.path());
-        let project = instructions.project.expect("project tier should load");
-        assert!(project.content.contains("zap wins"));
     }
 
     #[test]
@@ -304,20 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn user_instructions_loaded() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".zap.user.md"), "my prefs").unwrap();
-        let user = LayeredInstructions::try_load(
-            &tmp.path().join(".zap.user.md"),
-            InstructionLevel::User,
-        );
-        assert!(user.is_some());
-        let f = user.unwrap();
-        assert_eq!(f.level, InstructionLevel::User);
-        assert!(f.content.contains("my prefs"));
-    }
-
-    #[test]
     fn empty_file_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".zap.md"), "   \n  \n").unwrap();
@@ -329,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_output_order_is_global_project_user() {
+    fn merged_output_order_is_global_then_project() {
         let tmp = tempfile::tempdir().unwrap();
         let instructions = LayeredInstructions {
             global: Some(InstructionFile {
@@ -342,22 +316,15 @@ mod tests {
                 content: "PROJECT_CONTENT".to_string(),
                 level: InstructionLevel::Project,
             }),
-            user: Some(InstructionFile {
-                path: tmp.path().join("user.md"),
-                content: "USER_CONTENT".to_string(),
-                level: InstructionLevel::User,
-            }),
         };
         let merged = instructions.merged();
         let global_pos = merged.find("GLOBAL_CONTENT").unwrap();
         let project_pos = merged.find("PROJECT_CONTENT").unwrap();
-        let user_pos = merged.find("USER_CONTENT").unwrap();
         assert!(global_pos < project_pos, "global must come before project");
-        assert!(project_pos < user_pos, "project must come before user");
     }
 
     #[test]
-    fn status_lines_show_all_three_levels() {
+    fn status_lines_show_both_levels() {
         let tmp = tempfile::tempdir().unwrap();
         let instructions = LayeredInstructions {
             global: Some(InstructionFile {
@@ -366,23 +333,16 @@ mod tests {
                 level: InstructionLevel::Global,
             }),
             project: None,
-            user: Some(InstructionFile {
-                path: tmp.path().join("u.md"),
-                content: "u".to_string(),
-                level: InstructionLevel::User,
-            }),
         };
         let lines = instructions.status_lines(tmp.path());
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].level, InstructionLevel::Global);
         assert!(lines[0].found);
         assert!(lines[0].path.ends_with("g.md"));
         assert_eq!(lines[1].level, InstructionLevel::Project);
         assert!(!lines[1].found);
-        assert_eq!(lines[1].path, tmp.path().join(".zap.md"));
-        assert_eq!(lines[2].level, InstructionLevel::User);
-        assert!(lines[2].found);
-        assert!(lines[2].path.ends_with("u.md"));
+        // Preferred path to create matches the loader's FIRST-precedence name (AGENTS.md).
+        assert_eq!(lines[1].path, tmp.path().join("AGENTS.md"));
     }
 
     #[test]
@@ -408,7 +368,6 @@ mod tests {
                 content: "p".to_string(),
                 level: InstructionLevel::Project,
             }),
-            user: None,
         };
         assert!(instructions.has_any());
     }
@@ -418,7 +377,6 @@ mod tests {
         let instructions = LayeredInstructions {
             global: None,
             project: None,
-            user: None,
         };
         assert!(!instructions.has_any());
     }
@@ -427,7 +385,6 @@ mod tests {
     fn level_labels_are_correct() {
         assert_eq!(InstructionLevel::Global.label(), "GLOBAL");
         assert_eq!(InstructionLevel::Project.label(), "PROJECT");
-        assert_eq!(InstructionLevel::User.label(), "USER");
     }
 
     #[test]
@@ -439,7 +396,6 @@ mod tests {
                 content: "Only project rules".to_string(),
                 level: InstructionLevel::Project,
             }),
-            user: None,
         };
         let merged = instructions.merged();
         assert!(merged.contains("=== PROJECT INSTRUCTIONS"));

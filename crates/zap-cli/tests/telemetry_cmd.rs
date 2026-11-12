@@ -9,7 +9,7 @@ fn _isolate_jeikcode_home() {
 }
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zap")
+    env!("CARGO_BIN_EXE_jeikcode")
 }
 
 #[test]

@@ -1060,6 +1060,13 @@ pub(crate) struct UpstreamModelsRequest {
     pub provider_name: Option<String>,
     #[serde(default)]
     pub skip_tls_verify: bool,
+    /// 为 true 时不做模型目录列举，而是经解析后的传输发一次极小「Hi」请求，
+    /// 返回 `{ok, latency_ms}`（探活）。
+    #[serde(default)]
+    pub probe: bool,
+    /// 探活目标模型 id（`probe=true` 时必填）。
+    #[serde(default)]
+    pub model: String,
 }
 
 /// Resolved transport facts for an upstream `/models` probe.
@@ -1176,6 +1183,39 @@ pub(crate) async fn list_upstream_models(
         Ok(v) => v,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
     };
+    // 探活分支：走与真实对话相同的 provider 链路，只发一条「Hi」（无工具/无系统提示词），
+    // 无论成败都返回 200，由前端渲染 OK(绿)/Failed(红)。
+    if req.probe {
+        let model = req.model.trim();
+        if model.is_empty() {
+            return json_error(StatusCode::BAD_REQUEST, "model is required for probe")
+                .into_response();
+        }
+        // 读配置只为继承已保存提供商的可选设置；配置损坏时退回默认值，
+        // 表单里的传输事实（base_url/key/协议/model）仍然可用。
+        let config = load_config().unwrap_or_default();
+        return match probe_via_provider(&config, &req, &resolved, model).await {
+            ProbeOutcome {
+                ok: true,
+                latency_ms,
+                ..
+            } => Json(serde_json::json!({
+                "ok": true,
+                "latency_ms": latency_ms,
+            }))
+            .into_response(),
+            ProbeOutcome {
+                ok: false,
+                latency_ms,
+                error,
+            } => Json(serde_json::json!({
+                "ok": false,
+                "latency_ms": latency_ms,
+                "error": error.unwrap_or_default(),
+            }))
+            .into_response(),
+        };
+    }
     match fetch_upstream_model_ids(
         &resolved.protocol,
         &resolved.base_url,
@@ -1186,6 +1226,109 @@ pub(crate) async fn list_upstream_models(
     {
         Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error).into_response(),
+    }
+}
+
+/// 探活结果：首字耗时始终上报（成功 = 首字延迟，失败 = 报错前耗时）。
+struct ProbeOutcome {
+    ok: bool,
+    latency_ms: u64,
+    error: Option<String>,
+}
+
+/// 探活入口：包裹真实对话链路，把「首字延迟 / 错误」统一成前端 DTO。
+async fn probe_via_provider(
+    config: &zap_config::config::Config,
+    req: &UpstreamModelsRequest,
+    resolved: &UpstreamResolve,
+    model: &str,
+) -> ProbeOutcome {
+    let started = std::time::Instant::now();
+    let outcome = probe_via_provider_inner(config, req, resolved, model).await;
+    ProbeOutcome {
+        ok: outcome.is_ok(),
+        latency_ms: started.elapsed().as_millis() as u64,
+        error: outcome.err(),
+    }
+}
+
+/// 探活：走与真实对话**完全相同**的 provider 构建链（同一工厂、同一套认证头、
+/// User-Agent、TLS、协议适配与会话头），只把工具与系统提示词去掉，发一条「Hi」。
+///
+/// 旧实现自己拼 HTTP 请求，与真实对话的请求形态不一致：网关类提供商要求会话头
+/// （`x-jeikcode-session-id` / `x-session-id`）才能路由/复用会话，自定义探测
+/// 不带就会报 400 MissingSessionID。这里复用 kernel `LlmProvider`，
+/// 拿到首个流事件即视为探测成功。
+async fn probe_via_provider_inner(
+    config: &zap_config::config::Config,
+    req: &UpstreamModelsRequest,
+    resolved: &UpstreamResolve,
+    model: &str,
+) -> Result<(), String> {
+    use futures::StreamExt;
+    use zap_kernel::message::Message;
+    use zap_kernel::provider::ChatOptions;
+    use zap_kernel::stream::StreamEvent;
+
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // 已有提供商（编辑中/账号）时继承它完整的运行时设置；表单里的传输事实优先。
+    let selection = req
+        .provider_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            req.account
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    let mut runtime = zap_coding::CodingRuntimeConfig::from_config(
+        config,
+        &working_dir,
+        Some(selection),
+        None,
+        false,
+        false,
+    );
+    runtime.api_key = resolved.api_key.clone();
+    runtime.base_url = resolved.base_url.clone();
+    runtime.model = model.to_string();
+    runtime.provider_type = resolved.protocol.clone();
+    runtime.skip_tls_verify = resolved.skip_tls_verify;
+    // 探活是一次性的极短请求：不挂 MCP、不跑 agent 循环，只要首字。
+    runtime.mcp = false;
+    runtime.max_tokens = Some(16);
+
+    let cfg = crate::kernel_runtime::coding_config_from_runtime(&runtime);
+    let options = ChatOptions {
+        // 只保留真实对话的会话/请求形态，把输出上限压到很小，成本可忽略。
+        max_tokens: Some(16),
+        ..cfg.chat_options.clone()
+    };
+    let factory = crate::runtime_host::coding_provider_factory();
+    // 真实对话会给每次请求绑一个会话身份（网关据此路由/复用会话）；探活也用
+    // 一次性会话 id，保证请求头与正常对话完全一致。
+    let session_id = format!("probe-{}", uuid::Uuid::new_v4());
+    let provider = tokio::task::spawn_blocking(move || factory.build(&cfg, Some(&session_id)))
+        .await
+        .map_err(|e| format!("provider build task panicked: {e}"))?
+        .map_err(|e| format!("provider construction failed: {e}"))?;
+
+    let messages = vec![Message::user("Hi")];
+    // 工具为空 = 不带任何工具定义；也没有系统提示词 —— 与普通对话只差这两项。
+    let mut stream = provider
+        .chat_stream(&messages, &[], &options)
+        .await
+        .map_err(|e| e.message)?;
+    let idle = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(idle, stream.next()).await {
+        Err(_) => Err("probe timed out: no first event within 30s".into()),
+        Ok(None) => Ok(()),
+        Ok(Some(StreamEvent::Error(error))) => Err(error.message),
+        // 任何一段内容（正文/思考/工具参数）都证明请求被受理并已开始生成。
+        Ok(Some(_)) => Ok(()),
     }
 }
 
@@ -1294,7 +1437,8 @@ async fn fetch_upstream_model_ids(
 #[cfg(test)]
 mod upstream_tests {
     use super::{
-        models_endpoint, parse_model_ids, resolve_upstream_request, UpstreamModelsRequest,
+        models_endpoint, parse_model_ids, probe_via_provider, resolve_upstream_request,
+        UpstreamModelsRequest, UpstreamResolve,
     };
     use crate::api_config::update_config;
     use zap_config::config::provider::{ModelProfileConfig, ProviderAccountConfig};
@@ -1321,6 +1465,114 @@ mod upstream_tests {
         assert_eq!(
             parse_model_ids(body),
             vec!["grok-4.5".to_string(), "grok-4.6".to_string()]
+        );
+    }
+
+    /// 探活必须与真实对话同形：只有一条 user「Hi」，没有工具定义、没有系统提示词，
+    /// 并携带与对话相同的会话头（OpenCode 类网关靠它路由）。
+    #[tokio::test]
+    async fn probe_sends_the_chat_request_shape_without_tools_or_system_prompt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<(String, String)>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept probe request");
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).await.expect("read probe request");
+                assert!(read > 0, "probe request ended before headers");
+                raw.extend_from_slice(&buffer[..read]);
+                if let Some(index) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).await.expect("read probe body");
+                assert!(read > 0, "probe request body truncated");
+                raw.extend_from_slice(&buffer[..read]);
+            }
+            let body =
+                String::from_utf8_lossy(&raw[header_end..header_end + content_length]).to_string();
+            let _ = request_tx.send((headers, body));
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let config = zap_config::config::Config::default();
+        let base_url = format!("http://{address}/v1");
+        let req = UpstreamModelsRequest {
+            protocol: "openai".into(),
+            base_url: base_url.clone(),
+            api_key: Some("sk-probe".into()),
+            account: None,
+            provider_name: None,
+            skip_tls_verify: false,
+            probe: true,
+            model: "probe-model".into(),
+        };
+        let resolved = UpstreamResolve {
+            protocol: "openai".into(),
+            base_url,
+            api_key: "sk-probe".into(),
+            skip_tls_verify: false,
+        };
+
+        let outcome = probe_via_provider(&config, &req, &resolved, "probe-model").await;
+        let (headers, body) = tokio::time::timeout(std::time::Duration::from_secs(5), request_rx)
+            .await
+            .expect("probe request must reach the mock provider")
+            .expect("capture channel");
+        let _ = server.await;
+        assert!(outcome.ok, "probe failed: {:?}", outcome.error);
+
+        let payload: serde_json::Value = serde_json::from_str(&body).expect("probe json body");
+        let messages = payload["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "probe must send exactly one message: {payload}"
+        );
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Hi");
+        assert!(
+            payload.get("tools").is_none()
+                || payload["tools"].as_array().is_some_and(|t| t.is_empty()),
+            "probe must not send tool definitions: {payload}"
+        );
+        assert_eq!(payload["model"], "probe-model");
+
+        let head = headers.to_ascii_lowercase();
+        assert!(
+            head.contains("x-jeikcode-session-id: probe-"),
+            "probe must carry the product's own session header: {head}"
+        );
+        assert!(
+            head.contains("x-session-id: probe-"),
+            "probe must carry the same gateway session header as chat: {head}"
+        );
+        assert!(
+            !head.contains("x-opencode-session"),
+            "only our own brand session header may be sent: {head}"
         );
     }
 
@@ -1354,6 +1606,8 @@ mod upstream_tests {
             account: Some("my-gemini".into()),
             provider_name: None,
             skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
         })
         .expect("resolve");
 
@@ -1392,6 +1646,8 @@ mod upstream_tests {
             account: Some("ds".into()),
             provider_name: None,
             skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
         })
         .expect("resolve");
 
@@ -1452,6 +1708,8 @@ mod upstream_tests {
             account: None,
             provider_name: Some("chat".into()),
             skip_tls_verify: false,
+            probe: false,
+            model: String::new(),
         })
         .expect("resolve");
 

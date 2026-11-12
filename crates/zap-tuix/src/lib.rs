@@ -11,7 +11,6 @@ fn _isolate_jeikcode_home() {
 }
 
 pub mod commands;
-pub mod custom_commands;
 pub mod event_loop;
 pub mod git;
 pub(crate) mod git_diff;
@@ -353,6 +352,14 @@ pub async fn run(
     let RuntimeEndpoint { native: runtime } = endpoint;
     let mut caps = TerminalCaps::probe();
 
+    // Ensure the i18n subsystem reflects the loaded configuration's language choice.
+    if config.language.is_some() {
+        crate::i18n::set_locale(zap_config::i18n::resolve_initial_locale(
+            None,
+            config.language,
+        ));
+    }
+
     // Decide force_plain BEFORE activating TerminalGuard. Plain mode
     // is incompatible with raw-mode setup: PlainRenderer emits `\n`
     // (LF only) via `writeln!`, but raw mode disables the kernel's
@@ -598,7 +605,7 @@ pub async fn run(
         }
     }
 
-    {
+    if !zap_config::config::offline::is_offline_active() {
         let slot = update_hint.clone();
         let wake = wake_tx.clone();
         tokio::spawn(async move {
@@ -649,7 +656,7 @@ pub async fn run(
     };
 
     let capability_scan_start = std::time::Instant::now();
-    let custom_commands = crate::custom_commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = zap_capabilities::commands::UserCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.

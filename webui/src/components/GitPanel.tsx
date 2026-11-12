@@ -36,7 +36,7 @@ import {
 } from '../lib/gitGraph';
 import { copyTextToClipboard } from '../lib/clipboard';
 import { gitPanelFingerprint } from '../lib/gitRefresh';
-import { gitStore, type GitProjectState } from '../lib/gitStore';
+import { gitStore, getSessionActiveRepo, type GitProjectState } from '../lib/gitStore';
 
 interface ParsedCommitMessage {
   subject: string;
@@ -74,6 +74,7 @@ function parseCommitMessage(rawMessage: string): ParsedCommitMessage {
 
 interface GitPanelProps {
   cwd?: string;
+  sessionId?: string | null;
   refreshTrigger?: number;
   onBranchChanged?: (newBranch: string) => void;
   onOpenFileDiff?: (commit: GitCommitItem, file: GitCommitFile, repoRoot?: string) => void;
@@ -82,6 +83,7 @@ interface GitPanelProps {
 
 export function GitPanel({
   cwd,
+  sessionId,
   refreshTrigger,
   onBranchChanged,
   onOpenFileDiff,
@@ -195,10 +197,20 @@ export function GitPanel({
   const [commitFiles, setCommitFiles] = useState<Record<string, GitCommitFile[]>>({});
   const [loadingCommitHash, setLoadingCommitHash] = useState<string | null>(null);
 
-  // 异步探测子仓库列表（仅在初次或 cwd 变更时触发，不阻塞主视图渲染）
+  // 异步探测子仓库列表（并在传入 sessionId 时优先对齐当前会话绑定的子仓）
   useEffect(() => {
-    void gitStore.refreshRepos(cwd);
-  }, [cwd]);
+    void gitStore.refreshRepos(cwd, sessionId);
+  }, [cwd, sessionId]);
+
+  // 跨会话切换时，若当前会话绑定了特定子仓，静默对齐当前激活子仓
+  useEffect(() => {
+    if (!sessionId || repos.length === 0) return;
+    const target = getSessionActiveRepo(sessionId, repos);
+    if (target && target !== storeState.activeRepoRoot) {
+      gitStore.setActiveRepoRoot(cwd, target, sessionId);
+      setSelectedBranch(null);
+    }
+  }, [sessionId, repos]);
 
   // VSCode Context Menu State
   interface ContextMenuState {
@@ -508,7 +520,17 @@ export function GitPanel({
       const res = await gitAction({ action: 'push_branch', target: branch, cwd: effectiveCwd });
       setSuccessMsg(res.message || `Pushed ${branch} to remote`);
       showToast(res.message || `Pushed ${branch} to remote`, 'success');
-      await loadGitData(true);
+      gitStore.setOptimisticState(cwd, (prev) => {
+        if (!prev || !prev.gitStatus) return prev;
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            ahead: 0,
+          },
+        };
+      });
+      void handleFullRefresh();
     } catch (err: any) {
       setError(err?.message || 'Push failed');
     }
@@ -559,7 +581,8 @@ export function GitPanel({
     setIsFetching(true);
     if (!silent) setPanelError(null);
     try {
-      const ok = await gitStore.triggerAutoFetch(cwd, { force: !silent });
+      const fetchTarget = effectiveCwd || cwd;
+      const ok = await gitStore.triggerAutoFetch(fetchTarget, { force: !silent });
       if (!silent) {
         if (ok) {
           showToast(t('git.fetchSuccess'), 'success');
@@ -576,13 +599,19 @@ export function GitPanel({
     } finally {
       setIsFetching(false);
     }
-  }, [cwd, isFetching, t]);
+  }, [cwd, effectiveCwd, isFetching, t]);
 
-  // 综合刷新（本地状态 + 获取全部远程代码）
+  // 综合刷新（阶段一：本地状态毫秒级先到先更；阶段二：网络Fetch异步非阻塞，远端新引用到货后级联重绘图谱并重新落缓存）
   const handleFullRefresh = useCallback(async () => {
-    loadGitData(false);
-    await handleFetch(false);
-  }, [loadGitData, handleFetch]);
+    // 阶段 1：本地即时快速刷新（<15ms 本地更改列表、当前分支、ahead/behind 即刻上屏）
+    gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false, filterBranch });
+    // 阶段 2：异步并发拉取远程最新代码（按钮优雅旋转，完全非阻塞，连击自动单飞复用）
+    void (async () => {
+      await handleFetch(false);
+      // 阶段 3：远程到货后，无条件以 forceAll 刷新图谱，后端校验双指纹变动并重新落缓存
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true, filterBranch });
+    })();
+  }, [cwd, filterBranch, handleFetch]);
 
   // Initial load 与外部 refreshTrigger 联动
   const seenRefreshRef = useRef<number | null>(null);
@@ -646,11 +675,76 @@ export function GitPanel({
   const handleStage = async (path?: string, all?: boolean) => {
     setActionLoadingPath(path || 'all');
     setError(null);
+
+    // 0ms 瞬间乐观更新：立即从未暂存移至暂存区，体验对齐 VS Code
+    gitStore.setOptimisticState(cwd, (prev) => {
+      if (!prev || !prev.gitStatus) return prev;
+      const curStaged = [...(prev.gitStatus.staged || [])];
+      let curUnstaged = [...(prev.gitStatus.unstaged || [])];
+      let curUntracked = [...(prev.gitStatus.untracked || [])];
+
+      if (all || !path) {
+        // 暂存全部
+        const stagedPaths = new Set(curStaged.map((f) => f.path));
+        for (const item of [...curUnstaged, ...curUntracked]) {
+          if (!stagedPaths.has(item.path)) {
+            stagedPaths.add(item.path);
+            curStaged.push({
+              ...item,
+              status: item.status === '?' ? 'A' : item.status,
+              staged: true,
+            });
+          }
+        }
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: curStaged,
+            unstaged: [],
+            untracked: [],
+          },
+        };
+      } else {
+        // 暂存单个文件
+        const targetFromUnstaged = curUnstaged.find((f) => f.path === path);
+        const targetFromUntracked = curUntracked.find((f) => f.path === path);
+        const target = targetFromUnstaged || targetFromUntracked;
+        if (!target) return prev;
+
+        curUnstaged = curUnstaged.filter((f) => f.path !== path);
+        curUntracked = curUntracked.filter((f) => f.path !== path);
+
+        const existingIdx = curStaged.findIndex((f) => f.path === path);
+        const stagedItem: GitStatusItem = {
+          ...target,
+          status: target.status === '?' ? 'A' : target.status,
+          staged: true,
+        };
+        if (existingIdx !== -1) {
+          curStaged[existingIdx] = stagedItem;
+        } else {
+          curStaged.push(stagedItem);
+        }
+
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: curStaged,
+            unstaged: curUnstaged,
+            untracked: curUntracked,
+          },
+        };
+      }
+    });
+
     try {
       await gitStage({ path, all, cwd: effectiveCwd });
-      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
     } catch (err: any) {
       setError(err?.message || 'Stage failed');
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
     }
@@ -660,11 +754,70 @@ export function GitPanel({
   const handleUnstage = async (path?: string, all?: boolean) => {
     setActionLoadingPath(path || 'all');
     setError(null);
+
+    // 0ms 瞬间乐观更新：立即将文件从暂存区移回未暂存区
+    gitStore.setOptimisticState(cwd, (prev) => {
+      if (!prev || !prev.gitStatus) return prev;
+      let curStaged = [...(prev.gitStatus.staged || [])];
+      const curUnstaged = [...(prev.gitStatus.unstaged || [])];
+      let curUntracked = [...(prev.gitStatus.untracked || [])];
+
+      if (all || !path) {
+        // 取消暂存全部
+        const unstagedPaths = new Set(curUnstaged.map((f) => f.path));
+        for (const item of curStaged) {
+          if (!unstagedPaths.has(item.path)) {
+            unstagedPaths.add(item.path);
+            if (item.status === 'A') {
+              curUntracked.push({ ...item, status: '?', staged: false });
+            } else {
+              curUnstaged.push({ ...item, staged: false });
+            }
+          }
+        }
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: [],
+            unstaged: curUnstaged,
+            untracked: curUntracked,
+          },
+        };
+      } else {
+        // 取消暂存单个文件
+        const target = curStaged.find((f) => f.path === path);
+        if (!target) return prev;
+
+        curStaged = curStaged.filter((f) => f.path !== path);
+        if (target.status === 'A') {
+          if (!curUntracked.some((f) => f.path === path)) {
+            curUntracked.push({ ...target, status: '?', staged: false });
+          }
+        } else {
+          if (!curUnstaged.some((f) => f.path === path)) {
+            curUnstaged.push({ ...target, staged: false });
+          }
+        }
+
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: curStaged,
+            unstaged: curUnstaged,
+            untracked: curUntracked,
+          },
+        };
+      }
+    });
+
     try {
       await gitUnstage({ path, all, cwd: effectiveCwd });
-      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: false });
     } catch (err: any) {
       setError(err?.message || 'Unstage failed');
+      await gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setActionLoadingPath(null);
     }
@@ -685,7 +838,7 @@ export function GitPanel({
     setError(null);
 
     // 0ms 瞬间乐观更新：立刻在前端移除该文件，绝不产生滞留视觉
-    setStoreState((prev) => {
+    gitStore.setOptimisticState(cwd, (prev) => {
       if (!prev || !prev.gitStatus) return prev;
       return {
         ...prev,
@@ -726,7 +879,7 @@ export function GitPanel({
     setError(null);
 
     // 0ms 瞬间乐观清空
-    setStoreState((prev) => {
+    gitStore.setOptimisticState(cwd, (prev) => {
       if (!prev || !prev.gitStatus) return prev;
       return {
         ...prev,
@@ -773,7 +926,7 @@ export function GitPanel({
         body: t('git.commitNoStagedPrompt'),
         icon: '📦',
         danger: false,
-        confirmLabel: t('git.stageAll') || '暂存全部并提交',
+        confirmLabel: t('git.stageAllAndCommit'),
         cancelLabel: t('common.cancel'),
       });
       if (!ok) {
@@ -787,11 +940,27 @@ export function GitPanel({
     setError(null);
     try {
       const res = await gitCommit({ message: msg, cwd: effectiveCwd });
+
+      // 0ms 瞬间乐观更新：暂存区立即清空，ahead 立即累加，体验对齐 VS Code 极速体感
+      gitStore.setOptimisticState(cwd, (prev) => {
+        if (!prev || !prev.gitStatus) return prev;
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            staged: [],
+            ahead: (prev.gitStatus.ahead || 0) + 1,
+          },
+        };
+      });
+
       setSuccessMsg(res.message || 'Commit successful');
       setCommitMessage('');
-      await loadGitData(true);
+      // 提交后主动异步触发一次绿色刷新（拉取本地与远程图谱，使提交记录立即可见）
+      void handleFullRefresh();
     } catch (err: any) {
       setError(err?.message || 'Commit failed');
+      void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setIsCommitting(false);
     }
@@ -816,9 +985,25 @@ export function GitPanel({
           setSuccessMsg(res.message || 'Synced successfully');
         }
       }
-      await loadGitData(true);
+
+      // 0ms 乐观重置 ahead / behind
+      gitStore.setOptimisticState(cwd, (prev) => {
+        if (!prev || !prev.gitStatus) return prev;
+        return {
+          ...prev,
+          gitStatus: {
+            ...prev.gitStatus,
+            ahead: 0,
+            behind: 0,
+          },
+        };
+      });
+
+      // 主动异步触发完整刷新
+      void handleFullRefresh();
     } catch (err: any) {
       setError(err?.message || 'Sync failed');
+      void gitStore.scheduleRefresh(cwd, { immediate: true, forceAll: true });
     } finally {
       setIsSyncing(false);
     }
@@ -1774,6 +1959,36 @@ export function GitPanel({
 
   return (
     <div class="git-panel-root">
+      {/* Multi-Repo Switcher Bar (VSCode style - 顶层常驻置顶) */}
+      {repos.length > 0 && (
+        <div class="git-repo-bar">
+          <span class="git-repo-label" title={t('git.switchRepo')}>
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M1.75 2.5h3.61a1.5 1.5 0 0 1 1.06.44l1.08 1.06h6.75A1.75 1.75 0 0 1 16 5.75v7.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V4.25C0 3.28.78 2.5 1.75 2.5z" />
+            </svg>
+          </span>
+          <select
+            class="git-repo-select"
+            value={effectiveCwd}
+            onChange={(e) => {
+              const newRoot = (e.target as HTMLSelectElement).value;
+              gitStore.setActiveRepoRoot(cwd, newRoot, sessionId);
+              setSelectedBranch(null);
+            }}
+            title={effectiveCwd}
+          >
+            {repos.map((r) => (
+              <option key={r.root} value={r.root}>
+                {r.name} {r.current_branch ? `(${r.current_branch})` : ''} {r.is_root ? `· ${t('git.rootRepo')}` : `· ${r.relative_path}`}
+              </option>
+            ))}
+          </select>
+          {repos.length > 1 && (
+            <span class="git-badge-counter">{t('git.repoCount', { count: repos.length })}</span>
+          )}
+        </div>
+      )}
+
       {/* Top Toolbar */}
       <div class="git-panel-toolbar">
         <div class="git-panel-subtabs">
@@ -1853,7 +2068,7 @@ export function GitPanel({
           type="button"
           class={'git-refresh-btn' + (loading || isFetching ? ' spinning' : '')}
           onClick={handleFullRefresh}
-          title={isZh ? '刷新本地状态并拉取远程代码 (Refresh & Fetch All)' : 'Refresh local & fetch all remote branches'}
+          title={t('git.refreshAndFetch')}
           aria-label={t('git.refresh')}
         >
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -1861,36 +2076,6 @@ export function GitPanel({
           </svg>
         </button>
       </div>
-
-      {/* Multi-Repo Switcher Bar (VSCode style) */}
-      {repos.length > 0 && (
-        <div class="git-repo-bar">
-          <span class="git-repo-label" title={t('git.switchRepo')}>
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M1.75 2.5h3.61a1.5 1.5 0 0 1 1.06.44l1.08 1.06h6.75A1.75 1.75 0 0 1 16 5.75v7.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V4.25C0 3.28.78 2.5 1.75 2.5z" />
-            </svg>
-          </span>
-          <select
-            class="git-repo-select"
-            value={effectiveCwd}
-            onChange={(e) => {
-              const newRoot = (e.target as HTMLSelectElement).value;
-              gitStore.setActiveRepoRoot(cwd, newRoot);
-              setSelectedBranch(null);
-            }}
-            title={effectiveCwd}
-          >
-            {repos.map((r) => (
-              <option key={r.root} value={r.root}>
-                {r.name} {r.current_branch ? `(${r.current_branch})` : ''} {r.is_root ? `· ${t('git.rootRepo')}` : `· ${r.relative_path}`}
-              </option>
-            ))}
-          </select>
-          {repos.length > 1 && (
-            <span class="git-badge-counter">{t('git.repoCount', { count: repos.length })}</span>
-          )}
-        </div>
-      )}
 
       {/* Alert / Notifications */}
       {error && (
@@ -1905,7 +2090,7 @@ export function GitPanel({
                   style={{ display: 'inline-block', width: 'auto', padding: '2px 8px', fontSize: '11px' }}
                   onClick={() => setSubView('changes')}
                 >
-                  {isZh ? '前往“更改”标签提交或暂存' : 'Go to "Changes" to commit or stash'}
+                  {t('git.goToChangesToCommit')}
                 </button>
               </div>
             )}
@@ -1940,7 +2125,7 @@ export function GitPanel({
             <div
               class="git-split-resizer"
               onMouseDown={handleResizerMouseDown}
-              title={t("common.drag") || "上下拖拽调整大小"}
+              title={t('common.drag')}
             />
           )}
 

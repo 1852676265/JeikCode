@@ -5,7 +5,7 @@
 //! Harness decision (Task 1 spike): the `agent-client-protocol` crate exposes
 //! `Channel::duplex() -> (Channel, Channel)`, two endpoints wired to each other,
 //! each implementing `ConnectTo<R>` for any role. We run the real agent
-//! (`zap::acp::serve_over`) over one endpoint and a `Client.builder()` over
+//! (`jeikcode::acp::serve_over`) over one endpoint and a `Client.builder()` over
 //! the other — the same handlers production uses, just over an in-memory pipe.
 //!
 //! The stub is `zap_kernel::testkit::MockProvider`, the kernel's own
@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Channel, Client, ConnectionTo};
-use zap::acp::engine::EngineConfig;
-use zap::acp::{serve_over, AcpServeOptions};
+use jeikcode::acp::engine::EngineConfig;
+use jeikcode::acp::{serve_over, AcpServeOptions};
 use zap_coding::{CodingAgentConfig, CodingProviderFactory, ProviderBuildError};
 use zap_kernel::provider::LlmProvider;
 use zap_kernel::stream::{ProviderError, StreamEvent};

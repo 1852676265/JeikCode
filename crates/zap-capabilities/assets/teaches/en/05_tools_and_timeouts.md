@@ -1,6 +1,6 @@
 # 05 - Tools and Timeouts Configuration Guide (Tools & Timeouts)
 
-Configuration file path: `~/.zap/config.toml`.
+Configuration file path: `~/.jeikcode/config.toml`.
 
 ---
 
@@ -35,6 +35,15 @@ Short commands undergo health checks at every `silent_kill_secs`: pager/REPL/ful
 - Use `"$TMPDIR"` (or `"$TMP"` / `"$TEMP"`) instead of hardcoded `/tmp`, and `"$DESKTOP"` instead of assuming `~/Desktop`: both work identically inside the shell and as **arguments passed to native Windows programs** (python / node / curl). `"$TMPDIR_WIN"` / `"$DESKTOP_WIN"` are aliases for nested non-bash shell scenarios.
 - Undefined environment variables are **preserved verbatim** (never silently stripped); a typo in a variable name stays relative within the workspace and is exposed in error diagnostics rather than escaping to the filesystem drive root.
 
+### 1.3 grep / glob Search Visibility
+
+- Default search covers source, docs, tests, and ordinary config; build artifacts/caches/dependencies are ignored.
+- `glob` includes log paths by default (paths only); `grep` skips log contents by default.
+- `include_ignored=true` opens build artifacts/caches/dependencies.
+- `include_logs=true` independently opens grep log contents (default false, independent from `include_ignored`); glob includes log paths by default.
+- `include_sensitive=true` opens sensitive credential paths; Build/AcceptEdits/Plan prompt, Auto continues.
+- `read` does not apply the ignore filter to an explicit path; sensitive paths go through `SensitivePathGate`.
+
 ---
 
 ## 2. In-Process Short Timeout Budgets (`[tools.timeouts]`)
@@ -59,14 +68,13 @@ idle_ttl_secs = 600         # Idle reclamation timeout for scope="session" MCP p
 
 ## 3. Tool Output Compression Policy (`[tools.tool_output]`)
 
-Prevents massive tool outputs from exhausting context windows. Non-exempt tools exceeding the threshold are folded into a "head 1500 + tail 2200 bytes" preview accompanied by an `artifact` retrieval token; full output is saved to disk, retrieved on demand via `fetch_output`:
+Prevents massive tool outputs from exhausting context windows. Non-exempt tools exceeding the threshold are folded and saved as an `artifact`; full output is saved to disk, retrieved on demand via `read(path="artifact://<id>")`:
 
 ```toml
 [tools.tool_output]
 max_bytes = 65536               # General compression threshold (bytes, default 65536 = 64KiB; 0 disables compression completely)
 terminal_max_bytes = 24576      # Earlier compression threshold for terminal (run_command/bash) (bytes, default 24KiB; 0 follows max_bytes)
 no_fold_tools = [               # Whitelist tools: returned raw and never compressed
-    "fetch_output",
     "code_explore",
     "web_fetch",
     "web_search"
@@ -110,7 +118,7 @@ Environment variable overrides: `JEIKCODE_CONNECT_TIMEOUT_SECS`, `JEIKCODE_OPEN_
 
 ```toml
 [subagent]
-max_concurrent = 3              # Maximum concurrent subagents (default 3)
+max_concurrent = 0              # Maximum concurrent subagents (0 = unlimited, the default; >0 caps it)
 max_rounds = 230                # Maximum interaction rounds per subagent (0 = unlimited)
 ```
 
@@ -131,7 +139,7 @@ mode = "follow_system"          # Proxy mode: "follow_system" (default) | "defau
 
 ```toml
 # Top-level scalar configurations (MUST precede all [table] sections)
-keep_interrupted_context = true # Preserve generated context upon Ctrl+C interruption for seamless continuation
+keep_interrupted_context = true # Preserve generated context upon Ctrl+C interruption for seamless continuation (always on for WebUI/HTTP turns)
 
 [ui]
 theme = "auto"                  # Terminal theme: "auto" | "dark" | "light"
@@ -142,7 +150,7 @@ ai_session_naming = true        # Asynchronously generate session titles using A
 
 ## 9. Reload Semantics & Triggering
 
-- **No automatic reload**: Saving edits to `~/.zap/config.toml` does not trigger automatic reload.
+- **No automatic reload**: Saving edits to `~/.jeikcode/config.toml` does not trigger automatic reload.
 - **Reload Triggers**:
   1. **Agent Side**: Invoke the built-in tool `zap_config(action="reload")`; takes effect on the next turn immediately after the current turn completes.
   2. **User Side**: Enter `/reload` in WebUI or TUI terminal to reread configuration immediately.
