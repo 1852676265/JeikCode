@@ -15,15 +15,25 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { GitWebhookDialog } from './GitWebhookDialog';
 import { showToast } from './Toast';
 import { CwdPicker } from './CwdPicker';
-import { mergeOptimisticSession, mergeOptimisticSessions } from '../lib/sessionList';
+import { foldProjectSessions, mergeOptimisticSession, mergeOptimisticSessions, mergeProjectSessions, sessionIdRange, uniqueSessionsById } from '../lib/sessionList';
 import { mcpAutoTrustSignature, mcpEnableNeedsTrust } from '../lib/mcpTrust';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { collapseHomePath as collapseHomePathShared, displayPath, isLoopbackHost, isUserHomeDir, stripExtendedPathPrefix } from '../lib/displayPath';
 import { FileExplorer } from './FileExplorer';
 import { getPageZoom } from '../lib/pageZoom';
+import { menuPointFromEvent } from '../lib/menuPosition';
 import { buildSessionAnalysisPrompt } from '../lib/sessionAnalysis';
 import { openDeepSeekSettingsCenter } from '../custom/custom-registry';
 import { zapPluginKernel } from '../custom/plugin-kernel';
+
+/** 会话右键菜单的估算尺寸（用于防漂移翻转/夹取），与 CSS 宽度保持一致。 */
+const SESSION_CONTEXT_MENU_WIDTH = 200;
+const SESSION_CONTEXT_MENU_HEIGHT = 150;
+
+/** 会话菜单锚点：三点按钮用「右/上/下」贴边，右键用光标坐标。 */
+type SessionMenuPos =
+  | { kind: 'anchor'; top?: number; bottom?: number; left?: number; right?: number }
+  | { kind: 'point'; top: number; left: number };
 
 interface SidebarProps {
   activeSessionId: string | null;
@@ -610,10 +620,13 @@ export function Sidebar({
   const [menuFor, setMenuFor] = useState<string | null>(null);
   // top XOR bottom: `top` opens the menu downward below the kebab; `bottom`
   // opens it upward above the kebab (used when there isn't room below, so the
-  // 2-row menu isn't clipped by the viewport edge).
-  const [menuPos, setMenuPos] = useState<
-    { top?: number; bottom?: number; left?: number; right?: number } | null
-  >(null);
+  // 2-row menu isn't clipped by the viewport edge). Right-click menus use
+  // cursor coordinates instead (`kind: 'point'`).
+  const [menuPos, setMenuPos] = useState<SessionMenuPos | null>(null);
+  // Actions in the open menu; >1 means a batch delete (rename/export still
+  // target the primary row). Kept as full rows so older project-bucket sessions
+  // are deletable even when they are outside the capped global /sessions list.
+  const [menuTargets, setMenuTargets] = useState<SessionMetaWithProject[]>([]);
   const [projectMenuTarget, setProjectMenuTarget] = useState<ProjectInfo | null>(null);
   const [projectMenuPos, setProjectMenuPos] = useState<
     { top?: number; bottom?: number; left?: number; right?: number } | null
@@ -633,6 +646,8 @@ export function Sidebar({
   const [deleteTargets, setDeleteTargets] = useState<SessionMetaWithProject[] | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Shift 连续多选的锚点：最近一次 Ctrl/普通点击的行。
+  const selectionAnchorRef = useRef<string | null>(null);
   const [pendingDeleteCount, setPendingDeleteCount] = useState(0);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   // Settings menu (3 entries → each opens its own dialog), fixed-anchored above the button.
@@ -1083,13 +1098,26 @@ export function Sidebar({
       if (el.closest?.('.session-item-kebab')) return;
       close();
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      // 捕获阶段截断：菜单打开时 Escape 只负责关闭菜单，
+      // 不让主输入框的 Escape 动作（停止/回填）同时触发。
+      e.stopPropagation();
+      close();
+    };
     document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey, true);
     window.addEventListener('resize', close);
     window.addEventListener('scroll', close, true);
+    // 页面缩放会整体改变 fixed 坐标的视觉比例；菜单打开期间若缩放，
+    // 直接关闭而不是让锚点漂移（与资源管理器右键菜单同样的防漂移策略）。
+    window.addEventListener('jeikcode:zoom_change', close);
     return () => {
       document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey, true);
       window.removeEventListener('resize', close);
       window.removeEventListener('scroll', close, true);
+      window.removeEventListener('jeikcode:zoom_change', close);
     };
   }, [menuFor]);
 
@@ -1143,39 +1171,73 @@ export function Sidebar({
     setProjectMenuTarget(p);
   }
 
-  function openItemMenu(e: MouseEvent, id: string) {
+  function openItemMenu(e: MouseEvent, session: SessionMetaWithProject) {
     e.preventDefault();
     e.stopPropagation();
-    const zoom = getPageZoom() || 1.0;
-    const isRightClick = e.type === 'contextmenu';
-    if (!isRightClick && menuFor === id) {
+    if (menuFor === session.id) {
       setMenuFor(null);
       return;
     }
+    const zoom = getPageZoom() || 1.0;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const right = (window.innerWidth - rect.right) / zoom;
     const MENU_EST_HEIGHT = 180;
-    const MENU_EST_WIDTH = 190;
-
-    if (isRightClick) {
-      const clientX = e.clientX;
-      const clientY = e.clientY;
-      const spaceBelow = (window.innerHeight - clientY) / zoom;
-      const spaceRight = (window.innerWidth - clientX) / zoom;
-      const top = spaceBelow < MENU_EST_HEIGHT + 8 ? undefined : clientY / zoom;
-      const bottom = spaceBelow < MENU_EST_HEIGHT + 8 ? (window.innerHeight - clientY) / zoom : undefined;
-      const left = spaceRight < MENU_EST_WIDTH + 8 ? undefined : clientX / zoom;
-      const right = spaceRight < MENU_EST_WIDTH + 8 ? (window.innerWidth - clientX) / zoom : undefined;
-      setMenuPos({ top, bottom, left, right });
+    const spaceBelow = (window.innerHeight - rect.bottom) / zoom;
+    setMenuTargets([session]);
+    if (spaceBelow < MENU_EST_HEIGHT + 8) {
+      setMenuPos({ kind: 'anchor', bottom: (window.innerHeight - rect.top + 4) / zoom, right });
     } else {
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const right = (window.innerWidth - rect.right) / zoom;
-      const spaceBelow = (window.innerHeight - rect.bottom) / zoom;
-      if (spaceBelow < MENU_EST_HEIGHT + 8) {
-        setMenuPos({ bottom: (window.innerHeight - rect.top + 4) / zoom, right });
-      } else {
-        setMenuPos({ top: (rect.bottom + 4) / zoom, right });
-      }
+      setMenuPos({ kind: 'anchor', top: (rect.bottom + 4) / zoom, right });
     }
-    setMenuFor(id);
+    setMenuFor(session.id);
+  }
+
+  /**
+   * 右键菜单与三点菜单共用同一套动作。
+   *
+   * 坐标先用 menuPointFromEvent 按页面缩放归一化并夹进视口；右键已选中的行时
+   * 保留多选并把该行置于首位（重命名/导出作用于它，删除作用于全部选中）。
+   */
+  function openContextMenu(e: MouseEvent, session: SessionMetaWithProject) {
+    e.preventDefault();
+    e.stopPropagation();
+    const point = menuPointFromEvent(
+      e.clientX,
+      e.clientY,
+      SESSION_CONTEXT_MENU_WIDTH,
+      SESSION_CONTEXT_MENU_HEIGHT,
+    );
+    let targets: SessionMetaWithProject[];
+    if (selectedIds.has(session.id)) {
+      const others = resolveSessionsByIds(selectedIds).filter((row) => row.id !== session.id);
+      targets = [session, ...others];
+    } else {
+      // 与 Windows 资源管理器一致：右键未选中的行先把它变成唯一选中项。
+      setSelectedIds(new Set([session.id]));
+      selectionAnchorRef.current = session.id;
+      targets = [session];
+    }
+    setMenuTargets(targets);
+    setMenuPos({ kind: 'point', top: point.top, left: point.left });
+    setMenuFor(session.id);
+  }
+
+  /** 按 id 解析完整会话行：全局列表只有最近 50 条，项目桶负责补全历史。 */
+  function resolveSessionsByIds(ids: Iterable<string>): SessionMetaWithProject[] {
+    const wanted = new Set(ids);
+    if (wanted.size === 0) return [];
+    const byId = new Map<string, SessionMetaWithProject>();
+    const put = (row: SessionMetaWithProject) => {
+      if (row.id && !byId.has(row.id)) byId.set(row.id, row);
+    };
+    for (const row of mergeOptimisticSessions(allOptimistic, sessions)) put(row);
+    for (const list of Object.values(projectSessionsMap)) {
+      for (const row of list) put(row);
+    }
+    for (const row of allOptimistic) put(row);
+    return [...wanted]
+      .map((id) => byId.get(id))
+      .filter((row): row is SessionMetaWithProject => !!row);
   }
 
   async function handleAnalyzeSession(targetSession: SessionMetaWithProject) {
@@ -1287,11 +1349,13 @@ export function Sidebar({
     }
     setSelectMode(false);
     setSelectedIds(new Set());
+    selectionAnchorRef.current = null;
   }
 
   function exitSelectMode() {
     setSelectMode(false);
     setSelectedIds(new Set());
+    selectionAnchorRef.current = null;
   }
 
   function toggleSelected(id: string) {
@@ -1301,6 +1365,56 @@ export function Sidebar({
       else next.add(id);
       return next;
     });
+  }
+
+  /**
+   * 会话行点击：普通点击照旧打开会话；Ctrl/Cmd 切换单选，Shift 从锚点连续选中。
+   * 修饰键选择不打开会话，且在没有进入显式多选模式时也能用。
+   */
+  function handleSessionClick(e: MouseEvent, session: SessionMetaWithProject) {
+    // Ctrl+Shift 与 Shift 一样扩展连续范围；必须先于 Ctrl 单选分支判断。
+    if (e.shiftKey && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      selectSessionRange(session.id);
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      selectionAnchorRef.current = session.id;
+      toggleSelected(session.id);
+      return;
+    }
+    if (e.shiftKey) {
+      e.preventDefault();
+      selectSessionRange(session.id);
+      return;
+    }
+    if (selectMode) {
+      selectionAnchorRef.current = session.id;
+      toggleSelected(session.id);
+      return;
+    }
+    // 普通点击恢复“只打开这一条”，同时为下一次 Shift 点击落下锚点。
+    if (selectedIds.size > 0) setSelectedIds(new Set());
+    selectionAnchorRef.current = session.id;
+    handleSelectSessionItem(session);
+  }
+
+  /** Shift 连续多选：按当前 DOM 可见顺序选中锚点与目标之间的所有行（Excel/资源管理器语义）。 */
+  function selectSessionRange(targetId: string) {
+    const order = Array.from(
+      document.querySelectorAll<HTMLElement>('.session-list-body .session-item[data-session-id]'),
+    )
+      .map((el) => el.dataset.sessionId)
+      .filter((id): id is string => !!id);
+    const anchor = selectionAnchorRef.current;
+    const anchorVisible = !!anchor && order.includes(anchor);
+    if (!anchorVisible) selectionAnchorRef.current = targetId;
+    const range = sessionIdRange(order, anchorVisible ? anchor : null, targetId);
+    if (range.length === 0) return;
+    // 与资源管理器一致：Shift 扩展会把范围内的行并入已有选择，不丢掉之前
+    // Ctrl 点选的行；锚点保持不变，连续 Shift 点击会从同一行继续延伸。
+    setSelectedIds((current) => new Set([...current, ...range]));
   }
 
   /** Export a session's conversation as a Markdown file and trigger a browser download. */
@@ -2021,7 +2135,18 @@ export function Sidebar({
     return topList;
   }, [recentsList, showAllRecents, selectMode, activeSessionId]);
 
+  const rowsForProject = (p: ProjectInfo): SessionMetaWithProject[] => {
+    const bucket = projectSessionsMap[p.hash] ?? [];
+    const globalRows = sessions.filter((s) => s.project_hash === p.hash);
+    return mergeProjectSessions(bucket, globalRows);
+  };
+
   const filtered = q ? searchFiltered : merged;
+  // 显式多选模式与 Ctrl/Shift 临时多选共用同一套选中状态与批量删除栏。
+  const selectionActive = selectMode || selectedIds.size > 0;
+  // 批量删除栏只在真正存在多选时出现：右键单行选中不改变列表高度，
+  // 避免右键瞬间把被点的行挤走。
+  const showBatchBar = selectMode || selectedIds.size > 1;
 
   const handleSelectSessionItem = (s: SessionMetaWithProject) => {
     if (selectMode) {
@@ -2066,20 +2191,17 @@ export function Sidebar({
     return (
       <div
         key={s.id}
+        data-session-id={s.id}
         ref={active ? activeSessionItemRef : undefined}
         class={
           'session-item' +
           (active && !selectMode ? ' active' : '') +
           (running ? ' running' : '') +
           (menuFor === s.id ? ' menu-open' : '') +
-          (selectMode && selected ? ' selected' : '') +
-          (selectMode ? ' selecting' : '')
+          (selected ? ' selected' : '') +
+          (selectionActive ? ' selecting' : '')
         }
-        onContextMenu={(e) => {
-          if (!selectMode) {
-            openItemMenu(e as unknown as MouseEvent, s.id);
-          }
-        }}
+        onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, s)}
       >
         {selectMode && (
           <button
@@ -2090,13 +2212,14 @@ export function Sidebar({
             aria-label={label}
             onClick={(e) => {
               e.stopPropagation();
+              selectionAnchorRef.current = s.id;
               toggleSelected(s.id);
             }}
           />
         )}
         <button
           class="session-item-main"
-          onClick={() => handleSelectSessionItem(s)}
+          onClick={(e) => handleSessionClick(e as unknown as MouseEvent, s)}
           title={itemTitle}
         >
           <div class="session-item-header">
@@ -2117,7 +2240,7 @@ export function Sidebar({
         {!selectMode && (
           <button
             class="session-item-kebab"
-            onClick={(e) => openItemMenu(e as unknown as MouseEvent, s.id)}
+            onClick={(e) => openItemMenu(e as unknown as MouseEvent, s)}
             title={t('sidebar.itemMenu')}
             aria-label={t('sidebar.itemMenu')}
           >
@@ -2128,9 +2251,9 @@ export function Sidebar({
     );
   };
 
-  const menuSession = menuFor
-    ? filtered.find((s) => s.id === menuFor) ?? sessions.find((s) => s.id === menuFor) ?? null
-    : null;
+  // 菜单动作的主行（重命名/导出）与批量删除目标。菜单可能由右键打开，
+  // 主行来自 projectSessionsMap，不能再用 capped 的 filtered/sessions 反查。
+  const menuPrimary = menuTargets[0] ?? null;
 
   // Rail (collapsed desktop): a narrow icon rail instead of hiding the sidebar.
   // 移动端用抽屉；isMobile 随 matchMedia 更新，避免窄屏仍渲染 220px 空 rail。
@@ -2370,24 +2493,31 @@ export function Sidebar({
                 >
                   <div class="session-group-title-wrap">
                     <span class="session-group-label">
-                      {selectMode ? t('sidebar.selectedCount', { n: selectedIds.size }) : t('sidebar.recent')}
+                      {selectionActive ? t('sidebar.selectedCount', { n: selectedIds.size }) : t('sidebar.recent')}
                     </span>
-                    {!selectMode && (
+                    {!selectionActive && (
                       <span class={`section-caret ${recentsExpanded ? 'expanded' : ''}`} aria-hidden="true">
                         {recentsExpanded ? '▾' : '▸'}
                       </span>
                     )}
                   </div>
                   <span class="session-group-actions" onClick={(e) => e.stopPropagation()}>
-                    {selectMode ? (
+                    {selectionActive ? (
                       <>
                         <button
                           type="button"
                           class="session-select-btn"
                           onClick={() => {
-                            const visible = filtered.map((s) => s.id);
+                            const visible = Array.from(
+                              document.querySelectorAll<HTMLElement>(
+                                '.session-list-body .session-item[data-session-id]',
+                              ),
+                            )
+                              .map((el) => el.dataset.sessionId)
+                              .filter((id): id is string => !!id);
                             const allSelected = visible.length > 0 && visible.every((id) => selectedIds.has(id));
                             setSelectedIds(allSelected ? new Set() : new Set(visible));
+                            selectionAnchorRef.current = allSelected ? null : (visible[0] ?? null);
                           }}
                         >
                           {t('sidebar.selectAll')}
@@ -2396,7 +2526,13 @@ export function Sidebar({
                           type="button"
                           class="session-select-btn"
                           onClick={() => {
-                            const visible = filtered.map((s) => s.id);
+                            const visible = Array.from(
+                              document.querySelectorAll<HTMLElement>(
+                                '.session-list-body .session-item[data-session-id]',
+                              ),
+                            )
+                              .map((el) => el.dataset.sessionId)
+                              .filter((id): id is string => !!id);
                             setSelectedIds((current) => {
                               const next = new Set(current);
                               for (const id of visible) {
@@ -2405,6 +2541,7 @@ export function Sidebar({
                               }
                               return next;
                             });
+                            selectionAnchorRef.current = null;
                           }}
                         >
                           {t('sidebar.invertSelect')}
@@ -2429,6 +2566,7 @@ export function Sidebar({
                             localStorage.setItem('sidebar_recents_expanded', 'true');
                           } catch {}
                           setSelectMode(true);
+                          selectionAnchorRef.current = null;
                         }}
                         disabled={filtered.length === 0}
                       >
@@ -2437,7 +2575,7 @@ export function Sidebar({
                     )}
                   </span>
                 </div>
-                {selectMode && (
+                {showBatchBar && (
                   <div class="session-select-delete-bar">
                     {deleteError && (
                       <div class="session-select-delete-error" role="alert">{deleteError}</div>
@@ -2452,7 +2590,7 @@ export function Sidebar({
                       class="session-select-delete-btn"
                       disabled={selectedIds.size === 0 || pendingDeleteCount > 0}
                       onClick={() => {
-                        const targets = filtered.filter((s) => selectedIds.has(s.id));
+                        const targets = resolveSessionsByIds(selectedIds);
                         if (targets.length === 0) return;
                         setDeleteError(null);
                         setDeleteTargets(targets);
@@ -2537,8 +2675,7 @@ export function Sidebar({
               const isExpanded = expandedProjects.has(p.hash);
               const isShowAll = showAllProjects.has(p.hash);
 
-              const rawBase = projectSessionsMap[p.hash] ?? sessions.filter((s) => s.project_hash === p.hash);
-              const baseSessions = rawBase.filter(isNonEmptySession);
+              const baseSessions = rowsForProject(p).filter(isNonEmptySession);
               const projectOptimistics = allOptimistic.filter(
                 (opt) =>
                   opt.project_hash === p.hash ||
@@ -2550,19 +2687,13 @@ export function Sidebar({
                 ? mergeOptimisticSessions(projectOptimistics, baseSessions)
                 : baseSessions;
               const sorted = sortSessions(pSessions);
-              let displayList: SessionMetaWithProject[];
-              if (isShowAll) {
-                displayList = sorted;
-              } else {
-                const top5 = sorted.slice(0, 5);
-                if (activeSessionId && !top5.some((s) => s.id === activeSessionId)) {
-                  const activeItem = sorted.find((s) => s.id === activeSessionId);
-                  displayList = activeItem && isNonEmptySession(activeItem) ? [...top5, activeItem] : top5;
-                } else {
-                  displayList = top5;
-                }
-              }
-              const count = pSessions.length;
+              const folded = foldProjectSessions(sorted, {
+                showAll: isShowAll,
+                activeSessionId,
+                keepIds: activeSet,
+              });
+              const displayList = folded.visible;
+              const count = folded.total;
 
               return (
                 <div key={p.hash} class="project-group">
@@ -2596,16 +2727,16 @@ export function Sidebar({
                   {isExpanded && (
                     <div class="project-sessions-list">
                       {displayList.map(renderItem)}
-                      {sorted.length > 5 && (
+                      {folded.canToggle && (
                         <button
                           type="button"
-                          class="project-show-more-btn"
+                          class={'project-show-more-btn' + (isShowAll ? ' is-expanded' : '')}
                           onClick={() => toggleShowAll(p.hash)}
                         >
                           <span>{isShowAll ? t('sidebar.showLess') : t('sidebar.showMore')}</span>
                         </button>
                       )}
-                      {sorted.length === 0 && (
+                      {folded.total === 0 && (
                         <div class="session-empty" style={{ padding: '6px 12px', fontSize: '11.5px' }}>
                           {t('sidebar.empty')}
                         </div>
@@ -2716,21 +2847,26 @@ export function Sidebar({
 
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the
           scroll container nor the mobile drawer's transform/overflow clips it. */}
-      {menuSession && menuPos && createPortal(
+      {menuFor && menuPrimary && menuPos && createPortal(
         <div
-          class="item-menu"
+          class={'item-menu' + (menuPos.kind === 'point' ? ' session-context-menu' : '')}
           ref={itemMenuRef}
-          style={{
-            top: menuPos.top != null ? `${menuPos.top}px` : undefined,
-            bottom: menuPos.bottom != null ? `${menuPos.bottom}px` : undefined,
-            left: menuPos.left != null ? `${menuPos.left}px` : undefined,
-            right: menuPos.right != null ? `${menuPos.right}px` : undefined,
-          }}
+          style={
+            menuPos.kind === 'point'
+              ? { top: `${menuPos.top}px`, left: `${menuPos.left}px` }
+              : {
+                  top: menuPos.top != null ? `${menuPos.top}px` : undefined,
+                  bottom: menuPos.bottom != null ? `${menuPos.bottom}px` : undefined,
+                  left: menuPos.left != null ? `${menuPos.left}px` : undefined,
+                  right: menuPos.right != null ? `${menuPos.right}px` : undefined,
+                }
+          }
+          onContextMenu={(e) => e.preventDefault()}
         >
           <button
             class="item-menu-row"
             onClick={() => {
-              void handleAnalyzeSession(menuSession);
+              void handleAnalyzeSession(menuPrimary);
               setMenuFor(null);
             }}
           >
@@ -2740,7 +2876,7 @@ export function Sidebar({
           <button
             class="item-menu-row"
             onClick={() => {
-              setRenameTarget(menuSession);
+              setRenameTarget(menuPrimary);
               setMenuFor(null);
             }}
           >
@@ -2749,7 +2885,7 @@ export function Sidebar({
           </button>
           <button
             class="item-menu-row"
-            onClick={() => handleExportMarkdown(menuSession)}
+            onClick={() => handleExportMarkdown(menuPrimary)}
           >
             <DownloadIcon />
             <span>{t('sidebar.exportMarkdown')}</span>
@@ -2758,12 +2894,16 @@ export function Sidebar({
           <button
             class="item-menu-row danger"
             onClick={() => {
-              setDeleteTargets([menuSession]);
+              setDeleteTargets(menuTargets.length > 0 ? menuTargets : [menuPrimary]);
               setMenuFor(null);
             }}
           >
             <TrashIcon />
-            <span>{t('sidebar.delete')}</span>
+            <span>
+              {menuTargets.length > 1
+                ? t('sidebar.deleteSelectedCount', { n: menuTargets.length })
+                : t('sidebar.delete')}
+            </span>
           </button>
         </div>,
         document.body,
