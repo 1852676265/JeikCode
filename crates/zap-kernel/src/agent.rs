@@ -14,7 +14,7 @@ use crate::request::RequestCtx;
 use crate::stream::{StreamEvent, TokenUsage};
 use crate::tool::{MountedTools, ProgressSink, ToolCall, ToolContext, ToolResult};
 use futures::StreamExt;
-use jeikcode_config::i18n;
+use zap_config::i18n;
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -5198,7 +5198,7 @@ static I18N_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod empty_exhaustion_message_tests {
     use super::{empty_exhaustion_message, I18N_TEST_LOCK};
-    use jeikcode_config::i18n::{self, Locale};
+    use zap_config::i18n::{self, Locale};
 
     #[test]
     fn size_aware_when_near_or_over_window() {
@@ -5359,7 +5359,7 @@ mod over_window_advisory_tests {
     #[test]
     fn advisory_is_actionable_and_one_line() {
         let _guard = super::I18N_TEST_LOCK.lock().unwrap();
-        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::ZhCn);
+        zap_config::i18n::set_locale(zap_config::i18n::Locale::ZhCn);
         let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
         assert!(!m.contains('\n'), "must be a single line: {m}");
         assert!(m.contains("窗口"), "must name the window: {m}");
@@ -5380,7 +5380,7 @@ mod over_window_advisory_tests {
     #[test]
     fn advisory_in_english() {
         let _guard = super::I18N_TEST_LOCK.lock().unwrap();
-        jeikcode_config::i18n::set_locale(jeikcode_config::i18n::Locale::En);
+        zap_config::i18n::set_locale(zap_config::i18n::Locale::En);
         let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
         assert!(
             m.contains("watermark"),
