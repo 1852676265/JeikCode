@@ -94,8 +94,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use zap_auth as auth;
@@ -6775,77 +6773,6 @@ fn short_path(path: &str) -> String {
 }
 fn dangerous_tools_enabled() -> bool {
     std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
-}
-
-fn compression_layer() -> CompressionLayer<impl Predicate + Clone> {
-    CompressionLayer::new().gzip(true).br(true).compress_when(
-        DefaultPredicate::new()
-            .and(NotForContentType::new("text/event-stream"))
-            .and(CompressibleContentType),
-    )
-}
-
-/// Binary payloads are already compressed (or incompressible): gzip/brotli only
-/// burns CPU and can enlarge them. SSE is excluded separately above.
-#[derive(Clone, Copy, Default)]
-struct CompressibleContentType;
-
-fn is_binary_content_type(content_type: &str) -> bool {
-    let value = content_type.trim().to_ascii_lowercase();
-    value.starts_with("image/")
-        || value.starts_with("video/")
-        || value.starts_with("audio/")
-        || value.starts_with("font/")
-        || value.starts_with("application/zip")
-        || value.starts_with("application/gzip")
-        || value.starts_with("application/x-gzip")
-        || value.starts_with("application/octet-stream")
-        || value.starts_with("application/pdf")
-        || value.starts_with("application/wasm")
-}
-
-impl Predicate for CompressibleContentType {
-    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
-    where
-        B: axum::body::HttpBody,
-    {
-        let content_type = response
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        !is_binary_content_type(content_type)
-    }
-}
-
-#[cfg(test)]
-mod compression_predicate_tests {
-    use super::is_binary_content_type;
-
-    #[test]
-    fn binary_content_types_are_excluded_from_compression() {
-        for content_type in [
-            "image/png",
-            "video/mp4",
-            "audio/mpeg",
-            "font/woff2",
-            "application/zip",
-            "application/gzip",
-            "application/octet-stream",
-            "application/pdf",
-            "application/wasm",
-        ] {
-            assert!(is_binary_content_type(content_type), "{content_type}");
-        }
-        for content_type in [
-            "application/json",
-            "text/html; charset=utf-8",
-            "text/event-stream",
-            "application/javascript",
-        ] {
-            assert!(!is_binary_content_type(content_type), "{content_type}");
-        }
-    }
 }
 
 fn cors_layer() -> CorsLayer {
@@ -22495,8 +22422,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         ))
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))
-        .layer(cors_layer())
-        .layer(compression_layer());
+        .layer(cors_layer());
     let _ = router_slot.set(app.clone());
 
     // Spawn idle timeout watchdog task

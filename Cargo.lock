@@ -1863,15 +1863,6 @@ dependencies = [
  "ctor",
  "dirs",
  "is-terminal",
- "zap-auth",
- "zap-capabilities",
- "zap-coding",
- "zap-config",
- "zap-daemon",
- "zap-kernel",
- "zap-telemetry",
- "zap-tuix",
- "zap-updater",
  "libc",
  "mimalloc",
  "predicates",
@@ -1892,6 +1883,15 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg 0.55.0",
  "winresource",
+ "zap-auth",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-daemon",
+ "zap-kernel",
+ "zap-telemetry",
+ "zap-tuix",
+ "zap-updater",
 ]
 
 [[package]]
@@ -1900,8 +1900,6 @@ version = "1.0.11"
 dependencies = [
  "anyhow",
  "fs2",
- "zap-config",
- "zap-telemetry",
  "libc",
  "reqwest",
  "serde",
@@ -1913,6 +1911,8 @@ dependencies = [
  "url",
  "uuid",
  "windows-sys 0.61.2",
+ "zap-config",
+ "zap-telemetry",
 ]
 
 [[package]]
@@ -1939,9 +1939,6 @@ dependencies = [
  "httpdate",
  "hyper",
  "ignore",
- "zap-auth",
- "zap-config",
- "zap-kernel",
  "libc",
  "rayon",
  "regex",
@@ -1981,6 +1978,9 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg 0.55.0",
  "wiremock",
+ "zap-auth",
+ "zap-config",
+ "zap-kernel",
  "zeroize",
  "zstd",
 ]
@@ -1993,17 +1993,17 @@ dependencies = [
  "async-trait",
  "clap",
  "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
  "zap-capabilities",
  "zap-coding",
  "zap-config",
  "zap-kernel",
  "zap-review",
  "zap-telemetry",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml 0.8.23",
 ]
 
 [[package]]
@@ -2016,11 +2016,6 @@ dependencies = [
  "ctor",
  "dirs",
  "futures",
- "zap-capabilities",
- "zap-config",
- "zap-kernel",
- "zap-review",
- "zap-telemetry",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2031,6 +2026,11 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "zap-capabilities",
+ "zap-config",
+ "zap-kernel",
+ "zap-review",
+ "zap-telemetry",
 ]
 
 [[package]]
@@ -2040,7 +2040,6 @@ dependencies = [
  "anyhow",
  "dirs",
  "fs2",
- "zap-telemetry",
  "libc",
  "serde",
  "serde_json",
@@ -2051,6 +2050,7 @@ dependencies = [
  "toml_edit",
  "url",
  "winreg 0.55.0",
+ "zap-telemetry",
 ]
 
 [[package]]
@@ -2065,13 +2065,6 @@ dependencies = [
  "futures",
  "httpdate",
  "ignore",
- "zap-auth",
- "zap-capabilities",
- "zap-coding",
- "zap-config",
- "zap-kernel",
- "zap-telemetry",
- "zap-updater",
  "jsonwebtoken",
  "mime_guess",
  "portable-pty",
@@ -2096,6 +2089,13 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "winreg 0.55.0",
+ "zap-auth",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-kernel",
+ "zap-telemetry",
+ "zap-updater",
 ]
 
 [[package]]
@@ -2118,13 +2118,13 @@ version = "1.0.11"
 dependencies = [
  "async-trait",
  "futures",
- "zap-capabilities",
- "zap-kernel",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "zap-capabilities",
+ "zap-kernel",
 ]
 
 [[package]]
@@ -2164,14 +2164,6 @@ dependencies = [
  "futures",
  "ignore",
  "image",
- "zap-auth",
- "zap-capabilities",
- "zap-coding",
- "zap-config",
- "zap-daemon",
- "zap-kernel",
- "zap-telemetry",
- "zap-updater",
  "libc",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2192,6 +2184,14 @@ dependencies = [
  "urlencoding",
  "uuid",
  "vte",
+ "zap-auth",
+ "zap-capabilities",
+ "zap-coding",
+ "zap-config",
+ "zap-daemon",
+ "zap-kernel",
+ "zap-telemetry",
+ "zap-updater",
  "zeroize",
 ]
 
@@ -2202,7 +2202,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
- "zap-config",
  "reqwest",
  "serde",
  "serde_json",
@@ -2210,8 +2209,9 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "wiremock",
  "winreg 0.55.0",
+ "wiremock",
+ "zap-config",
 ]
 
 [[package]]
