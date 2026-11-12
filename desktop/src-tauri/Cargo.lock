@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "zap-desktop"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "serde",
  "serde_json",

@@ -21,6 +21,40 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.11 (2026-11-12)
+
+- **[Plugin Kernel & Extension Lifecycle] Monotonic versioning, generation guard, and slot cleanup**:
+  - Added monotonic kernel versioning and reactive version hooks in WebUI plugin architecture to prevent missed mount updates across sibling components.
+  - Guarded asynchronous script evaluation against deactivation and uninstallation races with generation checks, preventing stale code injection.
+  - Automatically purged package-registered slots, actions, and inspectors on deactivation to prevent orphaned UI entry points in the sidebar and settings center.
+  - Protected settings center modal backdrop from accidental dismissal during mouse drag-selections.
+
+- **[Chat & Live Streaming Rounds] Causal streaming order and multi-session sticky todos**:
+  - Preserved strict causal ordering for live streaming assistant rounds using stream sequences and anchor insertion on replay.
+  - Enforced session isolation on sticky todo panels (`SessionTodoSlot` and `resolveRenderedTodos`), eliminating single-frame cross-session todo leakage when switching chats.
+  - Decoded HEIC/HEIF images natively with lossless scaling in attachments preview.
+
+- **[Sidebar & Workspace Experience] Session folding and context-menu batch operations**:
+  - Restored project session limit folding with live/active session pinned protection.
+  - Introduced session context menus with Shift/Ctrl range multi-selection for fast batch deletion and session actions.
+
+---
+
+- **[插件内核与生命周期治理] 版本同步机制、异步脚本代际防护与插槽彻底回收**:
+  - 在 WebUI 插件内核中引入单调递增版本号与全局版本监听钩子，消除组件挂载与并发更新导致的视图刷新遗漏。
+  - 增加异步入口脚本加载的代际校验（runtime generation），废弃插件停用或重载后迟到的注入结果，避免脚本残留或重复执行。
+  - 在插件停用与卸载时通过 purgePackageContributions 彻底清除其自注册的插槽、Action 与 Inspector，防止侧边栏与设置中心残留失效入口。
+  - 增强设置中心遮罩层鼠标按压与释放目标校验，防止文本框选拖动松手时误关闭弹窗。
+
+- **[会话对话与流式体验] 回合因果时序校准与待办面板多会话强隔离**:
+  - 基于流式序列号保证助手生成回合的严格因果时序，并在回放时精准移至对应用户锚点消息之前。
+  - 引入 SessionTodoSlot 与待办展示解析器，严格将会话待办状态与当前查看的会话 ID 绑定，彻底消除切换会话时的单帧残影与状态交叉污染。
+  - 引入原生 HEIC/HEIF 图像解码与无损缩放管道，优化附件图像加载与呈现。
+
+- **[侧边栏与工作区管理] 会话超额折叠保护与多选批量操作**:
+  - 恢复项目会话超额折叠展示，并保证活动会话与生成中会话始终常驻。
+  - 新增会话右键上下文菜单，支持 Shift/Ctrl 范围多选与快速批量操作。
+
 ## v1.0.10 (2026-11-11)
 
 - **[Plugin Management & Desktop Pet] Full plugin HTTP lifecycle APIs and expanded local workspace RPCs**:
