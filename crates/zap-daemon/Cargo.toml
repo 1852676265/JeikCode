@@ -25,7 +25,7 @@ zap-kernel = { path = "../zap-kernel" }
 zap-coding = { path = "../zap-coding" }
 zap-telemetry = { path = "../zap-telemetry" }
 zap-updater = { path = "../zap-updater" }
-sysinfo = "0.33"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # HTTP
 axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
