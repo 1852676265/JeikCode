@@ -2,5 +2,5 @@
 /// Usage: echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-01-01"}}' | cargo run -p jeikcode --example acp_stdio_agent
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    jeikcode::acp::serve_stdio(jeikcode::acp::AcpServeOptions::default()).await
+    zap::acp::serve_stdio(zap::acp::AcpServeOptions::default()).await
 }

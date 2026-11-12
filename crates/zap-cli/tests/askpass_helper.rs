@@ -31,7 +31,7 @@ fn helper_sends_token_and_returns_password() {
         );
         s.write_all(b"{\"password\":\"pw\"}\n").unwrap();
     });
-    let pw = jeikcode::askpass::run_askpass("[sudo] password:", &sock2, "tok");
+    let pw = zap::askpass::run_askpass("[sudo] password:", &sock2, "tok");
     assert_eq!(pw.as_deref(), Some("pw"));
     h.join().unwrap();
 }

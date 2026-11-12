@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Channel, Client, ConnectionTo};
-use jeikcode::acp::engine::EngineConfig;
-use jeikcode::acp::{serve_over, AcpServeOptions};
+use zap::acp::engine::EngineConfig;
+use zap::acp::{serve_over, AcpServeOptions};
 use zap_coding::{CodingAgentConfig, CodingProviderFactory, ProviderBuildError};
 use zap_kernel::provider::LlmProvider;
 use zap_kernel::stream::{ProviderError, StreamEvent};

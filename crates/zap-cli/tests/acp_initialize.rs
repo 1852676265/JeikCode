@@ -2,8 +2,8 @@
 #[test]
 fn serve_stdio_symbol_exists() {
     // Compile-time proof the public surface exists; behavior covered in Task 11.
-    let _f: fn(jeikcode::acp::AcpServeOptions) -> _ = jeikcode::acp::serve_stdio;
-    let _opts = jeikcode::acp::AcpServeOptions {
+    let _f: fn(zap::acp::AcpServeOptions) -> _ = zap::acp::serve_stdio;
+    let _opts = zap::acp::AcpServeOptions {
         engine: None,
         provider_factory: None,
         auto_approve: false,

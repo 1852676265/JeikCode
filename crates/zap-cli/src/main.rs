@@ -18,7 +18,7 @@ mod schedule_os;
 mod server_cmd;
 mod telemetry_cmd;
 mod vision;
-use jeikcode::uninstall;
+use zap::uninstall;
 
 // Redirect JEIKCODE_HOME to a throwaway temp dir before any test in this binary
 // runs, so unit tests never persist into the developer's real `~/.jeikcode`.
@@ -495,7 +495,7 @@ async fn run_serve_mode(
     // Skip interactive wizard when this process is an in-place restart successor
     // (e.g. triggered remotely via WebUI update or port/host change).
     if !zap_updater::is_restarted_process() {
-        let setup = jeikcode::host_service::HostServiceSetupOptions {
+        let setup = zap::host_service::HostServiceSetupOptions {
             host: &host,
             port,
             workdir: &workdir,
@@ -506,13 +506,13 @@ async fn run_serve_mode(
             no_telemetry,
             banner: &startup_footer,
         };
-        match jeikcode::host_service::prompt_host_service_setup(&setup) {
+        match zap::host_service::prompt_host_service_setup(&setup) {
             Ok(true) => return 0,
             Ok(false) => {}
             Err(e) => {
                 eprintln!(
                     "{}",
-                    jeikcode::host_service::host_msg(
+                    zap::host_service::host_msg(
                         &format!("Could not install the host service: {e:#}"),
                         &format!("系统服务配置失败: {e:#}"),
                         &format!("Không thể cài đặt dịch vụ hệ thống: {e:#}"),
@@ -520,7 +520,7 @@ async fn run_serve_mode(
                 );
                 eprintln!(
                     "{}",
-                    jeikcode::host_service::host_msg(
+                    zap::host_service::host_msg(
                         "Continuing in the foreground.",
                         "改为前台运行。",
                         "Tiếp tục chạy ở chế độ foreground.",
@@ -1918,7 +1918,7 @@ async fn async_main() {
                 eprintln!("✓ Upgrading to {}...", applied.version);
                 // 开启自动更新时，后台无感更新自动全选同步所有非模型配置文件及提示词/词林/指南
                 let home = zap_config::config::Config::config_dir();
-                if let Err(e) = jeikcode::config_sync::apply_all_bundled_assets(&home, false) {
+                if let Err(e) = zap::config_sync::apply_all_bundled_assets(&home, false) {
                     eprintln!("  ⚠ 自动更新配置同步警告: {e}");
                 }
                 // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
@@ -2026,7 +2026,7 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             let token = std::env::var("JEIKCODE_ASKPASS_TOKEN").ok();
             match (sock, token) {
                 (Some(s), Some(t)) => {
-                    match jeikcode::askpass::run_askpass(prompt, Path::new(&s), &t) {
+                    match zap::askpass::run_askpass(prompt, Path::new(&s), &t) {
                         Some(pw) => {
                             use std::io::Write;
                             print!("{pw}");
@@ -2326,14 +2326,14 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
                 // every ACP session. Sharing one pre-built provider would pin gateway
                 // session affinity to whichever session bound it first.
                 let provider_factory = zap_daemon::coding_provider_factory();
-                let engine = jeikcode::acp::engine::EngineConfig::from_coding_config(
+                let engine = zap::acp::engine::EngineConfig::from_coding_config(
                     runtime_cfg.agent_config(),
                 );
                 // Flush telemetry before the long-running stdio loop.
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
-                return jeikcode::acp::serve_stdio(jeikcode::acp::AcpServeOptions {
+                return zap::acp::serve_stdio(zap::acp::AcpServeOptions {
                     engine: Some(engine),
                     provider_factory: Some(provider_factory),
                     auto_approve,
@@ -2363,13 +2363,13 @@ async fn run(inherited_token: Option<String>) -> Result<i32> {
             }
             Commands::SyncConfig { auto } => {
                 if let Some(home) = dirs::home_dir().map(|h| h.join(".jeikcode")) {
-                    let diffs = jeikcode::config_sync::scan_zap_config_diffs(&home);
+                    let diffs = zap::config_sync::scan_zap_config_diffs(&home);
                     if auto {
-                        let _ = jeikcode::config_sync::apply_selected_diffs(diffs);
+                        let _ = zap::config_sync::apply_selected_diffs(diffs);
                     } else if !diffs.is_empty() {
-                        let _ = jeikcode::config_sync::prompt_interactive_config_sync(diffs);
+                        let _ = zap::config_sync::prompt_interactive_config_sync(diffs);
                     }
-                    let _ = jeikcode::config_sync::set_last_seen_version(
+                    let _ = zap::config_sync::set_last_seen_version(
                         &home,
                         env!("CARGO_PKG_VERSION"),
                     );
@@ -4957,13 +4957,13 @@ async fn run_upgrade_cli(
                 if spawned.is_err() {
                     // Fallback to in-process sync if spawning new binary fails
                     if let Some(home) = dirs::home_dir().map(|h| h.join(".jeikcode")) {
-                        let diffs = jeikcode::config_sync::scan_zap_config_diffs(&home);
+                        let diffs = zap::config_sync::scan_zap_config_diffs(&home);
                         if yes {
-                            let _ = jeikcode::config_sync::apply_selected_diffs(diffs);
+                            let _ = zap::config_sync::apply_selected_diffs(diffs);
                         } else if !diffs.is_empty() {
-                            let _ = jeikcode::config_sync::prompt_interactive_config_sync(diffs);
+                            let _ = zap::config_sync::prompt_interactive_config_sync(diffs);
                         }
-                        let _ = jeikcode::config_sync::set_last_seen_version(
+                        let _ = zap::config_sync::set_last_seen_version(
                             &home,
                             env!("CARGO_PKG_VERSION"),
                         );
