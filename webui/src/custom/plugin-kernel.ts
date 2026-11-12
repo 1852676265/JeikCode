@@ -1043,7 +1043,11 @@ export class ZapPluginKernel {
   };
   private developerToolsEnabled = true;
   private listeners = new Set<Listener>();
+  // 单调递增的内核版本号：订阅方在挂载时比对，补偿「渲染→订阅」之间错过的变更通知
+  private version = 0;
   private dynamicDisposers = new Map<string, () => void>();
+  // 每个插件包的运行时同步代际，用于作废停用/重同步之前发起的异步脚本加载
+  private runtimeGenerations = new Map<string, number>();
   private styleElements = new Map<string, HTMLStyleElement>();
 
   // Generic Extension Registries (DSH / Cordis Action & Inspector models)
@@ -1195,7 +1199,12 @@ export class ZapPluginKernel {
     };
   }
 
+  public getVersion(): number {
+    return this.version;
+  }
+
   public notify() {
+    this.version += 1;
     for (const listener of this.listeners) {
       try {
         listener();
@@ -1663,11 +1672,13 @@ export class ZapPluginKernel {
   }
 
   public uninstallPackage(packageName: string) {
+    this.runtimeGenerations.set(packageName, (this.runtimeGenerations.get(packageName) ?? 0) + 1);
     const disposer = this.dynamicDisposers.get(packageName);
     if (disposer) {
       disposer();
       this.dynamicDisposers.delete(packageName);
     }
+    this.purgePackageContributions(packageName);
     if (typeof document !== 'undefined') {
       const cleanId = packageName.replace(/^@/, '').replace(/\//g, '-');
       document.querySelectorAll(`script[src*="${cleanId}"]`).forEach((s) => s.remove());
@@ -1970,7 +1981,32 @@ export class ZapPluginKernel {
     }
   }
 
+  /**
+   * 清理插件脚本通过全局内核 API 自行注册的插槽 / Action / Inspector。
+   * 内核代注册的贡献由 dynamicDisposers 回收；插件脚本自注册的贡献只能按 pluginPackage 归属清理，
+   * 否则停用或卸载后侧栏、设置导航中会残留失效入口。
+   */
+  private purgePackageContributions(packageName: string) {
+    for (const map of Object.values(this.slots) as Map<string, { pluginPackage?: string }>[]) {
+      for (const [id, entry] of map) {
+        if (entry.pluginPackage === packageName) map.delete(id);
+      }
+    }
+    const registries = [...this.actionRegistries.values(), ...this.inspectorRegistries.values()] as Map<
+      string,
+      { pluginPackage?: string }
+    >[];
+    for (const registry of registries) {
+      for (const [id, entry] of registry) {
+        if (entry.pluginPackage === packageName) registry.delete(id);
+      }
+    }
+  }
+
   private syncPackageRuntimeEffects(packageName: string) {
+    const generation = (this.runtimeGenerations.get(packageName) ?? 0) + 1;
+    this.runtimeGenerations.set(packageName, generation);
+
     const prevDisposer = this.dynamicDisposers.get(packageName);
     if (prevDisposer) {
       prevDisposer();
@@ -1979,6 +2015,7 @@ export class ZapPluginKernel {
 
     const pkg = this.externalPackages.find((p) => p.name === packageName);
     if (!pkg || !pkg.enabled) {
+      this.purgePackageContributions(packageName);
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('zap:plugin-deactivated', { detail: { package: packageName } }));
         if (packageName.includes('wallpaper')) {
@@ -2091,6 +2128,8 @@ export class ZapPluginKernel {
       const fullEntryPath = `${normalizedDir}/${normalizedEntry}`;
       fetchFsRead(fullEntryPath)
         .then((res) => {
+          // 读取期间插件已被停用 / 重新同步：丢弃本次结果，避免重复注入或注入到已回收的运行时
+          if (this.runtimeGenerations.get(packageName) !== generation) return;
           if (res.success && res.content) {
             const scriptEl = document.createElement('script');
             scriptEl.type = 'module';
@@ -2173,6 +2212,24 @@ export function useActiveInspector() {
   }, []);
 
   return active;
+}
+
+/**
+ * 订阅插件内核变更并返回当前版本号；任何插槽、插件包状态变化都会触发使用方重渲染。
+ * 订阅建立后立即比对一次版本，补偿父/兄弟组件 effect（如 syncAllPackagesRuntimeEffects）
+ * 先于本组件订阅执行而错过的通知。
+ */
+export function usePluginKernelVersion(): number {
+  const [version, setVersion] = useState(() => zapPluginKernel.getVersion());
+
+  useEffect(() => {
+    const sync = () => setVersion(zapPluginKernel.getVersion());
+    const unsub = zapPluginKernel.subscribe(sync);
+    sync();
+    return unsub;
+  }, []);
+
+  return version;
 }
 
 export function useZapHostSDK(): ZapHostSDK {

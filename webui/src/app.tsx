@@ -13,7 +13,7 @@ import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { ServerSwitcherModal } from './components/ServerSwitcherModal';
 import { PluginCenterHostApp } from './custom/custom-registry';
-import { zapPluginKernel } from './custom/plugin-kernel';
+import { zapPluginKernel, usePluginKernelVersion } from './custom/plugin-kernel';
 import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from './lib/serverProfiles';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { ToastHost, showToast } from './components/Toast';
@@ -79,12 +79,10 @@ export function App() {
   const [liveReview, setLiveReview] = useState<LiveReviewState | null>(null);
   // 主工作区视图状态（'chat' 为默认 AI 对话工作区，其他 ID 为插件贡献的独立主视图）
   const [activeWorkbenchView, setActiveWorkbenchView] = useState<string>('chat');
-  const [, setPluginViewsTick] = useState(0);
+  // 订阅插件内核版本：工作台视图插槽变化时重渲染（含挂载前已完成的首轮插件同步）
+  usePluginKernelVersion();
 
   useEffect(() => {
-    const unsub = zapPluginKernel.subscribe(() => {
-      setPluginViewsTick((v) => v + 1);
-    });
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{ viewId?: string }>).detail;
       if (detail?.viewId) {
@@ -95,7 +93,6 @@ export function App() {
     };
     window.addEventListener('zap:switch-workbench-view', handler);
     return () => {
-      unsub();
       window.removeEventListener('zap:switch-workbench-view', handler);
     };
   }, []);

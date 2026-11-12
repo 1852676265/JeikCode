@@ -7,7 +7,7 @@
 import { h, render } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { DeepSeekSettingsCenterModal } from './plugin-settings-center';
-import { zapPluginKernel } from './plugin-kernel';
+import { zapPluginKernel, usePluginKernelVersion } from './plugin-kernel';
 import './custom.css';
 
 export interface CustomExtension {
@@ -49,13 +49,10 @@ export function openDeepSeekSettingsCenter(initialSection: string = 'general') {
 export function PluginCenterHostApp() {
   const [open, setOpen] = useState(false);
   const [initialSection, setInitialSection] = useState<string>('general');
-  const [overlaysVersion, setOverlaysVersion] = useState(0);
+  usePluginKernelVersion();
 
   useEffect(() => {
     zapPluginKernel.syncAllPackagesRuntimeEffects();
-    const unsub = zapPluginKernel.subscribe(() => {
-      setOverlaysVersion((v) => v + 1);
-    });
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{ section?: string }>).detail;
       setInitialSection(detail?.section || 'general');
@@ -63,7 +60,6 @@ export function PluginCenterHostApp() {
     };
     window.addEventListener(OPEN_CENTER_EVENT, handler);
     return () => {
-      unsub();
       window.removeEventListener(OPEN_CENTER_EVENT, handler);
     };
   }, []);

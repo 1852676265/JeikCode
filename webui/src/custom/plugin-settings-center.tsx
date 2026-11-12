@@ -21,7 +21,12 @@ import { useSettings, Theme } from '../settings';
 import { Lang } from '../i18n';
 import { ModelSelector } from '../components/ModelSelector';
 import { getActiveServerProfile, isDirectLlmProfile, PROFILES_CHANGE_EVENT } from '../lib/serverProfiles';
-import { zapPluginKernel, ExternalPluginPackage, ZapPluginManifest } from './plugin-kernel';
+import {
+  zapPluginKernel,
+  usePluginKernelVersion,
+  ExternalPluginPackage,
+  ZapPluginManifest,
+} from './plugin-kernel';
 
 // =============================================================================
 // 1. 精致矢量图标 (Refined Outline Icons)
@@ -671,6 +676,9 @@ function PluginsManagerSection({
                         <button
                           type="button"
                           class="dsh-btn dsh-btn-outline dsh-btn-sm"
+                          // 停用插件不会注册配置分区，跳转会落回「通用」页，故禁用
+                          disabled={!pkg.enabled}
+                          title={pkg.enabled ? undefined : '启用插件后可配置'}
                           onClick={() => navigate?.(sectionId)}
                         >
                           配置
@@ -830,13 +838,9 @@ export function DeepSeekSettingsCenterModal({
   initialSection?: string;
   onClose: () => void;
 }) {
-  const [pluginsTick, setPluginsTick] = useState(0);
-
-  useEffect(() => {
-    return zapPluginKernel.subscribe(() => {
-      setPluginsTick((v) => v + 1);
-    });
-  }, []);
+  const kernelVersion = usePluginKernelVersion();
+  // 仅当按下与松开都发生在遮罩本身时才关闭，避免在弹窗内拖选文字后松手到遮罩上误关闭
+  const backdropPressRef = useRef(false);
 
   const dynamicSections = useMemo(() => {
     const customSlots = zapPluginKernel.getSlotEntries('settings.section');
@@ -859,27 +863,29 @@ export function DeepSeekSettingsCenterModal({
         },
       };
     });
-  }, [pluginsTick]);
+  }, [kernelVersion]);
 
   const allSections = useMemo(() => {
     return [...SETTINGS_SECTIONS, ...dynamicSections];
   }, [dynamicSections]);
 
-  // 智能规整 sectionId（兼容旧标识与动态注册标识）
+  // 规整 sectionId（仅做旧标识别名映射）。不在此校验分区是否存在：动态分区可能稍后才注册，
+  // 缺失时由 activeSection 临时回退到首项，分区就绪后自动切回。
   const resolveSectionId = (sec: string) => {
     if (sec === 'plugins' || sec === 'plugins-manager') return 'plugins-manager';
     if (sec === 'mcp' || sec === 'skills') return 'mcp-capabilities';
     if (sec === 'theme' || sec === 'glass') return 'ui-glass';
     if (sec === 'model' || sec === 'models') return 'general';
-    const exists = allSections.some((s) => s.id === sec);
-    return exists ? sec : 'general';
+    return sec || 'general';
   };
 
   const [activeId, setActiveId] = useState<string>(() => resolveSectionId(initialSection));
 
+  // 只在打开弹窗或外部指定新分区时同步。不能依赖 allSections：任何插件开关 / 配置变更都会重建该数组，
+  // 会把用户当前所在的「插件管理」等页面强制重置回 initialSection（通常是「通用」）。
   useEffect(() => {
-    setActiveId(resolveSectionId(initialSection));
-  }, [initialSection, open, allSections]);
+    if (open) setActiveId(resolveSectionId(initialSection));
+  }, [initialSection, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -898,8 +904,13 @@ export function DeepSeekSettingsCenterModal({
   return createPortal(
     <div
       class="dsh-settings-backdrop"
+      onMouseDown={(e) => {
+        backdropPressRef.current = e.target === e.currentTarget;
+      }}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        const pressedOnBackdrop = backdropPressRef.current;
+        backdropPressRef.current = false;
+        if (pressedOnBackdrop && e.target === e.currentTarget) onClose();
       }}
     >
       <div class="dsh-settings-dialog" role="dialog" aria-modal="true" aria-label="设置中心">

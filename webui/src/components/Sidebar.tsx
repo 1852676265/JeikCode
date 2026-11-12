@@ -24,7 +24,7 @@ import { getPageZoom } from '../lib/pageZoom';
 import { menuPointFromEvent } from '../lib/menuPosition';
 import { buildSessionAnalysisPrompt } from '../lib/sessionAnalysis';
 import { openDeepSeekSettingsCenter } from '../custom/custom-registry';
-import { zapPluginKernel } from '../custom/plugin-kernel';
+import { zapPluginKernel, usePluginKernelVersion } from '../custom/plugin-kernel';
 
 /** 会话右键菜单的估算尺寸（用于防漂移翻转/夹取），与 CSS 宽度保持一致。 */
 const SESSION_CONTEXT_MENU_WIDTH = 200;
@@ -557,12 +557,7 @@ export function Sidebar({
   const [mcpReloading, setMcpReloading] = useState(false);
 
   // 订阅插件内核侧边栏插槽 (`sidebar.nav`)，外部扩展挂载后自动渲染
-  const [, setPluginNavTick] = useState(0);
-  useEffect(() => {
-    return zapPluginKernel.subscribe(() => {
-      setPluginNavTick((v) => v + 1);
-    });
-  }, []);
+  usePluginKernelVersion();
   const sidebarPluginNavItems = zapPluginKernel.getSlotEntries('sidebar.nav');
 
   // 侧栏可拖拽宽度状态与本地持久化
