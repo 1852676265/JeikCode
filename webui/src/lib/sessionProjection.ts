@@ -38,6 +38,105 @@ export interface ProjectionMessage {
   ts?: number;
   /** 管线身份（kernel message id）。增量事件按此定向落笔，而非盲写“最后一条”。 */
   id?: string;
+  sourceIndex?: number;
+  seq?: number;
+  /** Watch-stream causal order for a LIVE-created assistant row.
+   *  Deliberately separate from `seq`: disk DisplayRecord.seq and the replay
+   *  cursor are different coordinate systems. Never persisted as display order. */
+  streamSeq?: number;
+}
+
+function finiteRecordSeq(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Insert a newly created assistant row at its causal position inside the
+ * current turn.
+ *
+ * A late `/chat/watch` subscriber can see a LATER round first (its resume
+ * cursor starts inside the turn), then receive an EARLIER round's replay. If
+ * every new row is appended, the later round sits above the earlier one until
+ * a disk reconciliation happens after the later round's next tool result —
+ * the “thinking/body/tool usurps the earlier round for a while” bug.
+ *
+ * Only rows created by this live watcher carry a comparable stream `seq`.
+ * Persisted disk rows use DisplayRecord.seq (a different coordinate), so they
+ * are never used as the insertion anchor; a live row stays after them.
+ */
+export function insertAssistantRowInCausalOrder<T extends ProjectionMessage>(
+  messages: T[],
+  row: T,
+  recordSeq?: number,
+): T[] {
+  const seq = finiteRecordSeq(recordSeq);
+  const stamped = seq == null ? row : ({ ...row, streamSeq: seq } as T);
+  if (seq == null) return [...messages, stamped];
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]!.role === 'user') {
+      lastUser = i;
+      break;
+    }
+  }
+  for (let i = lastUser + 1; i < messages.length; i += 1) {
+    const candidate = messages[i]!;
+    if (candidate.role !== 'assistant' || candidate.sourceIndex != null) continue;
+    const candidateSeq = finiteRecordSeq(candidate.streamSeq);
+    if (candidateSeq != null && candidateSeq > seq) {
+      const next = messages.slice();
+      next.splice(i, 0, stamped);
+      return next;
+    }
+  }
+  return [...messages, stamped];
+}
+
+/**
+ * Move an assistant row that was just painted to BEFORE an explicit user anchor.
+ *
+ * A late replay can deliver the previous turn's final answer after the new
+ * turn's opening user is already on canvas. The row is not a duplicate (it was
+ * absent), so appending it corrupts the order and dropping it loses the only
+ * copy. This helper puts it back where it belongs.
+ */
+export function moveAssistantRowBefore<T extends ProjectionMessage>(
+  messages: T[],
+  messageId?: string,
+  beforeId?: string,
+): T[] {
+  if (!messageId || !beforeId) return messages;
+  const assistant = identifiedAssistantIndex(messages, messageId);
+  if (assistant < 0) return messages;
+  const isAnchor = (message: T): boolean => (
+    message.role === 'user'
+    && (message.id === beforeId || (message as unknown as { clientInputId?: string }).clientInputId === beforeId)
+  );
+  const anchorBefore = messages.findIndex(isAnchor);
+  if (anchorBefore < 0 || assistant < anchorBefore) return messages;
+  const next = messages.slice();
+  const [row] = next.splice(assistant, 1);
+  const anchor = next.findIndex(isAnchor);
+  if (anchor < 0) return messages;
+  next.splice(anchor, 0, row!);
+  return next;
+}
+
+/** Stamp the first live frame's stream seq onto an existing placeholder/row. */
+export function stampAssistantRowSeq<T extends ProjectionMessage>(
+  messages: T[],
+  index: number,
+  recordSeq?: number,
+): T[] {
+  const seq = finiteRecordSeq(recordSeq);
+  if (seq == null || index < 0 || index >= messages.length) return messages;
+  const row = messages[index]!;
+  if (row.role !== 'assistant' || row.sourceIndex != null || typeof row.streamSeq === 'number') {
+    return messages;
+  }
+  const next = messages.slice();
+  next[index] = { ...row, streamSeq: seq } as T;
+  return next;
 }
 
 /**
@@ -178,11 +277,12 @@ export function paintCachedAssistantDelta<T extends ProjectionMessage>(
   messages: T[],
   part: 'text' | 'reasoning',
   content: string,
-  identity?: { messageId?: string; partId?: string },
+  identity?: { messageId?: string; partId?: string; replay?: boolean; recordSeq?: number },
 ): T[] {
+  const replay = identity?.replay === true;
   const painted = part === 'text'
-    ? paintAssistantText(messages, content, false, identity?.messageId, identity?.partId)
-    : paintAssistantReasoning(messages, content, false, identity?.messageId, identity?.partId);
+    ? paintAssistantText(messages, content, replay, identity?.messageId, identity?.partId, identity?.recordSeq)
+    : paintAssistantReasoning(messages, content, replay, identity?.messageId, identity?.partId, identity?.recordSeq);
   return withAssistantIdentity(painted, identity?.messageId, identity?.partId);
 }
 
@@ -288,6 +388,8 @@ export function paintAssistantText<T extends ProjectionMessage>(
   targetId?: string,
   /** 部件身份：回放帧的累积文本按 part 定向合并，不能拿整条消息的正文拼接做基线。 */
   partId?: string,
+  /** Session stream seq of the first frame that owns this round. */
+  recordSeq?: number,
 ): T[] {
   const target = identifiedAssistantIndex(messages, targetId);
   if (target >= 0) {
@@ -295,23 +397,34 @@ export function paintAssistantText<T extends ProjectionMessage>(
     if (!parts) return messages;
     const next = messages.slice();
     next[target] = { ...messages[target]!, parts };
-    return next;
+    return stampAssistantRowSeq(next, target, recordSeq);
   }
   // 身份未命中：这帧属于画布上还没有的轮（新一轮 / 迟到尾流）→ 直接落到当前气泡。
   // 不再用「跨轮隔离」猜测拦截：帧身份由线协议（轮编号 + 游标）给出，未命中就是新的。
   if (messages.length === 0) {
     if (!content) return messages;
-    return [{ role: 'assistant', parts: [{ kind: 'text', text: content }] } as unknown as T];
+    return [{ role: 'assistant', ...(targetId ? { id: targetId } : {}), parts: [{ kind: 'text', text: content }] } as unknown as T];
   }
-  let last = messages[messages.length - 1]!;
-  let base = messages;
-  if (!last || last.role !== 'assistant') {
-    last = { role: 'assistant', parts: [] } as unknown as T;
-    base = [...messages, last];
+  let last = messages[messages.length - 1];
+  if (last && last.role === 'assistant') {
+    const parts = mergeTextIntoParts(last.parts, content, replay, partId);
+    if (!parts) return messages;
+    const next = messages.slice();
+    const idx = next.length - 1;
+    next[idx] = { ...last, parts };
+    return stampAssistantRowSeq(next, idx, recordSeq);
   }
-  const parts = mergeTextIntoParts(last.parts, content, replay, partId);
+  const parts = mergeTextIntoParts([], content, replay, partId);
   if (!parts) return messages;
-  return [...base.slice(0, -1), { ...last, parts }];
+  return insertAssistantRowInCausalOrder(
+    messages,
+    {
+      role: 'assistant',
+      ...(targetId ? { id: targetId } : {}),
+      parts,
+    } as unknown as T,
+    recordSeq,
+  );
 }
 
 /** 合并一段正文增量；返回 null 表示重播去重后无新内容可落笔。
@@ -397,6 +510,8 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
   targetId?: string,
   /** 部件身份：回放帧按 part 定向合并，避免整段思考被重打。 */
   partId?: string,
+  /** Session stream seq of the first frame that owns this round. */
+  recordSeq?: number,
 ): T[] {
   const cleanContent = content.trim();
   if (!cleanContent) return messages;
@@ -407,19 +522,29 @@ export function paintAssistantReasoning<T extends ProjectionMessage>(
     if (!parts) return messages;
     const next = messages.slice();
     next[target] = { ...messages[target]!, parts };
-    return next;
+    return stampAssistantRowSeq(next, target, recordSeq);
   }
   // 身份未命中：同 paintAssistantText —— 未命中的帧就是画布上还没有的轮，直接落笔。
-
   let last = messages[messages.length - 1];
-  let base = messages;
-  if (!last || last.role !== 'assistant') {
-    last = { role: 'assistant', parts: [] } as unknown as T;
-    base = [...messages, last];
+  if (last && last.role === 'assistant') {
+    const parts = mergeReasoningIntoParts(last.parts, content, replay, partId);
+    if (!parts) return messages;
+    const next = messages.slice();
+    const idx = next.length - 1;
+    next[idx] = { ...last, parts };
+    return stampAssistantRowSeq(next, idx, recordSeq);
   }
-  const parts = mergeReasoningIntoParts(last.parts, content, replay, partId);
+  const parts = mergeReasoningIntoParts([], content, replay, partId);
   if (!parts) return messages;
-  return [...base.slice(0, -1), { ...last, parts }];
+  return insertAssistantRowInCausalOrder(
+    messages,
+    {
+      role: 'assistant',
+      ...(targetId ? { id: targetId } : {}),
+      parts,
+    } as unknown as T,
+    recordSeq,
+  );
 }
 
 /** 合并一段思考增量；返回 null 表示重播去重后无新内容可落笔。 */

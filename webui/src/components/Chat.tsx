@@ -249,6 +249,7 @@ import {
   foldLiveTodo,
   hydrateSession,
   identifiedAssistantIndex,
+  moveAssistantRowBefore,
   paintAssistantReasoning,
   paintAssistantText,
   paintAssistantNotice,
@@ -4047,17 +4048,17 @@ export function Chat({
   function appendToLastAssistant(
     content: string,
     opts?: { skipReplayDedup?: boolean; requireReplayDedup?: boolean },
-    ids?: { messageId?: string; partId?: string },
+    ids?: { messageId?: string; partId?: string; recordSeq?: number; insertBeforeMessageId?: string },
   ) {
     const replay = opts?.requireReplayDedup === true && opts?.skipReplayDedup !== true;
     setMessages((prev) => {
-      const next = withAssistantIdentity(
-        paintAssistantText(prev, content, replay, ids?.messageId, ids?.partId),
-        ids?.messageId,
-        ids?.partId,
-      );
-      messagesRef.current = next;
-      return next;
+      let painted = paintAssistantText(prev, content, replay, ids?.messageId, ids?.partId, ids?.recordSeq);
+      painted = withAssistantIdentity(painted, ids?.messageId, ids?.partId);
+      if (ids?.insertBeforeMessageId) {
+        painted = moveAssistantRowBefore(painted, ids.messageId, ids.insertBeforeMessageId);
+      }
+      messagesRef.current = painted;
+      return painted;
     });
   }
 
@@ -5603,7 +5604,12 @@ export function Chat({
     if (activeIdRef.current) artifactOpenBySessionRef.current.delete(activeIdRef.current);
   }
 
-  function addToolToLastAssistant(tool: ToolRow, messageId?: string) {
+  function addToolToLastAssistant(
+    tool: ToolRow,
+    messageId?: string,
+    recordSeq?: number,
+    insertBeforeMessageId?: string,
+  ) {
     setMessages((prev) => {
       if (prev.length === 0) return prev;
       let next: Message[] = prev;
@@ -5641,6 +5647,9 @@ export function Chat({
         ];
       }
       next = withAssistantIdentity(next, messageId);
+      if (insertBeforeMessageId) {
+        next = moveAssistantRowBefore(next, messageId, insertBeforeMessageId);
+      }
       messagesRef.current = next;
       return next;
     });
@@ -6081,10 +6090,12 @@ export function Chat({
       }
 
       case 'text': {
+        const streamSeq = (event as unknown as { seq?: number }).seq;
+        const insertBeforeMessageId = (event as unknown as { insert_before_message_id?: string }).insert_before_message_id;
         appendToLastAssistant(
           event.content,
           { requireReplayDedup },
-          { messageId: event.message_id, partId: event.part_id },
+          { messageId: event.message_id, partId: event.part_id, recordSeq: streamSeq, insertBeforeMessageId },
         );
         const textDelta = estimateTextTokens(event.content);
         if (textDelta > 0) {
@@ -6099,12 +6110,17 @@ export function Chat({
 
       case 'reasoning': {
         // Thinking / chain-of-thought stream — collapsible block in the UI.
+        const streamSeq = (event as unknown as { seq?: number }).seq;
+        const insertBeforeMessageId = (event as unknown as { insert_before_message_id?: string }).insert_before_message_id;
         setMessages((prev) => {
-          const next = withAssistantIdentity(
-            paintAssistantReasoning(prev, event.content, requireReplayDedup, event.message_id, event.part_id),
+          let next = withAssistantIdentity(
+            paintAssistantReasoning(prev, event.content, requireReplayDedup, event.message_id, event.part_id, streamSeq),
             event.message_id,
             event.part_id,
           );
+          if (insertBeforeMessageId) {
+            next = moveAssistantRowBefore(next, event.message_id, insertBeforeMessageId);
+          }
           messagesRef.current = next;
           return next;
         });
@@ -6121,6 +6137,8 @@ export function Chat({
       }
 
       case 'tool_start': {
+        const streamSeq = (event as unknown as { seq?: number }).seq;
+        const insertBeforeMessageId = (event as unknown as { insert_before_message_id?: string }).insert_before_message_id;
         const argsStr = formatArgs(event.arguments);
         const subtasks =
           event.name === 'task' ? subtasksFromTaskArgs(argsStr) ?? undefined : undefined;
@@ -6130,7 +6148,7 @@ export function Chat({
           args: argsStr,
           status: 'pending',
           ...(subtasks ? { subtasks } : {}),
-        }, event.message_id);
+        }, event.message_id, streamSeq, insertBeforeMessageId);
         if (isTodoTool(event.name)) {
           const appliedIds = appliedTodoIdsFor(activeIdRef.current);
           setActiveTodos((cur) => {

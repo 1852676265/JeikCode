@@ -7,10 +7,13 @@ import {
   foldLiveTodo,
   hydrateSession,
   identifiedAssistantIndex,
+  insertAssistantRowInCausalOrder,
+  moveAssistantRowBefore,
   paintAssistantReasoning,
   paintAssistantText,
   paintCachedAssistantDelta,
   paintUserMessage,
+  stampAssistantRowSeq,
   withAssistantIdentity,
 } from './sessionProjection.ts';
 
@@ -872,4 +875,39 @@ test('正文与思考无 partId 极端重放恢复：严格按顺序呈现，绝
   assert.equal(parts[3]?.kind, 'text');
   assert.equal((parts[3] as any).text, '阶段2结论');
 });
+
+test('insertAssistantRowInCausalOrder places an earlier round before later live rows with higher streamSeq', () => {
+  const initial = [
+    { role: 'user', id: 'u1', parts: [{ kind: 'text' as const, text: 'q' }] },
+    { role: 'assistant', id: 'a2', streamSeq: 20, parts: [{ kind: 'text' as const, text: 'round 2' }] },
+  ];
+  const round1 = { role: 'assistant', id: 'a1', parts: [{ kind: 'text' as const, text: 'round 1' }] };
+  const merged = insertAssistantRowInCausalOrder(initial, round1, 10);
+  assert.equal(merged.length, 3);
+  assert.equal(merged[1]?.id, 'a1');
+  assert.equal(merged[1]?.streamSeq, 10);
+  assert.equal(merged[2]?.id, 'a2');
+});
+
+test('moveAssistantRowBefore moves an assistant row before its anchor user row', () => {
+  const messages = [
+    { role: 'user', id: 'u1', parts: [{ kind: 'text' as const, text: 'q1' }] },
+    { role: 'user', id: 'u2', parts: [{ kind: 'text' as const, text: 'q2' }] },
+    { role: 'assistant', id: 'a1', parts: [{ kind: 'text' as const, text: 'answer 1' }] },
+  ];
+  const reordered = moveAssistantRowBefore(messages, 'a1', 'u2');
+  assert.equal(reordered.length, 3);
+  assert.deepEqual(reordered.map((m) => m.id), ['u1', 'a1', 'u2']);
+});
+
+test('stampAssistantRowSeq stamps streamSeq only once onto target assistant row', () => {
+  const messages = [
+    { role: 'assistant', id: 'a1', parts: [] },
+  ];
+  const stamped = stampAssistantRowSeq(messages, 0, 42);
+  assert.equal(stamped[0]?.streamSeq, 42);
+  const reStamped = stampAssistantRowSeq(stamped, 0, 99);
+  assert.equal(reStamped[0]?.streamSeq, 42, 'must preserve original streamSeq');
+});
+
 
