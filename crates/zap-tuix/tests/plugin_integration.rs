@@ -88,8 +88,9 @@ fn add_install_reload_flow() {
     zap_capabilities::plugin::loader::reload_skill_registry(&mut reg, working.path());
     assert!(reg.get("e2e:sk").is_some(), "missing skill e2e:sk");
 
-    // Verify the TUI-owned CustomCommandRegistry sees `e2e:c`; plugin install
-    // and skill discovery are provided by zap-capabilities.
-    let creg = zap_tuix::custom_commands::CustomCommandRegistry::load(working.path());
+    // Verify the user-command registry sees `e2e:c`. The registry moved to
+    // zap-capabilities (`UserCommandRegistry`); the retired TUI copy
+    // (`zap_tuix::custom_commands::CustomCommandRegistry`) no longer exists.
+    let creg = zap_capabilities::commands::UserCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
 }
