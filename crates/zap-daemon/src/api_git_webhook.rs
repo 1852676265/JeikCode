@@ -112,7 +112,7 @@ pub async fn generate_app_token_api(Json(req): Json<GenerateAppTokenRequest>) ->
     let repo = req
         .repo_identifier
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jeikl/JeikCode".to_string());
+        .unwrap_or_else(|| zap_config::endpoints::update_repo().to_string());
 
     let pem_content = if let Some(content) = req.private_key.filter(|s| !s.trim().is_empty()) {
         content

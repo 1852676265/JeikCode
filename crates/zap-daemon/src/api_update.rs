@@ -185,7 +185,13 @@ pub fn is_desktop_environment() -> bool {
     std::env::var("JEIKCODE_DESKTOP").is_ok()
 }
 
-const GITHUB_LATEST_API_URL: &str = "https://api.github.com/repos/jeikl/JeikCode/releases/latest";
+/// `GET /repos/{repo}/releases/latest`，仓库取自更新源配置，不写死任何上游地址。
+fn github_latest_api_url() -> String {
+    format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        zap_config::endpoints::update_repo()
+    )
+}
 
 #[derive(Debug, Deserialize, Clone)]
 struct GitHubRelease {
@@ -296,27 +302,31 @@ fn resolve_desktop_installer_url_fallback(version: &str) -> Option<String> {
         format!("v{version}")
     };
     let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
+    // 仓库与安装包名都随发布侧走：桌面安装包由 Tauri 按 productName 命名（Zap_*），
+    // 仓库取自更新源配置，不写死任何上游地址。
+    let repo = zap_config::endpoints::update_repo();
 
     #[cfg(target_os = "windows")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_x64-setup.exe"
         ))
     }
     #[cfg(target_os = "macos")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_aarch64.dmg"
         ))
     }
     #[cfg(target_os = "linux")]
     {
         Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
+            "https://github.com/{repo}/releases/download/{tag}/Zap_{clean_ver}_amd64.AppImage"
         ))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
+        let _ = repo;
         None
     }
 }
@@ -328,10 +338,12 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
     } else {
         format!("v{version}")
     };
-    let clean_ver = tag.trim_start_matches('v').trim_start_matches('V');
 
     // 优先尝试通过 GitHub API 查找 release assets 列表中的安装包
-    let api_url = format!("https://api.github.com/repos/jeikl/JeikCode/releases/tags/{tag}");
+    let api_url = format!(
+        "https://api.github.com/repos/{}/releases/tags/{tag}",
+        zap_config::endpoints::update_repo()
+    );
     let client = reqwest::Client::builder()
         .user_agent(concat!("jeikcode/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -376,29 +388,8 @@ async fn resolve_desktop_installer_url(version: &str) -> Option<String> {
         }
     }
 
-    // 后备方案：使用标准发布产物命名约定
-    #[cfg(target_os = "windows")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_x64-setup.exe"
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_aarch64.dmg"
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Some(format!(
-            "https://github.com/jeikl/JeikCode/releases/download/{tag}/JeikCode.Desktop_{clean_ver}_amd64.AppImage"
-        ))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    // 后备方案：按发布产物命名约定拼地址（与下面的 fallback 共用同一份逻辑）
+    resolve_desktop_installer_url_fallback(version)
 }
 
 /// GET /api/update/check
@@ -485,7 +476,7 @@ pub async fn check_update(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
                 download_url = Some(zap_updater::binary_url(&latest_version, target));
             }
         } else if let Some(ref c) = client {
-            if let Ok(resp) = c.get(GITHUB_LATEST_API_URL).send().await {
+            if let Ok(resp) = c.get(github_latest_api_url()).send().await {
                 if resp.status().is_success() {
                     if let Ok(rel) = resp.json::<GitHubRelease>().await {
                         latest_version = rel.tag_name.clone();

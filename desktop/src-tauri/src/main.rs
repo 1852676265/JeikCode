@@ -231,6 +231,15 @@ fn open_in_external_browser(url: &str) {
 fn main() {
     let child = Mutex::new(None);
     tauri::Builder::default()
+        // 必须最先注册：第二个实例在这里被拦下，只把已有窗口提到前台。
+        // 否则每点一次图标就多一个进程、多一个 Zap 窗口。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(ChildSlot(child))
         .setup(|app| {
             let webui_origin = Arc::new(Mutex::new(None));

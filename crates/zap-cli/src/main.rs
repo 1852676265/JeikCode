@@ -1966,7 +1966,10 @@ async fn async_main() {
                 location.column()
             );
         }
-        eprintln!("\nPlease report this at: https://github.com/jeikl/JeikCode/issues");
+        eprintln!(
+            "\nPlease report this at: https://github.com/{}/issues",
+            zap_config::endpoints::update_repo()
+        );
     }));
 
     match run(inherited_token).await {
@@ -4620,8 +4623,14 @@ fn handle_upgrade_set(target: Option<String>) -> Result<()> {
         handle_upgrade_get();
         println!("\nUsage: jeikcode update set <URL_OR_REPO>");
         println!("Examples:");
-        println!("  jeikcode update set https://github.com/jeikl/JeikCode");
-        println!("  jeikcode update set jeikl/JeikCode");
+        println!(
+            "  jeikcode update set https://github.com/{}",
+            zap_config::endpoints::update_repo()
+        );
+        println!(
+            "  jeikcode update set {}",
+            zap_config::endpoints::update_repo()
+        );
         println!("  jeikcode update set https://mirror.example.com/jeikcode");
         return Ok(());
     };

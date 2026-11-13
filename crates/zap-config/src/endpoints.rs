@@ -39,7 +39,6 @@ pub const UPDATE_DOWNLOAD_BASE_ENV: &str = "ZAP_UPDATE_DOWNLOAD_BASE";
 pub const DESKTOP_DOWNLOAD_URL_ENV: &str = "ZAP_DESKTOP_DOWNLOAD_URL";
 pub const UPDATE_REPO_ENV: &str = "ZAP_UPDATE_REPO";
 pub const DEFAULT_UPDATE_REPO: &str = "1852676265/JeikCode";
-pub const UPSTREAM_UPDATE_REPO: &str = "jeikl/JeikCode";
 pub const RELAY_URL_ENV: &str = "ZAP_APP_RELAY";
 
 /// Marketplace git URLs, comma-separated. Replaces the default list; an
@@ -445,7 +444,9 @@ pub fn parse_custom_update_source(input: &str) -> anyhow::Result<(String, String
     }
 
     anyhow::bail!(
-        "Invalid update source '{input}'. Expected a GitHub repository (e.g. https://github.com/jeikl/JeikCode or jeikl/JeikCode) or an HTTP(S) URL."
+        "Invalid update source '{input}'. Expected a GitHub repository (e.g. https://github.com/{} or {}) or an HTTP(S) URL.",
+        update_repo(),
+        update_repo()
     )
 }
 

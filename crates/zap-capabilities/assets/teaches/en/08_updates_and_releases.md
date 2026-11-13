@@ -8,9 +8,9 @@ JeikCode pulls updates and version manifests from the official GitHub repository
 
 | Item | Default Endpoint | Environment Variable Override | Description |
 | :--- | :--- | :--- | :--- |
-| **Version Manifest** | `https://github.com/jeikl/JeikCode/releases/latest/download/latest.json` | `JEIKCODE_UPDATE_MANIFEST_URL` | Contains platform versions, SHA256 checksums, and asset sizes. |
-| **Download Base** | `https://github.com/jeikl/JeikCode/releases/download` | `JEIKCODE_UPDATE_DOWNLOAD_BASE` | Concatenates `/{version}/{asset_name}` to download binary packages. |
-| **Official Repository** | `https://github.com/jeikl/JeikCode` | - | Official source repository. |
+| **Version Manifest** | `https://github.com/1852676265/JeikCode/releases/latest/download/latest.json` | `JEIKCODE_UPDATE_MANIFEST_URL` | Contains platform versions, SHA256 checksums, and asset sizes. |
+| **Download Base** | `https://github.com/1852676265/JeikCode/releases/download` | `JEIKCODE_UPDATE_DOWNLOAD_BASE` | Concatenates `/{version}/{asset_name}` to download binary packages. |
+| **Official Repository** | `https://github.com/1852676265/JeikCode` | - | Official source repository. |
 
 ---
 
@@ -24,10 +24,10 @@ Configure at the **very top of `~/.jeikcode/config.toml` (before any `[table]`)*
 # ==============================================================================
 
 # Custom version manifest URL
-update_manifest_url = "https://github.com/jeikl/JeikCode/releases/latest/download/latest.json"
+update_manifest_url = "https://github.com/1852676265/JeikCode/releases/latest/download/latest.json"
 
 # Custom binary download base URL
-update_download_base = "https://github.com/jeikl/JeikCode/releases/download"
+update_download_base = "https://github.com/1852676265/JeikCode/releases/download"
 
 # Automatically check and download updates in background (default false)
 auto_update = false
@@ -54,7 +54,7 @@ jeikcode update -y
 jeikcode upgrade --yes
 
 # Set custom update source and persist to config.toml
-jeikcode update set https://github.com/jeikl/JeikCode
+jeikcode update set https://github.com/1852676265/JeikCode
 
 # Inspect currently effective update endpoints
 jeikcode update get

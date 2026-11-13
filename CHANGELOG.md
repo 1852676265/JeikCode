@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.13 (2026-11-13)
+
+- **[Single Instance & Update Source] One desktop window, and no upstream coupling in update paths**:
+  - Launching Zap again now focuses the existing window instead of opening a second window and spawning a second local service.
+  - Desktop update checks and installer downloads resolve the repository and asset names from the configured update source instead of hard-coded upstream addresses, so they point at this project's own releases.
+  - Update-source error hints, `update set` examples, crash report links and the shipped configuration guides now show the configured repository as well.
+
+---
+
+- **[单实例与更新源] 桌面端只保留一个窗口，更新链路不再指向上游**:
+  - 再次点击 Zap 图标只会聚焦已有窗口，不再多开一个窗口、多起一个本地服务。
+  - 桌面端的更新检查与安装包下载改为从更新源配置解析仓库与产物名，不再写死上游地址，指向本项目自己的 release。
+  - 更新源报错提示、`update set` 示例、崩溃反馈链接与随包发布的配置指南也一并改为显示当前配置的仓库。
+
 ## v1.0.12 (2026-11-13)
 
 - **[Desktop Shell & Local Service] Restored desktop app startup broken by v1.0.11**:

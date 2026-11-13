@@ -8,9 +8,9 @@ JeikCode 默认从官方 GitHub 仓库拉取更新与版本清单：
 
 | 配置项 | 默认地址 | 环境变量覆盖 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **版本清单 (Manifest)** | `https://github.com/jeikl/JeikCode/releases/latest/download/latest.json` | `JEIKCODE_UPDATE_MANIFEST_URL` | 包含各平台版本号、SHA256 与文件大小。 |
-| **下载基址 (Download Base)** | `https://github.com/jeikl/JeikCode/releases/download` | `JEIKCODE_UPDATE_DOWNLOAD_BASE` | 自动拼接 `/{version}/{asset_name}` 下载二进制。 |
-| **官方代码仓** | `https://github.com/jeikl/JeikCode` | - | 官方源码主页。 |
+| **版本清单 (Manifest)** | `https://github.com/1852676265/JeikCode/releases/latest/download/latest.json` | `JEIKCODE_UPDATE_MANIFEST_URL` | 包含各平台版本号、SHA256 与文件大小。 |
+| **下载基址 (Download Base)** | `https://github.com/1852676265/JeikCode/releases/download` | `JEIKCODE_UPDATE_DOWNLOAD_BASE` | 自动拼接 `/{version}/{asset_name}` 下载二进制。 |
+| **官方代码仓** | `https://github.com/1852676265/JeikCode` | - | 官方源码主页。 |
 
 ---
 
@@ -24,10 +24,10 @@ JeikCode 默认从官方 GitHub 仓库拉取更新与版本清单：
 # ==============================================================================
 
 # 自定义版本清单地址
-update_manifest_url = "https://github.com/jeikl/JeikCode/releases/latest/download/latest.json"
+update_manifest_url = "https://github.com/1852676265/JeikCode/releases/latest/download/latest.json"
 
 # 自定义下载基址
-update_download_base = "https://github.com/jeikl/JeikCode/releases/download"
+update_download_base = "https://github.com/1852676265/JeikCode/releases/download"
 
 # 是否在后台自动检测并下载更新（默认 false）
 auto_update = false
@@ -54,7 +54,7 @@ jeikcode update -y
 jeikcode upgrade --yes
 
 # 一键设置更新源并持久化写入 config.toml
-jeikcode update set https://github.com/jeikl/JeikCode
+jeikcode update set https://github.com/1852676265/JeikCode
 
 # 查看当前生效的更新源与解析地址
 jeikcode update get
