@@ -30,11 +30,13 @@ export const LEGACY_WEBUI_TOKEN_STORAGE_KEY = 'jeikcode_webui_token';
 function persistWebuiToken(value: string) {
   try {
     sessionStorage.setItem(WEBUI_TOKEN_STORAGE_KEY, value);
+    sessionStorage.setItem(LEGACY_WEBUI_TOKEN_STORAGE_KEY, value);
   } catch {
     /* private mode / quota */
   }
   try {
     localStorage.setItem(WEBUI_TOKEN_STORAGE_KEY, value);
+    localStorage.setItem(LEGACY_WEBUI_TOKEN_STORAGE_KEY, value);
   } catch {
     /* private mode / quota */
   }
@@ -95,16 +97,28 @@ function currentWebuiToken(): string {
     return fromUrl;
   }
 
-  // 优先从当前激活的主机配置读取专用 Token
+  // 远端自定义主机优先使用对应配置的专用 Token；默认本地宿主机优先读取当前会话最新注入的 Token，
+  // 防止 Electron/WebView 本地存储残留旧版 jeikcode_webui_token 导致接口全部 401。
+  let activeProfile: ReturnType<typeof getActiveServerProfile> | null = null;
   try {
-    const activeProfile = getActiveServerProfile();
-    if (activeProfile && activeProfile.token && activeProfile.token.trim()) {
+    activeProfile = getActiveServerProfile();
+    if (
+      activeProfile &&
+      !activeProfile.isDefault &&
+      activeProfile.url &&
+      activeProfile.token &&
+      activeProfile.token.trim()
+    ) {
       return activeProfile.token.trim();
     }
   } catch {}
 
   const stored = storedWebuiToken();
   if (stored) return stored;
+
+  if (activeProfile && activeProfile.token && activeProfile.token.trim()) {
+    return activeProfile.token.trim();
+  }
 
   // 兜底从 document.cookie 读取（解决某些异地浏览器或非隐身页面存储孤岛问题）
   try {

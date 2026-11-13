@@ -1416,7 +1416,8 @@ pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
             continue;
         }
 
-        let is_jeik_family = name.starts_with("jeikcode") || name.starts_with("atomcode");
+        let is_jeik_family =
+            name.starts_with("zap") || name.starts_with("jeikcode") || name.starts_with("atomcode");
         if !is_jeik_family {
             continue;
         }
@@ -1427,15 +1428,15 @@ pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
             .unwrap_or_default();
         let exe_path_lower = exe_path_str.to_ascii_lowercase();
 
-        // 1. 判定是否为老旧 Dropper 目录残存
-        let is_legacy_path = exe_path_lower.contains(".local\\bin")
-            || exe_path_lower.contains(".local/bin")
-            || exe_path_lower.contains("atomcode");
+        // 1. 仅将已废弃的 atomcode 路径判定为历史遗留；`~/.local/bin` 是正式 CLI 安装目录，绝不误杀
+        let is_legacy_path = exe_path_lower.contains("atomcode");
 
-        // 2. 检查环境变量是否包含 JEIKCODE_DESKTOP=1
+        // 2. 检查环境变量是否包含桌面托管标记（兼容 ZAP_DESKTOP 与 JEIKCODE_DESKTOP）
         let is_desktop_env = proc_.environ().iter().any(|env_str| {
             let s = env_str.to_string_lossy();
-            s.starts_with("JEIKCODE_DESKTOP=")
+            s.starts_with("ZAP_DESKTOP=")
+                || s.starts_with("ZAP_DESKTOP_CLI_BIN=")
+                || s.starts_with("JEIKCODE_DESKTOP=")
                 || s.starts_with("JEIKCODE_DESKTOP_CLI_BIN=")
                 || s.starts_with("JEIKCODE_DESKTOP_PID=")
         });
@@ -1454,11 +1455,11 @@ pub fn scan_zombie_processes() -> Vec<ZombieProcessInfo> {
             || declared_desktop_pid.is_some_and(|dpid| active_desktop_pids.contains(&dpid));
 
         // 判定准则（严格保护普通终端/开发/TUI 实例）：
-        // - 如果是运行在旧目录 .local\bin 下的实例 -> 100% 历史遗留僵尸
-        // - 如果原本是桌面端子进程 (is_desktop_env)，但绑定的父级桌面壳已不再存活 -> 100% 孤儿僵尸
+        // - 若为已废弃的 atomcode 旧版遗留实例 -> 历史遗留僵尸
+        // - 如果原本是桌面端子进程 (is_desktop_env)，但绑定的父级桌面壳已不再存活 -> 孤儿子进程
         let mut zombie_reason = None;
         if is_legacy_path {
-            zombie_reason = Some("旧版 ~/.local/bin 遗留运行实例".to_string());
+            zombie_reason = Some("旧版 atomcode 遗留运行实例".to_string());
         } else if is_desktop_env && !desktop_owner_alive {
             zombie_reason = Some("父级桌面壳已退出，脱离托管的孤儿子进程".to_string());
         }
@@ -1514,8 +1515,7 @@ pub(crate) async fn get_legacy_status() -> impl IntoResponse {
                         .unwrap_or("")
                         .to_ascii_lowercase();
                     let is_current = current_exe.as_ref().map_or(false, |c| c == &path);
-                    if (name.starts_with("jeikcode") || name.starts_with("atomcode")) && !is_current
-                    {
+                    if name.starts_with("atomcode") && !is_current {
                         legacy_files.push(path.display().to_string());
                     }
                 }
@@ -1532,10 +1532,7 @@ pub(crate) async fn get_legacy_status() -> impl IntoResponse {
             let path_val: String = env.get_value("Path").unwrap_or_default();
             for item in path_val.split(';') {
                 let lower = item.trim().to_ascii_lowercase();
-                if lower.contains(".local\\bin")
-                    || lower.contains(".local/bin")
-                    || lower.contains("atomcode")
-                {
+                if lower.contains("atomcode") {
                     has_dirty_path = true;
                     break;
                 }
@@ -1575,9 +1572,7 @@ pub(crate) async fn post_migrate_legacy(
                             .and_then(|n| n.to_str())
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        if (name.starts_with("jeikcode") || name.starts_with("atomcode"))
-                            && running != &path
-                        {
+                        if name.starts_with("atomcode") && running != &path {
                             if std::fs::remove_file(&path).is_ok() {
                                 cleaned_files_count += 1;
                             }
@@ -1585,7 +1580,6 @@ pub(crate) async fn post_migrate_legacy(
                     }
                 }
             }
-            let _ = std::fs::remove_dir(&local_bin);
         }
     }
 

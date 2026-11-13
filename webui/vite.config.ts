@@ -663,6 +663,10 @@ export default defineConfig(async () => {
     plugins: [preact(), autoAuthPlugin(), mockApiPlugin(), localPluginsServePlugin()],
     base: './',
     resolve: {
+      // Preact 必须是单例：`react` 被 alias 到 `preact/compat`，一旦预构建把 `preact`
+      // 与 `preact/compat`/`preact/hooks` 拆成多份实例，`render()` 就无法识别已有根节点而不断追加
+      // 新树，表现是同一页面里叠出多份侧栏/主区（点开会话却看到“发送消息开始对话…”）。
+      dedupe: ['preact', 'preact/hooks', 'preact/compat', 'preact/jsx-runtime', 'preact/jsx-dev-runtime'],
       alias: {
         react: 'preact/compat',
         'react-dom': 'preact/compat',

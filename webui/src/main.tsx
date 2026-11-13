@@ -35,9 +35,23 @@ initPageZoom();
 // 初始化代码编辑/预览全局字号
 initEditorFontSize();
 
-render(
-  <SettingsProvider>
-    <App />
-  </SettingsProvider>,
-  document.getElementById('app')!,
-);
+// 单实例挂载：HMR、重复执行入口或上一轮未清理的挂载都可能在同一 #app 下叠加多份应用，
+// 表现就是侧栏与主区各来自不同实例（点开一个会话却看到“发送消息开始对话…”）。
+// 挂载前先显式卸载旧 Preact 树并清空容器，同时在 HMR dispose 时清理，保证整页只有一个 App 根节点。
+const container = document.getElementById('app');
+if (container) {
+  render(null, container);
+  container.replaceChildren();
+  render(
+    <SettingsProvider>
+      <App />
+    </SettingsProvider>,
+    container,
+  );
+  if (import.meta.hot) {
+    import.meta.hot.dispose(() => {
+      render(null, container);
+      container.replaceChildren();
+    });
+  }
+}

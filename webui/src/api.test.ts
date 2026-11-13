@@ -624,3 +624,52 @@ test('getConfig parses a successful config payload', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('getToken prefers fresh sessionStorage zap_webui_token over stale legacy localStorage token on default host', async () => {
+  const makeStorage = (init: Record<string, string>) => {
+    const map = new Map<string, string>(Object.entries(init));
+    return {
+      getItem: (k: string) => map.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        map.set(k, String(v));
+      },
+      removeItem: (k: string) => {
+        map.delete(k);
+      },
+      clear: () => map.clear(),
+    };
+  };
+
+  const prevLocation = globalThis.location;
+  const prevSessionStorage = (globalThis as any).sessionStorage;
+  const prevLocalStorage = (globalThis as any).localStorage;
+
+  Object.defineProperty(globalThis, 'location', {
+    value: new URL('http://localhost:5173/'),
+    configurable: true,
+  });
+  Object.defineProperty(globalThis, 'sessionStorage', {
+    value: makeStorage({ zap_webui_token: 'fresh-session-token' }),
+    configurable: true,
+  });
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: makeStorage({ jeikcode_webui_token: 'stale-legacy-token' }),
+    configurable: true,
+  });
+
+  try {
+    const { getToken } = await import('./api.ts');
+    const { getDefaultProfile } = await import('./lib/serverProfiles.ts');
+    assert.equal(getDefaultProfile().token, 'fresh-session-token');
+    assert.equal(getToken(), 'fresh-session-token');
+  } finally {
+    Object.defineProperty(globalThis, 'location', {
+      value: prevLocation,
+      configurable: true,
+    });
+    if (prevSessionStorage === undefined) delete (globalThis as any).sessionStorage;
+    else Object.defineProperty(globalThis, 'sessionStorage', { value: prevSessionStorage, configurable: true });
+    if (prevLocalStorage === undefined) delete (globalThis as any).localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', { value: prevLocalStorage, configurable: true });
+  }
+});

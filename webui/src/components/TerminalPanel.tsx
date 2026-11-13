@@ -621,8 +621,8 @@ export function TerminalPanel({ cwd, active }: TerminalPanelProps) {
         try {
           token =
             sessionStorage.getItem('zap_webui_token') ||
-            localStorage.getItem('zap_webui_token') ||
             sessionStorage.getItem('jeikcode_webui_token') ||
+            localStorage.getItem('zap_webui_token') ||
             localStorage.getItem('jeikcode_webui_token') ||
             '';
         } catch {}

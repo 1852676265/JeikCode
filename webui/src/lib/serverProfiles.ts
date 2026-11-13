@@ -85,7 +85,12 @@ export function normalizeDirectApiBase(rawUrl: string): string {
 export function getDefaultProfile(): ServerProfile {
   let initialToken = '';
   try {
-    initialToken = localStorage.getItem('jeikcode_webui_token') || sessionStorage.getItem('jeikcode_webui_token') || '';
+    initialToken =
+      sessionStorage.getItem('zap_webui_token') ||
+      sessionStorage.getItem('jeikcode_webui_token') ||
+      localStorage.getItem('zap_webui_token') ||
+      localStorage.getItem('jeikcode_webui_token') ||
+      '';
   } catch {}
 
   let hostLabel = '当前宿主机';
@@ -164,6 +169,8 @@ export function setActiveServerProfileId(id: string, reload: boolean = true): vo
   const profile = profiles.find((p) => p.id === id);
   if (profile && profile.token) {
     try {
+      localStorage.setItem('zap_webui_token', profile.token);
+      sessionStorage.setItem('zap_webui_token', profile.token);
       localStorage.setItem('jeikcode_webui_token', profile.token);
       sessionStorage.setItem('jeikcode_webui_token', profile.token);
     } catch {}

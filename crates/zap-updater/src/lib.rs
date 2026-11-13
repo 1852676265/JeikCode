@@ -402,7 +402,13 @@ pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
     vec![running.to_path_buf()]
 }
 
-/// Clean up orphaned legacy copies in `~/.local/bin` left by older dropper versions.
+/// 判断 `~/.local/bin` 中的文件是否属于已废弃的旧版遗留文件。
+/// `~/.local/bin/zap(.exe)` 与 `jeikcode(.exe)` 是桌面端和安装脚本的正式 CLI 目录，绝不能误删。
+fn is_legacy_dropper_filename(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("atomcode")
+}
+
+/// 清理 `~/.local/bin` 中已废弃的旧版（atomcode）孤儿副本，保留正式的 `zap` / `jeikcode` CLI。
 pub fn cleanup_legacy_dropper_file(running: &Path) {
     if let Some(home) = zap_config::util::real_home_dir() {
         let local_bin = home.join(".local").join("bin");
@@ -413,24 +419,76 @@ pub fn cleanup_legacy_dropper_file(running: &Path) {
                     let name = path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    if (name.starts_with("zap") || name.starts_with("atomcode"))
-                        && !same_exe(&path, running)
-                    {
+                        .unwrap_or("");
+                    if is_legacy_dropper_filename(name) && !same_exe(&path, running) {
                         let _ = std::fs::remove_file(&path);
                     }
                 }
             }
         }
-        let _ = std::fs::remove_dir(&local_bin);
     }
 }
 
-/// Migrate legacy installations on Windows/Unix for direct binary update users:
-/// 1. Remove legacy `~/.local/bin/jeikcode(.exe)` if not the running executable.
-/// 2. On Windows, clean legacy `.local\bin` from `HKCU\Environment\Path` and
-///    ensure the running binary's directory is registered in `Path`.
+/// 计算 Windows 用户 `Path` 的规范化结果：
+/// - 保留 `~/.local/bin`（桌面端和安装脚本的正式 CLI 安装目录），仅清理已废弃的 `atomcode` 项；
+/// - 当以桌面端内置无扩展名 `cli-bin` 启动时，不把桌面内部目录（如 `AppData\Local\Zap`）写入用户 `Path`，
+///   并在该目录没有 `zap.exe` 时清理此前误写入的内部目录；
+/// - 仅当以正式 CLI 可执行文件（`zap.exe`）直接运行时，才按需将其所在目录注册到 `Path`。
+fn reconcile_windows_user_path(current: &str, running: &Path, desktop_managed: bool) -> String {
+    let running_name = running
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_bundled_cli_bin = running_name == "cli-bin";
+    let install_dir = running.parent().map(|d| d.display().to_string());
+
+    let mut parts: Vec<String> = current
+        .split(';')
+        .filter(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("atomcode") {
+                return false;
+            }
+            // 若此前误把仅含 `cli-bin` 的桌面端内部目录写入过 `Path`，在桌面端/cli-bin 启动时一并清除
+            if is_bundled_cli_bin {
+                if let Some(ref dir_str) = install_dir {
+                    if trimmed.eq_ignore_ascii_case(dir_str)
+                        && !running
+                            .parent()
+                            .is_some_and(|parent| parent.join("zap.exe").is_file())
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .map(|s| s.to_string())
+        .collect();
+
+    // 仅在非桌面托管模式、且当前运行的是正式 CLI 可执行文件（而非 `cli-bin` 或临时/构建目录）时加入 PATH
+    if !desktop_managed && !is_bundled_cli_bin && looks_like_jeikcode_binary(running) {
+        if let Some(ref dir_str) = install_dir {
+            let lower = dir_str.to_ascii_lowercase();
+            if !lower.contains("temp")
+                && !lower.contains("staged")
+                && !lower.contains("target\\")
+                && !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(dir_str))
+            {
+                parts.insert(0, dir_str.clone());
+            }
+        }
+    }
+
+    parts.join(";")
+}
+
+/// 清理已废弃的 `atomcode` 遗留环境并按需校准用户 `Path`，不再破坏 `~/.local/bin` 正式 CLI 目录。
 pub fn migrate_legacy_environment() {
     #[cfg(windows)]
     {
@@ -447,42 +505,9 @@ pub fn migrate_legacy_environment() {
             return;
         };
         let current: String = env.get_value("Path").unwrap_or_default();
-        let home = zap_config::util::real_home_dir();
-        let legacy_dir = home
-            .as_ref()
-            .map(|h| h.join(".local").join("bin").display().to_string());
-        let install_dir = running.parent().map(|d| d.display().to_string());
-
-        let mut parts: Vec<String> = current
-            .split(';')
-            .filter(|p| {
-                let trimmed = p.trim();
-                if trimmed.is_empty() {
-                    return false;
-                }
-                let lower = trimmed.to_ascii_lowercase();
-                if lower.contains(".local\\bin")
-                    || lower.contains(".local/bin")
-                    || lower.contains("atomcode")
-                {
-                    return false;
-                }
-                true
-            })
-            .map(|s| s.to_string())
-            .collect();
-
-        // 仅在当前运行目录包含有效可执行文件且非临时目录时加入 PATH
-        if let Some(ref dir_str) = install_dir {
-            let lower = dir_str.to_ascii_lowercase();
-            if !lower.contains("temp") && !lower.contains("staged") && !lower.contains("target\\") {
-                if !parts.iter().any(|p| p.trim().eq_ignore_ascii_case(dir_str)) {
-                    parts.insert(0, dir_str.clone());
-                }
-            }
-        }
-
-        let new_path = parts.join(";");
+        let desktop_managed = std::env::var_os("ZAP_DESKTOP").is_some()
+            || std::env::var_os("JEIKCODE_DESKTOP").is_some();
+        let new_path = reconcile_windows_user_path(&current, &running, desktop_managed);
         if new_path != current {
             let _ = env.set_value("Path", &new_path);
             broadcast_setting_change();
@@ -4536,6 +4561,31 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             1,
             "client errors must not be retried"
+        );
+    }
+
+    #[test]
+    fn legacy_dropper_cleanup_preserves_zap_and_only_matches_atomcode() {
+        assert!(!is_legacy_dropper_filename("zap.exe"));
+        assert!(!is_legacy_dropper_filename("zap"));
+        assert!(!is_legacy_dropper_filename("jeikcode.exe"));
+        assert!(is_legacy_dropper_filename("atomcode.exe"));
+        assert!(is_legacy_dropper_filename("atomcode"));
+    }
+
+    #[test]
+    fn reconcile_windows_user_path_preserves_local_bin_and_drops_cli_bin_dir() {
+        let running_cli_bin = Path::new(r"C:\Users\Test\AppData\Local\Zap\cli-bin");
+        let current = r"C:\Users\Test\AppData\Local\Zap;C:\Users\Test\.local\bin;C:\Windows\System32;C:\Old\atomcode\bin";
+        let next = reconcile_windows_user_path(current, running_cli_bin, true);
+        assert_eq!(next, r"C:\Users\Test\.local\bin;C:\Windows\System32");
+
+        // 直接以正式 ~/.local/bin/zap.exe 运行时，若 Path 缺失则补回，且不破坏已有顺序
+        let running_zap = Path::new(r"C:\Users\Test\.local\bin\zap.exe");
+        let missing = r"C:\Windows\System32";
+        assert_eq!(
+            reconcile_windows_user_path(missing, running_zap, false),
+            r"C:\Users\Test\.local\bin;C:\Windows\System32"
         );
     }
 }

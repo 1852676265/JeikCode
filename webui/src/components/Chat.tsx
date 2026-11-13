@@ -3288,7 +3288,8 @@ export function Chat({
       setLoading(false);
     }
     if (!projectHash || !activeSession || activeSession.id !== sessionId) {
-      // SSE 可能先把 id 推过来；等 activeSession 对齐后再加载，期间保持落地页。
+      // SSE 可能先把 id 推过来；等 activeSession 对齐后再加载，期间保持落地页并确保不遗留 loading 态。
+      setLoading(false);
       return;
     }
 
@@ -3336,7 +3337,7 @@ export function Chat({
             applySessionTokens(loadId, idb.messages, idb.tokenUsage);
           }
         }
-      });
+      }).catch(() => {});
       if (!messageCacheRef.current.has(loadId)) {
         setLoading(true);
       }
@@ -3650,6 +3651,19 @@ export function Chat({
           !localTurnSessionsRef.current.has(loadId)
         ) {
           startIdleWatch(projectHash, loadId, loadGeneration, { replayIfLive: true });
+        }
+      })
+      .catch((err) => {
+        // 会话加载链路中任何一步抛错都不能让视图永久停在「发送消息开始对话…」：
+        // 记录可读提示并解除 loading，避免用户看到永远打不开的空会话。
+        if (activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration) {
+          setHistoryHint(t('chat.connError', { msg: String(err) }));
+        }
+      })
+      .finally(() => {
+        // 无论成功、失败还是提前 return，最终都必须退出 loading 态。
+        if (activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration) {
+          setLoading(false);
         }
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
