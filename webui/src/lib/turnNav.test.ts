@@ -399,3 +399,19 @@ test('resolveTurnTokenState accurately manages pending, in_progress and settled 
   assert.equal(settledState.turnTokens, 2800);
   assert.equal(settledState.cumulativeTokens, 35000);
 });
+
+test('buildTurnNavItemsFromOutline supports daemon label-only turns and missing text without throwing', () => {
+  const items = buildTurnNavItemsFromOutline([
+    { ordinal: 0, id: 'u1', index: 0, label: '升级后点开会话异常' },
+    { ordinal: 1, id: 'u2', index: 2, label: '<system-reminder>internal</system-reminder>' },
+    { ordinal: 2, id: 'u3', index: 4 },
+    { ordinal: 3, index: 6, text: '旧版 text 字段兼容' },
+  ]);
+  assert.deepEqual(
+    items.map((i) => ({ id: i.id, ordinal: i.ordinal, index: i.index, label: i.label, text: i.text })),
+    [
+      { id: 'turn-nav-0', ordinal: 0, index: 0, label: '升级后点开会话异常', text: '升级后点开会话异常' },
+      { id: 'turn-nav-3', ordinal: 3, index: 6, label: '旧版 text 字段兼容', text: '旧版 text 字段兼容' },
+    ],
+  );
+});

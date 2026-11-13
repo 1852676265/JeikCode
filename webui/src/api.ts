@@ -982,9 +982,18 @@ export interface SessionMessage {
 export interface SessionTurnOutline {
   /** Stable ordinal among real user questions. Absent on older daemons. */
   ordinal?: number;
+  /** Stable persisted message id when available. */
+  id?: string;
   /** Absolute index in the full transcript (not the returned window). */
   index: number;
-  text: string;
+  /** Compact user-question label returned by newer daemons (`SessionTurnOutline.label`). */
+  label?: string;
+  /** Legacy field name used by older daemons and local optimistic entries. */
+  text?: string;
+  /** Input admitted but not yet folded/persisted. */
+  pending?: boolean;
+  /** Admission sequence from durable input log. */
+  seq?: number;
 }
 
 export interface ModelUsageStat {

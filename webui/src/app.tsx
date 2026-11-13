@@ -1,6 +1,7 @@
 // Two-column layout: sidebar + chat, header with cwd breadcrumb + config.
 // VSCode design system: timeline messages, violet brand, floating input.
 
+import { Component, type ComponentChildren } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { lazy, Suspense } from 'preact/compat';
 import { Chat } from './components/Chat';
@@ -57,6 +58,57 @@ function readSessionIdFromUrl(): string | null {
 // URL 里只放 UUID 前 8 位以缩短地址；刷新时按前缀在会话列表里还原成完整 id。
 function shortSessionId(id: string): string {
   return id.slice(0, 8);
+}
+
+/**
+ * 局部渲染错误边界：防止子工作区（如 Chat/插件视图）渲染期抛错打断 Preact 根树 diff，
+ * 避免 #app 容器残留旧节点并分裂出多份 #app-root。
+ */
+class WorkspaceErrorBoundary extends Component<
+  {
+    resetKey: string | null;
+    retryLabel: string;
+    onErrorFormat: (msg: string) => string;
+    children: ComponentChildren;
+  },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('[WorkspaceErrorBoundary]', error);
+  }
+
+  componentDidUpdate(prevProps: { resetKey: string | null }) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div class="messages-empty" role="alert">
+          <div>
+            <div>{this.props.onErrorFormat(this.state.error.message || String(this.state.error))}</div>
+            <button
+              type="button"
+              class="btn"
+              style={{ marginTop: '12px' }}
+              onClick={() => this.setState({ error: null })}
+            >
+              {this.props.retryLabel}
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export function App() {
@@ -1754,7 +1806,12 @@ export function App() {
               })()}
             </div>
           ) : (
-            <Chat
+            <WorkspaceErrorBoundary
+              resetKey={`${activeWorkbenchView}:${sessionId ?? ''}`}
+              retryLabel={t('common.retry')}
+              onErrorFormat={(msg) => t('chat.connError', { msg })}
+            >
+              <Chat
               sessionId={sessionId}
               onSessionId={handleSessionAssigned}
               cwd={cwd}
@@ -1828,6 +1885,7 @@ export function App() {
               onLiveReview={onLiveReview}
               onBindReviewDismiss={onBindReviewDismiss}
             />
+            </WorkspaceErrorBoundary>
           )}
         </div>
       </div>

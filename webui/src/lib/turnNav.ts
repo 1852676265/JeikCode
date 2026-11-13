@@ -107,8 +107,8 @@ export function turnNavId(ordinal: number): string {
   return `turn-nav-${ordinal}`;
 }
 
-export function compactTurnNavText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
+export function compactTurnNavText(text: string | undefined | null): string {
+  return (typeof text === 'string' ? text : '').replace(/\s+/g, ' ').trim();
 }
 
 /** Collapse whitespace and truncate for the outline label. */
@@ -131,8 +131,25 @@ export interface TurnStatLike {
   }>;
 }
 
+export type OutlineTurnInput = {
+  ordinal?: number;
+  id?: string;
+  index: number;
+  label?: string;
+  text?: string;
+};
+
+/**
+ * 兼容新版后端 (`label`) 与旧版/乐观缓存 (`text`) 的大纲文本提取。
+ */
+export function resolveOutlineText(turn: OutlineTurnInput): string {
+  if (typeof turn.label === 'string' && turn.label.length > 0) return turn.label;
+  if (typeof turn.text === 'string') return turn.text;
+  return typeof turn.label === 'string' ? turn.label : '';
+}
+
 export function buildTurnNavItemsFromOutline(
-  turns: { ordinal?: number; index: number; text: string }[],
+  turns: OutlineTurnInput[],
   loadedItems?: TurnNavItem[],
   turnStats?: TurnStatLike[],
 ): TurnNavItem[] {
@@ -143,11 +160,12 @@ export function buildTurnNavItemsFromOutline(
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
+    const rawText = resolveOutlineText(turn);
     // Older sessions may not mark injected user rows as synthetic. Keep the
     // server outline aligned with the same rows history rendering suppresses.
-    if (isInternalHistoryUserMessage(turn.text)) continue;
+    if (isInternalHistoryUserMessage(rawText)) continue;
     const text = compactTurnNavText(
-      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(turn.text)),
+      stripSteerEnvelopeForDisplay(stripInjectedRemindersForDisplay(rawText)),
     );
     const label = truncateTurnNavLabel(text);
     if (!label) continue;

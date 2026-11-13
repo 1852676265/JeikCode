@@ -15,8 +15,9 @@ const INTERNAL_USER_PREFIXES = [
   '[Images returned by the tool calls above',
 ];
 
-export function isInternalHistoryUserMessage(text: string, synthetic?: boolean): boolean {
+export function isInternalHistoryUserMessage(text: string | undefined | null, synthetic?: boolean): boolean {
   if (synthetic === true) return true;
+  if (typeof text !== 'string' || !text) return false;
   const trimmed = text.trimStart();
   return INTERNAL_USER_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
@@ -25,7 +26,8 @@ export function isInternalHistoryUserMessage(text: string, synthetic?: boolean):
 const STEER_MARKER = '[jeikcode-steer]';
 
 /** UI-only: the steer note is for the model. The bubble keeps the user's words. */
-export function stripSteerEnvelopeForDisplay(text: string): string {
+export function stripSteerEnvelopeForDisplay(text: string | undefined | null): string {
+  if (typeof text !== 'string' || !text) return '';
   const match = text.match(/<user-query>\s*([\s\S]*?)\s*<\/user-query>/i);
   if (match) {
     const inner = match[1].trim();
@@ -47,7 +49,8 @@ export function stripSteerEnvelopeForDisplay(text: string): string {
 }
 
 /** UI-only: drop appended `<system-reminder>` and `<strong-reminder>` tails. Protocol context keeps them. */
-export function stripInjectedRemindersForDisplay(text: string): string {
+export function stripInjectedRemindersForDisplay(text: string | undefined | null): string {
+  if (typeof text !== 'string' || !text) return '';
   const stripTag = (input: string, open: string, close: string): string => {
     let rest = input;
     let out = '';

@@ -4852,12 +4852,12 @@ export function Chat({
           (item, position) =>
             (item.ordinal ?? position) === ordinal ||
             item.index === index ||
-            (position === prev.length - 1 && item.text.trim() === compact.trim()),
+            (position === prev.length - 1 && (item.label ?? item.text ?? '').trim() === compact.trim()),
         )
       ) {
         return prev;
       }
-      return [...prev, { ordinal, index, text: compact }].sort(
+      return [...prev, { ordinal, index, label: compact, text: compact }].sort(
         (a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0),
       );
     });
@@ -9550,10 +9550,8 @@ export function Chat({
           >
         <div class="timeline-inner">
         {messages.length === 0 && !historyHint && !restoring && loading && (
-          <div class="messages-empty">
-            <div>
-              {t('chat.startHint')}
-            </div>
+          <div class="messages-empty messages-loading" role="status" aria-live="polite">
+            <span class="codex-shimmer-status">{t('chat.loadingOlder')}</span>
           </div>
         )}
 
