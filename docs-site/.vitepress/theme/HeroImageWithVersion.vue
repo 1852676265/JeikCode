@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 
 // 两个独立的兜底版本号：一个正式版，一个 beta 版
-const stableVersion = ref('v1.0.13')
+const stableVersion = ref('v1.0.14')
 const betaVersion = ref('v1.0.1-beta.1')
 
 onMounted(async () => {

@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.14 (2026-11-13)
+
+- **[Update Source] Release list comes from this project's own repository**:
+  - The version list behind the update dialog no longer reads the upstream edge cache by default, so it can no longer show releases this project never published (the upstream `v7.1.x` line).
+  - The edge cache is only used when `JEIKCODE_RELEASES_API_URL` is set explicitly; otherwise releases come from the configured repository's GitHub API.
+  - Per-tag release lookups now resolve the repository from the update source instead of a fixed one.
+
+---
+
+- **[更新源] 版本列表只来自本项目自己的仓库**:
+  - 更新对话框背后的版本列表不再默认读取上游边缘缓存，因此不会再显示本项目从未发布过的版本（上游 `v7.1.x` 那一串）。
+  - 只有显式配置了 `JEIKCODE_RELEASES_API_URL` 时才使用边缘缓存，否则从当前配置仓库的 GitHub API 取。
+  - 按 tag 查询单个 release 时同样从更新源配置解析仓库，不再写死。
+
 ## v1.0.13 (2026-11-13)
 
 - **[Single Instance & Update Source] One desktop window, and no upstream coupling in update paths**:

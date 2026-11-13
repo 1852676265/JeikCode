@@ -841,7 +841,10 @@ async fn fetch_release_by_tag_with_client(
     client: &reqwest::Client,
     tag: &str,
 ) -> Result<ListedRelease> {
-    let url = format!("https://api.github.com/repos/1852676265/JeikCode/releases/tags/{tag}");
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/tags/{tag}",
+        zap_config::endpoints::update_repo()
+    );
     let resp = client
         .get(&url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -856,12 +859,12 @@ async fn fetch_release_by_tag_with_client(
         .context("parsing release row")
 }
 
-/// Releases from the edge cache at `jeikcode.top/api/releases`.
+/// Releases from the configured update repository.
 ///
-/// GitHub's REST API is used when the edge returns nothing, when it returns
-/// tags whose announcement `body` is still empty, or when the edge truncated a
-/// long announcement. Truncated tags are repaired individually by tag so a
-/// long changelog does not force a full release-page download.
+/// GitHub's REST API is the source. `JEIKCODE_RELEASES_API_URL` may point at an
+/// edge cache instead, but only when it is set explicitly: the historical default
+/// (`jeikcode.top/api/releases`) belongs to an upstream service and would list
+/// releases this project never published.
 pub async fn list_releases() -> Result<Vec<ListedRelease>> {
     if zap_config::config::offline::is_offline_active() {
         return Ok(vec![]);
@@ -871,21 +874,26 @@ pub async fn list_releases() -> Result<Vec<ListedRelease>> {
         .user_agent(JEIKCODE_USER_AGENT)
         .build()?;
     let mut all = Vec::new();
-    let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
+    let edge = std::env::var("JEIKCODE_RELEASES_API_URL")
         .ok()
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
-    if let Ok(resp) = client.get(&primary).send().await {
-        if resp.status().is_success() {
-            if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
-                merge_listed_releases(&mut all, list);
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    if let Some(primary) = edge.as_deref() {
+        if let Ok(resp) = client.get(primary).send().await {
+            if resp.status().is_success() {
+                if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
+                    merge_listed_releases(&mut all, list);
+                }
             }
         }
     }
     let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
     if all.is_empty() || !edge_has_notes {
-        let gh = "https://api.github.com/repos/1852676265/JeikCode/releases?per_page=100";
-        if let Ok(pages) = fetch_release_pages(&client, gh).await {
+        let gh = format!(
+            "https://api.github.com/repos/{}/releases?per_page=100",
+            zap_config::endpoints::update_repo()
+        );
+        if let Ok(pages) = fetch_release_pages(&client, &gh).await {
             merge_listed_releases(&mut all, pages);
         }
     } else {
