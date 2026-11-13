@@ -404,7 +404,11 @@ fn spawn_desktop_server(
         cmd.env("JEIKCODE_DESKTOP_CLI_BIN", bundled);
     }
     cmd.current_dir(&launch.home)
-        .stdin(Stdio::null())
+        // CLI 在桌面托管模式下靠 stdin 的 EOF 判定桌面壳退出（见 zap-cli
+        // `wait_until_webui_stopped` 的 desktop-lifeline-eof）。这里必须是管道：
+        // 空设备会立刻读到 EOF，子进程打印完地址就以 0 退出，端口没人监听，
+        // 窗口随即 ERR_CONNECTION_REFUSED。写端由下方留在 child 里，随 child 存活。
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     suppress_console(&mut cmd);

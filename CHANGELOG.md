@@ -21,6 +21,20 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.12 (2026-11-13)
+
+- **[Desktop Shell & Local Service] Restored desktop app startup broken by v1.0.11**:
+  - The desktop window no longer fails with "connection refused" on launch: the bundled local WebUI service now stays alive instead of exiting right after printing its address.
+  - The desktop shell keeps a live stdin pipe for the service process, so the service still terminates together with the window and never lingers as an orphan.
+  - Fixed on both the first-launch path and the automatic relaunch path used after an unexpected service exit.
+
+---
+
+- **[桌面外壳与本地服务] 修复 v1.0.11 引入的桌面端启动失败**:
+  - 桌面窗口启动后不再出现"无法访问此页面"：内置的本地 WebUI 服务会正常常驻，不再打印完访问地址就退出。
+  - 桌面外壳改为用管道持有服务进程的 stdin，服务仍随窗口关闭一并退出，不会残留孤儿进程。
+  - 首次启动与异常退出后的自动重启两条路径均已修复。
+
 ## v1.0.11 (2026-11-12)
 
 - **[Plugin Kernel & Extension Lifecycle] Monotonic versioning, generation guard, and slot cleanup**:
