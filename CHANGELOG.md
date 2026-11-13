@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.16 (2026-11-13)
+
+- **[WebUI Session Opening & Layout Stability] Fixed historical session rendering crash and split-pane duplication**:
+  - Fixed an issue where opening or switching to a historical conversation could throw a client error and split the workspace into two side-by-side panels showing the empty prompt hint.
+  - Aligned the turn outline and message display helpers with the current backend session protocol while preserving backward compatibility for legacy cached sessions.
+  - Restored the loading status indicator while a conversation is being fetched instead of showing the empty-conversation start prompt.
+  - Added a workspace error boundary so unexpected rendering errors stay contained within the active panel and offer a one-click retry without breaking the sidebar or root layout.
+
+---
+
+- **[WebUI 会话打开与布局稳定性] 修复点开历史会话报错崩溃并分裂成双界面的问题**:
+  - 修复升级后点开或切换历史对话时，页面可能异常分裂成左右两个界面并误显示「发送消息开始对话…」的问题。
+  - 对齐新版后端的会话轮次大纲协议并强化空值保护，同时兼容历史缓存会话数据。
+  - 修复历史消息加载期间的占位提示，改为正常展示加载中状态，不再误导提示为空会话。
+  - 为主工作区增加局部错误边界，即使遇到异常也能在面板内安全提示并提供一键重试，避免破坏侧栏与整体布局。
+
 ## v1.0.15 (2026-11-13)
 
 - **[WebUI & Desktop Stability] Single-instance UI mounting, session loading recovery, and desktop auth alignment**:
