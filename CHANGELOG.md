@@ -21,6 +21,22 @@
   - 具体缺陷修复与行为改善说明...
 -->
 
+## v1.0.15 (2026-11-13)
+
+- **[WebUI & Desktop Stability] Single-instance UI mounting, session loading recovery, and desktop auth alignment**:
+  - Fixed an issue where multiple side-by-side application instances could appear in the WebUI during development hot-reloads or dependency pre-bundling.
+  - Fixed an issue where switching to or opening a conversation could stay stuck on the empty loading prompt after a loading interruption or early exit.
+  - Fixed desktop client authentication where stale legacy tokens in local storage could override the current session token and prevent models, projects, and files from loading.
+  - Preserved the official `~/.local/bin` CLI directory and stopped desktop internal binaries from polluting user `Path` during environment cleanup.
+
+---
+
+- **[WebUI 与桌面端稳定性] 修复界面多实例叠放、会话加载卡死与桌面端鉴权失效**:
+  - 修复开发热更新或依赖预构建阶段页面可能出现多个侧栏/主区并排叠放的问题。
+  - 修复打开或切换会话遇异常或提前退出时，对话区可能永久停留在「发送消息开始对话…」的问题。
+  - 修复桌面端本地存储残留旧版凭据覆盖当前会话令牌，导致模型列表、项目列表与文件区无法加载的问题。
+  - 保护正式 `~/.local/bin` 命令行安装目录不再被清理，并避免桌面端内部二进制路径误写入用户环境变量 `Path`。
+
 ## v1.0.14 (2026-11-13)
 
 - **[Update Source] Release list comes from this project's own repository**:
